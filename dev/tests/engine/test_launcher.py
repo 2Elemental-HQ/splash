@@ -699,7 +699,7 @@ class LauncherTests(unittest.TestCase):
                             "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
                         },
                     ),
-                    mock.patch.object(launcher, "PROFILES_DIR", Path(temporary)),
+                    mock.patch.object(launcher, "AGENTS_DIR", Path(temporary)),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
                     ),
@@ -718,7 +718,7 @@ class LauncherTests(unittest.TestCase):
                             command.call_args.args[3:5], (MODEL_ID, 102400)
                         )
                         self.assertEqual(
-                            command.call_args.args[5], launcher._profiles_dir(port)
+                            command.call_args.args[5], launcher._agents_dir(port)
                         )
                     self.assertEqual(
                         execute.call_count, len(launcher.clients.INSTALL_URLS)
@@ -915,6 +915,14 @@ class LauncherTests(unittest.TestCase):
             ):
                 launcher.main(["serve", "--model", MODEL_ID])
             self.assertEqual(held, [str(assembly.resolve() / "target")])
+
+    def test_agent_homes_are_not_named_profiles(self):
+        # Hermes reads <root>/profiles/<name> as a profile of <root> and writes
+        # its shared files into <root>: the checkout's install/ directory, had
+        # Splash kept its agent homes in install/profiles. Homes for other
+        # ports are a level deeper, under ports/, and were not affected.
+        home = launcher._agents_dir(launcher.PORT) / "hermes"
+        self.assertNotEqual(home.parent.name, "profiles")
 
     def test_relative_draft_directory_is_resolved_for_the_installer(self):
         with (

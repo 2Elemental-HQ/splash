@@ -888,7 +888,7 @@ class ClientLifecycleTests(unittest.TestCase):
         status = {"ready": True, "maximum_context_tokens": context}
         with (
             tempfile.TemporaryDirectory() as runtime,
-            mock.patch.object(launcher, "PROFILES_DIR", Path(runtime)),
+            mock.patch.object(launcher, "AGENTS_DIR", Path(runtime)),
             mock.patch.object(
                 clients, "find_executable", return_value=f"/bin/{client}"
             ),

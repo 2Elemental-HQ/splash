@@ -120,7 +120,7 @@ class AgentRunnerTests(unittest.TestCase):
                     "'Task complete', NULL, NULL, NULL, 1, 0)"
                 )
             with (
-                mock.patch.object(agent.launcher, "PROFILES_DIR", runtime),
+                mock.patch.object(agent.launcher, "AGENTS_DIR", runtime),
                 mock.patch.object(
                     agent.clients, "command", return_value=(["hermes"], {})
                 ),
@@ -614,7 +614,7 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.BASE_URL,
                         "Actual-model",
                         102400,
-                        agent.launcher.PROFILES_DIR,
+                        agent.launcher.AGENTS_DIR,
                         environment,
                         input_modalities=["text"],
                     )
