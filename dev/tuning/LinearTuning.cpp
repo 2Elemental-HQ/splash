@@ -106,11 +106,14 @@ void poisonFloat(metal::MetalBuffer buffer) {
 // A split-K plan and a sequential plan are not bitwise comparable, so every
 // output element is held to the derived bound instead (LinearNumerics.hpp),
 // with the sequential plan's output as the reference whichever side it is.
+// Two split plans each reassociate the sum: `associations` counts the sides
+// whose fp32 slack the bound covers.
 void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuffer &exact,
                                  const metal::MetalBuffer &split,
                                  const metal::MetalBuffer &residual,
                                  const metal::MetalBuffer &gate,
-                                 const metal::MetalBuffer &up, float operandSlack = 0) {
+                                 const metal::MetalBuffer &up, uint32_t associations,
+                                 float operandSlack) {
   const auto values = [](const metal::MetalBuffer &buffer) {
     return buffer ? static_cast<const uint16_t *>(buffer.contents()) : nullptr;
   };
@@ -123,7 +126,7 @@ void requireWithinSplitTolerance(LinearWorkload workload, const metal::MetalBuff
   float maxAbs = 0;
   for (uint64_t i = 0; i < elements; ++i)
     maxAbs = std::max(maxAbs, std::fabs(bf16ToFloat(exactValues[i])));
-  const float slack = reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
+  const float slack = float(associations) * reassociationSlack(workload.matrix.inputSize, maxAbs) + operandSlack;
   for (uint64_t i = 0; i < elements; ++i) {
     SplitReference reference{bf16ToFloat(exactValues[i])};
     if (residualValues) reference.residual = bf16ToFloat(residualValues[i]);
@@ -290,10 +293,14 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
         else if (mixed && pair.first == Output) {
-          const bool baselineExact = plans[0].partialSums() == 1 && !plans[0].usesSimdgroup();
+          const auto sequential = [](const LinearPlan &plan) {
+            return plan.partialSums() == 1 && !plan.usesSimdgroup();
+          };
+          const bool baselineExact = sequential(plans[0]);
           requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
                                       baselineExact ? actual : reference, buffers.residual,
-                                      fields[ReferenceGate], fields[ReferenceUp], operandSlack);
+                                      fields[ReferenceGate], fields[ReferenceUp],
+                                      baselineExact || sequential(plans[candidate]) ? 1 : 2, operandSlack);
         } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }
