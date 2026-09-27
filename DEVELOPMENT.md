@@ -50,8 +50,10 @@ overrides this. Concurrent input bytes share a budget of at least 512 MiB
 an input-byte budget, not a process RSS limit: large ASCII/base64 strings can
 use roughly twice their encoded size during JSON parsing alone. Decoded images
 and object-heavy JSON need additional memory. Oversized requests return 413;
-exhausted ingress capacity returns 503. Image and model context limits apply
-independently.
+exhausted ingress capacity returns 503. A connection that has sent no request
+yet gives way to a new one, with that 503, when every connection slot is
+taken, so stalled clients cannot lock others out. Image and model context
+limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
 at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.

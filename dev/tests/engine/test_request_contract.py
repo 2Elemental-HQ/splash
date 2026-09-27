@@ -112,6 +112,8 @@ class RequestContractTests(unittest.TestCase):
     def test_unsupported_http_version_is_rejected_before_header_validation(self):
         handler = object.__new__(api.FrontendHandler)
         handler._header_timer = mock.Mock()
+        handler.server = mock.Mock()
+        handler.connection = mock.Mock()
         handler.request_version = "HTTP/0.9"
         handler.headers = {}
         handler.send_error = mock.Mock()
