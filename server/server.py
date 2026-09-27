@@ -2133,6 +2133,9 @@ def main():
     signal.signal(signal.SIGTERM, _interrupt)
     signal.signal(signal.SIGINT, _interrupt)
     try:
+        # The launcher blocks both across its exec: one sent while this module
+        # imported arrives here and ends the startup cleanly.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
         # service from receiving requests.

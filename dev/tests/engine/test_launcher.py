@@ -4,6 +4,7 @@ import io
 import json
 import os
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -17,6 +18,32 @@ from unittest import mock
 from install import launcher
 
 MODEL_ID = "community/custom-splash"
+
+
+def with_stop_held(command, number):
+    """The command, started with a stop signal already sent and held, as the
+    launcher holds one sent while it starts a program."""
+    return [
+        sys.executable,
+        "-c",
+        "import os, signal, sys; "
+        f"signal.pthread_sigmask(signal.SIG_BLOCK, ({int(number)},)); "
+        f"os.kill(os.getpid(), {int(number)}); "
+        "os.execv(sys.argv[1], sys.argv[1:])",
+        *command,
+    ]
+
+
+def keep_stop_signals(test):
+    """Give the process its stop-signal handlers and mask back after `test`:
+    serve takes the signals, and blocks them for the exec a test stubs."""
+    for number in launcher.STOP_SIGNALS:
+        test.addCleanup(signal.signal, number, signal.getsignal(number))
+    test.addCleanup(
+        signal.pthread_sigmask,
+        signal.SIG_SETMASK,
+        signal.pthread_sigmask(signal.SIG_BLOCK, ()),
+    )
 
 
 def selection(models_root, **options):
@@ -44,6 +71,7 @@ class LauncherTests(unittest.TestCase):
             "SPLASH_DEFAULT_REASONING_EFFORT",
         ):
             os.environ.pop(name, None)
+        keep_stop_signals(self)
 
     def test_kv_format_is_an_explicit_load_option(self):
         base = ["serve", "--model", MODEL_ID]
@@ -799,6 +827,11 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.object(launcher.paths, "PACKAGED", False),
                     mock.patch.object(launcher, "RUNTIME_DIR", runtime),
                     mock.patch.object(launcher.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        launcher,
+                        "_run_held",
+                        side_effect=lambda command, **options: run(command).returncode,
+                    ),
                 ):
                     if fail:
                         with self.assertRaisesRegex(
@@ -866,7 +899,8 @@ class LauncherTests(unittest.TestCase):
                     launcher.subprocess,
                     "run",
                     return_value=subprocess.CompletedProcess([], 0),
-                ) as run,
+                ),
+                mock.patch.object(launcher, "_run_held", return_value=0) as run,
                 mock.patch.object(launcher.paths, "PACKAGED", True),
             ):
                 launcher._ensure_installed(chosen)
@@ -924,6 +958,115 @@ class LauncherTests(unittest.TestCase):
         home = launcher._agents_dir(launcher.PORT) / "hermes"
         self.assertNotEqual(home.parent.name, "profiles")
 
+    def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
+        # A non-interactive shell starts background jobs with SIGINT ignored.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        held = {}
+
+        def execute(*_):
+            held["handlers"] = {
+                number: signal.getsignal(number) for number in launcher.STOP_SIGNALS
+            }
+            held["mask"] = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+            mock.patch.object(launcher.socket, "socket"),
+            mock.patch.object(launcher, "_ensure_installed"),
+            mock.patch.object(launcher.os, "execve", side_effect=execute),
+        ):
+            launcher.main(["serve", "--model", MODEL_ID])
+        self.assertEqual(
+            held["handlers"], dict.fromkeys(launcher.STOP_SIGNALS, launcher._interrupt)
+        )
+        self.assertLessEqual(set(launcher.STOP_SIGNALS), held["mask"])
+
+    def test_a_stop_ends_serve_with_the_status_of_its_signal(self):
+        for number, status in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            with (
+                self.subTest(signal=number.name),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(
+                    launcher,
+                    "_ensure_installed",
+                    side_effect=lambda _: signal.raise_signal(number),
+                ),
+            ):
+                self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), status)
+
+    def test_a_held_program_starts_with_the_stop_signals_blocked(self):
+        check = (
+            "import signal, sys; "
+            "sys.exit(not {signal.SIGINT, signal.SIGTERM} "
+            "<= signal.pthread_sigmask(signal.SIG_BLOCK, ()))"
+        )
+        self.assertEqual(launcher._run_held([sys.executable, "-c", check]), 0)
+        self.assertFalse(
+            set(launcher.STOP_SIGNALS) & signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        )
+
+    def test_a_stop_the_launcher_takes_ends_the_held_program(self):
+        signal.signal(signal.SIGINT, launcher._interrupt)
+        main = threading.main_thread().ident
+        popen = subprocess.Popen
+        for moment in ("spawn", "run"):
+            with self.subTest(moment=moment):
+                programs = []
+
+                def spawn(*args, **options):
+                    programs.append(popen(*args, **options))
+                    if moment == "spawn":
+                        # Held: it arrives once the program exists.
+                        signal.pthread_kill(main, signal.SIGINT)
+                    else:
+                        threading.Timer(
+                            0.2, signal.pthread_kill, (main, signal.SIGINT)
+                        ).start()
+                    return programs[-1]
+
+                with (
+                    mock.patch.object(launcher.subprocess, "Popen", side_effect=spawn),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    launcher._run_held(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    )
+                self.assertEqual(programs[0].wait(timeout=5), -signal.SIGKILL)
+
+    def test_programs_take_a_stop_held_from_their_start(self):
+        home = self.enterContext(tempfile.TemporaryDirectory())
+        # Unstopped, each would go on to fail at its first step.
+        server = ["server/server.py", "target", "draft", "--tokenizer", "tokenizer"]
+        server += ["--model", MODEL_ID, "--port", "0"]
+        installer = ["install/models.py", "--models", home, "--model", MODEL_ID]
+        installer.append("prepare")
+        environment = {
+            **os.environ,
+            "HOME": home,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_VERBOSITY": "error",
+        }
+        for program, number, status in (
+            (server, signal.SIGINT, 0),
+            (server, signal.SIGTERM, 0),
+            (installer, signal.SIGINT, 130),
+        ):
+            with self.subTest(program=program[0], signal=number.name):
+                result = subprocess.run(
+                    with_stop_held([sys.executable, *program], number),
+                    cwd=launcher.ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    (result.returncode, result.stdout, result.stderr), (status, "", "")
+                )
+
     def test_relative_draft_directory_is_resolved_for_the_installer(self):
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -973,9 +1116,11 @@ class LauncherTests(unittest.TestCase):
                 "run",
                 return_value=subprocess.CompletedProcess([], 0),
             ) as run,
+            mock.patch.object(launcher, "_run_held", return_value=0) as run_held,
         ):
             launcher._ensure_installed(selection(launcher.paths.MODELS))
-        check, command = (call.args[0] for call in run.call_args_list)
+        (check,) = (call.args[0] for call in run.call_args_list)
+        command = run_held.call_args.args[0]
         self.assertEqual(check, [str(launcher.paths.BINARY), "device-check"])
         self.assertEqual(command[0], str(launcher.paths.PYTHON))
         self.assertIn("prepare", command)
