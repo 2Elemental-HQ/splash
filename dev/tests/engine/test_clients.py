@@ -673,12 +673,7 @@ class ClientTests(unittest.TestCase):
             argv, ["/bin/opencode", "run", "--standalone", "--", "--server"]
         )
 
-    def test_version_probe_parses_client_output_and_fails_closed(self):
-        def completed(stdout, returncode=0):
-            return subprocess.CompletedProcess(
-                ["opencode", "--version"], returncode, stdout=stdout, stderr=""
-            )
-
+    def test_major_version_reads_a_client_version_output(self):
         outputs = {
             "1.18.31\n": 1,
             "2.0.12": 2,
@@ -691,7 +686,17 @@ class ClientTests(unittest.TestCase):
             "2\n": None,
             "warning: requires macOS 26.4\n": None,
         }
-        for stdout, expected in outputs.items():
+        for text, expected in outputs.items():
+            with self.subTest(text=text):
+                self.assertEqual(clients.major_version(text), expected)
+
+    def test_version_probe_parses_client_output_and_fails_closed(self):
+        def completed(stdout, returncode=0):
+            return subprocess.CompletedProcess(
+                ["opencode", "--version"], returncode, stdout=stdout, stderr=""
+            )
+
+        for stdout, expected in (("opencode v2.0.12\n", 2), ("unknown\n", None)):
             with self.subTest(stdout=stdout):
                 with mock.patch.object(
                     clients.subprocess, "run", return_value=completed(stdout)

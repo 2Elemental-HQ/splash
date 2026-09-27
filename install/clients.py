@@ -61,6 +61,15 @@ def find_executable(name):
     return path
 
 
+def major_version(text):
+    """The major version a client's --version output names; None if none."""
+    match = re.match(
+        r"(?:opencode\s+)?v?(\d+)\.\d+(?:\.\d+)?(?:[-+\s]|$)",
+        text.strip(),
+    )
+    return int(match.group(1)) if match else None
+
+
 def probe_major_version(path):
     """Best-effort major version of an installed client; None if probing fails.
 
@@ -78,11 +87,7 @@ def probe_major_version(path):
         return None
     if result.returncode:
         return None
-    match = re.match(
-        r"(?:opencode\s+)?v?(\d+)\.\d+(?:\.\d+)?(?:[-+\s]|$)",
-        result.stdout.strip(),
-    )
-    return int(match.group(1)) if match else None
+    return major_version(result.stdout)
 
 
 def command(

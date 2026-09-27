@@ -397,11 +397,24 @@ print('independent oracle passed')
 
 
 class ClientRun:
-    def __init__(self, name, path, folder, model, context, timeout, input_modalities):
+    def __init__(
+        self,
+        name,
+        path,
+        folder,
+        model,
+        context,
+        timeout,
+        input_modalities,
+        version=None,
+    ):
         self.name, self.path, self.folder = name, path, folder
         self.model, self.context, self.timeout = model, context, timeout
         # What the served model accepts, as /v1/models reports it.
         self.input_modalities = input_modalities
+        # The client's major version, on which only OpenCode's launch depends,
+        # as for splash.
+        self.version = version
         self.workspace = (folder / "project").resolve()
         self.session = None
         self.phases = []
@@ -418,24 +431,11 @@ class ClientRun:
             if self.name == "pi"
             else None
         )
-        argv, env = clients.command(
-            self.name,
-            self.path,
-            BASE_URL,
-            self.model,
-            self.context,
-            launcher.AGENTS_DIR,
-            environment,
-            input_modalities=self.input_modalities,
-        )
-        # subprocess(cwd=...) does not update inherited PWD. Keep both views
-        # consistent, just as a user shell entering the project would.
-        env["PWD"] = str(self.workspace)
         if self.name == "claude":
             # Normal edit authorization and one explicit project test command;
             # --allowedTools grants permission, unlike --tools it does not filter
             # the registered tool inventory. Production still defaults to default.
-            argv += [
+            arguments = [
                 "--print",
                 "--output-format",
                 "stream-json",
@@ -446,28 +446,53 @@ class ClientRun:
                 f"Bash({TEST_COMMAND})",
             ]
             if self.session:
-                argv += ["--resume", self.session]
+                arguments += ["--resume", self.session]
         elif self.name == "opencode":
-            argv += ["run", "--format", "json"]
+            arguments = ["run", "--format", "json"]
             if self.session:
-                argv += ["--session", self.session]
+                arguments += ["--session", self.session]
         elif self.name == "codex":
+            # Test overrides leave the shipped launcher profile unchanged.
+            arguments = [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                *os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split(),
+            ]
+            if self.session:
+                arguments += ["resume", self.session]
+            arguments += ["--json", "-"]
+        elif self.name == "pi":
+            arguments = ["--print", "--mode", "json"]
+            if self.session:
+                arguments += ["--session", self.session]
+        else:
+            arguments = ["--oneshot", "--query-file", "-"]
+            if self.session:
+                arguments += ["--resume", self.session]
+        argv, env = self.command(arguments, environment)
+        if self.name == "codex":
             self.codex_home.mkdir(exist_ok=True)
             env["CODEX_HOME"] = str(self.codex_home)
-            argv += ["exec", "--sandbox", "workspace-write"]
-            # Test overrides leave the shipped launcher profile unchanged.
-            argv += os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split()
-            if self.session:
-                argv += ["resume", self.session]
-            argv += ["--json", "-"]
-        elif self.name == "pi":
-            argv += ["--print", "--mode", "json"]
-            if self.session:
-                argv += ["--session", self.session]
-        else:
-            argv += ["--oneshot", "--query-file", "-"]
-            if self.session:
-                argv += ["--resume", self.session]
+        return argv, env
+
+    def command(self, arguments, environment=None):
+        """The client's command, as `splash NAME -- ARGUMENTS` runs it."""
+        argv, env = clients.command(
+            self.name,
+            self.path,
+            BASE_URL,
+            self.model,
+            self.context,
+            launcher.AGENTS_DIR,
+            environment,
+            input_modalities=self.input_modalities,
+            client_args=arguments,
+            client_version=self.version,
+        )
+        # subprocess(cwd=...) does not update inherited PWD. Keep both views
+        # consistent, just as a user shell entering the project would.
+        env["PWD"] = str(self.workspace)
         return argv, env
 
     def hermes_messages(self):
@@ -713,21 +738,12 @@ class ClientRun:
                 if entry.get("type") == "compaction"
             ]
         if self.name == "opencode":
-            argv, env = clients.command(
-                self.name,
-                self.path,
-                BASE_URL,
-                self.model,
-                self.context,
-                launcher.AGENTS_DIR,
-                input_modalities=self.input_modalities,
-            )
-            env["PWD"] = str(self.workspace)
+            argv, env = self.command(["export", self.session])
             # A regular file avoids losing buffered pipe output when the CLI
             # exits immediately after printing a large session export.
             with tempfile.TemporaryFile(mode="w+") as output:
                 result = subprocess.run(
-                    argv + ["export", self.session],
+                    argv,
                     env=env,
                     cwd=self.workspace,
                     stdout=output,
@@ -909,6 +925,16 @@ def main(argv=None):
             "path": path,
             "version": (result.stdout or result.stderr).strip(),
         }
+        # OpenCode's launch depends on its major version, read as splash reads
+        # it. The launcher starts a version it cannot read as OpenCode 1,
+        # which would run OpenCode 2 through its background service.
+        if name == "opencode":
+            major = clients.major_version(result.stdout)
+            if major is None:
+                raise AgentFailure(
+                    f"cannot determine opencode's major version: {result.stdout!r}"
+                )
+            versions[name]["major_version"] = major
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.preflight_only:
         atomic_json(
@@ -990,6 +1016,7 @@ def main(argv=None):
                 context,
                 args.client_timeout,
                 served["input_modalities"],
+                version=versions[name].get("major_version"),
             )
             entry = {**versions[name], "result": "running", "phases": runner.phases}
             document["clients"][name] = entry

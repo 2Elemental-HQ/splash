@@ -594,8 +594,13 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
                     runner.session = session
+                    runner.version = 2 if name == "opencode" else None
+
+                    def launch(*_, client_args, **__):
+                        return [runner.path, *client_args], {}
+
                     with mock.patch.object(
-                        agent.clients, "command", return_value=([runner.path], {})
+                        agent.clients, "command", side_effect=launch
                     ) as adapter:
                         argv, env = runner.argv()
                     # Pi configures itself in a private agent directory.
@@ -617,6 +622,8 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.launcher.AGENTS_DIR,
                         environment,
                         input_modalities=["text"],
+                        client_args=argv[1:],
+                        client_version=runner.version,
                     )
                     for forbidden in (
                         "--ephemeral",
@@ -643,6 +650,23 @@ class AgentRunnerTests(unittest.TestCase):
                         if session:
                             expected += ["--session", session]
                         self.assertEqual(argv[1:], expected)
+
+    def test_opencode_runs_as_splash_launches_it(self):
+        # OpenCode 2 reaches the inline configuration only through a private
+        # server, whose flag follows the subcommand; a background service
+        # would outlive the run. Version 1 rejects the flag.
+        for version, run in (
+            (2, ["run", "--format", "json", "--standalone"]),
+            (1, ["run", "--format", "json"]),
+        ):
+            with self.subTest(version=version):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.path = "opencode", "/test/opencode"
+                runner.model, runner.context = "Actual-model", 102400
+                runner.input_modalities = ["text"]
+                runner.workspace = Path("/test/project")
+                runner.session, runner.version = None, version
+                self.assertEqual(runner.argv()[0][1:], run)
 
     def test_artifact_oracle_rejects_stub_and_wrong_semantics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -733,6 +757,92 @@ class AgentRunnerTests(unittest.TestCase):
                 capture_output=True,
                 timeout=20,
             )
+
+    def test_preflight_requires_opencode_major_version(self):
+        # Unread, the launch would be OpenCode 1's: OpenCode 2 would run
+        # through its background service.
+        for printed, major in (
+            ("opencode v2.0.18\n", 2),
+            ("1.18.32\n", 1),
+            ("unknown\n", None),
+            ("", None),
+        ):
+            with (
+                self.subTest(printed=printed),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(
+                    agent.clients, "find_executable", return_value="/test/opencode"
+                ),
+                mock.patch.object(
+                    agent.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, printed, ""),
+                ),
+            ):
+                report = Path(directory) / "report.json"
+                arguments = [
+                    "--clients",
+                    "opencode",
+                    "--model",
+                    "incoai/Qwen3.8-27B-Splash",
+                    "--preflight-only",
+                    "--output",
+                    str(report),
+                ]
+                if major is None:
+                    with self.assertRaisesRegex(agent.AgentFailure, "major version"):
+                        agent.main(arguments)
+                    self.assertFalse(report.exists())
+                    continue
+                self.assertEqual(agent.main(arguments), 0)
+                entries = json.loads(report.read_text())["clients"]
+                self.assertEqual(entries["opencode"]["major_version"], major)
+
+    def test_opencode_runs_with_the_major_version_preflight_read(self):
+        model = "incoai/Qwen3.8-27B-Splash"
+        identity = "src-" + "a" * 64
+        initial = {
+            "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
+            "identity": {"cache": {"build_id": identity}},
+        }
+        served = {"data": [{"id": model, "input_modalities": ["text"]}]}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(
+                agent.clients, "find_executable", return_value="/test/opencode"
+            ),
+            mock.patch.object(
+                agent.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "2.0.18\n", ""),
+            ),
+            mock.patch.object(agent, "current_build_id", return_value=identity),
+            mock.patch.object(
+                agent.launcher, "_request_json", side_effect=[initial, served]
+            ),
+            mock.patch.object(agent, "idle_status", return_value=initial),
+            mock.patch.object(agent, "ClientRun") as client,
+        ):
+            client.return_value.phases = []
+            client.return_value.run.return_value = {}
+            report = Path(directory) / "report.json"
+            self.assertEqual(
+                agent.main(
+                    [
+                        "--model",
+                        model,
+                        "--clients",
+                        "opencode",
+                        "--scenario",
+                        "smoke",
+                        "--output",
+                        str(report),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(json.loads(report.read_text())["result"], "pass")
+        self.assertEqual(client.call_args.kwargs["version"], 2)
 
     def test_client_list_rejects_unknown_and_duplicates(self):
         for value in ("codex,codex", "unknown", ""):
