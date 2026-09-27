@@ -963,6 +963,28 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.check_artifact(2)
             validate.assert_not_called()
 
+    def test_any_python_running_unittest_executes_the_project_tests(self):
+        runner = agent.ClientRun.__new__(agent.ClientRun)
+        runner.workspace = Path("project")
+        # As Claude Code, Hermes and Codex ran them on the M3 and M6.
+        for command in (
+            agent.TEST_COMMAND,
+            "python -m unittest -v",
+            "/bin/zsh -lc '/opt/homebrew/bin/python3.14 -m unittest -v 2>&1'",
+            "cd project && .venv/bin/python -m unittest",
+        ):
+            with (
+                self.subTest(command=command),
+                mock.patch.object(agent, "validate_artifact", return_value="ok"),
+            ):
+                runner.phases = [{"executed_commands": [command]}]
+                self.assertEqual(runner.check_artifact(2), "ok")
+        for command in ("python3 -m pytest", "pytest -q", "mypython -m unittest"):
+            with self.subTest(command=command):
+                runner.phases = [{"executed_commands": [command]}]
+                with self.assertRaisesRegex(agent.AgentFailure, "execute"):
+                    runner.check_artifact(2)
+
     def test_missing_client_fails_before_server_start(self):
         with (
             mock.patch.object(
