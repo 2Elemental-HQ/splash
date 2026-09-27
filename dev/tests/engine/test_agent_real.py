@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -924,6 +925,32 @@ class AgentRunnerTests(unittest.TestCase):
             self.assertEqual(agent.validate_artifact(root, 2)["oracle"], "pass")
             with self.assertRaisesRegex(agent.AgentFailure, "oracle failed"):
                 agent.validate_artifact(root, 0)
+
+    def test_artifact_tests_run_with_the_harness_python(self):
+        # A python3 that fails first in PATH, as the Xcode shim does on a Mac
+        # whose Xcode license is not accepted.
+        with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory) / "commands"
+            commands.mkdir()
+            (commands / "python3").write_text("#!/bin/sh\necho shim >&2\nexit 69\n")
+            (commands / "python3").chmod(0o755)
+            root = Path(directory) / "project"
+            agent.fixture(root)
+            (root / "ledger.py").write_text(
+                "def summarize(records):\n"
+                "    rows = [r for r in records if r['amount_cents'] is not None]\n"
+                "    return {'count': len(rows), "
+                "'total_cents': sum(r['amount_cents'] for r in rows)}\n"
+            )
+            (root / "test_ledger.py").write_text(
+                "import unittest\nfrom ledger import summarize\n"
+                "class LedgerTests(unittest.TestCase):\n"
+                "    def test_empty(self):\n"
+                "        self.assertEqual(summarize([]), {'count': 0, 'total_cents': 0})\n"
+            )
+            path = f"{commands}{os.pathsep}{os.environ['PATH']}"
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                self.assertEqual(agent.validate_artifact(root, 0)["oracle"], "pass")
 
     def test_prior_tool_execution_cannot_validate_the_current_phase(self):
         runner = agent.ClientRun.__new__(agent.ClientRun)

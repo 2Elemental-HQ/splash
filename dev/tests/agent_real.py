@@ -31,7 +31,10 @@ from install import clients, launcher  # noqa: E402
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
 BASE_URL = launcher._base_url(launcher.PORT)
-TEST_COMMAND = "python3 -m unittest -v"
+# The project's tests: the prompts give their command with python3, and the
+# harness reruns them with its own Python.
+TEST_ARGUMENTS = ("-m", "unittest", "-v")
+TEST_COMMAND = " ".join(("python3", *TEST_ARGUMENTS))
 
 
 class AgentFailure(RuntimeError):
@@ -428,8 +431,11 @@ print('independent oracle passed')
         )
     if not (workspace / "test_ledger.py").is_file():
         raise AgentFailure("client did not create the requested unit tests")
+    # Rerun the client's tests as its test command does, with the harness's
+    # Python like the oracle above: the python3 first on PATH can be a shim
+    # that refuses to run, as Xcode's does until its license is accepted.
     result = subprocess.run(
-        TEST_COMMAND.split(),
+        [sys.executable, *TEST_ARGUMENTS],
         cwd=workspace,
         capture_output=True,
         text=True,
