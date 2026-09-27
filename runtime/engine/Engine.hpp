@@ -118,6 +118,9 @@ private:
     StateFailure reason = StateFailure::None;
     std::optional<double> startedMilliseconds;
     double deadlineMilliseconds = 0.0;
+    // The latest tick at which a lane submitted before the request had work
+    // in flight; the limit restarts from it.
+    double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
     // Memory is on its way back; the limit fires only without progress.
@@ -132,6 +135,9 @@ private:
     };
 
     EngineRequest request;
+    // Its place in submission order. Earlier requests' lanes hold memory it
+    // may wait for, so their work restarts its resource wait's limit.
+    uint64_t sequence = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
@@ -251,7 +257,9 @@ private:
                           StateFailure reason = StateFailure::MemoryPressure,
                           bool pending = false) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
-  // pending wait that has seen progress waits for its next attempt.
+  // pending wait that has seen progress waits for its next attempt. The
+  // limit restarts whenever a lane submitted before the request has work in
+  // flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,

@@ -92,6 +92,7 @@ void Engine::submit(EngineRequest value) {
     }
   }
   Request requestState;
+  requestState.sequence = counters_.submitted;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
@@ -176,6 +177,12 @@ bool Engine::tick(double now) {
     progressed = true;
   }
   progressed = pollRestores(now) || progressed;
+  // The earliest submitted of the lanes with work in flight.
+  uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
+  if (pending_) {
+    for (const BatchItem &item : pending_->plan.items)
+      earliestWorking = std::min(earliestWorking, request(item.requestId).sequence);
+  }
   const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
     // Admission is deliberately paused while resident peers finish. Start a
@@ -184,6 +191,10 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
+    // A lane submitted earlier holds memory this request may wait for until
+    // it finishes; while it works, the wait's limit restarts.
+    if (active.sequence > earliestWorking)
+      active.resourceWait.earlierLaneWorkMilliseconds = now;
     const double deadline = resourceDeadline(active);
     if (!active.finalized && deadline > 0.0 && now >= deadline) {
       finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
@@ -720,8 +731,13 @@ void Engine::deferResourceRetry(Request &active, double now,
 
 double Engine::resourceDeadline(const Request &active) const noexcept {
   const ResourceWait &wait = active.resourceWait;
-  return wait.pending && wait.epoch != resourceEpoch_ ? 0.0
-                                                      : wait.deadlineMilliseconds;
+  if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
+    return 0.0;
+  // The limit restarts whenever a lane submitted before the request works,
+  // however long that takes. Later lanes do not extend it: requests that
+  // keep arriving would otherwise hold it until the request's deadline.
+  return std::max(wait.deadlineMilliseconds,
+                  wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
 
 void Engine::signalResourceProgress() noexcept {

@@ -198,6 +198,7 @@ public:
 
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
+    lastBeginId = request.id;
     if (beginObserver) beginObserver();
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
@@ -438,6 +439,8 @@ public:
   uint32_t deniedSnapshots = 0;
   std::optional<uint32_t> denySnapshotAtBoundary;
   uint32_t beginAttempts = 0;
+  // The request of the latest begin(), for hooks that refuse only some.
+  uint64_t lastBeginId = 0;
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
   uint32_t resumptions = 0;
@@ -1698,6 +1701,84 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
           "lone request was suspended although idle cached pages could serve it");
   require(resources.snapshot().pool.pagesResident == cached.pool.pagesResident,
           "idle-cache reuse grew the resident footprint");
+}
+
+// A request that cannot start while an earlier lane holds memory waits for
+// that lane however long it runs: the wait's limit restarts whenever the lane
+// has work in flight. Once the lane is done, the limit runs out as before if
+// memory still does not come.
+void testAdmissionWaitsOutEarlierLanes() {
+  for (const bool hostRecovers : {true, false}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 100;
+    engine::Engine engine(config, resources, executor, events);
+    auto running = request(310, {310});
+    running.maxNewTokens = 1000;
+    engine.submit(std::move(running));
+    static_cast<void>(engine.tick(1));
+    // The host has no memory for a second lane while the first runs.
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [&] { return !hostRecovers || !events.completedCount; };
+    engine.submit(request(311, {311}));
+    double now = 1;
+    while (now < 500)
+      static_cast<void>(engine.tick(now += 50));
+    require(!events.completedCount && events.failedCount == 0,
+            "a request waiting for a resident lane's memory timed out while it ran");
+    executor.decodeFinishes = true;
+    while (!events.completedCount && now < 1000)
+      static_cast<void>(engine.tick(now += 10));
+    for (const double end = now + 150; now < end && !engine.idle();)
+      static_cast<void>(engine.tick(now += 10));
+    if (hostRecovers)
+      require(events.completedCount == 2 && events.failedCount == 0,
+              "the waiting request did not start once the lane finished");
+    else
+      require(events.completedCount == 1 &&
+                  events.failures == std::vector<std::string>{"resource_timeout"},
+              "a wait that no resident lane could end did not expire");
+    require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
+  }
+}
+
+// A lane submitted after a waiting request does not extend its wait, or
+// requests that keep arriving could hold it until its deadline: it fails at
+// its limit, retryably, while the later lane still runs.
+void testLaterLanesDoNotExtendAResourceWait() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  // The host has memory for the later request's state, not the waiting one's.
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 320; };
+  Events events;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = 300;
+  engine::Engine engine(config, resources, executor, events);
+  engine.submit(request(320, {320}));
+  static_cast<void>(engine.tick(1));
+  auto later = request(321, {321});
+  later.maxNewTokens = 1000;
+  engine.submit(std::move(later));
+  double now = 1;
+  while (!events.failedCount && now < 1000)
+    static_cast<void>(engine.tick(now += 10));
+  require(now == 301 && events.failures == std::vector<std::string>{"resource_timeout"} &&
+              events.failureDetails.back().second && !events.completedCount &&
+              executor.requests.contains(321),
+          "a lane submitted after a waiting request extended its wait");
+  engine.cancel(321);
+  for (const double end = now + 100; now < end && !engine.idle();)
+    static_cast<void>(engine.tick(now += 10));
+  require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
 }
 
 void testSingletonHostPressureWaitRecoversOrTerminates() {
@@ -4970,6 +5051,8 @@ int main() {
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
     testSingletonHostPressureWaitRecoversOrTerminates();
+    testAdmissionWaitsOutEarlierLanes();
+    testLaterLanesDoNotExtendAResourceWait();
     testKvPressureNarrowsTheRealBatch();
     testKvGrowthReclaimsCachedStateWhenBudgetIsShared();
     testRequiredWorkDoesNotReserveAnExtraPage();
