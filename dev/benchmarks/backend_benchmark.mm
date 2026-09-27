@@ -377,6 +377,19 @@ std::vector<uint32_t> prompt(uint32_t length, uint64_t salt) {
   return result;
 }
 
+// What each lookup of a cache check found, for its failure: under host
+// memory pressure the engine evicts the cached prefixes the checks reuse.
+std::string lookups(
+    std::initializer_list<std::reference_wrapper<const Measurement>> requests,
+    uint32_t expectedTokens) {
+  std::string found;
+  for (const Measurement &request : requests)
+    found += request.scenario + "=" + request.cacheStatus + "/" +
+             std::to_string(request.matchedTokens) + " ";
+  return found + "(expected a " + std::to_string(expectedTokens) +
+         "-token hit)";
+}
+
 Measurement runRequest(engine::Engine &engine, Driver &driver,
                        model::RuntimeModel &executor, Events &events,
                        ProgressJournal *progress, uint64_t requestId,
@@ -965,12 +978,20 @@ int main(int argc, char **argv) {
     }
 
     constexpr std::array<uint32_t, 4> lengths{2048, 10000, 50000, 128000};
+    // The rolling request, a length's longest, appends this many tokens.
+    constexpr uint32_t rollingSuffixTokens = 256;
     std::vector<Measurement> measurements;
+    // Lengths the memory plan cannot hold, on a Mac with less memory.
+    std::vector<uint32_t> skippedLengths;
     for (uint32_t length : selected.context || selected.exact
                                ? std::span<const uint32_t>{lengths}
                                : std::span<const uint32_t>{}) {
-      if (length > engineConfig.maxContext)
-        throw std::runtime_error("benchmark length exceeds runtime capacity");
+      // Every request generates at least one token beyond its prompt.
+      if (length + (selected.exact ? 0 : rollingSuffixTokens) >=
+          engineConfig.maxContext) {
+        skippedLengths.push_back(length);
+        continue;
+      }
       // Repeat short contexts for timing; run the costly 50K/128K cases once.
       const uint32_t lengthSamples =
           !selected.exact && length <= 10000 ? samples : 1;
@@ -995,7 +1016,9 @@ int main(int argc, char **argv) {
         if (coldResult.cacheStatus != "miss" ||
             exactResult.cacheStatus != "prefix_hit" ||
             exactResult.matchedTokens != expectedBoundary) {
-          throw std::runtime_error("cold/exact cache oracle failed");
+          throw std::runtime_error("cold/exact cache oracle failed: " +
+                                   lookups({coldResult, exactResult},
+                                           expectedBoundary));
         }
         // Cache reuse changes chunking and reduction order. Output agreement
         // is diagnostic; the runtime/Metal oracles validate state and numerics.
@@ -1010,7 +1033,8 @@ int main(int argc, char **argv) {
             if (exactResult.cacheStatus != "prefix_hit" ||
                 exactResult.matchedTokens != expectedBoundary ||
                 exactResult.targetPrefillRows != length - expectedBoundary)
-              throw std::runtime_error("repeated exact cache oracle failed");
+              throw std::runtime_error("repeated exact cache oracle failed: " +
+                                       lookups({exactResult}, expectedBoundary));
             exactResult.coldOutputMatch = coldResult.outputTokens == exactResult.outputTokens;
             if (exactResult.ttftMilliseconds * 2 >= coldResult.ttftMilliseconds)
               performanceFailures.push_back("repeated exact TTFT did not improve twofold");
@@ -1045,7 +1069,8 @@ int main(int argc, char **argv) {
         }
         std::vector<uint32_t> rolling = cold;
         std::vector<uint32_t> suffix =
-            prompt(256, (uint64_t{length} << 32 | sample) ^ 0xa5a5a5a5ULL);
+            prompt(rollingSuffixTokens,
+                   (uint64_t{length} << 32 | sample) ^ 0xa5a5a5a5ULL);
         rolling.insert(rolling.end(), suffix.begin(), suffix.end());
         Measurement rollingResult =
             runRequest(engine, driver, *executor, events, progress.get(),
@@ -1060,7 +1085,9 @@ int main(int argc, char **argv) {
         if (rollingResult.cacheStatus != "prefix_hit" ||
             rollingCold.cacheStatus != "miss" ||
             rollingResult.matchedTokens != expectedBoundary) {
-          throw std::runtime_error("rolling cache oracle failed");
+          throw std::runtime_error("rolling cache oracle failed: " +
+                                   lookups({rollingResult, rollingCold},
+                                           expectedBoundary));
         }
         rollingResult.coldOutputMatch = rollingResult.outputTokens == rollingCold.outputTokens;
         evictAllCache(resources->cache());
@@ -1256,7 +1283,11 @@ int main(int argc, char **argv) {
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }
-    std::cout << "]},\"measurements\":[";
+    std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"skipped_context_lengths\":[";
+    for (size_t index = 0; index < skippedLengths.size(); ++index)
+      std::cout << (index ? "," : "") << skippedLengths[index];
+    std::cout << "],\"measurements\":[";
     for (size_t index = 0; index < measurements.size(); ++index)
       emitMeasurement(measurements[index], index == 0);
     const engine::EngineSnapshot snapshot = engine.snapshot();
