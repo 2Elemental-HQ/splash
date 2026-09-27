@@ -739,7 +739,8 @@ double median(std::vector<double> values) {
                            : (values[middle - 1] + values[middle]) / 2.0;
 }
 
-double decodeWallThroughputMedian(
+// The aggregate wall decode throughput of each sample at one width.
+std::vector<double> decodeWallThroughputs(
     std::span<const DecodeThroughputMeasurement> measurements,
     uint32_t width) {
   std::vector<double> values;
@@ -747,7 +748,9 @@ double decodeWallThroughputMedian(
     if (measurement.width == width)
       values.push_back(measurement.aggregateDecodeWallTokensPerSecond);
   }
-  return median(std::move(values));
+  if (values.empty())
+    throw std::invalid_argument("no decode throughput samples at this width");
+  return values;
 }
 
 // The scenarios one run measures: decode, partial and context by default, or
@@ -970,10 +973,16 @@ int main(int argc, char **argv) {
               width, sample, decodeThroughputPrompt));
         }
       }
-      if (decodeWallThroughputMedian(decodeThroughput, 3) <=
-          decodeWallThroughputMedian(decodeThroughput, 2)) {
+      // A wider batch must not lose aggregate throughput. A dense model can
+      // fill the GPU by width 3, leaving B3 within B2's noise, so the gate
+      // fails only when every B3 sample falls below every B2 sample; how far
+      // widths scale is for a comparison with a baseline build.
+      const std::vector<double> b2 = decodeWallThroughputs(decodeThroughput, 2);
+      const std::vector<double> b3 = decodeWallThroughputs(decodeThroughput, 3);
+      if (*std::max_element(b3.begin(), b3.end()) <
+          *std::min_element(b2.begin(), b2.end())) {
         performanceFailures.push_back(
-            "B3 aggregate decode throughput did not exceed B2");
+            "B3 aggregate decode throughput fell below B2");
       }
     }
 
