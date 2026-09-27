@@ -78,9 +78,17 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 The context column reports capacity, not the prompt length of the decode
 measurement. Coding agents need about 100K tokens (Claude Code's own prompt is
 about 33K, and at 64K it compacted repeatedly and stopped), so serve the 27B
-with `--language-only` for them. Host memory pressure can suspend a long
-request. Startup suggests `--max-cache-disk` when memory may not hold that
-context.
+with `--language-only` for them.
+
+Splash keeps 2 GiB free for macOS and grows its caches only while 1 GiB more
+is free, so these models leave other applications little room. A request that
+cannot get memory waits for it, then fails with `resource_timeout`: close
+memory-heavy applications, or serve with `--language-only`. Host memory
+pressure can suspend a long request. Startup suggests `--max-cache-disk` when
+memory may not hold the advertised context. The tier then writes whenever
+memory runs short: serving Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed
+traffic for 30 minutes, a 16 GiB tier on the M6 wrote 26 GB, about 50 GB an
+hour, and read 36 GB.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and
