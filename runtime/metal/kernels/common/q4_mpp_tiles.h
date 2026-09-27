@@ -85,6 +85,37 @@ inline void q4_store_input_sums(device const bfloat *input, uint input_size,
   }
 }
 
+// The output at `index` of element i of a tile's fp32 sums, sums_0 the
+// projection's (the gate's for GateUp) and sums_1 GateUp's up projection's.
+// The projection rounds once to bf16, except into an fp32 destination (a
+// plain projection's logits, ops::Projection::destination), which keeps the
+// sum unrounded. Then GateUp takes silu(gate) times the bf16 up value,
+// MultiplySiluGate multiplies silu of the bf16 gate in `auxiliary` into it,
+// and AddResidual adds the residual in `auxiliary`; the result rounds to the
+// destination's type Out.
+template <bool GateUp, bool AddResidual, bool MultiplySiluGate, class Sums, class Out>
+__attribute__((always_inline)) inline void
+q4_store_output(thread Sums &sums_0, thread Sums &sums_1, ushort i,
+                device bfloat *auxiliary, device Out *output, uint index) {
+  float value;
+  if constexpr (GateUp) {
+    float gate = float(bfloat(sums_0[i]));
+    float up = float(bfloat(sums_1[i]));
+    value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
+  } else if constexpr (MultiplySiluGate) {
+    float gate = float(auxiliary[index]);
+    value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) *
+            float(bfloat(sums_0[i]));
+  } else if constexpr (is_same_v<Out, float>) {
+    value = sums_0[i];
+  } else {
+    value = float(bfloat(sums_0[i]));
+  }
+  if constexpr (AddResidual)
+    value += float(auxiliary[index]);
+  output[index] = Out(value);
+}
+
 // Pipelined issues two quant groups' matmuls before either epilogue. Narrow
 // projections run few threadgroups and are bound by the latency of one group's
 // weight load and matmul, so overlapping two hides most of it; wide
@@ -93,9 +124,8 @@ inline void q4_store_input_sums(device const bfloat *input, uint input_size,
 // Simdgroups is the cooperative scope of the matmul: four simdgroups halve a
 // threadgroup to 128 threads so four of them fit a core at the 512-thread
 // occupancy knee; the per-element arithmetic is unchanged, so every
-// Simdgroups instance of one tile is bit-identical to the others.
-// The destination's type Out is bf16, or fp32 for a plain projection's
-// logits (ops::Projection::destination), which keeps the sum unrounded.
+// Simdgroups instance of one tile is bit-identical to the others. The tile
+// stores its sums by q4_store_output.
 template <ushort TileN, bool GateUp, bool AddResidual,
           ushort StorageN = TileN, bool Pipelined = false, ushort Simdgroups = 8, class Out>
 inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
@@ -221,19 +251,8 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
   q4_visit(accumulated_0, traversal, [&](ushort i) {
     auto index = accumulated_0.get_multidimensional_index(i);
     uint output_index = index[1] * output_size + output_origin + index[0];
-    float value;
-    if constexpr (GateUp) {
-      float gate = float(bfloat(accumulated_0[i]));
-      float up = float(bfloat(accumulated_1[i]));
-      value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
-    } else if constexpr (is_same_v<Out, float>) {
-      value = accumulated_0[i];
-    } else {
-      value = float(bfloat(accumulated_0[i]));
-    }
-    if constexpr (AddResidual)
-      value += float(residual[output_index]);
-    output_0[output_index] = Out(value);
+    q4_store_output<GateUp, AddResidual, false>(
+        accumulated_0, accumulated_1, i, residual, output_0, output_index);
   });
   // Persistent callers run the next tile on the same scratch straight away,
   // and its prologue rewrites input-sum region 0 while a straggling simdgroup
@@ -338,23 +357,8 @@ inline void q4_mpp_tile_batched(
   q4_visit(accumulated_0, traversal, [&](ushort i) {
     auto index = accumulated_0.get_multidimensional_index(i);
     uint output_index = index[1] * output_size + output_origin + index[0];
-    float value;
-    if constexpr (GateUp) {
-      float gate = float(bfloat(accumulated_0[i]));
-      float up = float(bfloat(accumulated_1[i]));
-      value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
-    } else if constexpr (MultiplySiluGate) {
-      float gate = float(residual[output_index]);
-      value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) *
-              float(bfloat(accumulated_0[i]));
-    } else if constexpr (is_same_v<Out, float>) {
-      value = accumulated_0[i];
-    } else {
-      value = float(bfloat(accumulated_0[i]));
-    }
-    if constexpr (AddResidual)
-      value += float(residual[output_index]);
-    output_0[output_index] = Out(value);
+    q4_store_output<GateUp, AddResidual, MultiplySiluGate>(
+        accumulated_0, accumulated_1, i, residual, output_0, output_index);
   });
   // Same next-tile hazard on input-sum region 0 as q4_mpp_tile.
   threadgroup_barrier(mem_flags::mem_threadgroup);
