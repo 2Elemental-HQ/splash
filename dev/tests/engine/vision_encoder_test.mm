@@ -233,8 +233,9 @@ int main(int argc, char **argv) {
                   "%.4f gpu %.2f ms\n",
                   grid.height, grid.width, parity.relativeError,
                   parity.maxAbsolute, parity.worstCosine, gpuSeconds * 1e3);
-      // The bf16 tower drifts ~1-3% relative from fp32 over 27 blocks; that
-      // is the correctness bar, and every row must stay tightly aligned.
+      // The tower's bf16 activations drift ~1-2.5% relative from fp32 over
+      // 27 blocks, by the tower and how the shaders are compiled; that is the
+      // correctness bar, and every row must stay tightly aligned.
       bool pass = parity.relativeError < 0.03 && parity.worstCosine > 0.995;
 
       for (uint32_t width : {2048U, 5120U}) {
