@@ -1009,6 +1009,15 @@ The source formats load differently: an MLX target is prepared into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
 kernels, and a package's packed files are mapped as they are.
 
+On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
+memory pressure, which the smaller GGUF variants such a Mac uses can reach under
+an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
+to observe how the engine sheds its cache. The runtime oracle in `test-real` has
+no production memory guard: the prepared weights, and then what the runtime
+allocates as it runs, must fit in what macOS has available above its reserve,
+so it stops, naming what it needs, while other programs hold that memory. With
+only desktop applications open, a 24 GB Mac runs it for those variants.
+
 `make test-engine-cpu` builds the affine source oracle so it cannot break
 unnoticed, but no target runs it because it needs real models: after
 `make all build/engine-tests/affine-source-oracle`, pass it

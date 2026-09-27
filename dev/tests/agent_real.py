@@ -652,7 +652,8 @@ class ClientRun:
                         critical_since = None
                     if sample["pressure"] >= pressure_stop_level():
                         reason = (
-                            f"OS memory pressure level {sample['pressure']}; "
+                            f"OS memory pressure level {sample['pressure']} reached "
+                            f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}; "
                             "stopped for desktop safety"
                         )
                         break
@@ -1103,7 +1104,10 @@ def main(argv=None):
             atomic_json(args.output, document)
             remaining = selected[selected.index(name) + 1 :]
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():
-                raise AgentFailure("stopping remaining clients for OS memory pressure")
+                raise AgentFailure(
+                    "stopping remaining clients: OS memory pressure reached "
+                    f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}"
+                )
         document["final_status"] = idle_status()
         document["result"] = (
             "pass"
