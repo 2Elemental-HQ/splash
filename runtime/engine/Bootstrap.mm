@@ -273,9 +273,15 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   if (!config.nativeLoop.engine.maxContext) {
     config.nativeLoop.engine.maxContext = automaticContext;
   } else if (config.nativeLoop.engine.maxContext > automaticContext) {
+    // --max-memory sets the budget only below this Mac's own.
+    const auto &budget = resources->memoryPlan().breakdown();
+    const bool memoryCapped = budget.configuredMemoryLimitBytes &&
+                              budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
-         "logical max_context exceeds the model or physical "
-         "single-request Q8 KV capacity");
+         "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
+             " exceeds the " + std::to_string(automaticContext) + " tokens the model and " +
+             (memoryCapped ? "--max-memory" : "this Mac's memory") +
+             " allow; omit it or pass at most " + std::to_string(automaticContext));
   }
   // Without the disk tier a request that runs out of memory cannot publish
   // its progress checkpoints and replays its prompt.

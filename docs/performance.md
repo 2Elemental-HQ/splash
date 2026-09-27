@@ -72,12 +72,15 @@ Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
 
 | Unsloth GGUF | Code decode | Advertised context limit |
 | --- | ---: | ---: |
-| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 102,393 tokens |
+| `Qwen3.8-27B-GGUF:UD-IQ3_XXS` | 43.5 tok/s | 73,721 tokens (102,393 with `--language-only`) |
 | `Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL` | 145 tok/s | 256K tokens |
 
 The context column reports capacity, not the prompt length of the decode
-measurement. Host memory pressure can suspend a long request. Startup
-suggests `--max-cache-disk` when memory may not hold that context.
+measurement. Coding agents need about 100K tokens (Claude Code's own prompt is
+about 33K, and at 64K it compacted repeatedly and stopped), so serve the 27B
+with `--language-only` for them. Host memory pressure can suspend a long
+request. Startup suggests `--max-cache-disk` when memory may not hold that
+context.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and
