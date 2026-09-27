@@ -51,13 +51,16 @@ an input-byte budget, not a process RSS limit: large ASCII/base64 strings can
 use roughly twice their encoded size during JSON parsing alone. Decoded images
 and object-heavy JSON need additional memory. Oversized requests return 413;
 exhausted ingress capacity returns 503. A connection that has sent no request
-yet gives way to a new one, with that 503, when every connection slot is
-taken, so stalled clients cannot lock others out. Image and model context
-limits apply independently.
+yet, or is receiving an upload refused unread, gives way to a new one when
+every connection slot is taken, the first with that 503, so stalled clients
+cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
 at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
-Timed-out uploads return 408 and release their input reservation.
+Timed-out uploads return 408 and release their input reservation. An upload
+refused before it is read, such as one over the shared budget, is still
+received on these terms, so a client that sends its whole body before reading
+the response gets the refusal.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or

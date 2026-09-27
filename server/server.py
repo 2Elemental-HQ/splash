@@ -113,9 +113,6 @@ DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
-# How long a response sent before the request body was read waits for the
-# client to finish uploading it.
-HTTP_UNREAD_BODY_DRAIN_SECONDS = 2.0
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
@@ -136,6 +133,17 @@ CONNECTION_OVERLOADED_RESPONSE = (
     b"Content-Length: %d\r\n\r\n%s"
     % (len(_CONNECTION_OVERLOADED_PAYLOAD), _CONNECTION_OVERLOADED_PAYLOAD)
 )
+
+
+def _content_length(value):
+    """A Content-Length value as a byte count; None when it is not a
+    decimal count, or has more digits than int() converts."""
+    if not value.isascii() or not value.isdigit():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _normalize_path(raw_path):
@@ -169,7 +177,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         self._response_started = False
-        self._unread_body = False
+        self._unread_body = 0
         self._last_sse_write = time.monotonic()
         super().setup()
         self.connection.settimeout(self.server.io_timeout)
@@ -191,16 +199,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _discard_unread_body(self):
         # Closing with request bytes unread resets the connection, and the
         # reset can destroy the response before a client still uploading
-        # reads it. Half-close, then discard the upload for a bounded time,
-        # waiting on the client as a connection with no request yet does.
+        # reads it. Half-close, then receive the rest of the upload on the
+        # terms a body is read, waiting on the client as a connection with
+        # no request yet does.
         self.server.connections.draining(self.connection)
-        deadline = time.monotonic() + HTTP_UNREAD_BODY_DRAIN_SECONDS
         try:
             self.connection.shutdown(socket.SHUT_WR)
-            while (remaining := deadline - time.monotonic()) > 0:
-                self.connection.settimeout(remaining)
-                if not self.rfile.read1(65536):
+            while self._unread_body > 0:
+                remaining = self._upload_deadline - time.monotonic()
+                if remaining <= 0:
                     return
+                self.connection.settimeout(min(remaining, self.server.io_timeout))
+                chunk = self.rfile.read1(min(65536, self._unread_body))
+                if not chunk:
+                    return
+                self._unread_body -= len(chunk)
         except OSError:
             pass
 
@@ -221,10 +234,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send_error(505, "HTTP version not supported")
             return False
-        # finish() drains a body that no handler read before responding.
-        self._unread_body = bool(
-            self.headers.get_all("Content-Length")
-            or self.headers.get_all("Transfer-Encoding")
+        # The body still to come, which finish() receives if no handler
+        # reads it before responding: its stated length or, without a valid
+        # one, as much as the server accepts, in the time an upload gets,
+        # counted from here.
+        lengths = self.headers.get_all("Content-Length", [])
+        length = _content_length(lengths[0]) if len(lengths) == 1 else None
+        if length is not None:
+            self._unread_body = length
+        elif lengths or self.headers.get_all("Transfer-Encoding"):
+            self._unread_body = self.server.max_request_bytes
+        self._upload_deadline = time.monotonic() + self._upload_seconds(
+            min(self._unread_body, self.server.max_request_bytes)
         )
         try:
             allowed_hosts = self.server.allowed_hosts | {
@@ -321,6 +342,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
+    def _upload_seconds(self, length):
+        # Inactivity allowed at any point, plus the body at the upload rate.
+        return self.server.io_timeout + length / HTTP_UPLOAD_BYTES_PER_SECOND
+
     def _read_json_body(self, deadline):
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
@@ -342,9 +367,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1:
             raise APIError(400, "exactly one Content-Length header is required")
-        if not lengths[0].isascii() or not lengths[0].isdigit():
+        length = _content_length(lengths[0])
+        if length is None:
             raise APIError(400, "invalid Content-Length header")
-        length = int(lengths[0])
         if length <= 0:
             raise APIError(400, "request body must not be empty")
         if length > self.server.max_request_bytes:
@@ -355,12 +380,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "request_too_large",
             )
         # Bound total upload time even when a client keeps the socket active.
-        deadline = min(
-            deadline,
-            time.monotonic()
-            + self.server.io_timeout
-            + length / HTTP_UPLOAD_BYTES_PER_SECOND,
-        )
+        deadline = min(deadline, time.monotonic() + self._upload_seconds(length))
         self._body_reservation = RequestBodyReservation(
             self.server.request_bodies, length
         )
@@ -375,8 +395,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
-            self._unread_body = False
         finally:
+            self._unread_body = length - len(payload)
             self.connection.settimeout(self.server.io_timeout)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
         payload.clear()
