@@ -120,6 +120,9 @@ SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+# The chat page's brand mark, in its text colors, which the page shows too.
+# Browsers, and other clients, ask for a site's icon at /favicon.ico.
+FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
 # The answer to a connection that gets no slot, or gives up its slot before
 # its request is read. With no request path, no API dialect is known: a
 # generic server error with its stable diagnostic code.
@@ -255,7 +258,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/health", "/ready")
+                and path in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -417,11 +420,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.partition("?")[0]
-        if path in ("/", "/index.html"):
-            if self.server.webui:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
-            else:
+        if path in ("/", "/index.html", "/favicon.ico"):
+            if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
+            elif path == "/favicon.ico":
+                self._send(200, FAVICON_SVG, "image/svg+xml")
+            else:
+                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             return
         if path == "/health":
             self._json(200, {"status": "ok"})
