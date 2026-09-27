@@ -526,8 +526,9 @@
       stats.hidden = false;
     }
     const delta = chunk.choices?.[0]?.delta;
-    if (!delta) return false;
-    if (delta.reasoning_content || delta.content) box.querySelector('.waiting').hidden = true;
+    // A chunk without text has nothing to show or scroll to.
+    if (!delta?.reasoning_content && !delta?.content) return false;
+    box.querySelector('.waiting').hidden = true;
     if (delta.reasoning_content) {
       assistant.reasoning_content += delta.reasoning_content;
       const details = box.querySelector('details');
