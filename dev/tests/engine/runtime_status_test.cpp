@@ -141,6 +141,7 @@ void testCleanRuntimeStatus() {
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
   governor.observedResidentBytes = metal.allocatedBytes;
+  governor.servingFootprintBytes = 3 * kGiB;
   governor.headroomBytes = governor.limitBytes - governor.observedResidentBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
@@ -238,6 +239,9 @@ void testCleanRuntimeStatus() {
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
                   std::string::npos,
           "status omitted the host-side growth constraints");
+  require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
+              std::string::npos,
+          "status omitted the serving footprint");
   require(json.find("\"resident_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,

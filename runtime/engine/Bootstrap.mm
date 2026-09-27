@@ -369,6 +369,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         // Keep one lane's worth of warm buffers for the first request.
         static_cast<void>(resourcesPointer->stateStorage().releaseIdle(2, 1));
         resourcesPointer->cache().releaseUnusedKvBacking();
+        resourcesPointer->memoryGovernor().markServingFootprint();
         return report;
       },
       *nativeLoop);
