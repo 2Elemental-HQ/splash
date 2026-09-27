@@ -97,7 +97,7 @@ def events(text):
     return result
 
 
-def executed_commands(name, parsed, messages=()):
+def executed_commands(name, parsed, messages=(), turns=()):
     commands = []
     calls = {}
     if name == "hermes":
@@ -119,6 +119,9 @@ def executed_commands(name, parsed, messages=()):
                 ):
                     commands.append(calls[message["tool_call_id"]])
         return commands
+    if name == "opencode":
+        # From its session record: the turns the phase added.
+        return [command for turn in turns for command in turn["commands"]]
     for event in parsed:
         if name == "pi" and event.get("toolName") == "bash":
             if event.get("type") == "tool_execution_start":
@@ -133,15 +136,6 @@ def executed_commands(name, parsed, messages=()):
             item = event.get("item", {})
             if item.get("type") == "command_execution" and item.get("exit_code") == 0:
                 commands.append(item.get("command", ""))
-        if name == "opencode" and event.get("type") == "tool_use":
-            part = event.get("part", {})
-            state = part.get("state", {})
-            if (
-                part.get("tool") == "bash"
-                and state.get("status") == "completed"
-                and state.get("metadata", {}).get("exit", 0) == 0
-            ):
-                commands.append(state.get("input", {}).get("command", ""))
         if name == "claude":
             # System events such as permission_denied carry a string message.
             message = event.get("message")
@@ -176,6 +170,65 @@ def pi_completed(parsed):
         )
         and any(event.get("type") == "agent_end" for event in parsed)
     )
+
+
+def opencode_session(history, version):
+    """OpenCode's session export, the same record for both major versions:
+    the turns, each the assistant steps that answer a user message, as how
+    the last step finished, their text and the shell commands that
+    succeeded; and the automatic compactions, as the messages holding them."""
+    turns, compactions = [], []
+    for message in history["messages"]:
+        if version >= 2:
+            # 2.x keeps a message's role as its type and an assistant's parts
+            # in content, names its bash tool shell, and records a compaction
+            # as an entry of its own; an idle entry ends each turn.
+            role, finish = message["type"], message.get("finish")
+            parts = message.get("content") or []
+            shells = [
+                p for p in parts if p.get("type") == "tool" and p.get("name") == "shell"
+            ]
+            if (
+                role == "compaction"
+                and message.get("reason") == "auto"
+                and message.get("status") == "completed"
+            ):
+                compactions.append({"message_id": message["id"]})
+        else:
+            # 1.x keeps a message's role and finish in its info, and marks the
+            # user message that asks for a compaction with an automatic
+            # compaction part.
+            info, parts = message["info"], message.get("parts") or []
+            role, finish = info["role"], info.get("finish")
+            shells = [
+                p for p in parts if p.get("type") == "tool" and p.get("tool") == "bash"
+            ]
+            if any(p.get("type") == "compaction" and p.get("auto") for p in parts):
+                compactions.append({"message_id": info["id"]})
+        if role == "user":
+            turns.append({"finish": None, "text": "", "commands": []})
+        elif role == "assistant" and turns:
+            turn = turns[-1]
+            turn["finish"] = finish
+            turn["text"] += "".join(
+                p.get("text") or "" for p in parts if p.get("type") == "text"
+            )
+            for part in shells:
+                state = part.get("state") or {}
+                if (
+                    state.get("status") == "completed"
+                    and (state.get("metadata") or {}).get("exit", 0) == 0
+                ):
+                    turn["commands"].append(
+                        (state.get("input") or {}).get("command", "")
+                    )
+    return {"turns": turns, "compactions": compactions}
+
+
+def opencode_completed(turns):
+    """OpenCode answered a phase, given the turns it added: there is one, and
+    the last ended on a stopped assistant step and has text."""
+    return bool(turns and turns[-1]["finish"] == "stop" and turns[-1]["text"].strip())
 
 
 # The engine's own critical verdict drops every evictable cache entry and
@@ -420,6 +473,8 @@ class ClientRun:
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
+        # OpenCode's record of the session, as the last phase exported it.
+        self.opencode = {"turns": [], "compactions": []}
         folder.mkdir(parents=True)
         fixture(self.workspace)
 
@@ -622,6 +677,15 @@ class ClientRun:
             if self.name == "hermes"
             else []
         )
+        # The turns this phase added to OpenCode's record of the session.
+        turns = []
+        if self.name == "opencode" and self.session:
+            previous = self.opencode
+            try:
+                self.opencode = opencode_session(self.opencode_history(), self.version)
+            except Exception as error:
+                reason = reason or f"session export failed: {error}"
+            turns = self.opencode["turns"][len(previous["turns"]) :]
         try:
             after = idle_status()
         except Exception as error:
@@ -641,7 +705,7 @@ class ClientRun:
             "after": after,
             "memory_samples": samples,
             "log": str(log),
-            "executed_commands": executed_commands(self.name, parsed, messages),
+            "executed_commands": executed_commands(self.name, parsed, messages, turns),
         }
         self.phases.append(row)
         atomic_json(self.folder / f"{label}.json", row)
@@ -696,18 +760,12 @@ class ClientRun:
             else:
                 if any(e.get("type") == "error" for e in parsed):
                     raise AgentFailure("OpenCode reported a request error")
-                if not any(
-                    e.get("type") == "step_finish"
-                    and e.get("part", {}).get("reason") == "stop"
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode did not finish its user turn")
-                if not any(
-                    e.get("type") == "text"
-                    and e.get("part", {}).get("text", "").strip()
-                    for e in parsed
-                ):
-                    raise AgentFailure("OpenCode produced no assistant text")
+                # Its session records how the turn ended; OpenCode 2 prints no
+                # final step_finish to say so.
+                if not opencode_completed(turns):
+                    raise AgentFailure(
+                        "OpenCode did not finish its user turn with assistant text"
+                    )
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
@@ -738,30 +796,7 @@ class ClientRun:
                 if entry.get("type") == "compaction"
             ]
         if self.name == "opencode":
-            argv, env = self.command(["export", self.session])
-            # A regular file avoids losing buffered pipe output when the CLI
-            # exits immediately after printing a large session export.
-            with tempfile.TemporaryFile(mode="w+") as output:
-                result = subprocess.run(
-                    argv,
-                    env=env,
-                    cwd=self.workspace,
-                    stdout=output,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=20,
-                )
-                if result.returncode:
-                    raise AgentFailure("OpenCode session export failed")
-                output.seek(0)
-                history = json.load(output)
-            atomic_json(self.folder / "history.json", history)
-            return [
-                part
-                for message in history["messages"]
-                for part in message["parts"]
-                if part.get("type") == "compaction" and part.get("auto")
-            ]
+            return self.opencode["compactions"]
         return [
             e
             for p in self.folder.glob("*.log")
@@ -770,6 +805,32 @@ class ClientRun:
             and e.get("subtype") == "compact_boundary"
             and e.get("compact_metadata", {}).get("trigger") == "auto"
         ]
+
+    def opencode_history(self):
+        """OpenCode's own record of the session, which OpenCode 2 exports
+        with its session command."""
+        export = ["session", "export"] if self.version >= 2 else ["export"]
+        argv, env = self.command([*export, self.session])
+        # A regular file avoids losing buffered pipe output when the CLI
+        # exits immediately after printing a large session export.
+        with tempfile.TemporaryFile(mode="w+") as output:
+            result = subprocess.run(
+                argv,
+                env=env,
+                cwd=self.workspace,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode:
+                raise AgentFailure(
+                    f"exit status {result.returncode}: {result.stderr[-2000:]}"
+                )
+            output.seek(0)
+            history = json.load(output)
+        atomic_json(self.folder / "history.json", history)
+        return history
 
     def check_artifact(self, stage):
         if not any(

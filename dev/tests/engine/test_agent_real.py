@@ -281,10 +281,6 @@ class AgentRunnerTests(unittest.TestCase):
                             parse(model)
 
     def test_complete_phase_handles_auxiliary_cancellation_and_retains_failures(self):
-        finished = [
-            {"type": "text", "sessionID": "s", "part": {"text": "Done"}},
-            {"type": "step_finish", "part": {"reason": "stop"}},
-        ]
         for mode in (
             "complete",
             "incomplete",
@@ -294,7 +290,8 @@ class AgentRunnerTests(unittest.TestCase):
         ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 runner = agent.ClientRun.__new__(agent.ClientRun)
-                runner.name, runner.session = "opencode", "s"
+                runner.name, runner.session, runner.version = "opencode", "s", 2
+                runner.opencode = {"turns": [], "compactions": []}
                 runner.folder = runner.workspace = Path(directory)
                 runner.timeout, runner.phases = 10, []
                 process = mock.Mock(returncode=1 if mode == "exit_error" else 0)
@@ -318,17 +315,24 @@ class AgentRunnerTests(unittest.TestCase):
                     }
                 }
 
-                def launch(*args, **kwargs):
-                    for event in finished[:1] if mode == "incomplete" else finished:
-                        kwargs["stdout"].write(json.dumps(event) + "\n")
-                    return process
-
+                # OpenCode's record of the turn: stopped, unless incomplete.
+                record = {
+                    "messages": [
+                        {"type": "user"},
+                        {
+                            "type": "assistant",
+                            "finish": None if mode == "incomplete" else "stop",
+                            "content": [{"type": "text", "text": "Done"}],
+                        },
+                    ]
+                }
                 with (
                     mock.patch.object(runner, "argv", return_value=(["client"], {})),
+                    mock.patch.object(runner, "opencode_history", return_value=record),
                     mock.patch.object(
                         agent, "idle_status", side_effect=[before, after]
                     ),
-                    mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(agent.subprocess, "Popen", return_value=process),
                     mock.patch.object(agent, "stop_process") as stop,
                     mock.patch.object(
                         agent, "memory_sample", return_value={"pressure": 1}
@@ -513,6 +517,45 @@ class AgentRunnerTests(unittest.TestCase):
             [agent.TEST_COMMAND],
         )
 
+    def test_opencode_shell_commands_count_in_both_major_versions(self):
+        # A user turn with one tool call, as OpenCode 1.x and 2.0.18 export
+        # it: 2.x names its bash tool shell and keeps an assistant's parts in
+        # content.
+        def v1(state):
+            return [
+                {"info": {"role": "user"}, "parts": []},
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "tool", "tool": "bash", "state": state}],
+                },
+            ]
+
+        def v2(state):
+            return [
+                {"type": "user"},
+                {
+                    "type": "assistant",
+                    "content": [{"type": "tool", "name": "shell", "state": state}],
+                },
+            ]
+
+        ran = {"status": "completed", "input": {"command": agent.TEST_COMMAND}}
+        for version, turn in ((1, v1), (2, v2)):
+            for state, expected in (
+                ({**ran, "metadata": {"exit": 0}}, [agent.TEST_COMMAND]),
+                ({**ran, "metadata": {"exit": 1}}, []),
+                ({**ran, "status": "error", "metadata": {"exit": 0}}, []),
+                # A tool part may hold null for its state or its metadata.
+                ({**ran, "metadata": None}, [agent.TEST_COMMAND]),
+                (None, []),
+            ):
+                with self.subTest(version=version, state=state):
+                    session = agent.opencode_session({"messages": turn(state)}, version)
+                    self.assertEqual(
+                        agent.executed_commands("opencode", [], turns=session["turns"]),
+                        expected,
+                    )
+
     def test_only_real_successful_commands_count_as_client_execution(self):
         self.assertEqual(
             agent.executed_commands(
@@ -667,6 +710,189 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.workspace = Path("/test/project")
                 runner.session, runner.version = None, version
                 self.assertEqual(runner.argv()[0][1:], run)
+
+    def test_opencode_turn_completion_comes_from_its_session_record(self):
+        # The shapes OpenCode 1.x and 2.0.18 export; 2.x prints no final
+        # step_finish, so its record is what says the turn ended.
+        def v1(role, finish=None, *texts):
+            parts = [{"type": "text", "text": text} for text in texts]
+            return {"info": {"role": role, "finish": finish}, "parts": parts}
+
+        def v2(role, finish=None, *texts):
+            content = [{"type": "text", "text": text} for text in texts]
+            return {"type": role, "finish": finish, "content": content}
+
+        for version, message in ((1, v1), (2, v2)):
+            with self.subTest(version=version):
+                # OpenCode 2 ends a turn with an idle marker after its messages.
+                idle = (
+                    [{"type": "idle", "outcome": "succeeded"}] if version == 2 else []
+                )
+                for messages, completed in (
+                    (
+                        [message("user"), message("assistant", "stop", "done"), *idle],
+                        True,
+                    ),
+                    # Text from an earlier step of the turn counts.
+                    (
+                        [
+                            message("user"),
+                            message("assistant", "tool-calls", "writing"),
+                            message("assistant", "stop"),
+                        ],
+                        True,
+                    ),
+                    ([message("user"), message("assistant", "tool-calls", "x")], False),
+                    ([message("user"), message("assistant", None, "partial")], False),
+                    # A previous turn's text does not answer this one.
+                    (
+                        [
+                            message("user"),
+                            message("assistant", "stop", "done"),
+                            message("user"),
+                            message("assistant", "stop", " "),
+                        ],
+                        False,
+                    ),
+                ):
+                    session = agent.opencode_session({"messages": messages}, version)
+                    self.assertEqual(
+                        agent.opencode_completed(session["turns"]), completed
+                    )
+        # A phase that added no turn did not answer its prompt.
+        self.assertFalse(agent.opencode_completed([]))
+
+    def test_opencode_automatic_compactions_in_both_major_versions(self):
+        # OpenCode 1.x: a compaction part in the message that asks for one.
+        def v1(auto):
+            parts = [{"type": "compaction", "auto": auto}]
+            return {"info": {"role": "user", "id": f"auto {auto}"}, "parts": parts}
+
+        session = agent.opencode_session({"messages": [v1(False), v1(True)]}, 1)
+        self.assertEqual(session["compactions"], [{"message_id": "auto True"}])
+
+        # OpenCode 2.0.18: a message of its own, with its reason and status.
+        def v2(reason, status):
+            return {
+                "type": "compaction",
+                "id": f"{reason} {status}",
+                "reason": reason,
+                "status": status,
+                "summary": "Earlier work",
+                "recent": "[User]: the turns the summary replaced",
+            }
+
+        messages = [
+            v2("manual", "completed"),
+            v2("auto", "running"),
+            v2("auto", "failed"),
+            v2("auto", "completed"),
+        ]
+        session = agent.opencode_session({"messages": messages}, 2)
+        self.assertEqual(session["compactions"], [{"message_id": "auto completed"}])
+
+    def test_opencode_session_export_follows_its_version(self):
+        for version, export in ((2, ["session", "export"]), (1, ["export"])):
+            with self.subTest(version=version):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.path = "opencode", "/test/opencode"
+                runner.model, runner.context = "Actual-model", 102400
+                runner.input_modalities = ["text"]
+                runner.workspace = Path("/test/project")
+                runner.folder = Path("/test/run")
+                runner.session, runner.version = "ses_1", version
+                history = {"messages": []}
+
+                def exported(argv, *, stdout, **_):
+                    stdout.write(json.dumps(history))
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with (
+                    mock.patch.object(
+                        agent.subprocess, "run", side_effect=exported
+                    ) as run,
+                    mock.patch.object(agent, "atomic_json"),
+                ):
+                    self.assertEqual(runner.opencode_history(), history)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[1 : 1 + len(export) + 1], [*export, "ses_1"])
+                self.assertEqual("--standalone" in argv, version == 2)
+                # A failed export says why.
+                failed = subprocess.CompletedProcess(argv, 1, stderr="Error: gone\n")
+                with (
+                    mock.patch.object(agent.subprocess, "run", return_value=failed),
+                    self.assertRaisesRegex(agent.AgentFailure, "Error: gone"),
+                ):
+                    runner.opencode_history()
+
+    def test_opencode_phase_is_judged_on_the_turn_it_added(self):
+        def turn(*entries):
+            return [{"type": "user"}, *entries, {"type": "idle"}]
+
+        def answer(text):
+            content = [{"type": "text", "text": text}]
+            return {"type": "assistant", "finish": "stop", "content": content}
+
+        compaction = {
+            "type": "compaction",
+            "id": "msg_compaction",
+            "reason": "auto",
+            "status": "completed",
+        }
+        earlier = turn(answer("Done"))
+        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
+        for history, error in (
+            ({"messages": [*earlier, *turn(compaction, answer("Again"))]}, None),
+            # The prompt never reached OpenCode: the session's last turn is
+            # the previous phase's.
+            ({"messages": earlier}, "did not finish its user turn"),
+            (
+                agent.AgentFailure("exit status 1: Error: gone"),
+                "session export failed: exit status 1: Error: gone",
+            ),
+        ):
+            with (
+                self.subTest(error=error),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session, runner.version = "opencode", "s", 2
+                runner.opencode = agent.opencode_session({"messages": earlier}, 2)
+                runner.folder = runner.workspace = Path(directory)
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = 0
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["client"], {})),
+                    mock.patch.object(
+                        runner, "opencode_history", side_effect=[history]
+                    ) as export,
+                    mock.patch.object(
+                        agent,
+                        "idle_status",
+                        side_effect=[
+                            {"requests": idle},
+                            {"requests": {**idle, "submitted": 1, "completed": 1}},
+                        ],
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", return_value=process),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                ):
+                    if error is None:
+                        runner.phase("test", "task")
+                    else:
+                        with self.assertRaisesRegex(agent.AgentFailure, error):
+                            runner.phase("test", "task")
+                # One export per phase, which the compaction check reuses.
+                export.assert_called_once_with()
+                self.assertEqual(
+                    runner.compaction(),
+                    [{"message_id": "msg_compaction"}] if error is None else [],
+                )
+                self.assertEqual(len(runner.phases), 1)
 
     def test_artifact_oracle_rejects_stub_and_wrong_semantics(self):
         with tempfile.TemporaryDirectory() as directory:
