@@ -116,6 +116,8 @@ private:
 
   struct ResourceWait final {
     StateFailure reason = StateFailure::None;
+    // What refused the memory at the latest attempt.
+    metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
     double deadlineMilliseconds = 0.0;
     // The latest tick at which a lane submitted before the request had work
@@ -249,13 +251,14 @@ private:
                         double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
-  // With `pending`, memory is on its way back (pages of demoted blocks land
-  // within commands): the wait limit measures time without progress, so it
-  // moves out with every retry that follows progress and never fires while
+  // The wait keeps the denial's allocation failure for its timeout message.
+  // With a pending denial, memory is on its way back (pages of demoted blocks
+  // land within commands): the wait limit measures time without progress, so
+  // it moves out with every retry that follows progress and never fires while
   // progress has been made since the last attempt.
   void deferResourceRetry(Request &request, double nowMilliseconds,
-                          StateFailure reason = StateFailure::MemoryPressure,
-                          bool pending = false) noexcept;
+                          const Denial &denial,
+                          StateFailure reason = StateFailure::MemoryPressure) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
   // limit restarts whenever a lane submitted before the request has work in

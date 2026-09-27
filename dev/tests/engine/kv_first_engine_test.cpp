@@ -1749,7 +1749,8 @@ void testAdmissionWaitsOutEarlierLanes() {
 
 // A lane submitted after a waiting request does not extend its wait, or
 // requests that keep arriving could hold it until its deadline: it fails at
-// its limit, retryably, while the later lane still runs.
+// its limit, retryably, while the later lane still runs. The host refused its
+// memory, so the failure says so, though growth is not paused as it expires.
 void testLaterLanesDoNotExtendAResourceWait() {
   Backing backing(32);
   KvPool pool(backing);
@@ -1775,6 +1776,10 @@ void testLaterLanesDoNotExtendAResourceWait() {
               events.failureDetails.back().second && !events.completedCount &&
               executor.requests.contains(321),
           "a lane submitted after a waiting request extended its wait");
+  require(events.failureDetails.back().first ==
+              "memory did not become available within the resource wait limit: "
+              "macOS is short of memory; close memory-heavy applications",
+          "a wait the host refused did not name the shortage");
   engine.cancel(321);
   for (const double end = now + 100; now < end && !engine.idle();)
     static_cast<void>(engine.tick(now += 10));
@@ -1799,6 +1804,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
 
     pressure = MemoryPressure::Warning;
     backing.growthBlocked = true;
+    backing.allocationFailure = metal::AllocationFailure::HostPressure;
     auto value = request(221, std::vector<uint32_t>(161, 221));
     value.deadlineMilliseconds = 300.0;
     engine.submit(std::move(value));
@@ -1840,8 +1846,13 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     } else if (outcome == 3) {
       static_cast<void>(engine.tick(150.0));
       require(events.failures == std::vector<std::string>{"resource_timeout"} &&
-                  events.failureDetails.back().second,
-              "persistent memory pressure did not fail with a retryable timeout");
+                  events.failureDetails.back().second &&
+                  events.failureDetails.back().first ==
+                      "memory did not become available within the resource wait "
+                      "limit: macOS is short of memory; close memory-heavy "
+                      "applications",
+              "persistent memory pressure did not fail with a retryable timeout "
+              "that names the shortage");
     } else {
       static_cast<void>(engine.tick(301.0));
       require(events.completedCount + events.failedCount == 2,
@@ -2705,8 +2716,11 @@ void testStateAdmissionWaitsForKvRelease() {
         static_cast<void>(engine.tick(51));
       } else {
         static_cast<void>(engine.tick(502));
-        require(events.failures == std::vector<std::string>{"resource_timeout"},
-                "pending release bypassed resource wait deadline");
+        require(events.failures == std::vector<std::string>{"resource_timeout"} &&
+                    events.failureDetails.back().first ==
+                        "memory did not become available within the resource wait limit",
+                "pending release bypassed resource wait deadline, or a budget "
+                "wait blamed macOS");
       }
       require(engine.idle() && cache.snapshot().activeRequests == 0 &&
                   executor.requests.empty(),
