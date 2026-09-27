@@ -1558,13 +1558,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     )
                 )
 
+            def keepalive():
+                # Array/object tool arguments are buffered until complete, which
+                # can take minutes. Clients that time out on missing data events
+                # ignore SSE comments, so send an empty delta chunk instead.
+                self._sse(stream_chunk(self.app.model, public_id, created, {}))
+
             _, _, tool_calls, result, _ = self._collect(
                 job,
                 thinking,
                 has_tools,
                 put_text,
                 put_tool_delta,
-                self._sse_keepalive,
+                keepalive,
                 put_progress,
             )
             self._sse(

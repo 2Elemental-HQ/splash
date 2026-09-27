@@ -3945,10 +3945,9 @@ class ServerTest(unittest.TestCase):
             try:
                 role = json.loads(self.next_sse_data(response))
                 self.assertEqual(role["choices"][0]["delta"]["role"], "assistant")
-                self.assertEqual(
-                    response.readline().decode().rstrip("\r\n"),
-                    ": splash-keepalive",
-                )
+                heartbeat = json.loads(self.next_sse_data(response))
+                self.assertEqual(heartbeat["choices"][0]["delta"], {})
+                self.assertIsNone(heartbeat["choices"][0]["finish_reason"])
             finally:
                 plan.release.set()
                 response.read()
