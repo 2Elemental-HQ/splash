@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 6;
+inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -190,6 +190,9 @@ struct RequestFrame {
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
   std::vector<uint32_t> scoreTokens{};
+  // Trailing prompt tokens of the chat template's generation prompt; zero
+  // when unknown. It must leave at least one prompt token.
+  uint32_t generationPromptTokens = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };

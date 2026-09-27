@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -29,7 +29,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBI")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +50,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 64
+assert _REQUEST.size == 68
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -221,6 +221,9 @@ class RequestFrame:
     # Option token ids for score-only requests; empty means ordinary
     # generation. Score tokens serialize after the image pixel bytes.
     score_tokens: tuple[int, ...] = ()
+    # Trailing prompt tokens of the chat template's generation prompt; zero
+    # when unknown. It must leave at least one prompt token.
+    generation_prompt_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -731,6 +734,9 @@ def _request_issue(
         )
     try:
         _image_spans_check(request, len(prompt), limits)
+        generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
+        if generation >= len(prompt):
+            raise ValueError("generation prompt must leave a prompt token")
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if scores and (
@@ -1143,6 +1149,7 @@ def _encode_message(
                 message.seed,
                 message.return_progress,
                 len(scores),
+                message.generation_prompt_tokens,
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1425,6 +1432,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         seed,
         return_progress,
         score_count,
+        generation_prompt_tokens,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1509,6 +1517,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         bytes(image_pixels),
         bool(return_progress),
         score_tokens,
+        generation_prompt_tokens,
     )
     _raise_issue(_request_issue(request, limits))
     return request

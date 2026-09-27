@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 64;
+constexpr uint64_t kRequestFixedBytes = 68;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -57,7 +57,8 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   if (limits.maxFramePayloadBytes < kRequestFixedBytes ||
       limits.maxFramePayloadBytes > kAbsoluteMaxFramePayloadBytes) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "maxFramePayloadBytes must be in [64, 256 MiB]");
+                     "maxFramePayloadBytes must be in [" +
+                         std::to_string(kRequestFixedBytes) + ", 256 MiB]");
   }
   if (limits.maxStatusJsonBytes >
       limits.maxFramePayloadBytes - kStatusJsonFixedBytes) {
@@ -418,6 +419,10 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "image pixels do not match the image grids");
   }
+  if (request.generationPromptTokens >= request.promptTokens.size()) {
+    return invalid(IssueCode::InvalidCount,
+                   "generation prompt must leave a prompt token");
+  }
   if (scoring) {
     if (!request.imageSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
@@ -695,6 +700,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
+  writer.u32(request.generationPromptTokens);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -903,7 +909,8 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress) || !reader.u32(scoreCount)) {
+      !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
+      !reader.u32(request.generationPromptTokens)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));

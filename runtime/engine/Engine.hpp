@@ -185,6 +185,11 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  // Where the state a later request resumes from is kept: the last whole
+  // page before the replay's final input token and, while the lane replays
+  // only its prompt, before the prompt's generation prompt.
+  [[nodiscard]] static uint32_t
+  replayStateBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
