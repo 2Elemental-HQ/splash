@@ -10,6 +10,7 @@ import random
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -3228,14 +3229,12 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("queue_ms", record["metrics"])
         self.assertNotIn("hello", json.dumps(record))
 
-        with mock.patch("builtins.print") as output:
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             diagnostics.print_request(record)
-        line = output.call_args.args[0]
-        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Done · input ")
+        line = output.getvalue()
+        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$")
         self.assertNotIn("request_id", line)
         self.assertNotIn("hello", line)
-        self.assertNotIn("\n", line)
-        self.assertTrue(output.call_args.kwargs["flush"])
 
     def test_latency_histograms_cover_http_preparation_and_token_batches(self):
         harness = self.harness(FakeRuntime(Plan([[4, 4], [4]], delay=0.01)))
@@ -3286,13 +3285,13 @@ class ServerTest(unittest.TestCase):
         }
         with (
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
-            mock.patch("builtins.print") as output,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             diagnostics.print_request(record)
         self.assertEqual(
-            output.call_args.args[0],
+            output.getvalue(),
             "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
-            " · TTFT 0.8s · 85.0 tok/s",
+            " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
     def test_console_shows_the_tool_block_signature(self):
@@ -3305,25 +3304,28 @@ class ServerTest(unittest.TestCase):
         }
         with (
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
-            mock.patch("builtins.print") as output,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             diagnostics.print_request(record)
         self.assertEqual(
-            output.call_args.args[0],
+            output.getvalue(),
             "14:32:08 Done · input 33,799 · cached 6,656 · output 12"
-            " · tools 27·1a2b3c4d",
+            " · tools 27·1a2b3c4d\n",
         )
 
     def test_console_cancellation_without_tokens_or_latency(self):
-        with mock.patch("builtins.print") as output:
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             diagnostics.print_request({"outcome": "cancelled", "prompt_tokens": 32})
-        line = output.call_args.args[0]
+        line = output.getvalue()
         self.assertIn("Cancelled · input 32 · cached 0 · output 0", line)
         self.assertNotIn("TTFT", line)
         self.assertNotIn("tok/s", line)
 
     def test_console_error_omits_private_details(self):
-        with mock.patch("builtins.print") as output:
+        with (
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
             diagnostics.print_request(
                 {
                     "outcome": "error",
@@ -3332,9 +3334,45 @@ class ServerTest(unittest.TestCase):
                     "request_id": 123,
                 }
             )
-        line = output.call_args.args[0]
-        self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded$")
-        self.assertIs(output.call_args.kwargs["file"], api.sys.stderr)
+        self.assertRegex(
+            errors.getvalue(), r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded\n$"
+        )
+        self.assertEqual(output.getvalue(), "")
+
+    def test_concurrent_console_lines_stay_whole(self):
+        # Status lines on stdout and errors on stderr, both on one unbuffered
+        # file, as `python -u server.py > log 2>&1` or launchd writes them.
+        with tempfile.TemporaryFile() as log:
+            streams = [
+                io.TextIOWrapper(
+                    io.FileIO(os.dup(log.fileno()), "w"), write_through=True
+                )
+                for _ in range(2)
+            ]
+            self.addCleanup(lambda: [stream.close() for stream in streams])
+
+            def write(worker):
+                for line in range(300):
+                    diagnostics.print_status(
+                        f"worker {worker} line {line}", error=worker % 2 == 1
+                    )
+
+            workers = [
+                threading.Thread(target=write, args=(worker,)) for worker in range(8)
+            ]
+            with (
+                mock.patch("sys.stdout", streams[0]),
+                mock.patch("sys.stderr", streams[1]),
+            ):
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join()
+            log.seek(0)
+            lines = log.read().decode().splitlines()
+        self.assertEqual(len(lines), 8 * 300)
+        for line in lines:
+            self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
@@ -3532,7 +3570,7 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(api, "Frontend", return_value=mock.Mock()) as app_type,
             mock.patch.object(api, "FrontendServer", side_effect=bind),
             mock.patch.object(api.signal, "signal", side_effect=install),
-            mock.patch("builtins.print"),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             api.main()
         self.assertEqual(
