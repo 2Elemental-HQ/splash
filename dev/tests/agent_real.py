@@ -473,19 +473,13 @@ class ClientRun:
         self.phases = []
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
+        self.opencode_data = (folder / "opencode-data").resolve()
         # OpenCode's record of the session, as the last phase exported it.
         self.opencode = {"turns": [], "compactions": []}
         folder.mkdir(parents=True)
         fixture(self.workspace)
 
     def argv(self):
-        # Pi keeps its providers, sessions, settings and extensions in one
-        # agent directory; a private one leaves the developer's untouched.
-        environment = (
-            dict(os.environ, PI_CODING_AGENT_DIR=str(self.pi_home))
-            if self.name == "pi"
-            else None
-        )
         if self.name == "claude":
             # Normal edit authorization and one explicit project test command;
             # --allowedTools grants permission, unlike --tools it does not filter
@@ -525,14 +519,24 @@ class ClientRun:
             arguments = ["--oneshot", "--query-file", "-"]
             if self.session:
                 arguments += ["--resume", self.session]
-        argv, env = self.command(arguments, environment)
-        if self.name == "codex":
-            self.codex_home.mkdir(exist_ok=True)
-            env["CODEX_HOME"] = str(self.codex_home)
-        return argv, env
+        return self.command(arguments)
 
-    def command(self, arguments, environment=None):
-        """The client's command, as `splash NAME -- ARGUMENTS` runs it."""
+    def command(self, arguments):
+        """The client's command, as `splash NAME -- ARGUMENTS` runs it, with
+        the client's own state in this run's folder, leaving the developer's
+        untouched: Pi's agent directory (providers, sessions, settings and
+        extensions), Codex's home, and OpenCode's data directory, whose
+        session database OpenCode 2 migrates to a schema OpenCode 1 cannot
+        open."""
+        environment = dict(os.environ)
+        match self.name:
+            case "pi":
+                environment["PI_CODING_AGENT_DIR"] = str(self.pi_home)
+            case "codex":
+                self.codex_home.mkdir(exist_ok=True)
+                environment["CODEX_HOME"] = str(self.codex_home)
+            case "opencode":
+                environment["XDG_DATA_HOME"] = str(self.opencode_data)
         argv, env = clients.command(
             self.name,
             self.path,

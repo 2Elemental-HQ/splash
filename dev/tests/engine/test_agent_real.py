@@ -636,6 +636,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.workspace = Path("/test/project")
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
+                    runner.opencode_data = Path(directory) / "opencode-data"
                     runner.session = session
                     runner.version = 2 if name == "opencode" else None
 
@@ -646,15 +647,14 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.clients, "command", side_effect=launch
                     ) as adapter:
                         argv, env = runner.argv()
-                    # Pi configures itself in a private agent directory.
-                    environment = (
-                        dict(agent.os.environ, PI_CODING_AGENT_DIR=str(runner.pi_home))
-                        if name == "pi"
-                        else None
-                    )
+                    # Pi, Codex and OpenCode keep their state in the run.
+                    state = {
+                        "pi": {"PI_CODING_AGENT_DIR": str(runner.pi_home)},
+                        "codex": {"CODEX_HOME": str(runner.codex_home)},
+                        "opencode": {"XDG_DATA_HOME": str(runner.opencode_data)},
+                    }.get(name, {})
                     self.assertEqual(env["PWD"], "/test/project")
                     if name == "codex":
-                        self.assertEqual(env["CODEX_HOME"], str(runner.codex_home))
                         self.assertTrue(runner.codex_home.is_dir())
                     adapter.assert_called_once_with(
                         name,
@@ -663,7 +663,7 @@ class AgentRunnerTests(unittest.TestCase):
                         "Actual-model",
                         102400,
                         agent.launcher.AGENTS_DIR,
-                        environment,
+                        dict(agent.os.environ, **state),
                         input_modalities=["text"],
                         client_args=argv[1:],
                         client_version=runner.version,
@@ -708,6 +708,7 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.model, runner.context = "Actual-model", 102400
                 runner.input_modalities = ["text"]
                 runner.workspace = Path("/test/project")
+                runner.opencode_data = Path("/test/run/opencode-data")
                 runner.session, runner.version = None, version
                 self.assertEqual(runner.argv()[0][1:], run)
 
@@ -800,6 +801,7 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.input_modalities = ["text"]
                 runner.workspace = Path("/test/project")
                 runner.folder = Path("/test/run")
+                runner.opencode_data = runner.folder / "opencode-data"
                 runner.session, runner.version = "ses_1", version
                 history = {"messages": []}
 
@@ -817,6 +819,11 @@ class AgentRunnerTests(unittest.TestCase):
                 argv = run.call_args.args[0]
                 self.assertEqual(argv[1 : 1 + len(export) + 1], [*export, "ses_1"])
                 self.assertEqual("--standalone" in argv, version == 2)
+                # The export reads the run's own session database.
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["XDG_DATA_HOME"],
+                    "/test/run/opencode-data",
+                )
                 # A failed export says why.
                 failed = subprocess.CompletedProcess(argv, 1, stderr="Error: gone\n")
                 with (
