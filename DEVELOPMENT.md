@@ -660,9 +660,11 @@ Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
 original schema validates complete arguments, including cross-field conditions,
 dependencies and property-count rules that framing alone cannot enforce; array
-item bounds and `multipleOf` above 64 are left to that validation as well, and
-the framed schemas of one request are limited to 16 MiB. Extra properties use
-JSON-encoded values; statically typed strings retain raw text.
+item bounds and `multipleOf` above 64 are left to that validation as well, as
+are patterns the grammar cannot compile (look-around, word boundaries,
+backreferences). The framed schemas of one request are limited to 16 MiB. Extra
+properties use JSON-encoded values; statically typed strings retain raw text,
+so their patterns are checked on the complete call.
 `tool_choice: "none"` renders the tools like any other choice and only
 prevents calls. Remote schema references, parameter names containing XML
 delimiters and `unevaluatedProperties` combined with `patternProperties` are
