@@ -875,6 +875,143 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
           "duplicate state publication was not reused and accounted");
 }
 
+// A prompt's replay state is its last whole page before its generation
+// prompt, or before its last token when that is unknown.
+void testReplayStateEndsBeforeTheGenerationPrompt() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  struct Case {
+    uint32_t tokens;
+    uint32_t generationPromptTokens;
+    uint32_t replayBoundary;
+  };
+  uint64_t id = 0;
+  for (const Case &test : {Case{97, 0, 96}, Case{97, 7, 64}, Case{103, 7, 96},
+                           Case{33, 7, 0}}) {
+    std::vector<uint32_t> prompt(test.tokens);
+    std::iota(prompt.begin(), prompt.end(), static_cast<uint32_t>(++id * 1000));
+    EngineRequest value = request(id, prompt);
+    value.generationPromptTokens = test.generationPromptTokens;
+    engine.submit(std::move(value));
+    runUntilIdle(engine);
+    require(resources.lookup(prompt).resumeBoundary() == test.replayBoundary,
+            "the replay state did not end before the generation prompt");
+  }
+  require(executor.snapshots == 3,
+          "a generation prompt within the first page left a replay state");
+
+  EngineRequest whole = request(++id, std::vector<uint32_t>(33, 5));
+  whole.generationPromptTokens = 33;
+  bool rejected = false;
+  try {
+    engine.submit(std::move(whole));
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "a generation prompt leaving no prompt token was admitted");
+}
+
+// A next turn that renders the generation prompt differently diverges inside
+// it (at N-4, as Qwen3.6 without reasoning does). Only a replay state before
+// the generation prompt serves it.
+void testFollowUpResumesBeforeTheGenerationPrompt() {
+  const auto followUp = [](uint32_t generationPromptTokens) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    std::vector<uint32_t> prompt(97);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    EngineRequest turn = request(1, prompt);
+    turn.generationPromptTokens = generationPromptTokens;
+    engine.submit(std::move(turn));
+    runUntilIdle(engine);
+    prompt.resize(93);
+    prompt.resize(133, 500);
+    engine.submit(request(2, prompt));
+    runUntilIdle(engine);
+    return std::pair{executor.plans.at(1), events.starts.at(1)};
+  };
+  const auto [plan, start] = followUp(7);
+  require(plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64 &&
+              plan.boundaries[1].boundary == 97,
+          "the replay state was not planned before the generation prompt");
+  require(start == std::pair<EngineCacheStatus, uint32_t>{
+                       EngineCacheStatus::PrefixHit, 64},
+          "the follow-up did not resume before the generation prompt");
+  require(followUp(0).second == std::pair<EngineCacheStatus, uint32_t>{
+                                    EngineCacheStatus::Miss, 0},
+          "a replay state past the divergence served the follow-up");
+}
+
+// An identical retry, in sequence or concurrently, resumes from the replay
+// state and publishes no second state inside the generation prompt.
+void testRetryPublishesNoStateInsideTheGenerationPrompt() {
+  for (bool concurrent : {false, true}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    std::vector<uint32_t> prompt(97);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    for (uint64_t id : {1, 2}) {
+      EngineRequest value = request(id, prompt);
+      value.generationPromptTokens = 7;
+      engine.submit(std::move(value));
+      if (!concurrent)
+        runUntilIdle(engine);
+    }
+    runUntilIdle(engine);
+    const auto snapshot = engine.snapshot();
+    require(executor.snapshotAttempts == 1 &&
+                snapshot.junctionMaterializations == 0 &&
+                snapshot.resources.stateCache.entries == 1 &&
+                events.starts.at(1) == std::pair<EngineCacheStatus, uint32_t>{
+                                           EngineCacheStatus::PrefixHit, 64},
+            "a retry published a state inside the generation prompt");
+  }
+}
+
+// A shared junction serves the waiter's next turn too, so it also ends before
+// the waiter's generation prompt.
+void testSharedJunctionEndsBeforeTheGenerationPrompt() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  std::vector<uint32_t> prompt(200);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest producer = request(1, prompt);
+  // Admitted first, it plans the junction for the waiter's whole prompt.
+  producer.priority = RequestPriority::Foreground;
+  producer.generationPromptTokens = 7;
+  engine.submit(std::move(producer));
+  prompt.resize(97);
+  EngineRequest waiter = request(2, prompt);
+  waiter.generationPromptTokens = 7;
+  engine.submit(std::move(waiter));
+  runUntilIdle(engine);
+  prompt.resize(93);
+  prompt.resize(133, 500);
+  engine.submit(request(3, prompt));
+  runUntilIdle(engine);
+  const std::pair<EngineCacheStatus, uint32_t> hit{EngineCacheStatus::PrefixHit,
+                                                   64};
+  require(events.starts.size() == 3 && events.starts[1] == hit &&
+              events.starts[2] == hit,
+          "the shared junction was not the waiter's reusable state");
+}
+
 void testImageSpansKeyPrefixIdentity() {
   Backing backing(32);
   KvPool pool(backing);
@@ -2524,6 +2661,39 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
               engine.snapshot().cacheHits == 0 &&
               engine.snapshot().coldMisses == 2,
           "internal cache restore changed output or request accounting");
+}
+
+// Once a resumed lane replays generated history, the generation prompt lies
+// inside it: the lane's own recovery point stays its last whole page.
+void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
+  Backing backing(6);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id : {262, 263}) {
+    auto value = request(id, std::vector<uint32_t>(65, id));
+    // Long enough to move the boundary if it applied to the 89-token history
+    // too: the prompt's state lands at 32, the history's at 64.
+    value.generationPromptTokens = 30;
+    value.maxNewTokens = 30;
+    engine.submit(std::move(value));
+  }
+  for (double now = 1; now < 300 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && executor.suspensions == 1 &&
+              executor.resumedPrompts.size() == 1 &&
+              executor.resumedPrompts.front().size() == 89 &&
+              events.completedCount == 2,
+          "the decode was not preempted after 24 generated tokens");
+  // Prompt tokens are the request id.
+  const DraftContextPlan &plan =
+      executor.plans.at(executor.resumedPrompts.front().front());
+  require(executor.restored == 32 && plan.replayEnd == 89 &&
+              plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64,
+          "the resumed decode's replay boundary applied its generation prompt");
 }
 
 void testRepeatedPreemptionRespectsBackoffAndCancellation() {
@@ -4944,6 +5114,10 @@ int main() {
     testCheckpointIntervalValidationAndDisable();
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
+    testReplayStateEndsBeforeTheGenerationPrompt();
+    testFollowUpResumesBeforeTheGenerationPrompt();
+    testRetryPublishesNoStateInsideTheGenerationPrompt();
+    testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
@@ -4993,6 +5167,7 @@ int main() {
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
     testPreemptedDecodeRestoresItsResidentCompositeState();
+    testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();
     testRepeatedPreemptionRespectsBackoffAndCancellation();
     testAdmissionReopensAfterLastSuspendedRequestResumes();
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();

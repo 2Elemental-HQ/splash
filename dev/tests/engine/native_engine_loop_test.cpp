@@ -422,6 +422,42 @@ void testWireLifecycleAndCacheHit() {
           "native lifecycle events are incomplete");
 }
 
+// The request's generation prompt reaches the engine: its replay state, which
+// an identical retry resumes from, ends before it.
+void testGenerationPromptBoundsTheReplayState() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  double monotonic = 100.0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  loop.announceReady();
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    input.generationPromptTokens = 2;
+    auto encoded = protocol::serializeMessage(protocol::Message{input});
+    require(encoded && loop.receive(*encoded.value),
+            "generation prompt request wire failed");
+    runUntilIdle(loop);
+  }
+  std::vector<uint32_t> matched;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *start = std::get_if<protocol::StartEvent>(&message))
+      matched.push_back(start->matchedPromptTokens);
+  }
+  require(matched == std::vector<uint32_t>{0, 32},
+          "the replay state did not end before the generation prompt");
+}
+
 void testFatalFramingClosesConnection() {
   Backing backing(8);
   KvPool pool(backing);
@@ -1278,6 +1314,7 @@ void testConstrainedMaskExchange() {
 int main() {
   try {
     testWireLifecycleAndCacheHit();
+    testGenerationPromptBoundsTheReplayState();
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();

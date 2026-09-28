@@ -184,6 +184,9 @@ class GenerationRequest:
     return_progress: bool = False
     # Option token ids for score-only requests; empty means generation.
     score_tokens: tuple[int, ...] = ()
+    # Trailing prompt tokens of the chat template's generation prompt; zero
+    # when unknown.
+    generation_prompt_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -621,6 +624,7 @@ class MultiplexedRuntime:
                 image_pixels=request.image_pixels,
                 return_progress=request.return_progress,
                 score_tokens=request.score_tokens,
+                generation_prompt_tokens=request.generation_prompt_tokens,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)

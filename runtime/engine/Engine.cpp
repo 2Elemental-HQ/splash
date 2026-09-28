@@ -11,11 +11,6 @@ namespace {
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
-uint32_t replayStateBoundary(uint32_t tokens) noexcept {
-  return tokens > 1 ? (tokens - 1) / KvCache::pageTokens * KvCache::pageTokens
-                    : 0;
-}
-
 } // namespace
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -39,6 +34,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 void Engine::submit(EngineRequest value) {
   const bool scoring = !value.scoreTokens.empty();
   if (!value.id || value.prompt.empty() ||
+      value.generationPromptTokens >= value.prompt.size() ||
       (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
@@ -406,6 +402,17 @@ bool Engine::admitQueued(double now) {
   return progressed;
 }
 
+uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
+  // A later request may not share the generation prompt; generated history
+  // that a resumed lane replays is its own.
+  const uint32_t tail =
+      active.replayTokens == active.promptTokens
+          ? std::max(active.request.generationPromptTokens, uint32_t{1})
+          : 1;
+  return (active.replayTokens - tail) / KvCache::pageTokens *
+         KvCache::pageTokens;
+}
+
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
   const auto prompt = [](const Request &value) -> std::span<const uint32_t> {
@@ -419,8 +426,7 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
   uint32_t boundary = std::min<uint32_t>(
       static_cast<uint32_t>(end - a.begin()),
-      std::min(replayStateBoundary(left.promptTokens),
-               replayStateBoundary(right.promptTokens)));
+      std::min(replayStateBoundary(left), replayStateBoundary(right)));
   boundary -= boundary % KvCache::pageTokens;
   if (!left.request.images.empty() || !right.request.images.empty()) {
     for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
@@ -612,7 +618,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     // it on disk. Other restored progress points retain their rolling
     // lifetime.
     if (active.latestCheckpoint &&
-        resumeBoundary == replayStateBoundary(active.replayTokens)) {
+        resumeBoundary == replayStateBoundary(active)) {
       if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
         ++counters_.deduplicatedStatePublications;
       active.latestCheckpoint = {};
@@ -736,9 +742,12 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     throw std::logic_error("request already has a composite-state plan");
   }
 
+  // The replay state is the last one planned: a lazy junction past it would
+  // lie inside the generation prompt, which a later request may not share.
+  const uint32_t latestReplayBoundary = replayStateBoundary(active);
   const auto addCandidate = [&](uint32_t tokens,
                                 Request::StateBoundary::Purpose purpose) {
-    if (!tokens || tokens <= stateBoundary)
+    if (tokens <= stateBoundary || tokens > latestReplayBoundary)
       return;
     for (size_t index = 0; index < active.stateBoundaries.size(); ++index) {
       if (active.stateBoundaries[index].tokens != tokens)
@@ -752,7 +761,6 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
 
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
-  const uint32_t latestReplayBoundary = replayStateBoundary(active.replayTokens);
   if (const uint32_t interval = config_.prefillCheckpointTokens) {
     for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
          boundary < latestReplayBoundary; boundary += interval) {
@@ -782,7 +790,7 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   if (active.suspended || active.replaying)
     return false;
   bool changed = false;
-  const uint32_t replay = replayStateBoundary(active.replayTokens);
+  const uint32_t replay = replayStateBoundary(active);
   for (const auto &[id, peer] : requests_) {
     if (id == active.request.id || peer.stateCell || peer.suspended ||
         peer.finalized || peer.failure ||
@@ -886,7 +894,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
         // point instead of evicting it or writing a short-lived replacement.
         if (checkpoint && model_.canSnapshotToDisk() &&
             uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-                replayStateBoundary(active.replayTokens)) {
+                replayStateBoundary(active)) {
           state = model_.snapshot(active.request.id);
           if (!state)
             continue;

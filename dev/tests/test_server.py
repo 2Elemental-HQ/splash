@@ -116,8 +116,8 @@ class FakeTokenizer:
         self.backend_tokenizer = _byte_backend(self.fragments)
         self.templates = []
 
-    # Requests render as a fixed generation prefix; the source only has to be
-    # a template ChatTemplates can probe at startup.
+    # Requests render as their generation prompt alone, a fixed prefix; the
+    # source only has to be a template ChatTemplates can probe at startup.
     chat_template = (
         "{%- for message in messages %}"
         "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}"
@@ -127,9 +127,11 @@ class FakeTokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
-        rendered = "<|im_start|>assistant\n<think>\n"
-        if not kwargs.get("enable_thinking", True):
-            rendered += "\n</think>\n\n"
+        rendered = ""
+        if kwargs.get("add_generation_prompt"):
+            rendered = "<|im_start|>assistant\n<think>\n"
+            if not kwargs.get("enable_thinking", True):
+                rendered += "\n</think>\n\n"
         return rendered if kwargs.get("tokenize") is False else [101, 102]
 
     def __call__(self, text, **kwargs):
@@ -1696,9 +1698,10 @@ class ServerTest(unittest.TestCase):
                         if part.get("type") == "image_url"
                     )
             rendered += "Z"
-            rendered += "<|im_start|>assistant\n<think>\n"
-            if not kwargs.get("enable_thinking", True):
-                rendered += "\n</think>\n\n"
+            if kwargs.get("add_generation_prompt"):
+                rendered += "<|im_start|>assistant\n<think>\n"
+                if not kwargs.get("enable_thinking", True):
+                    rendered += "\n</think>\n\n"
             return (
                 rendered
                 if kwargs.get("tokenize") is False
@@ -2536,9 +2539,13 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_count_tokens_matches_generation_without_admission(self):
         class InputTokenizer(FakeTokenizer):
-            def apply_chat_template(self, messages, **kwargs):
-                prefix = super().apply_chat_template(messages, **kwargs)
-                return json.dumps([messages, kwargs], sort_keys=True) + prefix
+            def apply_chat_template(
+                self, messages, add_generation_prompt=False, **kwargs
+            ):
+                prompt = super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                return json.dumps([messages, kwargs], sort_keys=True) + prompt
 
             def __call__(self, text, **kwargs):
                 return {"input_ids": list(text.encode())}
@@ -5728,7 +5735,8 @@ class ServerTest(unittest.TestCase):
             ("<think>\\n\\n</think>\\n\\n", "low"),
         ):
             tokenizer = TemplateTokenizer(
-                "{{ '<|im_start|>assistant\\n" + prefix + "' }}"
+                "{% if add_generation_prompt %}"
+                "{{ '<|im_start|>assistant\\n" + prefix + "' }}{% endif %}"
             )
             app = make_frontend(
                 tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
@@ -5739,26 +5747,37 @@ class ServerTest(unittest.TestCase):
             ):
                 app.prepare(self.body(reasoning_effort=effort))
 
-    def test_thinking_prefix_excludes_completed_or_nonassistant_history(self):
-        for suffix, expected in (
+    def test_generation_prompt_decides_thinking_and_its_token_count(self):
+        history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
+        for suffix, thinking in (
             ("", False),
             ("<think>\n", True),
             ("<think>\n\n</think>\n\n", False),
         ):
-            history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
-            self.assertEqual(
-                request_frontend._thinking_from_prefix(
-                    history + "<|im_start|>assistant\n" + suffix
-                ),
-                expected,
-            )
-        for rendered in (
-            "",
-            "<|im_start|>user\n<think>",
-            "<|im_start|>assistant\n<think>old<|im_end|>\n",
+            text = "<|im_start|>assistant\n" + suffix
+            # Tokens that end otherwise, or are the generation prompt alone,
+            # are not counted.
+            for tokens, count in (
+                ([1, 2, 7, 8, 9], 3),
+                ([1, 2, 7, 8, 8], 0),
+                ([7, 8, 9], 0),
+            ):
+                with self.subTest(suffix=suffix, tokens=tokens):
+                    self.assertEqual(
+                        request_frontend._generation_prompt(
+                            (text, (7, 8, 9)), history + text, tokens
+                        ),
+                        (thinking, count),
+                    )
+        # A prompt must end with the generation prompt the probe found.
+        assistant = ("<|im_start|>assistant\n", (7, 8))
+        for probed, rendered in (
+            (assistant, ""),
+            (assistant, "<|im_start|>assistant\n<think>old<|im_end|>\n"),
+            (("", ()), history),
         ):
             with self.subTest(rendered=rendered), self.assertRaises(api.APIError):
-                request_frontend._thinking_from_prefix(rendered)
+                request_frontend._generation_prompt(probed, rendered, [1, 2, 7, 8])
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template())
