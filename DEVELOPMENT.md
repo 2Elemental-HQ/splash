@@ -1009,6 +1009,15 @@ The source formats load differently: an MLX target is prepared into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
 kernels, and a package's packed files are mapped as they are.
 
+On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
+memory pressure, which the smaller GGUF variants such a Mac uses can reach under
+an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
+to observe how the engine sheds its cache. The runtime oracle in `test-real` has
+no production memory guard: the prepared weights, and then what the runtime
+allocates as it runs, must fit in what macOS has available above its reserve,
+so it stops, naming what it needs, while other programs hold that memory. With
+only desktop applications open, a 24 GB Mac runs it for those variants.
+
 `make test-engine-cpu` builds the affine source oracle so it cannot break
 unnoticed, but no target runs it because it needs real models: after
 `make all build/engine-tests/affine-source-oracle`, pass it
@@ -1101,11 +1110,16 @@ make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit BASELINE=/path/t
 The first characterizes this build: the decode widths B1-B4 and a 14,096-token
 partial-prefix request, three samples each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
-`make benchmark-backend MODEL=...` adds the 2K to 128K contexts. The second
-compares this build with a retained checkout's in ABBA order, as the release
-check does ([Release check](#release-check)), and writes
+`make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
+plan holds. The second compares this build with a retained checkout's in ABBA
+order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
+
+`benchmark-backend` lists the contexts the memory plan cannot hold in its
+report. Its cache checks reuse each context's cached prefix, so they need that
+memory free: when other programs leave too little, the engine evicts cached
+prefixes and the checks fail, naming what each lookup found.
 
 For a same-machine HTTP regression check, retain the previous `splash` binary
 **and its adjacent `splash.metallib`**, then run from the candidate checkout:

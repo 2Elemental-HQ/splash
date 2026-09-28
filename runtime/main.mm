@@ -359,9 +359,6 @@ int runNative(const NativeArguments &arguments) {
   }
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
-  // Serving handles shutdown and memory pressure between engine ticks.
-  // The per-operation guard is only needed during bootstrap.
-  bootstrap->resources().backend().setOperationGuard({});
   published = bootstrap.get();
 
   transport.setControlHandler([&pressureMonitor, published,
