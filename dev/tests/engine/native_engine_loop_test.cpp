@@ -70,6 +70,8 @@ public:
   bool pendingHealth = false;
   // Score requests whose final prompt chunk reports a per-lane model failure.
   std::unordered_set<uint64_t> invalidScores;
+  // The request flags each request began with.
+  std::unordered_map<uint64_t, uint32_t> beganFlags;
   // Prefill chunks each request received, to prove a failure was isolated to
   // the last one rather than to a prefill that never chunked.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
@@ -80,6 +82,7 @@ public:
   }
   bool needsHealthCheck() const noexcept override { return pendingHealth; }
   StateAdmission begin(const ModelRequest &request) override {
+    beganFlags[request.id] = request.flags;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
          ++slot) {
       const bool used = std::any_of(
@@ -456,6 +459,33 @@ void testGenerationPromptBoundsTheReplayState() {
   }
   require(matched == std::vector<uint32_t>{0, 32},
           "the replay state did not end before the generation prompt");
+}
+
+// A request's flags reach the model with the rest of its request.
+void testRequestFlagsReachTheModel() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  double monotonic = 100.0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor, [](std::span<const uint8_t>) {},
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  loop.announceReady();
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    input.flags = id == 2 ? protocol::RequestIgnoreEndOfSequence : 0;
+    auto encoded = protocol::serializeMessage(protocol::Message{input});
+    require(encoded && loop.receive(*encoded.value), "flagged request wire failed");
+    runUntilIdle(loop);
+  }
+  require(executor.beganFlags ==
+              std::unordered_map<uint64_t, uint32_t>{
+                  {1, 0}, {2, RequestIgnoreEndOfSequence}},
+          "request flags did not reach the model");
 }
 
 void testFatalFramingClosesConnection() {
@@ -1315,6 +1345,7 @@ int main() {
   try {
     testWireLifecycleAndCacheHit();
     testGenerationPromptBoundsTheReplayState();
+    testRequestFlagsReachTheModel();
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();

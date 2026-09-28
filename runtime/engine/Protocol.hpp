@@ -137,6 +137,16 @@ enum class ConstraintMode : uint8_t {
   TokenMask = 1,
 };
 
+// Request options, one bit each; a request with any other bit set is a
+// request error.
+enum RequestFlag : uint32_t {
+  // Never select the model's stop tokens, so generation runs to its output
+  // limit. Only unconstrained generation can carry it.
+  RequestIgnoreEndOfSequence = 1U << 0,
+};
+
+inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+
 struct SamplingParameters {
   float temperature = 0.0f;
   float topP = 1.0f;
@@ -193,6 +203,8 @@ struct RequestFrame {
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // RequestFlag bits.
+  uint32_t flags = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };

@@ -37,6 +37,8 @@ if __package__:
         responses_output,
         responses_response,
         stream_chunk,
+        text_completion_chunk,
+        text_completion_response,
     )
     from .backend import NativeBackend, remaining_request_time
     from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
@@ -78,6 +80,8 @@ else:
         responses_output,
         responses_response,
         stream_chunk,
+        text_completion_chunk,
+        text_completion_response,
     )
     from backend import NativeBackend, remaining_request_time
     from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
@@ -523,8 +527,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
         systemone = path == "/v1/systemone"
+        completions = path == "/v1/completions"
         if path not in (
             "/v1/chat/completions",
+            "/v1/completions",
             "/v1/responses",
             "/v1/messages",
             "/v1/messages/count_tokens",
@@ -649,7 +655,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 stream_options = {
                     "include_usage": stream_options.get("include_usage", False)
                 }
-                job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+                if completions:
+                    job = self.app.prepare_completion(body, deadline=deadline)
+                    thinking = has_tools = False
+                else:
+                    job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
             body = None
             self._body_reservation.retain_for(job)
             self._body_reservation = None
@@ -669,6 +679,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._responses_stream(job, thinking, has_tools)
             elif responses:
                 self._responses_complete(job, thinking, has_tools)
+            elif completions and stream:
+                self._text_completion_stream(job, stream_options)
+            elif completions:
+                self._text_completion(job)
             elif stream:
                 self._stream(job, thinking, has_tools, stream_options)
             else:
@@ -947,6 +961,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             completion_response(self.app.model, job, result, message, bool(tool_calls)),
         )
 
+    def _text_completion(self, job):
+        _, text, _, result, _ = self._collect(job, False, False)
+        self._json(200, text_completion_response(self.app.model, job, result, text))
+
     def _anthropic_complete(self, job, thinking, has_tools):
         reasoning, content, tool_calls, result, _ = self._collect(
             job, thinking, has_tools
@@ -1217,12 +1235,24 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # not take a long prefill or resource wait for a dead connection, but
         # event decoders skip it and clients that time out on missing data
         # events ignore it. Streams send it only where no data event fits: the
-        # chat stream before its role chunk, the Responses stream once output
-        # has begun.
+        # chat and text completion streams until the request starts, the
+        # Responses stream once output has begun.
         self._start_event_stream()
         self.wfile.write(b": splash-keepalive\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
+
+    def _sse_error(self, error):
+        self._sse(
+            {
+                "error": {
+                    "message": error.message,
+                    "type": error.protocol_type(),
+                    "code": error.code,
+                }
+            }
+        )
+        self._sse("[DONE]")
 
     def _guarded_stream(self, job, run, send_error):
         try:
@@ -1643,19 +1673,67 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             self._sse("[DONE]")
 
-        def send_error(error):
-            self._sse(
-                {
-                    "error": {
-                        "message": error.message,
-                        "type": error.protocol_type(),
-                        "code": error.code,
-                    }
-                }
+        self._guarded_stream(job, run, self._sse_error)
+
+    def _text_completion_stream(self, job, stream_options):
+        public_id = job.public_id
+
+        def run():
+            first = self._next_event(job, self._sse_keepalive)
+            if first[0] != "start":
+                raise APIError(500, "runtime protocol error", "protocol_error")
+            self._start_event_stream()
+            created = job.created_at
+
+            def put_progress(progress):
+                chunk = text_completion_chunk(self.app.model, public_id, created, "")
+                chunk["prompt_progress"] = progress
+                self._sse(chunk)
+
+            def put_text(_field, text):
+                self._sse(
+                    text_completion_chunk(self.app.model, public_id, created, text)
+                )
+
+            def keepalive():
+                # Clients that time out on missing data events ignore SSE
+                # comments; an empty text chunk is one, as chat's empty
+                # delta is.
+                self._sse(text_completion_chunk(self.app.model, public_id, created, ""))
+
+            _, _, _, result, _ = self._collect(
+                job,
+                False,
+                False,
+                put_text,
+                None,
+                keepalive,
+                put_progress,
             )
+            self._sse(
+                text_completion_chunk(
+                    self.app.model,
+                    public_id,
+                    created,
+                    "",
+                    result.reason,
+                    timings=timings_dict(result),
+                )
+            )
+            if stream_options.get("include_usage"):
+                self._sse(
+                    text_completion_chunk(
+                        self.app.model,
+                        public_id,
+                        created,
+                        "",
+                        usage=usage_dict(result, job),
+                        metrics=metrics_dict(result),
+                    )
+                )
             self._sse("[DONE]")
 
-        self._guarded_stream(job, run, send_error)
+        self._guarded_stream(job, run, self._sse_error)
 
 
 class HttpAdmission:

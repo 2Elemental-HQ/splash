@@ -187,6 +187,7 @@ class GenerationRequest:
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown.
     generation_prompt_tokens: int = 0
+    flags: wire.RequestFlag = wire.RequestFlag(0)
 
 
 @dataclass(slots=True, frozen=True)
@@ -625,6 +626,7 @@ class MultiplexedRuntime:
                 return_progress=request.return_progress,
                 score_tokens=request.score_tokens,
                 generation_prompt_tokens=request.generation_prompt_tokens,
+                flags=request.flags,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)

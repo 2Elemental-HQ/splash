@@ -29,7 +29,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +50,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 68
+assert _REQUEST.size == 72
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -175,6 +175,16 @@ class ConstraintMode(IntEnum):
     TOKEN_MASK = 1
 
 
+class RequestFlag(IntFlag):
+    # Never select the model's stop tokens, so generation runs to its output
+    # limit. Only unconstrained generation can carry it.
+    IGNORE_END_OF_SEQUENCE = 1 << 0
+
+
+# A request with any other bit set is a request error.
+_REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
+
+
 @dataclass(slots=True, frozen=True)
 class SamplingParameters:
     temperature: float = 0.0
@@ -224,6 +234,7 @@ class RequestFrame:
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int = 0
+    flags: RequestFlag = RequestFlag(0)
 
 
 @dataclass(slots=True, frozen=True)
@@ -688,6 +699,14 @@ def _request_issue(
         _enum_value(request.priority, RequestPriority, "request priority")
         cohort = _enum_value(request.cohort, Cohort, "cohort")
         constraint = _enum_value(request.constraint, ConstraintMode, "constraint mode")
+        flags = _u32(
+            int(request.flags)
+            if isinstance(request.flags, RequestFlag)
+            else request.flags,
+            "request flags",
+        )
+        if flags & ~_REQUEST_FLAG_BITS:
+            raise ValueError("request flags are not defined by native protocol")
     except ValueError as error:
         return _issue(
             FailureClass.REQUEST_ERROR,
@@ -795,6 +814,16 @@ def _request_issue(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_COHORT_CONSTRAINT,
             "cohort does not match sampling and constraint semantics",
+            request_id,
+        )
+    # A grammar decides where constrained output ends.
+    if flags & RequestFlag.IGNORE_END_OF_SEQUENCE and (
+        scores or constraint is not ConstraintMode.NONE
+    ):
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COHORT_CONSTRAINT,
+            "only unconstrained generation can ignore end-of-sequence",
             request_id,
         )
     try:
@@ -1150,6 +1179,7 @@ def _encode_message(
                 message.return_progress,
                 len(scores),
                 message.generation_prompt_tokens,
+                message.flags,
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1433,6 +1463,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         return_progress,
         score_count,
         generation_prompt_tokens,
+        flags,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1518,6 +1549,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         bool(return_progress),
         score_tokens,
         generation_prompt_tokens,
+        RequestFlag(flags),
     )
     _raise_issue(_request_issue(request, limits))
     return request
