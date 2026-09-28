@@ -454,6 +454,43 @@ class AgentRunnerTests(unittest.TestCase):
                 if existed:
                     self.assertEqual([p.name for p in profiles.iterdir()], ["splash"])
 
+    def test_hermes_phase_without_a_session_record_reports_the_exit(self):
+        # Hermes creates state.db with its first session; its absence is not
+        # a sqlite error.
+        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
+        for code in (1, 0):
+            with (
+                self.subTest(exit_code=code),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session = "hermes", None
+                runner.folder = runner.workspace = Path(directory)
+                runner.hermes_home = Path(directory, "profile")
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=code)
+                process.poll.return_value = code
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["hermes"], {})),
+                    mock.patch.object(
+                        agent,
+                        "idle_status",
+                        side_effect=[{"requests": idle}, {"requests": idle}],
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", return_value=process),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                    self.assertRaisesRegex(
+                        agent.AgentFailure,
+                        f"^Hermes exited {code} without a session record in "
+                        f"{runner.hermes_home / 'state.db'}; see ",
+                    ),
+                ):
+                    runner.phase("test", "task")
+                self.assertEqual(runner.phases[0]["executed_commands"], [])
+
     def test_continuation_does_not_overwrite_interrupted_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = agent.ClientRun.__new__(agent.ClientRun)

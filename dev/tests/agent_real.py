@@ -575,6 +575,9 @@ class ClientRun:
 
     def hermes_messages(self):
         path = self.hermes_home / "state.db"
+        # Hermes creates it with its first session; the phase reports its absence.
+        if not path.exists():
+            return []
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             if self.session is None:
@@ -738,6 +741,11 @@ class ClientRun:
             raise KeyboardInterrupt
         if reason:
             raise AgentFailure(reason)
+        if not self.session and self.name == "hermes":
+            raise AgentFailure(
+                f"Hermes exited {process.returncode} without a session record in "
+                f"{self.hermes_home / 'state.db'}; see {log}"
+            )
         if not self.session:
             raise AgentFailure("client did not expose a real session id")
         if after["requests"]["failed"] != before["requests"]["failed"]:
