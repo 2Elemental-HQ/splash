@@ -8,6 +8,7 @@ import http.client
 import json
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -26,22 +27,56 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-PROFILES_DIR = paths.PROFILES
+AGENTS_DIR = paths.AGENTS
 PORT = 8000
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# Either stops `splash serve` wherever it is. The programs with handlers of
+# their own, the installer it runs and the server it executes, start with
+# them blocked, not ignored, until those handlers are in place, so one sent
+# meanwhile waits for its handler instead of being lost or ending the
+# program in a traceback. make and the device check run with them unblocked.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class LauncherError(RuntimeError):
     pass
 
 
+class StopSignal(KeyboardInterrupt):
+    """One of STOP_SIGNALS, raised where it arrives, as Ctrl+C is."""
+
+    def __init__(self, number):
+        super().__init__(number)
+        self.number = number
+
+
+def _interrupt(number, _frame):
+    raise StopSignal(number)
+
+
+def _run_held(command, **options):
+    """Run a program that unblocks the stop signals itself, holding them from
+    its spawn. One the launcher takes meanwhile ends the program too."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        with subprocess.Popen(command, **options) as program:
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+                return program.wait()
+            except BaseException:
+                program.kill()
+                raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
-def _profiles_dir(port):
-    return PROFILES_DIR if port == PORT else PROFILES_DIR / "ports" / str(port)
+def _agents_dir(port):
+    return AGENTS_DIR if port == PORT else AGENTS_DIR / "ports" / str(port)
 
 
 def _request_json(path, timeout=2, *, port=PORT):
@@ -118,7 +153,7 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if subprocess.run(command, cwd=ROOT).returncode:
+    if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
 
 
@@ -168,6 +203,10 @@ def _check_port(host, port):
 
 
 def serve(args):
+    # Started in the background from a non-interactive shell, the launcher
+    # inherits SIGINT as ignored; take both stop signals from the start.
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -266,6 +305,9 @@ def serve(args):
         catalog.spawn_refresh()
         os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
+        # The exec resets the handlers; the server unblocks the signals once
+        # its own are in place, past its imports.
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         os.execve(command[0], command, environment)
 
 
@@ -303,7 +345,7 @@ def coding_client(args):
         _base_url(args.port),
         model,
         context,
-        _profiles_dir(args.port),
+        _agents_dir(args.port),
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
@@ -612,8 +654,12 @@ def main(argv=None):
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except StopSignal as stop:
+        # The status a shell gives a program the signal ends: 130 for
+        # SIGINT, 143 for SIGTERM.
+        return 128 + stop.number
     except KeyboardInterrupt:
-        return 130
+        return 128 + signal.SIGINT
 
 
 if __name__ == "__main__":

@@ -50,12 +50,17 @@ overrides this. Concurrent input bytes share a budget of at least 512 MiB
 an input-byte budget, not a process RSS limit: large ASCII/base64 strings can
 use roughly twice their encoded size during JSON parsing alone. Decoded images
 and object-heavy JSON need additional memory. Oversized requests return 413;
-exhausted ingress capacity returns 503. Image and model context limits apply
-independently.
+exhausted ingress capacity returns 503. A connection that has sent no request
+yet, or is receiving an upload refused unread, gives way to a new one when
+every connection slot is taken, the first with that 503, so stalled clients
+cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
 at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
-Timed-out uploads return 408 and release their input reservation.
+Timed-out uploads return 408 and release their input reservation. An upload
+refused before it is read, such as one over the shared budget, is still
+received on these terms, so a client that sends its whole body before reading
+the response gets the refusal.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or
@@ -661,9 +666,11 @@ Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
 original schema validates complete arguments, including cross-field conditions,
 dependencies and property-count rules that framing alone cannot enforce; array
-item bounds and `multipleOf` above 64 are left to that validation as well, and
-the framed schemas of one request are limited to 16 MiB. Extra properties use
-JSON-encoded values; statically typed strings retain raw text.
+item bounds and `multipleOf` above 64 are left to that validation as well, as
+are patterns the grammar cannot compile (look-around, word boundaries,
+backreferences). The framed schemas of one request are limited to 16 MiB. Extra
+properties use JSON-encoded values; statically typed strings retain raw text,
+so their patterns are checked on the complete call.
 `tool_choice: "none"` renders the tools like any other choice and only
 prevents calls. Remote schema references, parameter names containing XML
 delimiters and `unevaluatedProperties` combined with `patternProperties` are
