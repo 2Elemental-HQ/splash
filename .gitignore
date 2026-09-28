@@ -2,8 +2,8 @@ build/
 .venv
 .venv.install.lock
 install/models/
+# Hermes homes of older checkouts, with their sessions and keys.
 install/agents/
-# Agent homes of older checkouts, with Hermes sessions and keys.
 install/profiles/
 .DS_Store
 __pycache__/

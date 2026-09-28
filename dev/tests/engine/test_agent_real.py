@@ -100,10 +100,12 @@ class AgentRunnerTests(unittest.TestCase):
                 "hermes", "hermes", alias / "run", "test-model", 102400, 10, ["text"]
             )
             workspace = physical / "run/project"
-            runtime = root / "runtime"
-            (runtime / "hermes").mkdir(parents=True)
+            runner.hermes_home = root / "profile"
+            runner.hermes_home.mkdir()
             with (
-                contextlib.closing(sqlite3.connect(runtime / "hermes/state.db")) as db,
+                contextlib.closing(
+                    sqlite3.connect(runner.hermes_home / "state.db")
+                ) as db,
                 db,
             ):
                 db.executescript(
@@ -120,11 +122,8 @@ class AgentRunnerTests(unittest.TestCase):
                     "INSERT INTO messages VALUES (1, 'matching', 'assistant', "
                     "'Task complete', NULL, NULL, NULL, 1, 0)"
                 )
-            with (
-                mock.patch.object(agent.launcher, "AGENTS_DIR", runtime),
-                mock.patch.object(
-                    agent.clients, "command", return_value=(["hermes"], {})
-                ),
+            with mock.patch.object(
+                agent.clients, "command", return_value=(["hermes"], {})
             ):
                 messages = runner.hermes_messages()
                 _, environment = runner.argv()
@@ -416,6 +415,82 @@ class AgentRunnerTests(unittest.TestCase):
                             runner.phase("test", "task")
                 self.assertEqual(runner.session, "pi-session")
 
+    def test_hermes_runs_in_its_own_profile_of_the_developers_root(self):
+        # A root of its own would be the bug the launcher avoids: Hermes would
+        # install its tools there and point the developer's hermes command at
+        # them. The run's profile moves into the run's folder afterwards.
+        for existed in (False, True):
+            with (
+                self.subTest(profiles_existed=existed),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.dict(os.environ, {"HOME": directory}),
+            ):
+                os.environ.pop("HERMES_HOME", None)
+                profiles = Path(directory, ".hermes/profiles")
+                if existed:
+                    (profiles / "splash").mkdir(parents=True)
+                runner = agent.ClientRun(
+                    "hermes",
+                    "hermes",
+                    Path(directory, "run"),
+                    "m",
+                    102400,
+                    10,
+                    ["text"],
+                )
+                self.assertRegex(runner.hermes_profile, r"^splash-test-[0-9a-f]{8}$")
+                self.assertEqual(runner.hermes_home, profiles / runner.hermes_profile)
+                runner.hermes_home.mkdir(parents=True)
+                (runner.hermes_home / "state.db").write_bytes(b"sessions")
+                runner.finish_hermes()
+                self.assertEqual(
+                    (runner.folder / "hermes-profile/state.db").read_bytes(),
+                    b"sessions",
+                )
+                self.assertEqual(
+                    sorted(p.name for p in Path(directory, ".hermes").iterdir()),
+                    ["profiles"] if existed else [],
+                )
+                if existed:
+                    self.assertEqual([p.name for p in profiles.iterdir()], ["splash"])
+
+    def test_hermes_phase_without_a_session_record_reports_the_exit(self):
+        # Hermes creates state.db with its first session; its absence is not
+        # a sqlite error.
+        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
+        for code in (1, 0):
+            with (
+                self.subTest(exit_code=code),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session = "hermes", None
+                runner.folder = runner.workspace = Path(directory)
+                runner.hermes_home = Path(directory, "profile")
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=code)
+                process.poll.return_value = code
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["hermes"], {})),
+                    mock.patch.object(
+                        agent,
+                        "idle_status",
+                        side_effect=[{"requests": idle}, {"requests": idle}],
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", return_value=process),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                    self.assertRaisesRegex(
+                        agent.AgentFailure,
+                        f"^Hermes exited {code} without a session record in "
+                        f"{runner.hermes_home / 'state.db'}; see ",
+                    ),
+                ):
+                    runner.phase("test", "task")
+                self.assertEqual(runner.phases[0]["executed_commands"], [])
+
     def test_continuation_does_not_overwrite_interrupted_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = agent.ClientRun.__new__(agent.ClientRun)
@@ -638,6 +713,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
                     runner.opencode_data = Path(directory) / "opencode-data"
+                    runner.hermes_profile = "splash-test-0123abcd"
                     runner.session = session
                     runner.version = 2 if name == "opencode" else None
 
@@ -648,7 +724,8 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.clients, "command", side_effect=launch
                     ) as adapter:
                         argv, env = runner.argv()
-                    # Pi, Codex and OpenCode keep their state in the run.
+                    # Pi, Codex and OpenCode keep their state in the run, and
+                    # Hermes in the run's profile.
                     state = {
                         "pi": {"PI_CODING_AGENT_DIR": str(runner.pi_home)},
                         "codex": {"CODEX_HOME": str(runner.codex_home)},
@@ -663,11 +740,11 @@ class AgentRunnerTests(unittest.TestCase):
                         agent.BASE_URL,
                         "Actual-model",
                         102400,
-                        agent.launcher.AGENTS_DIR,
                         dict(agent.os.environ, **state),
                         input_modalities=["text"],
                         client_args=argv[1:],
                         client_version=runner.version,
+                        hermes_profile=runner.hermes_profile,
                     )
                     for forbidden in (
                         "--ephemeral",
@@ -710,6 +787,7 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.input_modalities = ["text"]
                 runner.workspace = Path("/test/project")
                 runner.opencode_data = Path("/test/run/opencode-data")
+                runner.hermes_profile = None
                 runner.session, runner.version = None, version
                 self.assertEqual(runner.argv()[0][1:], run)
 
@@ -803,6 +881,7 @@ class AgentRunnerTests(unittest.TestCase):
                 runner.workspace = Path("/test/project")
                 runner.folder = Path("/test/run")
                 runner.opencode_data = runner.folder / "opencode-data"
+                runner.hermes_profile = None
                 runner.session, runner.version = "ses_1", version
                 history = {"messages": []}
 

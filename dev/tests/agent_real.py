@@ -13,6 +13,8 @@ import json
 import os
 import random
 import re
+import secrets
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -484,6 +486,13 @@ class ClientRun:
         self.codex_home = (folder / "codex-home").resolve()
         self.pi_home = (folder / "pi-agent").resolve()
         self.opencode_data = (folder / "opencode-data").resolve()
+        # A profile of the developer's own Hermes root: Hermes takes any other
+        # home for a root of its own, where it would install its tools and to
+        # which it would point the developer's hermes command. finish_hermes
+        # moves it into this folder.
+        self.hermes_profile = f"splash-test-{secrets.token_hex(4)}"
+        self.hermes_home = clients.hermes_profile_home(os.environ, self.hermes_profile)
+        self.hermes_profiles_existed = self.hermes_home.parent.is_dir()
         # OpenCode's record of the session, as the last phase exported it.
         self.opencode = {"turns": [], "compactions": []}
         folder.mkdir(parents=True)
@@ -537,7 +546,7 @@ class ClientRun:
         untouched: Pi's agent directory (providers, sessions, settings and
         extensions), Codex's home, and OpenCode's data directory, whose
         session database OpenCode 2 migrates to a schema OpenCode 1 cannot
-        open."""
+        open. Hermes runs in this run's own profile."""
         environment = dict(os.environ)
         match self.name:
             case "pi":
@@ -553,11 +562,11 @@ class ClientRun:
             BASE_URL,
             self.model,
             self.context,
-            launcher.AGENTS_DIR,
             environment,
             input_modalities=self.input_modalities,
             client_args=arguments,
             client_version=self.version,
+            hermes_profile=self.hermes_profile,
         )
         # subprocess(cwd=...) does not update inherited PWD. Keep both views
         # consistent, just as a user shell entering the project would.
@@ -565,7 +574,10 @@ class ClientRun:
         return argv, env
 
     def hermes_messages(self):
-        path = launcher.AGENTS_DIR / "hermes/state.db"
+        path = self.hermes_home / "state.db"
+        # Hermes creates it with its first session; the phase reports its absence.
+        if not path.exists():
+            return []
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             if self.session is None:
@@ -729,6 +741,11 @@ class ClientRun:
             raise KeyboardInterrupt
         if reason:
             raise AgentFailure(reason)
+        if not self.session and self.name == "hermes":
+            raise AgentFailure(
+                f"Hermes exited {process.returncode} without a session record in "
+                f"{self.hermes_home / 'state.db'}; see {log}"
+            )
         if not self.session:
             raise AgentFailure("client did not expose a real session id")
         if after["requests"]["failed"] != before["requests"]["failed"]:
@@ -846,6 +863,17 @@ class ClientRun:
             history = json.load(output)
         atomic_json(self.folder / "history.json", history)
         return history
+
+    def finish_hermes(self):
+        """Move this run's Hermes profile, with its native history, into the
+        run's folder, leaving the developer's Hermes root as it was."""
+        if self.hermes_home.exists():
+            shutil.move(self.hermes_home, self.folder / "hermes-profile")
+        if not self.hermes_profiles_existed:
+            try:
+                self.hermes_home.parent.rmdir()
+            except OSError:
+                pass
 
     def check_artifact(self, stage):
         if not any(
@@ -1101,6 +1129,8 @@ def main(argv=None):
             except Exception as error:
                 entry.update(result="fail", error=str(error))
                 print(f"{name}: FAIL: {error}", flush=True)
+            finally:
+                runner.finish_hermes()
             atomic_json(args.output, document)
             remaining = selected[selected.index(name) + 1 :]
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():
