@@ -647,8 +647,9 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 
 ## Code and API boundaries
 
-- `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, typed
-  judgments, templates, streaming and input processing. No client-version branches.
+- `server/`: OpenAI Chat/Completions/Responses, Anthropic Messages/count_tokens,
+  typed judgments, templates, streaming and input processing. No client-version
+  branches.
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
@@ -703,13 +704,25 @@ raw tokenization does not account for image embeddings (use `count_tokens` for t
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
 
+`POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
+string, which the loaded tokenizer encodes as a raw prompt, adding its own
+special tokens such as a BOS and recognizing special-token strings, or one array
+of token IDs from its vocabulary. No chat template, reasoning split, tools or
+images apply: `text` is the generated text, decoded without special tokens.
+`max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
+SGLang, or to what the context leaves when that is less. `temperature`,
+`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+`stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
+`echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
 initial cached tokens, completed tokens including cache, and elapsed milliseconds
 since prefill admission. Updates follow completed chunks and never regress during
-recovery; they are not a time estimate. Chat uses empty-delta chunks, Responses
-uses `response.in_progress`, and Messages uses `ping`. Queueing and prompt
-preparation do not advance this counter. Non-streaming requests cannot enable it.
+recovery; they are not a time estimate. Chat uses empty-delta chunks, text
+completions empty-text chunks, Responses `response.in_progress`, and Messages
+`ping`. Queueing and prompt preparation do not advance this counter.
+Non-streaming requests cannot enable it.
 
 `GET /status` returns instance identity and the effective context limit as JSON.
 Proxy consumers can use these fields; additional fields may be added:
@@ -727,11 +740,12 @@ Proxy consumers can use these fields; additional fields may be added:
 `GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
 require the API key when authentication is enabled. Consumers should tolerate
 missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat streams include token usage when the request sets
-`"stream_options":{"include_usage":true}`; non-streaming Chat responses always
-include usage. A proxy must consume these fields to display statistics.
+an engine restart. Chat and text completion streams include token usage when
+the request sets `"stream_options":{"include_usage":true}`; their non-streaming
+responses always include usage. A proxy must consume these fields to display
+statistics.
 
-Chat completions also include a llama-server-style `timings` object, both in
+Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
 even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
 and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures

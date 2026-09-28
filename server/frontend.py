@@ -86,6 +86,11 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 
 
+# Text completions' output budget when max_tokens is omitted: OpenAI's
+# default for the endpoint, which vLLM and SGLang also use.
+COMPLETION_DEFAULT_MAX_TOKENS = 16
+
+
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
@@ -209,6 +214,16 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+
+
+@dataclass(frozen=True)
+class GenerationOptions:
+    """Sampling and stop options, validated alike by every generation API."""
+
+    temperature: float
+    top_p: float
+    top_k: int
+    stop_sequences: tuple[str, ...]
 
 
 def validate_served_model_name(value):
@@ -462,6 +477,78 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             return self._prepare(body, tool_namespaces, deadline, clamp_output_budget)
+
+    def prepare_completion(self, body, *, deadline=None):
+        """A text completion: the prompt generates as given, with no chat
+        template, reasoning split, tools or images."""
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        with self._preparation(deadline):
+            nullable = {
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "n",
+                "best_of",
+                "presence_penalty",
+                "frequency_penalty",
+                "max_tokens",
+                "suffix",
+                "echo",
+                "logprobs",
+            }
+            body = {
+                key: value
+                for key, value in body.items()
+                if value is not None or key not in nullable
+            }
+            if not self.accepts_model(body.get("model", self.model)):
+                raise APIError(
+                    404, f"model {body['model']} not found", "model_not_found"
+                )
+            # A request generates one text and returns only that text.
+            for field in ("suffix", "logprobs"):
+                if field in body:
+                    raise APIError(400, f"{field} is not supported")
+            if body.get("echo", False) is not False:
+                raise APIError(400, "echo is not supported")
+            for field in ("best_of", "n"):
+                value = body.get(field, 1)
+                if not isinstance(value, int) or isinstance(value, bool) or value != 1:
+                    raise APIError(400, f"{field} must be 1")
+            options = self._generation_options(body)
+            prompt_tokens = self._completion_prompt(body.get("prompt"))
+            remaining_request_time(deadline)
+            # The default is a ceiling: a prompt that leaves less context
+            # generates up to the rest.
+            requested = body.get("max_tokens")
+            max_new = self._output_budget(
+                COMPLETION_DEFAULT_MAX_TOKENS if requested is None else requested,
+                prompt_tokens,
+                "max_tokens",
+                clamp=requested is None,
+            )
+            return self._generation_job(body, options, prompt_tokens, max_new, deadline)
+
+    def _completion_prompt(self, prompt):
+        """A string encodes as a raw prompt, with the tokenizer's own special
+        tokens such as a BOS; token ids must be in its vocabulary."""
+        if isinstance(prompt, str):
+            try:
+                tokens = self._tokenize(prompt, add_special_tokens=True)["input_ids"]
+            except Exception as error:
+                raise APIError(400, "prompt could not be tokenized") from error
+        elif isinstance(prompt, list) and all(type(token) is int for token in prompt):
+            vocabulary = len(self.tokenizer)
+            if any(not 0 <= token < vocabulary for token in prompt):
+                raise APIError(400, "prompt token ids must be in the vocabulary")
+            tokens = prompt
+        else:
+            raise APIError(400, "prompt must be one string or one array of token ids")
+        if not tokens:
+            raise APIError(400, "prompt must not be empty")
+        return list(tokens)
 
     def count_tokens(self, body, *, deadline=None):
         if deadline is None:
@@ -848,34 +935,7 @@ class Frontend:
             if value is not None or key not in nullable
         }
         prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
-        temperature = body.get("temperature", 1.0)
-        top_p, top_k = body.get("top_p", 0.95), body.get("top_k", 20)
-        if (
-            not is_finite_number(temperature)
-            or not is_finite_number(top_p)
-            or not isinstance(top_k, int)
-            or isinstance(top_k, bool)
-            or temperature < 0
-            or temperature > 2
-            or (temperature != 0 and temperature < MIN_FLOAT32_SUBNORMAL)
-            or not 0 < top_p <= 1
-            or top_p < MIN_FLOAT32_SUBNORMAL
-            or not 1 <= top_k <= wire.MAX_TOP_K
-        ):
-            raise APIError(400, "invalid sampling parameters")
-        stop = body.get("stop")
-        if stop in (None, []):
-            stop_sequences = ()
-        elif isinstance(stop, str) and stop:
-            stop_sequences = (stop,)
-        elif (
-            isinstance(stop, list)
-            and 1 <= len(stop) <= 4
-            and all(isinstance(value, str) and value for value in stop)
-        ):
-            stop_sequences = tuple(stop)
-        else:
-            raise APIError(400, "stop must be a string or up to four strings")
+        options = self._generation_options(body)
         n = body.get("n", 1)
         logprobs = body.get("logprobs")
         if (
@@ -885,17 +945,6 @@ class Frontend:
             or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
         ):
             raise APIError(400, "n and logprobs are not currently supported")
-        penalties = (
-            body.get("presence_penalty", 0),
-            body.get("frequency_penalty", 0),
-            body.get("min_p", 0),
-        )
-        if any(
-            not is_finite_number(value) or value != 0 for value in penalties
-        ) or body.get("logit_bias") not in (None, {}):
-            raise APIError(
-                400, "the requested logits or output transformation is not supported"
-            )
         tools, tool_policy = prompt.tools, prompt.tool_policy
         response_schema, response_validator = (
             prompt.response_schema,
@@ -903,7 +952,7 @@ class Frontend:
         )
         # A stop sequence could cut a tool call or a structured result short;
         # under tool_choice none the tools are only described, never called.
-        if stop_sequences and (
+        if options.stop_sequences and (
             (tools and tool_policy.schemas) or response_schema is not None
         ):
             raise APIError(
@@ -939,45 +988,18 @@ class Frontend:
                 prompt_tokens, prepared_images, image_positions
             )
         remaining_request_time(deadline)
-        if len(prompt_tokens) >= self.max_context:
-            raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
-        max_new = body.get(
+        max_new = self._output_budget(
+            body.get("max_completion_tokens", body.get("max_tokens")),
+            prompt_tokens,
             "max_completion_tokens",
-            body.get(
-                "max_tokens",
-                min(self.default_max_new, self.max_context - len(prompt_tokens)),
-            ),
+            clamp_output_budget,
         )
-        if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
-            raise APIError(400, "max_completion_tokens must be a positive integer")
-        if len(prompt_tokens) + max_new > self.max_context:
-            if not clamp_output_budget:
-                raise APIError(
-                    400,
-                    "prompt and max_completion_tokens exceed the context window",
-                    "context_length_exceeded",
-                )
-            # This API treats the output budget as a ceiling. Generate up to
-            # the remaining context and report the length stop if it is reached.
-            max_new = self.max_context - len(prompt_tokens)
-        seed = body.get("seed")
-        if seed is None:
-            seed = secrets.randbits(64)
-        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
-            raise APIError(400, "seed must be an unsigned 64-bit integer")
-        priority = self._priority(body)
-        request_id = next(self.ids)
-        job = Job(
-            request_id=request_id,
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=max_new,
-            seed=seed,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            deadline=deadline,
-            priority=priority,
-            stop_sequences=stop_sequences,
+        job = self._generation_job(
+            body,
+            options,
+            prompt_tokens,
+            max_new,
+            deadline,
             thinking=thinking,
             thinking_display=(
                 "omitted" if body.get("thinking_display") == "omitted" else "summarized"
@@ -989,11 +1011,100 @@ class Frontend:
             image_spans=image_spans,
             image_pixels=image_pixels,
             image_owner=prepared_images if prepared_images else None,
-            public_id=secrets.token_hex(16),
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
         )
         return job, thinking, bool(tools)
+
+    def _generation_options(self, body):
+        temperature = body.get("temperature", 1.0)
+        top_p, top_k = body.get("top_p", 0.95), body.get("top_k", 20)
+        if (
+            not is_finite_number(temperature)
+            or not is_finite_number(top_p)
+            or not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or temperature < 0
+            or temperature > 2
+            or (temperature != 0 and temperature < MIN_FLOAT32_SUBNORMAL)
+            or not 0 < top_p <= 1
+            or top_p < MIN_FLOAT32_SUBNORMAL
+            or not 1 <= top_k <= wire.MAX_TOP_K
+        ):
+            raise APIError(400, "invalid sampling parameters")
+        stop = body.get("stop")
+        if stop in (None, []):
+            stop_sequences = ()
+        elif isinstance(stop, str) and stop:
+            stop_sequences = (stop,)
+        elif (
+            isinstance(stop, list)
+            and 1 <= len(stop) <= 4
+            and all(isinstance(value, str) and value for value in stop)
+        ):
+            stop_sequences = tuple(stop)
+        else:
+            raise APIError(400, "stop must be a string or up to four strings")
+        penalties = (
+            body.get("presence_penalty", 0),
+            body.get("frequency_penalty", 0),
+            body.get("min_p", 0),
+        )
+        if any(
+            not is_finite_number(value) or value != 0 for value in penalties
+        ) or body.get("logit_bias") not in (None, {}):
+            raise APIError(
+                400, "the requested logits or output transformation is not supported"
+            )
+        return GenerationOptions(temperature, top_p, top_k, stop_sequences)
+
+    def _output_budget(self, requested, prompt_tokens, field, clamp=False):
+        """The output token budget, requested under the API's field name or
+        the server default, within the context window the prompt leaves."""
+        if len(prompt_tokens) >= self.max_context:
+            raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
+        remaining = self.max_context - len(prompt_tokens)
+        max_new = (
+            min(self.default_max_new, remaining) if requested is None else requested
+        )
+        if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
+            raise APIError(400, f"{field} must be a positive integer")
+        if max_new > remaining:
+            if not clamp:
+                raise APIError(
+                    400,
+                    f"prompt and {field} exceed the context window",
+                    "context_length_exceeded",
+                )
+            # This API treats the output budget as a ceiling. Generate up to
+            # the remaining context and report the length stop if it is reached.
+            max_new = remaining
+        return max_new
+
+    def _generation_job(
+        self, body, options, prompt_tokens, max_new, deadline, **fields
+    ):
+        """The job for a prepared prompt, with the endpoint's own fields."""
+        seed = body.get("seed")
+        if seed is None:
+            seed = secrets.randbits(64)
+        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
+            raise APIError(400, "seed must be an unsigned 64-bit integer")
+        priority = self._priority(body)
+        return Job(
+            request_id=next(self.ids),
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=max_new,
+            seed=seed,
+            temperature=options.temperature,
+            top_p=options.top_p,
+            top_k=options.top_k,
+            deadline=deadline,
+            priority=priority,
+            stop_sequences=options.stop_sequences,
+            public_id=secrets.token_hex(16),
+            **fields,
+        )
 
     def prepare_responses(self, body, *, deadline=None, reserve_input=None):
         if deadline is None:
