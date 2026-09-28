@@ -124,6 +124,23 @@ a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
 
+`splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
+user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
+creates it with `hermes profile create` on first use. It writes only the
+profile's model settings; Hermes's tools and the root's `config.yaml` remain
+the user's.
+
+Earlier versions gave Hermes a home of its own, `install/agents/hermes` in a
+checkout or `~/Library/Application Support/Splash/runtime/hermes` in a
+release, which Hermes took for a root: a Hermes that manages its own runtime
+installed its tools there and pointed the `hermes` command at them. While that
+directory still exists, run `hermes pm install` once in a normal shell; it
+installs Hermes's tools under `~/.hermes/tools` and points the `hermes` and
+`hermes-acp` launchers in `~/.hermes/hermes-agent/.hermes/bin` at them. Once
+those launchers no longer name the old directory, or do not exist, as with
+Hermes before its managed runtime, delete it with the sessions Splash started
+there.
+
 ### KV cache precision
 
 Select the target KV format when starting the server:
@@ -1020,6 +1037,10 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+`test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
+root, `splash-test-<id>`, which moves into the run's folder under
+`build/release` when Hermes finishes.
+
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 
@@ -1218,5 +1239,5 @@ publicly accessible. Check the installed bottle on a supported Mac without
 developer tools; building from the source tree is not an installation check.
 
 The runtime package allowlists engine, Python, server and launcher files; tests,
-benchmarks and developer documents are excluded. User model links and Hermes
-sessions survive upgrades; downloads remain in the Hugging Face cache.
+benchmarks and developer documents are excluded. User model links survive
+upgrades; downloads remain in the Hugging Face cache.

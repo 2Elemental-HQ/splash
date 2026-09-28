@@ -754,9 +754,10 @@ class LauncherTests(unittest.TestCase):
                             "SPLASH_PORT": str(port),
                             "SPLASH_API_KEY": "test-key",
                             "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
+                            # Hermes's root.
+                            "HOME": temporary,
                         },
                     ),
-                    mock.patch.object(launcher, "AGENTS_DIR", Path(temporary)),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
                     ),
@@ -766,6 +767,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.object(launcher.os, "execvpe") as execute,
                     mock.patch("sys.stdout", io.StringIO()),
                 ):
+                    os.environ.pop("HERMES_HOME", None)
                     for name in launcher.clients.INSTALL_URLS:
                         launcher.main([name])
                         self.assertEqual(
@@ -773,9 +775,6 @@ class LauncherTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             command.call_args.args[3:5], (MODEL_ID, 102400)
-                        )
-                        self.assertEqual(
-                            command.call_args.args[5], launcher._agents_dir(port)
                         )
                     self.assertEqual(
                         execute.call_count, len(launcher.clients.INSTALL_URLS)
@@ -978,14 +977,6 @@ class LauncherTests(unittest.TestCase):
             ):
                 launcher.main(["serve", "--model", MODEL_ID])
             self.assertEqual(held, [str(assembly.resolve() / "target")])
-
-    def test_agent_homes_are_not_named_profiles(self):
-        # Hermes reads <root>/profiles/<name> as a profile of <root> and writes
-        # its shared files into <root>: the checkout's install/ directory, had
-        # Splash kept its agent homes in install/profiles. Homes for other
-        # ports are a level deeper, under ports/, and were not affected.
-        home = launcher._agents_dir(launcher.PORT) / "hermes"
-        self.assertNotEqual(home.parent.name, "profiles")
 
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.

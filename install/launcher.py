@@ -27,7 +27,6 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-AGENTS_DIR = paths.AGENTS
 PORT = 8000
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -73,10 +72,6 @@ def _run_held(command, **options):
 
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
-
-
-def _agents_dir(port):
-    return AGENTS_DIR if port == PORT else AGENTS_DIR / "ports" / str(port)
 
 
 def _request_json(path, timeout=2, *, port=PORT):
@@ -345,7 +340,6 @@ def coding_client(args):
         _base_url(args.port),
         model,
         context,
-        _agents_dir(args.port),
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
