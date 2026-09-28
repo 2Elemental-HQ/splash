@@ -715,6 +715,15 @@ SGLang, or to what the context leaves when that is less. `temperature`,
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
+Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
+and llama.cpp do: the model never selects its own stop tokens, and a draft
+proposal of one is rejected, so generation runs to its output budget and
+finishes with `length` unless a `stop` string ends it first. Benchmarks use it
+to generate a fixed number of tokens. Tools and structured output generate
+under a grammar, which decides where the output ends, so combining them with
+`ignore_eos` returns 400. The engine receives it as bit 0 of the request
+frame's flags word (native wire version 7), which rejects undefined bits.
+
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
 initial cached tokens, completed tokens including cache, and elapsed milliseconds

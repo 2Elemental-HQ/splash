@@ -18,6 +18,10 @@ static_assert(protocol::kMaximumScoreOptions ==
 static_assert(protocol::kMinimumScoreOptions ==
                   model::ExecutionLimits::minimumScoreOptions,
               "native protocol and model score option bounds must match");
+static_assert(uint32_t{protocol::RequestIgnoreEndOfSequence} ==
+                      uint32_t{RequestIgnoreEndOfSequence} &&
+                  protocol::kRequestFlagBits == kRequestFlagBits,
+              "native protocol and model request flags must match");
 
 RequestPriority mapPriority(protocol::RequestPriority priority) {
   switch (priority) {
@@ -282,6 +286,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
                               request.sampling.topP, request.sampling.topK,
                               request.seed};
     engineRequest.constraint = mapConstraint(request.constraint);
+    engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;
     engineRequest.deadlineMilliseconds =
         nowMonotonic + double(remaining) / 1000.0;

@@ -224,6 +224,7 @@ class GenerationOptions:
     top_p: float
     top_k: int
     stop_sequences: tuple[str, ...]
+    ignore_eos: bool
 
 
 def validate_served_model_name(value):
@@ -958,12 +959,19 @@ class Frontend:
             raise APIError(
                 400, "stop cannot be combined with tools or structured output"
             )
+        # Tools and structured output generate under a grammar, which decides
+        # where the output ends.
+        constrained = bool(tools) or response_schema is not None
+        if options.ignore_eos and constrained:
+            raise APIError(
+                400, "ignore_eos cannot be combined with tools or structured output"
+            )
         rendered = self._render_prompt(prompt, deadline)
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
         remaining_request_time(deadline)
-        if tools or response_schema is not None:
+        if constrained:
             with self.latencies.measure("grammar"):
                 if tools:
                     constraint = self.constraint_factory.create(
@@ -1056,7 +1064,10 @@ class Frontend:
             raise APIError(
                 400, "the requested logits or output transformation is not supported"
             )
-        return GenerationOptions(temperature, top_p, top_k, stop_sequences)
+        ignore_eos = body.get("ignore_eos", False)
+        if not isinstance(ignore_eos, bool):
+            raise APIError(400, "ignore_eos must be a boolean")
+        return GenerationOptions(temperature, top_p, top_k, stop_sequences, ignore_eos)
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
         """The output token budget, requested under the API's field name or
@@ -1102,6 +1113,11 @@ class Frontend:
             deadline=deadline,
             priority=priority,
             stop_sequences=options.stop_sequences,
+            flags=(
+                wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+                if options.ignore_eos
+                else wire.RequestFlag(0)
+            ),
             public_id=secrets.token_hex(16),
             **fields,
         )

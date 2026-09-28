@@ -15,10 +15,10 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480700180001000000580000000000000000000000efcdab8967452301"
+    "53504c4807001800010000005c0000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
     "cc4c3f3333733f200000001032547698badcfe00000000000200000000000000"
-    "010000002a00000000000080ffffffff"
+    "00000000010000002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
     "53504c4807001800050100002700000000000000000000000200000000000000"
@@ -86,6 +86,11 @@ int main() {
     score.constraint = ConstraintMode::None;
     score.scoreTokens = {101, 202, 303};
     show(score);
+    RequestFrame ignoreEos = request;
+    ignoreEos.cohort = Cohort::Sampling;
+    ignoreEos.constraint = ConstraintMode::None;
+    ignoreEos.flags = RequestIgnoreEndOfSequence;
+    show(ignoreEos);
     show(CancelFrame{91});
     show(MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}});
     show(StatusRequestFrame{808});
@@ -161,11 +166,21 @@ def example_score_request():
     )
 
 
+def example_ignore_eos_request():
+    return replace(
+        example_request(),
+        cohort=p.Cohort.SAMPLING,
+        constraint=p.ConstraintMode.NONE,
+        flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE,
+    )
+
+
 def all_messages():
     return [
         example_request(),
         example_image_request(),
         example_score_request(),
+        example_ignore_eos_request(),
         p.CancelFrame(91),
         p.MaskResponseFrame(91, 7, (0xFFFFFFFF, 0, 0xA5A5A5A5)),
         p.StatusRequestFrame(808),
@@ -412,7 +427,7 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<I", wire, 24 + 60)[0], len(request.score_tokens)
         )
         self.assertEqual(
-            struct.unpack_from("<3I", wire, 24 + 68 + 4 * 3),
+            struct.unpack_from("<3I", wire, 24 + 72 + 4 * 3),
             request.score_tokens,
         )
         self.assertEqual(
@@ -495,7 +510,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_malformed_score_frames_preserve_request_error_codes(self):
         request = example_score_request()
         payload = p.encode_message(request).payload
-        score_offset = 68 + 4 * len(request.prompt_tokens)
+        score_offset = 72 + 4 * len(request.prompt_tokens)
         for tokens, output_tokens in (
             ((101,), 0),
             ((101, 101), 0),
@@ -639,22 +654,22 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 88, 0),
+            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 92, 0),
         )
         self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 0)
         self.assertEqual(
-            struct.unpack_from("<I", wire, 24 + 64)[0],
-            request.generation_prompt_tokens,
+            struct.unpack_from("<II", wire, 24 + 64),
+            (request.generation_prompt_tokens, request.flags),
         )
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 68), request.prompt_tokens
+            struct.unpack_from("<5I", wire, 24 + 72), request.prompt_tokens
         )
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 68 + 4 * len(image.prompt_tokens)
+        span_offset = 24 + 72 + 4 * len(image.prompt_tokens)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),
@@ -681,6 +696,53 @@ class ProtocolPythonTests(unittest.TestCase):
                         p.FailureClass.REQUEST_ERROR, p.IssueCode.INVALID_COUNT, check
                     )
                     self.assertEqual(issue.request_id, request.request_id)
+
+    def test_request_flags_follow_the_generation_prompt(self):
+        request = example_ignore_eos_request()
+        wire = p.serialize_message(request)
+        self.assertEqual(struct.unpack_from("<I", wire, 24 + 68)[0], 1)
+        decoded = p.decode_frame(parse_all(wire)[0])
+        self.assertEqual(decoded, request)
+        self.assertIs(type(decoded.flags), p.RequestFlag)
+        # An undefined bit, or ignoring end-of-sequence where a grammar or
+        # scoring decides the output, fails the request on either side.
+        cases = [
+            (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
+            for flags in (1 << 1, 1 << 31, 0xFFFFFFFF)
+        ] + [
+            (
+                replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),
+                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+            )
+            for base in (example_request(), example_score_request())
+        ]
+        for invalid, code in cases:
+            mutated = mutate_u32(
+                p.serialize_message(replace(invalid, flags=p.RequestFlag(0))),
+                24 + 68,
+                int(invalid.flags),
+            )
+            for side, check in (
+                ("encode", lambda invalid=invalid: p.serialize_message(invalid)),
+                (
+                    "decode",
+                    lambda mutated=mutated: p.decode_frame(parse_all(mutated)[0]),
+                ),
+            ):
+                with self.subTest(flags=int(invalid.flags), side=side):
+                    issue = self.assert_protocol_error(
+                        p.FailureClass.REQUEST_ERROR, code, check
+                    )
+                    self.assertEqual(issue.request_id, request.request_id)
+        for flags in (True, -1, 1 << 32, 1.0):
+            with self.subTest(flags=flags):
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_ENUM_VALUE,
+                    lambda flags=flags: p.serialize_message(
+                        replace(request, flags=flags)
+                    ),
+                )
 
     def test_token_words_must_be_exact_uint32_ints(self):
         base = example_request()
