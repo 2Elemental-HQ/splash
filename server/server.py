@@ -1173,9 +1173,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._last_sse_write = time.monotonic()
 
     def _sse_keepalive(self):
-        # SSE comments are invisible to SDK event decoders but still count as
-        # transport progress. Long prefill and resource waits must not look
-        # like dead connections to strict local-agent idle timers.
+        # An SSE comment is traffic, so socket read timeouts and proxies do
+        # not take a long prefill or resource wait for a dead connection, but
+        # event decoders skip it and clients that time out on missing data
+        # events ignore it. Streams send it only where no data event fits: the
+        # chat stream before its role chunk, the Responses stream once output
+        # has begun.
         self._start_event_stream()
         self.wfile.write(b": splash-keepalive\n\n")
         self.wfile.flush()
@@ -1242,7 +1245,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     response=responses_response(self.app.model, job, "in_progress", []),
                 )
             else:
-                # Do not replace already-streamed output with an empty snapshot.
+                # The data event that adds nothing, response.in_progress,
+                # carries a snapshot of the response, which would replace the
+                # output streamed so far. A comment keeps the stream alive
+                # instead, though clients that time out on missing data events
+                # ignore it.
                 self._sse_keepalive()
 
         def start_part(kind, item, index):

@@ -3953,6 +3953,25 @@ class ServerTest(unittest.TestCase):
                 response.read()
                 connection.close()
 
+    def test_stream_keepalive_is_a_comment_until_the_role_chunk(self):
+        plan = Plan([[4]], before_start=True)
+        harness = self.harness(FakeRuntime(plan))
+        with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
+            connection, response = harness.open_stream(
+                "/v1/chat/completions",
+                self.body(stream=True, reasoning_effort="none"),
+            )
+            try:
+                self.assertEqual(response.readline(), b": splash-keepalive\n")
+                self.assertFalse(plan.started.is_set())
+                plan.start_release.set()
+                role = json.loads(self.next_sse_data(response))
+                self.assertEqual(role["choices"][0]["delta"]["role"], "assistant")
+            finally:
+                plan.start_release.set()
+                response.read()
+                connection.close()
+
     def test_responses_stream_heartbeats_before_native_start(self):
         plan = Plan([[4]], before_start=True)
         harness = self.harness(FakeRuntime(plan))
