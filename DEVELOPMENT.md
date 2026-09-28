@@ -528,6 +528,17 @@ and represent different operator contracts. Arena sizing collects each
 projection's actual layout (a GGUF target's block projections beside its
 affine draft's) and reserves the vocabulary head only for decode.
 
+Affine Q4 decode (`runtime/ops/Linear.cpp`) runs MPP tiles on Apple10 and later
+(the M6 reports family 11 and runs the same rules) and bf16 simdgroup matrix
+tiles on Apple9. On Apple10 a projection with at most two N128 tiles per core
+runs that tile over two, four or eight K partitions (`LinearTile::Split128`,
+`kernels/decode/linear_q4_grid_split.metal`), the most whose split grid still
+fits four 256-thread threadgroups per core; the last partition of each tile
+adds the fp32 partials in split order, so the sums do not depend on
+scheduling. The split count depends on the grid per core, never on the batch
+width, so a request's sums are the same alone and batched. Every other
+projection keeps the sequential tiles (`dev/benchmarks/device-policy.md`).
+
 ### GGUF targets
 
 `--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
