@@ -208,14 +208,22 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  bool hostFits =
-      hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
+  // Growth leaves the warning margin free above the host's reserve, except
+  // back to the serving footprint: that is what a request is served from,
+  // and a pressure pass that released it must not leave the server unable
+  // to start one while other applications hold the margin.
+  const bool withinServingFootprint =
+      !overflows && observed <= servingFootprintBytes_ &&
+      requested <= servingFootprintBytes_ - observed;
+  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  const uint64_t hostMargin = withinServingFootprint ? 0 : kHostWarningMarginBytes;
+  bool hostFits = requested <= hostRoom && hostRoom - requested >= hostMargin;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || hostHeld() ||
+  if (!engineFits || !hostFits || (hostHeld() && !withinServingFootprint) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -252,6 +260,11 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::markServingFootprint() noexcept {
+  std::lock_guard lock(mutex_);
+  servingFootprintBytes_ = observedResidentBytes(true);
+}
+
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
@@ -278,6 +291,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   return {
       limitBytes_,
       observed,
+      servingFootprintBytes_,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,

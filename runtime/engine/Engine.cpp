@@ -88,6 +88,7 @@ void Engine::submit(EngineRequest value) {
     }
   }
   Request requestState;
+  requestState.sequence = counters_.submitted;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
@@ -172,6 +173,12 @@ bool Engine::tick(double now) {
     progressed = true;
   }
   progressed = pollRestores(now) || progressed;
+  // The earliest submitted of the lanes with work in flight.
+  uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
+  if (pending_) {
+    for (const BatchItem &item : pending_->plan.items)
+      earliestWorking = std::min(earliestWorking, request(item.requestId).sequence);
+  }
   const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
     // Admission is deliberately paused while resident peers finish. Start a
@@ -180,9 +187,16 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
+    // A lane submitted earlier holds memory this request may wait for until
+    // it finishes; while it works, the wait's limit restarts.
+    if (active.sequence > earliestWorking)
+      active.resourceWait.earlierLaneWorkMilliseconds = now;
     const double deadline = resourceDeadline(active);
     if (!active.finalized && deadline > 0.0 && now >= deadline) {
-      finishFailure(active, {"resource_timeout", "memory did not become available within the resource wait limit", true});
+      std::string message = "memory did not become available within the resource wait limit";
+      if (active.resourceWait.allocationFailure == metal::AllocationFailure::HostPressure)
+        message += ": macOS is short of memory; close memory-heavy applications";
+      finishFailure(active, {"resource_timeout", std::move(message), true});
       progressed = true;
     }
   }
@@ -363,7 +377,7 @@ bool Engine::admitQueued(double now) {
       continue;
     if (cellsFull) {
       scheduler_.waitForResources(id);
-      deferResourceRetry(active, now, StateFailure::ConcurrencyLimit);
+      deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
       continue;
     }
     active.admissionProbe =
@@ -529,7 +543,7 @@ bool Engine::admit(Request &active, double now) {
         return true;
       }
       scheduler_.waitForResources(active.request.id);
-      deferResourceRetry(active, now, admission.failure, denial.pending);
+      deferResourceRetry(active, now, denial, admission.failure);
       return false;
     }
     executorStarted = true;
@@ -565,7 +579,7 @@ bool Engine::admit(Request &active, double now) {
         // Release the prefix pin before retrying without its memory footprint.
         active.skipCache = true;
         scheduler_.waitForResources(requestId);
-        deferResourceRetry(active, now);
+        deferResourceRetry(active, now, kv.denial);
         return false;
       }
       if (verdict == Verdict::Fail) {
@@ -573,7 +587,7 @@ bool Engine::admit(Request &active, double now) {
         return true;
       }
       scheduler_.waitForResources(requestId);
-      deferResourceRetry(active, now, StateFailure::MemoryPressure, kv.denial.pending);
+      deferResourceRetry(active, now, kv.denial);
       return false;
     }
     active.resourceWait = {};
@@ -709,13 +723,14 @@ bool Engine::resourceRetryReady(const Request &active,
 }
 
 void Engine::deferResourceRetry(Request &active, double now,
-                                StateFailure reason, bool pending) noexcept {
+                                const Denial &denial, StateFailure reason) noexcept {
   auto &wait = active.resourceWait;
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
   const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
   wait.reason = reason;
-  wait.pending = pending;
+  wait.allocationFailure = denial.allocationFailure;
+  wait.pending = denial.pending;
   if (reason == StateFailure::ConcurrencyLimit)
     wait.deadlineMilliseconds = 0.0;
   else if (progressed || wait.deadlineMilliseconds <= 0.0)
@@ -726,8 +741,13 @@ void Engine::deferResourceRetry(Request &active, double now,
 
 double Engine::resourceDeadline(const Request &active) const noexcept {
   const ResourceWait &wait = active.resourceWait;
-  return wait.pending && wait.epoch != resourceEpoch_ ? 0.0
-                                                      : wait.deadlineMilliseconds;
+  if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
+    return 0.0;
+  // The limit restarts whenever a lane submitted before the request works,
+  // however long that takes. Later lanes do not extend it: requests that
+  // keep arriving would otherwise hold it until the request's deadline.
+  return std::max(wait.deadlineMilliseconds,
+                  wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
 
 void Engine::signalResourceProgress() noexcept {
@@ -1037,8 +1057,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
   if (std::any_of(denied.begin(), denied.end(),
                   [](const Denied &entry) { return entry.denial.pending; })) {
     for (const Denied &entry : denied)
-      deferResourceRetry(request(entry.requestId), now, StateFailure::MemoryPressure,
-                         entry.denial.pending);
+      deferResourceRetry(request(entry.requestId), now, entry.denial);
     return Prepared::Waiting;
   }
   const Denied &victim = *std::min_element(
@@ -1204,7 +1223,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
                       failure != metal::AllocationFailure::HostPressure;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
-  deferResourceRetry(active, now);
+  deferResourceRetry(active, now, {.allocationFailure = failure});
   ++counters_.resourceSuspensions;
 }
 

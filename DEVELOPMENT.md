@@ -777,13 +777,22 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
+A lane's arithmetic can depend on the batch it decodes in and on how its
+prompt is chunked. Concurrent requests change both, and chunk boundaries also
+come from the cached boundary a request resumes from and from the junctions
+and checkpoints earlier requests left. So a greedy or seeded request repeats
+its output when it runs alone with the same cached prefixes; alongside other
+requests, or with other prefixes cached, it can differ.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
 prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
 work. These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
-requests then resume first, each within its own resource wait. Readiness does
+requests then resume first, each within its own resource wait. A resource
+wait's limit restarts whenever a lane submitted before the waiting request has
+work in flight, since that lane holds memory the request waits for until it
+finishes; lanes submitted after the request do not extend it. Readiness does
 not guarantee that a request-sized allocation fits.
 
 ### Disk cache
