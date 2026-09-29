@@ -274,6 +274,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def send_error(self, code, message=None, explain=None):
+        # The stdlib's send_error, which answers requests it cannot parse or
+        # route and parse_request's 505, writes an HTML page. After a request
+        # line it cannot parse, or HTTP/0.9's, request_version is HTTP/0.9,
+        # and it writes that page with no status line or headers. Answer as
+        # any other error, over HTTP/1.1.
+        self.request_version = self.protocol_version
+        path = getattr(self, "path", "").partition("?")[0]
+        self._safe_error(
+            APIError(code, message or self.responses[code][0]),
+            path.startswith("/v1/messages"),
+            log=False,
+        )
+
     @property
     def app(self):
         return self.server.app
