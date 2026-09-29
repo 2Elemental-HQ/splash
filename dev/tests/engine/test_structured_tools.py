@@ -134,6 +134,26 @@ class StructuredToolGrammarTest(unittest.TestCase):
         self.assert_complete(CALL + "\n" + OTHER_CALL, choice="required", schema=None)
         self.assert_not_complete(CALL + "\n" + CALL, choice=named, schema=None)
 
+    def test_a_call_with_too_many_parameters_fails_where_it_begins(self):
+        # The grammar compiles, but the parser cannot admit every parameter
+        # name at once: requests check each call's opening before prefill.
+        properties = {f"p{index}": {"type": "string"} for index in range(1100)}
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "wide", "parameters": {"properties": properties}},
+            }
+        ]
+        grammar = tool_schema.tool_grammar(
+            tool_schema.normalize_tools(tools, "auto", True)[1], False
+        )
+        self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
+        opening = self.tokenizer.encode(
+            tool_schema.TOOL_CALL_OPEN + tool_schema.function_opening("wide")
+        ).ids
+        matcher = LLMatcher(self.guidance, grammar, log_level=0)
+        self.assertFalse(matcher.consume_tokens(opening))
+
     def test_none_keeps_the_tools_but_lets_no_call_start(self):
         # The prompt renders the tools as for any choice; only output changes.
         tools, none = tool_schema.normalize_tools(TOOLS, "none", True)

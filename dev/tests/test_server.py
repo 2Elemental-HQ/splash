@@ -516,7 +516,7 @@ class FakeConstraintFactory:
     def __init__(self):
         self.grammars = []
 
-    def create(self, grammar, *, timeout=None):
+    def create(self, grammar, *, timeout=None, prefixes=None):
         self.grammars.append(grammar)
         return SimpleNamespace(consume=lambda _tokens: None)
 
@@ -527,7 +527,7 @@ class FakeConstraintFactory:
 class PassThroughConstraintFactory:
     """Leaves generation unconstrained, for tests that do not check grammars."""
 
-    def create(self, grammar, *, timeout=None):
+    def create(self, grammar, *, timeout=None, prefixes=None):
         return None
 
     def stats(self):
@@ -810,6 +810,51 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(all(result.grammar == "shared" for result in results))
         self.assertEqual(Matcher.builds, 1)
         self.assertEqual(factory.stats()["hits"], 3)
+
+    def test_constraint_factory_checks_prefixes_when_it_compiles(self):
+        class Matcher:
+            @staticmethod
+            def validate_grammar(_grammar, _tokenizer):
+                return None
+
+            def __init__(self, _tokenizer, grammar, log_level=0):
+                self.grammar = grammar
+
+            def is_error(self):
+                return False
+
+            def deep_copy(self):
+                return self
+
+            def consume_tokens(self, tokens):
+                return tokens != [9]
+
+        compiled = []
+
+        def prefixes(*extra):
+            compiled.append(extra)
+            return [([1], "fine"), *extra]
+
+        with (
+            mock.patch("server.constraints.guidance_tokenizer", return_value=object()),
+            mock.patch("server.constraints.LLMatcher", Matcher),
+            mock.patch("server.constraints.LLExecutor", return_value=object()),
+            mock.patch(
+                "server.constraints.TokenConstraint",
+                side_effect=lambda matcher, _: matcher,
+            ),
+        ):
+            factory = generation_constraints.ConstraintFactory(object())
+            for _ in range(2):
+                with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
+                    factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))
+                self.assertEqual(caught.exception.status, 400)
+            factory.create("narrow", prefixes=prefixes)
+            factory.create("narrow", prefixes=prefixes)
+
+        # A failing grammar is not cached; a cached one is not checked again.
+        self.assertEqual(compiled, [(([9], "too wide"),)] * 2 + [()])
+        self.assertEqual(list(factory.cache), ["narrow"])
 
     @staticmethod
     def openai_client(harness):
