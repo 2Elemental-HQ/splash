@@ -922,7 +922,8 @@ class ServerTest(unittest.TestCase):
             tokenizer = ByteLevelTestTokenizer(raw_tokens)
             token_ids = list(tokenizer.token_ids)
             token_ids.insert(max(1, len(token_ids) // 2), tokenizer.eos_token_id)
-            expected = tokenizer.decode(token_ids)
+            # The one-shot decode, less a character the output ends inside.
+            expected = tokenizer.decode(token_ids).rstrip("\ufffd")
             for seed in range(50):
                 randomizer = random.Random(seed)
                 chunks = []
@@ -956,7 +957,29 @@ class ServerTest(unittest.TestCase):
                 streamer.put_tokens(token_ids[offset : offset + size])
                 offset += size
             streamer.end()
-            self.assertEqual("".join(chunks), tokenizer.decode(token_ids), seed)
+            self.assertEqual(
+                "".join(chunks), tokenizer.decode(token_ids).rstrip("\ufffd"), seed
+            )
+
+    def test_callback_streamer_drops_a_character_the_output_ends_inside(self):
+        # "é" is b"\xc3\xa9". Output that ends after its first byte decodes it
+        # to U+FFFD, which is dropped; one that text follows stays.
+        tokenizer = ByteLevelTestTokenizer([b"caf", b"\xc3", b" noir"])
+        caf, lead, noir = tokenizer.token_ids
+        for incremental in (True, False):
+            for token_ids, expected in (
+                ([caf, lead], "caf"),
+                ([caf, lead, noir, lead], "caf\ufffd noir"),
+            ):
+                chunks = []
+                streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
+                if not incremental:
+                    # As an invalid DecodeStream prefix leaves it: the end
+                    # decodes the whole output.
+                    streamer.decode_stream = None
+                streamer.put_tokens(token_ids)
+                streamer.end()
+                self.assertEqual("".join(chunks), expected)
 
     def test_callback_streamer_reconciles_an_invalid_decoder_prefix(self):
         tokenizer = ByteLevelTestTokenizer([b'{"', b"value", b'":', b"123", b"}"])

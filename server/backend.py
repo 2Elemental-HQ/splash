@@ -213,7 +213,10 @@ class CallbackStreamer:
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
-        self._emit(decoded[len(handled) :])
+        # Bytes of a multi-byte character the output ends inside decode to
+        # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
+        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
+        self._emit(decoded[len(handled) :].rstrip("\ufffd"))
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""
