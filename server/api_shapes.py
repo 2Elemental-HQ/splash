@@ -935,6 +935,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
             if isinstance(tool.get("description"), str):
                 function["description"] = tool["description"]
+            if "strict" in tool:
+                function["strict"] = tool["strict"]
             chat["tools"].append({"type": "function", "function": function})
     choice = body.get("tool_choice")
     if choice is not None:

@@ -232,6 +232,77 @@ def _grammar_compatible_schema(schema):
     return output
 
 
+# Keywords that apply further schemas to the instance a schema describes.
+IN_PLACE_APPLICATORS = {
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependencies",
+    "extends",
+    "$dynamicRef",
+    "$recursiveRef",
+}
+SCHEMA_IDENTIFIERS = {
+    "$schema",
+    "$id",
+    "$anchor",
+    "$dynamicAnchor",
+    "$defs",
+    "definitions",
+}
+# Keywords by which an object says which properties it takes beyond those it
+# declares.
+MORE_PROPERTIES = {"additionalProperties", "unevaluatedProperties", "patternProperties"}
+
+
+def _extended(node):
+    """Whether other schemas apply to the instance `node` describes, so that
+    `node` may declare only some of its properties."""
+    keys = set(node) - SCHEMA_ANNOTATIONS - SCHEMA_IDENTIFIERS
+    if keys & IN_PLACE_APPLICATORS or ("$ref" in keys and keys != {"$ref"}):
+        return True
+    unions = keys & {"anyOf", "oneOf"}
+    return bool(unions and keys - unions - {"type"})
+
+
+def _strict_schema(schema):
+    """The schema a strict tool's arguments are generated to, as vLLM and
+    SGLang generate them with XGrammar's strict mode: an object that does not
+    say which properties it takes beyond those it declares takes none, and
+    an array that does not say which items it takes beyond its leading ones
+    takes none. Validation keeps the declared schema.
+
+    A schema that other schemas of the same instance extend, as an allOf
+    does, may declare only some of its properties, and closing it would
+    refuse the others; a schema composed that way is left as declared."""
+    if any(_extended(node) for node in _schemas(schema) if isinstance(node, dict)):
+        return schema
+    output = copy.deepcopy(schema)
+    for node in _schemas(output):
+        if not isinstance(node, dict):
+            continue
+        keys = set(node)
+        # A union or a reference describes its instance by its alternatives
+        # or its target, which are closed in their own places.
+        if keys & {"anyOf", "oneOf", "$ref"}:
+            continue
+        kind = node.get("type")
+        kinds = kind if isinstance(kind, list) else [kind]
+        if "object" in kinds or (kind is None and "properties" in keys):
+            if not keys & MORE_PROPERTIES:
+                node["additionalProperties"] = False
+        if "array" in kinds or (kind is None and "prefixItems" in keys):
+            if isinstance(node.get("items"), list):
+                if not keys & {"additionalItems", "unevaluatedItems"}:
+                    node["additionalItems"] = False
+            elif not keys & {"items", "unevaluatedItems"}:
+                node["items"] = False
+    return output
+
+
 def _lookup_tool_reference(ref, root):
     if not isinstance(ref, str) or not ref.startswith("#"):
         raise APIError(400, "unsupported tool parameter reference")
@@ -745,11 +816,14 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             schema = {}
         if not isinstance(schema, (dict, bool)):
             raise APIError(400, f"invalid tool schema for {name}")
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise APIError(400, f"strict must be a boolean for tool {name}")
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
             validators[name] = build_validator(schema, _schemas, LOCAL_REGISTRY)
-            schemas[name] = schema
+            schemas[name] = _strict_schema(schema) if strict else schema
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"
