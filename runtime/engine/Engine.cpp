@@ -15,13 +15,16 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), model_(model), events_(events) {
+    : config_(config), cache_(cache), model_(model), events_(events),
+      scheduler_(config_.decodeShare) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
   if (!std::isfinite(config_.resourceWaitTimeoutMilliseconds) ||
       config_.resourceWaitTimeoutMilliseconds <= 0.0)
     throw std::invalid_argument("resource wait timeout must be positive and finite");
+  if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
+    throw std::invalid_argument("decode share must be nonnegative and finite");
   if (config_.prefillCheckpointTokens &&
       (config_.prefillCheckpointTokens <
            model::ExecutionLimits::draftContextTokens ||

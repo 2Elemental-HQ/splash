@@ -2147,6 +2147,13 @@ def parse_args(argv=None):
         type=_parse_max_cache_disk,
         default=0,
     )
+    parser.add_argument(
+        "--decode-share",
+        type=float,
+        default=None,
+        help="decode time owed per unit of prefill time while other requests "
+        "decode (default: 0.5; 0 alternates one command each)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=None)
@@ -2183,6 +2190,10 @@ def parse_args(argv=None):
         args.request_timeout = math.inf
     elif not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
+    if args.decode_share is not None and (
+        not is_finite_number(args.decode_share) or args.decode_share < 0
+    ):
+        parser.error("--decode-share must be nonnegative and finite")
     if args.queue_size <= 0:
         parser.error("--queue-size must be positive")
     if not 0 <= args.port <= 65535:
@@ -2203,6 +2214,8 @@ def _native_command(args):
         command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.decode_share is not None:
+        command.extend(("--decode-share", str(args.decode_share)))
     return command
 
 
