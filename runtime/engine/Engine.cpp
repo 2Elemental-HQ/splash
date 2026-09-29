@@ -1166,7 +1166,7 @@ CacheReclaimResult Engine::reclaimForGrowth(CacheReclaimMode mode) {
 }
 
 bool Engine::reclaimIdleState() noexcept {
-  if (!model_.reclaimIdleState())
+  if (!model_.reclaimIdleState(false))
     return false;
   signalResourceProgress();
   return true;
@@ -1194,7 +1194,7 @@ CacheReclaimResult Engine::reuseIdleBackingWhilePaused(const TokenAdmission &adm
     // An evicted state parks its buffers in the model's pool; under pressure
     // that memory goes back to the host now rather than waiting for the
     // next background pass.
-    while (model_.reclaimIdleState()) {
+    while (model_.reclaimIdleState(false)) {
     }
     signalResourceProgress();
   }
@@ -1231,18 +1231,20 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   if (!directive.reclaimEmptyKvExtents)
     return {};
 
+  const bool keep = directive.keepServingFootprint;
   uint64_t released = 0;
-  while (const uint64_t idle = model_.reclaimIdleState())
+  while (const uint64_t idle = model_.reclaimIdleState(keep))
     released += idle;
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Even a zero-byte directive may release completely empty KV extents.
-  const uint64_t fromCache = cache_.reclaimCache(
-      remaining, directive.evictAllUnpinnedPrefixes, directive.keepResumePoint);
+  const uint64_t fromCache =
+      cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
+                          directive.keepResumePoint, keep);
   released += fromCache;
   // Evicted states park their buffers in the model's pool; a pressure pass
   // returns that memory to the host now rather than keeping it warm.
-  while (model_.reclaimIdleState()) {
+  while (model_.reclaimIdleState(keep)) {
   }
   if (released)
     signalResourceProgress();
