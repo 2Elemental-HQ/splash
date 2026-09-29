@@ -286,6 +286,8 @@ def serve(args):
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.request_timeout is not None:
             command.extend(["--request-timeout", str(args.request_timeout)])
+        if args.queue_size is not None:
+            command.extend(["--queue-size", str(args.queue_size)])
         if args.no_webui:
             command.append("--no-webui")
         for host in args.allowed_host:
@@ -465,6 +467,18 @@ def _parse_request_timeout(value):
     return timeout
 
 
+def _parse_queue_size(value):
+    # Mirror the server's own validation (--queue-size must be positive) so
+    # bad values fail before installation or model work.
+    try:
+        size = int(value)
+    except ValueError:
+        size = 0
+    if size <= 0:
+        raise argparse.ArgumentTypeError("use a positive number of requests such as 32")
+    return size
+
+
 def _parse_max_image_pixels(value):
     try:
         pixels = int(value)
@@ -609,6 +623,12 @@ def parse_args(argv=None):
         type=_parse_request_timeout,
         help="seconds before a queued or in-flight request expires with 504 "
         "(default: none)",
+    )
+    server.add_argument(
+        "--queue-size",
+        type=_parse_queue_size,
+        help="requests admitted at once, running or waiting; more get 503 "
+        "(default: 32)",
     )
     server.add_argument(
         "--api-key",

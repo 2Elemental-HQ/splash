@@ -111,6 +111,17 @@ class LauncherTests(unittest.TestCase):
                 launcher.main(base + ["--request-timeout", "3600"])
             execute.assert_called_once()
 
+    def test_queue_size_is_optional_and_positive(self):
+        base = ["serve", "--model", MODEL_ID]
+        # Unset stays unset: the server's own default (32) remains authoritative.
+        self.assertIsNone(launcher.parse_args(base).queue_size)
+        self.assertEqual(
+            launcher.parse_args(base + ["--queue-size", "64"]).queue_size, 64
+        )
+        for value in ("0", "-1", "1.5", "many"):
+            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                launcher.parse_args(base + ["--queue-size", value])
+
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
@@ -306,6 +317,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(
                     argv[argv.index("--max-cache-disk") + 1], str(5 * 1024**3)
                 )
+                self.assertEqual(argv[argv.index("--queue-size") + 1], "64")
                 self.assertEqual(
                     argv[-4:],
                     ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
@@ -353,6 +365,8 @@ class LauncherTests(unittest.TestCase):
                         "28G",
                         "--max-cache-disk",
                         "5G",
+                        "--queue-size",
+                        "64",
                         "--allowed-host",
                         "splash.local",
                         "--allowed-host",

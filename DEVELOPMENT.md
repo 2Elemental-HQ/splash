@@ -107,6 +107,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
 | `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
