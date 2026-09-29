@@ -539,6 +539,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "error")
         self.assertEqual(error.status, 503)
         self.assertEqual(error.code, "runtime_unavailable")
+        # A failure to start, rather than of an engine running the request,
+        # keeps its own reason.
+        self.assertEqual(error.message, "native startup failed")
         self.assertFalse(transport.active)
 
     def test_pending_limit_does_not_leave_active_state(self):

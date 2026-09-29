@@ -726,6 +726,16 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
+        except engine_runtime.EngineUnhealthy:
+            # An admitted request ends with EngineUnhealthy only when the
+            # engine running it fails, and the backend restarts that engine.
+            # The console names the failure; a client can only retry.
+            error = APIError(
+                503,
+                "the inference engine stopped unexpectedly and is restarting; "
+                "retry the request",
+                "runtime_unavailable",
+            )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
