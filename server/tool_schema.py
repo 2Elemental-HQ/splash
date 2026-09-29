@@ -33,6 +33,12 @@ PARAMETER_CLOSE = "\n</parameter>\n"
 THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
 
 
+def function_opening(name):
+    """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
+    arguments."""
+    return f"{FUNCTION_OPEN}{name}>\n"
+
+
 LOCAL_REGISTRY = Registry()
 
 # Framing projects each tool's fields through schema composition and copies
@@ -765,9 +771,11 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             or name not in validators
         ):
             raise APIError(400, "invalid named tool_choice")
-        # The prompt keeps every tool; the grammar and validators force the call.
+        # The prompt keeps every tool; the grammar and validators force the
+        # call, exactly one, as a forced function is defined.
         validators = {name: validators[name]}
         schemas = {name: schemas[name]}
+        parallel = False
     elif choice not in ("auto", "required"):
         raise APIError(400, "invalid tool_choice")
     policy = ToolPolicy(
@@ -792,47 +800,49 @@ def tool_grammar(policy, thinking, response_schema=None):
         # An older declared dialect leaves newer keywords unchecked, so framing
         # can meet any JSON value where it reads part of a schema.
         raise APIError(400, "unsupported tool parameter schema") from error
+    # Text of the model's own may come before a call only where the answer
+    # may be text. A required call, like a JSON answer, stands apart from the
+    # reasoning and from other calls by whitespace alone.
+    separator = "WS" if policy.required or response_schema is not None else "TEXT"
     side_grammars = []
     tag_rules = []
     for index, (name, grammar) in enumerate(zip(policy.argument_schemas, arguments)):
         grammar_name = f"arguments_{index}"
         side_grammars.append({"name": grammar_name, "lark_grammar": grammar})
         tag_rules.append(
-            f"tool_{index}: {'WS' if response_schema is not None else 'TEXT'} {TOOL_CALL_OPEN} "
-            f"{json.dumps(FUNCTION_OPEN + name + '>' + chr(10))} "
+            f"tool_{index}: {separator} {TOOL_CALL_OPEN} "
+            f"{json.dumps(function_opening(name))} "
             f"@{grammar_name} {json.dumps(FUNCTION_CLOSE.removesuffix(TOOL_CALL_CLOSE))} "
             f"{TOOL_CALL_CLOSE}"
         )
     tool_choice = (
         "(" + " | ".join(f"tool_{index}" for index in range(len(tag_rules))) + ")"
     )
+    calls = tool_choice + ("+" if policy.parallel else "") + " WS"
     thinking_prefix = "think " if thinking else ""
     if not tag_rules:
         # tool_choice "none": neither the text nor a JSON answer starts a call.
         body = "tail" if response_schema is None else "answer"
         start = f"start: {thinking_prefix}{body}"
     elif response_schema is not None:
-        calls = tool_choice + ("+" if policy.parallel else "") + " WS"
         body = calls if policy.required else f"({calls} | answer)"
         start = f"start: {thinking_prefix}{body}"
     elif policy.required:
-        body = tool_choice + ("+" if policy.parallel else "")
-        start = f"start: {thinking_prefix}{body}"
+        start = f"start: {thinking_prefix}{calls}"
     else:
         body = tool_choice + ("*" if policy.parallel else "?")
         start = f"start: {thinking_prefix}{body} tail"
     main = ["%llguidance {}", start]
     if response_schema is not None:
-        main.extend(
-            [
-                "answer: WS %json "
-                + json.dumps(
-                    _grammar_compatible_schema(response_schema), separators=(",", ":")
-                )
-                + " WS",
-                r"WS: /[ \n\r\t]*/",
-            ]
+        main.append(
+            "answer: WS %json "
+            + json.dumps(
+                _grammar_compatible_schema(response_schema), separators=(",", ":")
+            )
+            + " WS"
         )
+    if separator == "WS":
+        main.append(r"WS: /[ \n\r\t]*/")
     if thinking:
         main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
     main.extend(

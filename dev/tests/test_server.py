@@ -5219,8 +5219,8 @@ class ServerTest(unittest.TestCase):
         named = {"type": "function", "function": {"name": "g"}}
         cases = (
             ({"tool_choice": "none"}, False, True, "tail"),
-            ({"tool_choice": "required"}, True, True, "(tool_0 | tool_1)+"),
-            ({"tool_choice": named}, True, True, "(tool_0)+"),
+            ({"tool_choice": "required"}, True, True, "(tool_0 | tool_1)+ WS"),
+            ({"tool_choice": named}, True, False, "(tool_0) WS"),
             ({"parallel_tool_calls": False}, False, False, "(tool_0 | tool_1)? tail"),
         )
         for extra, required, parallel, start in cases:

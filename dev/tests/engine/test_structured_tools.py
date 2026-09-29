@@ -65,12 +65,12 @@ class StructuredToolGrammarTest(unittest.TestCase):
             cls.tokenizer.to_str(), eos_token=cls.tokenizer.token_to_id("<eos>")
         )
 
-    def matcher(self, choice="auto", parallel=True, thinking=False):
+    def matcher(self, choice="auto", parallel=True, thinking=False, schema=SCHEMA):
         with mock.patch.object(
             tool_schema, "THINK_END_TOKEN_ID", self.tokenizer.token_to_id("</think>")
         ):
             grammar = tool_schema.tool_grammar(
-                policy(choice, parallel), thinking, SCHEMA
+                policy(choice, parallel), thinking, schema
             )
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         return LLMatcher(self.guidance, grammar)
@@ -118,6 +118,21 @@ class StructuredToolGrammarTest(unittest.TestCase):
         self.assert_not_complete(
             OTHER_CALL, choice={"type": "function", "function": {"name": "lookup"}}
         )
+
+    def test_required_and_named_calls_follow_the_reasoning_directly(self):
+        # Reasoning stays free; after it only whitespace may precede a call.
+        named = {"type": "function", "function": {"name": "lookup"}}
+        for choice in ("required", named):
+            for thinking, reasoning in ((False, ""), (True, "Look it up.</think>")):
+                settings = {"choice": choice, "thinking": thinking, "schema": None}
+                with self.subTest(choice=choice, thinking=thinking):
+                    for text in (CALL, "\n\n" + CALL, CALL + "\n"):
+                        self.assert_complete(reasoning + text, **settings)
+                    for text in ("", "plain answer", "Sure. " + CALL):
+                        self.assert_not_complete(reasoning + text, **settings)
+        # A required choice may call several tools, a named one exactly once.
+        self.assert_complete(CALL + "\n" + OTHER_CALL, choice="required", schema=None)
+        self.assert_not_complete(CALL + "\n" + CALL, choice=named, schema=None)
 
     def test_none_keeps_the_tools_but_lets_no_call_start(self):
         # The prompt renders the tools as for any choice; only output changes.
