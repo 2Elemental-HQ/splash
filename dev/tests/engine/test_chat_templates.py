@@ -659,6 +659,67 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 with self.assertRaisesRegex(APIError, "assistant generation prefix"):
                     frontend(template_tokenizer).prepare(body)
 
+    def test_template_kwargs_are_template_variables(self):
+        """A request's chat_template_kwargs reach the template: its own
+        enable_thinking outranks the reasoning effort and the server default,
+        and a variable only another template reads is probed when first set."""
+        messages = [{"role": "user", "content": "Hi"}]
+
+        def frontend(template, **options):
+            return fixtures.make_frontend(
+                chat_tokenizer(template, "<|im_start|>", "<|im_end|>"),
+                None,
+                "test-model",
+                4096,
+                16,
+                10,
+                2,
+                vision=False,
+                **options,
+            )
+
+        qwen = source("qwen36_gguf")
+        off, on = {"enable_thinking": False}, {"enable_thinking": True}
+        for options, extra, kwargs, thinking, tokens in (
+            ({}, {}, off, False, 7),
+            ({"default_reasoning_effort": "high"}, {}, off, False, 7),
+            ({}, {"reasoning_effort": "high"}, off, False, 7),
+            ({}, {"reasoning_effort": "none"}, on, True, 5),
+        ):
+            with self.subTest(options=options, extra=extra, kwargs=kwargs):
+                job, found, _tools = frontend(qwen, **options).prepare(
+                    {
+                        "model": "test-model",
+                        "messages": messages,
+                        "chat_template_kwargs": kwargs,
+                        **extra,
+                    }
+                )
+                self.assertEqual(
+                    (found, job.generation_prompt_tokens), (thinking, tokens)
+                )
+        # A switch Splash does not set, as DeepSeek's templates name it.
+        switch = (
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>"
+            "{% if thinking %}<think>{% else %}</think>{% endif %}{% endif %}"
+        )
+        app = frontend(switch)
+        body = {"model": "test-model", "messages": messages}
+        for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
+            _job, thinking, _tools = app.prepare(
+                {**body, "chat_template_kwargs": kwargs}
+            )
+            self.assertEqual(thinking, expected)
+        self.assertEqual(app.chat_templates.select(None).probe.cache_info().misses, 1)
+        for kwargs, error in (
+            ("on", "must be an object"),
+            ({"tools": []}, "cannot set tools"),
+            ({"add_generation_prompt": False}, "cannot set add_generation_prompt"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(APIError, error):
+                app.prepare({**body, "chat_template_kwargs": kwargs})
+
     class ScoringTokenizer(
         fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer
     ):
