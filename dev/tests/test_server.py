@@ -6208,6 +6208,8 @@ class ServerTest(unittest.TestCase):
             self.body(top_p=1e-46),
             self.body(presence_penalty=1),
             self.body(presence_penalty=False),
+            self.body(repetition_penalty=1.1),
+            self.body(repetition_penalty=True),
             self.body(min_p=0.1),
             self.body(logit_bias={"1": 2}),
             self.body(stream="true"),
@@ -6275,6 +6277,10 @@ class ServerTest(unittest.TestCase):
             body = self.body()
             if stop is not None:
                 body["stop"] = stop
+            status, _, _ = harness.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200)
+        for repetition_penalty in (None, 1):
+            body = self.body(repetition_penalty=repetition_penalty)
             status, _, _ = harness.request("POST", "/v1/chat/completions", body)
             self.assertEqual(status, 200)
 
