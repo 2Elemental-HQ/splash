@@ -106,6 +106,50 @@ void checkDense(const std::filesystem::path &directory) {
   }
 }
 
+// IQ4_XS gate pairs retain their format and native row stride on both
+// architectures; mixed pairs must still be refused before preparation.
+void checkIq4xsAlphaBeta(const std::filesystem::path &directory) {
+  for (bool moe : {false, true}) {
+    const SmallTarget target = smallTarget(moe);
+    const auto &g = target.geometry;
+    const auto path = directory / (moe ? "moe-iq4xs.gguf" : "dense-iq4xs.gguf");
+    const auto tensorsWith = [&](uint32_t betaType, uint32_t alphaType) {
+      std::vector<Tensor> tensors = target.tensors;
+      for (const char *name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+        Tensor &tensor = tensorNamed(tensors, name);
+        tensor.type = tensor.name.ends_with("_beta.weight") ? betaType : alphaType;
+        const auto &traits = *model::ggmlTypeTraits(tensor.type);
+        tensor.data.resize(uint64_t{g.gdnValueHeads} * g.hiddenSize / traits.blockElements * traits.blockBytes);
+      }
+      return tensors;
+    };
+    writeGguf(path, tensorsWith(model::ggml::kIQ4_XS, model::ggml::kIQ4_XS), g);
+    const Plan result = plan(path, g);
+    check(!result.error, std::string("planner accepts IQ4_XS alpha/beta for ") + g.architecture() +
+                             (result.error ? ": " + *result.error : ""));
+    if (!result.error) {
+      const auto *pair = repackOf(result.images[0], "blk.0.ssm_beta.weight");
+      const auto heads = [&](const model::gguf::TensorRows &rows, const char *name) {
+        return rows.name == name && rows.type == model::ggml::kIQ4_XS && rows.rows == g.gdnValueHeads &&
+               rows.rowBytes == gguf_reference::rowBytes(gguf_reference::IQ4XS, g.hiddenSize) &&
+               grouped(rows.order, 0, 1, g);
+      };
+      check(pair && pair->format == GGUF_FMT_IQ4XS && pair->columns == g.hiddenSize &&
+                pair->rows == QUANT_TILE_ROWS && pair->sources.size() == 2 &&
+                heads(pair->sources[0], "blk.0.ssm_beta.weight") &&
+                heads(pair->sources[1], "blk.0.ssm_alpha.weight"),
+            "planner preserves IQ4_XS type, stride, grouped beta/alpha order and tile padding");
+    }
+    for (uint32_t other : {model::ggml::kQ8_0, model::ggml::kF32})
+      for (bool betaIq4xs : {false, true}) {
+        writeGguf(path, tensorsWith(betaIq4xs ? model::ggml::kIQ4_XS : other,
+                                   betaIq4xs ? other : model::ggml::kIQ4_XS), g);
+        check(names(plan(path, g), {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}),
+              "planner refuses mismatched IQ4_XS alpha/beta types and names both tensors");
+      }
+  }
+}
+
 void checkMoe(const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(true);
   const model::gguf::TargetGeometry &g = target.geometry;
@@ -243,6 +287,11 @@ void checkRotation(const std::filesystem::path &directory) {
   check(!q8.error, "planner plans a rotation that names Q8_0 alpha/beta" + (q8.error ? ": " + *q8.error : ""));
   check(names(planned(model::ggml::kQ8_0, false), {"the rotation must name every quantized tensor"}),
         "planner refuses a rotation that leaves out Q8_0 alpha/beta");
+  const Plan iq4xs = planned(model::ggml::kIQ4_XS, true);
+  check(!iq4xs.error,
+        "planner plans a rotation that names IQ4_XS alpha/beta" + (iq4xs.error ? ": " + *iq4xs.error : ""));
+  check(names(planned(model::ggml::kIQ4_XS, false), {"the rotation must name every quantized tensor"}),
+        "planner refuses a rotation that leaves out IQ4_XS alpha/beta");
 }
 
 } // namespace
@@ -252,6 +301,7 @@ int main() {
     const splash::test::TemporaryDirectory directory("splash-gguf-planner");
     guarded("planner on the dense target", [&] { checkDense(directory.path()); });
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
+    guarded("planner on IQ4_XS alpha/beta", [&] { checkIq4xsAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);

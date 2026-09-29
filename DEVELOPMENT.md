@@ -532,8 +532,8 @@ and lists every unsupported tensor in one error:
 - token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: both Q8_0, both F32 or both BF16, which preparation
-  widens to the F32 values it equals.
+- GDN alpha and beta: matching Q8_0, IQ4_XS, F32 or BF16 pairs; preparation
+  widens BF16 exactly to F32.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
 and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
@@ -550,7 +550,7 @@ tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
 the token table, whose rows are stored as H (D e). The engine runs that one
 form, on dense targets whose rotation names exactly the tensors the planner
-repacks (every quantized projection and the head, and alpha/beta when Q8_0),
+repacks (every quantized projection and the head, and alpha/beta when Q8_0 or IQ4_XS),
 a PQ2_0 token table, and GDN value heads in grouped order (the installer
 screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`

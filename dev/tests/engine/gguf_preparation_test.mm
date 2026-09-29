@@ -193,6 +193,41 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
   check(keys()[0] != original[0], "a changed tensor byte prepares its image again");
 }
 
+// IQ4_XS beta and alpha rows retain their native values in grouped head
+// order, followed by zero rows through the end of the quantization tile.
+void checkIq4xsAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
+  for (bool moe : {false, true}) {
+    SmallTarget target = smallTarget(moe);
+    const auto &g = target.geometry;
+    uint32_t seed = 1200;
+    std::vector<uint8_t> rows;
+    const uint32_t stride = rowBytes(IQ4XS, g.hiddenSize);
+    for (const char *name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+      Tensor &tensor = tensorNamed(target.tensors, name);
+      tensor.type = model::ggml::kIQ4_XS;
+      tensor.data = fixture(IQ4XS, g.gdnValueHeads, g.hiddenSize, ++seed);
+      // Derive the expected head order from the geometry, independently of
+      // the planner's recorded source order.
+      for (uint32_t key = 0; key < g.gdnKeyHeads; ++key)
+        for (uint32_t value = 0; value < g.gdnValueHeads / g.gdnKeyHeads; ++value) {
+          const uint64_t source = (value * g.gdnKeyHeads + key) * uint64_t{stride};
+          rows.insert(rows.end(), tensor.data.begin() + source, tensor.data.begin() + source + stride);
+        }
+    }
+    rows.resize(QUANT_TILE_ROWS * stride);
+    const Packed expected = repack(IQ4XS, rows, QUANT_TILE_ROWS, g.hiddenSize, nullptr);
+    const auto path = directory / (moe ? "moe-iq4xs.gguf" : "dense-iq4xs.gguf");
+    writeGguf(path, target.tensors, g);
+    const auto images = planned(path, g);
+    const auto prepared = preparedImages(backend, path, g);
+    const auto *pair = repackOf(images[0], "blk.0.ssm_beta.weight");
+    if (!pair) throw std::runtime_error("the plan has no IQ4_XS alpha/beta tensor");
+    check(pair->format == GGUF_FMT_IQ4XS && slice(prepared[0], pair->plane0, expected.w0.size()) == expected.w0 &&
+              slice(prepared[0], pair->meta, expected.meta.size()) == expected.meta,
+          std::string("prepared IQ4_XS alpha/beta and zero padding match the CPU reference for ") + g.architecture());
+  }
+}
+
 // The MoE layer: the F32 alpha/beta tensor, the golden images, warm loads
 // and tensor offsets past 4 GiB.
 void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
@@ -483,6 +518,7 @@ int main(int argc, char **argv) {
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
     guarded("preparation of BF16 alpha/beta", [&] { checkWidenedAlphaBeta(backend, directory.path()); });
+    guarded("preparation of IQ4_XS alpha/beta", [&] { checkIq4xsAlphaBeta(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
     checkExecutor(backend, directory.path());
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
