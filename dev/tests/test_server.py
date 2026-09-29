@@ -6811,7 +6811,7 @@ class ServerTest(unittest.TestCase):
         self._wait_for_http_active(harness.server.requests, 0)
         with mock.patch.object(harness.backend, "submit", return_value=False):
             self.assertEqual(
-                harness.request("POST", "/v1/chat/completions", self.body())[0], 429
+                harness.request("POST", "/v1/chat/completions", self.body())[0], 503
             )
         self._wait_for_http_active(harness.server.requests, 0)
         self.assertEqual(
@@ -7082,11 +7082,22 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(harness.backend.submit(head))
         self.assertTrue(blocking.started.wait(1))
 
-        status, _, payload = harness.request(
-            "POST", "/v1/chat/completions", self.body()
+        connection = http.client.HTTPConnection(
+            *harness.server.server_address, timeout=3
         )
-        self.assertEqual(status, 429)
-        self.assertEqual(json.loads(payload)["error"]["code"], "rate_limit_exceeded")
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            json.dumps(self.body()),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.getheader("Retry-After"), "1")
+        self.assertEqual(
+            json.loads(response.read())["error"]["code"], "frontend_overloaded"
+        )
         self.assertEqual(len(runtime.requests), 1)
         blocking.release.set()
 

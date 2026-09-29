@@ -179,6 +179,14 @@ def _normalize_path(raw_path):
     return normalized
 
 
+def _queue_full():
+    """The answer when the native pending limit refuses a submission. That
+    limit is --queue-size, the HTTP request gate's capacity, so only a race
+    with the gate reaches it, as when a cancelled request still holds its
+    native slot: an overload like the gate's own, retried the same way."""
+    return APIError(503, "request queue is full", "frontend_overloaded")
+
+
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -622,7 +630,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 submitted = True
                 self._judgment_complete(job, row)
                 return
@@ -683,7 +691,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
             if not self.app.backend.submit(job):
-                raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                raise _queue_full()
             submitted = True
             if anthropic and stream:
                 self._anthropic_stream(job, thinking, has_tools)
@@ -783,7 +791,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # queue bound and lets later questions reuse the state prefix.
                 active_job = job
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 result = None
                 while result is None:
                     kind, value = self._next_event(job)
