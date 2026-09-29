@@ -331,7 +331,9 @@ def _hermes(path, server, environment, arguments, profile):
         OPENAI_BASE_URL=server.endpoint,
         OPENAI_API_KEY=server.api_key,
     )
-    return [path, "chat", "--provider", "custom", "--model", server.model, *arguments]
+    # Hermes takes --provider and --model before any subcommand and runs chat
+    # without one, so the user's arguments follow as Hermes itself takes them.
+    return [path, "--provider", "custom", "--model", server.model, *arguments]
 
 
 def hermes_profile_home(environment, name):

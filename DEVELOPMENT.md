@@ -35,7 +35,8 @@ whose message names the last failure.
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
-Arguments pass through, for example `./splash codex resume --last`.
+Arguments pass through, for example `./splash codex resume --last` or
+`./splash hermes chat -q "Hello"`.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. API requests

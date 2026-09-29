@@ -321,7 +321,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(
             argv,
-            ["/bin/hermes", "chat", "--provider", "custom", "--model", MODEL],
+            ["/bin/hermes", "--provider", "custom", "--model", MODEL],
         )
         self.assertEqual(
             env,
@@ -357,6 +357,17 @@ class ClientTests(unittest.TestCase):
             {path.name for path in self.hermes_root.iterdir()},
             {"config.yaml", "profiles"},
         )
+
+    def test_hermes_arguments_pass_through_as_hermes_takes_them(self):
+        # Hermes takes --provider and --model before any subcommand; -q is
+        # chat's, and -z the top level's.
+        for args in (["chat", "-q", "Hello"], ["sessions", "list"], ["-z", "Hello"]):
+            with self.subTest(args=args):
+                argv, _ = self.command("hermes", client_args=args)
+                self.assertEqual(
+                    argv,
+                    ["/bin/hermes", "--provider", "custom", "--model", MODEL, *args],
+                )
 
     def test_hermes_names_a_profile_per_port(self):
         for port, name in ((8000, "splash"), (8001, "splash-8001")):
