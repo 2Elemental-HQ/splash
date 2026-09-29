@@ -608,7 +608,7 @@ def parse_args(argv=None):
         dest="request_timeout",
         type=_parse_request_timeout,
         help="seconds before a queued or in-flight request expires with 504 "
-        "(default: 1800)",
+        "(default: none)",
     )
     server.add_argument(
         "--api-key",

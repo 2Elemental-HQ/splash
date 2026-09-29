@@ -84,7 +84,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_request_timeout_reaches_the_server(self):
         base = ["serve", "--model", MODEL_ID]
-        # Unset stays unset: the server's own default (1800) remains authoritative.
+        # Unset stays unset: the server's own default (none) remains authoritative.
         self.assertIsNone(launcher.parse_args(base).request_timeout)
         self.assertEqual(
             launcher.parse_args(base + ["--request-timeout", "3600"]).request_timeout,
