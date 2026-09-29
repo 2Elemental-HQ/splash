@@ -7062,6 +7062,17 @@ class ServerTest(unittest.TestCase):
         closer.close(stopped)
         self.assertEqual(stopped.fileno(), -1)
 
+    def test_a_burst_waits_in_the_kernel_queue_instead_of_being_reset(self):
+        # Nothing accepts while the connections arrive, as when the accept
+        # loop falls behind a burst: the kernel holds them all, where a short
+        # queue had it reset those beyond it before the server saw them.
+        server = api.FrontendServer(("127.0.0.1", 0), None)
+        self.addCleanup(server.server_close)
+        for _ in range(100):
+            client = socket.create_connection(server.server_address, timeout=2)
+            self.addCleanup(client.close)
+            client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
     def test_thread_start_failure_returns_connection_slot(self):
         server = api.FrontendServer(("127.0.0.1", 0), None)
         self.addCleanup(server.server_close)

@@ -2050,9 +2050,13 @@ class RequestBodyReservation:
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Connections the kernel holds until the accept loop takes them. A burst
+    # beyond this queue is reset by the kernel, unseen by the server, so ask
+    # for as many as uvicorn does; the kernel caps it (128 on macOS).
+    # Queued connections take no thread or descriptor.
+    request_queue_size = 2048
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
-    request_queue_size = 64
     control_connection_capacity = 64
     # Connections refused at the accept that wait at once, on one thread,
     # for their clients to close.
