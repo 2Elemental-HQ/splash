@@ -205,6 +205,56 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     )
                     self.assertEqual(accepted, text == declared or not strict)
 
+    def test_whitespace_between_tokens_is_bounded(self):
+        # A model preferring whitespace to every token the grammar allows next
+        # must write one of them within 64 characters; strings keep theirs.
+        bound = tool_schema.MAX_WHITESPACE
+        for spaces, complete in ((bound, True), (bound + 1, False)):
+            with self.subTest(spaces=spaces):
+                pad = " " * spaces
+                for text in (
+                    "{" + pad + '"answer":42}',
+                    pad + ANSWER,
+                    CALL + "\n" * spaces + OTHER_CALL,
+                ):
+                    if complete:
+                        self.assert_complete(text)
+                    else:
+                        self.assert_not_complete(text)
+                grammar = tool_schema.json_grammar(SCHEMA, False)
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode("{" + pad + '"answer":42}').ids
+                self.assertEqual(
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting(),
+                    complete,
+                )
+        self.assert_complete('{"answer":42,"marker":"' + " " * 200 + '"}')
+        # Any value, as an open parameter takes, is bounded alike.
+        tool = {"name": "note", "parameters": {"type": "object"}}
+        grammar = tool_schema.tool_grammar(
+            tool_schema.normalize_tools(
+                [{"type": "function", "function": tool}], "auto", True
+            )[1],
+            False,
+        )
+        for spaces, complete in ((bound, True), (bound + 1, False)):
+            text = (
+                "<tool_call>\n<function=note>\n<parameter=body>\n{"
+                + " " * spaces
+                + '"a":1}\n</parameter>\n</function>\n</tool_call>'
+            )
+            with self.subTest(open_parameter=spaces):
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode(text).ids
+                self.assertEqual(
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting(),
+                    complete,
+                )
+
     def test_strict_closing_leaves_a_schema_that_others_extend(self):
         schema = {
             "type": "object",

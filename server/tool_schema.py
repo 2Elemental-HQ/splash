@@ -201,6 +201,17 @@ MAX_GRAMMAR_BOUND = 64
 # output schema on every turn, so the answers for this many patterns are kept.
 PATTERN_CHECK_CACHE_SIZE = 1024
 
+# The whitespace a model chooses between the tokens of constrained output, in
+# JSON and around tool calls, is bounded: a model that prefers whitespace to
+# every token the grammar allows next would otherwise write it until
+# max_tokens, as Qwen models do, most of all under speculative decoding (vLLM
+# #38696, #50989). llama.cpp and Outlines bound it more tightly; 64 characters
+# still take pretty printing 15 levels deep at four spaces. Whitespace inside
+# strings is content and unbounded.
+MAX_WHITESPACE = 64
+WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
+WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
+
 
 @lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
 def _grammar_takes_pattern(pattern):
@@ -227,8 +238,11 @@ def _grammar_compatible_schema(schema):
             bound = node.get(key)
             if isinstance(bound, (int, float)) and bound > MAX_GRAMMAR_BOUND:
                 del node[key]
+    if output is True:
+        # Any value, with the whitespace between its tokens bounded.
+        output = {}
     if isinstance(output, dict):
-        output["x-guidance"] = {"lenient": True}
+        output["x-guidance"] = {"lenient": True, "whitespace_pattern": WHITESPACE}
     return output
 
 
@@ -758,7 +772,7 @@ def json_grammar(schema, thinking):
     if thinking:
         grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
         grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
-    grammar.append("WS: /[ \\n\\r\\t]*/")
+    grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
 
@@ -916,7 +930,7 @@ def tool_grammar(policy, thinking, response_schema=None):
             + " WS"
         )
     if separator == "WS":
-        main.append(r"WS: /[ \n\r\t]*/")
+        main.append(WHITESPACE_RULE)
     if thinking:
         main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
     main.extend(

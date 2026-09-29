@@ -5085,7 +5085,10 @@ class ServerTest(unittest.TestCase):
             "required": ["pattern", "propertyNames", "nested", "constant", "choice"],
         }
         projected = _grammar_compatible_schema(schema)
-        self.assertEqual(projected.pop("x-guidance"), {"lenient": True})
+        self.assertEqual(
+            projected.pop("x-guidance"),
+            {"lenient": True, "whitespace_pattern": tool_schema.WHITESPACE},
+        )
         self.assertEqual(projected, schema)
         _, policy = tool_schema.normalize_tools(
             [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
