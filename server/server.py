@@ -120,6 +120,8 @@ HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
+# How long a connection refused unread may take its client to close.
+REFUSED_LINGER_SECONDS = 2.0
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
@@ -1802,17 +1804,115 @@ def _refuse_connection(connection):
         pass
 
 
+def _has_input(connection):
+    """Whether `connection` holds input its thread has yet to read, such as
+    a request that arrived before its thread ran."""
+    # A poll object holds no descriptor.
+    poller = select.poll()
+    poller.register(connection, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+class LingeringCloser:
+    """Closes connections answered without reading their requests.
+
+    Closing a connection with request bytes unread resets it, and the reset
+    can destroy the answer before the client reads it. Each connection given
+    here is half-closed instead; one thread reads and drops what its client
+    still sends, and closes it once the client has closed or `linger`
+    seconds after its answer. At most `capacity` wait at once; any beyond
+    them are closed at once.
+    """
+
+    # How soon the thread first reads a connection that arrives while it
+    # waits on others.
+    TICK = 0.05
+
+    def __init__(self, capacity, linger):
+        self.capacity = capacity
+        self.linger = linger
+        self.changed = threading.Condition()
+        self.arrivals = []
+        self.held = 0
+        self.stopped = False
+        self.thread = threading.Thread(
+            target=self._run, name="lingering close", daemon=True
+        )
+        self.thread.start()
+
+    def close(self, connection):
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            connection.setblocking(False)
+        except OSError:
+            connection.close()
+            return
+        with self.changed:
+            if self.stopped or self.held >= self.capacity:
+                connection.close()
+                return
+            self.held += 1
+            self.arrivals.append((connection, time.monotonic() + self.linger))
+            self.changed.notify()
+
+    def stop(self):
+        """Close every waiting connection and end the thread."""
+        with self.changed:
+            self.stopped = True
+            self.changed.notify()
+        self.thread.join()
+
+    def _run(self):
+        # A poll object holds no descriptor.
+        poller = select.poll()
+        waiting = {}
+        while True:
+            with self.changed:
+                while not (waiting or self.arrivals or self.stopped):
+                    self.changed.wait()
+                arrivals, self.arrivals = self.arrivals, []
+                stopped = self.stopped
+            for connection, deadline in arrivals:
+                poller.register(connection, select.POLLIN)
+                waiting[connection.fileno()] = connection, deadline
+            if not stopped:
+                for descriptor, _ in poller.poll(self.TICK * 1000):
+                    connection, _ = waiting[descriptor]
+                    try:
+                        if connection.recv(65536):
+                            continue
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        pass
+                    waiting[descriptor] = connection, 0.0
+            now = time.monotonic()
+            done = [
+                descriptor
+                for descriptor, (_, deadline) in waiting.items()
+                if stopped or deadline <= now
+            ]
+            for descriptor in done:
+                poller.unregister(descriptor)
+                waiting.pop(descriptor)[0].close()
+            with self.changed:
+                self.held -= len(done)
+            if stopped:
+                return
+
+
 class ConnectionSlots:
     """The connections the server gives a thread, at most `capacity`.
 
-    One that waits on its client, for its request or to drain an upload
-    refused unread, gives its slot to a new connection when no slot is
-    free, the longest waiting first, so stalled connections, however many
-    and from however many addresses, cannot keep others out; only
-    connections with a request in progress can fill every slot. One that
-    gives way still awaiting its request gets the 503 of a connection
-    refused at the accept: in a burst, its request may only be waiting for
-    its thread. One draining a refused upload already has its response.
+    One that waits for its request with nothing yet to read, or drains an
+    upload refused unread, gives its slot to a new connection when no slot
+    is free, the longest waiting first, so stalled connections, however
+    many and from however many addresses, cannot keep others out. One whose
+    request has arrived keeps its slot, although its thread may not have
+    run yet: when every slot has a request, arrived or in progress, the new
+    connection is refused. One that gives way still awaiting its request
+    gets the 503 of a connection refused at the accept, as its request may
+    be on its way. One draining a refused upload already has its response.
     """
 
     # What a connection with a slot is doing.
@@ -1831,14 +1931,15 @@ class ConnectionSlots:
 
     def admit(self, connection):
         """Give `connection` a slot, awaiting its request; False when every
-        slot has a request in progress."""
+        slot has a request, arrived or in progress."""
         with self.lock:
             if len(self.holders) >= self.capacity:
                 waiting = next(
                     (
                         held
                         for held, state in self.holders.items()
-                        if state != self.SERVING
+                        if state == self.DRAINING
+                        or (state == self.AWAITING_REQUEST and not _has_input(held))
                     ),
                     None,
                 )
@@ -1953,6 +2054,9 @@ class FrontendServer(ThreadingHTTPServer):
     # Neither gate allocates workers in advance.
     request_queue_size = 64
     control_connection_capacity = 64
+    # Connections refused at the accept that wait at once, on one thread,
+    # for their clients to close.
+    refused_connection_capacity = 64
 
     def __init__(
         self,
@@ -1993,6 +2097,9 @@ class FrontendServer(ThreadingHTTPServer):
         self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity
         )
+        self.refused = LingeringCloser(
+            self.refused_connection_capacity, REFUSED_LINGER_SECONDS
+        )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
 
@@ -2020,7 +2127,7 @@ class FrontendServer(ThreadingHTTPServer):
             # Do not create a thread or block the accept loop to reject an
             # excess socket.
             _refuse_connection(request)
-            self.shutdown_request(request)
+            self.refused.close(request)
             return
         super().process_request(request, client_address)
 
@@ -2030,6 +2137,7 @@ class FrontendServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        self.refused.stop()
         self.connections.idle.wait(min(2.0, self.io_timeout))
 
     def handle_error(self, request, client_address):
