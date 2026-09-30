@@ -480,12 +480,28 @@ class Frontend:
         return started_at + min(timeout, self.request_timeout)
 
     def prepare(
-        self, body, tool_namespaces=None, *, deadline=None, clamp_output_budget=False
+        self,
+        body,
+        tool_namespaces=None,
+        *,
+        deadline=None,
+        output_field=None,
+        clamp_output_budget=False,
     ):
+        """A Chat request, or another API's request converted to Chat.
+        Output limit errors name output_field, that API's own field; with
+        clamp_output_budget, a limit larger than what the context leaves is
+        lowered to it instead of refused."""
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
-            return self._prepare(body, tool_namespaces, deadline, clamp_output_budget)
+            return self._prepare(
+                body,
+                tool_namespaces,
+                deadline,
+                output_field=output_field,
+                clamp_output_budget=clamp_output_budget,
+            )
 
     def prepare_completion(self, body, *, deadline=None):
         """A text completion: the prompt generates as given, with no chat
@@ -935,7 +951,15 @@ class Frontend:
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
         )
 
-    def _prepare(self, body, tool_namespaces, deadline, clamp_output_budget=False):
+    def _prepare(
+        self,
+        body,
+        tool_namespaces,
+        deadline,
+        *,
+        output_field=None,
+        clamp_output_budget=False,
+    ):
         nullable = {
             "temperature",
             "top_p",
@@ -1017,10 +1041,17 @@ class Frontend:
                 prompt_tokens, prepared_images, image_positions
             )
         remaining_request_time(deadline)
+        if output_field is None:
+            # Chat takes either field; errors name the one the client sent.
+            output_field = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in body
+                else "max_tokens"
+            )
         max_new = self._output_budget(
             body.get("max_completion_tokens", body.get("max_tokens")),
             prompt_tokens,
-            "max_completion_tokens",
+            output_field,
             clamp_output_budget,
         )
         job = self._generation_job(
@@ -1123,7 +1154,8 @@ class Frontend:
             if not clamp:
                 raise APIError(
                     400,
-                    f"prompt and {field} exceed the context window",
+                    f"prompt and {field} exceed the context window: "
+                    f"{len(prompt_tokens)} + {max_new} > {self.max_context} tokens",
                     "context_length_exceeded",
                 )
             # This API treats the output budget as a ceiling. Generate up to
@@ -1191,7 +1223,9 @@ class Frontend:
                 previous_items = json_codec.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
-            job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
+            job, thinking, has_tools = self._prepare(
+                chat, namespaces, deadline, output_field="max_output_tokens"
+            )
             job.response_store = store
             job.response_previous_id = previous_id
             if store:

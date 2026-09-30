@@ -6408,26 +6408,58 @@ class ServerTest(unittest.TestCase):
     def test_context_window_rejects_output_budget_without_truncating(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, max_context=10)
+        # Each error names the field its client sent and gives the counts.
         cases = (
             (
                 "/v1/chat/completions",
                 self.body(max_completion_tokens=9),
+                "max_completion_tokens",
             ),
-            ("/v1/chat/completions", self.body(max_tokens=9)),
-            ("/v1/responses", self.responses_body(max_output_tokens=9)),
+            ("/v1/chat/completions", self.body(max_tokens=9), "max_tokens"),
+            (
+                "/v1/responses",
+                self.responses_body(max_output_tokens=9),
+                "max_output_tokens",
+            ),
         )
-        for path, body in cases:
+        for path, body, field in cases:
             with self.subTest(path=path, body=body):
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 400, payload)
-                self.assertIn(
-                    "prompt and max_completion_tokens exceed the context window",
+                self.assertRegex(
                     json.loads(payload)["error"]["message"],
+                    rf"^prompt and {field} exceed the context window: "
+                    r"[1-9]\d* \+ 9 > 10 tokens$",
                 )
                 error = json.loads(payload)["error"]
                 self.assertEqual(error["type"], "invalid_request_error")
                 if path != "/v1/messages":
                     self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertEqual(runtime.requests, [])
+
+    def test_output_budget_errors_name_the_field_the_client_sent(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        for path, body, field in (
+            ("/v1/chat/completions", self.body(max_tokens=0), "max_tokens"),
+            (
+                "/v1/chat/completions",
+                self.body(max_completion_tokens=0, max_tokens=5),
+                "max_completion_tokens",
+            ),
+            (
+                "/v1/responses",
+                self.responses_body(max_output_tokens=0),
+                "max_output_tokens",
+            ),
+        ):
+            with self.subTest(path=path, field=field):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    f"{field} must be a positive integer",
+                )
         self.assertEqual(runtime.requests, [])
 
     def test_anthropic_output_budget_is_clamped_to_the_remaining_window(self):

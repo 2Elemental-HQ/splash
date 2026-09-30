@@ -750,9 +750,11 @@ Chat's `max_completion_tokens` or `max_tokens` and Responses'
 all the context the prompt leaves, as in vLLM and SGLang: the context limit,
 and `--request-timeout` when set, are the only server bounds on a request that
 names no limit. A value larger than what the context leaves returns 400
-`context_length_exceeded`. Messages requires `max_tokens`; a larger value than
-the context leaves generates up to the context limit, since Claude Code asks
-for the same limit on every turn and does not compact for it.
+`context_length_exceeded` with the prompt's tokens, the value and the window,
+as in vLLM and SGLang; that error and an invalid value's name the field the
+request sent. Messages requires `max_tokens`; a larger value than the context
+leaves generates up to the context limit, since Claude Code asks for the same
+limit on every turn and does not compact for it.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft

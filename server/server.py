@@ -657,6 +657,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
+                    output_field="max_tokens",
                     clamp_output_budget=True,
                 )
                 stream_options = None
