@@ -241,14 +241,14 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(len(runtime.requests), 3)
 
     def test_omitted_max_tokens_is_openais_default_within_the_context(self):
-        # 16 tokens, not the server's chat budget; a prompt that leaves less
-        # context generates up to the rest instead of failing.
-        harness, runtime = self.harness(max_context=64, default_max_new=8)
+        # 16 tokens, not all the context leaves as in chat; a prompt that
+        # leaves less context generates up to the rest instead of failing.
+        harness, runtime = self.harness(max_context=64)
         for fields in ({}, {"max_tokens": None}):
             status, response = self.complete(harness, **fields)
             self.assertEqual(status, 200, response)
             self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 16)
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(harness)
         self.assertEqual(status, 200, response)
         request = runtime.requests[0]
@@ -257,7 +257,7 @@ class TextCompletionTests(unittest.TestCase):
         )
 
     def test_sampling_budget_seed_and_priority_are_validated_as_in_chat(self):
-        harness, runtime = self.harness(max_context=16, default_max_new=8)
+        harness, runtime = self.harness(max_context=16)
         status, response = self.complete(
             harness,
             temperature=0.7,

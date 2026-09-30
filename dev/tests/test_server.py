@@ -549,7 +549,6 @@ def main_args(**overrides):
             "max_cache_disk": 0,
             "decode_share": None,
             "max_image_pixels": api.image_input.MAX_PIXELS,
-            "max_new_tokens": 16,
             "request_timeout": 2,
             "queue_size": 1,
             "host": "127.0.0.1",
@@ -598,7 +597,6 @@ class Harness:
         queue_size=4,
         timeout=2,
         max_context=128,
-        default_max_new=16,
         model="test-model",
         request_logger=None,
         constraint_factory=None,
@@ -622,7 +620,6 @@ class Harness:
             self.backend,
             model,
             max_context,
-            default_max_new,
             timeout,
             2,
             constraint_factory=constraint_factory,
@@ -1502,7 +1499,7 @@ class ServerTest(unittest.TestCase):
     def test_judgment_deadline_stops_the_slot_boundary_pass(self):
         clock = [100.0]
         tokenizer = self.BoundaryCountingTokenizer(clock, 0.5)
-        app = make_frontend(tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True)
+        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
         body = self.judgment_body(
             options=[
                 {"id": f"opt{index}", "description": f"case {index}"}
@@ -1523,7 +1520,7 @@ class ServerTest(unittest.TestCase):
 
     def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
         tokenizer = self.BoundaryCountingTokenizer()
-        app = make_frontend(tokenizer, None, "test-model", 8, 16, 10, 2, vision=True)
+        app = make_frontend(tokenizer, None, "test-model", 8, 10, 2, vision=True)
         with self.assertRaises(api.APIError) as error:
             app.prepare_judgment(
                 self.judgment_body(
@@ -3521,21 +3518,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             api.parse_args([*required, "--max-memory", "32G"]).max_memory, 32 * 1024**3
         )
-        self.assertEqual(args.max_new_tokens, 32768)
         self.assertEqual(args.request_timeout, math.inf)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 40000, 32768, 1, 2, vision=True
-        )
-        self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 32768)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 10, 32768, 1, 2, vision=True
-        )
-        self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 8)
+        # No server option bounds the output of a request that names no
+        # limit: it may use what the two-token prompt leaves of the window.
+        app = make_frontend(tokenizer, backend, "test-model", 40000, 1, 2, vision=True)
+        self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 39998)
         with mock.patch("sys.stderr"):
             for option, value in (
                 ("--max-context", "0"),
@@ -3543,7 +3535,6 @@ class ServerTest(unittest.TestCase):
                 ("--max-context", "not-a-number"),
                 ("--max-memory", "0"),
                 ("--max-memory", "not-a-number"),
-                ("--max-new-tokens", "0"),
                 ("--request-timeout", "0"),
                 ("--request-timeout", "nan"),
                 ("--request-timeout", "inf"),
@@ -3567,10 +3558,10 @@ class ServerTest(unittest.TestCase):
             api.secrets, "token_hex", side_effect=("boot_a", "boot_b")
         ):
             first = make_frontend(
-                tokenizer, first_backend, "test-model", 128, 16, 1, 2, vision=True
+                tokenizer, first_backend, "test-model", 128, 1, 2, vision=True
             )
             second = make_frontend(
-                tokenizer, second_backend, "test-model", 128, 16, 1, 2, vision=True
+                tokenizer, second_backend, "test-model", 128, 1, 2, vision=True
             )
         first_job, _, _ = first.prepare(self.body(seed=1))
         second_job, _, _ = second.prepare(self.body(seed=1))
@@ -3687,7 +3678,7 @@ class ServerTest(unittest.TestCase):
             runtime, tokenizer, request_logger=diagnostics.print_request
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
-        self.assertEqual(app_type.call_args.args[6], 4)
+        self.assertEqual(app_type.call_args.args[5], 4)
         runtime.wait_ready.assert_called_once_with()
         server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
@@ -5293,9 +5284,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [
             {"type": "function", "function": {"name": "f"}},
             {"type": "function", "function": {"name": "g"}},
@@ -5332,9 +5321,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [{"type": "function", "function": {"name": "f"}}]
         job, _, _ = app.prepare(self.body(tools=tools, tool_choice="none", stop=["x"]))
         self.assertEqual(job.tool_policy.schemas, {})
@@ -5680,9 +5667,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         for effort in ("xhigh", "medium", "low"):
             app.prepare(self.body(reasoning_effort=effort))
             template = tokenizer.templates[-1][1]
@@ -5766,7 +5751,6 @@ class ServerTest(unittest.TestCase):
             None,
             "test-model",
             128,
-            16,
             1,
             2,
             constraint_factory=factory,
@@ -5818,9 +5802,7 @@ class ServerTest(unittest.TestCase):
             ),
         ):
             tokenizer = TemplateTokenizer(self.reasoning_template(efforts=accepted))
-            app = make_frontend(
-                tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
-            )
+            app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
                 with self.subTest(accepted=accepted, effort=effort):
                     tokenizer.templates.clear()
@@ -5837,7 +5819,7 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_template_errors_do_not_silently_drop_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template(efforts=("medium",)))
-        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
+        app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
         tokenizer.templates.clear()
         with self.assertRaises(api.APIError):
             app.prepare(self.body(reasoning_effort="high"))
@@ -5855,7 +5837,7 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_effort_accepts_only_standard_protocol_values(self):
         tokenizer = FakeTokenizer()
-        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
+        app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
         tokenizer.templates.clear()
         for effort in ("", "on", "off", "ultra", True, 1, [], {}):
             with (
@@ -5878,9 +5860,7 @@ class ServerTest(unittest.TestCase):
                 "{% if add_generation_prompt %}"
                 "{{ '<|im_start|>assistant\\n" + prefix + "' }}{% endif %}"
             )
-            app = make_frontend(
-                tokenizer, None, "test-model", 128, 16, 1, 2, vision=True
-            )
+            app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
             with (
                 self.subTest(effort=effort),
                 self.assertRaisesRegex(api.APIError, "requested thinking mode"),
@@ -5921,7 +5901,7 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template())
-        app = make_frontend(tokenizer, None, "test-model", 128, 16, 1, 2, vision=True)
+        app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
         for thinking in (None, {"type": "disabled"}):
             body = self.anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
@@ -6375,7 +6355,6 @@ class ServerTest(unittest.TestCase):
             SimpleNamespace(status=lambda: {}),
             "test-model",
             32768,
-            16,
             2.0,
             2,
             vision=True,
@@ -6421,7 +6400,6 @@ class ServerTest(unittest.TestCase):
                 SimpleNamespace(status=lambda: {}),
                 "test-model",
                 128,
-                16,
                 1,
                 0,
                 vision=True,
@@ -6429,7 +6407,7 @@ class ServerTest(unittest.TestCase):
 
     def test_context_window_rejects_output_budget_without_truncating(self):
         runtime = FakeRuntime()
-        harness = self.harness(runtime, max_context=10, default_max_new=9)
+        harness = self.harness(runtime, max_context=10)
         cases = (
             (
                 "/v1/chat/completions",
@@ -6456,7 +6434,7 @@ class ServerTest(unittest.TestCase):
         # Claude Code sends max_tokens 32K on every turn and does not compact
         # for it; the request must proceed with what the window allows.
         runtime = FakeRuntime()
-        harness = self.harness(runtime, max_context=10, default_max_new=9)
+        harness = self.harness(runtime, max_context=10)
         status, _, payload = harness.request(
             "POST", "/v1/messages", self.anthropic_body(max_tokens=9)
         )
@@ -6470,7 +6448,7 @@ class ServerTest(unittest.TestCase):
 
     def test_default_output_budget_uses_remaining_context(self):
         runtime = FakeRuntime()
-        harness = self.harness(runtime, max_context=10, default_max_new=9)
+        harness = self.harness(runtime, max_context=10)
         for path, body in (
             ("/v1/chat/completions", self.body()),
             ("/v1/responses", self.responses_body()),
@@ -6481,8 +6459,22 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 8)
                 self.assertEqual(runtime.requests[-1].prompt_tokens, (101, 102))
 
+        # The window, not a server default, bounds a request that names no
+        # limit; one that names a limit inside the window gets it as is.
+        harness.app.max_context = 262144
+        for path, body, expected in (
+            ("/v1/chat/completions", self.body(), 262142),
+            ("/v1/responses", self.responses_body(), 262142),
+            ("/v1/chat/completions", self.body(max_tokens=131072), 131072),
+        ):
+            with self.subTest(path=path, body=body):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(
+                    runtime.requests[-1].logical_max_output_tokens, expected
+                )
+
         harness.app.max_context = 100000
-        harness.app.default_max_new = 32768
         for length, expected in ((90000, 10000), (99999, 1)):
             with mock.patch.object(
                 FakeTokenizer, "__call__", return_value={"input_ids": [101] * length}
@@ -6499,7 +6491,7 @@ class ServerTest(unittest.TestCase):
 
     def test_preparation_consumes_original_deadline_and_releases_slots(self):
         app = make_frontend(
-            FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
+            FakeTokenizer(), None, "test-model", 128, 10, 1, vision=True
         )
         for elapsed in (0.25, 5):
             clock = [100.0]
@@ -6533,7 +6525,7 @@ class ServerTest(unittest.TestCase):
 
     def test_preparation_queue_respects_request_timeout(self):
         app = make_frontend(
-            FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
+            FakeTokenizer(), None, "test-model", 128, 10, 1, vision=True
         )
         app.tokenizer.templates.clear()
         app.preparation_slots.acquire()
@@ -6550,7 +6542,7 @@ class ServerTest(unittest.TestCase):
 
     def test_expired_preparation_skips_later_stages(self):
         app = make_frontend(
-            FakeTokenizer(), None, "test-model", 128, 16, 10, 1, vision=True
+            FakeTokenizer(), None, "test-model", 128, 10, 1, vision=True
         )
         for stage in ("grammar", "images"):
             clock = [100.0]
@@ -7211,9 +7203,7 @@ class ServerTest(unittest.TestCase):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
-        app = make_frontend(
-            tokenizer, backend, "test-model", 128, 16, 1, 2, vision=True
-        )
+        app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         body = self.body()
         body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):

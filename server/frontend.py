@@ -257,7 +257,6 @@ class Frontend:
         backend,
         model,
         max_context,
-        default_max_new,
         request_timeout,
         preparation_capacity,
         *,
@@ -297,7 +296,6 @@ class Frontend:
             raise ValueError("invalid default_reasoning_effort")
         self.default_reasoning_effort = default_reasoning_effort
         self.max_context = max_context
-        self.default_max_new = default_max_new
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
@@ -1112,14 +1110,13 @@ class Frontend:
         return GenerationOptions(temperature, top_p, top_k, stop_sequences, ignore_eos)
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
-        """The output token budget, requested under the API's field name or
-        the server default, within the context window the prompt leaves."""
+        """The output token budget requested under the API's field name,
+        within the context window the prompt leaves. A request that names
+        none may use all of that window, as in vLLM and SGLang."""
         if len(prompt_tokens) >= self.max_context:
             raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         remaining = self.max_context - len(prompt_tokens)
-        max_new = (
-            min(self.default_max_new, remaining) if requested is None else requested
-        )
+        max_new = remaining if requested is None else requested
         if not isinstance(max_new, int) or isinstance(max_new, bool) or max_new <= 0:
             raise APIError(400, f"{field} must be a positive integer")
         if max_new > remaining:

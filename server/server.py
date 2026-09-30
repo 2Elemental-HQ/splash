@@ -2289,7 +2289,6 @@ def parse_args(argv=None):
         "decode (default: 0.5; 0 alternates one command each)",
     )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
-    parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
@@ -2311,8 +2310,6 @@ def parse_args(argv=None):
             validate_api_key(args.api_key)
         except ValueError as error:
             parser.error(str(error))
-    if args.max_new_tokens <= 0:
-        parser.error("--max-new-tokens must be positive")
     if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
         parser.error(
             "--max-image-pixels must be in "
@@ -2425,7 +2422,6 @@ def main():
             backend,
             args.model,
             effective_context,
-            args.max_new_tokens,
             args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,

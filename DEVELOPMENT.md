@@ -745,6 +745,15 @@ SGLang, or to what the context leaves when that is less. `temperature`,
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
+Chat's `max_completion_tokens` or `max_tokens` and Responses'
+`max_output_tokens` bound a response's output. Omitted, the output may use
+all the context the prompt leaves, as in vLLM and SGLang: the context limit,
+and `--request-timeout` when set, are the only server bounds on a request that
+names no limit. A value larger than what the context leaves returns 400
+`context_length_exceeded`. Messages requires `max_tokens`; a larger value than
+the context leaves generates up to the context limit, since Claude Code asks
+for the same limit on every turn and does not compact for it.
+
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
 proposal of one is rejected, so generation runs to its output budget and
