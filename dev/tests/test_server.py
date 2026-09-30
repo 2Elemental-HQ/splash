@@ -4679,7 +4679,7 @@ class ServerTest(unittest.TestCase):
         tokenizer.fragments[40] = "Fix the </parameter> and <function= handling.\n"
         tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
         tools = [{"type": "function", "function": {"name": "weather"}}]
-        prose = tokenizer.fragments[40] + "\n"
+        prose = tokenizer.fragments[40]
         for stream in (False, True):
             with self.subTest(stream=stream):
                 harness = self.harness(
@@ -8575,8 +8575,8 @@ class ServerTest(unittest.TestCase):
                 "required": ["city"],
             },
         }
-        # Text, a tool call, then the template newline that follows the call.
-        harness = self.harness(FakeRuntime(Plan([[4, 5]]), Plan([[1, 2, 3, 5]])))
+        # Text, a tool call, then more text.
+        harness = self.harness(FakeRuntime(Plan([[4, 5, 4]]), Plan([[1, 2, 3, 5]])))
         status, _, payload = harness.request(
             "POST",
             "/v1/responses",

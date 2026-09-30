@@ -657,37 +657,95 @@ class TextAfterToolCallTests(unittest.TestCase):
                     projected = project(text, size, False)[0]
                     self.assertEqual(streamed_text(projected), content)
 
-    def test_whitespace_after_the_last_call_streams_only_at_a_normal_finish(self):
-        # Once a turn has text, the template's whitespace after the last
-        # call is part of its content: a normal finish streams it after the
-        # calls, and a cut leaves it out.
+    def test_whitespace_alone_is_text_only_between_texts(self):
+        # The template's whitespace around calls, before the first text or
+        # after the last, is neither streamed nor reported, at a normal
+        # finish or a cut. Between two texts it is their separator and
+        # streams with the later one, and text keeps its own whitespace.
         paris, rome = weather_call("Paris"), weather_call("Rome")
-        interleaved = "Text. " + paris + "\nMore text.\n" + rome + "\n"
-        interleaved_runs = [
-            ("text", "Text. "),
-            ("call", "weather"),
-            ("text", "\nMore text.\n"),
-            ("call", "weather"),
-        ]
-        for text, incomplete, runs in (
-            (interleaved, False, interleaved_runs + [("text", "\n")]),
-            (interleaved, True, interleaved_runs),
+        for text, content, runs in (
             (
-                "I'll check both.\n\n" + paris + "\n" + rome,
-                False,
+                "Text. " + paris + "\nMore text.\n" + rome + "\n",
+                "Text. \nMore text.\n",
+                [
+                    ("text", "Text. "),
+                    ("call", "weather"),
+                    ("text", "\nMore text.\n"),
+                    ("call", "weather"),
+                ],
+            ),
+            (
+                "I'll check both.\n\n" + paris + "\n" + rome + "\n",
+                "I'll check both.\n\n",
                 [
                     ("text", "I'll check both.\n\n"),
                     ("call", "weather"),
                     ("call", "weather"),
-                    ("text", "\n"),
                 ],
             ),
-            (paris + "\n" + rome + "\n", False, [("call", "weather")] * 2),
+            (
+                " \n" + paris + "\n" + rome + "\nDone.",
+                "\nDone.",
+                [("call", "weather"), ("call", "weather"), ("text", "\nDone.")],
+            ),
+            (
+                "Checking both." + paris + "\n" + rome + "Done.",
+                "Checking both.\nDone.",
+                [
+                    ("text", "Checking both."),
+                    ("call", "weather"),
+                    ("call", "weather"),
+                    ("text", "\nDone."),
+                ],
+            ),
+            (
+                "Hi" + paris + "\n" + rome + "\nBye",
+                "Hi\n\nBye",
+                [
+                    ("text", "Hi"),
+                    ("call", "weather"),
+                    ("call", "weather"),
+                    ("text", "\n\nBye"),
+                ],
+            ),
+            (paris + "\n" + rome + "\n", "", [("call", "weather")] * 2),
         ):
-            for size in (1, 3, len(text)):
-                with self.subTest(text=text, incomplete=incomplete, size=size):
-                    projected = project(text, size, incomplete)[0]
-                    self.assertEqual(text_runs(projected), runs)
+            for incomplete in (False, True):
+                for size in (1, 3, len(text)):
+                    with self.subTest(text=text, incomplete=incomplete, size=size):
+                        projected, reported, _ = project(text, size, incomplete)
+                        self.assertEqual(text_runs(projected), runs)
+                        self.assertEqual(reported, content)
+
+    def test_whitespace_around_parallel_calls_in_every_protocol(self):
+        # After a preface and parallel calls, the newlines between and after
+        # the calls are not text. With text after the calls as well, the
+        # newline between them separates the two texts.
+        paris, rome = weather_call("Paris"), weather_call("Rome")
+        calls = [("call", '{"city":"Paris"}'), ("call", '{"city":"Rome"}')]
+        for text, complete, streamed in (
+            (
+                "I'll check both.\n\n" + paris + "\n" + rome + "\n",
+                [("text", "I'll check both.\n\n")] + calls,
+                [("text", "I'll check both.\n\n")] + calls,
+            ),
+            (
+                "Checking both." + paris + "\n" + rome + "Done.",
+                [("text", "Checking both.\nDone.")] + calls,
+                [("text", "Checking both.")] + calls + [("text", "\nDone.")],
+            ),
+        ):
+            for path, output in (
+                ("/v1/chat/completions", chat_output),
+                ("/v1/responses", responses_output),
+                ("/v1/messages", messages_output),
+            ):
+                for stream in (False, True):
+                    with self.subTest(text=text, path=path, stream=stream):
+                        status, payload = respond(path, text, stream, False)
+                        self.assertEqual(status, 200, payload)
+                        items, _ = output(payload, stream)
+                        self.assertEqual(items, streamed if stream else complete)
 
     def check_cut_after_text_following_a_call(self, path, output, complete, finish):
         # The model writes text, a call and more text, and the token limit

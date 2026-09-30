@@ -128,9 +128,9 @@ class StreamingToolCallProjector:
         self.arguments = {}
         self.argument_fragments = []
         self.content_fragments = []
-        # How many content fragments the stream has published, and whether
-        # the text since the start of the output or the last call has shown
-        # a visible character yet.
+        # How many content fragments the stream has published (the rest are
+        # whitespace it holds), and whether the text since the start of the
+        # output or the last call has shown a visible character yet.
         self.streamed_count = 0
         self.text_visible = False
         self.closed_calls = []
@@ -153,8 +153,9 @@ class StreamingToolCallProjector:
         self.content_fragments.append(value)
         # The chat template sets calls apart from text with whitespace. Hold
         # whitespace that starts the output or follows a call until visible
-        # text arrives: a tool-only turn then streams no text, and output cut
-        # right after a call does not report the whitespace that follows it.
+        # text arrives. Before the first text or after the last, it only
+        # frames the calls and is dropped; between two texts it separates
+        # them and streams with the later one.
         if not self.text_visible:
             if not value.strip():
                 return
@@ -178,6 +179,9 @@ class StreamingToolCallProjector:
                 "invalid_model_output",
             )
         self.pending = self.pending[name_end + 2 :]
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
         self.function_name = name
         self.call_id = f"call_{self.request_id}_{self.call_index}"
         self.arguments = {}
@@ -397,12 +401,13 @@ class StreamingToolCallProjector:
                 incomplete and TOOL_CALL_OPEN.startswith(self.pending)
             ):
                 self.content_fragments.append(self.pending)
+            elif self.closed_calls:
+                # Whitespace held after the last text only framed the calls.
+                del self.content_fragments[self.streamed_count :]
             self.pending = ""
         elif not incomplete:
             self._malformed()
         parsed_content = "".join(self.content_fragments)
-        if canonical_calls and not parsed_content.strip():
-            parsed_content = ""
         emitted = self._streamed_content()
         if (
             not incomplete and parsed_content != canonical_content
@@ -513,8 +518,13 @@ def parse_tool_calls(text, request_id, policy=None):
             }
         )
     content.append(text[cursor:])
-    content = "".join(content)
-    return ("" if calls and not content.strip() else content), calls
+    if calls:
+        # Whitespace alone before the first text or after the last is the
+        # chat template's framing around calls; between two texts it
+        # separates them.
+        visible = [index for index, part in enumerate(content) if part.strip()]
+        content = content[visible[0] : visible[-1] + 1] if visible else []
+    return "".join(content), calls
 
 
 def _validate(validator, value):
