@@ -339,10 +339,13 @@ class CompileConfigurationTests(unittest.TestCase):
                 for phase in ("prefill", "decode")
                 for name in ("attention_q8.metal", "attention_q8_store.metal")
             ]
+            # Every test library links the kernel that ends residency.
+            residency_source = kernel_root / "shared/residency.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
             for relative in (
                 *q8_sources,
+                residency_source,
                 removed_source,
                 removed_header,
                 Path("runtime/metal/abi/ExecutionGeometry.h"),
@@ -371,7 +374,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "metal"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in (*q8_sources, removed_source)
+                for source in (*q8_sources, residency_source, removed_source)
             }
             test_airs = {
                 str(
@@ -379,7 +382,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "engine-tests/kernels"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in q8_sources
+                for source in (*q8_sources, residency_source)
             }
 
             def rebuild(*selected):

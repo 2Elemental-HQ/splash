@@ -621,7 +621,13 @@ struct MetalBackend::Impl {
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
+        id<MTLComputePipelineState> result = newPipeline(name);
+        pipelines.emplace(name, result);
+        sampleDeviceMemory();
+        return result;
+    }
 
+    id<MTLComputePipelineState> newPipeline(std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
         id<MTLFunction> function = [library newFunctionWithName:key];
         if (!function) {
@@ -636,8 +642,6 @@ struct MetalBackend::Impl {
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
         }
-        pipelines.emplace(name, result);
-        sampleDeviceMemory();
         return result;
     }
 };
@@ -784,8 +788,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
-        impl_->residency = std::make_shared<Residency>(
-            impl_->device, impl_->queue, residencyKeepAliveSeconds);
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
         NSError *error = nil;
@@ -809,6 +811,12 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
                 "unable to load metallib " + metallibPath + ": " +
                 errorDescription(error));
         }
+        // Ending residency dispatches a kernel built here, so no pipeline or
+        // driver program is compiled when a keep-alive lapses.
+        impl_->residency = std::make_shared<Residency>(
+            impl_->device, impl_->queue,
+            impl_->newPipeline(Residency::kKickPipeline),
+            residencyKeepAliveSeconds);
         impl_->sampleDeviceMemory();
 
         readDeviceCapabilities(impl_->device, impl_->capabilities);

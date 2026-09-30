@@ -54,7 +54,8 @@ power condition.
   matched the retained main run on the same input token-for-token.
 
 The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
-`--compare-metallib BASELINE` and checks exact output equality;
+`--compare-metallib BASELINE` and checks exact output equality (the baseline
+must be built from a tree with `residency_kick`, which every backend loads);
 `paged-attention-plan METALLIB --long` runs the long independent references.
 
 ## Combined serving validation with PR #92

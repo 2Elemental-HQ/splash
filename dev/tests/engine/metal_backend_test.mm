@@ -382,6 +382,63 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
 }
 
+std::atomic<unsigned> blitEncoders{0};
+std::atomic<unsigned> computeEncoders{0};
+IMP originalBlitEncoder = nullptr;
+IMP originalComputeEncoder = nullptr;
+id countBlitEncoder(id command, SEL selector) {
+    ++blitEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalBlitEncoder)(command, selector);
+}
+id countComputeEncoder(id command, SEL selector) {
+    ++computeEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalComputeEncoder)(command, selector);
+}
+
+// A lapsed keep-alive ends residency with one dispatch of a kernel built with
+// the library, never a blit whose driver program compiles at that moment, and
+// destroying a backend that holds its set submits no GPU work at all.
+void residencyEndsWithoutBlits(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.2;
+    id<MTLCommandBuffer> command =
+        [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+    commits = 0;
+    blitEncoders = 0;
+    computeEncoders = 0;
+    MethodReplacement committing(command, @selector(commit),
+                                 reinterpret_cast<IMP>(countCommit));
+    originalCountedCommit = committing.original;
+    MethodReplacement blits(command, @selector(blitCommandEncoder),
+                            reinterpret_cast<IMP>(countBlitEncoder));
+    originalBlitEncoder = blits.original;
+    MethodReplacement computes(command, @selector(computeCommandEncoder),
+                               reinterpret_cast<IMP>(countComputeEncoder));
+    originalComputeEncoder = computes.original;
+    unsigned lapseCommits = 0, lapseComputes = 0;
+    {
+        MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+        const uint64_t page = static_cast<uint64_t>(getpagesize());
+        MetalBuffer lapsing = backend.allocateBuffer(page);
+        backend.keepResident(lapsing);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((!backend.lapsedResidentBytes() || !commits) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        lapseCommits = commits.exchange(0);
+        lapseComputes = computeEncoders.exchange(0);
+        // Keeping another buffer holds the set again for the teardown.
+        MetalBuffer held = backend.allocateBuffer(page);
+        backend.keepResident(held);
+        require(backend.lapsedResidentBytes() == 0, "a kept buffer did not hold the set");
+    }
+    require(lapseCommits == 1 && lapseComputes == 1,
+            "a lapsed keep-alive did not end residency with one compute dispatch");
+    require(commits == 0 && computeEncoders == 0,
+            "backend teardown submitted GPU work");
+    require(blitEncoders == 0, "residency encoded a blit");
+    std::cout << "PASS residency ends without blits\n";
+}
+
 // Kept buffers stay held until the keep-alive passes without a command, the
 // next command holds them again at once, and a buffer's last view takes it
 // out of the set.
@@ -1446,6 +1503,7 @@ int main(int argc, const char *argv[]) {
             pendingCommandStillTimesOut(argv[1]);
             keptBuffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
+            residencyEndsWithoutBlits(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()
