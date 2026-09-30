@@ -162,9 +162,11 @@ ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
 // (LinearPlan::scratchSize and gateScratchBytes, as the decode arena sizes
 // them) followed by a guard band, and the split partials are set to NaN
 // before every dispatch, so a partition that reads a partial before its
-// writer published it poisons the output.
+// writer published it poisons the output. The poison word is an fp32 NaN
+// made of two bf16 NaNs, so it poisons bf16 buffers too.
 constexpr uint64_t kGuardBytes = 4096;
-constexpr uint32_t kPoisonNaN = 0x7FC00000u;
+constexpr uint32_t kPoisonNaN = 0x7FC07FC0u;
+constexpr uint16_t kPoisonBf16 = 0x7FC0u;
 constexpr uint32_t kSplitMaximumRows = kRows * kMaximumBatch;
 
 struct Guarded final {
@@ -198,12 +200,18 @@ std::string describe(const SplitCase &c) {
          (c.destination == splash::ops::FloatOutput::Float32 ? " fp32" : "");
 }
 
-// Runs `plan` over `rows` rows of the operands and returns its output bytes;
-// fails on a write past any buffer or a counter left nonzero.
+// Runs `plan` over `rows` rows of the operands (`input`, and `residual` for a
+// residual epilogue) twice back to back in one command buffer, the output
+// set to NaN in between, and returns the second run's output bytes: every
+// element is stored again through the counters the first run left. Each
+// operand is bound from a buffer of the widest step's rows whose rows past
+// the plan's, and its guard band, hold bf16 NaN, so a read past the plan's
+// rows or inputs that reaches a stored element poisons it. Fails on a write
+// past any buffer or a counter left nonzero.
 std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Linear &linear,
                                   const splash::ops::LinearPlan &plan, const SplitCase &c,
                                   const splash::ops::Projection &up, const splash::ops::Projection &gate,
-                                  const MetalBuffer &input, const MetalBuffer &residual, const MetalBuffer &poison) {
+                                  const uint16_t *input, const uint16_t *residual, const MetalBuffer &poison) {
   using namespace splash::ops;
   const auto [n, k] = c.matrix;
   const uint32_t rows = plan.storageRows();
@@ -213,21 +221,34 @@ std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Line
   const uint64_t gateBytes = plan.gateScratchBytes();
   std::optional<Guarded> gateScratch;
   if (gateBytes) gateScratch.emplace(backend, gateBytes);
+  const auto operand = [&](const uint16_t *values, uint32_t width) {
+    const uint64_t used = uint64_t{rows} * width, capacity = uint64_t{kSplitMaximumRows} * width + kGuardBytes / 2;
+    MetalBuffer buffer = shared(backend, capacity * 2, "q4-split-operand");
+    auto *data = static_cast<uint16_t *>(buffer.contents());
+    std::copy_n(values, used, data);
+    std::fill(data + used, data + capacity, kPoisonBf16);
+    return backend.view(buffer, 0, used * 2);
+  };
   const bool residualEpilogue = c.epilogue == LinearEpilogue::Residual;
-  LinearBuffers buffers{backend.view(input, 0, uint64_t{rows} * k * 2), output.view, {},
-                        residualEpilogue ? backend.view(residual, 0, uint64_t{rows} * n * 2) : MetalBuffer{},
+  LinearBuffers buffers{operand(input, k), output.view, {}, residualEpilogue ? operand(residual, n) : MetalBuffer{},
                         gateScratch ? gateScratch->view : MetalBuffer{}, {},
                         LinearScratch{{}, {}, partials.view, counters.view}};
   splash::metal::CommandGraph projection;
   linear.add(projection, buffers, up, plan, c.epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
-  // The poison before each of the plan's dispatches (gate/up runs two).
+  // The poison before each of the plan's dispatches (gate/up runs two), and
+  // the output's before the second run.
   splash::metal::CommandGraph poisoning;
   poisoning.add("test_copy_u32", {poison, partials.view}, uint32_t(scratch.partials / 4),
                 {uint32_t((scratch.partials / 4 + 255) / 256), 1, 1}, {256, 1, 1});
+  poisoning.add("test_copy_u32", {poison, output.view}, uint32_t(output.bytes / 4),
+                {uint32_t((output.bytes / 4 + 255) / 256), 1, 1}, {256, 1, 1});
   std::vector<ComputeDispatch> dispatches;
-  for (const ComputeDispatch &dispatch : projection.dispatches()) {
-    dispatches.push_back(poisoning.dispatches().front());
-    dispatches.push_back(dispatch);
+  for (uint32_t run = 0; run < 2; ++run) {
+    if (run) dispatches.push_back(poisoning.dispatches()[1]);
+    for (const ComputeDispatch &dispatch : projection.dispatches()) {
+      dispatches.push_back(poisoning.dispatches()[0]);
+      dispatches.push_back(dispatch);
+    }
   }
   (void)backend.submitCommand(dispatches);
   const auto *count = static_cast<const uint32_t *>(counters.view.contents());
@@ -263,20 +284,22 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
   const auto plan = [&](uint32_t lanes) {
     return Linear::plan({c.matrix, lanes * kRows, LinearPhase::Decode, c.epilogue}, config, c.destination);
   };
+  // The poison covers the widest step's partials, which hold its output too.
   const LinearScratchSize widest = plan(kMaximumBatch).scratchSize();
   MetalBuffer poison = shared(backend, widest.partials, "q4-split-poison");
   std::fill_n(static_cast<uint32_t *>(poison.contents()), widest.partials / 4, kPoisonNaN);
   const uint64_t element = elementBytes(c.destination), laneBytes = uint64_t{kRows} * n * element;
+  const auto *inputValues = static_cast<const uint16_t *>(input.contents());
+  const auto *residualValues = static_cast<const uint16_t *>(residual.contents());
   // Each lane alone, at 8 rows.
   std::vector<uint8_t> lanes;
   for (uint32_t lane = 0; lane < kMaximumBatch; ++lane) {
-    const MetalBuffer laneInput = backend.view(input, uint64_t{lane} * kRows * k * 2, uint64_t{kRows} * k * 2);
-    const MetalBuffer laneResidual = backend.view(residual, uint64_t{lane} * kRows * n * 2, uint64_t{kRows} * n * 2);
-    const auto bytes = runSplitPlan(backend, linear, plan(1), c, up, gate, laneInput, laneResidual, poison);
+    const auto bytes = runSplitPlan(backend, linear, plan(1), c, up, gate, inputValues + uint64_t{lane} * kRows * k,
+                                    residualValues + uint64_t{lane} * kRows * n, poison);
     lanes.insert(lanes.end(), bytes.begin(), bytes.end());
   }
   for (uint32_t width = 2; width <= kMaximumBatch; ++width)
-    if (runSplitPlan(backend, linear, plan(width), c, up, gate, input, residual, poison) !=
+    if (runSplitPlan(backend, linear, plan(width), c, up, gate, inputValues, residualValues, poison) !=
         std::vector<uint8_t>(lanes.begin(), lanes.begin() + width * laneBytes))
       fail(describe(c) + " M" + std::to_string(width * kRows) + " differs from its lanes at 8 rows");
   // The sequential tile of lane 0 and, for gate/up, its exact gate and up.
@@ -307,7 +330,6 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
   float maxAbs = 0, maxDiff = 0;
   for (uint64_t i = 0; i < elements; ++i) maxAbs = std::max(maxAbs, std::fabs(bf16At(exact.contents(), i)));
   const float slack = reassociationSlack(k, maxAbs);
-  const auto *residualValues = static_cast<const uint16_t *>(residual.contents());
   for (uint64_t i = 0; i < elements; ++i) {
     SplitReference reference{bf16At(exact.contents(), i)};
     if (c.epilogue == LinearEpilogue::Residual) reference.residual = bf16ToFloat(residualValues[i]);
