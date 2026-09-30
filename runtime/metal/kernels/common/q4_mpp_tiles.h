@@ -262,15 +262,21 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-template <ushort Rows, ushort TileN, bool GateUp, bool AddResidual,
-          ushort StorageN = TileN, bool MultiplySiluGate = false,
-          ushort Simdgroups = 8, class Out>
-inline void q4_mpp_tile_batched(
+// The fp32 sums of a Rows x TileN tile over quant groups
+// [first_group, end_group): per group the MPP matmul of the input's 64 values
+// with the group's weights, then its scale/bias epilogue, in group order, with
+// the input sums of each 256-input block (first_group is a multiple of four)
+// double-buffered in `input_sums`, 8 * Rows floats. GateUp accumulates the
+// second weight stream alongside. The tile hands its sums to
+// store(sums_0, sums_1, traversal).
+template <ushort Rows, ushort TileN, bool GateUp, ushort StorageN,
+          ushort Simdgroups, class Store>
+__attribute__((always_inline)) inline void q4_mpp_tile_sums(
     device bfloat *input, device uchar *weights_0, device bfloat *scales_0,
-    device bfloat *biases_0, device Out *output_0, device uchar *weights_1,
-    device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
-    uint output_size, uint input_size, threadgroup float *input_sums,
-    uint output_origin, uint simd_lane, uint simd_group) {
+    device bfloat *biases_0, device uchar *weights_1, device bfloat *scales_1,
+    device bfloat *biases_1, uint input_size, threadgroup float *input_sums,
+    uint output_origin, uint first_group, uint end_group, uint simd_lane,
+    uint simd_group, const thread Store &store) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows},
                   array<int, 2>{1, int(input_size)});
   constexpr auto descriptor =
@@ -296,7 +302,8 @@ inline void q4_mpp_tile_batched(
       decltype(a0), decltype(b00), float>();
   auto accumulated_1 = operation.template get_destination_cooperative_tensor<
       decltype(a0), decltype(b10), float>();
-  // Full Rows x TileN destination and uniform partition capacity, as above.
+  // Full Rows x TileN destination and uniform partition capacity, as in
+  // q4_mpp_tile.
   const bool fullyOccupied =
       uint(accumulated_0.get_capacity()) * (uint(Simdgroups) * 32u) ==
       uint(Rows) * TileN;
@@ -307,10 +314,12 @@ inline void q4_mpp_tile_batched(
     if constexpr (GateUp)
       accumulated_1[i] = 0.0f;
   });
-  q4_store_input_sums<Rows, Simdgroups>(input, input_size, 0, input_sums, 0, simd_lane,
-                            simd_group);
+  q4_store_input_sums<Rows, Simdgroups>(input, input_size, first_group * 64,
+                                        input_sums,
+                                        ((first_group >> 2) & 1) * (4 * Rows),
+                                        simd_lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+  for (uint quant_group = first_group; quant_group < end_group; ++quant_group) {
     uint input_origin = quant_group * 64;
     auto a_slice = a.slice<64, Rows>(input_origin, 0);
     device uchar *group_weights_0 =
@@ -347,7 +356,7 @@ inline void q4_mpp_tile_batched(
             input_sums[sum_offset + row] * float(biases_1[parameter]);
       }
     });
-    if ((quant_group & 3) == 3 && quant_group + 1 < quant_groups) {
+    if ((quant_group & 3) == 3 && quant_group + 1 < end_group) {
       uint next_group = (quant_group + 1) >> 2;
       q4_store_input_sums<Rows, Simdgroups>(input, input_size, input_origin + 64,
                                 input_sums, (next_group & 1) * (4 * Rows),
@@ -355,11 +364,30 @@ inline void q4_mpp_tile_batched(
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
-  q4_visit(accumulated_0, traversal, [&](ushort i) {
-    auto index = accumulated_0.get_multidimensional_index(i);
-    uint output_index = index[1] * output_size + output_origin + index[0];
-    q4_store_output<GateUp, AddResidual, MultiplySiluGate>(
-        accumulated_0, accumulated_1, i, residual, output_0, output_index);
+  store(accumulated_0, accumulated_1, traversal);
+}
+
+template <ushort Rows, ushort TileN, bool GateUp, bool AddResidual,
+          ushort StorageN = TileN, bool MultiplySiluGate = false,
+          ushort Simdgroups = 8, class Out>
+inline void q4_mpp_tile_batched(
+    device bfloat *input, device uchar *weights_0, device bfloat *scales_0,
+    device bfloat *biases_0, device Out *output_0, device uchar *weights_1,
+    device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
+    uint output_size, uint input_size, threadgroup float *input_sums,
+    uint output_origin, uint simd_lane, uint simd_group) {
+  q4_mpp_tile_sums<Rows, TileN, GateUp, StorageN, Simdgroups>(
+      input, weights_0, scales_0, biases_0, weights_1, scales_1, biases_1,
+      input_size, input_sums, output_origin, 0, input_size / 64, simd_lane,
+      simd_group,
+      [&](thread auto &accumulated_0, thread auto &accumulated_1,
+          Q4Traversal traversal) __attribute__((always_inline)) {
+    q4_visit(accumulated_0, traversal, [&](ushort i) {
+      auto index = accumulated_0.get_multidimensional_index(i);
+      uint output_index = index[1] * output_size + output_origin + index[0];
+      q4_store_output<GateUp, AddResidual, MultiplySiluGate>(
+          accumulated_0, accumulated_1, i, residual, output_0, output_index);
+    });
   });
   // Same next-tile hazard on input-sum region 0 as q4_mpp_tile.
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -551,85 +579,31 @@ inline void q4_mpp_tile_grid_split(
     threadgroup uint *arrival, uint2 group, uint splits, uint simd_lane,
     uint simd_group) {
   const uint blocks = input_size / 256;
-  const uint first_group = group.y * blocks / splits * 4;
-  const uint quant_groups = (group.y + 1) * blocks / splits * 4 - first_group;
   const uint output_origin = group.x * TileN;
-  auto a = tensor(input, dextents<int, 2>{int(input_size), Rows},
-                  array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor =
-      matmul2d_descriptor(Rows, TileN, 64, false, true, false);
-  matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
-  uint total_quant_groups = input_size / 64;
-  uint tile = output_origin / 256;
-  uint tile_offset = output_origin % 256;
-  device uchar *tile_weights =
-      weights + (ulong(tile) * total_quant_groups + first_group) * 256 * 64 / 2;
-  tensor<device uint4b_format, dextents<int, 2>, tensor_inline> first_b(
-      tile_weights + tile_offset * 32, dextents<int, 2>{64, TileN},
-      array<int, 2>{1, 64});
-  auto a0 = a.slice<64, Rows>(0, 0);
-  auto b0 = first_b.slice<64, TileN>(0, 0);
-  auto accumulated = operation.template get_destination_cooperative_tensor<
-      decltype(a0), decltype(b0), float>();
-  // Full Rows x TileN destination and uniform partition capacity, as in
-  // q4_mpp_tile.
-  const bool fullyOccupied =
-      uint(accumulated.get_capacity()) * (uint(Simdgroups) * 32u) ==
-      uint(Rows) * TileN;
-  const auto traversal = fullyOccupied ? Q4Traversal::All
-                                       : q4_traversal(accumulated);
-  q4_visit(accumulated, traversal, [&](ushort i) { accumulated[i] = 0.0f; });
-  q4_store_input_sums<Rows, Simdgroups>(input, input_size, first_group * 64,
-                                        input_sums, 0, simd_lane, simd_group);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
-    uint input_origin = (first_group + quant_group) * 64;
-    auto a_slice = a.slice<64, Rows>(input_origin, 0);
-    device uchar *group_weights =
-        tile_weights + (ulong(quant_group) * 256 + tile_offset) * 64 / 2;
-    tensor<device uint4b_format, dextents<int, 2>, tensor_inline> b(
-        group_weights, dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
-    auto b_slice = b.slice<64, TileN>(0, 0);
-    auto partial = operation.template get_destination_cooperative_tensor<
-        decltype(a_slice), decltype(b_slice), float>();
-    operation.run(a_slice, b_slice, partial);
-    q4_visit(accumulated, traversal,
-             [&](ushort i) __attribute__((always_inline)) {
-      auto index = accumulated.get_multidimensional_index(i);
-      ulong parameter =
-          (ulong(tile) * total_quant_groups + first_group + quant_group) * 256 +
-          tile_offset + index[0];
-      uint sum_offset =
-          ((quant_group >> 2) & 1) * (4 * Rows) + (quant_group & 3) * Rows;
-      accumulated[i] +=
-          partial[i] * float(scales[parameter]) +
-          input_sums[sum_offset + index[1]] * float(biases[parameter]);
-    });
-    if ((quant_group & 3) == 3 && quant_group + 1 < quant_groups) {
-      uint next_group = (quant_group + 1) >> 2;
-      q4_store_input_sums<Rows, Simdgroups>(
-          input, input_size, input_origin + 64, input_sums,
-          (next_group & 1) * (4 * Rows), simd_lane, simd_group);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-  }
   const ulong split_stride = ulong(Rows) * output_size;
-  q4_visit(accumulated, traversal, [&](ushort i) {
-    auto index = accumulated.get_multidimensional_index(i);
-    partials[group.y * split_stride + index[1] * output_size + output_origin +
-             index[0]] = accumulated[i];
+  q4_mpp_tile_sums<Rows, TileN, false, 256, Simdgroups>(
+      input, weights, scales, biases, weights, scales, biases, input_size,
+      input_sums, output_origin, group.y * blocks / splits * 4,
+      (group.y + 1) * blocks / splits * 4, simd_lane, simd_group,
+      [&](thread auto &accumulated, thread auto &, Q4Traversal traversal)
+          __attribute__((always_inline)) {
+    q4_visit(accumulated, traversal, [&](ushort i) {
+      auto index = accumulated.get_multidimensional_index(i);
+      partials[group.y * split_stride + index[1] * output_size +
+               output_origin + index[0]] = accumulated[i];
+    });
+    const uint thread_index = simd_group * 32 + simd_lane;
+    if (!split_arrive_last(counters + group.x, splits, thread_index, arrival))
+      return;
+    q4_visit(accumulated, traversal, [&](ushort i) {
+      auto index = accumulated.get_multidimensional_index(i);
+      const uint element = index[1] * output_size + output_origin + index[0];
+      accumulated[i] = split_sum(
+          float(accumulated[i]), group.y, splits,
+          [&](uint split) { return partials[split * split_stride + element]; });
+      q4_store_output<false, AddResidual, MultiplySiluGate>(
+          accumulated, accumulated, i, auxiliary, output, element);
+    });
+    split_release(counters + group.x, thread_index);
   });
-  const uint thread_index = simd_group * 32 + simd_lane;
-  if (!split_arrive_last(counters + group.x, splits, thread_index, arrival))
-    return;
-  q4_visit(accumulated, traversal, [&](ushort i) {
-    auto index = accumulated.get_multidimensional_index(i);
-    const uint element = index[1] * output_size + output_origin + index[0];
-    accumulated[i] = split_sum(
-        float(accumulated[i]), group.y, splits,
-        [&](uint split) { return partials[split * split_stride + element]; });
-    q4_store_output<false, AddResidual, MultiplySiluGate>(
-        accumulated, accumulated, i, auxiliary, output, element);
-  });
-  split_release(counters + group.x, thread_index);
 }
