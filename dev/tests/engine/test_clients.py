@@ -469,7 +469,7 @@ class ClientTests(unittest.TestCase):
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
-                                "maxTokens": 25600,
+                                "maxTokens": 32768,
                             }
                         ],
                     }

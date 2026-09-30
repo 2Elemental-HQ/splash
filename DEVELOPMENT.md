@@ -126,6 +126,12 @@ cannot fit, startup prints a memory budget breakdown and stops.
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
+`splash opencode`, `pi` and `hermes` configure an output limit per response
+of 32K tokens (`CLIENT_RESPONSE_TOKENS` in `install/clients.py`); OpenCode and
+Hermes, which reserve it out of the context they compact at, get a quarter of
+a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
+Codex, leave the limit to the server; Claude Code keeps its own, which
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
 
 `splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
 user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
