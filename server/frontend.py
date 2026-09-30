@@ -1041,6 +1041,7 @@ class Frontend:
                 prompt_tokens, prepared_images, image_positions
             )
         remaining_request_time(deadline)
+        requested = body.get("max_completion_tokens", body.get("max_tokens"))
         if output_field is None:
             # Chat takes either field; errors name the one the client sent.
             output_field = (
@@ -1049,10 +1050,7 @@ class Frontend:
                 else "max_tokens"
             )
         max_new = self._output_budget(
-            body.get("max_completion_tokens", body.get("max_tokens")),
-            prompt_tokens,
-            output_field,
-            clamp_output_budget,
+            requested, prompt_tokens, output_field, clamp_output_budget
         )
         job = self._generation_job(
             body,
@@ -1073,6 +1071,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            output_clamped_to_context=requested is not None and max_new < requested,
         )
         return job, thinking, bool(tools)
 

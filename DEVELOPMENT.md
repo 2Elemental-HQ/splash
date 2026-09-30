@@ -754,7 +754,9 @@ names no limit. A value larger than what the context leaves returns 400
 as in vLLM and SGLang; that error and an invalid value's name the field the
 request sent. Messages requires `max_tokens`; a larger value than the context
 leaves generates up to the context limit, since Claude Code asks for the same
-limit on every turn and does not compact for it.
+limit on every turn and does not compact for it. A response the context limit
+ends then has the `stop_reason` `model_context_window_exceeded`, as in
+Anthropic's API, not `max_tokens`.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft

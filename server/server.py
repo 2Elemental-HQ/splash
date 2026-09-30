@@ -1185,7 +1185,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "message_delta",
                 {
                     "delta": {
-                        "stop_reason": anthropic_stop(result, tool_calls),
+                        "stop_reason": anthropic_stop(
+                            result, tool_calls, job.output_clamped_to_context
+                        ),
                         "stop_sequence": result.stop_sequence,
                     },
                     "usage": {"output_tokens": result.completion_tokens},

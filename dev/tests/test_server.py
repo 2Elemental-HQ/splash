@@ -6478,6 +6478,38 @@ class ServerTest(unittest.TestCase):
         )
         self.assertGreaterEqual(request.logical_max_output_tokens, 1)
 
+    def test_anthropic_reports_the_context_window_when_it_ends_the_response(self):
+        # The prompt is 2 tokens of a 10-token window: max_tokens 9 is
+        # lowered to 8, 8 fits exactly and 7 leaves room.
+        cases = [
+            (max_tokens, stream, expected)
+            for max_tokens, expected in (
+                (9, "model_context_window_exceeded"),
+                (8, "max_tokens"),
+                (7, "max_tokens"),
+            )
+            for stream in (False, True)
+        ]
+        harness = self.harness(
+            FakeRuntime(*(Plan([[4]], reason="length") for _ in cases)),
+            max_context=10,
+        )
+        for max_tokens, stream, expected in cases:
+            with self.subTest(max_tokens=max_tokens, stream=stream):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/messages",
+                    self.anthropic_body(max_tokens=max_tokens, stream=stream),
+                )
+                self.assertEqual(status, 200, payload)
+                if stream:
+                    events = self.response_events(payload)
+                    self.assertEqual(events[-2]["type"], "message_delta")
+                    stop_reason = events[-2]["delta"]["stop_reason"]
+                else:
+                    stop_reason = json.loads(payload)["stop_reason"]
+                self.assertEqual(stop_reason, expected)
+
     def test_default_output_budget_uses_remaining_context(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, max_context=10)
