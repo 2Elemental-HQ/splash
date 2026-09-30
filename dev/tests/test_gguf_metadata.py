@@ -349,10 +349,15 @@ class GgufMetadataTests(unittest.TestCase):
         # Layer 3 is full attention; the others around it GDN.
         self.assertIn("blk.3.attn_q.weight", tensors)
         self.assertNotIn("blk.2.attn_q.weight", tensors)
-        # GDN alpha and beta may also both be F32, and the MTP layer (block
-        # 40) is never loaded, so its types do not matter.
+        # GDN alpha and beta may be both of any one quantized format or both
+        # F32, and the MTP layer (block 40) is never loaded, so its types do
+        # not matter.
+        tensors |= {"blk.0.ssm_alpha.weight": GGML["IQ4_XS"]}
+        tensors |= {"blk.0.ssm_beta.weight": GGML["IQ4_XS"]}
         tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
         tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
+        tensors |= {"blk.2.ssm_alpha.weight": GGML["Q8_0"]}
+        tensors |= {"blk.2.ssm_beta.weight": GGML["Q8_0"]}
         tensors |= {"blk.40.ffn_up_exps.weight": GGML["BF16"]}
         tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
         # The low-bit formats of Unsloth's smaller files, the embedding too.
@@ -388,6 +393,13 @@ class GgufMetadataTests(unittest.TestCase):
             (
                 {"blk.1.ssm_alpha.weight": GGML["Q8_0"]},
                 "ssm_alpha.weight and ssm_beta.weight of different types",
+            ),
+            (
+                {
+                    "blk.1.ssm_alpha.weight": GGML["F16"],
+                    "blk.1.ssm_beta.weight": GGML["F16"],
+                },
+                "ssm_alpha.weight F16",
             ),
             # An all-F32 file, whose types the loader reads somewhere.
             (f32, "attn_output.weight F32 [(]10 tensors[)]"),

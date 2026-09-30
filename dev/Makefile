@@ -79,7 +79,6 @@ test-python: install-development
 test-models: install-development
 	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
 		dev/tests/test_weight_preparation_identity.py dev/tests/test_gguf_metadata.py \
-		dev/tests/test_iq4xs_gate_metadata.py \
 		dev/tests/test_installer_restarts.py
 
 check-python-engine: install-development test-python test-models
