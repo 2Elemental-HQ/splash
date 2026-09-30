@@ -439,6 +439,26 @@ class StructuredToolProjectionTest(unittest.TestCase):
                 content = "".join(value for kind, value in events if kind == "content")
                 self.assertEqual(content + "".join(tail), canonical)
 
+    def test_a_cut_after_a_call_reports_and_streams_no_text(self):
+        # Beside an output schema only whitespace surrounds calls.
+        job = self.job()
+        text = " \n" + CALL + "\n" + OTHER_CALL + "\n"
+        for end in range(len(" \n" + CALL), len(text) + 1):
+            cut = text[:end]
+            with self.subTest(cut=cut):
+                content, calls = self.finalize(cut, job, True)
+                self.assertEqual(content, "")
+                self.assertEqual(calls[0]["function"]["name"], "lookup")
+                projector = model_output.StreamingToolCallProjector(
+                    job.tool_policy, job.public_id, True
+                )
+                events = []
+                for char in cut:
+                    events.extend(projector.put(char))
+                tail = projector.finish(content, calls, True)
+                self.assertFalse([value for kind, value in events if kind == "content"])
+                self.assertEqual(tail, [])
+
     def test_finalization_enforces_required_parallel_and_output_schema(self):
         for text, job in (
             (ANSWER, self.job("required")),
