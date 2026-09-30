@@ -266,6 +266,7 @@ class Frontend:
         vision,
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
+        announce_served_name: bool = False,
         default_reasoning_effort=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
@@ -289,6 +290,15 @@ class Frontend:
                 ]
             )
         )
+        # Diagnostics keep reporting the package id the engine loaded, so an
+        # alias can never hide what served a request (#81).
+        self.loaded_model = model
+        if announce_served_name and served_model_names:
+            # Opt-in: responses announce the primary served name so a client
+            # that requested it gets it back. Every name in model_names stays
+            # accepted for requests and the registry name stays listed in
+            # /v1/models.
+            self.model = validate_served_model_name(served_model_names[0])
         if (
             default_reasoning_effort is not None
             and default_reasoning_effort not in REASONING_EFFORTS

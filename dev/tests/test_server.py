@@ -543,6 +543,7 @@ def main_args(**overrides):
             "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
+            "announce_served_name": False,
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
@@ -2202,6 +2203,76 @@ class ServerTest(unittest.TestCase):
                         "GET", f"/v1/models/{model['id']}"
                     )
                     self.assertEqual((status, json.loads(detail)), (200, model))
+
+    def test_served_name_keeps_registry_name_by_default(self):
+        harness = self.harness(FakeRuntime(), served_model_names=("local",))
+        status, _, payload = harness.request("GET", "/v1/models")
+        self.assertEqual(status, 200)
+        models = json.loads(payload)["data"]
+        self.assertEqual([model["id"] for model in models], ["test-model", "local"])
+        self.assertNotIn("root", models[0])
+        self.assertEqual(models[1]["root"], "test-model")
+        status, _, payload = harness.request("GET", "/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["instance"]["model"], "test-model")
+        for requested in ("local", "test-model"):
+            with self.subTest(requested=requested):
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(model=requested)
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(json.loads(payload)["model"], "test-model")
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", self.responses_body(model="local")
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["model"], "test-model")
+
+    def test_announce_served_name_reports_served_name(self):
+        harness = self.harness(
+            FakeRuntime(), served_model_names=("local",), announce_served_name=True
+        )
+        status, _, payload = harness.request("GET", "/v1/models")
+        self.assertEqual(status, 200)
+        models = json.loads(payload)["data"]
+        self.assertEqual([model["id"] for model in models], ["test-model", "local"])
+        self.assertNotIn("root", models[1])
+        self.assertEqual(models[0]["root"], "local")
+        # Diagnostics keep reporting the loaded package id even while
+        # responses announce the served name (#81).
+        status, _, payload = harness.request("GET", "/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["instance"]["model"], "test-model")
+        for requested in ("local", "test-model"):
+            with self.subTest(requested=requested):
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(model=requested)
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(json.loads(payload)["model"], "local")
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", self.responses_body(model="test-model")
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["model"], "local")
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(model="local", stream=True)
+        )
+        self.assertEqual(status, 200, payload)
+        first = next(
+            line
+            for line in payload.decode().splitlines()
+            if line.startswith("data: ") and '"choices"' in line
+        )
+        self.assertEqual(json.loads(first[len("data: ") :])["model"], "local")
+
+    def test_response_keeps_registry_name_without_served_names(self):
+        harness = self.harness(FakeRuntime())
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["model"], "test-model")
 
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app

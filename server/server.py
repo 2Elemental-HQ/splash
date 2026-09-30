@@ -2116,7 +2116,7 @@ class FrontendServer(ThreadingHTTPServer):
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
-            "model": self.app.model,
+            "model": self.app.loaded_model,
             "host": self.server_address[0],
             "port": self.server_address[1],
             "started_at": self.started_at,
@@ -2256,6 +2256,14 @@ def parse_args(argv=None):
         default=[],
         type=validate_served_model_name,
         help="additional API model name; responses still identify the loaded model (repeatable)",
+    )
+    parser.add_argument(
+        "--announce-served-name",
+        action="store_true",
+        help=(
+            "with --served-model-name, report the first served name in API "
+            "responses; /status keeps reporting the loaded model"
+        ),
     )
     parser.add_argument(
         "--default-reasoning-effort",
@@ -2432,6 +2440,7 @@ def main():
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
+            announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
         )
