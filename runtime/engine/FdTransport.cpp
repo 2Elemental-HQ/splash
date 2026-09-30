@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <fcntl.h>
@@ -188,12 +189,18 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
       return NativeProcessExit::IoFailure;
     }
 
+    const auto inputRead = std::chrono::steady_clock::now();
     deferredControl = completionWake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
     }
 
-    if (loop.tick())
+    const bool progressed = loop.tick();
+    const double tickMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - inputRead).count();
+    if (tickMilliseconds > maxTickMilliseconds_.load(std::memory_order_relaxed))
+      maxTickMilliseconds_.store(tickMilliseconds, std::memory_order_relaxed);
+    if (progressed)
       continue;
     if (loop.connectionMustClose())
       return loopFailure(loop);
@@ -220,6 +227,10 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
 
 bool FdTransport::shutdownRequested() const noexcept {
   return completionWake_->shutdownRequested.load(std::memory_order_acquire);
+}
+
+double FdTransport::maxTickMilliseconds() const noexcept {
+  return maxTickMilliseconds_.load(std::memory_order_relaxed);
 }
 
 void FdTransport::requestShutdown() noexcept {

@@ -2,6 +2,7 @@
 
 #include "engine/NativeRuntime.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -40,6 +41,10 @@ public:
   // It does not wait for in-flight GPU work; the process owner bounds teardown.
   void requestShutdown() noexcept;
   [[nodiscard]] bool shutdownRequested() const noexcept;
+  // The longest run() has gone without reading its input: one control pass
+  // and one tick. A frame larger than the pipe buffer waits that long for
+  // room, and the server gives up on a write that makes no progress for 5 s.
+  [[nodiscard]] double maxTickMilliseconds() const noexcept;
 
 private:
   struct CompletionWake;
@@ -49,6 +54,7 @@ private:
   int outputFd_ = -1;
   std::shared_ptr<CompletionWake> completionWake_;
   ControlHandler controlHandler_;
+  std::atomic<double> maxTickMilliseconds_{0.0};
 };
 
 } // namespace splash::engine

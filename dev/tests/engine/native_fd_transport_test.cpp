@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 
 using namespace splash;
@@ -147,6 +148,30 @@ void testShutdownRequestAndControlContinuation() {
   }
 }
 
+// The loop records the longest stretch it spent without reading its input,
+// a control pass and a tick, and keeps it as later stretches are shorter.
+void testLoopRecordsItsLongestTick() {
+  Harness harness;
+  require(harness.transport.maxTickMilliseconds() == 0.0,
+          "a loop that never ran reported a tick");
+  int invocations = 0;
+  double recorded = 0.0;
+  harness.transport.setControlHandler([&] {
+    if (++invocations == 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      return true;
+    }
+    recorded = harness.transport.maxTickMilliseconds();
+    harness.transport.requestShutdown();
+    return false;
+  });
+  harness.transport.controlNotifier()();
+  require(harness.transport.run(harness.loop) == engine::NativeProcessExit::CleanEof,
+          "control-driven shutdown did not end the loop cleanly");
+  require(recorded >= 40.0 && harness.transport.maxTickMilliseconds() >= recorded,
+          "the loop did not keep its longest stretch without reading input");
+}
+
 // With no input and no command in flight, the loop sleeps until the
 // engine's next deadline and then fails the request that reached it.
 void testLoopWakesForAnEngineDeadline() {
@@ -213,6 +238,7 @@ int main() {
   try {
     testCleanEofAndProtocolFailure();
     testShutdownRequestAndControlContinuation();
+    testLoopRecordsItsLongestTick();
     testLoopWakesForAnEngineDeadline();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;

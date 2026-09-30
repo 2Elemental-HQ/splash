@@ -255,6 +255,11 @@ private:
   unsigned state_ = 0;
 };
 
+// The native loop's own timing, which its transport measures.
+struct NativeLoopTiming {
+  double maxTickMilliseconds = 0.0;
+};
+
 // Single source for /status and native protocol status events.
 [[nodiscard]] std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const EngineSnapshot &core,
@@ -264,6 +269,7 @@ private:
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason = {},
-    const ResourceWaitSnapshot &resourceWait = {});
+    const ResourceWaitSnapshot &resourceWait = {},
+    const NativeLoopTiming &loop = {});
 
 } // namespace splash::engine

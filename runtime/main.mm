@@ -338,7 +338,8 @@ int runNative(const NativeArguments &arguments) {
         published->modelRuntime().telemetry(), resources.cacheIdentity(),
         resources.memoryGovernor().snapshot(), healthy,
         healthy ? std::string{} : backend.unhealthyReason(),
-        published->nativeLoop().resourceWaitSnapshot());
+        published->nativeLoop().resourceWaitSnapshot(),
+        engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
   engine::StartupRetryWindow recovery(kStartupMemoryRecoveryTimeout);

@@ -493,8 +493,15 @@ void testResourceWaitDiagnostics() {
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait);
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"suspended\":1,\"draining\":true,"
-                    "\"oldest_wait_ms\":1250}") != std::string::npos,
+                    "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0}") !=
+              std::string::npos,
           "resource wait summary is missing or inaccurate");
+  const std::string ticked = runtimeStatusJson(
+      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
+      NativeLoopTiming{1843.25});
+  require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
+              ticked.find("\"schema_version\":5") != std::string::npos,
+          "the loop's longest tick is missing, or changed the status schema");
   MemoryStatusReporter reporter;
   require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");
   require(!reporter.update(wait, false).empty(), "pressure transition was silent");
