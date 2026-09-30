@@ -34,12 +34,10 @@ bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUN
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The token rows the embedding kernel gathers.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
-// Matching alpha/beta pairs retain Q8_0 or IQ4_XS quantization.
-// F32 stays F32; BF16 is widened exactly to F32.
-bool alphaBetaType(uint32_t type) {
-  return type == ggml::kQ8_0 || gguf_format_of(type) == GGUF_FMT_IQ4XS ||
-         type == ggml::kF32 || type == ggml::kBF16;
-}
+// alpha/beta run as one segment of their shared type: any format of the
+// projections (one repacked tensor) or F32 (one float tensor), which BF16
+// becomes exactly.
+bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32 || type == ggml::kBF16; }
 
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
@@ -75,8 +73,8 @@ public:
   }
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
-  // order: Q8_0 or IQ4_XS as one zero-padded 256-row tensor,
-  // or F32 as one float tensor, which BF16 is widened to exactly.
+  // order: one 256-row tensor of their format padded with zero rows, or F32 as
+  // one float tensor, which BF16 is widened to exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
     const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
     if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
@@ -102,9 +100,9 @@ public:
     }
     if (2 * heads > QUANT_TILE_ROWS) throw GgufError("alpha/beta rows exceed one 256-row tile");
     const uint32_t format = gguf_format_of(beta->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], hidden);
     Repack repack = planes(format, QUANT_TILE_ROWS, hidden, alphaName);
-    for (const GgufTensor *t : {beta, alpha})
-      repack.sources.push_back(tensorRows(*t, heads, ggufRowBytes(kQuantFormats[format], hidden), grouped(0, 1)));
+    for (const GgufTensor *t : {beta, alpha}) repack.sources.push_back(tensorRows(*t, heads, rowBytes, grouped(0, 1)));
     image_.repacks.push_back(std::move(repack));
   }
 

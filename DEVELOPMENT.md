@@ -532,12 +532,15 @@ and lists every unsupported tensor in one error:
 - token embeddings: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 or PQ2_0;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
-- GDN alpha and beta: matching Q8_0, IQ4_XS, F32 or BF16 pairs; preparation
-  widens BF16 exactly to F32.
+- GDN alpha and beta: both of one type, any of the linears' formats (one
+  segment of the GDN input projection), F32 or BF16, which preparation widens
+  to the F32 values it equals.
 
-Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B
-and Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16
-tensors need kernels that do not exist yet. PQ2_0 is Prism ML's type 142,
+Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
+Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
+need kernels that do not exist yet. llama-quantize's default type selection
+stores alpha and beta in the file type's format (Q4_K in a Q4_K_M), as in
+lmstudio-community's files, so those load too. PQ2_0 is Prism ML's type 142,
 `block_pq2_0` of PrismML-Eng/llama.cpp, which upstream GGML does not define:
 2-bit codes q worth d (q - 1) with one half d per 128 weights. A format's
 image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
@@ -550,9 +553,9 @@ tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
 the token table, whose rows are stored as H (D e). The engine runs that one
 form, on dense targets whose rotation names exactly the tensors the planner
-repacks (every quantized projection and the head, and alpha/beta when Q8_0 or IQ4_XS),
-a PQ2_0 token table, and GDN value heads in grouped order (the installer
-screens the parameters, `GgufFile` and the planner check the rest).
+repacks (every quantized projection and the head, and alpha/beta when
+quantized), a PQ2_0 token table, and GDN value heads in grouped order (the
+installer screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input

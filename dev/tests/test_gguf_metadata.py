@@ -86,10 +86,10 @@ def fixture(*, native=False):
 
 def loadable_tensors(values, directory):
     """A tensor table the native loader accepts for the header values: each
-    tensor it reads, quantized as Q4_K, Q8_0 (GDN alpha and beta) or F32."""
+    tensor it reads, quantized as Q4_K or F32."""
     header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
     return {
-        name: GGML[next(t for t in ("Q4_K", "Q8_0", "F32") if t in types)]
+        name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
         for name, types in gguf.loaded_tensors(header).items()
     }
 
