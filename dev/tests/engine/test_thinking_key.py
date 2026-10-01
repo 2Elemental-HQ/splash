@@ -149,6 +149,7 @@ class ThinkingKeyTests(unittest.TestCase):
             port=0,
             queue_size=1,
             allowed_host=[],
+            allowed_origin=[],
             api_key=None,
             no_webui=False,
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,

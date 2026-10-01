@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 try:
@@ -294,6 +295,8 @@ def serve(args):
             command.append("--no-webui")
         for host in args.allowed_host:
             command.extend(["--allowed-host", host])
+        for origin in args.allowed_origin:
+            command.extend(["--allowed-origin", origin])
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
@@ -439,6 +442,30 @@ def _version():
     return "Splash " + str(
         json.loads((paths.ROOT / "release.json").read_text())["version"]
     )
+
+
+def _parse_allowed_origin(value):
+    # The server's rule (server/http_security.py), before any model work.
+    try:
+        origin = urllib.parse.urlsplit(value)
+        valid = value == "*" or bool(
+            all(32 < ord(c) < 127 for c in value)
+            and origin.scheme
+            and origin.hostname
+            and origin.username is None
+            and origin.password is None
+            and not (origin.path or origin.query or origin.fragment)
+            # Reading the port refuses one out of range.
+            and (origin.port is None or origin.port >= 0)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise argparse.ArgumentTypeError(
+            "expected a scheme and a host, as in tauri://localhost or "
+            "http://localhost:3000, or * for every origin"
+        )
+    return value
 
 
 def _parse_served_model_name(value):
@@ -624,6 +651,15 @@ def parse_args(argv=None):
         metavar="HOST",
         help="additional HTTP Host name to accept, e.g. mymac.local; does not change "
         "the bind address (repeatable)",
+    )
+    server.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        type=_parse_allowed_origin,
+        metavar="ORIGIN",
+        help="origin whose pages may call the API from a browser or webview, e.g. "
+        "tauri://localhost; * for any (repeatable)",
     )
     server.add_argument(
         "--max-request-size",

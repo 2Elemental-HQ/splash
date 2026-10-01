@@ -47,7 +47,13 @@ if __package__:
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend, validate_served_model_name
-    from .http_security import authenticate, validate_api_key, validate_headers
+    from .http_security import (
+        ANY_ORIGIN,
+        authenticate,
+        parse_allowed_origins,
+        validate_api_key,
+        validate_headers,
+    )
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
@@ -90,7 +96,13 @@ else:
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
     from frontend import Frontend, validate_served_model_name
-    from http_security import authenticate, validate_api_key, validate_headers
+    from http_security import (
+        ANY_ORIGIN,
+        authenticate,
+        parse_allowed_origins,
+        validate_api_key,
+        validate_headers,
+    )
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
@@ -192,9 +204,13 @@ def _queue_full():
 
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    methods = "GET, HEAD, POST, DELETE, OPTIONS"
 
     def setup(self):
         self._response_started = False
+        # What the response owes its request's origin, once the request has
+        # passed validate_headers.
+        self._allow_origin = None
         self._unread_body = 0
         self._last_sse_write = time.monotonic()
         super().setup()
@@ -269,7 +285,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             allowed_hosts = self.server.allowed_hosts | {
                 self.connection.getsockname()[0].lower()
             }
-            validate_headers(self.headers, allowed_hosts)
+            self._allow_origin = validate_headers(
+                self.headers, allowed_hosts, self.server.allowed_origins
+            )
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
@@ -302,6 +320,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
     @property
     def app(self):
         return self.server.app
+
+    def end_headers(self):
+        # A browser hands a page the response from another origin only when
+        # the response names that origin, so every response to an admitted
+        # origin does: errors and event streams too.
+        if self._allow_origin is not None:
+            self.send_header("Access-Control-Allow-Origin", self._allow_origin)
+            if self._allow_origin != ANY_ORIGIN:
+                self.send_header("Vary", "Origin")
+        super().end_headers()
 
     def _send(self, status, data, content_type):
         self.send_response(status)
@@ -439,7 +467,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", self.methods)
+        if (
+            self._allow_origin is not None
+            and "Access-Control-Request-Method" in self.headers
+        ):
+            # A browser's preflight, which asks what the request it holds back
+            # may use: every method the server has and, as in vLLM, any header.
+            self.send_header("Access-Control-Allow-Methods", self.methods)
+            requested = self.headers.get("Access-Control-Request-Headers")
+            if requested is not None and requested.isprintable():
+                self.send_header("Access-Control-Allow-Headers", requested)
+            self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -2077,6 +2116,7 @@ class FrontendServer(ThreadingHTTPServer):
         api_key=None,
         webui=True,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        allowed_origins=(),
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
@@ -2098,6 +2138,7 @@ class FrontendServer(ThreadingHTTPServer):
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
             if host not in ("0.0.0.0", "::")
         }
+        self.allowed_origins = parse_allowed_origins(allowed_origins)
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
@@ -2296,6 +2337,7 @@ def parse_args(argv=None):
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
+    parser.add_argument("--allowed-origin", action="append", default=[])
     parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
@@ -2313,6 +2355,10 @@ def parse_args(argv=None):
             validate_api_key(args.api_key)
         except ValueError as error:
             parser.error(str(error))
+    try:
+        parse_allowed_origins(args.allowed_origin)
+    except ValueError as error:
+        parser.error(f"--allowed-origin {error}")
     if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
         parser.error(
             "--max-image-pixels must be in "
@@ -2383,6 +2429,7 @@ def main():
             api_key=args.api_key,
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
+            allowed_origins=args.allowed_origin,
         )
         server.server_bind()
         thinking_codec = ThinkingCodec(load_thinking_key())

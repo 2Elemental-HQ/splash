@@ -37,7 +37,13 @@ class HttpBoundaryTests(unittest.TestCase):
 
     def test_authority_and_origin_validation(self):
         allowed = {"localhost", "127.0.0.1", "::1", "serving.example"}
-        cross_origin = "cross-origin requests are not allowed"
+
+        def elsewhere(origin):
+            return (
+                f"Origin {origin} is not allowed; restart the server with "
+                f"--allowed-origin {origin} to accept it"
+            )
+
         cases = (
             ("localhost:8000", "http://localhost:8000", None),
             ("[::1]:8000", "http://[::1]:8000", None),
@@ -50,8 +56,17 @@ class HttpBoundaryTests(unittest.TestCase):
                 "with --allowed-host unconfigured.example to accept it",
             ),
             ("user@localhost:8000", None, "invalid Host header"),
-            ("localhost:8000", "http://localhost:9000", cross_origin),
-            ("localhost:8000", "http://other.example:8000", cross_origin),
+            (
+                "localhost:8000",
+                "http://localhost:9000",
+                elsewhere("http://localhost:9000"),
+            ),
+            (
+                "localhost:8000",
+                "http://other.example:8000",
+                elsewhere("http://other.example:8000"),
+            ),
+            ("localhost:8000", "tauri://localhost", elsewhere("tauri://localhost")),
             ("localhost:8000", "null", "invalid Origin header"),
             ("localhost:8000", "http://user@localhost:8000", "invalid Origin header"),
             ("localhost:8000", "http://localhost:8000/path", "invalid Origin header"),
@@ -64,7 +79,7 @@ class HttpBoundaryTests(unittest.TestCase):
                 if origin is not None:
                     headers["Origin"] = origin
                 if rejection is None:
-                    http_security.validate_headers(headers, allowed)
+                    self.assertIsNone(http_security.validate_headers(headers, allowed))
                     continue
                 with self.assertRaises(APIError) as caught:
                     http_security.validate_headers(headers, allowed)
@@ -80,6 +95,56 @@ class HttpBoundaryTests(unittest.TestCase):
             headers[name] = headers[name]
             with self.assertRaises(APIError):
                 http_security.validate_headers(headers, allowed)
+
+    def test_only_the_origins_named_are_admitted_from_elsewhere(self):
+        def answer(origin, allowed):
+            headers = Message()
+            headers["Host"] = "localhost:8000"
+            headers["Origin"] = origin
+            return http_security.validate_headers(headers, {"localhost"}, allowed)
+
+        named = http_security.parse_allowed_origins(
+            ("tauri://localhost", "HTTP://Localhost:3000", "https://chat.example")
+        )
+        for origin in (
+            "tauri://localhost",
+            "http://localhost:3000",
+            "https://chat.example",
+            "https://chat.example:443",
+        ):
+            with self.subTest(origin=origin):
+                self.assertEqual(answer(origin, named), origin)
+        for origin in (
+            "tauri://other",
+            "app://localhost",
+            "http://localhost:3001",
+            "http://chat.example",
+            "https://chat.example:8443",
+        ):
+            with self.subTest(origin=origin), self.assertRaises(APIError) as caught:
+                answer(origin, named)
+            self.assertIn(f"--allowed-origin {origin} ", caught.exception.message)
+        # The server's own pages owe their browser nothing, named or not.
+        self.assertIsNone(answer("http://localhost:8000", named))
+        # Every origin: whatever a browser sends, a sandboxed page's null too.
+        every = http_security.parse_allowed_origins(("*",))
+        for origin in ("https://anywhere.example", "null", "http://localhost:8000"):
+            with self.subTest(origin=origin):
+                self.assertEqual(answer(origin, every), "*")
+        for value in (
+            "",
+            "null",
+            "localhost:3000",
+            "http://",
+            "http://localhost:3000/",
+            "http://localhost/app",
+            "http://localhost?debug",
+            "http://user@localhost",
+            "http://localhost:99999",
+            "http://local host",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                http_security.parse_allowed_origins((value,))
 
     def test_http_rejection_precedes_routing_and_local_access_still_works(self):
         harness = Harness(FakeRuntime())

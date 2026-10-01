@@ -553,6 +553,7 @@ def main_args(**overrides):
             "queue_size": 1,
             "host": "127.0.0.1",
             "allowed_host": [],
+            "allowed_origin": [],
             "api_key": None,
             "no_webui": False,
             "max_request_size": api.DEFAULT_MAX_REQUEST_BYTES,
@@ -607,6 +608,7 @@ class Harness:
         max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
+        allowed_origins=(),
         vision=True,
         **frontend_options,
     ):
@@ -640,6 +642,7 @@ class Harness:
             webui=webui,
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()

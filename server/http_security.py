@@ -58,7 +58,45 @@ def _forbidden(message):
     return APIError(403, message, "forbidden")
 
 
-def validate_headers(headers, allowed_hosts):
+# Every origin: in --allowed-origin, and in Access-Control-Allow-Origin.
+ANY_ORIGIN = "*"
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(value):
+    # An origin as a browser serializes it: a scheme and an authority and
+    # nothing after them. A port it does not name is its scheme's default.
+    if any(ord(char) <= 32 or ord(char) >= 127 for char in value):
+        raise ValueError("invalid origin")
+    parsed = urlsplit(value)
+    if not parsed.scheme or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("invalid origin")
+    host, port = _authority(parsed.netloc)
+    return (
+        parsed.scheme,
+        host,
+        _DEFAULT_PORTS.get(parsed.scheme) if port is None else port,
+    )
+
+
+def parse_allowed_origins(values):
+    """The origins --allowed-origin names, as validate_headers compares them."""
+    origins = set()
+    for value in values:
+        try:
+            origins.add(value if value == ANY_ORIGIN else _origin(value))
+        except ValueError:
+            raise ValueError(
+                f"{value} is not an origin: expected a scheme and a host, as in "
+                "tauri://localhost or http://localhost:3000, or * for every origin"
+            ) from None
+    return frozenset(origins)
+
+
+def validate_headers(headers, allowed_hosts, allowed_origins=frozenset()):
+    """Refuses a request whose Host or Origin the server does not serve.
+    Returns what its response owes a browser in Access-Control-Allow-Origin:
+    the origin of a page elsewhere that --allowed-origin admits, or None."""
     hosts = headers.get_all("Host", [])
     origins = headers.get_all("Origin", [])
     if len(hosts) != 1 or len(origins) > 1:
@@ -75,19 +113,26 @@ def validate_headers(headers, allowed_hosts):
             f"--allowed-host {host} to accept it"
         )
     if not origins:
-        return
+        return None
+    if ANY_ORIGIN in allowed_origins:
+        return ANY_ORIGIN
     try:
-        origin = urlsplit(origins[0])
-        if origin.scheme not in ("http", "https") or origin.path:
-            raise ValueError("invalid origin")
-        if origin.query or origin.fragment:
-            raise ValueError("invalid origin")
-        origin_host, origin_port = _authority(origin.netloc)
+        origin = _origin(origins[0])
     except ValueError:
         raise _forbidden("invalid Origin header") from None
-    default_port = 443 if origin.scheme == "https" else 80
-    if (origin_host, default_port if origin_port is None else origin_port) != (
+    default_port = _DEFAULT_PORTS.get(origin[0])
+    if default_port is not None and origin[1:] == (
         host,
         default_port if port is None else port,
     ):
-        raise _forbidden("cross-origin requests are not allowed")
+        # The server's own pages.
+        return None
+    if origin not in allowed_origins:
+        # A browser sends Origin with what a page asks of another origin. Only
+        # the origins --allowed-origin names may, which keeps the pages of
+        # other sites out. Name the fix for the operator.
+        raise _forbidden(
+            f"Origin {origins[0]} is not allowed; restart the server with "
+            f"--allowed-origin {origins[0]} to accept it"
+        )
+    return origins[0]
