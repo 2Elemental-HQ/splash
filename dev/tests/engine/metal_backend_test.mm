@@ -490,17 +490,15 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
         MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
         MetalBuffer lapsing = backend.allocateBuffer(page);
-        backend.keepResident(lapsing);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while ((!backend.lapsedResidentBytes() || !commits) &&
                std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         lapseCommits = commits.exchange(0);
         lapseComputes = computeEncoders.exchange(0);
-        // Keeping another buffer holds the set again for the teardown.
+        // Allocating another buffer holds the set again for the teardown.
         MetalBuffer held = backend.allocateBuffer(page);
-        backend.keepResident(held);
-        require(backend.lapsedResidentBytes() == 0, "a kept buffer did not hold the set");
+        require(backend.lapsedResidentBytes() == 0, "an allocation did not hold the set");
     }
     require(lapseCommits == 1 && lapseComputes == 1,
             "a lapsed keep-alive did not end residency with one compute dispatch");
@@ -510,7 +508,7 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     std::cout << "PASS residency ends without blits\n";
 }
 
-// A kept buffer's memory returns once its last view is gone, and a set the
+// A buffer's memory returns once its last view is gone, and a set the
 // backend still holds lets its buffers go with the backend, though the
 // serving thread's autorelease pool, like this one, never drains.
 void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
@@ -519,19 +517,17 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
     {
         MetalBackend backend(metallibPath);
         const uint64_t before = device.currentAllocatedSize;
-        MetalBuffer kept = backend.allocateBuffer(kBytes);
-        backend.keepResident(kept);
-        kept = {};
+        MetalBuffer buffer = backend.allocateBuffer(kBytes);
+        buffer = {};
         require(device.currentAllocatedSize <= before + (1ull << 20),
                 "a buffer taken out of the residency set kept its memory");
     }
     const uint64_t before = device.currentAllocatedSize;
     {
-        MetalBuffer kept;
+        MetalBuffer buffer;
         {
             MetalBackend backend(metallibPath);
-            kept = backend.allocateBuffer(kBytes);
-            backend.keepResident(kept);
+            buffer = backend.allocateBuffer(kBytes);
         }
     }
     require(device.currentAllocatedSize <= before + (32ull << 20),
@@ -539,32 +535,32 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
     std::cout << "PASS residency returns removed buffers\n";
 }
 
-// Kept buffers stay held until the keep-alive passes without a command, the
-// next command holds them again at once, and a buffer's last view takes it
-// out of the set.
-void keptBuffersStayResident(const std::string &metallibPath) {
+// Every buffer is held from its allocation until the keep-alive passes
+// without a command, the next command holds it again at once, and its last
+// view takes it out of the set: allocated and wrapped buffers alike.
+void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
     MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer dropped = backend.allocateBuffer(page);
+    void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    require(address != MAP_FAILED, "unable to map memory to wrap");
+    std::shared_ptr<void> mapping(address, [page](void *memory) { munmap(memory, page); });
+    const auto start = std::chrono::steady_clock::now();
+    MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping), 0, 64);
     MetalBuffer used = backend.allocateBuffer(page);
     const uint64_t each = backend.memoryStats().allocatedBytes / 2;
-    const auto start = std::chrono::steady_clock::now();
-    backend.keepResident(backend.view(dropped, 0, 64));
-    backend.keepResident(used);
-    require(backend.lapsedResidentBytes() == 0, "kept buffers were not held at once");
-    requireBackendError([&] { backend.keepResident(dropped); },
-                        "the base of a kept view was kept again");
+    require(backend.lapsedResidentBytes() == 0, "buffers were not held at once");
     while (!backend.lapsedResidentBytes() &&
            std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const std::chrono::duration<double> lapsedAfter = std::chrono::steady_clock::now() - start;
     require(backend.lapsedResidentBytes() == 2 * each &&
                 lapsedAfter.count() >= kKeepAliveSeconds,
-            "kept buffers did not lapse once the keep-alive passed without a command");
+            "buffers did not lapse once the keep-alive passed without a command");
     dropped = {};
     require(backend.lapsedResidentBytes() == each,
-            "a buffer whose last view is gone is still kept");
+            "a buffer whose last view is gone is still a member");
     const uint32_t count = 1, increment = 7;
     *static_cast<uint32_t *>(used.contents()) = 0;
     ComputeDispatch dispatch{"test_add_u32", {{0, used}},
@@ -572,18 +568,18 @@ void keptBuffersStayResident(const std::string &metallibPath) {
         {1, 1, 1}, {1, 1, 1}};
     auto ticket = backend.submitAsync(dispatch);
     require(backend.lapsedResidentBytes() == 0,
-            "a command did not hold the kept buffers again");
+            "a command did not hold the buffers again");
     (void)ticket.wait();
     require(*static_cast<uint32_t *>(used.contents()) == increment,
-            "a command on a kept buffer produced the wrong result");
-    std::cout << "PASS kept buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
+            "a command on a resident buffer produced the wrong result");
+    std::cout << "PASS buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
               << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
 }
 
-// Keeping, lapsing and holding again race the heartbeat while another thread
-// drops kept buffers, as command completion can, and the backend is then
-// destroyed with its heartbeat live and a kept buffer outliving it. Nothing
-// may block, and every command must see its buffer.
+// Allocating, lapsing and holding again race the heartbeat while another
+// thread drops buffers, as command completion can, and the backend is then
+// destroyed with its heartbeat live and a buffer outliving it. Nothing may
+// block, and every command must see its buffer.
 void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
@@ -591,7 +587,6 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
                                                   kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = backend->allocateBuffer(page);
-    backend->keepResident(used);
     *static_cast<uint32_t *>(used.contents()) = 0;
     std::mutex mutex;
     std::condition_variable ready;
@@ -614,11 +609,10 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
         {1, 1, 1}, {1, 1, 1}};
     int lapses = 0;
     for (int round = 0; round < kRounds; ++round) {
-        MetalBuffer kept = backend->allocateBuffer(page);
-        backend->keepResident(kept);
+        MetalBuffer member = backend->allocateBuffer(page);
         {
             std::lock_guard lock(mutex);
-            handed.push_back(std::move(kept));
+            handed.push_back(std::move(member));
         }
         ready.notify_one();
         // Every third round lets the heartbeat end residency, so that its
@@ -709,8 +703,9 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
                 backend.view(buffers[0], 4096, 4096).gpuAddress() ==
                     buffers[0].gpuAddress() + 4096,
             "a view's GPU address does not start at its offset");
-    require(backend.lapsedResidentBytes() == kBuffers * kBytes,
-            "addressed buffers are not members of the residency set");
+    require(backend.lapsedResidentBytes() == 0,
+            "addressed buffers did not hold the residency set");
+    const uint64_t members = backend.memoryStats().allocatedBytes;
 
     auto *entries = static_cast<uint64_t *>(table.contents());
     for (uint32_t index = 0; index < kBuffers; ++index)
@@ -742,7 +737,7 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
             while (!backend.lapsedResidentBytes() &&
                    std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            require(backend.lapsedResidentBytes() == kBuffers * kBytes,
+            require(backend.lapsedResidentBytes() == members,
                     "addressed buffers did not lapse with the residency set");
             lapsedRound = true;
         }
@@ -1097,7 +1092,7 @@ int main(int argc, const char *argv[]) {
             pendingCommandStillTimesOut(argv[1]);
             synchronousWaitObeysTheWatchdog(argv[1]);
             abandonedTicketReturnsAfterTheWatchdog(argv[1]);
-            keptBuffersStayResident(argv[1]);
+            buffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
             residencyReturnsRemovedBuffers(argv[1]);
