@@ -6,12 +6,17 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <fcntl.h>
+#include <mutex>
+#include <optional>
 #include <poll.h>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -132,12 +137,137 @@ struct FdTransport::CompletionWake {
   }
 };
 
-FdTransport::FdTransport(int inputFd, int outputFd)
-    : inputFd_(inputFd), outputFd_(outputFd),
+// Reads the input on a thread of its own and queues it for the loop, which
+// takes it between ticks. The bytes, then the input's end or a read error,
+// reach the loop in the order they were read. Destruction stops the thread,
+// whether it waits for input or for room in the queue, and joins it.
+class FdTransport::InputReader final {
+public:
+  struct Input final {
+    std::vector<uint8_t> bytes;
+    // Set once the input has ended after these bytes: 0 at its end,
+    // otherwise the error that ended reading.
+    std::optional<int> end;
+  };
+
+  InputReader(int fd, size_t queueBytes, std::shared_ptr<CompletionWake> wake)
+      : fd_(fd), queueBytes_(queueBytes), wake_(std::move(wake)) {
+    int descriptors[2];
+    if (pipe(descriptors) < 0)
+      throwIo("pipe(input reader stop)");
+    stopRead_ = descriptors[0];
+    stopWrite_ = descriptors[1];
+    try {
+      thread_ = std::thread([this] { read(); });
+    } catch (...) {
+      close(stopRead_);
+      close(stopWrite_);
+      throw;
+    }
+  }
+
+  ~InputReader() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    room_.notify_all();
+    constexpr uint8_t byte = 1;
+    while (write(stopWrite_, &byte, sizeof(byte)) < 0 && errno == EINTR) {
+    }
+    thread_.join();
+    close(stopRead_);
+    close(stopWrite_);
+  }
+
+  InputReader(const InputReader &) = delete;
+  InputReader &operator=(const InputReader &) = delete;
+
+  // Everything read since the last call, with the input's end once nothing
+  // read before it is left.
+  [[nodiscard]] Input take() {
+    Input input;
+    {
+      std::lock_guard lock(mutex_);
+      input.bytes.swap(queue_);
+      input.end = end_;
+    }
+    room_.notify_all();
+    return input;
+  }
+
+private:
+  void read() noexcept {
+    try {
+      std::vector<uint8_t> chunk(64 * 1024);
+      while (true) {
+        {
+          std::unique_lock lock(mutex_);
+          room_.wait(lock, [&] { return stopping_ || queue_.size() < queueBytes_; });
+          if (stopping_)
+            return;
+        }
+        std::array<pollfd, 2> descriptors{pollfd{fd_, POLLIN, 0},
+                                          pollfd{stopRead_, POLLIN, 0}};
+        if (poll(descriptors.data(), descriptors.size(), -1) < 0) {
+          if (errno == EINTR)
+            continue;
+          return finish(errno);
+        }
+        if (descriptors[1].revents)
+          return;
+        if (descriptors[0].revents & POLLNVAL)
+          return finish(EBADF);
+        if (!descriptors[0].revents)
+          continue;
+        const ssize_t count = ::read(fd_, chunk.data(), chunk.size());
+        if (count > 0) {
+          {
+            std::lock_guard lock(mutex_);
+            queue_.insert(queue_.end(), chunk.begin(), chunk.begin() + count);
+          }
+          wake_->notify();
+          continue;
+        }
+        if (count == 0)
+          return finish(0);
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+          return finish(errno);
+      }
+    } catch (const std::bad_alloc &) {
+      finish(ENOMEM);
+    }
+  }
+
+  void finish(int error) noexcept {
+    {
+      std::lock_guard lock(mutex_);
+      end_ = error;
+    }
+    wake_->notify();
+  }
+
+  int fd_ = -1;
+  size_t queueBytes_ = 0;
+  std::shared_ptr<CompletionWake> wake_;
+  int stopRead_ = -1;
+  int stopWrite_ = -1;
+  std::mutex mutex_;
+  std::condition_variable room_;
+  std::vector<uint8_t> queue_;
+  std::optional<int> end_;
+  bool stopping_ = false;
+  std::thread thread_;
+};
+
+FdTransport::FdTransport(int inputFd, int outputFd, size_t inputQueueBytes)
+    : inputFd_(inputFd), outputFd_(outputFd), inputQueueBytes_(inputQueueBytes),
       completionWake_(std::make_shared<CompletionWake>()) {
   if (inputFd_ < 0 || outputFd_ < 0) {
     throw std::invalid_argument("native transport requires valid fds");
   }
+  if (!inputQueueBytes_)
+    throw std::invalid_argument("native transport requires an input queue");
 }
 
 NativeRuntime::ByteSink FdTransport::outputSink() {
@@ -163,30 +293,21 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     throwIo("fcntl(F_SETFL)");
   }
   RestoreFdFlags restore(inputFd_, originalFlags);
-  std::array<uint8_t, 64 * 1024> input{};
+  // Stopped and joined on every way out of run(), before the flags return.
+  InputReader reader(inputFd_, inputQueueBytes_, completionWake);
   bool deferredControl = false;
 
   while (!loop.connectionMustClose()) {
     if (shutdownRequested())
       return NativeProcessExit::CleanEof;
-    while (true) {
-      ssize_t count = read(inputFd_, input.data(), input.size());
-      if (count > 0) {
-        if (!loop.receive(std::span<const uint8_t>(
-                input.data(), static_cast<size_t>(count)))) {
-          return loopFailure(loop);
-        }
-        continue;
-      }
-      if (count == 0) {
-        return loop.finishInput() ? NativeProcessExit::CleanEof
-                                  : loopFailure(loop);
-      }
-      if (errno == EINTR)
-        continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-      return NativeProcessExit::IoFailure;
+    const InputReader::Input input = reader.take();
+    if (!input.bytes.empty() && !loop.receive(input.bytes))
+      return loopFailure(loop);
+    if (input.end) {
+      if (*input.end)
+        return NativeProcessExit::IoFailure;
+      return loop.finishInput() ? NativeProcessExit::CleanEof
+                                : loopFailure(loop);
     }
 
     const auto inputRead = std::chrono::steady_clock::now();
@@ -205,19 +326,17 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     if (loop.connectionMustClose())
       return loopFailure(loop);
 
-    std::array<pollfd, 2> descriptors{
-        pollfd{inputFd_, short(POLLIN | POLLHUP), 0},
-        pollfd{completionWake->readFd, POLLIN, 0}};
+    // The reader wakes the loop through the completion pipe as well.
+    pollfd descriptor{completionWake->readFd, POLLIN, 0};
     int result;
     do {
-      result = poll(descriptors.data(), descriptors.size(),
-                    pollTimeout(loop, deferredControl));
+      result = poll(&descriptor, 1, pollTimeout(loop, deferredControl));
     } while (result < 0 && errno == EINTR && !shutdownRequested());
     if (result < 0 && errno == EINTR)
       return NativeProcessExit::CleanEof;
     if (result < 0)
       return NativeProcessExit::IoFailure;
-    if (descriptors[1].revents & POLLIN)
+    if (descriptor.revents & POLLIN)
       completionWake->drain();
     // A zero result is a deadline or resource-retry wake-up; tick() at the
     // top of the next iteration performs the transition.

@@ -801,7 +801,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
-| `loop.max_tick_ms` | Longest time the engine has gone without reading requests; a request write that makes no progress for 5 s fails the engine |
+| `loop.max_tick_ms` | Longest control pass and engine step of the native loop; a reader thread keeps reading requests meanwhile, and a request write that makes no progress for 5 s fails the engine |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
