@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -18,13 +19,15 @@ namespace splash::test {
 // allocationFailure (EngineBudget, the governor's cause, unless a test
 // names another) past budgetPages allocated pages, while growthBlocked,
 // or when growthAllowed(extent) says no; a budget-limited pool needs more
-// page ids than its budget, as production's has. A release throws
-// std::logic_error while commandInFlight() says a command is in flight,
-// as PageStorage's does.
+// page ids than its budget, as production's has. A release or a copy
+// throws std::logic_error while commandInFlight() says a command is in
+// flight, as PageStorage's does. Every page holds one value, which a test
+// sets and a copy carries, so a test can follow the content of pages the
+// pool moves.
 class TestKvStorage final : public kv::ExtentStorage {
 public:
     TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages)
-        : pageCount_(pages), bytesPerPage_(bytesPerPage),
+        : content(pages), pageCount_(pages), bytesPerPage_(bytesPerPage),
           extentPages_(extentPages) {
         if (!pages || !bytesPerPage || !extentPages || pages % extentPages) {
             throw std::invalid_argument("invalid test KV extent storage");
@@ -64,6 +67,16 @@ public:
         ++releasedExtents;
         if (released) released();
     }
+    void copyPages(std::span<const kv::PageCopy> pages) override {
+        if (commandInFlight && commandInFlight()) {
+            throw std::logic_error(
+                "cannot copy KV pages while a command is in flight");
+        }
+        for (const kv::PageCopy &copy : pages) {
+            content.at(copy.to) = content.at(copy.from);
+            copies.push_back(copy);
+        }
+    }
 
     [[nodiscard]] bool allocated(uint32_t extent) const {
         return allocated_.at(extent);
@@ -89,6 +102,8 @@ public:
     // and all of them together.
     double longestRelease = 0.0;
     double totalRelease = 0.0;
+    std::vector<uint64_t> content;
+    std::vector<kv::PageCopy> copies;
 
 private:
     uint32_t pageCount_ = 0;

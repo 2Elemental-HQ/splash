@@ -62,6 +62,9 @@ public:
   // a request or the cache holds; GPU page tables rely on it (Runtime's
   // PageTableBinding).
   void releaseExtent(uint32_t extent) override;
+  // Copies every tensor of each page in every layer (spans()).
+  // std::out_of_range for a page past the pool.
+  void copyPages(std::span<const PageCopy> copies) override;
   // Where each attention layer's region sits in every extent, by layer.
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
     return layers_;

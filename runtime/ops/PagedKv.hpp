@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -38,6 +39,12 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
+// A page whose content goes to another page.
+struct PageCopy final {
+  uint32_t from = 0;
+  uint32_t to = 0;
+};
+
 // The memory of the engine's page pool: extents of extentPages() pages,
 // pageCount() a whole number of them. Only KvPool allocates and releases
 // them. Implementations provide Metal storage or deterministic test storage.
@@ -55,6 +62,12 @@ public:
   // nothing, for an unallocated extent or while a command is in flight (a
   // command reaches extents through its page tables without retaining them).
   virtual void releaseExtent(uint32_t extent) = 0;
+  // Copies each page's content onto its destination, both in allocated
+  // extents: how the pool moves the pages of an extent it empties.
+  // std::logic_error, copying nothing, for a page of an unallocated extent
+  // or while a command is in flight (it reaches both pages through its
+  // tables and may still write the source).
+  virtual void copyPages(std::span<const PageCopy> copies) = 0;
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.

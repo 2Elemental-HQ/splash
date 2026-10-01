@@ -276,6 +276,120 @@ void testPrefixAndActiveReferencesHoldTheExtent() {
             "last prefix release did not make extent reclaimable");
 }
 
+// The pool with every page allocated and held by a request, less the pages
+// in `released`. Every page starts with content of its own.
+KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
+    for (uint32_t page = 0; page < storage.pageCount(); ++page)
+        storage.content[page] = 100 + page;
+    KvPool pool(storage, storage.pageCount());
+    auto all = pool.acquirePages(storage.pageCount(), false);
+    require(all.granted(), "compaction setup did not acquire every page");
+    release(pool, released);
+    return pool;
+}
+
+// The free pages of the extents in use cover the extent with the fewest
+// pages: its pages move to them, content and references, and it is empty.
+void testCompactionEmptiesTheExtentWithTheFewestPages() {
+    TestKvStorage storage(12, 100, 4);
+    // Extent 0 keeps page 3, extent 1 pages 4 to 6, extent 2 pages 8 and 9.
+    KvPool pool = held(storage, {0, 1, 2, 7, 10, 11});
+    pool.retainPage(3, true);
+    const auto moves = pool.compactExtent({});
+    require(!moves.empty() && moves.firstPage == 0 &&
+                moves.destinations.size() == 4 && moves.follow(3) == 7 &&
+                moves.follow(0) == 0 && moves.follow(8) == 8,
+            "compaction did not move the emptiest extent's page to the fullest one");
+    require(storage.copies.size() == 1 && storage.copies[0].from == 3 &&
+                storage.copies[0].to == 7 && storage.content[7] == 103,
+            "the moved page's content did not follow it");
+    require(pool.pageFree(3) && pool.activeReferences(7) == 1,
+            "the moved page's references did not follow it");
+    const auto status = pool.snapshot();
+    require(status.pagesActive == 6 && status.pagesPrefix == 1 &&
+                status.pagesFree == 6 && status.pagesAllocated == 12 &&
+                status.reclaimableExtents == 1 && status.extentCompactions == 1 &&
+                status.pagesMoved == 1,
+            "compaction changed what is held or did not empty its extent");
+    // Both references release on the page it moved to.
+    pool.releasePage(7, true);
+    pool.releasePage(7, false);
+    require(pool.pageFree(7) && pool.snapshot().pagesPrefix == 0,
+            "a moved reference was not released where it went");
+    require(reclaimEvery(pool, false) == 1 &&
+                pool.snapshot().pagesAllocated == 8 && storage.releasedExtents == 1,
+            "the emptied extent was not released");
+}
+
+// Pages go to the fullest extents first and on to the next when one is full.
+void testCompactionFillsTheFullestExtentsFirst() {
+    TestKvStorage storage(16, 100, 4);
+    // Extents 0 and 1 keep three pages each, extents 2 and 3 two each.
+    KvPool pool = held(storage, {3, 7, 10, 11, 14, 15});
+    const auto moves = pool.compactExtent({});
+    require(moves.firstPage == 8 && moves.follow(8) == 3 && moves.follow(9) == 7 &&
+                storage.content[3] == 108 && storage.content[7] == 109,
+            "compaction did not fill the fullest extents first");
+    // Extents 0 and 1 are full now; extent 3's two pages have nowhere to go.
+    require(pool.compactExtent({}).empty() && storage.copies.size() == 2 &&
+                pool.snapshot().extentCompactions == 1,
+            "compaction moved pages the free pages did not cover");
+}
+
+// Free pages count only in extents that hold pages: an empty extent is
+// released as it is, never filled to release another.
+void testCompactionNeedsFreePagesInExtentsInUse() {
+    TestKvStorage storage(12, 100, 4);
+    // Extent 0 keeps one page, extent 1 none, extent 2 all four.
+    KvPool pool = held(storage, {1, 2, 3, 4, 5, 6, 7});
+    require(pool.compactExtent({}).empty() && storage.copies.empty() &&
+                pool.snapshot().reclaimableExtents == 1 &&
+                pool.snapshot().extentCompactions == 0,
+            "compaction filled an empty extent");
+    // Each extent holds more than the other has free.
+    TestKvStorage tight(8, 100, 4);
+    KvPool packed = held(tight, {2, 3, 7});
+    require(packed.compactExtent({}).empty() && tight.copies.empty(),
+            "compaction moved an extent the free pages did not cover");
+}
+
+// An extent with a page that must stay where it is is not emptied; the
+// extent with the next fewest pages is.
+void testCompactionLeavesFixedPagesInPlace() {
+    TestKvStorage storage(16, 100, 4);
+    KvPool pool = held(storage, {3, 7, 10, 11, 14, 15});
+    const std::vector<uint32_t> everywhere{0, 4, 9, 13};
+    require(pool.compactExtent(everywhere).empty() && storage.copies.empty(),
+            "compaction emptied an extent that holds a fixed page");
+    const std::vector<uint32_t> fixed{9};
+    const auto moves = pool.compactExtent(fixed);
+    require(moves.firstPage == 12 && moves.follow(12) == 3 && moves.follow(13) == 7 &&
+                moves.follow(9) == 9 && pool.activeReferences(9) == 1,
+            "compaction did not pass over the extent with a fixed page");
+}
+
+// A storage that cannot copy now, while a command is in flight, throws
+// before anything moved.
+void testCompactionMovesNothingWhenTheStorageRefuses() {
+    TestKvStorage storage(12, 100, 4);
+    KvPool pool = held(storage, {0, 1, 2, 7, 10, 11});
+    storage.commandInFlight = [] { return true; };
+    bool threw = false;
+    try {
+        static_cast<void>(pool.compactExtent({}));
+    } catch (const std::logic_error &) {
+        threw = true;
+    }
+    const auto status = pool.snapshot();
+    require(threw && pool.activeReferences(3) == 1 && pool.pageFree(7) &&
+                status.pagesActive == 6 && status.pagesFree == 6 &&
+                status.reclaimableExtents == 0 && status.extentCompactions == 0,
+            "a refused copy left pages moved");
+    storage.commandInFlight = nullptr;
+    require(pool.compactExtent({}).follow(3) == 7,
+            "the pool did not compact after the storage refused");
+}
+
 }  // namespace
 
 int main() {
@@ -290,6 +404,11 @@ int main() {
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
+        testCompactionEmptiesTheExtentWithTheFewestPages();
+        testCompactionFillsTheFullestExtentsFirst();
+        testCompactionNeedsFreePagesInExtentsInUse();
+        testCompactionLeavesFixedPagesInPlace();
+        testCompactionMovesNothingWhenTheStorageRefuses();
         std::cout << "elastic KV pool tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

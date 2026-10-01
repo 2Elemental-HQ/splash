@@ -151,6 +151,7 @@ public:
           });
       if (!used) {
         requests.emplace(request.id, Request{slot, 0, true});
+        prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
         return {slot, StateFailure::None};
       }
     }
@@ -225,6 +226,16 @@ public:
     prefillWidths.push_back(static_cast<uint32_t>(items.size()));
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
+      requireRows(item, item.promptOffset);
+      if (kv) {
+        const uint32_t end = item.promptOffset + item.tokenCount;
+        for (uint32_t row = (item.promptOffset + KvCache::pageTokens - 1) /
+                            KvCache::pageTokens * KvCache::pageTokens;
+             row < end; row += KvCache::pageTokens) {
+          kv->content.at(item.pageTable[row / KvCache::pageTokens]) =
+              rows(row / KvCache::pageTokens, item.inputTokens[row - item.promptOffset]);
+        }
+      }
       requests.at(item.requestId).position += item.tokenCount;
       prefillRows += item.tokenCount;
       ModelStepResult step{item.requestId, item.tokenCount, {}, false,
@@ -246,6 +257,7 @@ public:
                                       std::span<const ModelBatchItem> items) {
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
+      requireRows(item, item.logicalPosition);
       // The production runtime stores eight verify rows from the lane's
       // position; the engine must have covered them with page-table entries.
       if (uint64_t{item.pageTable.size()} * KvCache::pageTokens <
@@ -376,6 +388,25 @@ public:
     pageTables.erase(id);
   }
 
+  // What a page holds once prefill has written a block's first row to it.
+  static uint64_t rows(uint32_t block, uint32_t firstToken) {
+    return (uint64_t{block} << 32) | firstToken;
+  }
+  // With `kv`, a step finds every prompt block before `position` through
+  // the page table the engine handed it.
+  void requireRows(const ModelBatchItem &item, uint64_t position) const {
+    if (!kv)
+      return;
+    const std::vector<uint32_t> &prompt = prompts.at(item.requestId);
+    const uint64_t blocks =
+        std::min<uint64_t>(position, prompt.size()) / KvCache::pageTokens;
+    for (uint32_t block = 0; block < blocks; ++block) {
+      if (kv->content.at(item.pageTable[block]) !=
+          rows(block, prompt[block * KvCache::pageTokens]))
+        throw std::logic_error("a page does not hold its block's rows");
+    }
+  }
+
   struct Request {
     uint32_t slot = 0;
     uint32_t position = 0;
@@ -389,6 +420,11 @@ public:
     std::vector<uint32_t> pages;
   };
   std::unordered_map<uint64_t, PageTableShadow> pageTables;
+  // The storage whose pages the fake writes and checks: prefill marks the
+  // page of every block it starts, as the production model writes its rows
+  // there, and each later step requires the marks of the blocks before it.
+  test::TestKvStorage *kv = nullptr;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> prompts;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
   std::shared_ptr<RestoreControl> restoreControl = std::make_shared<RestoreControl>();
   uint32_t diskReads = 0;
@@ -3461,6 +3497,76 @@ void testReclaimRefusesACommandInFlight() {
           "the reclaim after the command did not take the idle memory");
 }
 
+// A lane the budget refuses takes the pool's free pages before any cached
+// block: the extent that holds the fewest pages is emptied into the others
+// and released. The request whose page moved finds its rows through the
+// table of its next step.
+void testStateStartGathersFreePagesBeforeEvicting() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  model.kv = &storage;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+  const auto prompt = [](uint32_t first, uint32_t tokens) {
+    std::vector<uint32_t> result(tokens);
+    std::iota(result.begin(), result.end(), first);
+    return result;
+  };
+  // Three prompts of three blocks each fill pages 0 to 8.
+  for (uint32_t id = 1; id <= 3; ++id) {
+    engine.submit(request(id, prompt(1000 * id, 97)));
+    runUntilIdle(engine);
+  }
+  // The first prompt's state and blocks go: extent 0 keeps one page.
+  for (uint32_t victim = 0; victim < 4; ++victim) {
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+            "the first prompt was not evicted");
+  }
+  // The third prompt continues and keeps decoding. Its new rows fill extent
+  // 0 again, so extent 2 holds its third block alone.
+  EngineRequest running = request(4, prompt(3000, 129));
+  running.maxNewTokens = 4;
+  model.decodeFinishes = false;
+  engine.submit(running);
+  for (double now = 1; now < 16 && events.outputs[4].empty(); ++now)
+    static_cast<void>(engine.tick(now));
+  const PageTableView table = cache.pageTable(4);
+  const std::vector<uint32_t> before(table.pages.begin(), table.pages.end());
+  const uint64_t revision = table.revision;
+  const CacheSnapshot cached = cache.snapshot();
+  require(!events.outputs[4].empty() &&
+              before == std::vector<uint32_t>{6, 7, 8, 0, 1} &&
+              cached.pool.pagesAllocated == 12 && cached.pool.pagesFree == 4,
+          "compaction setup did not leave extent 2 with one held page");
+
+  // A fifth lane fits only once the pool has given an extent back.
+  model.beginGrowthBlocked = [&] {
+    return model.lastBeginId == 5 && pool.snapshot().pagesAllocated > 8;
+  };
+  model.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+  engine.submit(request(5, prompt(5000, 33)));
+  for (double now = 16; now < 32 && events.startIds.back() != 5; ++now)
+    static_cast<void>(engine.tick(now));
+  const CacheSnapshot started = cache.snapshot();
+  require(events.startIds.back() == 5 && storage.copies.size() == 1 &&
+              storage.copies[0].from == 8 && storage.copies[0].to == 2 &&
+              started.pool.extentCompactions == 1 && started.pool.extentReleases == 1 &&
+              started.kvCache.blocks >= cached.kvCache.blocks &&
+              started.stateCache.entries >= cached.stateCache.entries,
+          "the lane's start evicted instead of gathering the free pages");
+  const PageTableView moved = cache.pageTable(4);
+  require(moved.pages[2] == 2 && moved.pages[0] == 6 && moved.pages[4] == 1 &&
+              moved.revision > revision,
+          "the running request did not follow its moved page");
+  runUntilIdle(engine);
+  require(events.completedCount == 5 && events.failedCount == 0 &&
+              events.outputs[4].size() == 4,
+          "a request did not complete after its page moved");
+}
+
 void testAllocationCausesRemainDistinct() {
   for (bool stateAllocation : {false, true}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
@@ -5841,6 +5947,7 @@ int main() {
     testGrowthBeyondTheBudgetFailsAtOnce();
     testReclaimPassReleasesEveryEmptyExtent();
     testReclaimRefusesACommandInFlight();
+    testStateStartGathersFreePagesBeforeEvicting();
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
