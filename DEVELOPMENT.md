@@ -172,6 +172,12 @@ by unique aliases; each alias's `root` identifies the loaded model. Generation
 and scoring responses always report the real model ID, even when requested
 through an alias. The model list and lookup support both names.
 
+Some clients check a response's `model` against the name they requested and
+reject the real ID. For them, add `--announce-served-name`: responses then
+report the first alias, whichever accepted name the request used, and
+`/v1/models` gives the real ID that alias as its `root`. `/status` keeps
+reporting the loaded model.
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
 ```

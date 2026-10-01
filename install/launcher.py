@@ -274,6 +274,8 @@ def serve(args):
             command.extend(("--kv-format", args.kv_format))
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
+        if args.announce_served_name:
+            command.append("--announce-served-name")
         if args.default_reasoning_effort is not None:
             command.extend(
                 ["--default-reasoning-effort", args.default_reasoning_effort]
@@ -581,6 +583,11 @@ def parse_args(argv=None):
         default=[],
         type=_parse_served_model_name,
         help="additional API model name; responses keep the loaded model ID (repeatable)",
+    )
+    server.add_argument(
+        "--announce-served-name",
+        action="store_true",
+        help="report the first --served-model-name in API responses; /status keeps the loaded model ID",
     )
     server.add_argument(
         "--default-reasoning-effort",

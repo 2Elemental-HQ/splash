@@ -225,6 +225,32 @@ class ServedModelNamesTests(unittest.TestCase):
             self.assertEqual(parsed.model, "owner/repo")
             self.assertEqual(parsed.served_model_name, ["local", "stable", "-local"])
 
+    def test_launcher_forwards_the_announced_name_only_when_asked(self):
+        keep_stop_signals(self)
+        for flags, announced in (([], False), (["--announce-served-name"], True)):
+            with (
+                self.subTest(flags=flags),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(
+                    [
+                        "serve",
+                        "--model",
+                        "owner/repo",
+                        "--served-model-name",
+                        "local",
+                        *flags,
+                    ]
+                )
+                parsed = api.parse_args(execute.call_args.args[1][3:])
+                self.assertEqual(parsed.served_model_name, ["local"])
+                self.assertIs(parsed.announce_served_name, announced)
+
     def test_client_launcher_uses_canonical_model_when_aliases_are_listed(self):
         models = [
             {"id": name, "owned_by": "splash"} for name in ("owner/repo", "local")
