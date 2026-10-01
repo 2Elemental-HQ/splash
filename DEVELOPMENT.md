@@ -187,6 +187,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted); judgment endpoints always disable thinking.
 
+A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
+passed to the template as variables and outrank the effort, so
+`{"enable_thinking": false}` turns reasoning off. They cannot set what Splash
+passes itself, such as `tools` or `add_generation_prompt`.
+
 ## Upstream model loading
 
 `install/upstream.py` installs a model from its upstream repository: it

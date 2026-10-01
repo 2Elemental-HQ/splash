@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
 
@@ -27,6 +27,7 @@ if __package__:
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
+        RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
     )
@@ -62,6 +63,7 @@ else:
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
+        RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
     )
@@ -209,6 +211,8 @@ class Prompt:
     response_schema: dict | bool | None = None
     response_validator: object = None
     preserve_thinking: bool | None = None
+    # Template variables from the request, which outrank Splash's own.
+    template_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -822,6 +826,13 @@ class Frontend:
         preserve_thinking = body.get("preserve_thinking")
         if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
             raise APIError(400, "preserve_thinking must be a boolean")
+        template_kwargs = body.get("chat_template_kwargs")
+        if template_kwargs is None:
+            template_kwargs = {}
+        elif not isinstance(template_kwargs, dict):
+            raise APIError(400, "chat_template_kwargs must be an object")
+        elif reserved := sorted(RESERVED_TEMPLATE_KWARGS & template_kwargs.keys()):
+            raise APIError(400, f"chat_template_kwargs cannot set {reserved[0]}")
         messages = template_messages(
             normalize_messages(
                 body.get("messages"), vision=self.vision, deadline=deadline
@@ -844,6 +855,7 @@ class Frontend:
             response_schema,
             response_validator,
             preserve_thinking,
+            template_kwargs,
         )
 
     def _tokenize(self, text, **options):
@@ -870,6 +882,7 @@ class Frontend:
                 tools=prompt.tools,
                 add_generation_prompt=add_generation_prompt,
             ),
+            **prompt.template_kwargs,
         }
         with self.latencies.measure("images"):
             images = self._prepare_images(prompt.messages, check_context=check_context)
@@ -910,10 +923,11 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(template), rendered, tokens
             )
+        requested = template.get("enable_thinking")
         if (
             add_generation_prompt
-            and prompt.reasoning_effort is not None
-            and thinking != (prompt.reasoning_effort != "none")
+            and requested is not None
+            and thinking != bool(requested)
         ):
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
