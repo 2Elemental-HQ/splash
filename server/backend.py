@@ -54,7 +54,9 @@ def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise APIError(504, "request timed out", "request_timeout")
-    return remaining
+    # Callers wait this long, and waits reject a timeout above TIMEOUT_MAX;
+    # a request without a deadline has infinite time left.
+    return min(remaining, threading.TIMEOUT_MAX)
 
 
 @dataclass(frozen=True)
@@ -443,7 +445,10 @@ class NativeBackend:
 
     @staticmethod
     def _deadline(job):
-        remaining = remaining_request_time(job.deadline)
+        remaining_request_time(job.deadline)
+        # Uncapped, unlike a wait's timeout: a request without a deadline
+        # gets the wire's maximum.
+        remaining = job.deadline - time.monotonic()
         wall_micros = time.time_ns() // 1000
         maximum_remaining = MAX_PROTOCOL_U64 - wall_micros
         if remaining >= maximum_remaining / 1_000_000:

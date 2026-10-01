@@ -1,5 +1,6 @@
 import array
 import gc
+import math
 import queue
 import struct
 import threading
@@ -321,6 +322,33 @@ class NativeBackendContractTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
+
+    def test_request_without_a_deadline_reaches_the_engine_without_one(self):
+        # Without --request-timeout only a request's own timeout sets one. A
+        # request without either waits as long as a wait can, and the engine
+        # gets the wire's maximum.
+        factory = FakeFactory()
+        native = runtime.MultiplexedRuntime(
+            process_factory=factory,
+            pending_limit=4,
+        )
+        transport, _runtime = self.make_transport(native)
+        app = make_frontend(
+            FakeTokenizer(), transport, "test-model", 128, 32, math.inf, 2, vision=True
+        )
+        self.assertEqual(app.request_deadline({"timeout": 5}, 10), 15)
+        job, _thinking, _tools = app.prepare(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+        )
+        self.assertEqual(
+            backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
+        )
+
+        self.assertTrue(transport.submit(job))
+        frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
+        self.assertEqual(
+            frame.absolute_deadline_unix_micros, backend_api.MAX_PROTOCOL_U64
+        )
 
     def test_score_job_maps_to_score_only_request_and_returns_logits(self):
         factory = FakeFactory()

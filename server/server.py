@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -2148,7 +2149,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
-    parser.add_argument("--request-timeout", type=float, default=1800)
+    parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
@@ -2176,7 +2177,11 @@ def parse_args(argv=None):
             "--max-image-pixels must be in "
             f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
         )
-    if not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
+    if args.request_timeout is None:
+        # No deadline unless given, as in vLLM and SGLang; a request still
+        # ends when its client disconnects.
+        args.request_timeout = math.inf
+    elif not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
     if args.queue_size <= 0:
         parser.error("--queue-size must be positive")

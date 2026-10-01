@@ -477,7 +477,7 @@ class Frontend:
         timeout = body.get("timeout")
         if timeout is None:
             timeout = self.request_timeout
-        if not is_finite_number(timeout) or timeout <= 0:
+        elif not is_finite_number(timeout) or timeout <= 0:
             raise APIError(400, "timeout must be positive")
         return started_at + min(timeout, self.request_timeout)
 

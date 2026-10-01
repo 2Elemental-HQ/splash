@@ -35,7 +35,8 @@ whose message names the last failure.
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
-Arguments pass through, for example `./splash codex resume --last`.
+Arguments pass through, for example `./splash codex resume --last` or
+`./splash hermes chat -q "Hello"`.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. API requests
@@ -56,7 +57,7 @@ every connection slot is taken, the first with that 503, so stalled clients
 cannot lock others out. Image and model context limits apply independently.
 Stored Responses history is charged before decoding. Uploads allow 30 seconds
 of inactivity; total upload time is limited to 30 seconds plus the body size
-at 512 KiB/s (286 seconds for 128 MiB), capped by the overall request deadline.
+at 512 KiB/s (286 seconds for 128 MiB), capped by `--request-timeout` when set.
 Timed-out uploads return 408 and release their input reservation. An upload
 refused before it is read, such as one over the shared budget, is still
 received on these terms, so a client that sends its whole body before reading
@@ -106,7 +107,8 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
-| `--request-timeout` | `1800` | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
