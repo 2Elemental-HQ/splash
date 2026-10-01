@@ -445,8 +445,8 @@ EMBEDDING_TYPES = {
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
 # small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta both Q8_0, both F32 or both BF16,
-# which preparation widens to the F32 values it equals.
+# which run unrounded; GDN alpha and beta, both of one type: a quantized
+# format, F32 or BF16, which preparation widens to the F32 values it equals.
 F32 = {"F32"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
@@ -465,8 +465,8 @@ ATTENTION_TENSORS = {
 GDN_TENSORS = {
     "attn_qkv.weight": QUANTIZED_TYPES,
     "attn_gate.weight": QUANTIZED_TYPES,
-    "ssm_alpha.weight": {"Q8_0", "F32", "BF16"},
-    "ssm_beta.weight": {"Q8_0", "F32", "BF16"},
+    "ssm_alpha.weight": QUANTIZED_TYPES | {"F32", "BF16"},
+    "ssm_beta.weight": QUANTIZED_TYPES | {"F32", "BF16"},
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
