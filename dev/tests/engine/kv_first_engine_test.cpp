@@ -341,7 +341,8 @@ public:
   // The production model copies the lane's state into a cache slot at its
   // current page-aligned boundary and returns nullptr when no slot is free
   // and the governor denies a new one. The fake denies the next
-  // `deniedSnapshots` calls, or every call made at `denySnapshotAtBoundary`.
+  // `deniedSnapshots` calls, every call made at `denySnapshotAtBoundary`,
+  // and every call while `snapshotRoom` reports no memory.
   std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
     ++snapshotAttempts;
     if (snapshotObserver)
@@ -354,6 +355,8 @@ public:
         *denySnapshotAtBoundary == requests.at(id).position) {
       return nullptr;
     }
+    if (snapshotRoom && !snapshotRoom())
+      return nullptr;
     ++snapshots;
     return std::make_shared<State>();
   }
@@ -449,6 +452,7 @@ public:
   std::function<void()> beginObserver;
   std::function<void()> restoreObserver;
   std::function<void()> snapshotObserver;
+  std::function<bool()> snapshotRoom;
   std::function<bool()> beginGrowthBlocked;
   std::vector<std::vector<uint32_t>> resumedPrompts;
   std::vector<uint32_t> prefillWidths;
@@ -3180,6 +3184,122 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
           "the resumed lane did not rebuild the prompt's replay point");
 }
 
+// The field case of a lane suspended mid-decode: it resumes with its
+// prompt's replay point lost, and the only memory left is another
+// conversation's cached KV, with no state to recycle. The rebuilt point is in
+// use, so its publication takes that KV, oldest first, until the free pages
+// fill an extent, which is emptied and goes at once, between commands, and
+// the conversation's next turn resumes from it. An extent may hold less than
+// a state needs: the publication then takes a second one the same way.
+void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
+  Events events;
+  MemoryPressure pressure = MemoryPressure::Normal;
+  EngineConfig config;
+  config.prefillCheckpointTokens = 8192;
+  config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+
+  constexpr uint64_t id = 256;
+  const std::vector<uint32_t> prompt(4097, 5);
+  auto value = request(id, prompt);
+  value.maxNewTokens = 10'000;
+  value.deadlineMilliseconds = 100'000;
+  engine.submit(std::move(value));
+  double now = 1;
+  for (; now < 20'000 && executor.suspensions == 0; ++now) {
+    if (events.emitted >= 200) {
+      storage.growthBlocked = true;
+      storage.allocationFailure = metal::AllocationFailure::HostPressure;
+      pressure = MemoryPressure::Warning;
+    }
+    static_cast<void>(engine.tick(now));
+  }
+  require(executor.suspensions == 1 && !engine.commandInFlight() &&
+              resources.snapshot().stateCache.entries == 0,
+          "the decode was not suspended without its point");
+  // Its KV goes too, and so do the extents it held.
+  while (resources.reclaimOne().madeProgress) {
+  }
+  require(resources.snapshot().kvCache.blocks == 0 && pool.snapshot().pagesAllocated == 0,
+          "the suspended lane's KV stayed");
+  storage.growthBlocked = false;
+  pressure = MemoryPressure::Normal;
+  // Another conversation's KV, with no state, fills two whole extents.
+  const std::vector<uint32_t> other(257, 6);
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+  resources.endRequest(900);
+
+  // A snapshot needs memory that only released extents give, and an extent
+  // goes only while no command is in flight (guardReleases).
+  const uint32_t releases = storage.releasedExtents;
+  executor.deniedSnapshots = 0;
+  executor.snapshotRoom = [&] { return storage.releasedExtents >= releases + extentsPerState; };
+  executor.decodeFinishes = true;
+  now += 101;
+  const double finishBy = now + 1000;
+  for (; now < finishBy && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  const auto after = engine.snapshot();
+  require(engine.idle() && executor.resumptions == 1 && events.completedCount == 1 &&
+              events.failedCount == 0 && after.recycledStatePublications == 1 &&
+              after.resources.stateCache.inUseEvictions == 0 &&
+              after.resources.stateCache.inUse == 0,
+          "the resumed lane did not publish its rebuilt point");
+  // For one extent the older KV paid one page: the lane's last page, alone
+  // in its extent, moved there and its extent went. A second extent costs
+  // the older KV four pages more. The next turn resumes from the point.
+  std::vector<uint32_t> next = prompt;
+  next.resize(next.size() + 40, 9);
+  require(resources.lookup(other).kvBoundary == (extentsPerState == 1 ? 224u : 96u) &&
+              storage.copies.size() == extentsPerState &&
+              storage.releasedExtents == releases + extentsPerState &&
+              resources.lookup(next).resumeBoundary() == 4096,
+          "the rebuilt point did not come from the older KV");
+}
+
+// While growth is paused a released extent gives a snapshot nothing, so a
+// replay point's publication that finds no state to recycle goes unpublished
+// and leaves another conversation's cached KV where it is.
+void testPausedPublicationInUseTakesNoKv() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> other(257, 6);
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+  resources.endRequest(900);
+
+  executor.snapshotRoom = [] { return false; };
+  const uint32_t releases = storage.releasedExtents;
+  engine.submit(request(1, std::vector<uint32_t>(4097, 5)));
+  double now = 1;
+  require(engine.tick(now++) && executor.requests.contains(1), "the request did not start");
+  paused = true;
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  require(events.completedCount == 1 && events.failedCount == 0 &&
+              engine.snapshot().replayStatePublicationFailures == 1 &&
+              storage.releasedExtents == releases && storage.copies.empty() &&
+              resources.lookup(other).kvBoundary == 256,
+          "a paused publication took cached KV for a snapshot it could not allocate");
+}
+
 void testPreemptedDecodeRestoresItsResidentCompositeState() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
@@ -4888,8 +5008,10 @@ void testDecodeShareValidation() {
 
 // With no cache slot and nothing to recycle, a lane writes its state straight
 // to disk and the next lane over the prefix restores it. While that write is
-// in flight another lane's boundary is refused. Long-prefill checkpoints
-// can use free disk quota until a later state replaces them.
+// in flight another lane's boundary is refused; the first lane still decodes
+// then, so its KV is no cached KV that boundary could make room with.
+// Long-prefill checkpoints can use free disk quota until a later state
+// replaces them.
 void testStateWithoutACacheSlotGoesToDisk() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -4897,24 +5019,32 @@ void testStateWithoutACacheSlotGoesToDisk() {
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
+  executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({}, cache, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> first(65, 1);
-  engine.submit(request(1, first));
-  runUntilIdle(engine);
+  auto decoding = request(1, first);
+  decoding.maxNewTokens = 4;
+  engine.submit(std::move(decoding));
+  double now = 1;
+  tickUntil(engine, now, [&] { return engine.snapshot().diskStatePublications == 1; },
+            "the first lane did not publish its state");
   auto counters = engine.snapshot();
   auto states = cache.snapshot().stateCache;
   require(executor.diskSnapshots == 1 && counters.replayStatePublications == 1 &&
               counters.diskStatePublications == 1 &&
               counters.replayStatePublicationFailures == 0 &&
               counters.recycledStatePublications == 0 && states.entries == 1 &&
-              states.bytes == 0 && states.diskBytes == 64 && states.offloads == 1 &&
-              events.completedCount == 1,
+              states.bytes == 0 && states.diskBytes == 64 && states.offloads == 1,
           "the state did not go straight to disk");
   // The write is still in flight: the next boundary finds the staging
   // buffer busy and is not retried.
   engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  tickUntil(engine, now,
+            [&] { return engine.snapshot().replayStatePublicationFailures == 1; },
+            "the second lane did not reach its boundary");
+  require(events.completedCount == 0, "the first lane ended before the second boundary");
   runUntilIdle(engine);
   counters = engine.snapshot();
   require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
@@ -6478,6 +6608,9 @@ int main() {
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
+    testResumedLaneRebuildsItsPointFromCachedKv(1);
+    testResumedLaneRebuildsItsPointFromCachedKv(2);
+    testPausedPublicationInUseTakesNoKv();
     testPreemptedDecodeRestoresItsResidentCompositeState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();
     testRepeatedPreemptionRespectsBackoffAndCancellation();
