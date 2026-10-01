@@ -547,6 +547,7 @@ def main_args(**overrides):
             "max_context": None,
             "max_memory": None,
             "max_cache_disk": 0,
+            "decode_share": None,
             "max_image_pixels": api.image_input.MAX_PIXELS,
             "max_new_tokens": 16,
             "request_timeout": 2,
@@ -3482,6 +3483,15 @@ class ServerTest(unittest.TestCase):
         )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             api.parse_args([*required, "--kv-format", "fp16"])
+        self.assertIsNone(args.decode_share)
+        self.assertNotIn("--decode-share", api._native_command(args))
+        share_args = api.parse_args(
+            [*required, "--max-cache-disk", "5G", "--decode-share", "0"]
+        )
+        self.assertEqual(
+            api._native_command(share_args)[-3:],
+            [str(5 * 1024**3), "--decode-share", "0.0"],
+        )
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
@@ -3514,6 +3524,9 @@ class ServerTest(unittest.TestCase):
                 ("--request-timeout", "0"),
                 ("--request-timeout", "nan"),
                 ("--request-timeout", "inf"),
+                ("--decode-share", "-0.5"),
+                ("--decode-share", "nan"),
+                ("--decode-share", "inf"),
                 ("--queue-size", "0"),
                 ("--port", "-1"),
                 ("--port", "65536"),

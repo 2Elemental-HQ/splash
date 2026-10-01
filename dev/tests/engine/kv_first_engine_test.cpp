@@ -4109,6 +4109,25 @@ void testCheckpointIntervalValidationAndDisable() {
           "disabling checkpoints changed existing replay-state behavior");
 }
 
+void testDecodeShareValidation() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  for (double invalid : {-0.5, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
+    bool rejected = false;
+    try {
+      engine::Engine engine({.decodeShare = invalid}, resources, executor,
+                            events);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "invalid decode share was accepted");
+  }
+}
+
 } // namespace
 
 // With no cache slot and nothing to recycle, a lane writes its state straight
@@ -5207,6 +5226,7 @@ int main() {
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
+    testDecodeShareValidation();
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testReplayStateEndsBeforeTheGenerationPrompt();

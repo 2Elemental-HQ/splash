@@ -282,6 +282,8 @@ def serve(args):
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_cache_disk:
             command.extend(["--max-cache-disk", str(args.max_cache_disk)])
+        if args.decode_share is not None:
+            command.extend(["--decode-share", str(args.decode_share)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.request_timeout is not None:
@@ -479,6 +481,17 @@ def _parse_queue_size(value):
     return size
 
 
+def _parse_decode_share(value):
+    # Mirror the server's validation so bad values fail before model work.
+    try:
+        share = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use a number such as 0.5") from None
+    if not math.isfinite(share) or share < 0:
+        raise argparse.ArgumentTypeError("use a nonnegative number such as 0.5")
+    return share
+
+
 def _parse_max_image_pixels(value):
     try:
         pixels = int(value)
@@ -597,6 +610,12 @@ def parse_args(argv=None):
         "--max-context",
         type=_parse_max_context,
         help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
+    )
+    server.add_argument(
+        "--decode-share",
+        type=_parse_decode_share,
+        help="decode time owed per unit of prefill time while other requests "
+        "decode (default: 0.5; 0 alternates one command each)",
     )
     server.add_argument(
         "--allowed-host",
