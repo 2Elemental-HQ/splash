@@ -41,10 +41,7 @@ private:
   throw std::system_error(errno, std::generic_category(), operation);
 }
 
-// Retry pending control work while the engine is idle.
-constexpr int kControlRetryMilliseconds = 25;
-
-int pollTimeout(const NativeRuntime &loop, bool controlPending) {
+int pollTimeout(const NativeRuntime &loop) {
   auto delay = loop.millisecondsUntilNextWakeup();
   int timeout = -1;
   if (delay) {
@@ -54,10 +51,6 @@ int pollTimeout(const NativeRuntime &loop, bool controlPending) {
       timeout = INT_MAX;
     else
       timeout = static_cast<int>(std::ceil(*delay));
-  }
-  if (controlPending && !loop.commandInFlight() &&
-      (timeout < 0 || timeout > kControlRetryMilliseconds)) {
-    timeout = kControlRetryMilliseconds;
   }
   return timeout;
 }
@@ -353,7 +346,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     pollfd descriptor{wake->readFd, POLLIN, 0};
     int result;
     do {
-      result = poll(&descriptor, 1, pollTimeout(loop, deferredControl));
+      result = poll(&descriptor, 1, pollTimeout(loop));
     } while (result < 0 && errno == EINTR);
     if (result < 0) {
       failure_ = "poll(loop wake): " + std::string(std::strerror(errno));
@@ -361,7 +354,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     }
     if (descriptor.revents & POLLIN)
       wake->drain();
-    // A zero result is a deadline, health-check or control-retry wake; the
+    // A zero result is a deadline, health-check or admission-retry wake; the
     // next iteration takes input, runs control and ticks.
   }
   return loopFailure(loop);
