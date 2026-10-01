@@ -37,7 +37,10 @@ if __package__:
     from .tokenization import PromptTokenizer
     from .tool_schema import (
         THINK_END,
+        THINK_END_TOKEN_ID,
+        TOOL_CALL_OPEN,
         ToolPolicy,
+        function_opening,
         json_grammar,
         normalize_response_format,
         normalize_tools,
@@ -69,7 +72,10 @@ else:
     from tokenization import PromptTokenizer
     from tool_schema import (
         THINK_END,
+        THINK_END_TOKEN_ID,
+        TOOL_CALL_OPEN,
         ToolPolicy,
+        function_opening,
         json_grammar,
         normalize_response_format,
         normalize_tools,
@@ -977,6 +983,7 @@ class Frontend:
                     constraint = self.constraint_factory.create(
                         tool_grammar(tool_policy, thinking, response_schema),
                         timeout=remaining_request_time(deadline),
+                        prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
                 elif response_schema is not None:
                     constraint = self.constraint_factory.create(
@@ -1023,6 +1030,22 @@ class Frontend:
             generation_prompt_tokens=rendered.generation_prompt_tokens,
         )
         return job, thinking, bool(tools)
+
+    def _call_openings(self, policy, thinking):
+        """The tokens that begin each callable tool's call. Its parameter
+        names are all possible next, so a tool with more of them than the
+        parser admits fails there."""
+        reasoning = [THINK_END_TOKEN_ID] if thinking else []
+        return [
+            (
+                reasoning
+                + self._tokenize(
+                    TOOL_CALL_OPEN + function_opening(name), add_special_tokens=False
+                )["input_ids"],
+                f"tool {name} has too many parameters to constrain",
+            )
+            for name in policy.schemas
+        ]
 
     def _generation_options(self, body):
         temperature = body.get("temperature", 1.0)
