@@ -548,7 +548,6 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 None,
                 "test-model",
                 4096,
-                16,
                 10,
                 2,
                 vision=True,
@@ -645,7 +644,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
 
         def frontend(template_tokenizer):
             return fixtures.make_frontend(
-                template_tokenizer, None, "test-model", 4096, 16, 10, 2, vision=False
+                template_tokenizer, None, "test-model", 4096, 10, 2, vision=False
             )
 
         job, thinking, _tools = frontend(gemma_tokenizer).prepare(body)
@@ -671,7 +670,6 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 None,
                 "test-model",
                 4096,
-                16,
                 10,
                 2,
                 vision=False,
@@ -728,7 +726,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
     def test_scoring_prompts_use_the_template_chosen_at_startup(self):
         tokenizer = self.ScoringTokenizer(source("qwen36"))
         app = fixtures.make_frontend(
-            tokenizer, None, "test-model", 8192, 16, 10, 2, vision=True
+            tokenizer, None, "test-model", 8192, 10, 2, vision=True
         )
         tokenizer.templates.clear()
         app.prepare_judgment(fixtures.ServerTest.judgment_body())

@@ -469,7 +469,7 @@ class ClientTests(unittest.TestCase):
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
-                                "maxTokens": 25600,
+                                "maxTokens": 32768,
                             }
                         ],
                     }
@@ -1321,7 +1321,7 @@ class InstalledCodexTests(unittest.TestCase):
         # The installed client and production HTTP adapter are real. A
         # controlled length stop keeps this boundary test independent of model text.
         runtime = FakeRuntime(*(Plan([[4]], reason="length") for _ in range(32)))
-        harness = Harness(runtime, max_context=131072, default_max_new=16, timeout=60)
+        harness = Harness(runtime, max_context=131072, timeout=60)
         self.addCleanup(harness.close)
         base_url = f"http://127.0.0.1:{harness.server.server_port}"
         with tempfile.TemporaryDirectory() as directory:
@@ -1387,6 +1387,13 @@ class InstalledCodexTests(unittest.TestCase):
                 32,
                 "client exhausted the bounded truncation fixture",
             )
+            # Codex names no output limit, so each request may use all the
+            # context its prompt leaves.
+            for request in runtime.requests:
+                self.assertEqual(
+                    request.logical_max_output_tokens,
+                    131072 - len(request.prompt_tokens),
+                )
             rows = [
                 json.loads(line) for line in stdout.splitlines() if line.startswith("{")
             ]

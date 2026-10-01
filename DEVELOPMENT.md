@@ -126,6 +126,12 @@ cannot fit, startup prints a memory budget breakdown and stops.
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
+`splash opencode`, `pi` and `hermes` configure an output limit per response
+of 32K tokens (`CLIENT_RESPONSE_TOKENS` in `install/clients.py`); OpenCode and
+Hermes, which reserve it out of the context they compact at, get a quarter of
+a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
+Codex, leave the limit to the server; Claude Code keeps its own, which
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
 
 `splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
 user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
@@ -744,6 +750,19 @@ SGLang, or to what the context leaves when that is less. `temperature`,
 `top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat's `max_completion_tokens` or `max_tokens` and Responses'
+`max_output_tokens` bound a response's output. Omitted, the output may use
+all the context the prompt leaves, as in vLLM and SGLang: the context limit,
+and `--request-timeout` when set, are the only server bounds on a request that
+names no limit. A value larger than what the context leaves returns 400
+`context_length_exceeded` with the prompt's tokens, the value and the window,
+as in vLLM and SGLang; that error and an invalid value's name the field the
+request sent. Messages requires `max_tokens`; a larger value than the context
+leaves generates up to the context limit, since Claude Code asks for the same
+limit on every turn and does not compact for it. A response the context limit
+ends then has the `stop_reason` `model_context_window_exceeded`, as in
+Anthropic's API, not `max_tokens`.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft

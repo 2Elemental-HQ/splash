@@ -254,7 +254,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
         app = make_frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
+            FakeTokenizer(), transport, "test-model", 128, 10, 2, vision=True
         )
         job, _thinking, _tools = app.prepare(
             {
@@ -334,7 +334,7 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, _runtime = self.make_transport(native)
         app = make_frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, math.inf, 2, vision=True
+            FakeTokenizer(), transport, "test-model", 128, math.inf, 2, vision=True
         )
         self.assertEqual(app.request_deadline({"timeout": 5}, 10), 15)
         job, _thinking, _tools = app.prepare(
