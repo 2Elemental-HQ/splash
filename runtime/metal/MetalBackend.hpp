@@ -306,7 +306,6 @@ public:
   // Timeout marks the backend unhealthy without releasing in-flight resources.
   // A synchronous ticket wait runs the same command watchdog.
   void checkHealth();
-  [[nodiscard]] bool needsHealthCheck() const noexcept;
   [[nodiscard]] std::string unhealthyReason() const;
 
 private:

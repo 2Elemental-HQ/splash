@@ -1128,10 +1128,6 @@ void MetalBackend::checkHealth() {
     impl_->asyncState->checkCommandHealth();
 }
 
-bool MetalBackend::needsHealthCheck() const noexcept {
-    return impl_->asyncState->hasActiveSubmission();
-}
-
 bool MetalBackend::healthy() const noexcept {
     return impl_->asyncState->healthy.load(std::memory_order_acquire);
 }
