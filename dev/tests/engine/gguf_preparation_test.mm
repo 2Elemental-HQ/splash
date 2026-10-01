@@ -367,7 +367,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                      {"ffn_up.weight", kQ4_K},
                                      {"ffn_down.weight", kQ6_K},
                                      {"output.weight", kQ6_K},
-                                     {"token_embd.weight", kQ8_0}}),
+                                     {"token_embd.weight", kIQ4_XS}}),
             geometry);
   model::GgufTargetLoader files(backend, model::findTargetGguf(target), geometry);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
@@ -378,9 +378,9 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             weights.logitsProjection.destination == ops::FloatOutput::Float32,
         "GGUF target: logits a Q6_K block projection of vocabulary x hidden into fp32");
   check(weights.tokenEmbedding.layout() == ops::WeightLayout::Block32 &&
-            weights.tokenEmbedding.blocks().formatId == GGUF_FMT_Q80 &&
+            weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
-        "GGUF target: token table Q8_0 blocks of vocabulary x hidden");
+        "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
   check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");
   for (uint32_t index = 0; index < weights.layers.size(); ++index) {
     const auto &layer = weights.layers[index];

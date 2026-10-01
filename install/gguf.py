@@ -440,6 +440,9 @@ EMBEDDING_TYPES = {
     "Q8_0",
     "Q4_0",
     "Q4_1",
+    "IQ3_S",
+    "IQ4_NL",
+    "IQ4_XS",
     "PQ2_0",
 }
 # The tensors the native loader reads from a target, and the types it accepts
