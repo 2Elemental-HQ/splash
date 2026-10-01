@@ -227,7 +227,13 @@ class TextCompletionTests(unittest.TestCase):
 
     def test_default_values_of_unsupported_fields_are_accepted(self):
         harness, runtime = self.harness()
-        defaults = {"suffix": None, "echo": False, "logprobs": None, "best_of": 1}
+        defaults = {
+            "suffix": None,
+            "echo": False,
+            "logprobs": None,
+            "best_of": 1,
+            "repetition_penalty": 1,
+        }
         for fields in (defaults, {key: None for key in defaults}, {"n": 1}):
             with self.subTest(fields=fields):
                 status, response = self.complete(harness, **fields)
@@ -271,6 +277,7 @@ class TextCompletionTests(unittest.TestCase):
             ({"temperature": -1}, "invalid sampling parameters"),
             ({"top_k": 33}, "invalid sampling parameters"),
             ({"presence_penalty": 1}, "output transformation is not supported"),
+            ({"repetition_penalty": 1.1}, "output transformation is not supported"),
             ({"logit_bias": {"1": 2}}, "output transformation is not supported"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),

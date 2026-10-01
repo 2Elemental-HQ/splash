@@ -215,7 +215,10 @@ class CallbackStreamer:
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
-        self._emit(decoded[len(handled) :])
+        # Bytes of a multi-byte character the output ends inside decode to
+        # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
+        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
+        self._emit(decoded[len(handled) :].rstrip("\ufffd"))
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""
@@ -731,6 +734,16 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
+        except engine_runtime.EngineUnhealthy:
+            # An admitted request ends with EngineUnhealthy only when the
+            # engine running it fails, and the backend restarts that engine.
+            # The console names the failure; a client can only retry.
+            error = APIError(
+                503,
+                "the inference engine stopped unexpectedly and is restarting; "
+                "retry the request",
+                "runtime_unavailable",
+            )
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:

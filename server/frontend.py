@@ -504,6 +504,7 @@ class Frontend:
                 "best_of",
                 "presence_penalty",
                 "frequency_penalty",
+                "repetition_penalty",
                 "max_tokens",
                 "suffix",
                 "echo",
@@ -945,6 +946,7 @@ class Frontend:
             "n",
             "presence_penalty",
             "frequency_penalty",
+            "repetition_penalty",
             "max_tokens",
             "max_completion_tokens",
             "stream",
@@ -1090,13 +1092,16 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
+        # Each with the value that leaves the logits unchanged.
         penalties = (
-            body.get("presence_penalty", 0),
-            body.get("frequency_penalty", 0),
-            body.get("min_p", 0),
+            (body.get("presence_penalty", 0), 0),
+            (body.get("frequency_penalty", 0), 0),
+            (body.get("repetition_penalty", 1), 1),
+            (body.get("min_p", 0), 0),
         )
         if any(
-            not is_finite_number(value) or value != 0 for value in penalties
+            not is_finite_number(value) or value != neutral
+            for value, neutral in penalties
         ) or body.get("logit_bias") not in (None, {}):
             raise APIError(
                 400, "the requested logits or output transformation is not supported"

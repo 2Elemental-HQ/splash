@@ -300,7 +300,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             self.wait_bytes(harness, 0)
         with mock.patch.object(harness.backend, "submit", return_value=False):
             self.assertEqual(
-                harness.request("POST", "/v1/chat/completions", body)[0], 429
+                harness.request("POST", "/v1/chat/completions", body)[0], 503
             )
         self.wait_bytes(harness, 0)
 
