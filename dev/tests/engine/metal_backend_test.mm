@@ -477,6 +477,132 @@ void stopRefusesSubmission(const std::string &metallibPath) {
     std::cout << "PASS stopped backend refuses submission\n";
 }
 
+// A shutdown gives up a synchronous wait as the watchdog does: the wait
+// throws and the backend is unhealthy, and the command keeps its allocations
+// until the GPU ends it.
+void shutdownInterruptsACommandWait(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 120.0);
+    std::atomic<bool> stop{false};
+    backend.setWaitInterrupt([&] { return stop.load(); });
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::future<std::string> submitted;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        submitted = std::async(std::launch::async, [&]() -> std::string {
+            try {
+                (void)backend.submitCommand({&dispatch, 1});
+            } catch (const MetalBackendError &error) {
+                return error.what();
+            }
+            return "the command completed";
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop = true;
+        require(submitted.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+                "a shutdown did not end a synchronous wait");
+    }
+    const std::string failure = submitted.get();
+    require(failure.find("shutdown") != std::string::npos && !backend.healthy(),
+            "a shutdown did not fail the synchronous wait: " + failure);
+    dispatch.buffers.clear();
+    buffer = {};
+    require(backend.memoryStats().allocatedBytes != 0,
+            "an interrupted wait released the allocations of a pending command");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(released, "an interrupted command kept its allocations after the GPU ended it");
+    std::cout << "PASS shutdown interrupts a command wait\n";
+}
+
+// Destroying a ticket during a shutdown still waits for its command: only
+// wait() gives a command up for a shutdown, and only the watchdog judges the
+// backend's health meanwhile.
+void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 120.0);
+    backend.setWaitInterrupt([] { return true; });
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitAsync(dispatch);
+    }
+    auto destroyed = std::async(std::launch::async, [&ticket] {
+        splash::metal::CommandTicket dropped = std::move(ticket);
+    });
+    // Longer than a wait slice, after which a wait for wait() would give up.
+    const bool waited = destroyed.wait_for(std::chrono::milliseconds(1500)) ==
+                        std::future_status::timeout;
+    backend.checkHealth();
+    commandWatchdogGate.signaledValue = 1;
+    const bool returned = destroyed.wait_for(std::chrono::seconds(5)) ==
+                          std::future_status::ready;
+    commandWatchdogGate = nil;
+    require(waited && returned && backend.healthy(),
+            "a shutdown gave up a command its ticket's teardown waits for");
+    std::cout << "PASS shutdown leaves ticket teardown to the command\n";
+}
+
+// A command that completes while its wait asks about a shutdown stays a
+// success: the wait gives up only a command still unfinished, so the backend
+// stays healthy.
+void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 120.0);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::atomic<bool> completed{false};
+    // The command completes after the wait's slice ended, before the wait
+    // decides.
+    backend.setWaitInterrupt([&] {
+        commandWatchdogGate.signaledValue = 1;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!completed && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return true;
+    });
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitAsync(dispatch, [&](uint64_t) { completed = true; });
+    }
+    std::string failure;
+    try {
+        (void)ticket.wait();
+    } catch (const MetalBackendError &error) {
+        failure = error.what();
+    }
+    commandWatchdogGate = nil;
+    require(completed && failure.empty() && backend.healthy(),
+            "a shutdown gave up a command that completed: " + failure);
+    std::cout << "PASS shutdown spares a command that completes\n";
+}
+
 std::atomic<unsigned> blitEncoders{0};
 std::atomic<unsigned> computeEncoders{0};
 IMP originalBlitEncoder = nullptr;
@@ -1180,6 +1306,9 @@ int main(int argc, const char *argv[]) {
             synchronousWaitObeysTheWatchdog(argv[1]);
             abandonedTicketReturnsAfterTheWatchdog(argv[1]);
             stopRefusesSubmission(argv[1]);
+            shutdownInterruptsACommandWait(argv[1]);
+            shutdownLeavesTicketTeardownToTheCommand(argv[1]);
+            shutdownSparesACommandThatCompletes(argv[1]);
             buffersStayResident(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);

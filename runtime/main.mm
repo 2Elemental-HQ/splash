@@ -428,6 +428,14 @@ int runNative(const NativeArguments &arguments) {
         (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
                                      : transport.failure()) +
         ")");
+    // A command the backend gave up on may never complete; teardown would
+    // wait for it. The OS and the driver reclaim everything, as after
+    // SIGKILL.
+    if (!bootstrap->resources().backend().healthy()) {
+      writeStderrLine(
+          "error: the Metal backend is unhealthy; exiting without teardown");
+      _exit(static_cast<int>(exit));
+    }
     break;
   case engine::NativeProcessExit::IoFailure:
     writeStderrLine(

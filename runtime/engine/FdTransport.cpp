@@ -384,7 +384,9 @@ void FdTransport::writeAll(std::span<const uint8_t> bytes) const {
       offset += static_cast<size_t>(count);
       continue;
     }
-    if (count < 0 && errno == EINTR)
+    // The signal that requests a shutdown also ends a write the server has
+    // stopped draining.
+    if (count < 0 && errno == EINTR && !shutdownRequested())
       continue;
     if (count == 0) {
       throw std::runtime_error("native output accepted zero bytes");
