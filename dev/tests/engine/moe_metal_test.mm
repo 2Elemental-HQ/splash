@@ -587,15 +587,10 @@ void planBounds() {
     rejects([&] { (void)shipped.moePrefill(shape, 2049); }, "large prefill");
     rejects([&] { (void)shipped.moeDecode(shape, 0); }, "zero batch");
     rejects([&] { (void)shipped.moeDecode(shape, 5); }, "large batch");
-    rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
-            "uncompiled expert tile");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
             "affine 8-row prefill tile");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
             "affine 32-row decode tile");
-    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, moeRouteWideRows(kGpuCores),
-                                                  static_cast<MoeExpertSimdgroups>(6)}); },
-            "uncompiled expert simdgroups");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; an unknown family

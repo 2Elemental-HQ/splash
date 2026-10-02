@@ -22,7 +22,6 @@ static_assert(SPLASH_TARGET_VERIFY_ROWS == 8,
 // The kernels sum their input per block of four quant groups (256 inputs);
 // Split128 partitions K in whole blocks.
 constexpr uint32_t kInputSumBlock = 4 * kQuantGroup;
-static_assert(sizeof(LinearMatrix) == 8);
 
 bool oneLaneTile(LinearTile tile) noexcept {
   return tile == LinearTile::Paired128 || tile == LinearTile::Paired256;
@@ -54,8 +53,6 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
 }
 
 void validate(LinearWorkload w) {
-  if (w.weightLayout != WeightLayout::Affine64 && w.weightLayout != WeightLayout::Block32)
-    throw std::invalid_argument("invalid linear weight layout");
   if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
     throw std::invalid_argument("invalid linear matrix");
@@ -63,17 +60,12 @@ void validate(LinearWorkload w) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
-  } else if (w.phase == LinearPhase::Decode) {
+  } else {
     if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
-  } else {
-    throw std::invalid_argument("invalid linear phase");
   }
-  if (w.epilogue != LinearEpilogue::None && w.epilogue != LinearEpilogue::Residual &&
-      w.epilogue != LinearEpilogue::GateUp && w.epilogue != LinearEpilogue::UpWithGate)
-    throw std::invalid_argument("invalid linear epilogue");
 }
 
 // A buffer a plan does not use needs no bytes and may be absent.
@@ -220,18 +212,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool splitsK = config.tile == LinearTile::Simdgroup || config.tile == LinearTile::Split128;
   if (!splitsK && config.splits != 1)
     throw std::invalid_argument("K splits require the simdgroup or Split128 Q4 tile");
-  if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 && !splitsK &&
-      !oneLaneTile(config.tile))
-    throw std::invalid_argument("invalid Q4 linear tile");
-  if ((config.simdgroups != LinearSimdgroups::Four &&
-       config.simdgroups != LinearSimdgroups::Eight) ||
-      (config.simdgroups == LinearSimdgroups::Four &&
-       !supportsFourSimdgroups(w, config.tile)))
+  if (config.simdgroups == LinearSimdgroups::Four && !supportsFourSimdgroups(w, config.tile))
     throw std::invalid_argument("invalid Q4 cooperative execution scope");
   if (const auto fixed = fixedSimdgroups(config.tile); fixed && config.simdgroups != *fixed)
     throw std::invalid_argument("Q4 tile requires its kernel's simdgroup count");
-  if (w.matrix.outputSize % tileColumns())
-    throw std::invalid_argument("Q4 matrix is not divisible by tile columns");
   const bool residual = w.epilogue == LinearEpilogue::Residual;
   const bool four = config.simdgroups == LinearSimdgroups::Four;
   if (w.phase == LinearPhase::Prefill) {
@@ -256,8 +240,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     return;
   }
   const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
-  if (oneLaneTile(config.tile) && (lane != 0 || w.matrix.outputSize % 256))
-    throw std::invalid_argument("paired Q4 tile requires one lane and paired columns");
+  if (oneLaneTile(config.tile) && lane != 0)
+    throw std::invalid_argument("paired Q4 tile requires one lane");
   if (usesSimdgroup()) {
     const uint32_t groups = w.matrix.inputSize / kQuantGroup;
     if (!config.validSplits() || groups % config.splits)

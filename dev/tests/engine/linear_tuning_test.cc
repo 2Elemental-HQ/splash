@@ -68,8 +68,6 @@ void cpuContracts() {
        LinearWorkload{{0, 256}, 8}, LinearWorkload{{128, 256}, 8},
        LinearWorkload{{512, 64}, 8}, LinearWorkload{{512, 256}, 7},
        LinearWorkload{{512, 256}, 40},
-       LinearWorkload{{512, 256}, 8, static_cast<LinearPhase>(255)},
-       LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
        LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
        LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill},

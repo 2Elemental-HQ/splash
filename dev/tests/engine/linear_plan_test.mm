@@ -560,15 +560,11 @@ void planContracts(uint32_t family, uint32_t cores) {
            LinearWorkload{{512, 320}, 8}, LinearWorkload{{512, 0}, 8},
            LinearWorkload{{512, 256}, 0}, LinearWorkload{{512, 256}, 7},
            LinearWorkload{{512, 256}, 40},
-           LinearWorkload{{512, 256}, 8, static_cast<LinearPhase>(255)},
-           LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
            LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
            LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
            LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
     rejects([&] { (void)linear.plan(invalid); });
-  for (const LinearConfig invalid : {
-           LinearConfig{LinearTile::N128, 0}, LinearConfig{LinearTile::N128, 5},
-           LinearConfig{static_cast<LinearTile>(255), 1}})
+  for (const LinearConfig invalid : {LinearConfig{LinearTile::N128, 0}, LinearConfig{LinearTile::N128, 5}})
     rejects([&] { (void)Linear::plan(valid, invalid); });
   rejects([&] { (void)Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
@@ -645,9 +641,6 @@ void planContracts(uint32_t family, uint32_t cores) {
                                    {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}); });
   const LinearWorkload fourWorkload{{512, 256}, 24, LinearPhase::Decode, LinearEpilogue::None};
   const LinearConfig fourConfig{LinearTile::N128, 1, LinearSimdgroups::Four};
-  for (uint32_t scope : {0U, 1U, 2U, 3U, 16U, 255U})
-    rejects([&] { (void)Linear::plan(fourWorkload,
-        {LinearTile::N128, 1, static_cast<LinearSimdgroups>(scope)}); });
   for (uint32_t rows : {8U, 16U, 32U})
     rejects([&] { (void)Linear::plan({{512, 256}, rows}, fourConfig); });
   for (const auto tile : {LinearTile::N256, LinearTile::Paired128})

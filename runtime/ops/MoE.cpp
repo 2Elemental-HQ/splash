@@ -250,13 +250,9 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   // 8-row kernels in both phases and 32-row prefill kernels.
   const bool gguf = shape.weightLayout == WeightLayout::Block32;
   const bool prefill = phase == MoePhase::Prefill;
-  if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
-      (!prefill && config.expertTile != MoeExpertTile::M8) ||
+  if ((!prefill && config.expertTile != MoeExpertTile::M8) ||
       (!gguf && prefill && config.expertTile != MoeExpertTile::M32))
     throw std::invalid_argument("invalid MoE expert tile configuration");
-  if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
-      config.m8Simdgroups != MoeExpertSimdgroups::Four)
-    throw std::invalid_argument("invalid MoE expert simdgroup configuration");
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");
