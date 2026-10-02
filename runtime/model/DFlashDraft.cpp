@@ -360,7 +360,6 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     result.files.push_back(file.record());
   }
 
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;

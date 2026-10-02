@@ -15,7 +15,6 @@
 #include <functional>
 #include <memory>
 #include <span>
-#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -178,7 +177,6 @@ struct DFlashDraftWeights final {
   metal::MetalBuffer successorCodebook;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
-  std::string manifestFingerprintSha256;
 };
 
 inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";

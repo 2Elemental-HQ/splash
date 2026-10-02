@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <string>
 #include <string_view>
 #include <vector>
 
@@ -19,7 +18,6 @@ struct QwenVisionWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
-  std::string manifestFingerprintSha256;
 };
 
 // The packed vision/model.bin of directory.

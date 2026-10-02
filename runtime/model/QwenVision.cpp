@@ -70,7 +70,6 @@ QwenVisionWeights readVision(metal::MetalBackend &backend,
   file.finish();
   result.files.push_back(file.record());
 
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
