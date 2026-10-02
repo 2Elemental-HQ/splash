@@ -358,6 +358,60 @@ void testProbeCannotCrossCaches() {
           "a probe from another cache reused a colliding block id");
 }
 
+// Every change of a request's page list moves its revision by one and says
+// from which page on the list differs: an append from the length it grew
+// from, a written block swapped for the cached page at its index, a restore
+// from the start. A list that stays the same keeps its revision.
+void testPageTableReportsWhatChanged() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  constexpr uint32_t page = KvCache::pageTokens;
+  std::vector<uint32_t> prompt;
+  for (uint32_t token = 0; token <= 2 * page; ++token)
+    prompt.push_back(1000 + token);
+
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, page).granted() && cache.pageTable(1).revision == 1 &&
+              cache.pageTable(1).firstChanged == 0,
+          "a request's first page did not start its revision");
+  require(admitTokens(cache, 1, 2 * page).granted() && cache.pageTable(1).revision == 2 &&
+              cache.pageTable(1).firstChanged == 1 && cache.pageTable(1).pages.size() == 2,
+          "an append did not report the length it grew from");
+  require(admitTokens(cache, 1, page + 1).granted(), "held pages were denied");
+  static_cast<void>(cache.publishCommittedBlocks(1, prompt, 2 * page));
+  require(cache.pageTable(1).revision == 2,
+          "tokens on held pages or a request's own blocks moved its revision");
+  cache.publishCompositeState(cache.blockAt(1, 2 * page), std::make_shared<TestState>(100));
+
+  // A second request writes the same blocks into pages of its own, and
+  // publishing each swaps it for the cached page.
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 2 * page).granted() && cache.pageTable(2).revision == 1,
+          "a second request's pages were denied");
+  static_cast<void>(cache.publishCommittedBlocks(2, prompt, page));
+  require(cache.pageTable(2).revision == 2 && cache.pageTable(2).firstChanged == 0 &&
+              cache.pageTable(2).pages[0] == cache.pageTable(1).pages[0],
+          "the first swapped block did not report its index");
+  static_cast<void>(cache.publishCommittedBlocks(2, prompt, 2 * page));
+  require(cache.pageTable(2).revision == 3 && cache.pageTable(2).firstChanged == 1 &&
+              cache.pageTable(2).pages[1] == cache.pageTable(1).pages[1] &&
+              cache.pageTable(1).revision == 2,
+          "a swapped block did not report its index or moved the writer's revision");
+  cache.endRequest(2);
+  cache.endRequest(1);
+
+  cache.beginRequest(3);
+  require(admitRestore(cache, 3, cache.lookup(prompt)).granted() &&
+              cache.pageTable(3).revision == 1 && cache.pageTable(3).firstChanged == 0 &&
+              cache.pageTable(3).pages.size() == 2,
+          "a restore did not report its whole list");
+  require(admitTokens(cache, 3, prompt.size()).granted() &&
+              cache.pageTable(3).revision == 2 && cache.pageTable(3).firstChanged == 2,
+          "an append after a restore did not report the restored length");
+  cache.endRequest(3);
+}
+
 void testCacheLookupAndOneTokenReplay() {
   CacheFixture fixture;
   fixture.publish(0);
@@ -2562,6 +2616,7 @@ int main() {
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();
     testProbeCannotCrossCaches();
+    testPageTableReportsWhatChanged();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();

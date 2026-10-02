@@ -21,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 using namespace splash;
@@ -190,6 +191,29 @@ void beginCold(model::Runtime &runtime, const EngineRequest &request,
   runtime.beginColdRequest(request.modelView(), slot);
 }
 
+// Gives an item the revision of its page list the way the engine's cache
+// does: a request's revision moves whenever its list differs from the last
+// one it named, which it keeps below the first page that differs. Growing
+// tables then take the runtime's incremental page-table writes.
+ModelBatchItem withRevision(ModelBatchItem item) {
+  struct Named final {
+    uint64_t revision = 0;
+    uint32_t firstChanged = 0;
+    std::vector<uint32_t> pages;
+  };
+  static std::unordered_map<uint64_t, Named> named;
+  Named &last = named[item.requestId];
+  if (!last.revision || !std::ranges::equal(last.pages, item.pageTable)) {
+    last.firstChanged = static_cast<uint32_t>(
+        std::ranges::mismatch(last.pages, item.pageTable).in1 - last.pages.begin());
+    ++last.revision;
+    last.pages.assign(item.pageTable.begin(), item.pageTable.end());
+  }
+  item.pageTableRevision = last.revision;
+  item.pageTableFirstChanged = last.firstChanged;
+  return item;
+}
+
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
                          const std::shared_ptr<const CompositeState> &state) {
@@ -210,8 +234,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
                  cohort,
                  {{requestId, tokenCount}},
                  DecodeStage::Regular};
-  ModelBatchItem item{requestId,    slot,       logicalPosition,
-                         promptOffset, tokenCount, pageTable};
+  ModelBatchItem item = withRevision(
+      {requestId, slot, logicalPosition, promptOffset, tokenCount, pageTable});
   item.inputTokens = inputTokens;
   auto ticket = executor.submit(
       plan, std::span<const ModelBatchItem>(&item, 1), {});
@@ -248,7 +272,8 @@ decodeOne(model::Runtime &executor, uint64_t requestId, uint32_t slot,
           uint64_t logicalPosition, const std::vector<uint32_t> &pageTable,
           BatchCohort cohort, DecodeStage decodeStage = DecodeStage::Regular) {
   BatchPlan plan{WorkKind::Decode, cohort, {{requestId, 0}}, decodeStage};
-  ModelBatchItem item{requestId, slot, logicalPosition, 0, 0, pageTable};
+  ModelBatchItem item =
+      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable});
   auto result =
       executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
   require(result.size() == 1 && result[0].requestId == requestId,
@@ -307,8 +332,8 @@ beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      DecodeStage decodeStage) {
   BatchPlan plan{WorkKind::Decode, BatchCohort::Constrained,
                  {{requestId, 0}}, decodeStage};
-  const std::array items{ModelBatchItem{
-      requestId, slot, logicalPosition, 0, 0, pageTable}};
+  const std::array items{
+      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable})};
   return beginMaskedDecode(executor, plan, items);
 }
 
@@ -1569,8 +1594,8 @@ int main(int argc, char **argv) {
                               {{42, 1}, {43, 1}},
                               DecodeStage::Regular};
     std::array<ModelBatchItem, 2> crossReplayItems{
-        ModelBatchItem{42, 0, 128, 128, 1, crossPages0},
-        ModelBatchItem{43, 1, 128, 128, 1, crossPages1}};
+        withRevision({42, 0, 128, 128, 1, crossPages0}),
+        withRevision({43, 1, 128, 128, 1, crossPages1})};
     const auto crossReplayToken =
         std::span<const uint32_t>(prompt129).subspan(128, 1);
     crossReplayItems[0].inputTokens = crossReplayToken;
@@ -1584,8 +1609,9 @@ int main(int argc, char **argv) {
                                BatchCohort::Constrained,
                                {{42, 0}, {43, 0}},
                                DecodeStage::RequestInitialMask};
-    std::vector<ModelBatchItem> crossItems{{42, 0, 129, 0, 0, crossPages0},
-                                              {43, 1, 129, 0, 0, crossPages1}};
+    std::vector<ModelBatchItem> crossItems{
+        withRevision({42, 0, 129, 0, 0, crossPages0}),
+        withRevision({43, 1, 129, 0, 0, crossPages1})};
     auto crossInitial = executor.decode(crossInitialPlan, crossItems);
     require(
         crossInitial.size() == 2 &&
@@ -1659,9 +1685,9 @@ int main(int argc, char **argv) {
                      {{b3Ids[0], 0}, {b3Ids[1], 0}, {b3Ids[2], 0}},
                      DecodeStage::Regular};
     std::array<ModelBatchItem, 3> b3Items{
-        ModelBatchItem{b3Ids[0], b3Slots[0], 1, 0, 0, b3Pages[0]},
-        ModelBatchItem{b3Ids[1], b3Slots[1], 1, 0, 0, b3Pages[1]},
-        ModelBatchItem{b3Ids[2], b3Slots[2], 1, 0, 0, b3Pages[2]}};
+        withRevision({b3Ids[0], b3Slots[0], 1, 0, 0, b3Pages[0]}),
+        withRevision({b3Ids[1], b3Slots[1], 1, 0, 0, b3Pages[1]}),
+        withRevision({b3Ids[2], b3Slots[2], 1, 0, 0, b3Pages[2]})};
     auto b3Decoded = executor.decode(b3Plan, b3Items);
     const model::ModelTelemetry b3Telemetry = executor.telemetry();
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
@@ -1692,8 +1718,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> equivalentItems;
     for (uint32_t lane = 0; lane < equivalentIds.size(); ++lane) {
       equivalentPlan.items.push_back({equivalentIds[lane], 0});
-      equivalentItems[lane] = {equivalentIds[lane],  lane, 1, 0, 0,
-                               equivalentPages[lane]};
+      equivalentItems[lane] =
+          withRevision({equivalentIds[lane], lane, 1, 0, 0, equivalentPages[lane]});
     }
     auto equivalentB4 = executor.decode(equivalentPlan, equivalentItems);
     for (uint64_t id : equivalentIds)
@@ -1787,8 +1813,8 @@ int main(int argc, char **argv) {
           raggedRequest(raggedIds[lane], lane),
           raggedSlots[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
-      raggedPrefillItems[lane] = {raggedIds[lane],  raggedSlots[lane], 0, 0,
-                                  raggedRows[lane], raggedPages[lane]};
+      raggedPrefillItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane], 0, 0,
+                                               raggedRows[lane], raggedPages[lane]});
       raggedPrefillItems[lane].inputTokens = raggedPrompts[lane];
     }
     const uint64_t beforeRaggedPrefill = backend.submissionCount();
@@ -1811,9 +1837,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> raggedDecodeItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       raggedDecodePlan.items.push_back({raggedIds[lane], 0});
-      raggedDecodeItems[lane] = {
-          raggedIds[lane],  raggedSlots[lane], raggedRows[lane], 0, 0,
-          raggedPages[lane]};
+      raggedDecodeItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane],
+                                              raggedRows[lane], 0, 0, raggedPages[lane]});
     }
     auto raggedDecoded = executor.decode(raggedDecodePlan, raggedDecodeItems);
     const model::ModelTelemetry raggedDecodeTelemetry =
@@ -1844,9 +1869,8 @@ int main(int argc, char **argv) {
           referenceSlots[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
-      raggedReferencePrefillItems[order] = {
-          referenceId, referenceSlots[order], 0,
-          0,           raggedRows[lane],      raggedPages[lane]};
+      raggedReferencePrefillItems[order] = withRevision(
+          {referenceId, referenceSlots[order], 0, 0, raggedRows[lane], raggedPages[lane]});
       raggedReferencePrefillItems[order].inputTokens = raggedPrompts[lane];
     }
     auto raggedReferencePrefill = executor.prefill(raggedReferencePrefillPlan,
@@ -1862,9 +1886,8 @@ int main(int argc, char **argv) {
       const uint32_t lane = raggedPermutation[order];
       const uint64_t referenceId = 104 + lane;
       raggedReferenceDecodePlan.items.push_back({referenceId, 0});
-      raggedReferenceDecodeItems[order] = {
-          referenceId, referenceSlots[order], raggedRows[lane], 0,
-          0,           raggedPages[lane]};
+      raggedReferenceDecodeItems[order] = withRevision(
+          {referenceId, referenceSlots[order], raggedRows[lane], 0, 0, raggedPages[lane]});
     }
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
@@ -1904,13 +1927,9 @@ int main(int argc, char **argv) {
                                      DecodeStage::Regular};
     std::array<ModelBatchItem, 4> productionB4ReplayItems;
     for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
-      productionB4ReplayItems[lane] = {
-          productionB4Ids[lane],
-          lane,
-          productionPrefix.size(),
-          static_cast<uint32_t>(productionPrefix.size()),
-          1,
-          productionB4Pages[lane]};
+      productionB4ReplayItems[lane] = withRevision(
+          {productionB4Ids[lane], lane, productionPrefix.size(),
+           static_cast<uint32_t>(productionPrefix.size()), 1, productionB4Pages[lane]});
       productionB4ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -1934,9 +1953,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 4> cycleItems;
       for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB4Ids[lane], 0});
-        cycleItems[lane] = {
-            productionB4Ids[lane],  lane, productionB4Lengths[lane], 0, 0,
-            productionB4Pages[lane]};
+        cycleItems[lane] = withRevision({productionB4Ids[lane], lane,
+                                         productionB4Lengths[lane], 0, 0,
+                                         productionB4Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 4, "production B4 width mismatch");
@@ -1993,13 +2012,9 @@ int main(int argc, char **argv) {
         DecodeStage::Regular};
     std::array<ModelBatchItem, 2> productionB2ReplayItems;
     for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
-      productionB2ReplayItems[lane] = {
-          productionB2Ids[lane],
-          productionB2Slots[lane],
-          productionPrefix.size(),
-          static_cast<uint32_t>(productionPrefix.size()),
-          1,
-          productionB2Pages[lane]};
+      productionB2ReplayItems[lane] = withRevision(
+          {productionB2Ids[lane], productionB2Slots[lane], productionPrefix.size(),
+           static_cast<uint32_t>(productionPrefix.size()), 1, productionB2Pages[lane]});
       productionB2ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -2022,12 +2037,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 2> cycleItems;
       for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB2Ids[lane], 0});
-        cycleItems[lane] = {productionB2Ids[lane],
-                            productionB2Slots[lane],
-                            productionB2Lengths[lane],
-                            0,
-                            0,
-                            productionB2Pages[lane]};
+        cycleItems[lane] = withRevision({productionB2Ids[lane], productionB2Slots[lane],
+                                         productionB2Lengths[lane], 0, 0,
+                                         productionB2Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 2, "production B2 width mismatch");

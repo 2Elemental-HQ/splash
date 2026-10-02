@@ -40,6 +40,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
                                extentPages_, data, scale, layer, SPLASH_KV_KEYS, 0))});
     }
     extents_.resize(pageCount_ / extentPages_);
+    extentAddresses_.resize(extents_.size());
 }
 
 size_t PageStorage::extentIndex(uint32_t page) const {
@@ -73,8 +74,8 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
                 throw std::logic_error(
                     "KV extent address leaves no room for the page index");
             }
+            extentAddresses_[extent] = allocated.gpuAddress();
             buffer = std::move(allocated);
-            ++generation_;
         });
     } catch (const metal::MetalAllocationError &error) {
         return error.failure();
@@ -92,26 +93,32 @@ void PageStorage::releaseExtent(uint32_t extent) {
             "cannot release a KV extent while a command is in flight");
     }
     buffer = {};
-    ++generation_;
+    extentAddresses_[extent] = 0;
 }
 
 SplashKvPage PageStorage::entry(uint32_t page) const {
-    const metal::MetalBuffer &extent = extents_[extentIndex(page)];
-    if (!extent) {
+    const size_t extent = extentIndex(page);
+    const uint64_t address = extentAddresses_[extent];
+    if (!address) {
         throw std::logic_error("KV page " + std::to_string(page) +
                                " is in an extent that is not allocated");
     }
-    return extent.gpuAddress() | (page % extentPages_);
+    return address | (page - extent * extentPages_);
 }
 
 void PageStorage::writeEntries(std::span<const uint32_t> pages,
+                               uint32_t first,
                                const metal::MetalBuffer &table) const {
     auto *entries = static_cast<SplashKvPage *>(table.contents());
     if (!entries || table.sizeBytes() / sizeof(SplashKvPage) < pages.size()) {
         throw std::logic_error(
             "KV page table is not CPU-visible or too small for its entries");
     }
-    for (size_t index = 0; index < pages.size(); ++index)
+    if (first > pages.size()) {
+        throw std::invalid_argument(
+            "KV page table entries start past the end of its pages");
+    }
+    for (size_t index = first; index < pages.size(); ++index)
         entries[index] = entry(pages[index]);
 }
 

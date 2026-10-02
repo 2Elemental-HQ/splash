@@ -121,6 +121,8 @@ struct Lane final {
   uint32_t slot = 0;
   uint64_t position = 0;
   std::vector<uint32_t> pages;
+  // The pages never change, so the page table keeps its first revision.
+  uint64_t pageTableRevision = 1;
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
@@ -137,8 +139,8 @@ void prefill(model::Runtime &executor, Lane &lane,
         static_cast<uint32_t>(prompt.size()) - offset);
     BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
                    {{lane.id, count, offset}}, DecodeStage::Regular};
-    ModelBatchItem item{lane.id, lane.slot, offset, offset, count,
-                           lane.pages};
+    ModelBatchItem item{lane.id, lane.slot, offset, offset, count, lane.pages,
+                        lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
     auto results =
         executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -166,7 +168,8 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});
-    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages});
+    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages,
+                     lane.pageTableRevision});
   }
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())

@@ -103,6 +103,43 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
     require(next == extent + storage.extentBytes(), "the spans of an extent's pages do not cover it");
 }
 
+// Writing a table from an index on leaves the entries before it as they
+// are, and refuses an index past the pages.
+void entriesFromFirst(const kv::PageStorage &storage, const metal::MetalBuffer &table) {
+    auto *entries = static_cast<SplashKvPage *>(table.contents());
+    constexpr SplashKvPage kSentinel = ~SplashKvPage{0};
+    std::fill_n(entries, 3, kSentinel);
+    storage.writeEntries(std::array<uint32_t, 3>{5, 200, 255}, 1, table);
+    require(entries[0] == kSentinel && entries[1] == storage.entry(200) &&
+                entries[2] == storage.entry(255),
+            "a table written from an index did not keep the entries before it");
+    storage.writeEntries(std::array<uint32_t, 3>{5, 200, 255}, 3, table);
+    require(entries[0] == kSentinel, "a table written past its last page changed");
+    requireThrows<std::invalid_argument>(
+        [&] { storage.writeEntries(std::array<uint32_t, 1>{5}, 2, table); },
+        "a table was written from an index past its pages");
+}
+
+// An extent released and allocated again gets entries of its new buffer: a
+// kernel writing through the table reaches the memory the host reads.
+void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStorage &storage,
+                                     const metal::MetalBuffer &table) {
+    storage.releaseExtent(1);
+    require(static_cast<bool>(storage.allocateExtent(1)),
+            "a released extent could not be allocated again");
+    storage.writeEntries(std::array<uint32_t, 1>{128}, 0, table);
+    const uint32_t words = 1024, seed = 0x5eed;
+    (void)backend.submit({"addressed_write_u32", {{0, table}},
+                          {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                          {words / 256, 1, 1}, {256, 1, 1}});
+    const auto *written =
+        reinterpret_cast<const uint32_t *>(storage.spans(128).front().data());
+    for (uint32_t word = 0; word < words; ++word) {
+        if (written[word] != (seed ^ word))
+            throw std::runtime_error("a kernel did not reach a reallocated extent through its entry");
+    }
+}
+
 void run(const std::string &metallib) {
     metal::MetalBackend backend(metallib);
     auto baseline = backend.memoryStats();
@@ -353,19 +390,18 @@ void run(const std::string &metallib) {
                                     "a page of an unallocated extent received host memory");
     requireSpansTileExtent(storage, 0);
     requireThrows<std::logic_error>(
-        [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, table); },
+        [&] { storage.writeEntries(std::array<uint32_t, 1>{200}, 0, table); },
         "a table was written with a page of an unallocated extent");
     requireThrows<std::logic_error>(
-        [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, table); },
+        [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, 0, table); },
         "a table too small for its entries was written");
 
-    const uint64_t generation = storage.generation();
-    require(storage.allocateExtent(1) && storage.generation() == generation + 1 &&
+    require(storage.allocateExtent(1) &&
                 storage.allocatedExtents() * storage.extentPages() == 256 &&
                 storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
             "growth did not add exactly one extent");
-    storage.writeEntries(std::array<uint32_t, 4>{200, 5, 255, 128}, table);
+    storage.writeEntries(std::array<uint32_t, 4>{200, 5, 255, 128}, 0, table);
     const auto *entries = static_cast<const SplashKvPage *>(table.contents());
     // Pages 200, 255 and 128 share the second extent, at indices 72, 127, 0.
     require(entries[0] == storage.entry(200) && (entries[0] & SPLASH_KV_PAGE_INDEX_MASK) == 72 &&
@@ -382,21 +418,22 @@ void run(const std::string &metallib) {
         requireThrows<std::logic_error>(
             [&] { storage.releaseExtent(1); },
             "an extent was released while a command was in flight");
-        require(storage.isAllocated(200) && storage.entry(200) == entries[0] &&
-                    storage.generation() == generation + 1,
+        require(storage.isAllocated(200) && storage.entry(200) == entries[0],
                 "a refused release changed the extent");
         (void)ticket.wait();
     }
     storage.releaseExtent(1);
     require(!storage.isAllocated(200) &&
-                storage.generation() == generation + 2 && storage.allocatedExtents() * storage.extentPages() == 128 &&
+                storage.allocatedExtents() * storage.extentPages() == 128 &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
     requireThrows<std::logic_error>([&] { storage.releaseExtent(1); },
                                     "an unallocated extent was released again");
-    require(storage.allocateExtent(1) && storage.generation() == generation + 3 &&
+    require(storage.allocateExtent(1) &&
                 (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
+    entriesFromFirst(storage, table);
+    entriesFollowAReallocatedExtent(backend, storage, table);
 
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);

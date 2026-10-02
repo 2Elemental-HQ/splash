@@ -165,7 +165,12 @@ void Cache::recordLookup(const CacheLookup &result) {
 
 PageTableView Cache::pageTable(uint64_t requestId) const {
   const Request &active = request(requestId);
-  return {active.pages, active.pageTableRevision};
+  return {active.pages, active.pageTableRevision, active.firstChangedPage};
+}
+
+void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
+  ++active.pageTableRevision;
+  active.firstChangedPage = first;
 }
 
 uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
@@ -211,7 +216,7 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     }
     if (replacePage) {
       active.pages[logical] = inserted.physicalPage;
-      ++active.pageTableRevision;
+      pagesChanged(active, logical);
       pool_.releasePage(writerPage, false);
     }
     if (parent)
@@ -273,11 +278,11 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
   if (needed64 > std::numeric_limits<uint32_t>::max())
     throw std::invalid_argument("KV target exceeds the page id range");
   const uint32_t needed = static_cast<uint32_t>(needed64);
-  if (needed <= active.pages.size())
+  const auto previousSize = static_cast<uint32_t>(active.pages.size());
+  if (needed <= previousSize)
     return {};
   std::vector<uint32_t> acquired;
-  if (const TokenAdmission admission =
-          admitPages(needed - static_cast<uint32_t>(active.pages.size()), acquired);
+  if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
       !admission.granted())
     return admission;
   try {
@@ -287,7 +292,7 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
       pool_.releasePage(page, false);
     throw;
   }
-  ++active.pageTableRevision;
+  pagesChanged(active, previousSize);
   return {};
 }
 
@@ -549,7 +554,7 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   }
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
-  ++active.pageTableRevision;
+  pagesChanged(active, 0);
   return {};
 }
 

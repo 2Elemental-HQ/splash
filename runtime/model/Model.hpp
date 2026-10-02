@@ -206,7 +206,10 @@ struct ModelBatchItem final {
   uint32_t promptOffset = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
+  // pageTableRevision names the page list and is nonzero; the list equals
+  // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
+  uint32_t pageTableFirstChanged = 0;
   std::span<const uint32_t> inputTokens{};
 };
 

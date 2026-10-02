@@ -111,6 +111,7 @@ struct TokenAdmission final {
 struct PageTableView final {
   std::span<const uint32_t> pages;
   uint64_t revision = 0;
+  uint32_t firstChanged = 0;
 };
 
 struct CacheReclaimResult final {
@@ -176,6 +177,9 @@ public:
 
   [[nodiscard]] TokenAdmission ensureTokens(uint64_t requestId,
                                             uint64_t tokenCount);
+  // The request's page list. Its revision moves on every change of the
+  // list, and the list differs from the one at revision - 1 from
+  // firstChanged on.
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
 
   // Canonicalizes every newly complete Page32 block. Duplicate content swaps
@@ -266,9 +270,12 @@ private:
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;
     uint64_t pageTableRevision = 0;
+    uint32_t firstChangedPage = 0;
     uint32_t pendingRestores = 0;
     bool restoreFailed = false;
   };
+  // Records a change of the request's page list from index first on.
+  static void pagesChanged(Request &active, uint32_t first) noexcept;
   struct Demotion final {
     uint64_t block = 0;
     std::unique_ptr<model::KvTransfer> transfer;

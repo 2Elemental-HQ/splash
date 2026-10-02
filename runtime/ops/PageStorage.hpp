@@ -58,7 +58,9 @@ public:
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent) override;
   // The caller must prove that no active, prefix, reserved, or in-flight
   // reference remains anywhere in this extent. std::out_of_range for an
-  // extent past the pool.
+  // extent past the pool. KvPool never releases an extent that holds a page
+  // a request or the cache holds; GPU page tables rely on it (Runtime's
+  // PageTableBinding).
   void releaseExtent(uint32_t extent) override;
   // Where each attention layer's region sits in every extent, by layer.
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
@@ -69,9 +71,12 @@ public:
   // whose extent is not allocated: a GPU table holds only pages of allocated
   // extents.
   [[nodiscard]] SplashKvPage entry(uint32_t page) const;
-  // Writes the entries of `pages` to the start of a CPU-visible GPU page
-  // table, which must hold all of them; throws std::logic_error otherwise.
-  void writeEntries(std::span<const uint32_t> pages,
+  // Writes the entries of `pages` from index `first` on to a CPU-visible
+  // GPU page table, which must hold all of them; entries before `first` are
+  // left as they are. Throws std::logic_error for a table that is not
+  // CPU-visible or too small, std::invalid_argument for `first` past the
+  // pages.
+  void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
   // it: the page's bytes of each tensor in every layer's region, layer by
@@ -79,9 +84,6 @@ public:
   // splash_kv_offset places them for the kernels. BF16 pages have no scale
   // bytes. Throws std::logic_error for a page whose extent is not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
-  // Advances whenever an extent is allocated or released. A GPU table
-  // written at an earlier generation may hold an entry of a released extent.
-  [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
 private:
   [[nodiscard]] size_t extentIndex(uint32_t page) const;
@@ -94,7 +96,8 @@ private:
   std::vector<SplashKvLayer> layers_;
   // Empty while the extent is not allocated.
   std::vector<metal::MetalBuffer> extents_;
-  uint64_t generation_ = 0;
+  // Each extent's GPU address, zero while it is not allocated.
+  std::vector<uint64_t> extentAddresses_;
 };
 
 } // namespace splash::kv

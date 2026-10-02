@@ -237,13 +237,12 @@ struct Runtime::Impl {
     bool draftComputed = false;
   };
 
-  // What a lane's GPU page table was last written from: the request's page
-  // list at a revision, translated under the KV storage's generation.
+  // What a lane's GPU table was last written from. Its entries stay valid
+  // while the revision does: KvPool never releases the extent of a page a
+  // request holds (PageStorage::releaseExtent).
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
-    uint32_t entries = 0;
-    uint64_t generation = 0;
   };
 
   MetalBackend &backend;
@@ -603,19 +602,25 @@ struct Runtime::Impl {
         item.pageTable.size() > kMaximumPageTableEntries) {
       throw std::invalid_argument("request page table has invalid length");
     }
+    if (!item.pageTableRevision)
+      throw std::invalid_argument("request page table has no revision");
     PageTableBinding &binding = pageTableBindings[entry.slot];
     MetalBuffer destination =
         decodeArena->get(entry.slot, DecodeTensor::PageTable);
-    const bool unversioned = item.pageTableRevision == 0;
-    if (unversioned || binding.requestId != entry.id ||
-        binding.revision != item.pageTableRevision ||
-        binding.entries != item.pageTable.size() ||
-        binding.generation != kvPages.generation()) {
-      kvPages.writeEntries(item.pageTable, destination);
-      binding = {entry.id, item.pageTableRevision,
-                 static_cast<uint32_t>(item.pageTable.size()),
-                 kvPages.generation()};
+    // Rewrite only what changed since the table was written: nothing at the
+    // same revision, the entries from the first changed page on at the next
+    // one, and everything after two changes or for another request.
+    const auto size = static_cast<uint32_t>(item.pageTable.size());
+    uint32_t first = 0;
+    if (binding.requestId == entry.id) {
+      if (binding.revision == item.pageTableRevision)
+        first = size;
+      else if (binding.revision + 1 == item.pageTableRevision)
+        first = std::min(item.pageTableFirstChanged, size);
     }
+    if (first < size)
+      kvPages.writeEntries(item.pageTable, first, destination);
+    binding = {entry.id, item.pageTableRevision};
     return destination;
   }
 
@@ -2390,6 +2395,7 @@ void Runtime::end(uint64_t requestId) {
     impl_->retainEmbeddings(image);
   if (found->second.resident) {
     impl_->states.releaseSlot(found->second.slot, requestId);
+    impl_->pageTableBindings[found->second.slot] = {};
   }
   impl_->requests.erase(found);
 }
@@ -2417,6 +2423,16 @@ void requireRunwayPages(const kv::PageStorage &storage,
                              " is outside the startup runway");
     }
   }
+}
+
+// A warmup request's batch item. Each warmup residency keeps one page list,
+// so its revision stays 1.
+ModelBatchItem warmupItem(uint64_t id, uint32_t slot, uint64_t position,
+                          uint32_t promptOffset, uint32_t tokens,
+                          std::span<const uint32_t> pages) {
+  ModelBatchItem item{id, slot, position, promptOffset, tokens, pages};
+  item.pageTableRevision = 1;
+  return item;
 }
 
 } // namespace
@@ -2455,7 +2471,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
                    BatchCohort::Greedy,
                    {{id, rows}},
                    DecodeStage::Regular};
-    ModelBatchItem item{id, 0, 0, 0, rows, pages};
+    ModelBatchItem item = warmupItem(id, 0, 0, 0, rows, pages);
     item.inputTokens = request.prompt;
     const auto phaseStart = Clock::now();
     auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -2504,7 +2520,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                             BatchCohort::Greedy,
                             {{request.id, 1}},
                             DecodeStage::Regular};
-      ModelBatchItem item{request.id, slotOrder[lane], 0, 0, 1, pages[lane]};
+      ModelBatchItem item =
+          warmupItem(request.id, slotOrder[lane], 0, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
       static_cast<void>(
           prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2516,7 +2533,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     std::vector<ModelBatchItem> items;
     for (uint32_t lane = 0; lane < width; ++lane) {
       plan.items.push_back({firstId + lane, 0});
-      items.push_back({firstId + lane, slotOrder[lane], 1, 0, 0, pages[lane]});
+      items.push_back(
+          warmupItem(firstId + lane, slotOrder[lane], 1, 0, 0, pages[lane]));
     }
     const auto phaseStart = Clock::now();
     auto decoded = decode(plan, items);
@@ -2589,14 +2607,14 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
                           BatchCohort::Greedy,
                           {{id, 1}},
                           DecodeStage::Regular};
-    ModelBatchItem prefillItem{id, 0, 0, 0, 1, pages};
+    ModelBatchItem prefillItem = warmupItem(id, 0, 0, 0, 1, pages);
     prefillItem.inputTokens = request.prompt;
     static_cast<void>(
         prefill(prefillPlan, std::span<const ModelBatchItem>(&prefillItem, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem{id, 0, 1, 0, 0, pages};
+    ModelBatchItem decodeItem = warmupItem(id, 0, 1, 0, 0, pages);
     auto result =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const auto &lengths = impl_->states.metadata(0).lengths;
@@ -2639,7 +2657,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                    BatchCohort::Greedy,
                    {{id, prefixTokens}},
                    DecodeStage::Regular};
-    ModelBatchItem item{id, 0, 0, 0, prefixTokens, pages};
+    ModelBatchItem item = warmupItem(id, 0, 0, 0, prefixTokens, pages);
     item.inputTokens =
         std::span<const uint32_t>(request.prompt).first(prefixTokens);
     static_cast<void>(prefill(plan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2669,8 +2687,8 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                          BatchCohort::Greedy,
                          {{id, suffixTokens}},
                          DecodeStage::Regular};
-    ModelBatchItem suffix{id,           1,    prefixTokens, prefixTokens,
-                          suffixTokens, pages};
+    ModelBatchItem suffix =
+        warmupItem(id, 1, prefixTokens, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
     static_cast<void>(
@@ -2681,7 +2699,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += continuationWallSeconds;
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem{id, 1, promptTokens, 0, 0, pages};
+    ModelBatchItem decodeItem = warmupItem(id, 1, promptTokens, 0, 0, pages);
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const double historicalDecodeWallSeconds =

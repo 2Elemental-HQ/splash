@@ -160,6 +160,7 @@ public:
     Request &entry = requests.at(id);
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
+    pageTables.erase(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -273,9 +274,35 @@ public:
     }
     return result;
   }
+  // What the runtime's GPU page tables rely on: a revision names one page
+  // list, starts at one and only moves forward, and the list at the next
+  // revision keeps the pages below its first changed one. The cache starts
+  // a request's revisions again once the engine suspends or ends it.
+  void checkPageTables(std::span<const ModelBatchItem> items) {
+    for (const ModelBatchItem &item : items) {
+      if (!item.pageTableRevision)
+        throw std::logic_error("a page table has no revision");
+      const auto [found, inserted] = pageTables.try_emplace(item.requestId);
+      PageTableShadow &shadow = found->second;
+      const auto unchangedBelow = [&](size_t first) {
+        return first <= shadow.pages.size() && first <= item.pageTable.size() &&
+               std::equal(shadow.pages.begin(), shadow.pages.begin() + first,
+                          item.pageTable.begin());
+      };
+      if (!inserted &&
+          (item.pageTableRevision < shadow.revision ||
+           (item.pageTableRevision == shadow.revision &&
+            !std::ranges::equal(shadow.pages, item.pageTable)) ||
+           (item.pageTableRevision == shadow.revision + 1 &&
+            !unchangedBelow(item.pageTableFirstChanged))))
+        throw std::logic_error("a page table revision does not describe its pages");
+      shadow = {item.pageTableRevision, {item.pageTable.begin(), item.pageTable.end()}};
+    }
+  }
   std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
+    checkPageTables(items);
     // Every constrained cycle after the initial mask request waits for its
     // mask inside the ticket, as the production constrained ticket does.
     if (plan.kind == WorkKind::Decode &&
@@ -344,7 +371,10 @@ public:
     if (overlap && overlap->emitted && overlap->requestId == id)
       overlap->provided = true;
   }
-  void end(uint64_t id) override { requests.erase(id); }
+  void end(uint64_t id) override {
+    requests.erase(id);
+    pageTables.erase(id);
+  }
 
   struct Request {
     uint32_t slot = 0;
@@ -353,6 +383,12 @@ public:
     bool replaying = false;
   };
   std::unordered_map<uint64_t, Request> requests;
+  // The page list each request's last item named, at its revision.
+  struct PageTableShadow {
+    uint64_t revision = 0;
+    std::vector<uint32_t> pages;
+  };
+  std::unordered_map<uint64_t, PageTableShadow> pageTables;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
   std::shared_ptr<RestoreControl> restoreControl = std::make_shared<RestoreControl>();
   uint32_t diskReads = 0;
