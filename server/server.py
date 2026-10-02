@@ -65,7 +65,6 @@ if __package__:
     from .output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
-        argument_deltas,
         validate_response_content,
         validate_tool_calls,
     )
@@ -112,7 +111,6 @@ else:
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
-        argument_deltas,
         validate_response_content,
         validate_tool_calls,
     )
@@ -1012,8 +1010,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _anthropic_stream(self, job, thinking, has_tools):
         content_index = 0
         active_kind = None
-        active_tool_index = None
-        streamed_tool_calls = 0
         hidden_thinking = []
         omitted = job.thinking_display == "omitted"
 
@@ -1025,7 +1021,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("ping", {})
 
         def finish_active():
-            nonlocal active_kind, active_tool_index, content_index
+            nonlocal active_kind, content_index
             if active_kind is None:
                 return
             if active_kind == "thinking" and omitted:
@@ -1041,7 +1037,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("content_block_stop", {"index": content_index})
             content_index += 1
             active_kind = None
-            active_tool_index = None
 
         def put_text(field, text):
             nonlocal active_kind
@@ -1077,14 +1072,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("content_block_delta", {"index": content_index, "delta": delta})
 
         def put_tool_delta(delta):
-            nonlocal active_kind, active_tool_index, streamed_tool_calls
+            nonlocal active_kind
             function = delta.get("function") or {}
-            index = delta["index"]
             if function.get("name") is not None:
                 finish_active()
                 active_kind = "tool"
-                active_tool_index = index
-                streamed_tool_calls = max(streamed_tool_calls, index + 1)
                 send(
                     "content_block_start",
                     {
@@ -1099,12 +1091,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             arguments = function.get("arguments")
             if arguments:
-                if active_kind != "tool" or active_tool_index != index:
-                    raise APIError(
-                        500,
-                        "tool argument delta arrived before its tool header",
-                        "internal_server_error",
-                    )
                 send(
                     "content_block_delta",
                     {
@@ -1138,7 +1124,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            _, content, tool_calls, result, _ = self._collect(
+            _, _, tool_calls, result, _ = self._collect(
                 job,
                 thinking,
                 has_tools,
@@ -1148,7 +1134,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 lambda progress: send("ping", {"prompt_progress": progress}),
             )
             finish_active()
-            if not content and not tool_calls and content_index == 0:
+            if content_index == 0:
                 send(
                     "content_block_start",
                     {
@@ -1157,32 +1143,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     },
                 )
                 send("content_block_stop", {"index": content_index})
-                content_index += 1
-            for call in tool_calls[streamed_tool_calls:]:
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call["id"],
-                            "name": call["function"]["name"],
-                            "input": {},
-                        },
-                    },
-                )
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": call["function"]["arguments"],
-                        },
-                    },
-                )
-                send("content_block_stop", {"index": content_index})
-                content_index += 1
             send(
                 "message_delta",
                 {
@@ -1315,7 +1275,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         output, sequence = [], 0
         active_kind, active_parts = None, []
         active_call = None
-        streamed_tool_calls = 0
 
         def send(event, **payload):
             nonlocal sequence
@@ -1491,9 +1450,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             emit_delta(kind, item, len(output), text)
 
         def put_tool_delta(delta):
-            nonlocal active_call, active_kind, active_parts, streamed_tool_calls
+            nonlocal active_call, active_kind, active_parts
             function = delta.get("function") or {}
-            index = delta["index"]
             if function.get("name") is not None:
                 finish_active()
                 active_kind = "function_call"
@@ -1506,7 +1464,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         "arguments": "",
                     },
                 }
-                streamed_tool_calls = max(streamed_tool_calls, index + 1)
                 item = responses_item(
                     job,
                     "function_call",
@@ -1521,12 +1478,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             arguments = function.get("arguments")
             if arguments:
-                if active_kind != "function_call" or index + 1 != streamed_tool_calls:
-                    raise APIError(
-                        500,
-                        "tool argument delta arrived before its tool header",
-                        "internal_server_error",
-                    )
                 active_parts.append(arguments)
                 item = responses_item(
                     job,
@@ -1537,25 +1488,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
                 emit_delta("function_call", item, len(output), arguments)
 
-        def emit_item(kind, value, status="completed"):
+        def emit_empty_message(status):
             index = len(output)
-            pending = value if kind == "function_call" else ""
-            pending_item = responses_item(job, kind, pending, index, "in_progress")
-            if kind == "message":
-                pending_item["content"] = []
+            pending_item = responses_item(job, "message", "", index, "in_progress")
+            pending_item["content"] = []
             send(
                 "response.output_item.added",
                 output_index=index,
                 item=pending_item,
             )
-            start_part(kind, pending_item, index)
-            item = responses_item(job, kind, value, index, status)
-            if kind == "function_call":
-                for arguments in argument_deltas(item["arguments"]):
-                    emit_delta(kind, item, index, arguments)
-            elif value:
-                emit_delta(kind, item, index, value)
-            finish_part(kind, item, index)
+            start_part("message", pending_item, index)
+            item = responses_item(job, "message", "", index, status)
+            finish_part("message", item, index)
             send("response.output_item.done", output_index=index, item=item)
             output.append(item)
 
@@ -1563,7 +1507,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if self._next_event(job, keepalive)[0] != "start":
                 raise APIError(500, "runtime protocol error", "protocol_error")
             begin()
-            _, content, calls, result, reasoning_active = self._collect(
+            _, _, calls, result, reasoning_active = self._collect(
                 job,
                 thinking,
                 has_tools,
@@ -1584,20 +1528,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if active_kind == "reasoning" and not reasoning_active
                 else status
             )
-            active_value = None
-            if active_kind == "function_call" and streamed_tool_calls <= len(calls):
-                active_value = calls[streamed_tool_calls - 1]
-            finish_active(active_status, active_value)
-            if has_tools:
-                has_message = any(item["type"] == "message" for item in output)
-                if (
-                    content or (not calls and streamed_tool_calls == 0)
-                ) and not has_message:
-                    emit_item("message", content, status)
-                for call in calls[streamed_tool_calls:]:
-                    emit_item("function_call", call, status)
-            elif not any(item["type"] == "message" for item in output):
-                emit_item("message", "", status)
+            finish_active(
+                active_status, calls[-1] if active_kind == "function_call" else None
+            )
+            if not calls and not any(item["type"] == "message" for item in output):
+                emit_empty_message(status)
             event = (
                 "response.incomplete"
                 if status == "incomplete"
