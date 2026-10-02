@@ -85,8 +85,8 @@ struct MemoryGovernorSnapshot {
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   // Whether the host has room for growth that no request in service needs.
-  // tryReserve still grants what such a request needs while this is false,
-  // short of critical pressure. Allocation need not ask: tryReserve names
+  // Admission still grants what such a request needs while this is false,
+  // short of critical pressure. Allocation need not ask: admission names
   // the host as the cause of every refusal the host shares.
   bool hostGrowthAllowed = true;
 };
@@ -154,28 +154,6 @@ public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
 
-  class Reservation final {
-  public:
-    Reservation() = default;
-    ~Reservation();
-    Reservation(const Reservation &) = delete;
-    Reservation &operator=(const Reservation &) = delete;
-    Reservation(Reservation &&) noexcept;
-    Reservation &operator=(Reservation &&) noexcept;
-
-    [[nodiscard]] explicit operator bool() const noexcept;
-    void commit();
-
-  private:
-    Reservation(MemoryGovernor *owner, uint64_t bytes);
-    void release() noexcept;
-
-    MemoryGovernor *owner_ = nullptr;
-    uint64_t bytes_ = 0;
-
-    friend class MemoryGovernor;
-  };
-
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes);
   // Metal memory outside the backend's buffers (pipelines, driver
@@ -186,17 +164,15 @@ public:
                  HostAvailableMemoryProvider hostAvailableMemory,
                  uint64_t untrackedReserveBytes = 0);
 
-  // Reserves bytes under the limit and the host's headroom, or refuses them
-  // with the cause: HostPressure when the host refuses, whether or not the
-  // limit does too, and EngineBudget when only the limit does. The host
-  // refuses under critical pressure and, unless a request in service needs
-  // the bytes (setServing), inside the warning margin or while it holds for
-  // the recovery margin.
-  [[nodiscard]] std::optional<Reservation> tryReserve(
-      uint64_t bytes, metal::AllocationFailure *failure = nullptr);
-  // Low-level storage/model components receive only this transactional
-  // callback, so allocation stays governed without introducing a
-  // reverse dependency on engine policy.
+  // The only way to reserve memory. Low-level storage/model components
+  // receive only this transactional callback, so allocation stays governed
+  // without introducing a reverse dependency on engine policy. It reserves
+  // the bytes under the limit and the host's headroom while the allocation
+  // runs, or refuses them with the cause: HostPressure when the host refuses,
+  // whether or not the limit does too, and EngineBudget when only the limit
+  // does. The host refuses under critical pressure and, unless a request in
+  // service needs the bytes (setServing), inside the warning margin or while
+  // it holds for the recovery margin.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared. The host's margins do not refuse those: holding
@@ -215,6 +191,30 @@ public:
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
+  // Held while an admitted allocation runs; released when it ends.
+  class Reservation final {
+  public:
+    ~Reservation();
+    Reservation(const Reservation &) = delete;
+    Reservation &operator=(const Reservation &) = delete;
+    Reservation(Reservation &&) noexcept;
+
+    void commit();
+
+  private:
+    Reservation(MemoryGovernor *owner, uint64_t bytes);
+    void release() noexcept;
+
+    MemoryGovernor *owner_ = nullptr;
+    uint64_t bytes_ = 0;
+
+    friend class MemoryGovernor;
+  };
+
+  // allocationAdmission's reservation, or nothing with the cause of the
+  // refusal in failure.
+  [[nodiscard]] std::optional<Reservation>
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
   chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;

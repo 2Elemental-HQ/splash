@@ -18,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1551,18 +1552,21 @@ int main(int argc, char **argv) {
             "oracle runtime arena reservation overflows");
     const uint64_t arenaBytes = executorPlan.sharedPrefillPlannedAllocatedBytes +
                                 executorPlan.sharedDecodePlannedAllocatedBytes;
-    metal::AllocationFailure arenaFailure = metal::AllocationFailure::None;
-    auto arenaReservation = governor.tryReserve(arenaBytes, &arenaFailure);
-    if (arenaFailure == metal::AllocationFailure::HostPressure)
+    std::optional<model::Runtime> runtime;
+    const metal::AllocationResult arenas = governor.allocationAdmission()(
+        arenaBytes, [&] { runtime.emplace(context); });
+    if (arenas.failure == metal::AllocationFailure::HostPressure)
       stopForHostMemory(governor, "the runtime arenas", arenaBytes);
-    require(arenaReservation.has_value(),
+    require(static_cast<bool>(arenas),
             "oracle runtime arenas exceed the oracle Metal budget");
     if (warmupEosOnly) {
+      // The fixture builds its own runtimes one at a time in the admitted
+      // runtime's place, outside the admission, so its failures are its own.
+      runtime.reset();
       warmupEos(context, model);
       return 0;
     }
-    model::Runtime executor(context);
-    arenaReservation->commit();
+    model::Runtime &executor = *runtime;
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);

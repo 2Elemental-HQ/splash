@@ -91,22 +91,6 @@ MemoryGovernor::Reservation::Reservation(Reservation &&other) noexcept
   other.bytes_ = 0;
 }
 
-MemoryGovernor::Reservation &
-MemoryGovernor::Reservation::operator=(Reservation &&other) noexcept {
-  if (this == &other)
-    return *this;
-  release();
-  owner_ = other.owner_;
-  bytes_ = other.bytes_;
-  other.owner_ = nullptr;
-  other.bytes_ = 0;
-  return *this;
-}
-
-MemoryGovernor::Reservation::operator bool() const noexcept {
-  return owner_ && bytes_;
-}
-
 void MemoryGovernor::Reservation::commit() { release(); }
 
 void MemoryGovernor::Reservation::release() noexcept {
@@ -188,9 +172,7 @@ uint64_t MemoryGovernor::hostHeadroomBytes(
 }
 
 std::optional<MemoryGovernor::Reservation>
-MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
-  if (failure)
-    *failure = metal::AllocationFailure::None;
+MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!bytes) {
     throw std::invalid_argument("memory reservation must be positive");
   }
@@ -220,9 +202,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
-    if (failure)
-      *failure = hostRefuses ? metal::AllocationFailure::HostPressure
-                             : metal::AllocationFailure::EngineBudget;
+    failure = hostRefuses ? metal::AllocationFailure::HostPressure
+                          : metal::AllocationFailure::EngineBudget;
     if (deniedReservations_ != std::numeric_limits<uint64_t>::max()) {
       ++deniedReservations_;
     }
@@ -236,7 +217,7 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
   return [this](uint64_t bytes, const std::function<void()> &allocate)
              -> metal::AllocationResult {
     metal::AllocationFailure failure;
-    auto reservation = tryReserve(bytes, &failure);
+    auto reservation = tryReserve(bytes, failure);
     if (!reservation)
       return failure;
     try {

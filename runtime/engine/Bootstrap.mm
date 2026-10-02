@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -289,23 +288,28 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
+    // The plan's fixed bytes already proved the arenas' sum fits.
     const auto &budget = resources->memoryPlan().breakdown();
-    if (budget.sharedDecodeBytes >
-        std::numeric_limits<uint64_t>::max() - budget.sharedPrefillBytes) {
-      throw std::overflow_error(
-          "modelRuntime shared allocation reservation overflows");
-    }
-    const uint64_t modelBytes =
-        budget.sharedPrefillBytes + budget.sharedDecodeBytes;
-    metal::AllocationFailure failure;
-    auto reservation = resources->memoryGovernor().tryReserve(modelBytes, &failure);
-    if (!reservation) {
+    // Admission reports a refusal by its failure alone. One raised while the
+    // runtime allocates keeps its own message, which says what to do.
+    std::string refusal;
+    const metal::AllocationResult arenas =
+        resources->memoryGovernor().allocationAdmission()(
+            budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+              try {
+                modelRuntime = model::createRuntime(resources->modelContext());
+              } catch (const metal::MetalAllocationError &error) {
+                refusal = error.what();
+                throw;
+              }
+            });
+    if (!arenas) {
       throw metal::MetalAllocationError(
-          std::string("unable to reserve model arenas: ") +
-              metal::allocationFailureName(failure), failure);
+          refusal.empty() ? std::string("unable to admit model arenas: ") +
+                                metal::allocationFailureName(arenas.failure)
+                          : refusal,
+          arenas.failure);
     }
-    modelRuntime = model::createRuntime(resources->modelContext());
-    reservation->commit();
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,

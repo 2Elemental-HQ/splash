@@ -294,16 +294,17 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
   connectToGovernor(config, governor);
   require(config.growthPaused && config.serving && !config.growthPaused(),
           "the engine was not connected to the governor");
+  const auto admits = [admit = governor.allocationAdmission()] {
+    return static_cast<bool>(admit(1024, [] {}));
+  };
   // Inside the warning margin the host pauses growth that no request in
   // service needs.
   available = hostReserve + kGiB / 2;
-  require(config.growthPaused() && !governor.tryReserve(1024).has_value(),
-          "the engine did not see the host's pause");
+  require(config.growthPaused() && !admits(), "the engine did not see the host's pause");
   config.serving(true);
-  require(governor.tryReserve(1024).has_value(),
-          "the serving mark did not reach the governor");
+  require(admits(), "the serving mark did not reach the governor");
   config.serving(false);
-  require(!governor.tryReserve(1024).has_value(), "the serving mark was not cleared");
+  require(!admits(), "the serving mark was not cleared");
 }
 
 } // namespace

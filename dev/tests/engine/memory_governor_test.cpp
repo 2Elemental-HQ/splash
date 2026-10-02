@@ -3,6 +3,7 @@
 #include "engine/MemoryPlan.hpp"
 
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -36,6 +37,19 @@ namespace {
 void require(bool value, const std::string &message) {
   if (!value)
     throw std::runtime_error(message);
+}
+
+// Admits bytes through the governor's one admission path, running allocate
+// while they are reserved.
+metal::AllocationResult admit(MemoryGovernor &governor, uint64_t bytes,
+                              const std::function<void()> &allocate = [] {}) {
+  return governor.allocationAdmission()(bytes, allocate);
+}
+
+// Charges bytes to the backend, as an allocation does.
+void allocate(uint64_t bytes) {
+  metal::statistics.allocatedBytes += bytes;
+  metal::statistics.deviceCurrentAllocatedBytes += bytes;
 }
 
 // Available host memory is what macOS can hand out without swapping: free
@@ -140,12 +154,8 @@ uint32_t grantKvPages(MemoryGovernor &governor,
   while (granted < budget.kvCapacityPages) {
     const uint32_t pages = budget.kvExtentPages;
     const uint64_t bytes = uint64_t{pages} * budget.kvPageBytes;
-    auto reservation = governor.tryReserve(bytes);
-    if (!reservation)
+    if (!admit(governor, bytes, [bytes] { allocate(bytes); }))
       break;
-    metal::statistics.allocatedBytes += bytes;
-    metal::statistics.deviceCurrentAllocatedBytes += bytes;
-    reservation->commit();
     granted += pages;
   }
   return granted;
@@ -229,19 +239,18 @@ void testHostRefusalStartsReclaim() {
   std::optional<uint64_t> available = hostReserve + 64 * kGiB;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve,
                           [&available] { return available; });
-  metal::AllocationFailure failure;
-  require(!governor.tryReserve(40 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::EngineBudget,
+  const metal::AllocationResult beyondLimit = admit(governor, 40 * kGiB);
+  require(!beyondLimit && beyondLimit.failure == metal::AllocationFailure::EngineBudget,
           "an engine budget refusal was taken for host pressure");
   // The host refuses the same probe once it has 1.2 GiB of room, and that
   // is the cause reported; a probe beyond the limit holds no host pressure.
   available = hostReserve + kGiB + 200 * kMiB;
-  require(!governor.tryReserve(40 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure &&
+  const metal::AllocationResult shared = admit(governor, 40 * kGiB);
+  require(!shared && shared.failure == metal::AllocationFailure::HostPressure &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "a refusal the host shares was reported as the engine's");
-  require(!governor.tryReserve(stateCell, &failure) &&
-              failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult beyondHost = admit(governor, stateCell);
+  require(!beyondHost && beyondHost.failure == metal::AllocationFailure::HostPressure,
           "a request beyond the host headroom was admitted");
   const MemoryGovernorSnapshot refused = governor.snapshot();
   MemoryPressurePolicy policy;
@@ -253,7 +262,7 @@ void testHostRefusalStartsReclaim() {
           "a request-sized host refusal did not start the paced reclaim");
   // The reclaim reaches the recovery margin, and the request fits.
   *available += directive->targetBytes;
-  require(governor.tryReserve(stateCell).has_value() &&
+  require(static_cast<bool>(admit(governor, stateCell)) &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "the waiting request did not fit after the reclaim");
 }
@@ -269,17 +278,16 @@ void testHostRefusalComesBeforeTheEngineLimit() {
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
   MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
-  metal::AllocationFailure failure;
-  require(!governor.tryReserve(2 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult shared = admit(governor, 2 * kGiB);
+  require(!shared && shared.failure == metal::AllocationFailure::HostPressure,
           "a refusal the host shares was reported as the engine's");
   governor.setServing(true);
-  require(!governor.tryReserve(2 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::EngineBudget,
+  const metal::AllocationResult inService = admit(governor, 2 * kGiB);
+  require(!inService && inService.failure == metal::AllocationFailure::EngineBudget,
           "the host's margins refused a request in service");
   governor.setPressure(MemoryPressure::Critical);
-  require(!governor.tryReserve(2 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult critical = admit(governor, 2 * kGiB);
+  require(!critical && critical.failure == metal::AllocationFailure::HostPressure,
           "critical pressure was reported as the engine's limit");
 }
 
@@ -326,26 +334,27 @@ void testExhaustedReclaimWaivesTheHold() {
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
-  metal::AllocationFailure failure;
-  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult pastMargin = admit(governor, kGiB);
+  require(!pastMargin && pastMargin.failure == metal::AllocationFailure::HostPressure,
           "growth past the warning margin was admitted");
   governor.reclaimed(ReclaimOutcome::Untargeted);
-  require(!governor.tryReserve(100 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+  require(!admit(governor, 100 * kMiB) && !governor.snapshot().hostGrowthAllowed,
           "the host refusal did not hold growth for the recovery margin");
   governor.reclaimed(ReclaimOutcome::Exhausted);
-  require(governor.snapshot().hostGrowthAllowed && governor.tryReserve(100 * kMiB).has_value(),
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
           "growth within the warning margin still waited after reclaim was exhausted");
-  require(!governor.tryReserve(kGiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
+  const metal::AllocationResult waived = admit(governor, kGiB);
+  require(!waived && waived.failure == metal::AllocationFailure::HostPressure &&
               governor.snapshot().pressure == MemoryPressure::Warning &&
-              governor.tryReserve(100 * kMiB).has_value(),
+              admit(governor, 100 * kMiB),
           "a request past the warning margin was admitted or held the others");
   governor.reclaimed(ReclaimOutcome::Pending);
-  require(!governor.tryReserve(100 * kMiB), "the hold did not return with memory to reclaim");
+  require(!admit(governor, 100 * kMiB), "the hold did not return with memory to reclaim");
   governor.reclaimed(ReclaimOutcome::Exhausted);
   available = hostReserve + 3 * kGiB;
   require(governor.snapshot().pressure == MemoryPressure::Normal, "the host did not recover");
   available = hostReserve + kGiB + kGiB / 2;
-  require(!governor.tryReserve(kGiB) && !governor.tryReserve(100 * kMiB),
+  require(!admit(governor, kGiB) && !admit(governor, 100 * kMiB),
           "an earlier episode's exhausted reclaim waived the hold");
 }
 
@@ -362,17 +371,11 @@ void testRequestInServiceGrowsThroughHostPressure() {
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
   MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
-  const auto grow = [&](uint64_t bytes, metal::AllocationFailure *failure = nullptr) {
-    auto reservation = governor.tryReserve(bytes, failure);
-    if (!reservation)
-      return false;
-    metal::statistics.allocatedBytes += bytes;
-    metal::statistics.deviceCurrentAllocatedBytes += bytes;
-    reservation->commit();
-    return true;
+  const auto grow = [&](uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
   };
-  metal::AllocationFailure failure;
-  require(!grow(400 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
+  const metal::AllocationResult idle = grow(400 * kMiB);
+  require(!idle && idle.failure == metal::AllocationFailure::HostPressure &&
               !governor.snapshot().hostGrowthAllowed,
           "growth that nothing in service needs cleared no warning margin");
 
@@ -380,18 +383,23 @@ void testRequestInServiceGrowsThroughHostPressure() {
   require(grow(400 * kMiB) && !governor.snapshot().hostGrowthAllowed,
           "a request in service waited for the warning margin");
   available = hostReserve / 2;
-  require(grow(100 * kMiB), "a request in service waited for the host's reserve");
-  require(!grow(kGiB, &failure) && failure == metal::AllocationFailure::EngineBudget,
+  require(static_cast<bool>(grow(100 * kMiB)),
+          "a request in service waited for the host's reserve");
+  const metal::AllocationResult pastLimit = grow(kGiB);
+  require(!pastLimit && pastLimit.failure == metal::AllocationFailure::EngineBudget,
           "a request in service grew past the engine's limit");
   governor.setPressure(MemoryPressure::Critical);
-  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult critical = grow(100 * kMiB);
+  require(!critical && critical.failure == metal::AllocationFailure::HostPressure,
           "critical pressure admitted a request in service");
   governor.setPressure(MemoryPressure::Normal);
-  require(grow(100 * kMiB), "a request in service stayed refused after critical pressure");
+  require(static_cast<bool>(grow(100 * kMiB)),
+          "a request in service stayed refused after critical pressure");
 
   governor.setServing(false);
   available = hostReserve + kGiB / 2;
-  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+  const metal::AllocationResult afterService = grow(100 * kMiB);
+  require(!afterService && afterService.failure == metal::AllocationFailure::HostPressure,
           "the mark of a request in service outlived it");
 }
 

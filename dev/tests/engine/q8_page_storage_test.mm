@@ -157,17 +157,18 @@ void run(const std::string &metallib) {
         [&fakeHostAvailable] {
             return fakeHostAvailable;
         });
-    auto reservation = bounded.tryReserve(64 * 1024);
-    require(reservation.has_value() &&
-                bounded.snapshot().reservedBytes == 64 * 1024,
-            "memory governor did not reserve exact growth bytes");
-    metal::AllocationFailure failure;
-    require(!bounded.tryReserve(1, &failure).has_value() &&
-                failure == metal::AllocationFailure::EngineBudget &&
-                bounded.snapshot().deniedReservations == 1,
-            "memory governor oversold its hard ceiling");
-    reservation->commit();
     auto admit = bounded.allocationAdmission();
+    // Whether one byte more is admitted.
+    const auto admitsMore = [&admit] { return static_cast<bool>(admit(1, [] {})); };
+    const auto exact = admit(64 * 1024, [&] {
+      require(bounded.snapshot().reservedBytes == 64 * 1024,
+              "memory governor did not reserve exact growth bytes");
+      const auto over = admit(1, [] {});
+      require(!over && over.failure == metal::AllocationFailure::EngineBudget &&
+                  bounded.snapshot().deniedReservations == 1,
+              "memory governor oversold its hard ceiling");
+    });
+    require(static_cast<bool>(exact), "memory governor refused exact growth bytes");
     const auto driverDenied = admit(1024, [] {
       throw metal::MetalAllocationError("injected driver allocation denial");
     });
@@ -200,13 +201,13 @@ void run(const std::string &metallib) {
             "request-sized host refusal lost its cause or ran allocation");
     fakeHostAvailable = hostReserve + 3 * giB;
     bounded.setPressure(MemoryPressure::Critical);
-    require(!bounded.tryReserve(1).has_value(),
+    require(!admitsMore(),
             "critical pressure did not stop new growth");
     bounded.setPressure(MemoryPressure::Normal);
-    require(bounded.tryReserve(1).has_value(),
+    require(admitsMore(),
             "normal pressure did not reopen admission");
     fakeHostAvailable = hostReserve;
-    require(!bounded.tryReserve(1).has_value(),
+    require(!admitsMore(),
             "host reserve did not stop unified-memory growth");
     // Reaching the reserve is a warning that sheds cache in paced passes;
     // only the OS critical verdict drops every evictable entry.
@@ -214,12 +215,12 @@ void run(const std::string &metallib) {
             "reaching the host reserve was treated as critical");
     fakeHostAvailable = hostReserve / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                !bounded.tryReserve(1).has_value(),
+                !admitsMore(),
             "low availability escalated to destructive system pressure");
     fakeHostAvailable = hostReserve + giB / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 !bounded.snapshot().hostGrowthAllowed &&
-                !bounded.tryReserve(1).has_value(),
+                !admitsMore(),
             "low host headroom did not request proactive cache reclaim");
     fakeHostAvailable = hostReserve + 3 * giB / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning,
@@ -228,15 +229,14 @@ void run(const std::string &metallib) {
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
                 bounded.snapshot().hostGrowthAllowed,
             "host recovery did not reopen admission");
-    {
-        auto reservation = bounded.tryReserve(64 * 1024);
-        require(reservation.has_value(), "engine capacity reservation failed");
-        const auto full = bounded.snapshot();
-        require(full.headroomBytes == 0 && full.hostGrowthAllowed,
-                "engine budget exhaustion was confused with host pressure");
-    }
+    const auto full = admit(64 * 1024, [&] {
+      const auto snapshot = bounded.snapshot();
+      require(snapshot.headroomBytes == 0 && snapshot.hostGrowthAllowed,
+              "engine budget exhaustion was confused with host pressure");
+    });
+    require(static_cast<bool>(full), "engine capacity reservation failed");
     fakeHostAvailable.reset();
-    require(!bounded.tryReserve(1).has_value() &&
+    require(!admitsMore() &&
                 !bounded.snapshot().hostMeasurementValid,
             "missing host memory telemetry did not fail closed");
     MemoryPressurePolicy missingPolicy;
@@ -259,7 +259,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
     MemoryPressurePolicy hostPolicy;
     auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
-    require(!bounded.tryReserve(1).has_value() &&
+    require(!admitsMore() &&
                 bounded.snapshot().pressure == MemoryPressure::Warning &&
                 hostDirective && !hostDirective->critical &&
                 hostDirective->targetBytes == giB,
@@ -267,16 +267,16 @@ void run(const std::string &metallib) {
     pressurePages.fileBacked = 3 * giB;
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
     require(bounded.snapshot().hostGrowthAllowed &&
-                bounded.tryReserve(1).has_value() &&
+                admitsMore() &&
                 !hostPolicy.update(bounded.snapshot(), 1000.0, false),
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 bounded.snapshot().hostGrowthAllowed &&
-                bounded.tryReserve(1).has_value(),
+                admitsMore(),
             "system warning blocked growth despite sufficient host headroom");
     fakeHostAvailable = hostReserve + giB / 2;
-    require(!bounded.tryReserve(1).has_value(),
+    require(!admitsMore(),
             "system warning bypassed insufficient host headroom");
     fakeHostAvailable = hostReserve + 3 * giB;
     bounded.setPressure(MemoryPressure::Normal);

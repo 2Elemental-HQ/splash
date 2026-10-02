@@ -390,18 +390,15 @@ void run(const std::string &metallib) {
   // the count is of the admissions granted.
   bool admitNewAllocations = true;
   uint32_t admissions = 0;
-  auto admitState = [&governor, &admitNewAllocations, &admissions](
-                        uint64_t bytes, const std::function<void()> &allocate)
+  auto admitState = [admit = governor.allocationAdmission(), &admitNewAllocations,
+                     &admissions](uint64_t bytes, const std::function<void()> &allocate)
       -> metal::AllocationResult {
     if (!admitNewAllocations)
       return metal::AllocationFailure::EngineBudget;
-    auto reservation = governor.tryReserve(bytes);
-    if (!reservation)
-      return metal::AllocationFailure::EngineBudget;
-    allocate();
-    reservation->commit();
-    ++admissions;
-    return {};
+    const metal::AllocationResult result = admit(bytes, allocate);
+    if (result)
+      ++admissions;
+    return result;
   };
   constexpr kv::Layout kvLayout{16, 4, 256};
   kv::PageStorage pageStorage(backend, governor.allocationAdmission(),
