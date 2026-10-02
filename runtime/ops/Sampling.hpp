@@ -121,7 +121,6 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
-  metal::MetalBuffer nextAnchors;
   metal::MetalBuffer acceptedCounts;
 };
 

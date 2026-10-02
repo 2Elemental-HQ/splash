@@ -229,7 +229,6 @@ struct Runtime::Impl {
     Request *request = nullptr;
     uint32_t retained = 0;
     uint32_t accepted = 0;
-    uint32_t nextAnchor = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
     bool verify = false;
@@ -1432,7 +1431,6 @@ struct Runtime::Impl {
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
          decodeArena->packed(DecodeTensor::OutputTokens, width),
          decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->packed(DecodeTensor::NextAnchor, width),
          decodeArena->packed(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
@@ -1519,16 +1517,14 @@ struct Runtime::Impl {
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
-      laneResult.nextAnchor =
-          *contents<uint32_t>(d(DecodeTensor::NextAnchor), "GPU next anchor");
       if (!laneResult.retained || laneResult.retained > kDecodeRows)
         throw std::runtime_error("target policy produced invalid retention");
       // The retained target tokens end with the next anchor.
       const uint32_t *targetTokens = contents<uint32_t>(
           d(DecodeTensor::OutputTokens), "target output tokens");
       if (laneResult.accepted > kDraftProposalTokens ||
-          laneResult.nextAnchor >= geometry.target.vocabularySize ||
-          targetTokens[laneResult.retained - 1] != laneResult.nextAnchor) {
+          targetTokens[laneResult.retained - 1] >=
+              geometry.target.vocabularySize) {
         throw std::runtime_error(
             "target policy selected an invalid next anchor");
       }

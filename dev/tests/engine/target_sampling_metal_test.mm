@@ -669,7 +669,6 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t)),
       allocate(backend, lanes * sizeof(uint32_t))};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates = static_cast<uint32_t *>(acceptance.candidates.contents());
@@ -772,8 +771,6 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
   const auto *acceptedCounts =
       static_cast<const uint32_t *>(acceptance.acceptedCounts.contents());
-  const auto *anchors =
-      static_cast<const uint32_t *>(acceptance.nextAnchors.contents());
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const std::string label = "speculative lane " + std::to_string(lane) +
                               " sampling mask " + std::to_string(samplingMask);
@@ -785,8 +782,6 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       require(batch.outputTokens()[lane * kRows + position] ==
                   expectedOutput[lane][position],
               label + ": output differs from a sequential decode");
-    require(anchors[lane] == expectedOutput[lane][accepted],
-            label + ": the next anchor differs from a sequential decode");
   }
 }
 
@@ -1317,7 +1312,6 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, kLanes * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t)),
       allocate(backend, kLanes * sizeof(uint32_t))};
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     static_cast<uint32_t *>(
@@ -1367,19 +1361,15 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
         static_cast<void>(backend.submitCommand(accept.dispatches()));
         const auto *retained =
             static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
-        const auto *anchors =
-            static_cast<const uint32_t *>(acceptance.nextAnchors.contents());
         for (uint32_t lane = 0; lane < lanes; ++lane) {
           const uint32_t *output = tokens + lane * kRows;
           if (!policies[lane].excludesStopTokens) {
-            require(retained[lane] == 1 && output[0] == stops[0] &&
-                        anchors[lane] == stops[0],
+            require(retained[lane] == 1 && output[0] == stops[0],
                     "the target did not accept the drafted stop token");
             continue;
           }
-          require(retained[lane] >= 1 && retained[lane] <= kRows &&
-                      !stop(anchors[lane]),
-                  "an excluding lane accepted a stop token");
+          require(retained[lane] >= 1 && retained[lane] <= kRows,
+                  "an excluding lane retained no token");
           for (uint32_t index = 0; index < retained[lane]; ++index)
             require(output[index] < vocabulary && !stop(output[index]),
                     "an excluding lane accepted a stop token");
@@ -1565,7 +1555,6 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t)),
       allocate(backend, lanes * sizeof(uint32_t))};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates =
@@ -1669,7 +1658,6 @@ void overProposedResidual(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, sizeof(uint32_t)),
-      allocate(backend, sizeof(uint32_t)),
       allocate(backend, sizeof(uint32_t))};
   // Token 5 leads with weight 1 and token 6 weighs less than an ulp of it;
   // token 1000 weighs 0.5 and forty tokens from 1200 a hundredth each. The
@@ -1725,7 +1713,7 @@ void overProposedResidual(MetalBackend &backend) {
       return *static_cast<const uint32_t *>(buffer.contents());
     };
     require(value(acceptance.acceptedCounts) == 0 &&
-                value(acceptance.nextAnchors) == batch.outputTokens()[0],
+                value(acceptance.retainedCounts) == 1,
             label + ": acceptance did not take the correction as its anchor");
   }
 }

@@ -289,7 +289,7 @@ void Sampling::addAcceptance(
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.nextAnchors, buffers.acceptedCounts},
+             buffers.acceptedCounts},
             params, {params.lanes, 1, 1}, {1, 1, 1});
 }
 

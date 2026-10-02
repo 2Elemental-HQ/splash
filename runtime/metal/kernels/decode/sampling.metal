@@ -1278,10 +1278,10 @@ inline float sparse_lookup(device const uint *ids,
 }
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
-// cut after the first stop token, and records the count and the next anchor.
+// cut after the first stop token, and records the retained and accepted
+// counts.
 inline void finish_acceptance(device const uint *tokens, uint accepted,
                               AcceptParams params, device uint &retained,
-                              device uint &next_anchor,
                               device uint &accepted_count) {
   accepted_count = accepted;
   retained = min(accepted + 1, params.remaining);
@@ -1291,7 +1291,6 @@ inline void finish_acceptance(device const uint *tokens, uint accepted,
       break;
     }
   }
-  next_anchor = tokens[retained - 1];
 }
 
 // A sampled lane's verify rows carry their draft tokens' target
@@ -1306,7 +1305,6 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device const float *uniforms,
                                 device uint *output_tokens,
                                 device uint &retained,
-                                device uint &next_anchor,
                                 device uint &accepted_count,
                                 AcceptParams params) {
   uint accepted = 0;
@@ -1321,7 +1319,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
     output_tokens[accepted] = token;
     ++accepted;
   }
-  finish_acceptance(output_tokens, accepted, params, retained, next_anchor,
+  finish_acceptance(output_tokens, accepted, params, retained,
                     accepted_count);
 }
 
@@ -1435,7 +1433,6 @@ kernel void verify_input_tokens(
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
-                               device uint &next_anchor,
                                device uint &accepted_count,
                                AcceptParams params) {
   uint accepted = 0;
@@ -1443,7 +1440,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
-  finish_acceptance(target_tokens, accepted, params, retained, next_anchor,
+  finish_acceptance(target_tokens, accepted, params, retained,
                     accepted_count);
 }
 
@@ -1455,9 +1452,8 @@ kernel void decode_accept_dflash(
     device const float *uniforms [[buffer(4)]],
     device uint *target_tokens [[buffer(5)]],
     device uint *retained [[buffer(6)]],
-    device uint *next_anchor [[buffer(7)]],
-    device uint *accepted_count [[buffer(8)]],
-    constant AcceptBatchParams &params [[buffer(9)]],
+    device uint *accepted_count [[buffer(7)]],
+    constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
   if (batch >= params.lanes)
     return;
@@ -1475,10 +1471,9 @@ kernel void decode_accept_dflash(
         draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
         uniforms + batch * 2 * SPLASH_TARGET_VERIFY_ROWS, lane_target,
-        retained[batch], next_anchor[batch], accepted_count[batch],
-        lane_params);
+        retained[batch], accepted_count[batch], lane_params);
   } else {
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
-                       next_anchor[batch], accepted_count[batch], lane_params);
+                       accepted_count[batch], lane_params);
   }
 }
