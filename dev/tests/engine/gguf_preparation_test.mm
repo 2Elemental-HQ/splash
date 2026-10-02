@@ -331,7 +331,6 @@ bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vect
 // per tensor in the layout's padded width, the norms F32 and the GDN output in
 // the GGUF's tiled head order; the head and token table as the GGUF stores them.
 void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &directory) {
-  using namespace model::ggml;
   model::Qwen3_8Layout layout;
   layout.layers = 4;
   layout.hiddenSize = 256;

@@ -128,8 +128,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
             "planner alpha/beta: one 256-row " + model::ggmlTypeName(type) + " tensor of beta then alpha rows (" +
                 g.architecture() + ")" + (result.error ? ": " + *result.error : ""));
     }
-    for (const auto &[beta, alpha] : {std::pair{model::ggml::kIQ4_XS, model::ggml::kQ8_0},
-                                      std::pair{model::ggml::kQ4_K, model::ggml::kF32}}) {
+    for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32}}) {
       writeGguf(path, tensorsWith(beta, alpha), g);
       const std::string betaName = "blk.0.ssm_beta.weight (" + model::ggmlTypeName(beta) + ")";
       const std::string alphaName = "blk.0.ssm_alpha.weight (" + model::ggmlTypeName(alpha) + ")";
@@ -273,7 +272,7 @@ void checkRotation(const std::filesystem::path &directory) {
   };
   const Plan floats = planned(model::ggml::kF32, false);
   check(!floats.error, "planner plans a rotation of F32 alpha/beta" + (floats.error ? ": " + *floats.error : ""));
-  for (uint32_t type : {model::ggml::kQ8_0, model::ggml::kIQ4_XS}) {
+  for (uint32_t type : {kQ8_0, kIQ4_XS}) {
     const std::string gates = model::ggmlTypeName(type) + " alpha/beta";
     const Plan named = planned(type, true);
     check(!named.error, "planner plans a rotation that names " + gates + (named.error ? ": " + *named.error : ""));
