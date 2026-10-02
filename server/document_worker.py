@@ -4,7 +4,6 @@ import atexit
 import ctypes
 import json
 import math
-import os
 import resource
 import subprocess
 import sys
@@ -54,20 +53,16 @@ class _RusageInfo(ctypes.Structure):
     ]
 
 
-if sys.platform == "darwin":
-    _libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    _libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-    _libproc.proc_pid_rusage.restype = ctypes.c_int
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+_libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+_libproc.proc_pid_rusage.restype = ctypes.c_int
 
 
 def _memory_bytes(pid):
-    if sys.platform == "darwin":
-        usage = _RusageInfo()
-        if _libproc.proc_pid_rusage(pid, 2, ctypes.byref(usage)):
-            raise OSError(ctypes.get_errno(), "cannot inspect document worker")
-        return max(usage.resident_size, usage.phys_footprint)
-    pages = int(Path(f"/proc/{pid}/statm").read_text().split()[1])
-    return pages * os.sysconf("SC_PAGE_SIZE")
+    usage = _RusageInfo()
+    if _libproc.proc_pid_rusage(pid, 2, ctypes.byref(usage)):
+        raise OSError(ctypes.get_errno(), "cannot inspect document worker")
+    return max(usage.resident_size, usage.phys_footprint)
 
 
 def _stop(process):
@@ -165,8 +160,6 @@ def main():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
     cpu_seconds = max(1, math.ceil(duration))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-    if sys.platform != "darwin":
-        resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY_BYTES, MAX_MEMORY_BYTES))
     # On macOS RLIMIT_AS aliases the advisory RSS limit. The parent instead
     # measures resident/physical footprint and terminates an over-budget child.
     budget = DocumentBudget(
