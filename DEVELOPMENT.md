@@ -911,7 +911,7 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Tools and structured output generate
 under a grammar, which decides where the output ends, so combining them with
 `ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word (native wire version 7), which rejects undefined bits.
+frame's flags word, which rejects undefined bits.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -1229,13 +1229,14 @@ entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
-Native wire version 6 appends score-token IDs to requests and selected f32 logits
-to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
-in-vocabulary tokens, no images or generation constraints, and a zero output budget.
-It may use the full context window because no generated token needs a reserved
-position. The final prefill chunk runs the target head but no sampling policy or
-DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
-reports zero decode time. Cancelled requests carry no logits.
+Requests carry the score-token IDs and Done events the selected f32 logits; the
+server and the engine must speak the same native wire version. Scoring requires
+2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
+zero output budget. It may use the full context window because no generated
+token needs a reserved position. The final prefill chunk runs the target head
+but no sampling policy or DFlash decode. Successful scoring emits no Tokens
+event, finishes with Stop, and reports zero decode time. Cancelled requests
+carry no logits.
 
 A non-finite logit row is a per-request failure, not an engine fault: a score
 logit, or a token the sampling kernels could only select outside the
@@ -1386,6 +1387,12 @@ Expect about 1.5 hours on an M5 Pro and 2.5 hours on an M3 Max, most of it in
 the three 27B comparisons. A laptop can cap its GPU power during a long
 comparison and so make it inconclusive; rerun `make test-performance-real` for
 that model alone once the Mac has cooled.
+
+When the native wire layout or the status schema changed since the last
+release, bump `kProtocolVersion` (`runtime/engine/Protocol.hpp`) and
+`PROTOCOL_VERSION` (`server/protocol.py`) together: builds between releases
+share a version while its layout changes, and a server refuses an engine of
+another version.
 
 ### Local benchmarks
 
