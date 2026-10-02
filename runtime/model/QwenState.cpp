@@ -186,6 +186,10 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
     operation = file->write(
         std::move(disk), {std::span<const std::byte>(staged)},
         std::move(completion));
+    // Callers check that the file takes writes, and only a failed write of
+    // its own closes it: none is in flight beside this one.
+    if (!operation)
+      throw std::logic_error("the state file closed with no state write in flight");
     return std::make_unique<FileOffload>(operation, std::move(result), staging);
   } catch (...) {
     if (operation)

@@ -130,7 +130,9 @@ public:
   [[nodiscard]] bool idle() const;
   // The spans total at most one slot and stay valid until the operation is
   // ready. A write stores them in order from the start of the slot and zeros
-  // the rest; a read fills them from the start of the slot.
+  // the rest; a read fills them from the start of the slot. A write is null
+  // once the file accepts no further writes, as acquire() is null when the
+  // quota is full.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);

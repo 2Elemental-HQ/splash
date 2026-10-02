@@ -265,7 +265,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
   if (!slot || slot->backing_ != backing_ || totalBytes(source) > backing_->slotBytes)
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
-    throw std::logic_error("slot file no longer takes writes");
+    return nullptr;
   return submit([slot, source = std::move(source)](std::span<std::byte> buffer,
                                                    const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;

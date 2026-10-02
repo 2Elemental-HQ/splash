@@ -4,6 +4,8 @@
 
 #include "engine/MemoryGovernor.hpp"
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -248,6 +250,46 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   }
 }
 
+// A write that fails closes the file, and the tier refuses every demotion
+// from then on without throwing. A file-size limit at the file's length
+// fails the next slot's write with EFBIG, as a full disk would. The tier
+// refuses here in canDemote(): its refusal of a null write, for a file
+// that closes between canDemote() and the write, has no test of its own,
+// only slot-file's null write from a closed file.
+void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
+                               kv::Format format) {
+  const kv::Layout layout{2, 2, 256, format};
+  kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
+                        layout.minimumExtentPages(), layout.minimumExtentPages());
+  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  auto file = std::make_shared<SlotFile>(slotBytes, 4 * slotBytes);
+  KvPageTier tier(pages, file);
+  auto first = tier.acquireSlot();
+  auto stored = tier.demote(0, first, {});
+  require(stored != nullptr, "the first demotion was refused");
+  runUntilReady(tier, *stored);
+  require(stored->finish(), "the first demotion failed");
+
+  // The file is one slot long now, and that slot stays taken. The limit
+  // holds only until the failing write has landed, so nothing else of the
+  // process meets it.
+  rlimit original{};
+  require(getrlimit(RLIMIT_FSIZE, &original) == 0, "file limit unavailable");
+  rlimit limited = original;
+  limited.rlim_cur = slotBytes;
+  require(setrlimit(RLIMIT_FSIZE, &limited) == 0, "file limit could not be set");
+  auto failing = tier.demote(1, tier.acquireSlot(), {});
+  require(failing != nullptr, "a demotion into a new slot was refused");
+  runUntilReady(tier, *failing);
+  require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
+  require(!failing->finish(), "a write past the file limit succeeded");
+  require(!tier.writable() && !tier.canDemote() &&
+              tier.demote(2, tier.acquireSlot(), {}) == nullptr,
+          "a closed file took a demotion");
+  std::cout << "closed file tests passed\n";
+}
+
 // Kernels and the worker share an extent. Kernels write a page through its
 // address, and the worker writes those bytes to disk. Then one command keeps
 // writing and checking the pages around it while the worker reads the page
@@ -397,6 +439,7 @@ void run(const std::string &metallib) {
     roundTrip(backend, governor, kv::Layout{16, 4, 256, format}); // Qwen3.8-27B
     limits(backend, governor, format);
     allocationFailure(backend, governor, format);
+    closedFileRefusesDemotion(backend, governor, format);
     besideACommand(backend, governor, format);
     teardown(backend, governor, format);
   }

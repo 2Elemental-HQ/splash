@@ -50,9 +50,13 @@ static void testFailedWriteStopsWriting() {
       require(file.writtenBytes() == size + size / 2 && file.readBytes() == 0,
               "IO counters lost a partial write or counted an invalid read");
       require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
-      require(!file.writable() &&
-                  throws<std::logic_error>([&] { static_cast<void>(file.write(partial, {source}, {})); }),
+      require(!file.writable() && file.write(partial, {source}, {}) == nullptr,
               "storage failure did not stop further writes");
+      // A closed file still rejects a write that does not fit its slots.
+      std::vector<std::byte> oversized(size + 1);
+      require(throws<std::invalid_argument>(
+                  [&] { static_cast<void>(file.write(partial, {oversized}, {})); }),
+              "a closed file absorbed a write of more than a slot");
       require(file.read(complete, {output}, {})->wait() && output.front() == std::byte{1},
               "complete slot became unreadable after a storage failure");
       require(file.readBytes() == size, "successful read bytes were not counted");
