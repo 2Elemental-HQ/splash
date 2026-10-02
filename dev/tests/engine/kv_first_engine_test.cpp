@@ -2288,6 +2288,47 @@ void testEngineLimitBindsThroughTheHostPause() {
           "a lone request at the engine's limit waited for the host instead of failing");
 }
 
+// While the host refuses growth, a lane in service short of a page takes
+// cached KV, not the cached states, whose buffers would give it no page: the
+// checkpoint and the ordinary state stay.
+void testPausedPageShortageKeepsCachedStates() {
+  test::TestKvStorage storage(64, 4096, 1);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  // Cached: a checkpoint, an ordinary state below it, and KV below both.
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
+  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128));
+  resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
+  resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>());
+  resources.endRequest(900);
+  // The decode needs one more page, at its 57th token.
+  auto running = request(1, std::vector<uint32_t>(33, 1));
+  running.maxNewTokens = 30;
+  engine.submit(std::move(running));
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); },
+            "the request did not decode");
+  host.paused = true;
+  const StateCacheSnapshot before = resources.snapshot().stateCache;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  const StateCacheSnapshot after = resources.snapshot().stateCache;
+  require(events.completedCount == 1 && engine.snapshot().resourceSuspensions == 0 &&
+              host.reusableAtGrowth.empty(),
+          "the lane did not take a cached page under the pause");
+  require(after.entries == before.entries && after.evictions == before.evictions &&
+              after.checkpointEvictions == 0,
+          "a page shortage under the pause evicted cached states");
+}
+
 // A lone request short of pages under host pressure takes idle cached pages
 // of allocated extents instead of being suspended and replaying its prefix
 // later. Reuse only happens when it can cover the shortfall.
@@ -7644,6 +7685,7 @@ int main() {
     testSuspendedRequestWaitsForTheHostBesideOneInService();
     testEngineLimitBindsThroughTheHostPause();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
+    testPausedPageShortageKeepsCachedStates();
     testSingletonHostPressureWaitRecoversOrTerminates();
     testAdmissionWaitsOutEarlierLanes();
     testLaterLanesDoNotExtendAResourceWait();

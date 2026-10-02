@@ -316,8 +316,8 @@ uint64_t Cache::evictAll() {
   constexpr uint32_t every = std::numeric_limits<uint32_t>::max();
   uint64_t released = pool_.reclaimEmptyExtents(false, every);
   // Everything unpinned goes before anything moves.
-  for (CacheReclaimResult evicted = evictOne(ReclaimClass::InUse, false);
-       evicted.madeProgress; evicted = evictOne(ReclaimClass::InUse, false))
+  for (CacheReclaimResult evicted = evictOne(ReclaimClass::InUse, false, false);
+       evicted.madeProgress; evicted = evictOne(ReclaimClass::InUse, false, false))
     released += evicted.reclaimedBytes;
   do {
     released += pool_.reclaimEmptyExtents(false, every);
@@ -333,25 +333,27 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
         released.madeProgress)
       return released;
   }
-  CacheReclaimResult evicted = evictOne(upTo, keepResumePoint);
+  CacheReclaimResult evicted =
+      evictOne(upTo, keepResumePoint, mode == CacheReclaimMode::ReusePages);
   if (evicted.madeProgress && release)
     evicted.reclaimedBytes += pool_.reclaimEmptyExtents(keepRunway, 1);
   return evicted;
 }
 
-CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint) {
-  // Disposable checkpoints go first; one whose write must wait for the one
-  // in flight stays and holds back nothing else.
-  if (const auto oldest = states_.checkpointCandidate(keepResumePoint)) {
+CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool pagesOnly) {
+  // Disposable checkpoints go first, except in a page scan, to which their
+  // buffers give no page; one whose write must wait for the one in flight
+  // stays and holds back nothing else.
+  if (const auto oldest = states_.checkpointCandidate(keepResumePoint); oldest && !pagesOnly) {
     if (const StateEviction eviction = states_.reclaim(oldest->id, StateCache::Unwritten::Wait);
         eviction.evicted)
       return {true, eviction.reclaimedBytes};
   }
 
-  // Then oldest first across ordinary states and KV; the next pass takes
-  // what waited. States in use and the KV they need follow in a pass of
-  // their own, up to InUse and once no transfer in flight can return what is
-  // needed first.
+  // Then oldest first across ordinary states and KV, or the leaves alone
+  // in a page scan; the next pass takes what waited. States in use and the
+  // KV they need follow in a pass of their own, up to InUse and once no
+  // transfer in flight can return what is needed first.
   for (const bool inUse : {false, true}) {
     if (inUse && upTo == ReclaimClass::Ordinary)
       break;
@@ -360,7 +362,8 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint) {
     if (const auto victim = reclaimOldest({.inUse = inUse,
                                            .keepResumePoint = keepResumePoint,
                                            .unwritten = StateCache::Unwritten::Wait,
-                                           .timing = ReclaimTiming::CanWait}))
+                                           .timing = ReclaimTiming::CanWait,
+                                           .pagesOnly = pagesOnly}))
       return {true, victim->reclaimedBytes};
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
@@ -368,25 +371,28 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint) {
   return {false, 0, transfersInFlight()};
 }
 
-CacheReclaimResult Cache::reclaimForPages(uint32_t pages, ReclaimClass upTo) {
+CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
+                                          ReclaimClass upTo) {
   CacheReclaimResult total;
   while (pool_.freePageCount() + pendingPages() < pages) {
-    const CacheReclaimResult step = reclaimOne(CacheReclaimMode::KeepExtents, upTo);
+    const CacheReclaimResult step = reclaimOne(mode, upTo);
     if (!step.madeProgress) {
       total.pending = step.pending;
       break;
     }
     total.madeProgress = true;
     total.reclaimedBytes += step.reclaimedBytes;
-    if (step.reclaimedBytes)
+    // A state's memory may let the retry grow the pool. While the host
+    // refuses growth it gives no page, and the leaf the state sat on goes
+    // next.
+    if (step.reclaimedBytes && mode == CacheReclaimMode::KeepExtents)
       break;
   }
   return total;
 }
 
 uint32_t Cache::reusablePages(ReclaimClass upTo) const {
-  const KvPoolSnapshot pool = pool_.snapshot();
-  const uint32_t unheld = pool.pagesAllocated - pool.pagesActive;
+  const uint32_t unheld = pool_.reusablePages();
   if (upTo == ReclaimClass::InUse)
     return unheld;
   return unheld - kv_.idlePagesOnChains(states_.usedStates());
@@ -400,9 +406,10 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
       if (reclaimKvLeaf(leaf->id, scan.timing) == LeafReclaim::Started)
         return Victim{true, 0};
   }
-  std::optional<CacheEvictionCandidate> state =
-      scan.inUse ? states_.inUseCandidate() : states_.ordinaryCandidate(scan.keepResumePoint);
-  std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0, scan.inUse);
+  std::optional<CacheEvictionCandidate> state;
+  if (!scan.pagesOnly)
+    state = scan.inUse ? states_.inUseCandidate() : states_.ordinaryCandidate(scan.keepResumePoint);
+  std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0, scan.inUse, scan.pagesOnly);
   ReclaimTiming timing = scan.timing;
   while (state || kv) {
     if (state && (!kv || state->lastUsed <= kv->lastUsed)) {
@@ -410,6 +417,17 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
           eviction.evicted)
         return Victim{false, eviction.reclaimedBytes};
       state.reset();
+      continue;
+    }
+    // A page scan's leaf gives up its state in RAM first. The resume point
+    // the scan keeps stays, and the leaf under it.
+    if (states_.stateResident(kv->id)) {
+      if (!scan.keepResumePoint || kv->id != states_.resumePoint()) {
+        if (const StateEviction eviction = states_.reclaim(kv->id, scan.unwritten);
+            eviction.evicted)
+          return Victim{false, eviction.reclaimedBytes};
+      }
+      kv = oldestKvLeaf(kv->id, scan.inUse, true);
       continue;
     }
     switch (reclaimKvLeaf(kv->id, timing)) {
@@ -421,7 +439,7 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
       timing = ReclaimTiming::Immediate;
       [[fallthrough]];
     case LeafReclaim::Impossible:
-      kv = oldestKvLeaf(kv->id, scan.inUse);
+      kv = oldestKvLeaf(kv->id, scan.inUse, scan.pagesOnly);
       break;
     }
   }
@@ -454,7 +472,8 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
     while (const auto victim = reclaimOldest({.inUse = false,
                                               .keepResumePoint = false,
                                               .unwritten = unwritten,
-                                              .timing = ReclaimTiming::Immediate})) {
+                                              .timing = ReclaimTiming::Immediate,
+                                              .pagesOnly = false})) {
       if (!victim->kv)
         return {true};
       if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
@@ -491,10 +510,12 @@ std::optional<CacheEvictionCandidate> Cache::oldestDeadKvLeaf(uint64_t after) co
   return std::nullopt;
 }
 
-std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after, bool inUse) const {
+std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after, bool inUse,
+                                                          bool withRamState) const {
   while (auto candidate = kv_.evictionCandidate(after)) {
     after = candidate->id;
-    if (!states_.stateResident(candidate->id) && kvNeededByStateInUse(candidate->id) == inUse)
+    if ((withRamState || !states_.stateResident(candidate->id)) &&
+        kvNeededByStateInUse(candidate->id) == inUse)
       return candidate;
   }
   return std::nullopt;
@@ -502,8 +523,9 @@ std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after, bool i
 
 Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
   // No state in RAM sits on the leaf (oldestKvLeaf): one went first, in the
-  // order every victim goes in. A state already on disk costs nothing and
-  // stays while the leaf has a disk copy.
+  // order every victim goes in, or just before its leaf in a page scan. A
+  // state already on disk costs nothing and stays while the leaf has a disk
+  // copy.
   if (kv_.slot(block)) {
     kv_.dropPage(block);
     return LeafReclaim::Started;

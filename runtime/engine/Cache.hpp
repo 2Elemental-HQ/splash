@@ -127,7 +127,13 @@ struct CacheReclaimResult final {
   bool pending = false;
 };
 
-enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
+// What a reclaim step does with memory. KeepExtents: extents stay
+// allocated, and the pages a victim frees are reused. ReleaseExtents: free
+// pages return as extents first, and an extent a victim empties is
+// released. ReusePages, while the host refuses growth: extents stay, and
+// only what gives pages goes, KV leaves, and a state only where it sits on
+// the leaf that goes next; its buffers would give no page otherwise.
+enum class CacheReclaimMode { KeepExtents, ReleaseExtents, ReusePages };
 
 // The highest class a reclaim step may take (the class rule). Ordinary:
 // checkpoints, ordinary states and KV, for growth that can wait or yield
@@ -162,8 +168,9 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
 // A state in RAM always sits on a resident KV block: reclaim takes such a
-// block's state before its page (oldestKvLeaf skips it), and endRequest and
-// pollTransfers leave such a block its page.
+// block's state before its page (oldestKvLeaf skips it, and a page scan
+// takes the state a step before the leaf), and endRequest and pollTransfers
+// leave such a block its page.
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -290,18 +297,22 @@ public:
   // emptying its extent, and the extent a step empties may be the runway
   // it keeps. The step takes nothing of a class above upTo: with Ordinary,
   // once only what is in use is left, it makes no progress, and reports
-  // pending while a transfer is in flight.
+  // pending while a transfer is in flight. With ReusePages no checkpoint
+  // goes, and of each class the leaves go in their own oldest-first order;
+  // keepResumePoint (reclaimCache) keeps the leaf under the resume point too.
   [[nodiscard]] CacheReclaimResult reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
                                               bool keepResumePoint = false,
                                               bool keepRunway = false);
   // The reclaim step for a KV admission the pool denied: evicts in
-  // reclaimOne(KeepExtents, upTo)'s order until the free pages and the pages
-  // whose demotion is in flight cover `pages` (the admission's
-  // additionalPages), until an evicted state has returned memory (the retry
+  // reclaimOne(mode, upTo)'s order, mode being KeepExtents, or ReusePages
+  // while the host refuses growth, until the free pages and the pages whose
+  // demotion is in flight cover `pages` (the admission's additionalPages),
+  // until, with KeepExtents, an evicted state has returned memory (the retry
   // may then grow the pool), or until nothing more of the class can go; one
   // step instead of a retry per page.
-  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, ReclaimClass upTo);
-  // The most pages reclaimForPages(pages, upTo) can leave free: every
+  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
+                                                   ReclaimClass upTo);
+  // The most pages reclaimForPages(pages, mode, upTo) can leave free: every
   // allocated page no request holds, but with Ordinary not the idle KV that
   // states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
@@ -405,17 +416,20 @@ private:
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
   // One eviction: checkpoints first, then the ordinary class's
-  // reclaimOldest, then, up to InUse, that of what is in use.
-  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint);
+  // reclaimOldest, then, up to InUse, that of what is in use. pagesOnly
+  // (CacheReclaimMode::ReusePages) skips the checkpoints and scans for pages.
+  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint,
+                                            bool pagesOnly);
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
-  // state whose write cannot start now, and how long the caller can wait
-  // for KV memory.
+  // state whose write cannot start now, how long the caller can wait for KV
+  // memory, and whether only what gives pages goes.
   struct VictimScan final {
     bool inUse;
     bool keepResumePoint;
     StateCache::Unwritten unwritten;
     ReclaimTiming timing;
+    bool pagesOnly;
   };
   // Gives up one victim of the scan's class. The ordinary class first gives
   // the oldest KV leaf no state restores through (oldestDeadKvLeaf). Then
@@ -423,16 +437,20 @@ private:
   // `unwritten` says (StateCache::reclaim), a KV leaf as the timing allows
   // (reclaimKvLeaf). One that stays leaves the other kind to give, and once
   // a demotion has to wait for the tier, no other is started: leaves that
-  // need one stay. Nothing once all stay.
+  // need one stay. A page scan (pagesOnly) takes the class's leaves alone,
+  // in their own order, and a state only where it sits in RAM on the leaf
+  // that goes next: that state goes, the leaf on a later step; a resume
+  // point it keeps stays with its leaf. Nothing once all stay.
   [[nodiscard]] std::optional<Victim> reclaimOldest(const VictimScan &scan);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page
   // with no IO.
   [[nodiscard]] std::optional<CacheEvictionCandidate> oldestDeadKvLeaf(uint64_t after) const;
-  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM,
-  // and whose KV a state in use needs exactly when inUse.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after,
-                                                                   bool inUse) const;
+  // Oldest resident KV leaf after `after` whose KV a state in use needs
+  // exactly when inUse, and whose state, if any, is not in RAM unless
+  // withRamState.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  oldestKvLeaf(uint64_t after, bool inUse, bool withRamState) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier

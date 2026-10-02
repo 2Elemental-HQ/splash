@@ -803,7 +803,9 @@ holding admission closed runs from when its wait began. Memory transitions
 also appear in the console. When macOS runs short of memory, growth that no
 request in service needs pauses and the cache gives memory back, a paced pass at
 a time, down to one lane's state buffers and one KV extent. A request in service
-keeps growing within `--max-memory`, first into cached pages no request holds.
+keeps growing within `--max-memory`, first into cached pages no request holds:
+it takes cached KV, and a cached state only where it sits on the KV that goes
+next, since a state's buffers give it no page.
 A new request waits while another is in service unless it can start from what
 the engine already holds, and with none in service it starts. A request whose
 start was refused memory, under host pressure or at `--max-memory`, holds back

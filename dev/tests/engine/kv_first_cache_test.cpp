@@ -117,7 +117,8 @@ TokenAdmission admitLikeEngine(engine::Cache &cache,
   TokenAdmission admission = attempt();
   while (admission.failure == TokenAdmissionFailure::Denied) {
     const CacheReclaimResult step =
-        cache.reclaimForPages(admission.additionalPages, ReclaimClass::InUse);
+        cache.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents,
+                              ReclaimClass::InUse);
     if (!step.madeProgress) {
       if (step.pending)
         admission.failure = TokenAdmissionFailure::Pending;
@@ -2407,7 +2408,8 @@ void testReclaimForPagesCoversTheShortfall() {
     }
     require(pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8,
             "fixture geometry changed");
-    const CacheReclaimResult reclaimed = cache.reclaimForPages(3, ReclaimClass::InUse);
+    const CacheReclaimResult reclaimed =
+        cache.reclaimForPages(3, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
     if (withState) {
       require(reclaimed.madeProgress && reclaimed.reclaimedBytes > 0 &&
                   pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8 &&
@@ -3819,6 +3821,57 @@ void testInUsePublicationTakesNoKvWhenNoExtentCanEmpty() {
   cache.endRequest(3);
 }
 
+// While the host refuses growth only what gives pages goes: KV leaves in
+// their own oldest-first order, never a checkpoint or a state older than
+// every leaf, and a state only where it sits on the leaf that goes next,
+// which then goes on the next step. A scan that keeps the resume point
+// passes over it and its leaf.
+void testPageReuseTakesKvBeforeStates() {
+  constexpr auto reuse = CacheReclaimMode::ReusePages;
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  // Two chains whose leaves hold states only the disk holds, so neither is
+  // dead KV.
+  std::vector<std::vector<uint32_t>> prompts;
+  std::vector<std::vector<uint64_t>> chains;
+  for (uint64_t id = 1; id <= 2; ++id) {
+    auto [prompt, blocks] = cacheChain(cache, id, 2);
+    cache.publishCompositeState(blocks[1], std::make_shared<TieredState>(control));
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
+            "a leaf's state was not written");
+    prompts.push_back(std::move(prompt));
+    chains.push_back(std::move(blocks));
+  }
+  // An ordinary state and a checkpoint on the interior blocks, older than
+  // both leaves, which the lookups refresh.
+  const uint64_t ordinary = chains[0][0];
+  const uint64_t checkpoint = chains[1][0];
+  cache.publishCompositeState(ordinary, std::make_shared<TestState>(100));
+  cache.publishCompositeState(checkpoint, std::make_shared<TestState>(100), true);
+  for (const auto &prompt : prompts)
+    static_cast<void>(cache.lookup(prompt));
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              cache.snapshot().kvCache.blocks == 3 && cache.stateResident(ordinary) &&
+              cache.stateResident(checkpoint) &&
+              cache.snapshot().stateCache.checkpointEvictions == 0,
+          "page reuse took a state before a KV leaf");
+  // The first chain's interior block is now its oldest leaf, under the
+  // ordinary state, the resume point.
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse, true).madeProgress &&
+              cache.stateResident(ordinary) && cache.stateResident(checkpoint) &&
+              cache.snapshot().kvCache.blocks == 2,
+          "page reuse that keeps the resume point did not take the next leaf");
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              !cache.stateResident(ordinary) && cache.snapshot().kvCache.blocks == 2,
+          "page reuse did not take the state on the leaf that goes next");
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              cache.snapshot().kvCache.blocks == 1 && cache.stateResident(checkpoint),
+          "page reuse did not take the leaf its state left");
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -3849,6 +3902,7 @@ int main() {
     testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
     testLargeSharedDiskRestore();
     testReclaimForPagesCoversTheShortfall();
+    testPageReuseTakesKvBeforeStates();
     testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();

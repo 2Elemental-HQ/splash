@@ -202,6 +202,10 @@ public:
     return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() +
                                  (withInUse ? inUse_.size() : 0));
   }
+  // The resume point a reclaim may keep (keepResumePoint): the newest
+  // unpinned ordinary state in RAM, else the newest such checkpoint; 0
+  // without either.
+  [[nodiscard]] uint64_t resumePoint() const noexcept;
   // Oldest unpinned checkpoint in RAM, the first class a reclaim frees.
   // keepResumePoint withholds the resume point when it is a checkpoint: the
   // newest one, while no ordinary state is in RAM.
@@ -264,7 +268,6 @@ private:
     std::unique_ptr<StateOffload> transfer;
   };
 
-  [[nodiscard]] uint64_t resumePoint() const noexcept;
   // The order's oldest entry, unless keepResumePoint withholds it.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept;

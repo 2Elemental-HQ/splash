@@ -1328,7 +1328,8 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo) {
 CacheReclaimResult Engine::reclaimForKv(uint32_t pages, ReclaimClass upTo) {
   if (reclaimIdleState(false))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages, upTo);
+  const CacheReclaimResult reclaimed =
+      cache_.reclaimForPages(pages, CacheReclaimMode::KeepExtents, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1366,11 +1367,13 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
 // the shortfall: never those a request holds, nor, for a start a resident
 // lane holds back, the idle KV that states in use restore through
 // (Cache::reusablePages). Otherwise it survives for later hits, and the
-// request grows if it is in service and waits if it is not. A reclaim that
-// must wait for the transfer in flight makes the request wait with it, as it
-// does without the pause. Idle model state goes first, but not the pooled
-// buffers the next lane starts from: they would not let this request grow,
-// and the paced pass keeps them for the next one.
+// request grows if it is in service and waits if it is not. Only KV goes: a
+// state's buffers give no page while the host refuses growth, unless the
+// state sits on the leaf that goes next (CacheReclaimMode::ReusePages). A
+// reclaim that must wait for the transfer in flight makes the request wait
+// with it, as it does without the pause. Idle model state goes first, but
+// not the pooled buffers the next lane starts from: they would not let this
+// request grow, and the paced pass keeps them for the next one.
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
                                                        ReclaimClass upTo) {
   if (reclaimIdleState(true))
@@ -1378,7 +1381,7 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
   if (cache_.reusablePages(upTo) < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimForPages(admission.additionalPages, upTo);
+      cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::ReusePages, upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;
