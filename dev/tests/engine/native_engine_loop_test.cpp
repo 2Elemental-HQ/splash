@@ -462,7 +462,7 @@ void testRequestFlagsReachTheModel() {
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
-    input.flags = id == 2 ? protocol::RequestIgnoreEndOfSequence : 0;
+    input.flags = id == 2 ? RequestIgnoreEndOfSequence : 0;
     auto encoded = protocol::serializeMessage(protocol::Message{input});
     require(encoded && loop.receive(*encoded.value), "flagged request wire failed");
     runUntilIdle(loop);

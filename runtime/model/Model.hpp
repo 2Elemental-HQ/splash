@@ -31,11 +31,11 @@ enum class DecodeStage : uint8_t {
 
 enum class ConstraintMode : uint8_t { None, TokenMask };
 
-// Request options, one bit each, as the native protocol's request flags carry
-// them.
+// Request options, one bit each, as the native request frame's flags word
+// carries them; a request with any other bit set is a request error.
 enum RequestFlag : uint32_t {
   // Never select the model's stop tokens, so generation runs to its output
-  // limit. Only unconstrained generation carries it.
+  // limit. Only unconstrained generation can carry it.
   RequestIgnoreEndOfSequence = 1U << 0,
 };
 

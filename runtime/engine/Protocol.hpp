@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/Model.hpp"
 #include "ops/Vision.hpp"
 
 #include <array>
@@ -140,16 +141,6 @@ enum class ConstraintMode : uint8_t {
   None = 0,
   TokenMask = 1,
 };
-
-// Request options, one bit each; a request with any other bit set is a
-// request error.
-enum RequestFlag : uint32_t {
-  // Never select the model's stop tokens, so generation runs to its output
-  // limit. Only unconstrained generation can carry it.
-  RequestIgnoreEndOfSequence = 1U << 0,
-};
-
-inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 
 // The defaults are greedy selection with nothing changing the logits, which
 // score requests require.

@@ -18,6 +18,7 @@
 namespace {
 
 using namespace splash::protocol;
+using splash::RequestIgnoreEndOfSequence;
 
 int failures = 0;
 

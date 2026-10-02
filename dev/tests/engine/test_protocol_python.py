@@ -79,6 +79,7 @@ CPP_GOLDEN_SOURCE = r"""
 #include <iostream>
 
 using namespace splash::protocol;
+using splash::RequestIgnoreEndOfSequence;
 
 void show(const Message &message) {
     auto result = serializeMessage(message);

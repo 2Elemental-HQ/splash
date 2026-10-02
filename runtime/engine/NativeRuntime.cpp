@@ -18,10 +18,6 @@ static_assert(protocol::kMaximumScoreOptions ==
 static_assert(protocol::kMinimumScoreOptions ==
                   model::ExecutionLimits::minimumScoreOptions,
               "native protocol and model score option bounds must match");
-static_assert(uint32_t{protocol::RequestIgnoreEndOfSequence} ==
-                      uint32_t{RequestIgnoreEndOfSequence} &&
-                  protocol::kRequestFlagBits == kRequestFlagBits,
-              "native protocol and model request flags must match");
 
 RequestPriority mapPriority(protocol::RequestPriority priority) {
   switch (priority) {
