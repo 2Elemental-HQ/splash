@@ -43,8 +43,23 @@ def _forbidden(message):
     return APIError(403, message, "forbidden")
 
 
+class OriginRefused(APIError):
+    """A request from a page of an origin --allowed-origin does not admit."""
+
+    def __init__(self, origin):
+        # Name the fix for the operator.
+        super().__init__(
+            403,
+            f"Origin {origin} is not allowed; restart the server with "
+            f"--allowed-origin {origin} to accept it",
+            "forbidden",
+        )
+        self.origin = origin
+
+
 def validate_headers(headers, allowed_hosts, allowed_origins):
-    """Refuses a request whose Host or Origin the server does not serve.
+    """Refuses a request whose Host or Origin the server does not serve, with
+    OriginRefused for a well-formed Origin that no --allowed-origin admits.
     Returns what its response owes a browser in Access-Control-Allow-Origin:
     the origin of a page elsewhere that --allowed-origin admits, or None."""
     hosts = headers.get_all("Host", [])
@@ -80,9 +95,6 @@ def validate_headers(headers, allowed_hosts, allowed_origins):
     if origin not in allowed_origins:
         # A browser sends Origin with what a page asks of another origin. Only
         # the origins --allowed-origin names may, which keeps the pages of
-        # other sites out. Name the fix for the operator.
-        raise _forbidden(
-            f"Origin {origins[0]} is not allowed; restart the server with "
-            f"--allowed-origin {origins[0]} to accept it"
-        )
+        # other sites out.
+        raise OriginRefused(origins[0])
     return origins[0]

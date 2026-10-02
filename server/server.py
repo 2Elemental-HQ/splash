@@ -9,6 +9,7 @@ import queue
 import re
 import secrets
 import select
+import shlex
 import signal
 import socket
 import sys
@@ -47,7 +48,12 @@ if __package__:
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend, validate_served_model_name
-    from .http_security import authenticate, validate_api_key, validate_headers
+    from .http_security import (
+        OriginRefused,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
@@ -91,7 +97,12 @@ else:
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
     from frontend import Frontend, validate_served_model_name
-    from http_security import authenticate, validate_api_key, validate_headers
+    from http_security import (
+        OriginRefused,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
@@ -286,6 +297,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if not public:
                 authenticate(self.headers, self.server.api_key)
         except APIError as error:
+            if isinstance(error, OriginRefused):
+                self.server.refused_origins.report(error.origin)
             self.close_connection = True
             self._safe_error(
                 error, self.path.partition("?")[0].startswith("/v1/messages"), log=False
@@ -2080,6 +2093,38 @@ class RequestBodyReservation:
             weakref.finalize(job, self.release)
 
 
+class RefusedOriginLog:
+    """Prints each origin the server refuses, once. Its browser hides the 403
+    from the page, which sees a network error, so the operator learns here
+    which --allowed-origin would admit it. Any client can send any origin, so
+    past LIMIT origins no more are printed, and the flag value is quoted for a
+    shell."""
+
+    LIMIT = 32
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # The origins printed, and the first one past LIMIT.
+        self.origins = set()
+
+    def report(self, origin):
+        # Printing under the lock keeps the closing line last.
+        with self.lock:
+            if origin in self.origins or len(self.origins) > self.LIMIT:
+                return
+            self.origins.add(origin)
+            if len(self.origins) > self.LIMIT:
+                print_status("Refused · further Origins are not logged", error=True)
+                return
+            # Visible ASCII, as parse_origin admits, but of any length.
+            shown = origin[:256]
+            print_status(
+                f"Refused · Origin {shown} · restart with --allowed-origin "
+                f"{shlex.quote(shown)} to accept it",
+                error=True,
+            )
+
+
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -2130,6 +2175,7 @@ class FrontendServer(ThreadingHTTPServer):
         }
         # As parse_allowed_origin returns them.
         self.allowed_origins = frozenset(allowed_origins)
+        self.refused_origins = RefusedOriginLog()
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)

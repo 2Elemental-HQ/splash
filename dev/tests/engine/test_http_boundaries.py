@@ -81,6 +81,7 @@ class HttpBoundaryTests(unittest.TestCase):
             ),
             ("localhost:8000", "tauri://localhost", elsewhere("tauri://localhost")),
             ("localhost:8000", "null", "invalid Origin header"),
+            ("localhost:8000", "tauri://*", "invalid Origin header"),
             ("localhost:8000", "http://user@localhost:8000", "invalid Origin header"),
             ("localhost:8000", "http://localhost:8000/path", "invalid Origin header"),
             ("localhost:8000", "http://localhost:99999", "invalid Origin header"),
@@ -103,6 +104,12 @@ class HttpBoundaryTests(unittest.TestCase):
                     (error.status, error.code, error.message),
                     (403, "forbidden", rejection),
                 )
+                # Only a well-formed origin that is not admitted is refused
+                # by name, for the server to print.
+                refused = rejection == elsewhere(origin)
+                self.assertIs(isinstance(error, http_security.OriginRefused), refused)
+                if refused:
+                    self.assertEqual(error.origin, origin)
         for name in ("Host", "Origin"):
             headers = Message()
             headers["Host"] = "localhost"
@@ -165,6 +172,19 @@ class HttpBoundaryTests(unittest.TestCase):
             with (
                 self.subTest(value=value),
                 self.assertRaisesRegex(ValueError, "expected a scheme and a host"),
+            ):
+                origins.parse_allowed_origin(value)
+        # Origins match exactly: a pattern, which would match nothing, is refused.
+        for value in (
+            "tauri://*",
+            "app://*",
+            "http://*.example.com",
+            "http://localhost:*",
+            "*://localhost",
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, r"only a bare '\*'"),
             ):
                 origins.parse_allowed_origin(value)
 

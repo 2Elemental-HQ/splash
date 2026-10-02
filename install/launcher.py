@@ -651,7 +651,7 @@ def parse_args(argv=None):
         type=_parse_allowed_origin,
         metavar="ORIGIN",
         help="origin whose pages may call the API from a browser or webview, e.g. "
-        "tauri://localhost; * for any (repeatable)",
+        "tauri://localhost; '*' for any (repeatable)",
     )
     server.add_argument(
         "--max-request-size",

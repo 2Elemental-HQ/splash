@@ -72,7 +72,7 @@ class PackagedServerTests(unittest.TestCase):
                     "--model",
                     "owner/repo",
                     "--allowed-origin",
-                    "http://localhost/app",
+                    "tauri://*",
                 ],
                 cwd=stage_release(Path(directory)),
                 text=True,
@@ -81,7 +81,7 @@ class PackagedServerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn(
-                "http://localhost/app is not an origin: expected a scheme and a host",
+                "tauri://* is not an origin: only a bare '*' admits every origin",
                 result.stderr,
             )
 
