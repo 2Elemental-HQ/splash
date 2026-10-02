@@ -1,6 +1,7 @@
 #include "engine/Cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -507,6 +508,7 @@ uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
 }
 
 bool Cache::compactExtent() {
+  const auto start = std::chrono::steady_clock::now();
   std::vector<uint32_t> inTransfer;
   inTransfer.reserve(demotions_.size() + restores_.size());
   for (const Demotion &demotion : demotions_)
@@ -531,6 +533,11 @@ bool Cache::compactExtent() {
     if (first < pages)
       pagesChanged(active, static_cast<uint32_t>(first));
   }
+  extentCompactMaxMilliseconds_ = std::max(
+      extentCompactMaxMilliseconds_,
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start)
+          .count());
   return true;
 }
 
@@ -796,7 +803,8 @@ CacheSnapshot Cache::snapshot() const {
           states_.snapshot(),
           tier,
           lookup_,
-          static_cast<uint32_t>(requests_.size())};
+          static_cast<uint32_t>(requests_.size()),
+          extentCompactMaxMilliseconds_};
 }
 
 Cache::Request &Cache::request(uint64_t requestId) {

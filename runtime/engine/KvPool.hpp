@@ -29,11 +29,9 @@ struct KvPoolSnapshot {
   uint64_t extentReleases = 0;
   double extentAllocateMaxMilliseconds = 0.0;
   double extentReleaseMaxMilliseconds = 0.0;
-  // Extents emptied by moving their pages, the pages moved, and the longest
-  // emptying of one.
+  // Extents emptied by moving their pages, and the pages moved.
   uint64_t extentCompactions = 0;
   uint64_t pagesMoved = 0;
-  double extentCompactMaxMilliseconds = 0.0;
 };
 
 // Where the pages of an emptied extent went. Whoever names one of its pages
@@ -164,7 +162,6 @@ private:
   double extentReleaseMaxMilliseconds_ = 0.0;
   uint64_t extentCompactions_ = 0;
   uint64_t pagesMoved_ = 0;
-  double extentCompactMaxMilliseconds_ = 0.0;
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   uint32_t freePages_ = 0;

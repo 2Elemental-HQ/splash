@@ -229,7 +229,6 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
     to = pages_[to].nextFree;
   }
 
-  const auto start = std::chrono::steady_clock::now();
   storage_.copyPages(copies);
   KvPageMoves moves{first, std::vector<uint32_t>(extentPages_)};
   std::iota(moves.destinations.begin(), moves.destinations.end(), first);
@@ -244,8 +243,6 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
   }
   ++extentCompactions_;
   pagesMoved_ += copies.size();
-  extentCompactMaxMilliseconds_ =
-      std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
   return moves;
 }
 
@@ -265,7 +262,6 @@ KvPoolSnapshot KvPool::snapshot() const {
   result.extentReleaseMaxMilliseconds = extentReleaseMaxMilliseconds_;
   result.extentCompactions = extentCompactions_;
   result.pagesMoved = pagesMoved_;
-  result.extentCompactMaxMilliseconds = extentCompactMaxMilliseconds_;
   return result;
 }
 

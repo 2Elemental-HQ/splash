@@ -87,6 +87,9 @@ struct CacheSnapshot final {
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
   uint32_t activeRequests = 0;
+  // The longest emptying of one extent by moving its pages, re-pointing the
+  // cached blocks and requests on them included.
+  double extentCompactMaxMilliseconds = 0.0;
 };
 
 enum class TokenAdmissionFailure : uint8_t {
@@ -383,6 +386,7 @@ private:
   std::vector<uint64_t> poisoned_;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
+  double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };
 

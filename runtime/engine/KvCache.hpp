@@ -83,7 +83,8 @@ public:
   };
 
   KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
-      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency) {}
+      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency),
+        blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -135,8 +136,8 @@ public:
   // Gives a disk-only block a page whose content follows, by restore or from
   // the request that recomputed it. The parent must be resident.
   void adoptPage(uint64_t blockId, uint32_t page);
-  // The pool moved pages: every block on one of them names the page it
-  // moved to.
+  // The pool moved pages: the block on each of them, if any, names the page
+  // it moved to. It visits only the moved pages.
   void followPages(const KvPageMoves &moves) noexcept;
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
@@ -208,6 +209,10 @@ private:
   CacheNamespace cacheNamespace_;
   CacheRecency &recency_;
   std::unordered_map<uint64_t, Block> blocks_;
+  // The resident block on each page, 0 for none. A resident block owns its
+  // page: a writer whose block already exists moves onto that block's page,
+  // or keeps its own while the block is in transfer.
+  std::vector<uint64_t> blockOnPage_;
   std::unordered_multimap<uint64_t, uint64_t> index_;
   uint64_t nextBlockId_ = 1;
   // Any graph change invalidates previews, including a newly matched block.

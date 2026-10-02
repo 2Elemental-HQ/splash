@@ -537,11 +537,14 @@ empties is released.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
-(`allocated_bytes`, `reclaimable_bytes`), the extents allocated, released and
-emptied by moving pages (`extent_compactions`, `pages_moved`), and the longest
-allocation, release and emptying of one. The counts and the longest allocation
-include the runway allocated at startup, before serving begins; how long a
-whole pass holds the loop shows in `loop.max_tick_ms`.
+(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
+(`extent_allocations`, `extent_releases`) and those emptied by moving pages
+(`extent_compactions`, `pages_moved`), and the longest allocation, release and
+emptying of one (`extent_allocate_max_ms`, `extent_release_max_ms`,
+`extent_compact_max_ms`); the last includes re-pointing the cached blocks and
+requests on the moved pages. The counts and the longest allocation include the
+runway allocated at startup, before serving begins; how long a whole pass holds
+the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or

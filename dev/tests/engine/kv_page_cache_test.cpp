@@ -315,8 +315,8 @@ void testCandidateOrderThroughChurn() {
 // while one of them is in use.
 void testSubtreeThroughChurn() {
   constexpr uint32_t steps = 1000;
-  test::TestKvStorage storage(1, 100, 1);
-  KvPool pool(storage, 1);
+  test::TestKvStorage storage(steps, 100, 1);
+  KvPool pool(storage, steps);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   struct Reference {
@@ -333,9 +333,11 @@ void testSubtreeThroughChurn() {
     switch (random() % 5) {
     case 0:
     case 1: {
-      // Every block shares page 0: only the shape of the tree matters here.
+      // A resident block owns its page, so each block takes the next one;
+      // only the shape of the tree matters here.
       const uint64_t parent = live ? pick : 0;
-      const auto result = cache.insert(parent, page(step + 1), 0);
+      const auto result =
+          cache.insert(parent, page(step + 1), static_cast<uint32_t>(inserted));
       require(result.inserted && result.id == ++inserted, "unexpected test block identity");
       blocks[result.id] = {parent, true};
       break;
