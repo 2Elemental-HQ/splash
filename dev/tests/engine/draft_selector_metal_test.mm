@@ -7,7 +7,7 @@
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing.
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "ops/Sampling.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -161,11 +161,12 @@ void runCase(MetalBackend &backend, const Case &c) {
       randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
-      allocate(backend, uint64_t{c.lanes} * 2 * kRows * sizeof(float)),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes)};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * 2 * kRows; ++index)
+  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
   std::vector<SamplingPolicy> policies(c.lanes);
@@ -241,7 +242,8 @@ void runCase(MetalBackend &backend, const Case &c) {
           reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
           sum += reference[rank];
         }
-        const float uniform = uniforms[lane * 2 * kRows + position + 1];
+        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
+                                       SPLASH_UNIFORM_PROPOSALS + position];
         std::array<double, kCandidates> cumulative{};
         uint32_t expectedSelection = kCandidates - 1;
         for (uint32_t rank = 0; rank < kCandidates; ++rank) {
@@ -285,7 +287,7 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, uint64_t{kRows} * kRank * 2),
       allocate(backend, uint64_t{1024} * kRank * 2),
       allocate(backend, uint64_t{1024} * kRank * 2),
-      allocate(backend, 2 * kRows * sizeof(float)),
+      allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes)};
   const std::array<uint32_t, 2> anchors{1, 2};

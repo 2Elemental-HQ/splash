@@ -62,7 +62,8 @@ void runWidth(MetalBackend &backend, uint32_t width,
       shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
              "accept-target-rows");
   MetalBuffer uniforms =
-      shared(backend, kLanes * 2 * kRows * sizeof(float), "accept-uniforms");
+      shared(backend, kLanes * SPLASH_SAMPLING_UNIFORMS * sizeof(float),
+             "accept-uniforms");
   MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
                               "accept-output");
   MetalBuffer retained =

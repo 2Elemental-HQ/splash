@@ -150,7 +150,8 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid initial sampling row");
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
-  addSelection(graph, policies, buffers, {1, rowOffset, 0, 0, 0}, stopToken0,
+  addSelection(graph, policies, buffers,
+               {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0,
                stopToken1);
 }
 
@@ -163,10 +164,10 @@ void Sampling::addVerify(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid sampling batch width");
   addPenalties(graph, policies, buffers, penalties, 0, true);
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
-  // follows draft token r; every row draws with the lane's last uniform.
+  // follows draft token r; every row draws with the lane's correction
+  // uniform.
   addSelection(graph, policies, buffers,
-               {SPLASH_TARGET_VERIFY_ROWS, 0, 1,
-                2 * SPLASH_TARGET_VERIFY_ROWS - 1,
+               {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION,
                 SPLASH_DRAFT_PROPOSAL_TOKENS},
                stopToken0, stopToken1);
 }

@@ -8,6 +8,7 @@
 
 #include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/Sampling.h"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/PagedKv.hpp"
 
@@ -22,8 +23,9 @@ namespace splash::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
 inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
-// Per-lane sampling uniforms handed to the sampler each cycle.
-inline constexpr uint32_t kSamplingUniformCount = 16;
+// Per-lane sampling uniforms handed to the sampler each cycle, in the
+// layout of metal/abi/Sampling.h.
+inline constexpr uint32_t kSamplingUniformCount = SPLASH_SAMPLING_UNIFORMS;
 inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalTokens;
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;

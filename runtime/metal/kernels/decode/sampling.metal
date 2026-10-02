@@ -908,8 +908,7 @@ kernel void decode_sample_vocabulary_draw(
           drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * 2 * SPLASH_TARGET_VERIFY_ROWS +
-                   params.uniform],
+          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
           token, draft_probability) &&
@@ -1303,7 +1302,6 @@ kernel void draft_select_dflash(
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
@@ -1312,7 +1310,7 @@ kernel void draft_select_dflash(
   device const float *tables = partial_values +
                                params.lanes * Positions * Shards * Candidates +
                                batch * Positions * Candidates * Candidates;
-  uniforms += batch * 2 * Rows;
+  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
 
@@ -1343,7 +1341,7 @@ kernel void draft_select_dflash(
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&
-            cumulative > uniforms[position + 1]) {
+            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
           selected = i;
         }
       }
@@ -1412,7 +1410,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                             draft_probs + accepted * kDraftCandidates,
                             kDraftCandidates, token);
     float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[accepted + SPLASH_TARGET_VERIFY_ROWS] * q < p))
+    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -1563,7 +1561,7 @@ kernel void decode_accept_dflash(
         draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
-        uniforms + batch * 2 * SPLASH_TARGET_VERIFY_ROWS, lane_target,
+        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
   } else {
     accept_greedy_lane(lane_draft, lane_target, retained[batch],

@@ -662,7 +662,8 @@ struct Runtime::Impl {
 
   static void stageSamplingCycle(Request &entry) noexcept {
     entry.cycleUniforms.fill(0.0F);
-    for (uint32_t index = 1; index < entry.cycleUniforms.size(); ++index) {
+    for (uint32_t index = SPLASH_UNIFORM_PROPOSALS;
+         index < SPLASH_SAMPLING_UNIFORMS; ++index) {
       entry.cycleUniforms[index] = nextUniform(entry);
     }
   }
@@ -875,7 +876,7 @@ struct Runtime::Impl {
   // cycle.
   void uploadInitialUniform(Request &entry, uint32_t lane) const {
     entry.cycleUniforms.fill(0.0F);
-    entry.cycleUniforms[0] = nextUniform(entry);
+    entry.cycleUniforms[SPLASH_UNIFORM_INITIAL] = nextUniform(entry);
     uploadSamplingUniforms(entry, lane);
   }
 

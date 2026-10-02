@@ -8,15 +8,30 @@
 #include <stdint.h>
 #endif
 
+// The uniforms one lane draws a decode cycle with, in [0, 1): the first
+// token after a prompt draws SPLASH_UNIFORM_INITIAL; the draft's sampled
+// proposal at position p draws SPLASH_UNIFORM_PROPOSALS + p; acceptance tests
+// draft token p against SPLASH_UNIFORM_ACCEPTANCE + p; and a sampled verify
+// row draws its correction, or the bonus token after the whole draft, with
+// SPLASH_UNIFORM_CORRECTION. Lane l's uniforms start at
+// l * SPLASH_SAMPLING_UNIFORMS.
+#define SPLASH_UNIFORM_INITIAL 0u
+#define SPLASH_UNIFORM_PROPOSALS 1u
+#define SPLASH_UNIFORM_ACCEPTANCE                                          \
+  (SPLASH_UNIFORM_PROPOSALS + SPLASH_DRAFT_PROPOSAL_TOKENS)
+#define SPLASH_UNIFORM_CORRECTION                                          \
+  (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_PROPOSAL_TOKENS)
+#define SPLASH_SAMPLING_UNIFORMS (SPLASH_UNIFORM_CORRECTION + 1u)
+
 // One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
 // rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
-// 2 * SPLASH_TARGET_VERIFY_ROWS uniforms each. Selected row s is row s % rows
-// of lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
+// SPLASH_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
+// lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
 // logits_row + s % rows, its mask row lane * (SPLASH_TARGET_VERIFY_ROWS + 1) +
 // mask_row + s % rows, and its draw takes uniform
-// lane * 2 * SPLASH_TARGET_VERIFY_ROWS + uniform; workspaces and output
-// tokens are indexed by s. Rows below drafted_rows follow draft token
-// s % rows (verify input row s % rows + 1).
+// lane * SPLASH_SAMPLING_UNIFORMS + uniform; workspaces and output tokens are
+// indexed by s. Rows below drafted_rows follow draft token s % rows (verify
+// input row s % rows + 1).
 struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;
