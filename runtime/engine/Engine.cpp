@@ -149,7 +149,8 @@ void Engine::submit(EngineRequest value) {
     requests_.erase(found);
   }
   Request requestState;
-  requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
+  requestState.exactTokens = std::move(value.prompt);
+  requestState.promptTokens = static_cast<uint32_t>(requestState.exactTokens.size());
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
   const Request &stored =
@@ -475,9 +476,9 @@ bool Engine::admitQueued(double now) {
     if (active.skipCache)
       return 0;
     if (active.admissionProbe)
-      cache_.refresh(*active.admissionProbe, active.request.prompt, active.request.images);
+      cache_.refresh(*active.admissionProbe, active.exactTokens, active.request.images);
     else
-      active.admissionProbe = cache_.probe(active.request.prompt, active.request.images);
+      active.admissionProbe = cache_.probe(active.exactTokens, active.request.images);
     return active.admissionProbe->cachedTokens();
   };
   // A request starts only in a free state cell. While every cell is
@@ -619,14 +620,8 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
-  const auto prompt = [](const Request &value) -> std::span<const uint32_t> {
-    return value.exactTokens.empty()
-               ? std::span<const uint32_t>(value.request.prompt)
-               : std::span<const uint32_t>(value.exactTokens)
-                     .first(value.promptTokens);
-  };
-  const auto a = prompt(left);
-  const auto b = prompt(right);
+  const auto a = std::span<const uint32_t>(left.exactTokens).first(left.promptTokens);
+  const auto b = std::span<const uint32_t>(right.exactTokens).first(right.promptTokens);
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
   uint32_t boundary = std::min<uint32_t>(
       static_cast<uint32_t>(end - a.begin()),
@@ -680,8 +675,7 @@ bool Engine::pendingSharedPrefill(const Request &active,
 bool Engine::admit(Request &active, double now) {
   const bool resuming = scheduler_.suspended(active.request.id);
   ModelRequest modelRequest = active.request.modelView();
-  if (resuming)
-    modelRequest.prompt = active.exactTokens;
+  modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
       active.skipCache
           ? CacheLookup{}
@@ -839,7 +833,6 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     ++counters_.resourceResumptions;
     return;
   }
-  active.exactTokens = std::move(active.request.prompt);
   scheduler_.resourcesReady(active.request.id, resumeBoundary);
   armNextStateBoundary(active);
   cache_.recordLookup(lookup);
@@ -1768,11 +1761,8 @@ void Engine::finish(Request &active, EngineFinishReason reason,
     scheduler_.cancel(active.request.id);
   }
   active.finalized = true;
-  const uint32_t completionTokens =
-      active.exactTokens.size() > active.promptTokens
-          ? static_cast<uint32_t>(active.exactTokens.size() -
-                                  active.promptTokens)
-          : 0;
+  const auto completionTokens =
+      static_cast<uint32_t>(active.exactTokens.size() - active.promptTokens);
   events_.completed(active.request.id, reason, active.promptTokens,
                     completionTokens, optionLogits);
   if (reason == EngineFinishReason::Cancelled) {

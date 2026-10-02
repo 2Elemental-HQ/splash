@@ -219,8 +219,10 @@ private:
     // (admitQueued); a pass that does not schedule it or a prefix wait
     // leaves it in place.
     bool refusedMemory = false;
+    // The prompt from submit on, then the committed output; request.prompt
+    // is empty.
     std::vector<uint32_t> exactTokens;
-    // Made from request.prompt and request.images, which do not change while
+    // Made from exactTokens and request.images, which do not change while
     // the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;

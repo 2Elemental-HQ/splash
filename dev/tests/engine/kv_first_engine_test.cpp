@@ -847,6 +847,8 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
                 events.outputs[1] == std::vector<uint32_t>{42} &&
                 engine.snapshot().scheduler.waitingPrefix == 0,
             "expired prefix waiter allocated a cell or interrupted its producer");
+    require(!cancelled || events.usage.at(2) == std::pair<uint32_t, uint32_t>{193, 0},
+            "a request cancelled before it started reported other usage");
   }
 }
 
