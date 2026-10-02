@@ -167,8 +167,7 @@ public:
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
-  actualMemoryReport(const model::ModelMemoryActual &modelMemory,
-                     uint64_t estimatedWarmupPeakBytes) const;
+  actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
   // Offline tuning tool only, before any request: swaps between the operator
   // defaults and the choices this instance was created with. Arenas were
   // sized for exactly those two configurations, so nothing else may be

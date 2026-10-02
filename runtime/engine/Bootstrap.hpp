@@ -96,8 +96,7 @@ struct RuntimeBootstrapConfig {
     protocol::ProtocolLimits protocolLimits;
 };
 
-using ActualMemoryReporter =
-    std::function<ActualMemoryReport(uint64_t estimatedWarmupPeakBytes)>;
+using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
 // Complete owner returned only after the real loop has emitted its binary
 // ReadyEvent. No partially warmed instance escapes start().

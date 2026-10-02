@@ -67,8 +67,6 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
 };
 
 // Validates only the interface between independently defined target and draft

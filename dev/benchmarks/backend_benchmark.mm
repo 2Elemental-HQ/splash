@@ -897,8 +897,6 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (!prefillWarmup.completed)
-      throw std::runtime_error("maximum prefill warmup failed");
     if (median(decodeSamples[2]) >
         median(decodeSamples[0]) + median(decodeSamples[1])) {
       performanceFailures.push_back(

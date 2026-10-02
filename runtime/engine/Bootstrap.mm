@@ -120,7 +120,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime,
     ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
-  uint64_t estimatedPeakBytes = 0;
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
     model::WarmupStepResult result;
@@ -144,16 +143,13 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
            std::string(runtimeBootstrapStageName(stage)) +
                " threw an unknown exception");
     }
-    if (!result.completed || !result.estimatedPeakBytes ||
-        !(result.wallSeconds > 0.0) || !std::isfinite(result.wallSeconds)) {
+    if (!(result.wallSeconds > 0.0) || !std::isfinite(result.wallSeconds)) {
       std::string message = std::string(runtimeBootstrapStageName(stage)) +
                             " did not complete a real measured path";
       if (!result.detail.empty())
         message += ": " + result.detail;
       fail(report, stage, std::move(message));
     }
-    estimatedPeakBytes =
-        std::max(estimatedPeakBytes, result.estimatedPeakBytes);
     status = WarmupStepStatus::Complete;
     return result;
   };
@@ -192,7 +188,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
 
   ActualMemoryReport actual;
   try {
-    actual = memoryReporter(estimatedPeakBytes);
+    actual = memoryReporter();
   } catch (const metal::MetalAllocationError &error) {
     report.resourceFailure = resourceAllocationFailure(error.failure());
     fail(report, RuntimeBootstrapStage::MemoryAudit,
@@ -341,12 +337,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   model::RuntimeModel *modelPointer = modelRuntime.get();
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime,
-      [resourcesPointer, modelPointer](uint64_t estimatedPeakBytes) {
+      [resourcesPointer, modelPointer] {
         resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
-            modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
+            modelPointer->actualRuntimeMemory());
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
         while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {

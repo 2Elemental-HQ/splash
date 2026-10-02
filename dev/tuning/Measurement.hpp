@@ -24,8 +24,6 @@ struct RunTiming final {
     const model::WarmupStepResult &baseline, double baselineGpuSeconds,
     const model::WarmupStepResult &candidate, double candidateGpuSeconds,
     MeasurementOrder order) {
-  if (!baseline.completed || !candidate.completed)
-    throw std::runtime_error("cannot confirm incomplete warmups");
   if (baseline.lanes.empty() || baseline.lanes.size() != candidate.lanes.size())
     throw std::runtime_error("cannot confirm warmups with missing or different lane counts");
   for (size_t lane = 0; lane < baseline.lanes.size(); ++lane)

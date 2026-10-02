@@ -1400,11 +1400,11 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
             "EOS fixture did not terminate synthetic prefill");
     for (uint32_t width = 1; width <= 4; ++width) {
       const auto result = executor.warmupDecodeBatch(width);
-      require(result.completed && result.lanes.size() == width &&
+      require(result.lanes.size() == width &&
                   executor.telemetry().lastDecodeWidth == width,
               "prefill EOS skipped the actual decode warmup");
     }
-    require(executor.warmupCompositeStateRestore().completed,
+    require(executor.warmupCompositeStateRestore().wallSeconds > 0.0,
             "prefill EOS broke the restore warmup");
   }
   setStops(decodeStop);
@@ -1412,7 +1412,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     model::Runtime executor(context);
     const auto result = executor.warmupDecodeBatch(1);
     const auto &lane = result.lanes[0];
-    require(result.completed && lane.step.finished &&
+    require(lane.step.finished &&
                 lane.step.outputTokensWithoutKv == 1 &&
                 lane.pendingToken == decodeStop && lane.committedTokens > 1 &&
                 lane.committedTokens == lane.step.outputTokens.size(),
@@ -1542,10 +1542,7 @@ int main(int argc, char **argv) {
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout());
-    model::RuntimeContext context{
-        backend, model, pages, states, operators,
-        budget.pipelineReserveBytes,
-        budget.runtimeOverheadReserveBytes};
+    model::RuntimeContext context{backend, model, pages, states, operators};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,
@@ -3288,8 +3285,7 @@ int main(int argc, char **argv) {
     }
     for (uint32_t rows : {32U, 128U, 512U}) {
       const auto smallerWarmup = executor.warmupPrefill(rows);
-      require(smallerWarmup.completed && smallerWarmup.estimatedPeakBytes > 0 &&
-                  smallerWarmup.wallSeconds >= executor.telemetry().lastPrefillWallSeconds &&
+      require(smallerWarmup.wallSeconds >= executor.telemetry().lastPrefillWallSeconds &&
                   smallerWarmup.wallSeconds > 0 && smallerWarmup.lanes.size() == 1 &&
                   smallerWarmup.lanes[0].step.consumedPromptTokens == rows &&
                   smallerWarmup.lanes[0].committedTokens == rows,
@@ -3302,8 +3298,7 @@ int main(int argc, char **argv) {
     }
     model::WarmupStepResult prefillWarmup =
         executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
-    require(prefillWarmup.completed && prefillWarmup.estimatedPeakBytes > 0 &&
-                prefillWarmup.wallSeconds > 0.0,
+    require(prefillWarmup.wallSeconds > 0.0,
             "real prefill warmup did not report timing");
     require(prefillWarmup.wallSeconds >= executor.telemetry().lastPrefillWallSeconds &&
                 prefillWarmup.lanes.size() == 1 &&
@@ -3316,11 +3311,11 @@ int main(int argc, char **argv) {
     model::WarmupStepResult batch2 = executor.warmupDecodeBatch(2);
     model::WarmupStepResult batch3 = executor.warmupDecodeBatch(3);
     model::WarmupStepResult batch4 = executor.warmupDecodeBatch(4);
-    require(batch2.completed && batch2.wallSeconds > 0.0,
+    require(batch2.wallSeconds > 0.0,
             "real B2 decode warmup did not report timing");
-    require(batch3.completed && batch3.wallSeconds > 0.0,
+    require(batch3.wallSeconds > 0.0,
             "real B3 decode warmup did not report timing");
-    require(batch4.completed && batch4.wallSeconds > 0.0,
+    require(batch4.wallSeconds > 0.0,
             "real B4 decode warmup did not report timing");
     const std::array batches{&batch1, &batch2, &batch3, &batch4};
     for (size_t laneCount = 1; laneCount <= batches.size(); ++laneCount) {
@@ -3355,8 +3350,7 @@ int main(int argc, char **argv) {
               << " b4_m32=" << fusedTelemetry.lastDecodeM32Dispatches << '\n';
     model::WarmupStepResult historical =
         executor.warmupCompositeStateRestore();
-    require(historical.completed && historical.estimatedPeakBytes > 0 &&
-                historical.wallSeconds > 0.0,
+    require(historical.wallSeconds > 0.0,
             "historical restore-continuation warmup did not complete");
     const model::ModelTelemetry historicalTelemetry =
         executor.telemetry();

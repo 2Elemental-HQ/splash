@@ -229,10 +229,7 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
       actual.sharedDecodeBytes + actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  // Model warmup estimates add the pipeline and runtime reserves.
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
-                                    budget.pipelineReserveBytes +
-                                    budget.runtimeOverheadReserveBytes;
+  actual.backendPeakAllocatedBytes = actual.backendAllocatedBytes;
   return actual;
 }
 
@@ -243,10 +240,7 @@ public:
 
 class Executor final : public model::RuntimeModel {
 public:
-  explicit Executor(uint64_t estimatedPeak, int failingStep = -1,
-                    int throwingStep = -1)
-      : estimatedPeak_(estimatedPeak), failingStep_(failingStep),
-        throwingStep_(throwingStep) {}
+  explicit Executor(int throwingStep = -1) : throwingStep_(throwingStep) {}
 
   StateAdmission begin(const ModelRequest &) override {
     return {0, StateFailure::None};
@@ -320,26 +314,21 @@ private:
     if (step == throwingStep_) {
       throw std::runtime_error("injected warmup exception");
     }
-    model::WarmupStepResult result{
-        step != failingStep_, estimatedPeak_, "measured", 0.001, {}};
+    model::WarmupStepResult result{"measured", 0.001, {}};
     if (warmupHook)
       warmupHook(step, result);
     return result;
   }
 
-  uint64_t estimatedPeak_ = 0;
-  int failingStep_ = -1;
   int throwingStep_ = -1;
 };
 
 class Harness final {
 public:
-  Harness(const EngineMemoryPlan &plan, int failingStep = -1,
-          int throwingStep = -1, bool failReadyWrite = false)
+  explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16, 4096, 4), pool_(backing_, 16),
         resources_(pool_),
-        executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
-                  throwingStep),
+        executor_(throwingStep),
         loop_(
             loopConfig(), resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
@@ -373,18 +362,11 @@ private:
 
 void testAllNativeWarmupsPrecedeReady() {
   const EngineMemoryPlan plan = memoryPlan();
-  Harness harness(plan);
+  Harness harness;
   require(!harness.loop().ready() && harness.output().empty(),
           "runtime became visible before warmup");
-  ActualMemoryReport actual = validActual(plan);
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(),
-      [&](uint64_t estimate) {
-        require(estimate == actual.estimatedWarmupPeakBytes,
-                "bootstrap lost the maximum measured peak");
-        actual.estimatedWarmupPeakBytes = estimate;
-        return actual;
-      },
+      plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
   require(report.stage == RuntimeBootstrapStage::Ready &&
               report.warmup.ready() && report.memoryAudit.valid &&
@@ -400,12 +382,7 @@ void testAllNativeWarmupsPrecedeReady() {
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
   return RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(),
-      [&](uint64_t estimate) {
-        auto actual = validActual(plan);
-        actual.estimatedWarmupPeakBytes = estimate;
-        return actual;
-      },
+      plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
 }
 
@@ -438,7 +415,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     const EngineMemoryPlan plan = test::requireMemoryPlan(
         device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB),
         ceiling);
-    Harness harness(plan);
+    Harness harness;
     const auto report = warmup(harness, plan);
     requireReadyWithoutReducingConcurrency(harness, report);
     std::vector<int> expected{0};
@@ -460,7 +437,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
   const EngineMemoryPlan plan = memoryPlan();
   for (int deniedWidth : {-1, 2, 3, 4}) {
     for (bool denyRestore : {false, true}) {
-      Harness harness(plan);
+      Harness harness;
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
         if (step == deniedWidth || (step == 5 && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
@@ -527,7 +504,7 @@ void testRequiredWarmupPreservesAllocationFailure() {
   for (auto failure : {metal::AllocationFailure::HostPressure,
                        metal::AllocationFailure::EngineBudget,
                        metal::AllocationFailure::DriverRejected}) {
-    Harness harness(plan);
+    Harness harness;
     harness.executor().warmupHook =
         [failure](int step, model::WarmupStepResult &) {
           if (step == 0)
@@ -546,11 +523,11 @@ void testRequiredWarmupPreservesAllocationFailure() {
 
 void testFinalHostPressurePreventsReady() {
   const EngineMemoryPlan plan = memoryPlan();
-  Harness harness(plan);
+  Harness harness;
   try {
     static_cast<void>(RuntimeBootstrap::requireWarmupAndAnnounce(
         plan, harness.executor(),
-        [](uint64_t) -> ActualMemoryReport {
+        []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
         }, harness.loop()));
@@ -562,40 +539,9 @@ void testFinalHostPressurePreventsReady() {
   }
 }
 
-void testEveryWarmupFailureIsFailClosed() {
-  const EngineMemoryPlan plan = memoryPlan();
-  constexpr engine::RuntimeBootstrapStage expected[] = {
-      engine::RuntimeBootstrapStage::MaximumPrefill,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::CompositeStateRestore,
-  };
-  for (int step = 0; step < 6; ++step) {
-    Harness harness(plan, step);
-    try {
-      static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [&](uint64_t estimate) {
-            auto actual = validActual(plan);
-            actual.estimatedWarmupPeakBytes = estimate;
-            return actual;
-          },
-          harness.loop()));
-      throw std::runtime_error("failed warmup announced ready");
-    } catch (const engine::RuntimeBootstrapError &error) {
-      require(error.report().stage == expected[step] &&
-                  error.report().resourceFailure == RuntimeResourceFailure::Other &&
-                  !harness.loop().ready() && harness.output().empty(),
-              "failed warmup escaped the native bootstrap gate");
-    }
-  }
-}
-
 void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   enum class Failure {
-    Allocation, Backend, General, MissingPeak, ZeroTime, InfiniteTime, NanTime
+    Allocation, Backend, General, ZeroTime, InfiniteTime, NanTime
   };
   constexpr RuntimeBootstrapStage stages[] = {
       RuntimeBootstrapStage::MaximumPrefill,
@@ -608,13 +554,12 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   const EngineMemoryPlan plan = memoryPlan();
   for (int step = 0; step < 6; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
-                            Failure::General, Failure::MissingPeak,
-                            Failure::ZeroTime, Failure::InfiniteTime,
-                            Failure::NanTime}) {
+                            Failure::General, Failure::ZeroTime,
+                            Failure::InfiniteTime, Failure::NanTime}) {
       if (failure == Failure::Allocation &&
           (step == 2 || step == 3 || step == 4 || step == 5))
         continue; // Only these paths may skip a real allocation refusal.
-      Harness harness(plan);
+      Harness harness;
       harness.executor().warmupHook =
           [&](int current, model::WarmupStepResult &result) {
             if (current != step)
@@ -626,9 +571,6 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
               throw metal::MetalBackendError("injected GPU command failure");
             case Failure::General:
               throw std::runtime_error("injected general warmup failure");
-            case Failure::MissingPeak:
-              result.estimatedPeakBytes = 0;
-              break;
             case Failure::ZeroTime:
               result.wallSeconds = 0.0;
               break;
@@ -645,6 +587,8 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         throw std::runtime_error("invalid warmup announced ready");
       } catch (const RuntimeBootstrapError &error) {
         require(error.report().stage == stages[step] &&
+                    (failure == Failure::Allocation ||
+                     error.report().resourceFailure == RuntimeResourceFailure::Other) &&
                     !error.report().warmup.ready() && !harness.loop().ready() &&
                     harness.output().empty() &&
                     harness.executor().calls.back() == step,
@@ -657,11 +601,11 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
 void testExceptionsMemoryAndReadyWriteAreFailClosed() {
   const EngineMemoryPlan plan = memoryPlan();
   {
-    Harness harness(plan, -1, 3);
+    Harness harness(3);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [](uint64_t) { return ActualMemoryReport{}; }, harness.loop()));
+          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          harness.loop()));
       throw std::runtime_error("warmup exception announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -671,11 +615,11 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     }
   }
   {
-    Harness harness(plan);
+    Harness harness;
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [](uint64_t) { return ActualMemoryReport{}; }, harness.loop()));
+          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          harness.loop()));
       throw std::runtime_error("invalid memory report announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -685,15 +629,10 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     }
   }
   {
-    Harness harness(plan, -1, -1, true);
+    Harness harness(-1, true);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [&](uint64_t estimate) {
-            auto actual = validActual(plan);
-            actual.estimatedWarmupPeakBytes = estimate;
-            return actual;
-          },
+          plan, harness.executor(), [&] { return validActual(plan); },
           harness.loop()));
       throw std::runtime_error("failed Ready write left runtime ready");
     } catch (const engine::RuntimeBootstrapError &error) {
@@ -770,7 +709,6 @@ int main() {
     testResourceFailureClassificationSurvivesBootstrap();
     testRequiredWarmupPreservesAllocationFailure();
     testFinalHostPressurePreventsReady();
-    testEveryWarmupFailureIsFailClosed();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();

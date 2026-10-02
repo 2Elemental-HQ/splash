@@ -248,9 +248,7 @@ int main(int argc, char **argv) {
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
                                       model.stateLayout());
-      model::RuntimeContext context{
-          backend, model, pages, states, operators,
-          model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes};
+      model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",

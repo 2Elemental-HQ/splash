@@ -496,21 +496,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 }
 
 model::RuntimeContext RuntimeResources::modelContext() noexcept {
-  const EngineMemoryBreakdown &budget = memoryPlan_.breakdown();
   return {
       *backend_,
       model_,
       *kvPages_,
       *stateStorage_,
       operators_,
-      budget.pipelineReserveBytes,
-      budget.runtimeOverheadReserveBytes,
   };
 }
 
 ActualMemoryReport RuntimeResources::actualMemoryReport(
-    const model::ModelMemoryActual &modelMemory,
-    uint64_t estimatedWarmupPeakBytes) const {
+    const model::ModelMemoryActual &modelMemory) const {
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
   report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
@@ -530,17 +526,8 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.deviceCurrentAllocatedBytes = memory.deviceCurrentAllocatedBytes;
   report.devicePeakAllocatedBytes = memory.devicePeakAllocatedBytes;
   // A capacity-limited warmup can roll back a partial allocation before it
-  // returns a result. Preserve that tracked high-water mark independently of
-  // the device-wide measurement used by the audit.
-  const auto &budget = memoryPlan_.breakdown();
-  const uint64_t reserves =
-      budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
-  if (memory.peakAllocatedBytes >
-      std::numeric_limits<uint64_t>::max() - reserves) {
-    throw std::overflow_error("warmup memory estimate overflows");
-  }
-  report.estimatedWarmupPeakBytes =
-      std::max(estimatedWarmupPeakBytes, memory.peakAllocatedBytes + reserves);
+  // returns a result; the backend's own high-water mark keeps it.
+  report.backendPeakAllocatedBytes = memory.peakAllocatedBytes;
   return report;
 }
 

@@ -307,8 +307,6 @@ struct Runtime::Impl {
     std::shared_ptr<ImageRows> rows;
   };
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
@@ -321,8 +319,6 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
-        pipelineReserveBytes(value.pipelineReserveBytes),
-        runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
@@ -679,23 +675,6 @@ struct Runtime::Impl {
     for (uint32_t index = 1; index < entry.cycleUniforms.size(); ++index) {
       entry.cycleUniforms[index] = nextUniform(entry);
     }
-  }
-
-  [[nodiscard]] uint64_t estimatedWarmupPeak() const {
-    uint64_t result = 0;
-    auto add = [&](uint64_t bytes, std::string_view label) {
-      result = checkedAdd(result, bytes, label);
-    };
-    add(package.targetActualAllocatedBytes(), "warmup target weights");
-    add(package.draft.actualAllocatedBytes, "warmup draft weights");
-    add(package.vision.actualAllocatedBytes, "warmup vision weights");
-    add(states.actualAllocatedBytes(), "warmup state storage");
-    add(prefillArena->bytes(), "warmup prefill arena");
-    add(decodeArena->bytes(), "warmup decode arena");
-    add(kvPages.actualAllocatedBytes(), "warmup KV pool");
-    add(pipelineReserveBytes, "warmup pipeline reserve");
-    add(runtimeOverheadReserveBytes, "warmup runtime reserve");
-    return result;
   }
 
   [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
@@ -2511,17 +2490,6 @@ void Runtime::end(uint64_t requestId) {
 
 namespace {
 
-WarmupStepResult warmupResult(uint64_t estimatedPeakBytes, double wallSeconds,
-                              std::string detail) {
-  if (!estimatedPeakBytes) {
-    throw std::logic_error("warmup peak estimate must be nonzero");
-  }
-  if (!(wallSeconds > 0.0) || !std::isfinite(wallSeconds)) {
-    throw std::logic_error("warmup wall time must be finite and positive");
-  }
-  return {true, estimatedPeakBytes, std::move(detail), wallSeconds, {}};
-}
-
 // A warmup step whose lane failed (a non-finite logit row) fails the warmup
 // there, with the lane's reason.
 void requireLanesSucceeded(std::span<const ModelStepResult> results) {
@@ -2605,11 +2573,9 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     end(id);
     throw;
   }
-  auto result = warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
-                            "real " + std::to_string(rows) +
-                                "-row packed KV target+draft prefill [M32]");
-  result.lanes = std::move(lanes);
-  return result;
+  return {"real " + std::to_string(rows) +
+              "-row packed KV target+draft prefill [M32]",
+          wallSeconds, std::move(lanes)};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
@@ -2702,11 +2668,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       end(firstId + lane);
     throw;
   }
-  auto result = warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
-                            "real B" + std::to_string(width) +
-                                " draft/verify/commit decode");
-  result.lanes = std::move(lanes);
-  return result;
+  return {"real B" + std::to_string(width) + " draft/verify/commit decode",
+          wallSeconds, std::move(lanes)};
 }
 
 WarmupStepResult Runtime::warmupCompositeStateRestore() {
@@ -2720,7 +2683,6 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   request.prompt = warmupPrompt;
   request.maxNewTokens = 8;
   std::shared_ptr<const CompositeState> cachedState;
-  uint64_t estimatedPeakBytes = impl_->estimatedWarmupPeak();
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);
   try {
@@ -2739,10 +2701,6 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     cachedState = snapshot(id);
     if (!cachedState)
       throw metal::MetalAllocationError("prefix warmup state allocation failed");
-    // The snapshot remains live across restore; its cache slot is allocated
-    // through the state storage, so the state term of the estimate already
-    // covers it.
-    estimatedPeakBytes = impl_->estimatedWarmupPeak();
     end(id);
     beginColdRequest(request, 1);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
@@ -2794,10 +2752,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     end(id);
     throw;
   }
-  return warmupResult(
-      estimatedPeakBytes, wallSeconds,
-      "real paged-KV state restore, arbitrary page table, lane move, "
-      "bounded restore continuation, and decode");
+  return {"real paged-KV state restore, arbitrary page table, lane move, "
+          "bounded restore continuation, and decode",
+          wallSeconds, {}};
 }
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {

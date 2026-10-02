@@ -57,10 +57,7 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
       actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  // Model warmup estimates add the pipeline and runtime reserves.
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
-                                    b.pipelineReserveBytes +
-                                    b.runtimeOverheadReserveBytes;
+  actual.backendPeakAllocatedBytes = actual.backendAllocatedBytes;
   return auditActualMemory(memoryPlan, actual);
 }
 

@@ -406,8 +406,6 @@ struct WarmupLaneResult final {
 };
 
 struct WarmupStepResult final {
-  bool completed = false;
-  uint64_t estimatedPeakBytes = 0;
   std::string detail;
   // For prefill/decode-batch warmup, the synchronous production phase
   // including graph construction and result finalization, but not setup,

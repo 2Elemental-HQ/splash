@@ -46,7 +46,6 @@ void diagnosticNames() {
 
 void comparableWarmupPairs() {
   splash::model::WarmupStepResult baseline;
-  baseline.completed = true;
   baseline.wallSeconds = 2;
   baseline.lanes.resize(4);
   for (size_t lane = 0; lane < baseline.lanes.size(); ++lane) {
@@ -105,10 +104,6 @@ void comparableWarmupPairs() {
   auto different = candidate;
   different.lanes.pop_back();
   reject(baseline, different, "lane counts");
-  different = candidate;
-  different.completed = false;
-  reject(baseline, different, "incomplete warmups");
-  reject(different, candidate, "incomplete warmups");
   different = candidate;
   different.lanes.clear();
   reject(different, different, "lane counts");
