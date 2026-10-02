@@ -430,8 +430,9 @@ bool Engine::admitQueued(double now) {
   // is still short before spending their released headroom on a retry or a
   // new request; this prevents repeated B4 admission/preemption churn. The
   // drain ends when growth is no longer paused and nothing has failed since
-  // the suspension, and at the latest after the resource wait limit;
-  // suspended requests are then admitted before new work, one at a time.
+  // the suspension or since a resident lane last released its memory, and at
+  // the latest after the resource wait limit; suspended requests are then
+  // admitted before new work, one at a time.
   if (!recovering)
     drainEndMilliseconds_ = 0.0;
   if (drainingForRecovery())
@@ -1722,6 +1723,10 @@ void Engine::release(Request &active) {
   active.resourceWait = {};
   active.maskRequestedMilliseconds.reset();
   if (active.stateCell || active.suspended) {
+    // A resident lane gives its memory back: what failed for want of it may
+    // fit now, so the recovery drain ends and the next attempt finds out.
+    if (active.stateCell)
+      allocationFailed_ = false;
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);
     cache_.endRequest(active.request.id);

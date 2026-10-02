@@ -438,8 +438,9 @@ private:
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.
   double drainEndMilliseconds_ = 0.0;
-  // An allocation failed since the latest suspension, or the suspension
-  // itself met a limit that only freed memory lifts, unlike a host pause.
+  // An allocation failed since the latest suspension or since a resident
+  // lane last released its memory, or the suspension itself met a limit
+  // that only freed memory lifts, unlike a host pause.
   bool allocationFailed_ = false;
   EngineSnapshot counters_;
 };

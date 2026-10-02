@@ -5382,6 +5382,61 @@ void testRecoveryDrainEndsWithItsCause() {
   }
 }
 
+// At the engine's limit a prefill is suspended beside two lanes that wait
+// for their masks. When one of them ends, the drain stops waiting for the
+// memory it gave back: the suspended request retries at once and resumes
+// when that memory is enough. When it is not, its refusal starts the drain
+// again.
+void testRecoveryDrainEndsWhenAResidentReleasesMemory() {
+  for (const bool enough : {true, false}) {
+    test::TestKvStorage storage(32, 4096, 4);
+    storage.budgetPages = 16;
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 1000;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    // The residents hold one page and four: the large one's pages go to the
+    // suspended request once it ends, the small one's page is too little.
+    auto small = constrainedRequest(1, 100'000);
+    auto large = constrainedRequest(3, 100'000);
+    large.prompt.assign(100, 3);
+    engine.submit(std::move(small));
+    engine.submit(std::move(large));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.maskRequests.size() == 2; },
+              "the residents did not wait for their masks");
+    // Its first command, 416 rows, needs thirteen pages of the eleven left
+    // under the engine's limit.
+    auto suspended = request(2, std::vector<uint32_t>(420, 2));
+    suspended.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(suspended));
+    tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+              "the prefill was not suspended at the limit");
+    require(engine.resourceWaitSnapshot(now).draining && executor.resumeAttempts == 0,
+            "the suspension did not start the drain");
+    now += 2;
+    engine.cancel(enough ? 3 : 1);
+    for (uint32_t step = 0; step < 4; ++step)
+      static_cast<void>(engine.tick(now++));
+    if (enough) {
+      require(engine.snapshot().resourceResumptions == 1 && executor.requests.at(2).resident &&
+                  !engine.resourceWaitSnapshot(now).draining,
+              "the drain held after a resident released the memory it waited for");
+    } else {
+      require(executor.resumeAttempts == 1 && engine.snapshot().resourceResumptions == 0 &&
+                  engine.resourceWaitSnapshot(now).draining,
+              "a refusal after a resident ended did not resume the drain");
+    }
+    for (uint64_t id : {1, 2, 3})
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  }
+}
+
 void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -8668,6 +8723,7 @@ int main() {
     testKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testRecoveryDrainEndsWithItsCause();
+    testRecoveryDrainEndsWhenAResidentReleasesMemory();
     testPressureRetryIsBackedOffWithoutProgress();
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
