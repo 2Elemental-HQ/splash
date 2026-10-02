@@ -214,8 +214,6 @@ enum class DecodeTensor : uint32_t {
   DraftPositions,
   RopeCos,
   RopeSin,
-  Arrived,
-  Generation,
   ContextProjected,
   ContextHidden,
   ContextKv,

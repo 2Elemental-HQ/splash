@@ -1308,10 +1308,6 @@ struct Runtime::Impl {
       // The draft is a text model over logical positions.
       draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
     }
-    *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Arrived),
-                        "decode arrived") = 0;
-    *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Generation),
-                        "decode generation") = 0;
   }
 
   // Batch lanes beyond the active width replay the last active request so
@@ -1450,8 +1446,6 @@ struct Runtime::Impl {
     buffers.attentionOutput = d(DecodeTensor::AttentionOutput);
     buffers.ropeCos = d(DecodeTensor::RopeCos);
     buffers.ropeSin = d(DecodeTensor::RopeSin);
-    buffers.arrived = d(DecodeTensor::Arrived);
-    buffers.generation = d(DecodeTensor::Generation);
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
@@ -1642,11 +1636,6 @@ struct Runtime::Impl {
       auto d = [&](DecodeTensor tensor) {
         return decodeArena->get(lane, tensor);
       };
-      const uint32_t generation =
-          *contents<uint32_t>(d(DecodeTensor::Generation), "target generation");
-      if (generation != geometry.target.stateLayout.layers)
-        throw std::runtime_error("target verify resident grids did not finish");
-
       laneResult.retained = *contents<uint32_t>(d(DecodeTensor::RetainedCount),
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),

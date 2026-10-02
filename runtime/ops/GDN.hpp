@@ -78,8 +78,6 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer recurrent;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer arrived;
-  metal::MetalBuffer generation;
   LinearScratch linearScratch{};
 };
 

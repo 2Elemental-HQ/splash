@@ -127,7 +127,7 @@ struct Fixture final {
   Cell cell;
   uint32_t lanes;
   MetalBuffer packed, convWeights, mixed, decayWeights, timeBias, decay, beta,
-      recurrent, hidden, arrived, generation, retained;
+      recurrent, hidden, retained;
   NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
   std::vector<MetalBuffer> packedLayer, mixedLayer, decayLayer, betaLayer;
@@ -168,8 +168,6 @@ struct Fixture final {
     hidden = alloc(rowBytes, "gdn hidden");
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
-    arrived = alloc(kMaxLanes * 4, "gdn arrived");
-    generation = alloc(kMaxLanes * 4, "gdn generation");
     retained = alloc(kMaxLanes * 4, "gdn retained");
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
       current[lane] = alloc(cell.bytes, "gdn current");
@@ -203,7 +201,7 @@ struct Fixture final {
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
       std::memset(next[lane].contents(), 0, cell.bytes);
     for (MetalBuffer *buffer :
-         {&mixed, &decay, &beta, &recurrent, &hidden, &arrived, &generation})
+         {&mixed, &decay, &beta, &recurrent, &hidden})
       std::memset(buffer->contents(), 0, buffer->sizeBytes());
   }
 
@@ -211,8 +209,7 @@ struct Fixture final {
     return {packedLayer[layer], convWeights,     current,
             next,               mixedLayer[layer], decayWeights,
             timeBias,           decayLayer[layer], betaLayer[layer],
-            recurrent,          mixerNorm,       hidden,
-            arrived,            generation};
+            recurrent,          mixerNorm,       hidden};
   }
   GdnCommitBuffers commitBuffers() const {
     return {packed, mixed, decay, beta, current, next, retained};
@@ -500,17 +497,10 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
             where + ": plain GDN claimed a table");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-    const auto *generation =
-        static_cast<const uint32_t *>(fixture.generation.contents());
-    const auto *arrived =
-        static_cast<const uint32_t *>(fixture.arrived.contents());
-    require(arrived[lane] == 0, where + ": completion counter not reset");
     if (lane >= lanes) {
-      require(generation[lane] == 0, where + ": idle lane completed");
       requireUntouched(fixture, lane, where);
       continue;
     }
-    require(generation[lane] == kLayers, where + ": layer completion count");
     for (uint32_t layer = 0; layer < kLayers; ++layer)
       checkDecode(fixture, layer, lane);
   }

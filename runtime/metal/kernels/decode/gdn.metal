@@ -19,21 +19,6 @@
 // M5 Pro, bitwise unchanged.
 constant uint kDecodeSimdgroups = 8;
 
-inline void grid_completion(device atomic_uint &arrived,
-                            device atomic_uint &generation, uint group_count,
-                            uint thread_index) {
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
-                        thread_scope_device);
-    uint ticket = atomic_fetch_add_explicit(&arrived, 1, memory_order_relaxed);
-    if (ticket + 1 == group_count) {
-      atomic_store_explicit(&arrived, 0, memory_order_relaxed);
-      atomic_fetch_add_explicit(&generation, 1, memory_order_relaxed);
-    }
-  }
-}
-
 // The threadgroup operands of one value head: the rows' prepared q/k, the
 // head's v, the gates and the recurrent output rows.
 template <uint HeadDim> struct GdnDecodeShared {
@@ -406,9 +391,8 @@ inline void gdn_decode_batch_phase(
     device uchar *next3, device bfloat *mixed, device const float *a_scale,
     device const bfloat *dt_bias, device float *decay, device bfloat *beta,
     device bfloat *recurrent, device const W *gdn_norm_weight,
-    device bfloat *gdn_hidden, device atomic_uint *arrived,
-    device atomic_uint *generation, constant GDNDecodeBatchParams &params,
-    uint2 group, uint thread_index, uint lane, uint simd_group,
+    device bfloat *gdn_hidden, constant GDNDecodeBatchParams &params,
+    uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
     device bfloat *table, device float *sums) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
@@ -466,8 +450,6 @@ inline void gdn_decode_batch_phase(
                    column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
     }
   }
-  grid_completion(arrived[batch], generation[batch], ValueHeads,
-                  thread_index);
 }
 
 // W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
@@ -481,30 +463,28 @@ inline void gdn_decode_batch_phase(
     device bfloat *mixed [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
     device const bfloat *dt_bias [[buffer(12)]], device float *decay [[buffer(13)]], \
     device bfloat *beta [[buffer(14)]], device bfloat *recurrent [[buffer(15)]], \
-    device const W *gdn_norm_weight [[buffer(16)]], device bfloat *gdn_hidden [[buffer(17)]], \
-    device atomic_uint *arrived [[buffer(18)]], device atomic_uint *generation [[buffer(19)]]
+    device const W *gdn_norm_weight [[buffer(16)]], device bfloat *gdn_hidden [[buffer(17)]]
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
-    uint thread_index [[thread_index_in_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, Layout>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
-        gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
-        thread_index, lane, simd_group, shared, table, sums);
+        gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
+        table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(18)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr, q4sg::Table64) \
   }
 // The out-projection's table (Layout: q4sg::Table64 affine, gguf_sg::Table16 GGUF).
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Layout, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(20)]], device float *sums [[buffer(21)]], \
-      constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
+      device bfloat *table [[buffer(18)]], device float *sums [[buffer(19)]], \
+      constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
   }
 

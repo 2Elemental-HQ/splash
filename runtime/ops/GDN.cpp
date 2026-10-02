@@ -83,13 +83,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare && (buffers.linearScratch.input.sizeBytes() < tableBytes(outputWidth, rows) ||
                   buffers.linearScratch.sums.sizeBytes() < tableSumsBytes(input, outputWidth, rows)))
     throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
-  bindings.reserve(prepare ? 22 : 20);
+  bindings.reserve(prepare ? 20 : 18);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
                    buffers.decay, buffers.beta, buffers.recurrent,
-                   buffers.mixerNorm.buffer, buffers.hidden, buffers.arrived,
-                   buffers.generation});
+                   buffers.mixerNorm.buffer, buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
