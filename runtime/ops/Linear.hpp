@@ -48,21 +48,23 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // before the bf16 rounding. Paired256 is the four-simdgroup N256 paired tile.
 // Simdgroup uses bf16 8x8 matrix operations and an explicit activation/split
 // workspace.
-// GgufStaged dequantizes GGUF weights per simdgroup into threadgroup memory
-// for matmul2d: 64 columns per decode threadgroup (two simdgroups) of 8, 16
-// or 32 rows with optional K splits; prefill runs 128-row tiles, or the
-// decode tiles for chunks of up to 32 rows. GgufRegister is the exact
-// register tile on bf16 8x8 matrix operations (Apple9): 64 columns per
-// threadgroup, every request lane in one threadgroup, optional K splits.
+// The GGUF tiles run 64 columns per threadgroup. The staged tiles, GgufStaged
+// and GgufPrefill, dequantize GGUF weights into threadgroup memory for
+// matmul2d. GgufStaged: the two-simdgroup staged tile of 8, 16 or 32 rows
+// (decode, and prefill chunks of up to 32 rows), each simdgroup staging its
+// own columns, with optional K splits. GgufPrefill: the 128-row shared-stage
+// prefill tile. GgufRegister is the exact register tile on bf16 8x8 matrix
+// operations (Apple9): every request lane in one threadgroup, optional K
+// splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufRegister
+  N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufPrefill, GgufRegister
 };
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
 // register tiles build from grid lookups beside their matrix operations
 // (LinearGguf.cpp, MoE.hpp).
 [[nodiscard]] bool apple9StagesFormat(uint32_t format) noexcept;
-enum class LinearSimdgroups : uint8_t { Two = 2, Four = 4, Eight = 8 };
+enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
 
 struct LinearWorkload final {
   LinearMatrix matrix;
@@ -79,12 +81,14 @@ struct LinearConfig final {
   // tiles (1 to their column tiles); 0 for every other plan, whose grid
   // covers the matrix.
   uint32_t groups = 0;
-  // Simdgroups per threadgroup, independent of the persistent grid size: the
-  // cooperative scope of one tile (Paired256 runs four).
+  // Simdgroups of an affine Q4 tile's threadgroup, independent of the
+  // persistent grid size: the cooperative scope of one tile (Paired256 runs
+  // four). The GGUF tiles fix their threadgroups in their kernels
+  // (GGUF_*_THREADS) and leave this at its default.
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
-  // Cross-threadgroup K partitions for Split128, Simdgroup and the GGUF
-  // tiles, a power of two up to kMaximumSplits (Split128 takes at least two);
-  // all other tiles use one.
+  // Cross-threadgroup K partitions for Split128, Simdgroup, GgufStaged and
+  // GgufRegister, a power of two up to kMaximumSplits (Split128 takes at
+  // least two); all other tiles use one.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 8;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
@@ -302,6 +306,8 @@ private:
   void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
                      const Projection &projection, const LinearPlan &plan,
                      const Projection *gate) const;
+  void addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                      const Projection &projection, const LinearPlan &plan) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;

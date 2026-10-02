@@ -106,6 +106,7 @@ std::string_view name(LinearTile tile) {
     ENUMERATOR_NAME(LinearTile::Paired256);
     ENUMERATOR_NAME(LinearTile::Simdgroup);
     ENUMERATOR_NAME(LinearTile::GgufStaged);
+    ENUMERATOR_NAME(LinearTile::GgufPrefill);
     ENUMERATOR_NAME(LinearTile::GgufRegister);
   }
   unnamed();
@@ -128,7 +129,6 @@ std::string_view name(LinearEpilogue epilogue) {
 }
 std::string_view name(LinearSimdgroups groups) {
   switch (groups) {
-    ENUMERATOR_NAME(LinearSimdgroups::Two);
     ENUMERATOR_NAME(LinearSimdgroups::Four);
     ENUMERATOR_NAME(LinearSimdgroups::Eight);
   }

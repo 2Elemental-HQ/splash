@@ -692,16 +692,16 @@ takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the stag
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
 lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
-families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
-threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and inputs
-per partition, from measured occupancy, Apple9's staged tile taking the register tile's) that
-does not depend on the batch width. The MoE experts (`runtime/ops/MoE.cpp`) run the same numerics
-per family over the grouped rows: the register form in `linear_gguf_sgmatrix.metal`, the staged
-one in `kernels/shared/moe_gguf.metal`, which Apple9 takes for experts mostly in the formats it
-stages (`MoeShape::expertFormat`). The float router and alpha/beta projections run in
-`kernels/shared/gguf_float.metal`, and the token rows are gathered by one template in
-`kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core count, shape and
-format.
+families: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for chunks of
+up to 32 rows. Every projection splits its K across threadgroups by one rule (`decodeSplits`: each
+tile's tiers of threadgroups per core and inputs per partition, from measured occupancy, Apple9's
+staged tile taking the register tile's) that does not depend on the batch width. The MoE experts
+(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form
+in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which Apple9
+takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). The float router and
+alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the token rows are gathered
+by one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family,
+core count, shape and format.
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and

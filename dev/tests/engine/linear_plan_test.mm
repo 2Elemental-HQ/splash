@@ -1,6 +1,7 @@
 #include "AffineQ4Fixture.hpp"
 #include "ops/Linear.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 #include "tuning/LinearNumerics.hpp"
 #include "tuning/LinearTuning.hpp"
@@ -842,7 +843,7 @@ void ggufPlans() {
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, blockProjection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&
-              single.configuration() == LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two, 2} &&
+              single.configuration() == LinearConfig{.tile = LinearTile::GgufStaged, .splits = 2} &&
               single.groups() == 80 &&
               single.input() == LinearInput::Plain &&
               single.scratchSize().partials == splitPartialsBytes(single) &&
@@ -865,26 +866,27 @@ void ggufPlans() {
                                      {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            blockProjection(5120, 17408, 1));
-    // Chunks of up to 32 rows take the decode tile and its split rule (two
-    // partitions of the 80-tile grid on 16 cores); 128-row tiles take none.
+    // Chunks of up to 32 rows take the staged tile and its split rule (two
+    // partitions of the 80-tile grid on 16 cores); the 128-row prefill tile
+    // takes none.
     const uint32_t splits = rows <= 32 ? 2 : 1;
     require(prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
                 prefill.gateScratchBytes() == gateBytes(prefill) &&
+                prefill.configuration().tile == (rows <= 32 ? LinearTile::GgufStaged : LinearTile::GgufPrefill) &&
                 prefill.configuration().splits == splits &&
-                prefill.scratchSize().partials == (splits > 1 ? splitPartialsBytes(prefill) : 0) &&
-                prefill.threadsPerThreadgroup() == (rows <= 32 ? 64U : 128U),
+                prefill.scratchSize().partials == (splits > 1 ? splitPartialsBytes(prefill) : 0),
             "GGUF prefill tile rows and splits");
   }
   // The decode tiles hold at most a decode batch.
   LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
-  rejects([&] { (void)Linear::plan(longPrefill, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two}); });
+  rejects([&] { (void)Linear::plan(longPrefill, {.tile = LinearTile::GgufStaged}); });
   // Affine and GGUF plans do not mix.
-  rejects([&] { (void)Linear::plan(down, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two, 8}); });
+  rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 8}); });
   LinearWorkload gguf = down;
   gguf.weightLayout = WeightLayout::Block32;
   rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}); });
-  rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 8}); });
-  rejects([&] { (void)Linear::plan(gguf, {LinearTile::GgufStaged, 0, LinearSimdgroups::Two, 3}); });
+  rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .groups = 80, .splits = 8}); });
+  rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .splits = 3}); });
   // The arena bound is the single-tensor plan, which fused and gate/up plans share.
   require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
           "GGUF decode scratch bound");
@@ -907,7 +909,6 @@ void ggufPlans() {
     const LinearPlan plan = anchorPlan(9, anchor);
     require(plan.configuration().tile == LinearTile::GgufRegister &&
                 plan.configuration().groups == 0 && plan.groups() == anchor.n / 64 &&
-                plan.configuration().simdgroups == LinearSimdgroups::Four &&
                 plan.input() == LinearInput::Table16,
             "Apple9 GGUF register plan");
     requireAnchorSplits(plan, anchor, "Apple9 GGUF register split policy");
@@ -932,7 +933,7 @@ void ggufPlans() {
   require(registerGateUp.gateScratchBytes() == gateBytes(registerGateUp),
           "Apple9 GGUF gate/up runs a gate pass into the gate scratch");
   require(m3.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
-                  blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufStaged,
+                  blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
           "Apple9 GGUF prefill stages");
   require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
   LinearWorkload registerDown = down;
@@ -993,24 +994,36 @@ void ggufPlans() {
     const LinearPlan decode = m3.plan({{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None},
                                       blockProjection(n, k, 1, GGUF_FMT_IQ2XXS));
     const LinearPlan chunk = m3.plan({{n, k}, 8, LinearPhase::Prefill, LinearEpilogue::None}, blockProjection(n, k, 1));
-    require(decode.configuration() == LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Two, splits} &&
+    require(decode.configuration() == LinearConfig{.tile = LinearTile::GgufStaged, .splits = splits} &&
                 chunk.configuration().splits == splits,
             "Apple9 staged split tiers");
   }
-  for (const LinearConfig config : {LinearConfig{LinearTile::GgufRegister, 0, LinearSimdgroups::Four, 3},
-                                    LinearConfig{LinearTile::GgufRegister, 0, LinearSimdgroups::Four, 16},
-                                    LinearConfig{LinearTile::GgufRegister, 80, LinearSimdgroups::Four, 8},
-                                    LinearConfig{LinearTile::GgufRegister, 0, LinearSimdgroups::Two, 8}})
+  for (const LinearConfig config : {LinearConfig{.tile = LinearTile::GgufRegister, .splits = 3},
+                                    LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16},
+                                    LinearConfig{.tile = LinearTile::GgufRegister, .groups = 80, .splits = 8}})
     rejects([&] { (void)Linear::plan(registerDown, config); });
   // Split boundaries fall on 256-input units, and prefill has no register tile.
+  const LinearWorkload chunk{{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
   rejects([&] {
     (void)Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
-                         {LinearTile::GgufRegister, 0, LinearSimdgroups::Four, 4});
+                         {.tile = LinearTile::GgufRegister, .splits = 4});
   });
-  rejects([&] {
-    (void)Linear::plan({{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32},
-                         {LinearTile::GgufRegister, 0, LinearSimdgroups::Four, 1});
-  });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufRegister}); });
+  // The GGUF kernels fix their threadgroups (GGUF_*_THREADS): every GGUF tile
+  // takes the default simdgroups.
+  const auto fixedThreadgroup = [](LinearWorkload workload, LinearConfig config, uint32_t threads) {
+    require(Linear::plan(workload, config).threadsPerThreadgroup() == threads,
+            "a GGUF plan's threadgroup is not its kernel's");
+    config.simdgroups = LinearSimdgroups::Four;
+    rejects([&] { (void)Linear::plan(workload, config); });
+  };
+  fixedThreadgroup(registerDown, {.tile = LinearTile::GgufRegister, .splits = 8}, GGUF_REGISTER_THREADS);
+  fixedThreadgroup(registerDown, {.tile = LinearTile::GgufStaged, .splits = 2}, GGUF_STAGED_THREADS);
+  fixedThreadgroup(chunk, {.tile = LinearTile::GgufPrefill}, GGUF_PREFILL_THREADS);
+  // The prefill tile runs prefill chunks on their matrix grid, unsplit.
+  rejects([&] { (void)Linear::plan(registerDown, {.tile = LinearTile::GgufPrefill}); });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .groups = 80}); });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 2}); });
 }
 
 // The GGUF decode split rules are per-core laws, checked at every core count

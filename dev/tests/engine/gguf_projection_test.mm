@@ -390,11 +390,9 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload or a prefill chunk.
+// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows.
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits) {
-  if (w.phase == LinearPhase::Prefill) return {LinearTile::GgufStaged, 0, LinearSimdgroups::Two, splits};
-  return tile == LinearTile::GgufRegister ? LinearConfig{tile, 0, LinearSimdgroups::Four, splits}
-                                           : LinearConfig{tile, 0, LinearSimdgroups::Two, splits};
+  return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits};
 }
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue, WeightLayout::Block32};
@@ -533,7 +531,7 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 // segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t K = 1024, kChunks[] = {168, 136}, kSimdgroupRows = 32, kSplitChunk = 4;
-  constexpr LinearConfig kTiles{LinearTile::GgufStaged, 0, LinearSimdgroups::Four, 1};
+  constexpr LinearConfig kTiles{.tile = LinearTile::GgufPrefill};
   const auto chunks = [&](const Projection &p, const std::vector<const Tensor *> &parts, LinearEpilogue epilogue,
                           const std::string &what) {
     const uint32_t covered = segmentColumns(parts), columns = p.outputSize;

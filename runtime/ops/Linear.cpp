@@ -32,6 +32,10 @@ bool persistentTile(LinearTile tile) noexcept {
   return tile == LinearTile::N128 || tile == LinearTile::N256 || tile == LinearTile::Paired128 ||
          tile == LinearTile::Paired256;
 }
+// The tiles of block (GGUF) projections.
+bool blockTile(LinearTile tile) noexcept {
+  return tile == LinearTile::GgufStaged || tile == LinearTile::GgufPrefill || tile == LinearTile::GgufRegister;
+}
 // Simdgroups fixed by the kernel instance: the paired N256 tile runs four and
 // Split128 the N128 tile's eight.
 std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
@@ -43,6 +47,7 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::N256:
   case LinearTile::Paired128:
   case LinearTile::GgufStaged:
+  case LinearTile::GgufPrefill:
   case LinearTile::GgufRegister: return std::nullopt;
   }
   return std::nullopt;
@@ -128,7 +133,8 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
   case LinearTile::Simdgroup: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::GgufStaged:
-  case LinearTile::GgufRegister: return 64;
+  case LinearTile::GgufPrefill:
+  case LinearTile::GgufRegister: return GGUF_TILE_COLUMNS;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -141,7 +147,18 @@ uint32_t LinearPlan::groups() const noexcept {
   return config_.groups ? config_.groups : workload_.matrix.outputSize / tileColumns();
 }
 uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
-  return static_cast<uint32_t>(config_.simdgroups) * 32;
+  switch (config_.tile) {
+  case LinearTile::GgufStaged: return GGUF_STAGED_THREADS;
+  case LinearTile::GgufPrefill: return GGUF_PREFILL_THREADS;
+  case LinearTile::GgufRegister: return GGUF_REGISTER_THREADS;
+  case LinearTile::N128:
+  case LinearTile::N256:
+  case LinearTile::Paired128:
+  case LinearTile::Split128:
+  case LinearTile::Paired256:
+  case LinearTile::Simdgroup: return static_cast<uint32_t>(config_.simdgroups) * 32;
+  }
+  return 0;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
@@ -188,7 +205,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   if (destination == FloatOutput::Float32 &&
       (w.phase != LinearPhase::Decode || w.epilogue != LinearEpilogue::None))
     throw std::invalid_argument("an fp32 destination takes a plain decode projection");
-  const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufRegister;
+  const bool ggufTile = blockTile(config.tile);
   if (ggufTile != (w.weightLayout == WeightLayout::Block32))
     throw std::invalid_argument("block projections run the GGUF tiles, affine ones the Q4 tiles");
   if (w.phase == LinearPhase::Decode && persistentTile(config.tile)

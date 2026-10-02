@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
-        const LinearConfig config{LinearTile::GgufStaged, 0, LinearSimdgroups::Four, 1};
+        const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config),
                          config == linear.plan(w, ring.front()).configuration(), {}});
       }
@@ -137,8 +137,7 @@ int main(int argc, char **argv) {
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
-            const LinearConfig config{tile, 0, registerTile ? LinearSimdgroups::Four : LinearSimdgroups::Two,
-                                      splits};
+            const LinearConfig config{.tile = tile, .splits = splits};
             cases.push_back({"L" + std::to_string(lanes),
                              std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
                              Linear::plan(w, config), config == policy, {}});
