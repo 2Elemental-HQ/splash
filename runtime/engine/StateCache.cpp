@@ -96,11 +96,6 @@ std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
   return CompositeStateLease(*this, kvBlock, boundary, copy(entry));
 }
 
-void StateCache::recordLookup(bool hit, bool disk) noexcept {
-  hit ? ++hits_ : ++misses_;
-  if (disk) ++diskHits_;
-}
-
 bool StateCache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
   return stateResident(kvBlock) && reuseStoredState(kvBlock, checkpoint);
 }
@@ -118,7 +113,6 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   if (!entry.pins)
     entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
-  ++deduplicatedPublications_;
   return true;
 }
 
@@ -459,13 +453,9 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   result.offloads = offloads_;
   result.offloadFailures = offloadFailures_;
   result.invalidations = invalidations_;
-  result.diskHits = diskHits_;
   result.promotions = promotions_;
   result.promotionsSkipped = promotionsSkipped_;
-  result.hits = hits_;
-  result.misses = misses_;
   result.publications = publications_;
-  result.deduplicatedPublications = deduplicatedPublications_;
   result.evictions = evictions_;
   result.inUse = static_cast<uint32_t>(
       std::min<uint64_t>(uses_.size(), std::numeric_limits<uint32_t>::max()));

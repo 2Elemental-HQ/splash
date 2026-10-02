@@ -157,11 +157,9 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
 }
 
 void Cache::recordLookup(const CacheLookup &result) {
-  ++lookup_.lookups;
   lookup_.kvHitTokens += result.kvBoundary;
-  lookup_.stateHitTokens += result.resumeBoundary();
-  states_.recordLookup(result.state.has_value(),
-                       result.state && !result.state->state()->residentBytes());
+  if (result.state && !result.state->state()->residentBytes())
+    ++lookup_.stateDiskHits;
   if (result.junctionBoundary)
     ++lookup_.lazyJunctions;
   if (result.lostState)

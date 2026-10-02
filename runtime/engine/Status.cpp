@@ -159,15 +159,13 @@ std::string runtimeStatusJson(
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
       << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
-      << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
       << ",\"publications\":" << state.publications
-      << ",\"deduplicated_publications\":" << state.deduplicatedPublications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
       << ",\"checkpoint_retirements\":" << state.checkpointRetirements
-      << ",\"disk_hits\":" << state.diskHits
+      << ",\"disk_hits\":" << lookup.stateDiskHits
       << ",\"disk_promotions\":" << state.promotions
       << ",\"disk_promotions_skipped\":" << state.promotionsSkipped
       << ",\"disk_bytes\":" << state.diskBytes
@@ -189,13 +187,11 @@ std::string runtimeStatusJson(
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
       << "}"
-      << ",\"cache\":{\"lookups\":" << lookup.lookups
-      << ",\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
+      << ",\"cache\":{\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
       << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
-      << ",\"state_hit_tokens\":" << lookup.stateHitTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications

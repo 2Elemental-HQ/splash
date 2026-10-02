@@ -100,10 +100,9 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointRetirements = 3;
   engine.resources.stateCache.inUse = 2;
   engine.resources.stateCache.inUseEvictions = 5;
-  engine.resources.lookup = {.lookups = 3,
-                             .probeHashedBlocks = 7,
+  engine.resources.lookup = {.probeHashedBlocks = 7,
                              .kvHitTokens = 128,
-                             .stateHitTokens = 64,
+                             .stateDiskHits = 1,
                              .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
@@ -261,6 +260,14 @@ void testCleanRuntimeStatus() {
   require(json.find("\"pinned\":0,\"in_use\":2,\"in_use_evictions\":5,") !=
               std::string::npos,
           "states unfinished requests use are missing from status");
+  require(json.find("\"cache\":{\"probe_hashed_blocks\":7,\"hits\":1,\"cold_misses\":2,") !=
+              std::string::npos &&
+              json.find("\"disk_hits\":1,") != std::string::npos &&
+              json.find("\"misses\"") == std::string::npos &&
+              json.find("\"lookups\"") == std::string::npos &&
+              json.find("\"state_hit_tokens\"") == std::string::npos &&
+              json.find("\"deduplicated_publications\"") == std::string::npos,
+          "status reported a lookup counter twice");
   require(json.find("\"block_tokens\":32") != std::string::npos &&
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,
@@ -280,8 +287,6 @@ void testCleanRuntimeStatus() {
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
           json.find("\"resource_suspensions\":5,\"priority_suspensions\":2,") !=
-              std::string::npos &&
-          json.find("\"cache\":{\"lookups\":3,\"probe_hashed_blocks\":7,") !=
               std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"

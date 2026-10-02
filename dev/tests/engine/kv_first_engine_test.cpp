@@ -2285,6 +2285,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   engine.submit(request(200, std::vector<uint32_t>(65, 200)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
+  const uint64_t cacheHits = engine.snapshot().cacheHits;
   const uint64_t coldMisses = engine.snapshot().coldMisses;
   const uint32_t attempts = executor.beginAttempts;
 
@@ -2298,7 +2299,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
               resources.snapshot().stateCache.entries ==
                   cached.stateCache.entries &&
               resources.snapshot().pool.pagesPrefix == cached.pool.pagesPrefix &&
-              resources.snapshot().lookup.lookups == cached.lookup.lookups &&
+              engine.snapshot().cacheHits == cacheHits &&
               engine.snapshot().coldMisses == coldMisses &&
               engine.snapshot().scheduler.waitingResources == 1,
           "paused state admission drained the cache or retried without backoff");
@@ -2307,7 +2308,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   for (double now = 120.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && events.completedCount == 2 &&
-              resources.snapshot().lookup.lookups == cached.lookup.lookups + 1 &&
+              engine.snapshot().cacheHits == cacheHits &&
               engine.snapshot().coldMisses == coldMisses + 1 &&
               events.capacityExhaustedCount == 0 && events.failedCount == 0,
           "state admission did not recover after host pressure cleared");
@@ -3071,7 +3072,7 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
               events.starts.back().first == EngineCacheStatus::PrefixHit &&
               events.starts.back().second == 64 &&
               after.cacheHits == before.cacheHits + 1 &&
-              after.resources.lookup.lookups == before.resources.lookup.lookups + 1,
+              after.coldMisses == before.coldMisses,
           "successful retry failed to restore/count the protected cache state");
 }
 
@@ -3099,8 +3100,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
               events.capacityExhaustedCount == 0 && executor.restored == 0 &&
               executor.prefillRows == 130 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0 &&
-              resources.snapshot().lookup.lookups == 2,
+              engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0,
           "admission waited on its own cache pin instead of recomputing cold");
 }
 
@@ -4153,8 +4153,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               events.usage.at(251) == std::pair<uint32_t, uint32_t>{24, 4} &&
               events.startIds.size() == 3 &&
               events.maskRequests.empty() &&
-              engine.snapshot().resources.lookup.lookups == 3 &&
-              engine.snapshot().coldMisses == 3,
+              engine.snapshot().cacheHits == 0 && engine.snapshot().coldMisses == 3,
           "resource replay emitted prior output or changed request usage/hits");
   require(executor.requests.empty() && executor.snapshotAttempts == 0 &&
               resources.snapshot().pool.pagesActive == 0 &&
@@ -4524,7 +4523,6 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   // Lookups keep both prompts' states at 64 resident while the lanes contend
   // for pages: the preempted lane then resumes from its own.
   const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {260, 261});
-  const uint64_t lookups = engine.snapshot().resources.lookup.lookups;
   for (double now = 100; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && executor.suspensions == 1 &&
@@ -4538,7 +4536,6 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
               events.outputs.at(260) == std::vector<uint32_t>(30, 42) &&
               events.outputs.at(261) == std::vector<uint32_t>(30, 42) &&
               events.usage.at(260) == std::pair<uint32_t, uint32_t>{65, 30} &&
-              engine.snapshot().resources.lookup.lookups == lookups &&
               engine.snapshot().cacheHits == 0 &&
               engine.snapshot().coldMisses == 2,
           "internal cache restore changed output or request accounting");
@@ -4610,7 +4607,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
             "failed recovery replayed work or ignored retry backoff");
     require(engine.nextWakeupMilliseconds() == 301 &&
                 events.startIds.size() == 1 &&
-                engine.snapshot().resources.lookup.lookups == 1 &&
+                engine.snapshot().cacheHits + engine.snapshot().coldMisses == 1 &&
                 resources.snapshot().pool.pagesActive == 0 &&
                 resources.snapshot().activeRequests == 0,
             "repeated preemption retained KV or duplicated admission counters");
@@ -6755,8 +6752,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
   const auto counters = engine.snapshot();
   require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
               counters.replayStatePublications == 1 &&
-              counters.deduplicatedStatePublications == 1 &&
-              counters.resources.stateCache.deduplicatedPublications == 1,
+              counters.deduplicatedStatePublications == 1,
           "a state already on disk was counted as written");
 }
 
@@ -7366,7 +7362,7 @@ void testRepeatedDiskHitPromotesToMemory() {
     runUntilIdle(engine);
   }
   require(executor.diskReads == 1 && cache.snapshot().stateCache.promotions == 1 &&
-              cache.snapshot().stateCache.diskHits == 1 && events.failedCount == 0,
+              cache.snapshot().lookup.stateDiskHits == 1 && events.failedCount == 0,
           "hot restored prefix continued to read from disk");
 }
 

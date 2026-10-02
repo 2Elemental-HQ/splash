@@ -53,11 +53,11 @@ private:
 };
 
 struct CacheLookupSnapshot final {
-  uint64_t lookups = 0;
   // KV blocks scheduling probes hashed: admission work between commands.
   uint64_t probeHashedBlocks = 0;
   uint64_t kvHitTokens = 0;
-  uint64_t stateHitTokens = 0;
+  // Lookups whose state came from disk.
+  uint64_t stateDiskHits = 0;
   // Lookups that matched KV past their state at a branch point.
   uint64_t lazyJunctions = 0;
   // Lookups that matched KV where a reusable state used to be.

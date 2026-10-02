@@ -80,15 +80,11 @@ struct StateCacheSnapshot {
   uint64_t offloads = 0;
   uint64_t offloadFailures = 0;
   uint64_t invalidations = 0;
-  uint64_t diskHits = 0;
   uint64_t promotions = 0;
   // Restores that left no RAM copy behind: the request runs from the
   // disk copy either way.
   uint64_t promotionsSkipped = 0;
-  uint64_t hits = 0;
-  uint64_t misses = 0;
   uint64_t publications = 0;
-  uint64_t deduplicatedPublications = 0;
   uint64_t evictions = 0;
   // Blocks unfinished requests resume from, whether a state is still
   // cached there or not, and valid states at such a block that left all
@@ -146,13 +142,11 @@ public:
 
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireDeepest(std::span<const uint64_t> kvChain);
-  // Acquisition pins the state; accounting occurs only when admission succeeds.
-  void recordLookup(bool hit, bool disk = false) noexcept;
 
-  // Reuses a RAM copy without a restore pin or lookup accounting. A normal
-  // boundary upgrades a checkpoint; a checkpoint cannot downgrade an
-  // ordinary state. False for a state that is absent or only on disk: the
-  // caller publishes the copy it holds, which is promotion without a read.
+  // Reuses a RAM copy without a restore pin. A normal boundary upgrades a
+  // checkpoint; a checkpoint cannot downgrade an ordinary state. False for a
+  // state that is absent or only on disk: the caller publishes the copy it
+  // holds, which is promotion without a read.
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
   // The same for a copy in either tier.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
@@ -323,11 +317,7 @@ private:
   uint64_t bytes_ = 0;
   uint64_t diskBytes_ = 0;
   uint32_t pinnedEntries_ = 0;
-  uint64_t diskHits_ = 0;
-  uint64_t hits_ = 0;
-  uint64_t misses_ = 0;
   uint64_t publications_ = 0;
-  uint64_t deduplicatedPublications_ = 0;
   uint64_t evictions_ = 0;
   uint64_t checkpointEntries_ = 0;
   uint64_t checkpointBytes_ = 0;

@@ -241,7 +241,7 @@ void testSchedulingProbeDoesNotChangeCachePolicy() {
   const auto prefix = std::span<const uint32_t>(fixture.prompt).first(33);
   require(cachedTokens(prefix) == 32 && cachedTokens(fixture.prompt) == 128 &&
               fixture.cache.snapshot().stateCache.pinned == 0 &&
-              fixture.cache.snapshot().lookup.lookups == 0,
+              fixture.cache.snapshot().lookup.kvHitTokens == 0,
           "scheduling probe pinned a lease or counted a cache hit");
   require(fixture.cache.reclaimOneState(false, 0, false) && cachedTokens(prefix) == 0 &&
               cachedTokens(fixture.prompt) == 128,
@@ -255,7 +255,7 @@ void testValidAdmissionProbePreservesLookupAndAccounting() {
   const CacheProbe probe = fixture.cache.probe(fixture.prompt);
   const auto before = fixture.cache.snapshot();
   require(probe.cachedTokens() == 96 && before.stateCache.pinned == 0 &&
-              before.lookup.lookups == 0,
+              before.lookup.kvHitTokens == 0,
           "admission probe changed cache ownership or accounting");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
   require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 96 &&
@@ -263,9 +263,7 @@ void testValidAdmissionProbePreservesLookupAndAccounting() {
           "valid admission probe lost the deepest state or KV tail");
   fixture.cache.recordLookup(lookup);
   const auto after = fixture.cache.snapshot();
-  require(after.lookup.lookups == 1 && after.lookup.kvHitTokens == 128 &&
-              after.lookup.stateHitTokens == 96 &&
-              after.lookup.lazyJunctions == 0 &&
+  require(after.lookup.kvHitTokens == 128 && after.lookup.lazyJunctions == 0 &&
               after.stateCache.pinned == 1,
           "admission probe changed lookup accounting or lease ownership");
 }
@@ -700,9 +698,8 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
   require(!fixture.cache.reuseCompositeState(fixture.blocks[2]),
           "publication probe found a state that was never published");
   const auto probed = fixture.cache.snapshot();
-  require(probed.stateCache.hits == before.stateCache.hits &&
-              probed.stateCache.misses == before.stateCache.misses &&
-              probed.stateCache.deduplicatedPublications == 1,
+  require(probed.lookup.kvHitTokens == before.lookup.kvHitTokens &&
+              probed.lookup.stateDiskHits == before.lookup.stateDiskHits,
           "publication probe polluted restore hit/miss accounting");
   require(reclaimStateBytes(fixture.cache, CacheReclaimMode::ReleaseExtents) == 200,
           "publication probe did not promote the existing state in LRU");
@@ -1457,8 +1454,7 @@ void testDiskPublicationLifecycle() {
               fixture.cache.snapshot().stateCache.entries == 1 && control->slots == 1,
           "a second write started beside the one in flight");
   require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&
-              fixture.cache.snapshot().stateCache.offloads == 1 &&
-              fixture.cache.snapshot().stateCache.deduplicatedPublications == 1,
+              fixture.cache.snapshot().stateCache.offloads == 1,
           "a block already on disk was written again");
   control->ready = true;
   require(fixture.cache.pollTransfers() && !fixture.cache.pollTransfers(),
