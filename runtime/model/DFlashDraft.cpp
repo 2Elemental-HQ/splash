@@ -30,6 +30,35 @@ void requireLayout(const DFlashDraftLayout &layout) {
   validateQ4Layout(layout.selectorRank, layout.hiddenSize);
 }
 
+// The key and value rows of each layer's fused QKV projection, without a
+// copy: affine planes store whole tiles of kQ4StorageN rows in row order
+// (AffinePreparation), so rows from a tile boundary on are one range of
+// each plane.
+std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
+                                           const DFlashDraftWeights &weights) {
+  const DFlashDraftLayout &layout = weights.layout;
+  if (layout.attentionSize >= layout.qkvSize ||
+      layout.attentionSize % kQ4StorageN) {
+    throw std::invalid_argument(
+        "draft key and value rows do not start at a storage tile");
+  }
+  std::vector<ops::Projection> result;
+  result.reserve(weights.layers.size());
+  for (const DFlashDraftLayerWeights &layer : weights.layers) {
+    const ops::AffineWeights &fused = layer.qkvProjection.affine();
+    const auto rows = [&](const metal::MetalBuffer &plane) {
+      const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;
+      return backend.view(plane, uint64_t{layout.attentionSize} * rowBytes,
+                          uint64_t{layout.contextKvSize()} * rowBytes);
+    };
+    result.emplace_back(layout.contextKvSize(), layout.hiddenSize,
+                        ops::AffineWeights{rows(fused.weights),
+                                           rows(fused.scales),
+                                           rows(fused.biases)});
+  }
+  return result;
+}
+
 } // namespace
 
 DFlashDraftRing::DFlashDraftRing(
@@ -65,7 +94,8 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize) {}
+      selector_(weights.layout.vocabularySize),
+      contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, DFlashSelectionBuffers buffers,
@@ -102,17 +132,17 @@ void DFlashDraft::addContextPrefill(
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addPrefill(graph, buffers.hidden,
-                      weights_.layers[layer].qkvProjection, buffers.qkv,
-                      buffers.projectionSums, rows);
+                      contextKvProjections_[layer],
+                      buffers.contextKv, buffers.projectionSums, rows);
     for (const DFlashPrefillSpan &span : spans) {
-      const uint64_t qkvOffset =
-          uint64_t{span.compactRow} * layout.qkvSize * sizeof(uint16_t);
+      const uint64_t kvOffset =
+          uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
       const uint64_t ropeOffset =
           uint64_t{span.compactRow} * (layout.attentionHeadDimension / 2) * sizeof(float);
       ops::DraftAttention::addContextPrefill(
           graph,
-          backend_.view(buffers.qkv, qkvOffset,
-                        uint64_t{span.rows} * layout.qkvSize *
+          backend_.view(buffers.contextKv, kvOffset,
+                        uint64_t{span.rows} * layout.contextKvSize() *
                             sizeof(uint16_t)),
           weights_.layers[layer].keyNorm,
           backend_.view(buffers.ropeCos, ropeOffset,
@@ -239,17 +269,19 @@ void DFlashDraft::addContextCommit(
   operators_.linear().addDecodeBatch(graph,
                      buffers.capturedTargetHidden, weights_.contextProjection,
                      buffers.projected, lanes, stats, buffers.linearScratch);
-  // Every layer's qkv projection reads the same normalized rows.
+  // Every layer's key and value projection reads the same normalized rows.
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
-      buffers.linearScratch, operators_.linear().decodePlan(weights_.layers[0].qkvProjection, lanes).input());
+      buffers.linearScratch,
+      operators_.linear().decodePlan(contextKvProjections_[0], lanes).input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     hidden = operators_.linear().addDecodeBatch(graph, buffers.hidden,
-                       weights_.layers[layer].qkvProjection, buffers.qkv,
-                       lanes, stats, buffers.linearScratch, hidden);
+                       contextKvProjections_[layer],
+                       buffers.contextKv, lanes, stats, buffers.linearScratch,
+                       hidden);
     ops::DraftAttention::addContextCommit(
-        graph, buffers.qkv, weights_.layers[layer].keyNorm, buffers.ropeCos,
+        graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
         startPositions, layout.stateLayout().tokens, layout.attentionShape(),

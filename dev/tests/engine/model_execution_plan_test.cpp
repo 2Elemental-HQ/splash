@@ -209,7 +209,8 @@ void checkLaneScratch(const model::ModelPackage &package) {
   const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
   std::vector<ops::LinearMatrix> matrices{
-      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+      {d.hiddenSize, d.attentionSize},
       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
   for (const auto &p : geometry.target.decodeProjections)

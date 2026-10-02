@@ -2,15 +2,18 @@
 
 #include "metal/abi/KernelABI.h"
 
+// One KV head of one context row: a row of context_kv holds the row's keys,
+// then its values (KWidth each). The keys are normalized and rotated into
+// the ring slot of the row's position; the values are copied there.
 inline void draft_context_kv_phase(
-    device const bfloat *context_qkv, device const bfloat *k_norm,
+    device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *keys, device bfloat *values,
     DraftContextParams params, uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
   constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
-  constexpr uint QWidth = 4096, KWidth = 1024, PackedWidth = 6144;
+  constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)
     return;
@@ -18,7 +21,7 @@ inline void draft_context_kv_phase(
   uint position = params.start_position + row;
   uint slot = position % Window;
   device const bfloat *source =
-      context_qkv + ulong(row) * PackedWidth + QWidth + head_index * HeadDim;
+      context_kv + ulong(row) * RowWidth + head_index * HeadDim;
   device bfloat *key =
       keys + (ulong(head_index) * params.cache_stride + slot) * HeadDim;
   device bfloat *value =

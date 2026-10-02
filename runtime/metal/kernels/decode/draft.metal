@@ -111,7 +111,7 @@ inline void draft_qkv_prepare_phase(
 }
 
 kernel void draft_context_kv_commit(
-    device const bfloat *context_qkv [[buffer(0)]],
+    device const bfloat *context_kv [[buffer(0)]],
     device const bfloat *k_norm [[buffer(1)]],
     device const float *rope_cos [[buffer(2)]],
     device const float *rope_sin [[buffer(3)]],
@@ -129,7 +129,8 @@ kernel void draft_context_kv_commit(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint KVHeads = 8;
-  constexpr uint PackedWidth = 6144;
+  // A context row's keys and values (draft_context_kv_phase).
+  constexpr uint RowWidth = 2 * KVHeads * 128;
   constexpr uint RopeLaneStride = Rows * 64;
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
@@ -146,7 +147,7 @@ kernel void draft_context_kv_commit(
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
   draft_context_kv_phase(
-      context_qkv + ulong(batch) * Rows * PackedWidth, k_norm,
+      context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
       rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
       min(retained[batch], Rows), task, thread_index, lane, simd_group,

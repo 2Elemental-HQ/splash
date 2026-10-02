@@ -1127,7 +1127,7 @@ struct Runtime::Impl {
         graph,
         {p(PrefillTensor::Captured), p(PrefillTensor::ProjectionSums),
          p(PrefillTensor::ContextProjected), p(PrefillTensor::ContextHidden),
-         p(PrefillTensor::ContextQkv), p(PrefillTensor::DraftRopeCos),
+         p(PrefillTensor::ContextKv), p(PrefillTensor::DraftRopeCos),
          p(PrefillTensor::DraftRopeSin)},
         batch.capturedRows, std::span(spans).first(spanCount));
   }
@@ -1539,7 +1539,7 @@ struct Runtime::Impl {
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.projected = d(DecodeTensor::ContextProjected);
     buffers.hidden = d(DecodeTensor::ContextHidden);
-    buffers.qkv = d(DecodeTensor::ContextQkv);
+    buffers.contextKv = d(DecodeTensor::ContextKv);
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
