@@ -99,7 +99,8 @@ origin and the `--allowed-origin` flag that would accept it, once per origin. A
 `'*'` admits; the server does not print its refusal. Origins match exactly: a
 pattern such as `tauri://*` or `http://*.example.com` is refused at startup;
 only a bare `'*'` admits every origin. With `'*'` every page open in a browser
-that reaches the server can use it, so set `--api-key` too.
+that reaches the server can use it, so set `--api-key` too; the server warns at
+startup without one.
 
 Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
 `SPLASH_PORT` in the local agent shell. Separate ports allow separate servers;

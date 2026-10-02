@@ -2478,6 +2478,12 @@ def main():
             allowed_origins=args.allowed_origin,
         )
         server.server_bind()
+        if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
+            print_status(
+                "Warning · --allowed-origin '*' without --api-key lets every web "
+                "page open in a browser that reaches this server use it",
+                error=True,
+            )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
         tokenizer = AutoTokenizer.from_pretrained(

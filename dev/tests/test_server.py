@@ -32,7 +32,7 @@ from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
-from server.origins import parse_allowed_origin
+from server.origins import ANY_ORIGIN, parse_allowed_origin
 from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
@@ -3752,6 +3752,59 @@ class ServerTest(unittest.TestCase):
                     ),
                     status.call_args_list,
                 )
+
+    def test_main_wires_allowed_origins_and_warns_without_a_key(self):
+        warning = mock.call(
+            "Warning · --allowed-origin '*' without --api-key lets every web "
+            "page open in a browser that reaches this server use it",
+            error=True,
+        )
+        for origins, key, warned in (
+            ([("tauri", "localhost", None)], None, False),
+            ([ANY_ORIGIN], None, True),
+            ([ANY_ORIGIN], "key", False),
+        ):
+            with self.subTest(origins=origins, key=key):
+                runtime = mock.Mock()
+                runtime.readiness = native_wire.ReadyEvent(
+                    engine_instance_id=1,
+                    max_concurrent_requests=4,
+                    max_context_tokens=131072,
+                    feature_bits=15,
+                )
+                with (
+                    mock.patch.object(
+                        api,
+                        "parse_args",
+                        return_value=main_args(allowed_origin=origins, api_key=key),
+                    ),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(
+                        api.engine_runtime,
+                        "MultiplexedRuntime",
+                        return_value=runtime,
+                    ),
+                    mock.patch.object(api, "NativeBackend"),
+                    mock.patch.object(api, "ConstraintFactory"),
+                    mock.patch.object(api, "Frontend"),
+                    mock.patch.object(
+                        api,
+                        "FrontendServer",
+                        return_value=mock.Mock(server_port=8000),
+                    ) as server_type,
+                    mock.patch.object(api.signal, "signal"),
+                    mock.patch.object(api, "print_status") as status,
+                ):
+                    api.main()
+                self.assertEqual(
+                    server_type.call_args.kwargs["allowed_origins"], origins
+                )
+                self.assertIs(warning in status.call_args_list, warned)
 
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
         args = main_args(max_context=128, max_memory=32 * 1024**3)
