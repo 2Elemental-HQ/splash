@@ -129,6 +129,14 @@ struct CacheReclaimResult final {
 
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
 
+// The highest class a reclaim step may take (the class rule). Ordinary:
+// checkpoints, ordinary states and KV, for work a resident lane holds
+// back anyway (a start beside one: Engine's inService is false). InUse:
+// after all of those, the states unfinished requests use and the KV they
+// restore through, for running work (a resident lane, or a start that no
+// resident lane precedes) and for pressure passes.
+enum class ReclaimClass : uint8_t { Ordinary, InUse };
+
 // What one step of room for a state's snapshot gave: a recycled state's
 // buffers, which the snapshot takes as they are, or a released extent's
 // bytes, which the snapshot has to allocate and which may be fewer than a
@@ -268,16 +276,23 @@ public:
   // allocation frees only what it needs. Progress is distinct from released
   // bytes because evicting a KV reference can make a page reusable without
   // emptying its extent, and the extent a step empties may be the runway
-  // it keeps.
-  [[nodiscard]] CacheReclaimResult reclaimOne(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseExtents,
-      bool keepResumePoint = false, bool keepRunway = false);
+  // it keeps. The step takes nothing of a class above upTo: with Ordinary,
+  // once only what is in use is left, it makes no progress, and reports
+  // pending while a transfer is in flight.
+  [[nodiscard]] CacheReclaimResult reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
+                                              bool keepResumePoint = false,
+                                              bool keepRunway = false);
   // The reclaim step for a KV admission the pool denied: evicts in
-  // reclaimOne(KeepExtents)'s order until the free pages and the pages whose
-  // demotion is in flight cover `pages` (the admission's additionalPages),
-  // until an evicted state has returned memory (the retry may then grow the
-  // pool), or until nothing more can go; one step instead of a retry per page.
-  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages);
+  // reclaimOne(KeepExtents, upTo)'s order until the free pages and the pages
+  // whose demotion is in flight cover `pages` (the admission's
+  // additionalPages), until an evicted state has returned memory (the retry
+  // may then grow the pool), or until nothing more of the class can go; one
+  // step instead of a retry per page.
+  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, ReclaimClass upTo);
+  // The most pages reclaimForPages(pages, upTo) can leave free: every
+  // allocated page no request holds, but with Ordinary not the idle KV that
+  // states in use restore through.
+  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
   // One step of room for the snapshot of a state to publish at forBlock,
   // taking nothing of a higher class than that publication; the disk tier
   // keeps a state it admits. An optional publication (checkpointsOnly) takes
@@ -300,14 +315,16 @@ public:
   [[nodiscard]] StateRoom reclaimOneState(bool checkpointsOnly = false, uint64_t forBlock = 0,
                                           bool growth = true);
   // Recycles one unpinned state, preferring checkpoints, for a lane that
-  // takes the state's buffers. The lane is running work: a state in use goes
-  // once no other state is left and no transfer in flight can return what is
-  // needed first. A state the tier could take once the write in flight has
-  // finished stays and is reported pending, as in reclaimOne.
-  // evictableStates() are those it can take.
-  [[nodiscard]] CacheReclaimResult reclaimStateForLane();
-  [[nodiscard]] uint32_t evictableStates() const noexcept {
-    return states_.evictableStates();
+  // takes the state's buffers, taking nothing of a class above upTo. For
+  // running work (InUse) a state in use goes once no other state is left and
+  // no transfer in flight can return what is needed first; a start that a
+  // resident lane holds back (Ordinary) takes nothing in use. A state the
+  // tier could take once the write in flight has finished stays and is
+  // reported pending, as in reclaimOne. evictableStates(upTo) are those it
+  // can take.
+  [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
+  [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
+    return states_.evictableStates(upTo == ReclaimClass::InUse);
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
 
@@ -371,9 +388,9 @@ private:
 
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
-  // One eviction: checkpoints first, then the shared recency order, then
-  // what is in use.
-  [[nodiscard]] CacheReclaimResult evictOne(bool keepResumePoint);
+  // One eviction: checkpoints first, then the shared recency order, then,
+  // up to InUse, what is in use.
+  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint);
   // Reclaims a chosen state; with waitForWrite only the write in flight may
   // keep it.
   [[nodiscard]] StateEviction reclaimState(uint64_t block, bool waitForWrite);

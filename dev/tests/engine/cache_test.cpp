@@ -108,13 +108,14 @@ void testActiveTipProtectsTheContentChain() {
   resources.beginRequest(2);
 
   engine::TokenAdmission blocked = resources.ensureTokens(2, 96);
-  require(!blocked.granted() &&
-              !resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
-              resources.snapshot().kvCache.blocks == 2,
-          "memory pressure evicted an active request KV tip");
+  require(
+      !blocked.granted() &&
+          !resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+          resources.snapshot().kvCache.blocks == 2,
+      "memory pressure evicted an active request KV tip");
 
   resources.endRequest(1);
-  require(resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
+  require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
               resources.ensureTokens(2, 96).granted(),
           "released KV tip did not become reclaimable");
   resources.endRequest(2);
@@ -161,7 +162,8 @@ void testFragmentedColdKvPrecedesNewerState() {
   resources.endRequest(1);
   publish(resources, stateBlock, 100);
 
-  const auto reclaimed = resources.reclaimOne();
+  const auto reclaimed =
+      resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 3 &&
               resources.snapshot().stateCache.entries == 1 &&
@@ -180,7 +182,7 @@ void testReplacementKeepsTheExtentItEmpties() {
   static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
   resources.endRequest(1);
 
-  const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents);
+  const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
               resources.snapshot().kvCache.blocks == 0 &&
               storage.allocatedPages() == 4 && storage.releasedExtents == 0,

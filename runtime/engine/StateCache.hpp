@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
 namespace splash::engine {
 
@@ -174,13 +175,17 @@ public:
   [[nodiscard]] bool inUse(uint64_t kvBlock) const noexcept {
     return uses_.contains(kvBlock);
   }
+  // The blocks of the states in use that either tier holds.
+  [[nodiscard]] std::vector<uint64_t> usedStates() const;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
-  // The RAM copies a reclaim may free: the unpinned ones, in use or not.
-  [[nodiscard]] uint32_t evictableStates() const noexcept {
-    return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() + inUse_.size());
+  // The RAM copies a reclaim may free: the unpinned ones, and those in use
+  // only withInUse.
+  [[nodiscard]] uint32_t evictableStates(bool withInUse) const noexcept {
+    return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() +
+                                 (withInUse ? inUse_.size() : 0));
   }
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
   // regardless of recency. Without checkpoints, the oldest ordinary state.

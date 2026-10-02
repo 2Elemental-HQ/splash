@@ -898,20 +898,20 @@ A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
 
-Until the request ends, suspended or not, that replay point is in use, and so
-is the KV it restores through. Cache victims come in three classes:
-checkpoints, then ordinary states and KV, then what is in use. No work
-displaces anything of a class above its own. Memory for running requests takes
-what is in use after everything else. A publication in use takes cached KV and
-states in the same order, then the oldest state in use: KV leaves go until one
-empties an extent, which is released at once, and the snapshot follows. Other
-publications recycle only states, a disk copy in use may displace the oldest
-copy in use, and ordinary or optional work never displaces anything in use.
-Nothing in use is pinned, so running work that needs the memory still takes it
-once nothing else is left. A resumed lane that lost its prompt's replay point
-rebuilds it on the way. `/status` reports under `state` the replay points
-unfinished requests hold (`in_use`, zero when idle) and those evicted all the
-same (`in_use_evictions`).
+Until the request ends, suspended or not, that replay point is in use, and so is
+the KV it restores through. Cache victims come in three classes: checkpoints,
+then ordinary states and KV, then what is in use. No work displaces anything of
+a class above its own. Memory for running requests takes what is in use after
+everything else. A start that a resident lane holds back takes nothing in use:
+it waits for that lane. A publication in use takes cached KV and states in the
+same order, then the oldest state in use: KV leaves go until one empties an
+extent, which is released at once, and the snapshot follows. Other publications
+recycle only states, a disk copy in use may displace the oldest copy in use, and
+ordinary or optional work never displaces anything in use. Nothing in use is
+pinned, so running work that needs the memory still takes it once nothing else
+is left. A resumed lane that lost its prompt's replay point rebuilds it on the
+way. `/status` reports under `state` the replay points unfinished requests hold
+(`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold

@@ -323,8 +323,9 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool keepResumePoint,
   uint64_t released = reclaimEmptyExtents(keepRunway);
   // Pages whose copies are being written count toward the target.
   while (!reclaimMet(released, targetBytes)) {
-    const CacheReclaimResult result = reclaimOne(
-        CacheReclaimMode::ReleaseExtents, keepResumePoint, keepRunway);
+    const CacheReclaimResult result =
+        reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
+                   keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -335,8 +336,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool keepResumePoint,
 uint64_t Cache::evictAll() {
   uint64_t released = reclaimEmptyExtents(false);
   // Everything unpinned goes before anything moves.
-  for (CacheReclaimResult evicted = evictOne(false); evicted.madeProgress;
-       evicted = evictOne(false))
+  for (CacheReclaimResult evicted = evictOne(ReclaimClass::InUse, false);
+       evicted.madeProgress; evicted = evictOne(ReclaimClass::InUse, false))
     released += evicted.reclaimedBytes;
   do {
     released += reclaimEmptyExtents(false);
@@ -344,7 +345,7 @@ uint64_t Cache::evictAll() {
   return released;
 }
 
-CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
+CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
                                      bool keepResumePoint, bool keepRunway) {
   const bool release = mode == CacheReclaimMode::ReleaseExtents;
   if (release) {
@@ -352,13 +353,13 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
         released.madeProgress)
       return released;
   }
-  CacheReclaimResult evicted = evictOne(keepResumePoint);
+  CacheReclaimResult evicted = evictOne(upTo, keepResumePoint);
   if (evicted.madeProgress && release)
     evicted.reclaimedBytes += reclaimEmptyExtents(keepRunway, 1);
   return evicted;
 }
 
-CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
+CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint) {
   // Disposable checkpoints go first; one whose write must wait for the one
   // in flight stays and holds back nothing else.
   if (const auto oldest = states_.evictionCandidate(keepResumePoint);
@@ -369,8 +370,11 @@ CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
 
   // Then oldest first across ordinary states and KV; the next pass takes
   // what waited. States in use and the KV they need follow in a pass of
-  // their own, once no transfer in flight can return what is needed first.
+  // their own, up to InUse and once no transfer in flight can return what is
+  // needed first.
   for (const bool inUse : {false, true}) {
+    if (inUse && upTo == ReclaimClass::Ordinary)
+      break;
     if (inUse && transfersInFlight())
       return {false, 0, true};
     if (const auto victim = reclaimOldest(inUse, keepResumePoint, true))
@@ -381,10 +385,10 @@ CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
   return {false, 0, transfersInFlight()};
 }
 
-CacheReclaimResult Cache::reclaimForPages(uint32_t pages) {
+CacheReclaimResult Cache::reclaimForPages(uint32_t pages, ReclaimClass upTo) {
   CacheReclaimResult total;
   while (pool_.freePageCount() + pendingPages() < pages) {
-    const CacheReclaimResult step = reclaimOne(CacheReclaimMode::KeepExtents);
+    const CacheReclaimResult step = reclaimOne(CacheReclaimMode::KeepExtents, upTo);
     if (!step.madeProgress) {
       total.pending = step.pending;
       break;
@@ -395,6 +399,14 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages) {
       break;
   }
   return total;
+}
+
+uint32_t Cache::reusablePages(ReclaimClass upTo) const {
+  const KvPoolSnapshot pool = pool_.snapshot();
+  const uint32_t unheld = pool.pagesAllocated - pool.pagesActive;
+  if (upTo == ReclaimClass::InUse)
+    return unheld;
+  return unheld - kv_.idlePagesOnChains(states_.usedStates());
 }
 
 StateEviction Cache::reclaimState(uint64_t block, bool waitForWrite) {
@@ -466,11 +478,11 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
   return used ? recycle(*used, true) : StateRoom{};
 }
 
-CacheReclaimResult Cache::reclaimStateForLane() {
-  // A lane is running work: a state in use goes after every other, once no
-  // transfer in flight can return what is needed first.
+CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {
+  // Running work takes a state in use after every other, once no transfer
+  // in flight can return what is needed first.
   std::optional<CacheEvictionCandidate> state = states_.evictionCandidate();
-  if (!state && !transfersInFlight())
+  if (!state && upTo == ReclaimClass::InUse && !transfersInFlight())
     state = states_.inUseCandidate();
   if (!state)
     return {false, 0, transfersInFlight()};

@@ -244,6 +244,14 @@ void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   entry.checkpoint = false;
 }
 
+std::vector<uint64_t> StateCache::usedStates() const {
+  std::vector<uint64_t> blocks;
+  for (const auto &[kvBlock, _] : uses_)
+    if (contains(kvBlock))
+      blocks.push_back(kvBlock);
+  return blocks;
+}
+
 bool StateCache::contains(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && !found->second.invalid;

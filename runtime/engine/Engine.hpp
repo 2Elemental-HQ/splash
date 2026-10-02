@@ -233,13 +233,14 @@ private:
                                  double nowMilliseconds);
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
-  // memory of the other kind is released first.
-  [[nodiscard]] CacheReclaimResult reclaimForState();
-  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages);
+  // memory of the other kind is released first. Each takes cache up to the
+  // class allocate() derives from inService.
+  [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
+  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
-  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
-      const TokenAdmission &admission);
+      const TokenAdmission &admission, ReclaimClass upTo);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
@@ -263,12 +264,14 @@ private:
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one allocation of a lane's state or of KV pages, reclaiming between
-  // attempts while that makes progress. A refusal from the host reuses what
-  // the engine holds; when that gives nothing, a request in service retries
-  // as one (EngineConfig::serving), which only the engine's limit and
-  // critical pressure refuse. A refusal from the engine's limit reclaims
-  // cache; when that gives nothing, fallback may let go of what the request
-  // itself pins, and the reclaim goes on.
+  // attempts while that makes progress. A request in service is running
+  // work and reclaims up to what is in use; one that a resident lane holds
+  // back takes nothing in use and waits for that lane. A refusal from the
+  // host reuses what the engine holds; when that gives nothing, a request in
+  // service retries as one (EngineConfig::serving), which only the engine's
+  // limit and critical pressure refuse. A refusal from the engine's limit
+  // reclaims cache; when that gives nothing, fallback may let go of what the
+  // request itself pins, and the reclaim goes on.
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
                               const std::function<bool()> &fallback = {})

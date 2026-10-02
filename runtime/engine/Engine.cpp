@@ -1164,15 +1164,16 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
   Allocation<Admission> result{tryOnce(), {}};
   Admission &admission = result.admission;
   Denial &denial = result.denial;
+  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   while (memoryDenied(admission)) {
     const bool paused =
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     CacheReclaimResult reclaimed;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
-      reclaimed = paused ? reuseCachedStateWhilePaused() : reclaimForState();
+      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo);
     else
-      reclaimed = paused ? reuseCachedPagesWhilePaused(admission)
-                         : reclaimForKv(admission.additionalPages);
+      reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
+                         : reclaimForKv(admission.additionalPages, upTo);
     if (reclaimed.madeProgress) {
       admission = tryOnce();
       continue;
@@ -1209,11 +1210,11 @@ bool Engine::growthPaused() const {
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
 // acknowledge any reclaimed bytes.
-CacheReclaimResult Engine::reclaimForState() {
+CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
   const CacheReclaimResult reclaimed =
-      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents);
+      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1222,10 +1223,10 @@ CacheReclaimResult Engine::reclaimForState() {
 // The reclaim step for KV pages the engine's limit refused. Allocated extents
 // stay for the pages to reuse; idle state memory goes first, then the cache
 // gives up what covers the shortfall in one step.
-CacheReclaimResult Engine::reclaimForKv(uint32_t pages) {
+CacheReclaimResult Engine::reclaimForKv(uint32_t pages, ReclaimClass upTo) {
   if (reclaimIdleState(false))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages);
+  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1244,13 +1245,13 @@ bool Engine::reclaimIdleState(bool keepLane) noexcept {
 // from, and nothing is allocated. A state goes only when those in RAM cover
 // what the pool lacks; otherwise the cache survives, and the request grows
 // if it is in service and waits if it is not.
-CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
+CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
   const uint32_t lacked = model_.statesToActivate();
-  if (!lacked || cache_.evictableStates() < lacked)
+  if (!lacked || cache_.evictableStates(upTo) < lacked)
     return {};
-  const CacheReclaimResult reused = cache_.reclaimStateForLane();
+  const CacheReclaimResult reused = cache_.reclaimStateForLane(upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;
@@ -1259,23 +1260,23 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
 // Host pressure pauses growth, and the pressure controller owns the shrink.
 // Extents that stay allocated are outside that accounting: a request short
 // of pages takes idle cached pages before it grows or waits. Cache is only
-// evicted when the pages no request holds can actually cover the shortfall;
-// otherwise it survives for later hits, and the request grows if it is in
-// service and waits if it is not. A reclaim that must wait for the transfer
-// in flight makes the request wait with it, as it does without the pause.
-// Idle model state goes first, but not the pooled buffers the next lane
-// starts from: they would not let this request grow, and the paced pass
-// keeps them for the next one.
-CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission) {
+// evicted when the pages the request's class may take can actually cover
+// the shortfall: never those a request holds, nor, for a start a resident
+// lane holds back, the idle KV that states in use restore through
+// (Cache::reusablePages). Otherwise it survives for later hits, and the
+// request grows if it is in service and waits if it is not. A reclaim that
+// must wait for the transfer in flight makes the request wait with it, as it
+// does without the pause. Idle model state goes first, but not the pooled
+// buffers the next lane starts from: they would not let this request grow,
+// and the paced pass keeps them for the next one.
+CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
+                                                       ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
-  const KvPoolSnapshot pool = cache_.snapshot().pool;
-  // Cached prefixes can also have active owners; those pages cannot be reused.
-  const uint32_t reusable = pool.pagesAllocated - pool.pagesActive;
-  if (reusable < admission.additionalPages)
+  if (cache_.reusablePages(upTo) < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimForPages(admission.additionalPages);
+      cache_.reclaimForPages(admission.additionalPages, upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;

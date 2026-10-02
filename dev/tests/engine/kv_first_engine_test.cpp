@@ -3134,7 +3134,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   constexpr uint32_t retainedKvTokens = 6144;
   while (resources.snapshot().kvCache.blocks >
          retainedKvTokens / KvCache::pageTokens) {
-    require(resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "could not reclaim the suspended decode's KV tail");
   }
   {
@@ -3225,7 +3225,7 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
               resources.snapshot().stateCache.entries == 0,
           "the decode was not suspended without its point");
   // Its KV goes too, and so do the extents it held.
-  while (resources.reclaimOne().madeProgress) {
+  while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress) {
   }
   require(resources.snapshot().kvCache.blocks == 0 && pool.snapshot().pagesAllocated == 0,
           "the suspended lane's KV stayed");
@@ -3708,7 +3708,7 @@ struct ScatteredPages {
       runUntilIdle(engine);
     }
     for (uint32_t victim = 0; victim < 4; ++victim) {
-      require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
               "the first prompt was not evicted");
     }
     EngineRequest running = request(4, prompt(3000, 129));
@@ -5679,10 +5679,11 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   const auto block = cache.publishCommittedBlocks(999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
-  require(cache.reclaimOne(reuse).reclaimedBytes == 64 && cache.pollTransfers(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 64 &&
+              cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
@@ -5730,7 +5731,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   demoteState(cache, block);
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "fixture KV did not demote");
     tier.complete();
     static_cast<void>(cache.pollTransfers());
@@ -5842,7 +5843,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   demoteState(cache, cache.publishCommittedBlocks(999, prompt, 96));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 3; ++written) {
-    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
             "prefix block was not written");
     tier.complete();
     require(cache.pollTransfers(), "prefix block did not land");
@@ -5908,7 +5909,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   demoteState(cache, cache.publishCommittedBlocks(999, prompt, 256));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 8; ++written) {
-    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
             "prefix block was not written");
     tier.complete();
     require(cache.pollTransfers(), "prefix block did not land");
@@ -5991,7 +5992,8 @@ void testRestoringLaneWaitsForResidentLanes() {
   demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written, "block was not written");
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "block was not written");
     tier.complete();
     require(cache.pollTransfers(), "block did not land");
   }
@@ -6043,7 +6045,8 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse).madeProgress && tier.demotions == written, "block was not written");
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "block was not written");
     tier.complete();
     require(cache.pollTransfers(), "block did not land");
   }
@@ -6227,7 +6230,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   const uint64_t id = executor.resumedPrompts.front().front();
   require(!events.usage.contains(id), "the resumed lane finished early");
   while (resources.snapshot().stateCache.entries > 1) {
-    require(resources.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "the cache could not be reclaimed");
   }
   // The next turn keeps the text before the generation prompt.
@@ -6386,6 +6389,91 @@ void testWarningShrinkKeepsTheFinishedPoint() {
           "the shrink did not keep the finished request's point over the running one");
 }
 
+// A start beside a resident lane is held back by it (judge() yields), so the
+// reclaim for its memory takes nothing in use: the running request's replay
+// point outlasts the start's state allocation, which the budget refuses, or
+// the host, so that the lane would take a cached state's buffers, and the
+// restore of its cached prefix, whose pages the budget refuses. The start
+// waits for the lane and runs once it has finished.
+void testHeldBackStartTakesNothingInUse() {
+  enum class Refused { State, PausedState, Restore };
+  for (const Refused refused : {Refused::State, Refused::PausedState, Refused::Restore}) {
+    test::TestKvStorage storage(16, 4096, 4);
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    engine::Cache resources(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
+    const std::vector<uint32_t> held(65, 2);
+    if (refused == Refused::Restore) {
+      // The start's prompt matches a prefix only the disk holds, and the
+      // budget holds no extent beyond the one the running lane fills.
+      resources.beginRequest(999);
+      require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
+      demoteState(resources, resources.publishCommittedBlocks(999, held, 64));
+      resources.endRequest(999);
+      for (uint32_t written = 1; written <= 2; ++written) {
+        require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
+                        .madeProgress &&
+                    tier.demotions == written,
+                "block was not written");
+        tier.complete();
+        require(resources.pollTransfers(), "block did not land");
+      }
+      storage.budgetPages = 4;
+    }
+    double now = 1;
+    const std::vector<uint32_t> first(65, 1);
+    auto running = request(1, first);
+    running.maxNewTokens = 1000;
+    engine.submit(std::move(running));
+    tickUntil(engine, now, [&] { return events.outputs[1].size() >= 2; },
+              "the running request did not decode");
+    // Nothing but what is in use is left to reclaim.
+    while (resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+               .madeProgress) {
+    }
+    // The one state in RAM is the running request's replay point.
+    require(resources.snapshot().stateCache.inUse == 1 &&
+                resources.snapshot().stateCache.bytes == 64,
+            "the running request did not use its replay point");
+    if (refused == Refused::State)
+      executor.deniedBegins = 1000;
+    // Refused by the host, the lane takes a cached state's buffers instead
+    // (reuseCachedStateWhilePaused); the one cached state is in use.
+    bool hostRefuses = refused == Refused::PausedState;
+    executor.statesLacked = [&] { return hostRefuses ? 1U : 0U; };
+    executor.beginGrowthBlocked = [&] { return hostRefuses; };
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    engine.submit(request(2, held));
+    for (int step = 0; step < 20; ++step)
+      static_cast<void>(engine.tick(now++));
+    std::vector<uint32_t> next = first;
+    next.insert(next.end(), events.outputs[1].begin(), events.outputs[1].end());
+    next.resize(next.size() + 40, 7);
+    require(resources.snapshot().stateCache.inUseEvictions == 0 &&
+                resources.probe(next).cachedTokens() == 64 &&
+                engine.snapshot().scheduler.waitingResources == 1 &&
+                !executor.requests.contains(2),
+            "a start held back by a resident lane took the lane's replay point");
+    executor.decodeFinishes = true;
+    executor.deniedBegins = 0;
+    hostRefuses = false;
+    executor.restoreControl->ready = true;
+    for (const double end = now + 200; now < end && !engine.idle(); ++now) {
+      static_cast<void>(engine.tick(now));
+      tier.complete();
+    }
+    require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+                events.startIds.back() == 2 &&
+                executor.diskReads == (refused == Refused::Restore ? 1U : 0U),
+            "the held-back start did not run once the lane finished");
+  }
+}
+
 // Every end of a decoding request releases its replay point: cancellation
 // and failure at once, before the request leaves the engine, the deadline
 // and capacity exhaustion when the engine ends it.
@@ -6497,6 +6585,7 @@ int main() {
     testRestoredEndpointIsInUse();
     testReplayPointRecyclesAnOlderPointInUse();
     testWarningShrinkKeepsTheFinishedPoint();
+    testHeldBackStartTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testConcurrentColdPrefixesComputeOnce();

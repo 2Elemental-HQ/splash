@@ -129,6 +129,11 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
+  // The resident pages, on the chains of these blocks (each block and every
+  // block above it), that no request holds and no transfer moves; each
+  // counts once. A request holds every page of its chain, so a chain's
+  // count stops at the first page one holds.
+  [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
   // Resident, without resident children or users: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
   [[nodiscard]] bool transferring(uint64_t blockId) const;

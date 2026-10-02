@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace splash::engine {
@@ -287,6 +288,26 @@ bool KvCache::stateInUseBelow(uint64_t blockId) const {
 void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
+
+uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
+  std::unordered_set<uint64_t> visited;
+  uint32_t pages = 0;
+  for (uint64_t blockId : blocks) {
+    while (blockId && visited.insert(blockId).second) {
+      const Block &entry = block(blockId);
+      if (entry.page != noPage) {
+        // The request holding this page holds every page above it too.
+        if (pool_.activeReferences(entry.page))
+          break;
+        if (!entry.transferring)
+          ++pages;
+      }
+      // A disk-only block holds no page; the walk goes on above it.
+      blockId = entry.parent;
+    }
+  }
+  return pages;
+}
 
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
