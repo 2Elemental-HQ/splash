@@ -1,7 +1,6 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
-#include "metal/abi/KvExtent.h"
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
@@ -56,13 +55,6 @@ public:
   // nothing, for an unallocated extent or while a command is in flight (a
   // command reaches extents through its page tables without retaining them).
   virtual void releaseExtent(uint32_t extent) = 0;
-};
-
-// One attention layer of the pool as kernels address it: where its region
-// sits in every extent, and the format of its pages.
-struct LayerStorage final {
-  SplashKvLayer kv{};
-  Format format = Format::Int8;
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.

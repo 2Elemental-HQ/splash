@@ -315,7 +315,7 @@ private:
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, kTensorCount> buffers_{};
   std::unique_ptr<tuning::HostKvExtents> pages_;
-  kv::LayerStorage layer_;
+  SplashKvLayer layer_{};
   std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
   std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};
   std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};

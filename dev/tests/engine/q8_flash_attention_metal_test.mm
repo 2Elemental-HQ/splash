@@ -208,7 +208,7 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
   result.params = {committed,  activeRows, kStride, pages,
-                   result.pool->layer(kLayer).kv, splits, splits};
+                   result.pool->layer(kLayer), splits, splits};
   uint64_t queryElements =
       uint64_t{shape.queryHeads()} * kQueryStride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));

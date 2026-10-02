@@ -222,7 +222,7 @@ struct Case final {
   uint32_t rows;
   uint32_t stride;
   HostKvExtents pool;
-  kv::LayerStorage layer;
+  SplashKvLayer layer{};
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
@@ -562,11 +562,6 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
   };
   if (testBounds) {
     metal::CommandGraph shortGraph;
-    const auto originalFormat = data.layer.format;
-    data.layer.format = originalFormat == kv::Format::Int8 ? kv::Format::BFloat16 : kv::Format::Int8;
-    rejects([&] { encode(shortGraph, partials, statistics); });
-    data.layer.format = originalFormat;
-    require(shortGraph.empty(), "mismatched KV format partially encoded a graph");
     if constexpr (std::is_same_v<Config, ops::PrefillAttentionConfig>) {
       auto mismatch = data.stores[0];
       mismatch.chunk_tokens = plan.rows == 1 ? 2 : plan.rows - 1;
@@ -613,8 +608,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
       require(params.committed_tokens == plan.historyTokens && params.rows == data.rows &&
                   params.chunk_stride == data.stride &&
                   params.page_table_entries == data.stores[0].page_table_entries &&
-                  params.kv.extent_pages == data.layer.kv.extent_pages &&
-                  params.kv.offset == data.layer.kv.offset &&
+                  params.kv.extent_pages == data.layer.extent_pages &&
+                  params.kv.offset == data.layer.offset &&
                   params.split_count == plan.splits,
               "recorded prefill ABI does not describe the actual split plan");
     };

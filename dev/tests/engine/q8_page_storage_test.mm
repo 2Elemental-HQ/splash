@@ -87,7 +87,7 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
         }
         for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
             require(spans[layer * tensors].data() ==
-                        extent + storage.layer(layer).kv.offset +
+                        extent + storage.layers()[layer].offset +
                             uint64_t{index} * layout.dataBytesPerLayerPage(),
                     "a layer's spans do not start at the page's keys in its region");
         }
@@ -339,9 +339,9 @@ void run(const std::string &metallib) {
             "the first Q8 extent was not the one allocated");
     requireThrows<std::logic_error>([&] { (void)storage.allocateExtent(0); },
                                     "an allocated extent was allocated again");
-    const auto layer = storage.layer(15);
-    require(layer.format == kv::Format::Int8 && layer.kv.extent_pages == 128 &&
-                layer.kv.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
+    const SplashKvLayer layer = storage.layers()[15];
+    require(storage.layers().size() == kvLayout.attentionLayers && layer.extent_pages == 128 &&
+                layer.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
             "a layer's region does not follow the layers before it");
 
     const SplashKvPage runwayPage = storage.entry(5);
@@ -400,8 +400,8 @@ void run(const std::string &metallib) {
 
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);
-    require(compactStorage.allocateExtent(0) && compactStorage.layer(9).kv.extent_pages == 512 &&
-                compactStorage.layer(9).kv.offset ==
+    require(compactStorage.allocateExtent(0) && compactStorage.layers()[9].extent_pages == 512 &&
+                compactStorage.layers()[9].offset ==
                     9 * 512 * compactLayout.bytesPerLayerPage() &&
                 compactStorage.allocatedExtents() * compactStorage.extentPages() == 512 &&
                 compactStorage.actualAllocatedBytes() ==
@@ -412,9 +412,8 @@ void run(const std::string &metallib) {
         const uint32_t extent = layout.minimumExtentPages();
         kv::PageStorage bf16(backend, governor.allocationAdmission(), layout,
                              2 * extent, extent);
-        const auto bf16Layer = bf16.layer(layout.attentionLayers - 1);
-        require(bf16Layer.format == kv::Format::BFloat16 &&
-                    bf16Layer.kv.offset == (layout.attentionLayers - 1) * extent * 2 *
+        const SplashKvLayer bf16Layer = bf16.layers()[layout.attentionLayers - 1];
+        require(bf16Layer.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");
         require(bf16.allocateExtent(0) &&

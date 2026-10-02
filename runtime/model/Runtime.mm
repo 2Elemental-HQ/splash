@@ -1039,14 +1039,10 @@ struct Runtime::Impl {
     buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
     buffers.chunkValues = p(PrefillTensor::ChunkValues);
     buffers.moe = prefillArena->moeScratch();
-    std::vector<kv::LayerStorage> kvLayers(
-        geometry.target.kvLayout.attentionLayers);
-    for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
-      kvLayers[layer] = kvPages.layer(layer);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvLayers);
+        kvPages.layers());
     addPackedDraftContext(graph, batch);
 
     for (const PackedPrefillSequence &sequence : batch.sequences) {
@@ -1298,16 +1294,14 @@ struct Runtime::Impl {
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
           DecodeTensor::VerifyBetaBase, layer, storage);
     }
-    std::vector<kv::LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkKeysBase, layer, storage);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
-      kvLayers[layer] = kvPages.layer(layer);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
-                          lanes, stats);
+    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(), q8,
+                          verify, lanes, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,

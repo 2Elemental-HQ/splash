@@ -12,17 +12,6 @@ namespace {
 
 enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
 
-// Where a layer sits in the pool's extents, for kernels of `format`. Every
-// format's entries take the same buffers: they reach the pages through the
-// page tables and bind no KV storage.
-SplashKvLayer kvLayer(const kv::LayerStorage &layer, kv::Format format) {
-  if (layer.format != format)
-    throw std::invalid_argument("attention plan and KV storage formats differ");
-  if (!layer.kv.extent_pages)
-    throw std::invalid_argument("KV layer storage has no extents");
-  return layer.kv;
-}
-
 bool sameGrid(metal::DispatchSize a, metal::DispatchSize b) noexcept {
   return a.x == b.x && a.y == b.y && a.z == b.z;
 }
@@ -381,7 +370,7 @@ kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(
 }
 
 void PagedAttention::addPrefillStore(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer chunkKeys, metal::MetalBuffer chunkValues,
     metal::MetalBuffer pageTable,
     const kv::Q8ChunkedPrefillParams &params, kv::Layout layout) {
@@ -390,7 +379,7 @@ void PagedAttention::addPrefillStore(
       ? pipeline(kernel, "prefill_attention_bf16_store", "prefill_attention_bf16_store_kv2_g8")
       : pipeline(kernel, "prefill_attention_q8_store", "prefill_attention_q8_store_kv2_g8");
   kv::Q8ChunkedPrefillParams layerParams = params;
-  layerParams.kv = kvLayer(layer, layout.format);
+  layerParams.kv = layer;
   graph.add(std::string(store),
             {std::move(chunkKeys), std::move(chunkValues), std::move(pageTable)},
             layerParams, {uint64_t{2} * params.chunk_tokens * layout.kvHeads, 1, 1},
@@ -398,7 +387,7 @@ void PagedAttention::addPrefillStore(
 }
 
 void PagedAttention::addPrefill(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer queries, metal::MetalBuffer output,
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::Q8ChunkedPrefillParams &chunk,
@@ -416,7 +405,7 @@ void PagedAttention::addPrefill(
   }
   const kv::Q8PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, kvLayer(layer, plan.format), plan.splits};
+      chunk.page_table_entries, layer, plan.splits};
   graph.add(std::string(plan.splitPipeline),
             {std::move(queries), partials, statistics, std::move(pageTable)},
             params, plan.splitGroups);
@@ -426,7 +415,7 @@ void PagedAttention::addPrefill(
 }
 
 void PagedAttention::addVerify(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     PagedVerifyBuffers buffers,
     std::span<const kv::Q8ChunkedPrefillParams> storeParams,
     std::span<const kv::Q8VerifyAttentionParams> attentionParams,
@@ -468,11 +457,8 @@ void PagedAttention::addVerify(
                                     kv::kQ8VerifyMaximumRows))
       throw std::invalid_argument("paged verify lane history does not match plan");
   }
-  const SplashKvLayer kv = kvLayer(layer, plan.format);
-  for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
-    stores[lane].kv = kv;
-    attention[lane].kv = kv;
-  }
+  for (uint32_t lane = 0; lane < maximumLanes; ++lane)
+    stores[lane].kv = attention[lane].kv = layer;
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],

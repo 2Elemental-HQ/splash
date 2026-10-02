@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/KvExtent.h"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
@@ -99,11 +100,10 @@ public:
   [[nodiscard]] std::span<std::byte> bytes(uint32_t index) const {
     return {extents_.at(index).contents, extentBytes(layout_, extentPages_)};
   }
-  [[nodiscard]] kv::LayerStorage layer(uint32_t index) const {
+  [[nodiscard]] SplashKvLayer layer(uint32_t index) const {
     if (index >= layout_.attentionLayers)
       throw std::out_of_range("host KV layer is outside the layout");
-    return {{extentPages_, static_cast<uint32_t>(offset(index, SPLASH_KV_KEYS, 0))},
-            layout_.format};
+    return {extentPages_, static_cast<uint32_t>(offset(index, SPLASH_KV_KEYS, 0))};
   }
   [[nodiscard]] SplashKvPage entry(uint32_t page) const {
     return extent(page).gpuAddress | (page % extentPages_);

@@ -32,6 +32,13 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument(
             "KV page pool is not a whole number of extents");
     }
+    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        layers_.push_back({extentPages_,
+                           static_cast<uint32_t>(splash_kv_offset(
+                               extentPages_, data, scale, layer, SPLASH_KV_KEYS, 0))});
+    }
     extents_.resize(pageCount_ / extentPages_);
 }
 
@@ -86,17 +93,6 @@ void PageStorage::releaseExtent(uint32_t extent) {
     }
     buffer = {};
     ++generation_;
-}
-
-LayerStorage PageStorage::layer(uint32_t index) const {
-    if (index >= layout_.attentionLayers) {
-        throw std::out_of_range("invalid attention layer index");
-    }
-    const uint64_t offset = splash_kv_offset(
-        extentPages_, static_cast<uint32_t>(layout_.dataBytesPerLayerPage()),
-        static_cast<uint32_t>(layout_.scaleBytesPerLayerPage()), index,
-        SPLASH_KV_KEYS, 0);
-    return {{extentPages_, static_cast<uint32_t>(offset)}, layout_.format};
 }
 
 SplashKvPage PageStorage::entry(uint32_t page) const {

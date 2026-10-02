@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/KvExtent.h"
 #include "ops/PagedKv.hpp"
 
 #include <cstddef>
@@ -59,7 +60,10 @@ public:
   // reference remains anywhere in this extent. std::out_of_range for an
   // extent past the pool.
   void releaseExtent(uint32_t extent) override;
-  [[nodiscard]] LayerStorage layer(uint32_t index) const;
+  // Where each attention layer's region sits in every extent, by layer.
+  [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
+    return layers_;
+  }
 
   // The entry kernels reach a page by. Throws std::logic_error for a page
   // whose extent is not allocated: a GPU table holds only pages of allocated
@@ -87,6 +91,7 @@ private:
   Layout layout_;
   uint32_t pageCount_ = 0;
   uint32_t extentPages_ = 0;
+  std::vector<SplashKvLayer> layers_;
   // Empty while the extent is not allocated.
   std::vector<metal::MetalBuffer> extents_;
   uint64_t generation_ = 0;

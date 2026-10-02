@@ -187,7 +187,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   result.pool = std::make_unique<Pool>(device, geometry);
   result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
   result.params = {committed, chunk, stride, pages,
-                   result.pool->pages->layer(kLayer).kv};
+                   result.pool->pages->layer(kLayer)};
   require(chunkedPrefillValidationError(result.params).empty(),
           "invalid generated params");
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
@@ -789,7 +789,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
   auto *values = static_cast<BFloat16Bits *>(chunkValues.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer).kv};
+    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer)};
     tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
     tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
     pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);

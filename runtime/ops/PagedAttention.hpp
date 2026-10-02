@@ -297,8 +297,7 @@ public:
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
                 uint32_t chunkStride, uint32_t pageTableEntries);
 
-  static void addPrefillStore(metal::CommandGraph &graph,
-                              const kv::LayerStorage &layer,
+  static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
@@ -309,8 +308,7 @@ public:
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for
   // the command's largest sequence and configuration.
-  static void addPrefill(metal::CommandGraph &graph,
-                         const kv::LayerStorage &layer,
+  static void addPrefill(metal::CommandGraph &graph, SplashKvLayer layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,
                          metal::MetalBuffer statistics,
@@ -318,7 +316,7 @@ public:
                          const kv::Q8ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
   static void
-  addVerify(metal::CommandGraph &graph, const kv::LayerStorage &layer,
+  addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
             PagedVerifyBuffers buffers,
             std::span<const kv::Q8ChunkedPrefillParams> storeParams,
             std::span<const kv::Q8VerifyAttentionParams> attentionParams,
