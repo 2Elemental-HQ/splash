@@ -257,9 +257,6 @@ struct Runtime::Impl {
   // Allocated for image cache misses and reclaimable once pending encodes
   // finish. Injecting already encoded rows needs no vision arena.
   std::unique_ptr<ops::Vision> vision;
-  // Image buffers owned by the current admission attempt until a state cell
-  // is activated. Failed attempts leave no image allocations behind.
-  std::unordered_map<uint64_t, std::vector<ImageState>> stagedImages;
   // Encoded rows retained for reuse, including prefix hits that land inside
   // an image and still need its remaining rows. Byte-bounded LRU; the memory
   // reclaimer drops it entirely.
@@ -386,20 +383,11 @@ struct Runtime::Impl {
   // dropping their entry frees nothing until that request ends.
   [[nodiscard]] bool
   embeddingsHeld(const MetalBuffer &embeddings) const noexcept {
-    auto holds = [&](const std::vector<ImageState> &images) {
-      for (const ImageState &image : images) {
+    for (const auto &[_, entry] : requests) {
+      for (const ImageState &image : entry.images) {
         if (image.data && image.data->embeddings.sameView(embeddings))
           return true;
       }
-      return false;
-    };
-    for (const auto &[_, images] : stagedImages) {
-      if (holds(images))
-        return true;
-    }
-    for (const auto &[_, entry] : requests) {
-      if (holds(entry.images))
-        return true;
     }
     return false;
   }
@@ -415,20 +403,15 @@ struct Runtime::Impl {
     return released;
   }
 
-  struct ImageAdmission final {
+  // Drops the encoder a start built unless the start completes: an
+  // admission granted it, but a later step of the start threw.
+  struct VisionRollback final {
     Impl &runtime;
-    uint64_t requestId;
     bool hadVision;
     bool committed = false;
-
-    ImageAdmission(Impl &owner, uint64_t id)
-        : runtime(owner), requestId(id), hadVision(bool(owner.vision)) {}
-    ~ImageAdmission() {
-      if (!committed) {
-        runtime.stagedImages.erase(requestId);
-        if (!hadVision)
-          runtime.vision.reset();
-      }
+    ~VisionRollback() {
+      if (!committed && !hadVision)
+        runtime.vision.reset();
     }
   };
 
@@ -437,9 +420,11 @@ struct Runtime::Impl {
   // pixel and embedding buffers of the images not yet encoded. At the budget
   // the engine retries a denied start after each reclaim step, and a denial
   // builds nothing, so no encoder arena, image buffer or state cell is built
-  // and dropped every time. The refusal keeps its cause.
-  metal::AllocationResult activate(const ModelRequest &request, uint32_t slot) {
-    if (request.images.empty() || stagedImages.contains(request.id))
+  // and dropped every time. The refusal keeps its cause; a grant hands the
+  // request's images to `images`.
+  metal::AllocationResult activate(const ModelRequest &request, uint32_t slot,
+                                   std::vector<ImageState> &images) {
+    if (request.images.empty())
       return states.tryActivateSlot(slot, request.id);
     // The engine rejects image requests at submission when there is no vision.
     if (!package.descriptor.hasVision())
@@ -497,18 +482,14 @@ struct Runtime::Impl {
       return admission;
     if (encoder)
       vision = std::move(encoder);
-    stagedImages.emplace(request.id, std::move(staged));
+    images = std::move(staged);
     return {};
   }
 
-  // Hands an admitted request its staged images. Only then do its embedding
-  // cache hits count as reuses; the engine retries denied admissions.
-  void takeStagedImages(Request &entry) {
-    const auto staged = stagedImages.find(entry.id);
-    if (staged == stagedImages.end())
-      return;
-    entry.images = std::move(staged->second);
-    stagedImages.erase(staged);
+  // Gives an admitted request its images. Only an admitted request's cache
+  // hits count as reuses; the engine retries denied admissions.
+  void adoptImages(Request &entry, std::vector<ImageState> images) {
+    entry.images = std::move(images);
     for (auto image = entry.images.begin(); image != entry.images.end();
          ++image) {
       const bool repeated = std::any_of(
@@ -520,8 +501,6 @@ struct Runtime::Impl {
   }
 
   [[nodiscard]] bool visionIdle() const noexcept {
-    if (!stagedImages.empty())
-      return false;
     for (const auto &[_, entry] : requests) {
       for (const ImageState &image : entry.images) {
         if (image.data && !image.data->encoded && image.data->embeddings)
@@ -1772,10 +1751,10 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
-  Impl::ImageAdmission images(*impl_, request.id);
+  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
   StateAdmission admission = admitIdleSlot(
       impl_->states, [&](uint32_t slot) { return beginAt(request, slot); });
-  images.committed = admission.granted();
+  rollback.committed = admission.granted();
   return admission;
 }
 
@@ -1803,16 +1782,18 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
-  Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission = admitIdleSlot(
-      impl_->states, [&](uint32_t slot) { return impl_->activate(request, slot); });
+  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
+  std::vector<Impl::ImageState> images;
+  StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
+    return impl_->activate(request, slot, images);
+  });
   if (admission.granted()) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
-    impl_->takeStagedImages(entry);
+    impl_->adoptImages(entry, std::move(images));
   }
-  images.committed = admission.granted();
+  rollback.committed = admission.granted();
   return admission;
 }
 
@@ -1869,11 +1850,12 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
-  if (auto admission = impl_->activate(request, stateSlot); !admission)
+  std::vector<Impl::ImageState> images;
+  if (auto admission = impl_->activate(request, stateSlot, images); !admission)
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
-  impl_->takeStagedImages(entry);
+  impl_->adoptImages(entry, std::move(images));
   try {
     auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
     if (!inserted) {
@@ -2387,7 +2369,6 @@ void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
 }
 
 void Runtime::end(uint64_t requestId) {
-  impl_->stagedImages.erase(requestId);
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
     return;
