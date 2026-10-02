@@ -137,13 +137,12 @@ enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
 // resident lane precedes) and for pressure passes.
 enum class ReclaimClass : uint8_t { Ordinary, InUse };
 
-// Whether the caller can wait for memory a step leaves to come back.
-// CanWait (growth and pressure passes): a state the write in flight blocks
-// stays (pending), and a KV leaf a state needs is written first; its page
-// returns when the copy lands. Immediate (a snapshot between commands):
-// a state the write in flight blocks is dropped, and only leaves whose page
-// frees now go, dropped through their disk copy or erased when nothing
-// depends on them; a leaf that needs a demotion is passed over.
+// Whether the caller can wait for KV memory a step leaves to come back.
+// CanWait (growth and pressure passes): a KV leaf a state needs is written
+// first, and its page returns when the copy lands. Immediate (a snapshot
+// between commands): only leaves whose page frees now go, through their disk
+// copy or erased; a leaf that needs a demotion is passed over. What happens
+// to a state is the caller's StateCache::Unwritten.
 enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 
 // What one step of room for a state's snapshot gave: a recycled state's
@@ -161,9 +160,9 @@ enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
-// A state in RAM always sits on a resident KV block: reclaim takes the state
-// before the block's page, and endRequest, pollTransfers and freeDiskSpace
-// leave such a block its page.
+// A state in RAM always sits on a resident KV block: reclaim takes such a
+// block's state before its page (oldestKvLeaf skips it), and endRequest and
+// pollTransfers leave such a block its page.
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -174,6 +173,7 @@ public:
   Cache &operator=(const Cache &) = delete;
 
   void setCompletionNotifier(std::function<void()> notifier) {
+    states_.setCompletionNotifier(notifier);
     completionNotifier_ = std::move(notifier);
   }
   // Consumes finished transfers: a written state or KV page frees its RAM, a
@@ -403,15 +403,12 @@ private:
   // One eviction: checkpoints first, then the shared recency order, then,
   // up to InUse, what is in use.
   [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint);
-  // Reclaims a chosen state; with waitForWrite only the write in flight may
-  // keep it.
-  [[nodiscard]] StateEviction reclaimState(uint64_t block, bool waitForWrite);
-  // Gives up the oldest of one class's states and resident KV leaves, as
-  // the timing allows. A state whose write must wait for the one in flight
-  // stays when the caller can wait, and is dropped otherwise; a KV leaf that
-  // cannot go now (reclaimKvLeaf) stays. The other kind may still give.
+  // Gives up the oldest of one class's states and resident KV leaves: a
+  // state as `unwritten` says (StateCache::reclaim), a KV leaf as the timing
+  // allows (reclaimKvLeaf). One that stays leaves the other kind to give.
   // Nothing once all stay.
   [[nodiscard]] std::optional<Victim> reclaimOldest(bool inUse, bool keepResumePoint,
+                                                    StateCache::Unwritten unwritten,
                                                     ReclaimTiming timing);
   // Oldest resident KV leaf after `after` whose state, if any, is not in RAM,
   // and whose KV a state in use needs exactly when inUse.
@@ -456,9 +453,6 @@ private:
   [[nodiscard]] bool freeDiskSpace(bool inUse);
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
-  [[nodiscard]] uint64_t
-  reclaimEmptyExtents(bool keepRunway,
-                      uint32_t limit = std::numeric_limits<uint32_t>::max());
   // Evicting ordinary KV may empty an extent: the pages Ordinary may reuse
   // (reusablePages), less those whose demotion is in flight, cover one. That
   // counts the leaves that need a demotion too, which an Immediate step
@@ -480,7 +474,6 @@ private:
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;
-  DiskRoom makeRoom_;
   std::unordered_map<uint64_t, Request> requests_;
   std::vector<Demotion> demotions_;
   // Block IDs increase from parent to child. Restores start in that order so

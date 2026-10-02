@@ -31,7 +31,10 @@ void release(KvPool &pool, const std::vector<uint32_t> &pages,
     for (uint32_t page : pages) pool.releasePage(page, prefix);
 }
 
-uint32_t reclaimEvery(KvPool &pool, bool keepRunway) {
+// Every test pool has 4 pages of 100 bytes per extent.
+constexpr uint64_t extentBytes = 4 * 100;
+
+uint64_t reclaimEvery(KvPool &pool, bool keepRunway) {
     return pool.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
@@ -51,7 +54,7 @@ void testGrowthPacksAllocatedExtents() {
             "elastic growth accounting is incorrect");
 
     release(pool, pages.pages);
-    require(reclaimEvery(pool, true) == 1,
+    require(reclaimEvery(pool, true) == extentBytes,
             "reclaim did not retain exactly one warm runway");
     auto reclaimed = pool.snapshot();
     require(reclaimed.pagesAllocated == 4 &&
@@ -73,7 +76,7 @@ void testRunwayIsAllocatedThroughThePool() {
                 status.reclaimableExtents == 2 && storage.allocated(0) &&
                 storage.allocated(1) && !storage.allocated(2),
             "the runway was not the extents of its pages, allocated through the pool");
-    require(reclaimEvery(pool, true) == 1, "an empty runway extent was not released");
+    require(reclaimEvery(pool, true) == extentBytes, "an empty runway extent was not released");
     status = pool.snapshot();
     require(status.extentAllocations - status.extentReleases == 1 &&
                 status.pagesAllocated == 4 && storage.allocatedPages() == 4,
@@ -128,7 +131,7 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
                 storage.releasedExtents == 0,
             "the retry allocated again the extents it was denied with");
     release(pool, pages.pages);
-    require(reclaimEvery(pool, false) == 3 &&
+    require(reclaimEvery(pool, false) == 3 * extentBytes &&
                 pool.snapshot().pagesAllocated == 0,
             "a reclaim pass did not return the extents the retry left");
 }
@@ -154,7 +157,7 @@ void testPressureReusesFreePagesAndDeniesGrowth() {
             "critical pressure corrupted existing active references");
     release(pool, reused.pages);
     release(pool, active.pages);
-    require(reclaimEvery(pool, false) == 1 &&
+    require(reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 0,
             "pressure cleanup did not reclaim the empty extent");
 }
@@ -172,12 +175,12 @@ void testPassReleasesEveryEmptyExtent() {
     require(pool.snapshot().reclaimableExtents == extents,
             "every empty extent was not reclaimable");
     const auto before = pool.snapshot().extentReleases;
-    require(reclaimEvery(pool, true) == extents - 1 &&
+    require(reclaimEvery(pool, true) == (extents - 1) * extentBytes &&
                 storage.releasedExtents == extents - 1 &&
                 pool.snapshot().extentReleases == before + extents - 1 &&
                 pool.snapshot().reclaimableExtents == 1,
             "a pass did not release every empty extent but the runway");
-    require(reclaimEvery(pool, false) == 1 &&
+    require(reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 0 &&
                 pool.snapshot().extentReleases == extents,
             "a pass without the runway did not release it");
@@ -208,7 +211,7 @@ void testFullestExtentFillsFirstSoColdExtentsDrain() {
     // Its last page going cold empties the extent so it can be released.
     release(pool, {3});
     require(pool.snapshot().reclaimableExtents == 1 &&
-                reclaimEvery(pool, false) == 1 &&
+                reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 8 &&
                 storage.releasedExtents == 1,
             "drained extent was not released");
@@ -228,7 +231,7 @@ void testRefusedReleaseChangesNothing() {
                 storage.allocatedPages() == 8,
             "a refused release changed the pool's record of its extent");
     storage.commandInFlight = nullptr;
-    require(reclaimEvery(pool, false) == 2 && pool.snapshot().pagesAllocated == 0,
+    require(reclaimEvery(pool, false) == 2 * extentBytes && pool.snapshot().pagesAllocated == 0,
             "the extents a refused release kept were not released afterwards");
 }
 
@@ -243,7 +246,7 @@ void testPrefixAndActiveReferencesHoldTheExtent() {
                 pool.snapshot().pagesPrefix == 1,
             "prefix-owned extent was reclaimed while live");
     pool.releasePage(active.pages.front(), true);
-    require(reclaimEvery(pool, false) == 1,
+    require(reclaimEvery(pool, false) == extentBytes,
             "last prefix release did not make extent reclaimable");
 }
 
@@ -287,7 +290,7 @@ void testCompactionEmptiesTheExtentWithTheFewestPages() {
     pool.releasePage(7, false);
     require(pool.pageFree(7) && pool.snapshot().pagesPrefix == 0,
             "a moved reference was not released where it went");
-    require(reclaimEvery(pool, false) == 1 &&
+    require(reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 8 && storage.releasedExtents == 1,
             "the emptied extent was not released");
 }
