@@ -2626,13 +2626,21 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
                         resources, executor, events);
   guardReleases(storage, engine);
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  // The host refuses the first request twice: as an ordinary allocation and
+  // as that of the only request in service.
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts <= 2; };
   engine.submit(request(1, std::vector<uint32_t>(8193, 47)));
   static_cast<void>(engine.tick(1));
+  require(executor.beginAttempts == 2 && !executor.requests.contains(1) &&
+              engine.resourceWaitSnapshot(1).memory == 1,
+          "the first request did not wait for memory");
   auto urgent = request(2, std::vector<uint32_t>(4097, 48));
   urgent.priority = RequestPriority::Foreground;
   engine.submit(std::move(urgent));
-  require(engine.tick(102) && engine.resourceWaitSnapshot(102).memory == 0,
+  // Prefill admission packs only the top priority tier: the first request
+  // waits for scheduling alone.
+  require(engine.tick(102) && engine.resourceWaitSnapshot(102).memory == 0 &&
+              executor.requests.contains(2) && !executor.requests.contains(1),
           "scheduler delay retained a stale memory wait");
   for (uint32_t now = 1100; now < 1200 && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
