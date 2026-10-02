@@ -527,32 +527,42 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 }
 
 // ---------------------------------------------------------------- prefill
-// A 168-row chunk on the 128-row tiles: the second tile holds 40 rows, so its last two 32-row simdgroups skip their
-// matmuls and leave the rows from 192 unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the
-// 128-row tiles' bitwise without K splits and lie within fp64 with them. Every format ([1024, 1024]) at each
-// epilogue, and a fused projection at its segments' column offsets.
+// 168- and 136-row chunks on the 128-row tiles: the second tile holds 40 or 8 rows, so its last two or three 32-row
+// simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
+// unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
+// splits and lie within fp64 with them. Every format ([1024, 1024]) at each epilogue, and a fused projection at its
+// segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear) {
-  constexpr uint32_t K = 1024, kChunk = 168, kSimdgroupRows = 32, kSplitChunk = 4;
+  constexpr uint32_t K = 1024, kChunks[] = {168, 136}, kSimdgroupRows = 32, kSplitChunk = 4;
+  constexpr LinearConfig kTiles{LinearTile::GgufStaged, 0, LinearSimdgroups::Four, 1};
   const auto chunks = [&](const Projection &p, const std::vector<const Tensor *> &parts, LinearEpilogue epilogue,
                           const std::string &what) {
     const uint32_t covered = segmentColumns(parts), columns = p.outputSize;
-    const LinearWorkload tiles{{columns, K}, kChunk, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
-    const LinearPlan tilePlan = Linear::plan(tiles, {LinearTile::GgufStaged, 0, LinearSimdgroups::Four, 1});
-    const uint32_t storage = tilePlan.storageRows();
+    const auto workload = [&](uint32_t rows) {
+      return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
+    };
+    // Both chunks take two tiles.
+    const uint32_t storage = Linear::plan(workload(kChunks[0]), kTiles).storageRows();
     const std::vector<float> x = activations(Inputs::Dense, storage, K);
     // The residual, or the gate of the up-with-gate epilogue.
     const std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
         ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
-    const std::vector<Dot> dots = products(parts, columns, x, kChunk);
+    const std::vector<Dot> dots = products(parts, columns, x, kChunks[0]);
     const std::string label = what + " " + epilogueName(epilogue);
-    const Outcome whole = run(backend, linear, tilePlan, p, nullptr, storageRows(x, K, kChunk, storage), aux,
-                              kPoisonNaN, covered, label + " 168 rows");
-    checkValues(whole, dots, {}, aux, tiles, kChunk, covered, true, label + " 168 rows");
-    const uint32_t written = (kChunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
-    if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),
-                     [](uint16_t v) { return v == kUnwritten; }))
-      fail(label + ": simdgroups past the 168-row chunk write their rows");
+    std::vector<uint16_t> tileOutput;  // the first chunk's output on the 128-row tiles
+    for (const uint32_t chunk : kChunks) {
+      const LinearWorkload w = workload(chunk);
+      const std::string name = label + " " + std::to_string(chunk) + " rows";
+      const Outcome whole = run(backend, linear, Linear::plan(w, kTiles), p, nullptr,
+                                storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
+      checkValues(whole, dots, {}, aux, w, chunk, covered, true, name);
+      const uint32_t written = (chunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
+      if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),
+                       [](uint16_t v) { return v == kUnwritten; }))
+        fail(name + ": simdgroups past the chunk write their rows");
+      if (tileOutput.empty()) tileOutput = whole.output;
+    }
     for (const uint32_t rows : {8u, 16u, 24u, 32u})
       for (const uint32_t splits : {1u, kSplitChunk}) {
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
@@ -562,7 +572,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
         const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, plan.storageRows()),
                                 chunkAux, kPoisonNaN, covered, name);
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
-        if (splits == 1 && !sameRows(out.output, 0, whole.output, 0, rows, columns))
+        if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
       }
   };
@@ -577,8 +587,8 @@ void prefill(MetalBackend &backend, const Linear &linear) {
     chunks(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None,
            std::string(fmtName(fi)) + "|" + fmtName(b.format) + "|" + fmtName(c.format));
   }
-  section("prefill: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate and fused segments, 128-row tiles over a 168-row chunk and "
-          "chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
+  section("prefill: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row "
+          "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
 }
 
 // ---------------------------------------------------------------- split visibility

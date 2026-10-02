@@ -29,8 +29,11 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 
 // ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
-// a multiple of the tile) still stage but skip their matmuls and stores, so a chunk costs its rows rounded up to
-// RowsPerSG rather than to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile).
+// a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather than
+// to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Every simdgroup still
+// stages and meets the same barrier at each step: in MSL a barrier inside a conditional must be reached by every
+// thread of the threadgroup. Full tiles run this loop too: a separate branch-free copy for them, selected per
+// threadgroup, measured up to 4% slower on an M5 Max and no faster on an M3 Max.
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
@@ -71,35 +74,30 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
     }
     hdr[it] = F::loadMeta(tmeta + col * F::MetaBytes); hdr_unit[it] = 0;
   }
-  // The step loop with or without this simdgroup's matmuls, one copy each: a full tile runs the loop unchanged (a
-  // branch around the matmul inside the loop cost 1-3% at full tiles on the M3 Max).
-  const auto run_steps = [&](auto with_matmuls) {
-    for (uint step = 0; step < steps; ++step) {
-      threadgroup half *buf = stage + (step & 1) * (KS * TileN);
+  for (uint step = 0; step < steps; ++step) {
+    threadgroup half *buf = stage + (step & 1) * (KS * TileN);
+#pragma unroll
+    for (ushort it = 0; it < IPT; ++it) {
+      const uint item = thread_index + it * Threads; if (item >= Items) break;
+      const uint col = item % TileN, gi = item / TileN, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
+      if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
+      dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (step + Prefetch < steps) {
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) {
         const uint item = thread_index + it * Threads; if (item >= Items) break;
-        const uint col = item % TileN, gi = item / TileN, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
-        if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
-        dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (step + Prefetch < steps) {
-#pragma unroll
-        for (ushort it = 0; it < IPT; ++it) {
-          const uint item = thread_index + it * Threads; if (item >= Items) break;
-          const uint col = item % TileN, gi = item / TileN; const ulong g = ulong(step + Prefetch) * GPS + gi;
-          packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
-        }
-      }
-      if constexpr (decltype(with_matmuls)::value) {
-        auto a_slice = a.template slice<KS, RowsPerSG>(step * KS, 0);
-        if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
+        const uint col = item % TileN, gi = item / TileN; const ulong g = ulong(step + Prefetch) * GPS + gi;
+        packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
       }
     }
-  };
-  if (!owns_rows) { run_steps(false_type{}); return; }
-  run_steps(true_type{});
+    if (owns_rows) {
+      auto a_slice = a.template slice<KS, RowsPerSG>(step * KS, 0);
+      if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
+    }
+  }
+  if (!owns_rows) return;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
     if (!acc.is_valid_element(i)) continue;
