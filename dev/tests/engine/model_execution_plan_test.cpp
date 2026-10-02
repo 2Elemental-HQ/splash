@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -15,10 +16,7 @@ namespace {
 
 using namespace splash;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Weights>
 model::ModelPackage package() {

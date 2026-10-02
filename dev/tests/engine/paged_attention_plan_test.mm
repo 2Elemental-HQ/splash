@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -30,10 +31,7 @@ static_assert(!std::is_aggregate_v<ops::VerifyAttentionPlan> &&
               !std::is_default_constructible_v<ops::VerifyAttentionPlan> &&
               !std::is_copy_assignable_v<ops::VerifyAttentionPlan>);
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

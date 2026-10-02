@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestMetalMemory.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -16,10 +17,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const std::string &message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // Admits bytes through the governor's one admission path, running allocate
 // while they are reserved.

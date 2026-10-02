@@ -1,5 +1,6 @@
 #include "AllocationFailure.hpp"
 #include "ProtocolPeer.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
@@ -184,10 +185,7 @@ private:
   uint32_t restored_ = 0;
 };
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {

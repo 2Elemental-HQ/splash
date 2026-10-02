@@ -1,5 +1,6 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include "engine/MemoryGovernor.hpp"
@@ -27,9 +28,7 @@ using model::SlotFile;
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
   std::vector<std::byte> result(bytes);

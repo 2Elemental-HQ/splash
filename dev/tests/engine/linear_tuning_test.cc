@@ -1,4 +1,5 @@
 #include "AffineQ4Fixture.hpp"
+#include "TestChecks.hpp"
 #include "tuning/LinearTuning.hpp"
 
 #include "metal/BackendInstrumentation.hpp"
@@ -21,9 +22,7 @@ using splash::metal::BackendInstrumentation;
 using splash::test::deterministicQ4Projection;
 using splash::test::mix;
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 template <class Function> void rejects(Function function) {
   try { function(); }
   catch (const std::invalid_argument &) { return; }

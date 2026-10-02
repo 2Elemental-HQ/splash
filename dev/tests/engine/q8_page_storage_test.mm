@@ -1,5 +1,6 @@
 #include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include <algorithm>
@@ -19,9 +20,7 @@ using splash::test::entryOf;
 
 namespace {
 
-void require(bool condition, const char *message) {
-    if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Exception, typename Function>
 void requireThrows(Function &&function, const char *message) {

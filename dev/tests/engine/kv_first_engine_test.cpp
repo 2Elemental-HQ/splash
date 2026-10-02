@@ -1,4 +1,5 @@
 #include "TestCache.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
@@ -618,10 +619,7 @@ public:
   std::vector<std::pair<WorkKind, double>> cycles;
 };
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::Engine &engine) {

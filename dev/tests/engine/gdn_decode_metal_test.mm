@@ -7,6 +7,7 @@
 // checked at fp32 accuracy from the kernel's own k/v and gates, after those
 // were checked against the reference; the hidden rows from the recurrent rows
 // read from that state with the reference q and rounded to bf16.
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/StateLayout.hpp"
@@ -46,11 +47,6 @@ constexpr uint32_t kLayers = 2;
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544}};
-
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
 
 template <class Function> void rejects(Function function) {
   try {

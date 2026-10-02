@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
@@ -39,10 +40,7 @@ namespace {
   throw std::runtime_error(message);
 }
 
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    fail(message);
-}
+using splash::test::require;
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";

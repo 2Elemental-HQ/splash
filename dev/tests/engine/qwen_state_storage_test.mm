@@ -2,6 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
+#include "tests/engine/TestChecks.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -29,10 +30,7 @@ constexpr model::DraftStateLayout kDraftState{5, 8, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Exception = std::exception>
 void requireThrows(const std::function<void()> &operation,

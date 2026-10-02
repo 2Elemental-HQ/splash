@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "TestModel.hpp"
 
@@ -12,10 +13,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
   DeviceCapabilities result;

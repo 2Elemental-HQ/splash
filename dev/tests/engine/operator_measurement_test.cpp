@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "tuning/Measurement.hpp"
 
 #include <array>
@@ -16,10 +17,7 @@ using namespace splash::ops::tuning;
 
 constexpr CandidateId kCandidate{7};
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 RunTiming stableTiming(CandidateId candidate) {
   return candidate == kBaseline ? RunTiming{1, 2, false}

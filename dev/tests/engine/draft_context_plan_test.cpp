@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "model/Model.hpp"
 #include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
@@ -15,10 +16,7 @@ using benchmark::draftContextRows;
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
   return planDraftContext(replayBegin, replayEnd, {});

@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
@@ -18,10 +19,7 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 class TemporaryModelRoot final {
 public:

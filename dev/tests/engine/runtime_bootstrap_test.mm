@@ -1,5 +1,6 @@
 #include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
@@ -30,10 +31,7 @@ using namespace splash;
 using namespace splash::engine;
 namespace runtime = splash::engine;
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 class TemporaryModelRoot final {
 public:

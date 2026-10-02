@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 #include "ops/Linear.hpp"
@@ -24,7 +25,6 @@ using namespace splash::ops;
 using namespace splash::ops::tuning;
 using namespace splash::test;
 namespace {
-void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
 struct Guarded {
   metal::MetalBuffer backing, view;
   uint64_t size;

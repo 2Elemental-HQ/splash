@@ -1,4 +1,5 @@
 #include "Checked.hpp"
+#include "TestChecks.hpp"
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
@@ -25,9 +26,7 @@ static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
-static void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Exception, typename Call>
 static bool throws(Call call) {

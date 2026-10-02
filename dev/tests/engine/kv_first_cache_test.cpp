@@ -1,5 +1,6 @@
 #include "Checked.hpp"
 #include "TestCache.hpp"
+#include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
@@ -21,10 +22,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Error, typename Function>
 void requireThrows(Function &&function, const char *message) {

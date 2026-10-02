@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
 #include "ops/DraftSelector.hpp"
@@ -12,10 +13,7 @@
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

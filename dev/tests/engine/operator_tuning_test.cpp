@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "tuning/Tuning.hpp"
 
 #include <algorithm>
@@ -12,10 +13,7 @@ namespace {
 
 using namespace splash::ops::tuning;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 std::vector<PairedTiming> timings(double gain, size_t count = 12) {
   std::vector<PairedTiming> result;

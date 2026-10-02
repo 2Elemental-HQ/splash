@@ -1,4 +1,5 @@
 #include "ProtocolPeer.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
@@ -118,10 +119,7 @@ struct Pipes final {
   }
 };
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // For a failure that leaves a thread blocked: unwinding would wait for it.
 [[noreturn]] void abandon(const char *message) {

@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "engine/Status.hpp"
 
 #include <cmath>
@@ -10,10 +11,7 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 bool close(double left, double right) { return std::abs(left - right) < 1e-9; }
 

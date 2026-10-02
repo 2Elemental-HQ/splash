@@ -1,4 +1,5 @@
 #include "AffineQ4Fixture.hpp"
+#include "TestChecks.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -35,10 +36,7 @@ using namespace splash;
 using namespace splash::ops;
 using test::mix;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "tuning/TuningWorkloads.hpp"
 
 #include "metal/BackendInstrumentation.hpp"
@@ -20,10 +21,7 @@ static_assert(!tuning::kPrefillProbeRows.empty() &&
               tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
 static_assert(tuning::kDecodeProbeWidths == std::array<uint32_t, 4>{1, 2, 3, 4});
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

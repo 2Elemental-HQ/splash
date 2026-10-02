@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 
 #include <cstdlib>
@@ -12,9 +13,7 @@ using splash::engine::KvPool;
 using splash::metal::AllocationFailure;
 using splash::test::TestKvStorage;
 
-void require(bool condition, const char *message) {
-    if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Error, typename Function>
 void requireThrows(Function &&function, const char *message) {

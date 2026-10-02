@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "engine/Scheduler.hpp"
 
 #include <algorithm>
@@ -12,10 +13,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 engine::RequestSpec
 request(uint64_t id, uint32_t prompt, bool constrained = false,
