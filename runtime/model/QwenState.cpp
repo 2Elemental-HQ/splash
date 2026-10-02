@@ -260,11 +260,6 @@ QwenStateStorage::tryActivateLane(uint32_t index, uint64_t requestId, uint64_t e
       !admission)
     return admission;
   current.cells = std::move(buffers);
-
-  // A fresh recurrent sequence reads parity zero immediately. Parity one is
-  // fully overwritten by the first transition. Draft validity is controlled
-  // by the zero logical lengths below.
-  clear(current.cells.gdn[0]->buffers().stateBase, "lane GDN state");
   current.metadata = {requestId, 0, {}};
   return {};
 }
@@ -283,6 +278,14 @@ void QwenStateStorage::releaseLane(uint32_t index, uint64_t requestId) {
   }
   pool_->rings.push_back(std::move(current.cells.draft));
   current.metadata = {};
+}
+
+void QwenStateStorage::clearForColdStart(uint32_t index) {
+  const Lane &target = lane(index);
+  requireAssigned(target);
+  if (target.metadata.lengths != QwenLogicalLengths{})
+    throw std::logic_error("a cold start begins at logical length zero");
+  clear(current(index).stateBase, "cold-start GDN state");
 }
 
 uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {

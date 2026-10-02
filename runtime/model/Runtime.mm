@@ -1016,6 +1016,8 @@ struct Runtime::Impl {
           metadata.lengths.targetTokens != item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
+      if (item.logicalPosition == 0)
+        states.clearForColdStart(entry.stateLane);
       if (item.tokenCount > kPrefillRows - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }

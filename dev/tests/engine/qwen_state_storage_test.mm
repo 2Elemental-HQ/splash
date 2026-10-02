@@ -561,12 +561,15 @@ void run(const std::string &metallib) {
                 storage.metadata(1).lengths.draftBase == 2048,
             "GDN-only restore exposed stale draft metadata");
     // Cancellation releases ownership and returns the lane's buffers to the
-    // pool. Reactivation takes them back in the same order and initializes
-    // every state that can be read at logical length zero.
+    // pool. Reactivation takes them back in the same order and as they are:
+    // only a cold start clears the current cell, which a restore would
+    // overwrite instead.
+    const uint64_t tailWord = kTargetState.cellBytes() - sizeof(uint32_t);
     void *reusableGdnBase = storage.next(0).stateBase.contents();
     void *reusableDraftBase = storage.draft(0)[0].keys.contents();
     word(storage.next(0).convolutionLayers[0]) = 0xc1c1c1c1;
     word(storage.next(0).recurrentLayers[0]) = 0xc2c2c2c2;
+    word(storage.next(0).stateBase, tailWord) = 0xc3c3c3c3;
     storage.releaseLane(0, 101);
     require(!storage.metadata(0).assigned(), "cancellation did not release metadata");
     require(storage.idleCells() == 2 && storage.idleRings() == 1 &&
@@ -584,13 +587,21 @@ void run(const std::string &metallib) {
                 storage.metadata(0).activeParity == 0 &&
                 storage.metadata(0).lengths == QwenLogicalLengths{},
             "lane reuse did not reset logical state");
+    require(word(storage.current(0).convolutionLayers[0]) == 0xc1c1c1c1 &&
+                word(storage.current(0).recurrentLayers[0]) == 0xc2c2c2c2 &&
+                word(storage.current(0).stateBase, tailWord) == 0xc3c3c3c3,
+            "activation touched the pooled cell it took");
+    storage.clearForColdStart(0);
     require(word(storage.current(0).convolutionLayers[0]) == 0 &&
-                word(storage.current(0).recurrentLayers[0]) == 0,
-            "lane reuse did not initialize readable state");
+                word(storage.current(0).recurrentLayers[0]) == 0 &&
+                word(storage.current(0).stateBase, tailWord) == 0,
+            "a cold start left readable state in the current cell");
 
     // Rejected publications fail before any cache slot is taken or admitted.
     const uint64_t beforeRejected = storage.actualAllocatedBytes();
     storage.updateLengths(0, {128, 0, 127, 127});
+    requireThrows<std::logic_error>([&] { storage.clearForColdStart(0); },
+                                    "a lane past length zero was cleared for a cold start");
     requireThrows<std::invalid_argument>(
         [&] { static_cast<void>(storage.snapshot(0)); },
         "snapshot accepted divergent target/draft lengths");
@@ -614,9 +625,7 @@ void run(const std::string &metallib) {
             "preempted GDN or draft bytes remain outside the cache");
     require(storage.tryActivateLane(0, 303) &&
                 storage.metadata(0).assigned() &&
-                storage.metadata(0).lengths == QwenLogicalLengths{} &&
-                word(storage.current(0).convolutionLayers[0]) == 0 &&
-                word(storage.current(0).recurrentLayers[0]) == 0,
+                storage.metadata(0).lengths == QwenLogicalLengths{},
             "recomputation did not start from a fresh empty state");
 
     // Dropping a cached state returns its buffers to the storage's pool rather

@@ -183,13 +183,17 @@ public:
   // pool lacks, together with `extraBytes` for what else the request's start
   // allocates (`allocateExtra`, run first in the same admission). A start is
   // only useful whole, so a refusal allocates nothing, leaves the pool as it
-  // was and retains its cause. Activation clears parity-zero GDN state and
-  // resets draft logical lengths; later transitions overwrite the remaining
-  // data. Release returns the lane's buffers to the pool.
+  // was and retains its cause. Activation resets the logical lengths; a
+  // lane that starts from length zero clears its current cell with
+  // clearForColdStart before its first transition. Release returns the
+  // lane's buffers to the pool.
   [[nodiscard]] metal::AllocationResult
   tryActivateLane(uint32_t lane, uint64_t requestId, uint64_t extraBytes = 0,
                   const std::function<void()> &allocateExtra = {});
   void releaseLane(uint32_t lane, uint64_t requestId);
+  // A lane that starts at length zero without a restore reads zero recurrent
+  // state; its first transition overwrites the other parity.
+  void clearForColdStart(uint32_t lane);
 
   // Returns one pooled buffer to macOS, a cell before a ring, keeping one
   // lane's cells and ring when keepLane: what a reclaim step for a denied
