@@ -384,7 +384,6 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
   const bool pooledRing = !pool_->rings.empty();
   Buffers fresh;
   if (const uint64_t bytes = missingBytes(cells) + extraBytes) {
-    bool allocated = false;
     const auto admission = admitAllocation_(bytes, [&] {
       if (allocateExtra)
         allocateExtra();
@@ -398,13 +397,10 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
             backend_, allocations_, layout_.draft,
             std::string(label) + "-draft"));
       }
-      allocated = true;
     });
     // What a driver's refusal left of the attempt goes with `fresh`.
     if (!admission)
       return admission;
-    if (!allocated)
-      throw std::logic_error("state admission skipped its allocation");
   }
   for (uint32_t cell = 0; cell < pooledCells; ++cell) {
     buffers.gdn[cell] = std::move(pool_->cells.back());
