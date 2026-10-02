@@ -644,7 +644,9 @@ class Frontend:
             raise APIError(400, "priority must be foreground, normal, or background")
         return _PRIORITIES[priority_name]
 
-    def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
+    def _score_job(
+        self, prompt_tokens, slot_ids, deadline, priority, prompt_sha256=None
+    ):
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
@@ -655,8 +657,27 @@ class Frontend:
             priority=priority,
             score_tokens=tuple(slot_ids),
             public_id=secrets.token_hex(16),
-            meta=meta,
+            prompt_sha256=prompt_sha256,
         )
+
+    def _encode_score_prompt(self, messages, labels, admit, deadline, what):
+        """The tokens, answer-slot token ids and text of a scoring prompt. The
+        request's input drives the render, so a failure is its error."""
+        try:
+            return judgments.encode_prompt(
+                self.tokenizer,
+                self.chat_templates.select(None).source,
+                messages,
+                labels,
+                admit=admit,
+                checkpoint=lambda: remaining_request_time(deadline),
+            )
+        except judgments.ScoringUnsupported as error:
+            raise APIError(500, str(error), "scoring_unsupported") from error
+        except (APIError, judgments.SystemOneError):
+            raise
+        except Exception as error:
+            raise APIError(400, f"{what} prompt could not be rendered") from error
 
     def prepare_judgment(self, body, *, deadline=None):
         unknown = sorted(
@@ -681,31 +702,16 @@ class Frontend:
                 if prompt_tokens > self.max_context:
                     raise ContextLengthError(prompt_tokens, self.max_context)
 
-            try:
-                tokens, slots, prompt = judgments.encode_prompt(
-                    self.tokenizer,
-                    self.chat_templates.select(None).source,
-                    judgments.judgment_messages(body),
-                    judgments.LETTERS[: len(body["options"])],
-                    admit=admit,
-                    checkpoint=lambda: remaining_request_time(deadline),
-                )
-            except judgments.ScoringUnsupported as error:
-                raise APIError(500, str(error), "scoring_unsupported") from error
-            except APIError:
-                raise
-            except Exception as error:
-                raise APIError(400, "judgment prompt could not be rendered") from error
+            tokens, slots, prompt = self._encode_score_prompt(
+                judgments.judgment_messages(body),
+                judgments.LETTERS[: len(body["options"])],
+                admit,
+                deadline,
+                "judgment",
+            )
             remaining_request_time(deadline)
             job = self._score_job(
-                tokens,
-                slots,
-                deadline,
-                priority,
-                {
-                    "prompt_sha256": judgments.digest(prompt),
-                    "answer_token_ids": tuple(slots),
-                },
+                tokens, slots, deadline, priority, judgments.digest(prompt)
             )
         return job, body
 
@@ -722,19 +728,14 @@ class Frontend:
             )
         state, specs, question_details = judgments.validate_systemone(body)
         details.extend(question_details)
-        priority_name = body.get("priority", "normal")
-        if not isinstance(priority_name, str) or priority_name not in _PRIORITIES:
-            details.append(
-                judgments.detail(
-                    ["priority"],
-                    "priority must be foreground, normal, or background",
-                )
-            )
+        try:
+            priority = self._priority(body)
+        except APIError as error:
+            details.append(judgments.detail(["priority"], error.message))
         if details:
             raise judgments.SystemOneError(details)
         if deadline is None:
             deadline = self.request_deadline(body)
-        priority = _PRIORITIES[priority_name]
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):
@@ -771,36 +772,18 @@ class Frontend:
                             ]
                         )
 
-                try:
-                    tokens, slot_ids, prompt = judgments.encode_prompt(
-                        self.tokenizer,
-                        self.chat_templates.select(None).source,
-                        judgments.systemone_messages(state, spec, labels),
-                        labels,
-                        admit=admit,
-                        checkpoint=lambda: remaining_request_time(deadline),
-                    )
-                except judgments.ScoringUnsupported as error:
-                    raise APIError(500, str(error), "scoring_unsupported") from error
-                except (APIError, judgments.SystemOneError):
-                    raise
-                except Exception as error:
-                    raise APIError(
-                        500, "question prompt could not be rendered"
-                    ) from error
+                tokens, slot_ids, _ = self._encode_score_prompt(
+                    judgments.systemone_messages(state, spec, labels),
+                    labels,
+                    admit,
+                    deadline,
+                    "question",
+                )
                 remaining_request_time(deadline)
                 total_tokens += len(tokens)
-                job = self._score_job(
-                    tokens,
-                    slot_ids,
-                    deadline,
-                    priority,
-                    {
-                        "prompt_sha256": judgments.digest(prompt),
-                        "answer_token_ids": tuple(slot_ids),
-                    },
+                jobs.append(
+                    (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
                 )
-                jobs.append((qid, spec, job))
         return jobs
 
     def apply_template(self, body, *, deadline=None):

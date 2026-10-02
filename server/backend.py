@@ -128,8 +128,8 @@ class Job:
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
     output_clamped_to_context: bool = False
-    # Endpoint-specific metadata carried to the response builder.
-    meta: dict | None = None
+    # The digest of a judgment's rendered prompt, which its response reports.
+    prompt_sha256: str | None = None
     latency: RequestLatency | None = None
 
 

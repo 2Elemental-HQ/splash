@@ -1371,6 +1371,7 @@ class ServerTest(unittest.TestCase):
             response["prompt_sha256"],
             hashlib.sha256(prompt_text.encode()).hexdigest(),
         )
+        self.assertEqual(response["answer_token_ids"], list(request.score_tokens))
         self.assertEqual(
             harness.tokenizer.encode(prompt_text + "A"),
             list(request.prompt_tokens) + [ord("A")],
@@ -1566,6 +1567,33 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response["answers"]["choice"]["probabilities"], {"only": 1.0})
         self.assertEqual(response["answers"]["score"]["score"], 0.0)
         self.assertEqual(response["usage"], {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_render_failure_is_a_request_error(self):
+        class QuestionRenderFails(self.CharTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                if messages[0].get("content") == judgments.SYSTEMONE_SYSTEM:
+                    raise ValueError("the template cannot render this question")
+                return super().apply_chat_template(messages, **kwargs)
+
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=QuestionRenderFails(), max_context=8192
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Some evidence",
+                "questions": {"supported": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"],
+            "question prompt could not be rendered",
+        )
         self.assertEqual(runtime.requests, [])
 
     def test_systemone_shared_deadline_cancels_only_current_question(self):

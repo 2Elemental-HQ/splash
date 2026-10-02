@@ -808,7 +808,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         result = self._await_done(job)
         self._json(
             200,
-            judgments.judgment_response(self.app.response_model, row, job.meta, result),
+            judgments.judgment_response(self.app.response_model, row, job, result),
         )
 
     def _systemone(self, body, deadline):
