@@ -64,8 +64,7 @@ class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
-  explicit Scheduler(double decodeShare = 0.0) noexcept
-      : decodeShare_(decodeShare) {}
+  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
 
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
@@ -103,8 +102,7 @@ public:
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds = 0.0,
-                bool representativePrefillTiming = true);
+                double wallMilliseconds, bool representativePrefillTiming);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;

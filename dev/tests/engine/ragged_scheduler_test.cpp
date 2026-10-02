@@ -44,11 +44,11 @@ void completeDecode(engine::Scheduler &scheduler, bool finished = false,
   std::vector<StepResult> results;
   for (const BatchItem &item : plan.items)
     results.push_back({item.requestId, 0, finished, DecodeStage::Regular});
-  scheduler.complete(plan, results, wallMilliseconds);
+  scheduler.complete(plan, results, wallMilliseconds, true);
 }
 
 void testAdmissionSharesDispatchOrderAndBudget() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   scheduler.submit(request(1, 8193));
   scheduler.resourcesReady(1, 0);
   scheduler.submit(request(2, 8193));
@@ -68,7 +68,7 @@ void testAdmissionSharesDispatchOrderAndBudget() {
               plan.items[2].tokenCount == 1982,
           "dispatch disagreed with admission work accounting");
 
-  Scheduler shortPrompts;
+  Scheduler shortPrompts(0.0);
   std::vector<PrefillAdmission> many;
   for (uint64_t id = 1; id <= 8; ++id) {
     shortPrompts.submit(request(id, 65));
@@ -80,7 +80,7 @@ void testAdmissionSharesDispatchOrderAndBudget() {
 }
 
 void testAdmissionRespectsContendedBudgetAndDecodePriority() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   scheduler.observePrefill(2048, 6144.0);
   std::vector<PrefillAdmission> candidates;
   for (uint64_t id = 1; id <= 4; ++id) {
@@ -102,14 +102,14 @@ void testAdmissionRespectsContendedBudgetAndDecodePriority() {
 // The tier admission can select is set by the lanes that prefill or decode,
 // not by those waiting for a mask or for admission.
 void testHighestRunnablePriority() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   require(!scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
   scheduler.submit(request(1, 1, BatchCohort::Constrained, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 1);
   const BatchPlan initial = *scheduler.next({});
   scheduler.commit(initial, {});
   const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, result);
+  scheduler.complete(initial, result, 0.0, true);
   scheduler.submit(request(2, 1, BatchCohort::Greedy, RequestPriority::Background));
   scheduler.resourcesReady(2, 1);
   scheduler.submit(request(3, 100));
@@ -121,7 +121,7 @@ void testHighestRunnablePriority() {
 }
 
 void testQueuedPrefillCannotBeOvertakenIndefinitely() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   scheduler.submit(request(1, 8193));
   for (uint64_t id = 2; id <= 4; ++id) {
     scheduler.submit(request(id, 2048));
@@ -142,7 +142,7 @@ void testQueuedPrefillCannotBeOvertakenIndefinitely() {
 void testWarmupTimingSeedsFirstContendedCommand() {
   for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
                         std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
-    Scheduler scheduler;
+    Scheduler scheduler(0.0);
     scheduler.observePrefill(2048, sample);
     scheduler.observePrefill(1, 10000.0);
     scheduler.submit(request(1, 8193));
@@ -160,7 +160,7 @@ void testWarmupTimingSeedsFirstContendedCommand() {
 }
 
 void testShortestRemainingFirstUsesActualRows() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 17));
   scheduler.submit(request(2, 1000));
   scheduler.submit(request(3, 3000));
@@ -189,7 +189,7 @@ void testShortestRemainingFirstUsesActualRows() {
 }
 
 void testPerRequestBoundary() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096));
   scheduler.submit(request(2, 4096));
   scheduler.resourcesReady(1, 0);
@@ -221,7 +221,7 @@ void testPerRequestBoundary() {
 void testEqualPromptsFinishInArrivalOrder() {
   // Equal cold prompts are served oldest first, one whole budget at a time,
   // instead of an equal water-fill share that finishes them all at once.
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   for (uint64_t id = 1; id <= 3; ++id) {
     scheduler.submit(request(id, 3000));
     scheduler.resourcesReady(id, 0);
@@ -235,7 +235,7 @@ void testEqualPromptsFinishInArrivalOrder() {
 }
 
 void testShortArrivalPrecedesLongColdPrompt() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 3000));
   scheduler.submit(request(2, 700));
   scheduler.resourcesReady(1, 0);
@@ -249,7 +249,7 @@ void testShortArrivalPrecedesLongColdPrompt() {
 }
 
 void testBoundaryCapsDispatchWithoutChangingPriority() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096));
   scheduler.submit(request(2, 500));
   scheduler.resourcesReady(1, 0);
@@ -262,7 +262,7 @@ void testBoundaryCapsDispatchWithoutChangingPriority() {
               plan.items[1].tokenCount == 64,
           "state capture changed priority or lost its dispatch boundary");
 
-  engine::Scheduler checkpoints;
+  engine::Scheduler checkpoints(0.0);
   checkpoints.submit(request(1, 25000));
   checkpoints.submit(request(2, 10000));
   checkpoints.resourcesReady(1, 2048);
@@ -277,7 +277,7 @@ void testBoundaryCapsDispatchWithoutChangingPriority() {
 }
 
 void testEqualLanesRunInArrivalOrderWithoutOvertaking() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 5000));
   scheduler.submit(request(2, 5000));
   scheduler.resourcesReady(1, 0);
@@ -296,7 +296,7 @@ void testEqualLanesRunInArrivalOrderWithoutOvertaking() {
 }
 
 void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 6000));
   scheduler.resourcesReady(1, 0);
   // Three later short arrivals each take the whole budget ahead of lane 1;
@@ -306,7 +306,7 @@ void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
     const std::vector<StepResult> results{
         {plan.items[0].requestId, plan.items[0].tokenCount, true,
          DecodeStage::Regular}};
-    scheduler.complete(plan, results);
+    scheduler.complete(plan, results, 0.0, true);
   };
   for (uint64_t id = 2; id <= 4; ++id) {
     scheduler.submit(request(id, model::ExecutionLimits::prefillTokenBudget));
@@ -332,7 +332,7 @@ void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
 }
 
 void testServedLaneResetsOvertaking() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 3000));
   scheduler.submit(request(2, 700));
   scheduler.resourcesReady(1, 0);
@@ -347,7 +347,7 @@ void testServedLaneResetsOvertaking() {
     results.push_back({item.requestId, item.tokenCount, item.requestId == 2,
                        DecodeStage::Regular});
   }
-  scheduler.complete(first, results);
+  scheduler.complete(first, results, 0.0, true);
   scheduler.submit(request(3, 200));
   scheduler.resourcesReady(3, 0);
   const BatchPlan second = *scheduler.next({});
@@ -360,7 +360,7 @@ void testServedLaneResetsOvertaking() {
 
 void testRealDecodeWidths() {
   for (uint32_t width = 1; width <= 4; ++width) {
-    engine::Scheduler scheduler;
+    engine::Scheduler scheduler(0.0);
     for (uint32_t lane = 0; lane < width; ++lane) {
       scheduler.submit(request(lane + 1, 1));
       scheduler.resourcesReady(lane + 1, 1);
@@ -376,7 +376,7 @@ void testRealDecodeWidths() {
     for (const BatchItem &item : plan.items) {
       results.push_back({item.requestId, 0, false, DecodeStage::Regular});
     }
-    scheduler.complete(plan, results);
+    scheduler.complete(plan, results, 0.0, true);
     require(scheduler.snapshot().decodeBatchesByWidth[width - 1] == 1,
             "decode width counter did not record the real command");
   }
@@ -384,7 +384,7 @@ void testRealDecodeWidths() {
 
 void testMixedSamplingBatch() {
   for (uint32_t mask = 0; mask < 16; ++mask) {
-    Scheduler scheduler;
+    Scheduler scheduler(0.0);
     for (uint32_t lane = 0; lane < 4; ++lane) {
       const auto cohort = (mask & (1U << lane)) ? BatchCohort::Sampling
                                               : BatchCohort::Greedy;
@@ -401,7 +401,7 @@ void testMixedSamplingBatch() {
 void testDecodeMixTelemetryCountsMixedBatches() {
   for (uint32_t width = 1; width <= 4; ++width) {
     for (uint32_t sampled = 0; sampled < (1u << width); ++sampled) {
-      Scheduler scheduler;
+      Scheduler scheduler(0.0);
       for (uint32_t lane = 0; lane < width; ++lane) {
         const auto cohort = (sampled & (1u << lane)) ? BatchCohort::Sampling
                                                     : BatchCohort::Greedy;
@@ -429,7 +429,7 @@ void testDecodeMixTelemetryCountsMixedBatches() {
 }
 
 void testDecodeMixTelemetryIgnoresRejectedCommits() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Greedy));
   scheduler.submit(request(2, 1, BatchCohort::Sampling));
   scheduler.resourcesReady(1, 1);
@@ -452,13 +452,13 @@ void testDecodeMixTelemetryIgnoresRejectedCommits() {
 }
 
 void testConstrainedDecodeRemainsSeparate() {
-  Scheduler scheduler;
+  Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Constrained));
   scheduler.resourcesReady(1, 1);
   const BatchPlan initial = *scheduler.next({});
   scheduler.commit(initial, {});
   const std::array mask{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, mask);
+  scheduler.complete(initial, mask, 0.0, true);
   scheduler.maskReady(1);
   completeDecode(scheduler);
   scheduler.submit(request(2, 1, BatchCohort::Greedy));
@@ -479,7 +479,7 @@ void testConstrainedDecodeRemainsSeparate() {
 }
 
 void testPrefillAndDecodeAlternateWithoutStarvation() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1));
   scheduler.submit(request(2, 10'000));
   scheduler.resourcesReady(1, 1);
@@ -491,7 +491,7 @@ void testPrefillAndDecodeAlternateWithoutStarvation() {
   scheduler.commit(decode, {});
   const std::array decodeResult{
       StepResult{1, 0, false, DecodeStage::Regular}};
-  scheduler.complete(decode, decodeResult);
+  scheduler.complete(decode, decodeResult, 0.0, true);
 
   BatchPlan prefill = *scheduler.next({});
   require(prefill.kind == WorkKind::Prefill &&
@@ -542,7 +542,7 @@ void testMaskWaitAccruesNoDecodeDebt() {
   const BatchPlan initial = *scheduler.next({});
   scheduler.commit(initial, {});
   const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, result);
+  scheduler.complete(initial, result, 0.0, true);
   scheduler.submit(request(2, 20'000));
   scheduler.resourcesReady(2, 0);
   for (uint32_t command = 0; command < 3; ++command)
@@ -576,12 +576,12 @@ void testExcludedLanesAreNotPlanned() {
           "the prefill did not run while every decoder was left out");
   scheduler.commit(prefill, decoders);
   const std::array result{StepResult{3, prefill.items[0].tokenCount, false, DecodeStage::Regular}};
-  scheduler.complete(prefill, result, 500.0);
+  scheduler.complete(prefill, result, 500.0, true);
   completeDecode(scheduler, false, 50.0);
   require(scheduler.next({})->kind == WorkKind::Prefill,
           "a prefill owed decode time to decoders it was planned without");
 
-  engine::Scheduler blocked;
+  engine::Scheduler blocked(0.0);
   blocked.submit(request(1, 6000));
   blocked.resourcesReady(1, 0);
   const std::array<uint64_t, 1> waiting{1};
@@ -592,7 +592,7 @@ void testExcludedLanesAreNotPlanned() {
     blocked.commit(plan, waiting);
     const std::array finished{
         StepResult{id, plan.items[0].tokenCount, true, DecodeStage::Regular}};
-    blocked.complete(plan, finished);
+    blocked.complete(plan, finished, 0.0, true);
   }
   blocked.submit(request(5, model::ExecutionLimits::prefillTokenBudget));
   blocked.resourcesReady(5, 0);
@@ -628,7 +628,7 @@ void testHigherPriorityPrefillPrecedesDecodeDebt() {
 }
 
 void testMeasuredBudgetOnlyLimitsContendedWork() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   const BatchPlan first = *scheduler.next({});
@@ -652,7 +652,7 @@ void testMeasuredBudgetOnlyLimitsContendedWork() {
 }
 
 void testAuxiliaryWorkDoesNotTrainTextPrefillTiming() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -665,7 +665,7 @@ void testAuxiliaryWorkDoesNotTrainTextPrefillTiming() {
 }
 
 void testMeasuredBudgetUsesActualRowsAndRecovers() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 128));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 512.0);
@@ -686,7 +686,7 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
 }
 
 void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000, BatchCohort::Greedy,
                            RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
@@ -719,7 +719,7 @@ void testUnavailableTimingAndMinimumBudget() {
   for (double wallMilliseconds :
        {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::infinity(), 1.0, 1e9}) {
-    engine::Scheduler scheduler;
+    engine::Scheduler scheduler(0.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
     completePrefill(scheduler, *scheduler.next({}), wallMilliseconds);
@@ -734,7 +734,7 @@ void testUnavailableTimingAndMinimumBudget() {
 }
 
 void testMeasuredBudgetDoesNotCountBlockedPeers() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -746,7 +746,7 @@ void testMeasuredBudgetDoesNotCountBlockedPeers() {
 }
 
 void testMeasuredBudgetPreservesPurePrefillPacking() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -763,7 +763,7 @@ void testMeasuredBudgetPreservesPurePrefillPacking() {
 }
 
 void testTinyTailDoesNotDistortPrefillThroughput() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 2056));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 2048.0);
@@ -778,7 +778,7 @@ void testTinyTailDoesNotDistortPrefillThroughput() {
 void testMeasuredBudgetFinishesShortPrefillPromptly() {
   for (const auto priority : {RequestPriority::Normal,
                               RequestPriority::Background}) {
-    engine::Scheduler scheduler;
+    engine::Scheduler scheduler(0.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
     completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -809,7 +809,7 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
 // one that does not finish in it still packs a full command.
 void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
   const auto beside = [](std::initializer_list<uint32_t> arrivals) {
-    Scheduler scheduler;
+    Scheduler scheduler(0.0);
     scheduler.observePrefill(2048, 5632.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
@@ -844,7 +844,7 @@ void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
 }
 
 void testMeasuredBudgetRetainsOvertakingBound() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -859,7 +859,7 @@ void testMeasuredBudgetRetainsOvertakingBound() {
             "adaptive prefill did not serve a short arrival first");
     scheduler.commit(plan, {});
     const std::array result{StepResult{id, 128, true, DecodeStage::Regular}};
-    scheduler.complete(plan, result, 256.0);
+    scheduler.complete(plan, result, 256.0, true);
   }
   scheduler.submit(request(5, 128));
   scheduler.resourcesReady(5, 0);
@@ -871,7 +871,7 @@ void testMeasuredBudgetRetainsOvertakingBound() {
 }
 
 void testPriorityPrecedesWorkKindAlternation() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Greedy,
                            RequestPriority::Background));
   scheduler.submit(request(2, 100, BatchCohort::Greedy,
@@ -886,7 +886,7 @@ void testPriorityPrecedesWorkKindAlternation() {
 }
 
 void testPrefillCommandContainsOnePriorityTier() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096, BatchCohort::Greedy,
                            RequestPriority::Foreground));
   scheduler.submit(request(2, 4096, BatchCohort::Greedy,
@@ -903,7 +903,7 @@ void testPrefillCommandContainsOnePriorityTier() {
 }
 
 void testDecodeCommandContainsOnePriorityTier() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Greedy,
                            RequestPriority::Foreground));
   scheduler.submit(request(2, 1, BatchCohort::Greedy,
@@ -918,7 +918,7 @@ void testDecodeCommandContainsOnePriorityTier() {
   scheduler.commit(plan, {});
   const std::array result{
       StepResult{1, 0, true, DecodeStage::Regular}};
-  scheduler.complete(plan, result);
+  scheduler.complete(plan, result, 0.0, true);
 
   BatchPlan background = *scheduler.next({});
   require(background.kind == WorkKind::Decode && background.width() == 1 &&
@@ -927,7 +927,7 @@ void testDecodeCommandContainsOnePriorityTier() {
 }
 
 void testDecodeCohortsAndLanesRotate() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   for (uint64_t id = 1; id <= 5; ++id) {
     scheduler.submit(request(id, 1, BatchCohort::Greedy));
     scheduler.resourcesReady(id, 1);
@@ -945,7 +945,7 @@ void testDecodeCohortsAndLanesRotate() {
     firstResults.push_back(
         {item.requestId, 0, false, DecodeStage::Regular});
   }
-  scheduler.complete(first, firstResults);
+  scheduler.complete(first, firstResults, 0.0, true);
 
   BatchPlan second = *scheduler.next({});
   require(second.kind == WorkKind::Decode && second.width() == 4 &&
@@ -955,7 +955,7 @@ void testDecodeCohortsAndLanesRotate() {
 }
 
 void testMaskStagesNeverMix() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Constrained));
   scheduler.submit(request(2, 1, BatchCohort::Constrained));
   scheduler.resourcesReady(1, 1);
@@ -970,7 +970,7 @@ void testMaskStagesNeverMix() {
       StepResult{1, 0, false, DecodeStage::ApplyInitialMask},
       StepResult{2, 0, false, DecodeStage::ApplyInitialMask},
   };
-  scheduler.complete(initialRequest, initialResults);
+  scheduler.complete(initialRequest, initialResults, 0.0, true);
   scheduler.maskReady(1);
 
   BatchPlan initialResume = *scheduler.next({});
@@ -983,7 +983,7 @@ void testMaskStagesNeverMix() {
   // stage only after the entire constrained cycle completes.
   const std::array initialResumeResult{
       StepResult{1, 0, false, DecodeStage::Regular}};
-  scheduler.complete(initialResume, initialResumeResult);
+  scheduler.complete(initialResume, initialResumeResult, 0.0, true);
 
   scheduler.maskReady(2);
   BatchPlan otherInitial = *scheduler.next({});
@@ -994,7 +994,7 @@ void testMaskStagesNeverMix() {
   scheduler.commit(otherInitial, {});
   const std::array otherInitialResult{
       StepResult{2, 0, true, DecodeStage::Regular}};
-  scheduler.complete(otherInitial, otherInitialResult);
+  scheduler.complete(otherInitial, otherInitialResult, 0.0, true);
 
   BatchPlan verify = *scheduler.next({});
   require(verify.width() == 1 && verify.items[0].requestId == 1 &&
@@ -1003,11 +1003,11 @@ void testMaskStagesNeverMix() {
   scheduler.commit(verify, {});
   const std::array verifyResult{
       StepResult{1, 0, true, DecodeStage::Regular}};
-  scheduler.complete(verify, verifyResult);
+  scheduler.complete(verify, verifyResult, 0.0, true);
 }
 
 void testWaitingMaskExpiresAtRequestDeadline() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, BatchCohort::Constrained));
   scheduler.resourcesReady(1, 1);
 
@@ -1015,7 +1015,7 @@ void testWaitingMaskExpiresAtRequestDeadline() {
   scheduler.commit(plan, {});
   const std::array result{
       StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(plan, result);
+  scheduler.complete(plan, result, 0.0, true);
   require(scheduler.phase(1) == engine::Phase::WaitingMask,
           "constrained request did not wait for its CPU mask");
   require(scheduler.expireDeadlines(10'000.0) &&
@@ -1035,7 +1035,7 @@ void testWaitingMaskBoundsPeerPrefill() {
   for (const RequestPriority priority : {RequestPriority::Foreground,
                                          RequestPriority::Normal,
                                          RequestPriority::Background}) {
-    Scheduler scheduler;
+    Scheduler scheduler(0.0);
     scheduler.observePrefill(2048, 4096.0);
     scheduler.submit(request(1, 1, BatchCohort::Constrained, priority));
     scheduler.resourcesReady(1, 1);
@@ -1043,7 +1043,7 @@ void testWaitingMaskBoundsPeerPrefill() {
     scheduler.commit(initial, {});
     const std::array result{
         StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-    scheduler.complete(initial, result);
+    scheduler.complete(initial, result, 0.0, true);
 
     scheduler.submit(request(2, 20'000));
     scheduler.resourcesReady(2, 0);
@@ -1069,7 +1069,7 @@ void testWaitingMaskBoundsPeerPrefill() {
 }
 
 void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
-  engine::Scheduler scheduler;
+  engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096));
   scheduler.resourcesReady(1, 0);
   BatchPlan first = *scheduler.next({});
@@ -1083,14 +1083,14 @@ void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
               resumed.items[0].promptOffset == 32,
           "resource resume did not start from its acquired cache boundary");
 
-  engine::Scheduler decode;
+  engine::Scheduler decode(0.0);
   decode.submit(request(2, 1, BatchCohort::Constrained));
   decode.resourcesReady(2, 1);
   auto initial = *decode.next({});
   decode.commit(initial, {});
   const std::array initialResult{
       StepResult{2, 0, false, DecodeStage::ApplyInitialMask}};
-  decode.complete(initial, initialResult);
+  decode.complete(initial, initialResult, 0.0, true);
   decode.maskReady(2);
   decode.suspendForResources(2);
   decode.resumeFromResources(2, 32, 40);
