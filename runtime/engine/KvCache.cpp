@@ -278,7 +278,7 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
       const Block &entry = block(blockId);
       if (entry.page != noPage) {
         // The request holding this page holds every page above it too.
-        if (pool_.activeReferences(entry.page))
+        if (pool_.pageActive(entry.page))
           break;
         if (!entry.transferring)
           ++pages;

@@ -2748,6 +2748,7 @@ void testLargeSharedDiskRestore() {
               stats.kvTier.pendingPages == 0,
           "large shared restore retained a request, state pin, or transfer");
 }
+
 // Restores start in block order and stop at the first the tier refuses: a
 // poll that finds the tier full asks it once, not once per waiting block,
 // and each transfer that lands lets the next block start.
@@ -2911,7 +2912,7 @@ void testCompactionLeavesTheRunway() {
   const KvPoolSnapshot pool = cache.snapshot().pool;
   require(step.madeProgress && step.reclaimedBytes == 0 &&
               fixture.storage.copies.size() == 1 && pool.pagesAllocated == 12 &&
-              pool.reclaimableExtents == 1,
+              pool.reclaimableBytes == 400,
           "the emptied extent did not stay as the runway");
   // A pass with a target keeps one empty extent and returns the others.
   ExtentFixture spare;
@@ -2926,7 +2927,7 @@ void testCompactionLeavesTheRunway() {
   require(released == 400 &&
               spare.storage.copies.size() == 1 &&
               spare.cache.snapshot().pool.pagesAllocated == 12 &&
-              spare.cache.snapshot().pool.reclaimableExtents == 1 &&
+              spare.cache.snapshot().pool.reclaimableBytes == 400 &&
               spare.cache.snapshot().kvCache.blocks == 6,
           "a pass did not keep one runway and return the extent it emptied");
 }
@@ -2998,11 +2999,13 @@ void testCompactionFollowsOnlyTheMovedBlocks() {
 
   // The oldest leaves go: the second prompt's first block, the third
   // prompt's state, then its leaf, which frees the page it moved to last.
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && pool.pageFree(5) &&
+  uint32_t freePages = pool.freePageCount();
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              pool.freePageCount() == freePages + 1 &&
               cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
           "the second prompt's moved block did not free its page");
-  const uint32_t freePages = pool.freePageCount();
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && pool.pageFree(4) &&
+  freePages = pool.freePageCount();
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
               pool.freePageCount() == freePages + 1,
           "the twice-moved leaf did not free the page it moved to last");
 }

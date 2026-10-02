@@ -90,7 +90,7 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
-  engine.resources.pool = {128, 72, 24, 32, 1, 128 * 4096ULL,
+  engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
                            32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
   engine.resources.extentCompactMaxMilliseconds = 1.25;
   engine.resources.kvCache = {32, 32 * 4096ULL};

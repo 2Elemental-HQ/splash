@@ -2079,7 +2079,7 @@ void testWarningReclaimCountsOnlyWhatReachesTheHost() {
   constexpr uint64_t extentBytes = 4 * 4096;
   require(resources.snapshot().stateCache.bytes == 64 &&
               resources.snapshot().pool.allocatedBytes == 2 * extentBytes &&
-              resources.snapshot().pool.reclaimableExtents == 1,
+              resources.snapshot().pool.reclaimableBytes == extentBytes,
           "fixture did not cache a state and an extent of KV beside the runway");
   // The lane's pooled buffers went back to the host earlier.
   executor.laneFootprintBytes = 64;
@@ -4637,7 +4637,7 @@ void testBudgetDenialRetriesAfterRelease() {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, CacheNamespace{});
-    auto pages = pool.acquirePages(8, false);
+    auto pages = pool.acquirePages(8);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
       pool.releasePage(page, false);
@@ -4816,7 +4816,7 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
               events.failures == std::vector<std::string>{"capacity_exhausted"},
           "a request beyond the budget did not fail at once");
   require(after.extentAllocations == 8 && after.extentReleases == 0 &&
-              after.reclaimableExtents == 8,
+              after.reclaimableBytes == 8 * 4 * 4096,
           "the denied growth did not keep the extents it allocated");
 }
 
@@ -4828,7 +4828,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
     test::TestKvStorage storage(4 * extents, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, CacheNamespace{});
-    auto pages = pool.acquirePages(4 * extents, false);
+    auto pages = pool.acquirePages(4 * extents);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
       pool.releasePage(page, false);
@@ -4846,7 +4846,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
                                         : ReclaimOutcome::Untargeted) &&
                 result.releasedBytes == uint64_t{extents} * 4 * 4096 &&
                 pool.snapshot().pagesAllocated == 0 &&
-                pool.snapshot().reclaimableExtents == 0,
+                pool.snapshot().reclaimableBytes == 0,
             "a pass did not release every empty extent or report what was left");
   }
 }
@@ -4859,7 +4859,7 @@ void testReclaimRefusesACommandInFlight() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, CacheNamespace{});
-  auto pages = pool.acquirePages(8, false);
+  auto pages = pool.acquirePages(8);
   require(pages.granted(), "could not seed the KV extents");
   for (uint32_t page : pages.pages)
     pool.releasePage(page, false);
@@ -4872,7 +4872,7 @@ void testReclaimRefusesACommandInFlight() {
   guardReleases(storage, engine);
   engine.submit(request(289, {289}));
   require(engine.tick(1) && engine.commandInFlight() &&
-              pool.snapshot().reclaimableExtents == 1,
+              pool.snapshot().reclaimableBytes == 4 * 4096,
           "the prefill did not stay in flight beside an empty extent");
 
   const MemoryReclaimDirective directive{.reclaim = true,
@@ -4885,7 +4885,7 @@ void testReclaimRefusesACommandInFlight() {
   }
   require(refused && executor.reclaimableIdleStateBytes == 64 &&
               pool.snapshot().extentReleases == 0 &&
-              pool.snapshot().reclaimableExtents == 1,
+              pool.snapshot().reclaimableBytes == 4 * 4096,
           "a reclaim ran while a command was in flight");
 
   *executor.holdPrefillUntil = true;

@@ -226,13 +226,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   require(resources.ensureTokens(2, 4 * empty * 32 + 3 * 32).granted(),
           "empty extent allocation failed");
   resources.endRequest(2);
-  require(resources.snapshot().pool.reclaimableExtents == empty &&
+  require(resources.snapshot().pool.reclaimableBytes == uint64_t{empty} * 4 * 4096 &&
               resources.snapshot().kvCache.blocks == 1,
           "release setup geometry changed");
 
   require(resources.releaseEmptyExtents(false) == uint64_t{empty} * 4 * 4096 &&
               storage.releasedExtents == empty &&
-              resources.snapshot().pool.reclaimableExtents == 0 &&
+              resources.snapshot().pool.reclaimableBytes == 0 &&
               resources.snapshot().kvCache.blocks == 1,
           "a pass did not release every empty extent before evicting");
   const CacheReclaimResult step =
@@ -261,7 +261,7 @@ void testReleaseTimeCoversOneExtent() {
     resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128);
     resources.endRequest(id);
   }
-  require(resources.snapshot().pool.reclaimableExtents == 0 &&
+  require(resources.snapshot().pool.reclaimableBytes == 0 &&
               resources.snapshot().kvCache.blocks == 4 * extents,
           "release time setup geometry changed");
   static_cast<void>(resources.evictAll());
@@ -299,7 +299,8 @@ void testPublicationReleasesTheExtentItEmpties() {
   resources.beginRequest(3);
   require(resources.ensureTokens(3, 96).granted(), "the empty extent was not allocated");
   resources.endRequest(3);
-  require(resources.snapshot().pool.reclaimableExtents == 1 && storage.allocatedPages() == 16,
+  require(resources.snapshot().pool.reclaimableBytes == 4 * 4096 &&
+              storage.allocatedPages() == 16,
           "fixture geometry changed");
 
   // An extent is room only for a snapshot that can allocate its bytes.

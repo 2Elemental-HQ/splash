@@ -40,7 +40,7 @@ KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
   }
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
+KvPageAcquisition KvPool::acquirePages(uint32_t count) {
   if (!count)
     return {};
 
@@ -72,12 +72,9 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
   }
 
   for (uint32_t page : selected) {
-    PageRecord &record = pages_[page];
     markUsed(page);
-    uint32_t &references =
-        prefixOwner ? record.prefixReferences : record.activeReferences;
-    references = 1;
-    ++(prefixOwner ? prefixPages_ : activePages_);
+    pages_[page].activeReferences = 1;
+    ++activePages_;
   }
   return {std::move(selected)};
 }
@@ -122,8 +119,8 @@ uint64_t KvPool::bytesPerPage() const noexcept {
 
 uint32_t KvPool::freePageCount() const noexcept { return freePages_; }
 
-uint32_t KvPool::activeReferences(uint32_t page) const {
-  return pages_.at(page).activeReferences;
+bool KvPool::pageActive(uint32_t page) const {
+  return pages_.at(page).activeReferences != 0;
 }
 
 bool KvPool::pageFree(uint32_t page) const {
@@ -245,7 +242,6 @@ KvPoolSnapshot KvPool::snapshot() const {
   result.pagesPrefix = prefixPages_;
   result.pagesFree = freePages_;
   result.allocatedBytes = allocatedBytes();
-  result.reclaimableExtents = reclaimableExtents_.count;
   result.reclaimableBytes =
       uint64_t{reclaimableExtents_.count} * extentPages_ * bytesPerPage();
   result.extentAllocations = extentAllocations_;

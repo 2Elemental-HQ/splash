@@ -16,9 +16,9 @@ struct KvPoolSnapshot {
   uint32_t pagesFree = 0;
   uint32_t pagesActive = 0;
   uint32_t pagesPrefix = 0;
-  // Extents none of whose pages is held, which a reclaim releases at once.
-  uint32_t reclaimableExtents = 0;
   uint64_t allocatedBytes = 0;
+  // The bytes of extents none of whose pages is held, which a reclaim
+  // releases at once.
   uint64_t reclaimableBytes = 0;
   // Extents allocated and released through the pool, and the longest
   // allocation and release of one: what memory costs per extent. The counts
@@ -78,8 +78,8 @@ public:
   // std::invalid_argument for a runway longer than the pool.
   KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
 
-  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count,
-                                               bool prefixOwner);
+  // The pages come with one active reference each, the requester's.
+  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count);
   void retainPage(uint32_t page, bool prefixOwner);
   void releasePage(uint32_t page, bool prefixOwner);
 
@@ -88,8 +88,9 @@ public:
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
   // Free pages of allocated extents; acquisition hands these out first.
   [[nodiscard]] uint32_t freePageCount() const noexcept;
-  [[nodiscard]] uint32_t activeReferences(uint32_t page) const;
-  [[nodiscard]] bool pageFree(uint32_t page) const;
+  // A request holds the page, as one of its own or as a page of a cached
+  // chain it uses.
+  [[nodiscard]] bool pageActive(uint32_t page) const;
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   // Pages of allocated extents no request holds: free, or held only by the
   // cache.
@@ -144,6 +145,7 @@ private:
   [[nodiscard]] uint32_t firstPage(uint32_t extent) const noexcept {
     return extent * extentPages_;
   }
+  [[nodiscard]] bool pageFree(uint32_t page) const;
   // The lowest extent that is not allocated; noIndex when all of them are.
   [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
   void insertFree(uint32_t page) noexcept;

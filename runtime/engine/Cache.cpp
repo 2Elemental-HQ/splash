@@ -285,7 +285,7 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
 }
 
 TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
-  KvPageAcquisition acquired = pool_.acquirePages(count, false);
+  KvPageAcquisition acquired = pool_.acquirePages(count);
   if (!acquired.granted()) {
     // Demoted pages free theirs when their copies land: wait once those on
     // their way cover what the free pages do not, and until then reclaim.
