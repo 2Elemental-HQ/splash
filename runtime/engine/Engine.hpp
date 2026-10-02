@@ -433,6 +433,17 @@ private:
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
+  // Gives back what a lane holds: its planned and armed state boundaries,
+  // its state cell (keepContinuation keeps the model's host continuation of
+  // a suspended request) and its KV leases. The caller signals progress
+  // when the memory becomes available to waiting requests: a lane that
+  // held it across passes and ends (release) or fails its restore, or one
+  // suspended for a higher priority (preemptBelow). An admission returning
+  // what it took this pass does not: that memory was available before, and
+  // a signal would count as progress in deferResourceRetry and move the
+  // refused request's own wait limit out on every retry. Nor does a growth
+  // suspension (suspendForGrowth), which starts the recovery drain instead.
+  void vacateLane(Request &request, bool keepContinuation);
   void release(Request &request);
   void sweepTerminal();
 

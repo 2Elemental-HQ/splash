@@ -759,10 +759,7 @@ bool Engine::admit(Request &active, double now) {
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
     // state restore or replay has run, and all temporary leases are freed.
-    if (resuming) model_.suspend(requestId);
-    else model_.end(requestId);
-    cache_.endRequest(requestId);
-    active.stateCell.reset();
+    vacateLane(active, resuming);
     const Verdict verdict = judge(kv.denial, requestId);
     if (verdict == Verdict::Fail && !restoring) {
       settle(active, capacityExhausted("KV target", kv.admission.allocationFailure,
@@ -890,11 +887,7 @@ bool Engine::pollRestores(double now) {
     }
     restore.ticket.reset();
     restore.lookup = {};
-    discardPendingStateBoundaries(active);
-    if (scheduler_.suspended(id)) model_.suspend(id);
-    else model_.end(id);
-    cache_.endRequest(id);
-    active.stateCell.reset();
+    vacateLane(active, scheduler_.suspended(id));
     signalResourceProgress();
     scheduler_.waitForResources(id);
   }
@@ -1478,13 +1471,7 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   if (!active.stateCell || scheduler_.suspended(active.request.id)) {
     throw std::logic_error("request cannot be suspended");
   }
-  if (!active.stateBoundaries.empty()) {
-    discardPendingStateBoundaries(active);
-    scheduler_.setPrefillBoundary(active.request.id, std::nullopt);
-  }
-  model_.suspend(active.request.id);
-  cache_.endRequest(active.request.id);
-  active.stateCell.reset();
+  vacateLane(active, true);
   active.resumeKvTargetTokens = workEnd;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
@@ -1781,6 +1768,18 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
   release(active);
 }
 
+void Engine::vacateLane(Request &active, bool keepContinuation) {
+  const uint64_t id = active.request.id;
+  discardPendingStateBoundaries(active);
+  scheduler_.setPrefillBoundary(id, std::nullopt);
+  if (keepContinuation)
+    model_.suspend(id);
+  else
+    model_.end(id);
+  cache_.endRequest(id);
+  active.stateCell.reset();
+}
+
 void Engine::release(Request &active) {
   active.resourceWait = {};
   active.maskRequestedMilliseconds.reset();
@@ -1789,10 +1788,7 @@ void Engine::release(Request &active) {
     // fit now, so the recovery drain ends and the next attempt finds out.
     if (active.stateCell)
       allocationFailed_ = false;
-    discardPendingStateBoundaries(active);
-    model_.end(active.request.id);
-    cache_.endRequest(active.request.id);
-    active.stateCell.reset();
+    vacateLane(active, false);
     signalResourceProgress();
   }
   // Every end comes here; this request's use of its replay point ends,

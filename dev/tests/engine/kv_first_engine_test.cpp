@@ -7988,6 +7988,68 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
           "resource retries lost or repeated completed KV restores");
 }
 
+// An admission that gives back the lane and leases it took in the same pass
+// returns nothing waiting requests lacked before, so it is no progress: a
+// restore whose pages wait behind a demotion that never lands fails at the
+// limit of its first refused attempt instead of moving it out on every
+// retry.
+void testRolledBackAdmissionKeepsItsWaitLimit() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(12, 4096, 4);
+  storage.budgetPages = 8;
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  engine::Cache cache(pool, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // A three-block prefix and its state move to disk entirely.
+  std::vector<uint32_t> prompt(97, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 96).granted(), "fixture KV failed");
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 3; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "prefix block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "prefix block did not land");
+  }
+  // Six cached blocks under disk states hold six of the eight pages.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
+                                std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+            "filler state was not demoted");
+  }
+  require(pool.freePageCount() == 2, "fixture pages are off");
+
+  // The demotion that would free the restore's third page never lands.
+  tier.transferLimit = 1;
+  EngineRequest waiting = request(1, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  constexpr double firstAttempt = 1.0;
+  double failedAt = 0.0;
+  for (double now = firstAttempt; now < firstAttempt + 40000.0 && !events.failedCount;
+       now += 100.0) {
+    static_cast<void>(engine.tick(now));
+    failedAt = now;
+  }
+  require(events.failures == std::vector<std::string>{"resource_timeout"} &&
+              failedAt - firstAttempt >= 30000.0 && failedAt - firstAttempt <= 30200.0 &&
+              executor.suspensions == 0,
+          "a rolled-back admission moved its own wait limit out");
+}
+
 // Pages that land while a command runs keep a waiting lane past its limit
 // until its next attempt, after the command. Until then that limit is no
 // wake-up: tick() does not act on it, and the native loop would poll
@@ -8892,6 +8954,7 @@ int main() {
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
+    testRolledBackAdmissionKeepsItsWaitLimit();
     testLimitOutlivedByProgressDoesNotWakeTheLoop();
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
