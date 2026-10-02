@@ -41,16 +41,6 @@ ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
   return identity;
 }
 
-bool exactKvBlockKeyMatch(const KvBlockKeyView &stored,
-                          const KvBlockKeyView &query) noexcept {
-  return stored.indexHash == query.indexHash &&
-         stored.parentBlock == query.parentBlock &&
-         stored.images == query.images &&
-         stored.tokens.size() == query.tokens.size() &&
-         std::equal(stored.tokens.begin(), stored.tokens.end(),
-                    query.tokens.begin());
-}
-
 KvCache::~KvCache() noexcept {
   for (const auto &[_, entry] : blocks_) {
     if (entry.page == noPage)
@@ -85,23 +75,22 @@ KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
   if (parentBlock && !blocks_.contains(parentBlock))
     return std::nullopt;
   const uint64_t hash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, images);
-  const KvBlockKeyView query{parentBlock, hash, tokens, images};
   const auto [first, last] = index_.equal_range(hash);
   for (auto candidate = first; candidate != last; ++candidate) {
     const Block &entry = block(candidate->second);
-    const KvBlockKeyView stored{entry.parent, entry.indexHash, entry.tokens,
-                                entry.images};
-    if (!entry.poisoned && exactKvBlockKeyMatch(stored, query)) {
+    // Hashes filter candidates; equality requires the complete key.
+    if (!entry.poisoned && entry.parent == parentBlock && entry.images == images &&
+        std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
       return BlockMatch{entry.id, entry.page};
     }
   }
   return std::nullopt;
 }
 
-KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
-                                      std::span<const uint32_t> tokens,
-                                      uint32_t physicalPage,
-                                      ImageIdentity images) {
+KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
+                                    std::span<const uint32_t> tokens,
+                                    uint32_t physicalPage,
+                                    ImageIdentity images) {
   if (tokens.size() != pageTokens) {
     throw std::invalid_argument("KV cache block must contain one full page");
   }
@@ -109,9 +98,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
     throw std::out_of_range("KV cache physical page is out of range");
   }
   if (auto existing = find(parentBlock, tokens, images)) {
-    InsertResult result;
-    result.id = existing->id;
-    result.physicalPage = existing->physicalPage;
+    BlockMatch result{existing->id, existing->physicalPage};
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
       result.physicalPage = physicalPage;
@@ -170,11 +157,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   placed.lastUsed = recency_.next();
   reindex(placed);
   ++generation_;
-  InsertResult result;
-  result.id = id;
-  result.physicalPage = physicalPage;
-  result.inserted = true;
-  return result;
+  return {id, physicalPage};
 }
 
 void KvCache::retainActive(uint64_t blockId) {
@@ -311,10 +294,6 @@ bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
          !entry.transferring && !entry.poisoned;
-}
-
-bool KvCache::transferring(uint64_t blockId) const {
-  return block(blockId).transferring;
 }
 
 void KvCache::setTransferring(uint64_t blockId, bool transferring) {

@@ -77,7 +77,6 @@ void testImageIdentityKeysBlocks() {
 
   const auto tokens = page(248056);
   auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);
-  require(redBlock.inserted, "image block was not inserted");
   require(!cache.find(0, tokens), "text-only lookup matched an image block");
   require(!cache.find(0, tokens, blueIdentity),
           "a different image matched a token-identical block");
@@ -85,7 +84,7 @@ void testImageIdentityKeysBlocks() {
   require(found && found->id == redBlock.id,
           "identical image content did not match its block");
   auto blueBlock = cache.insert(0, tokens, acquired.pages[1], blueIdentity);
-  require(blueBlock.inserted && blueBlock.id != redBlock.id,
+  require(blueBlock.id != redBlock.id,
           "token-identical blocks with different images were merged");
   for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
   std::cout << "KV image identity ok\n";
@@ -108,8 +107,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   auto left = cache.insert(root.id, leftTokens, acquired.pages[1]);
   auto right = cache.insert(root.id, rightTokens, acquired.pages[2]);
   auto other = cache.insert(0, otherTokens, acquired.pages[3]);
-  require(root.inserted && left.inserted && right.inserted && other.inserted &&
-              cache.snapshot().blocks == 4 &&
+  require(cache.snapshot().blocks == 4 &&
               cache.snapshot().bytes == 400,
           "page cache did not retain four physical blocks");
 
@@ -133,7 +131,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
           "page cache did not reconstruct the exact parent chain");
 
   auto duplicate = cache.insert(root.id, leftTokens, acquired.pages[1]);
-  require(!duplicate.inserted && duplicate.id == left.id &&
+  require(duplicate.id == left.id &&
               duplicate.physicalPage == acquired.pages[1] &&
               cache.snapshot().blocks == 4,
           "exact duplicate created a second KV block");
@@ -346,7 +344,7 @@ void testSubtreeThroughChurn() {
       const uint64_t parent = live ? pick : 0;
       const auto result =
           cache.insert(parent, page(step + 1), static_cast<uint32_t>(inserted));
-      require(result.inserted && result.id == ++inserted, "unexpected test block identity");
+      require(result.id == ++inserted, "unexpected test block identity");
       blocks[result.id] = {parent, true};
       break;
     }
@@ -396,19 +394,6 @@ void testSubtreeThroughChurn() {
   while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
   require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
           "subtree churn leaked a block or a page reference");
-}
-
-void testHashCollisionStillRequiresExactTokens() {
-  const auto left = page(7);
-  auto right = left;
-  right.back() = 8;
-  constexpr uint64_t forcedCollision = 0x12345678;
-  const KvBlockKeyView stored{11, forcedCollision, left, {}};
-  const KvBlockKeyView colliding{11, forcedCollision, right, {}};
-  const KvBlockKeyView exact{11, forcedCollision, left, {}};
-  require(!exactKvBlockKeyMatch(stored, colliding) &&
-              exactKvBlockKeyMatch(stored, exact),
-          "KV block matching trusted a colliding index hash");
 }
 
 struct FakeSlot final : engine::KvDiskSlot {};
@@ -476,8 +461,9 @@ void testDiskTierTransitions() {
   cache.releaseActive(leaf.id);
   require(cache.diskCandidate(false).value().id == leaf.id, "released disk block left the order");
   cache.setTransferring(leaf.id, true);
-  require(!cache.diskCandidate(false) && cache.transferring(leaf.id),
-          "a block in transfer stayed replaceable");
+  require(!cache.diskCandidate(false), "a block in transfer stayed replaceable");
+  requireThrows<std::logic_error>([&] { cache.setTransferring(leaf.id, true); },
+                                  "a block in transfer was not marked as such");
   requireThrows<std::logic_error>([&] { cache.erase(leaf.id); },
                                   "a block in transfer was erased");
 
@@ -489,7 +475,7 @@ void testDiskTierTransitions() {
               cache.snapshot().blocks == 2 && !pool.pageFree(acquired.pages[2]),
           "adopted page was not retained by the block");
   auto writer = cache.insert(root.id, leafTokens, acquired.pages[3]);
-  require(!writer.inserted && writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
+  require(writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
           "a writer was switched to a page still being filled");
   pool.releasePage(acquired.pages[3], false);
   cache.setTransferring(leaf.id, false);
@@ -526,7 +512,7 @@ void testDiskOnlyAdoptionAndPoison() {
   cache.dropPage(leaf.id);
 
   auto adopted = cache.insert(root.id, leafTokens, acquired.pages[2]);
-  require(!adopted.inserted && adopted.id == leaf.id &&
+  require(adopted.id == leaf.id &&
               adopted.physicalPage == acquired.pages[2] &&
               cache.page(leaf.id) == acquired.pages[2] &&
               cache.diskCandidate(true).value().id == leaf.id,
@@ -548,7 +534,7 @@ void testDiskOnlyAdoptionAndPoison() {
           "poisoned block still matched or waited in an order");
   auto fresh = cache.insert(root.id, leafTokens, acquired.pages[3]);
   pool.releasePage(acquired.pages[3], false);
-  require(fresh.inserted && fresh.id != leaf.id &&
+  require(fresh.id != leaf.id &&
               cache.find(root.id, leafTokens).value().id == fresh.id,
           "poisoned block blocked republication of its content");
   cache.releaseActive(leaf.id);
@@ -600,7 +586,6 @@ int main() {
     testInputValidation();
     testCandidateOrderThroughChurn();
     testSubtreeThroughChurn();
-    testHashCollisionStillRequiresExactTokens();
     testDiskTierTransitions();
     testDiskOnlyAdoptionAndPoison();
     testMatchableExcludesPoisonedBlocks();

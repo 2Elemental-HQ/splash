@@ -40,17 +40,6 @@ struct ImageIdentity final {
 blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                    std::span<const ImageSpan> spans) noexcept;
 
-struct KvBlockKeyView final {
-  uint64_t parentBlock = 0;
-  uint64_t indexHash = 0;
-  std::span<const uint32_t> tokens;
-  ImageIdentity images;
-};
-
-// Hashes filter candidates; equality still requires the complete key.
-[[nodiscard]] bool exactKvBlockKeyMatch(const KvBlockKeyView &stored,
-                                        const KvBlockKeyView &query) noexcept;
-
 // Content-addressed target-KV blocks across two tiers. Matching walks the
 // chained full-page hashes from the root. A block holds a pool page, a disk
 // slot, or both; resident blocks form a subtree at the root, so a matched
@@ -65,10 +54,6 @@ public:
   struct BlockMatch {
     uint64_t id = 0;
     uint32_t physicalPage = noPage;
-  };
-
-  struct InsertResult : BlockMatch {
-    bool inserted = false;
   };
 
   // Root first; noPage marks a disk-only block.
@@ -97,10 +82,10 @@ public:
                                                ImageIdentity images = {}) const;
   // Existing content is returned as is; a disk-only block adopts the
   // writer's page, and a block in transfer keeps its own.
-  [[nodiscard]] InsertResult insert(uint64_t parentBlock,
-                                    std::span<const uint32_t> tokens,
-                                    uint32_t physicalPage,
-                                    ImageIdentity images = {});
+  [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
+                                  std::span<const uint32_t> tokens,
+                                  uint32_t physicalPage,
+                                  ImageIdentity images = {});
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
@@ -139,7 +124,6 @@ public:
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
   // Resident, without resident children or users: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
-  [[nodiscard]] bool transferring(uint64_t blockId) const;
   void setTransferring(uint64_t blockId, bool transferring);
   // Publishes the block's disk copy; a resident block may drop it with null.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);

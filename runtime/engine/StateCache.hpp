@@ -32,21 +32,18 @@ public:
   CompositeStateLease &operator=(CompositeStateLease &&other) noexcept;
   ~CompositeStateLease() noexcept;
 
-  [[nodiscard]] explicit operator bool() const noexcept {
-    return owner_ != nullptr;
-  }
   [[nodiscard]] uint64_t kvBlock() const noexcept { return kvBlock_; }
   [[nodiscard]] uint32_t boundary() const noexcept { return boundary_; }
   [[nodiscard]] const std::shared_ptr<const CompositeState> &
   state() const noexcept {
     return state_;
   }
-  void reset() noexcept;
 
 private:
   friend class StateCache;
   CompositeStateLease(StateCache &owner, uint64_t kvBlock, uint32_t boundary,
                       std::shared_ptr<const CompositeState> state) noexcept;
+  void reset() noexcept;
 
   StateCache *owner_ = nullptr;
   uint64_t kvBlock_ = 0;
