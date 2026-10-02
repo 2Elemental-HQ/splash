@@ -190,9 +190,8 @@ void testCleanRuntimeStatus() {
       "\",\"format\":\"int8\",\"quantization\":\"symmetric_int8\","
       "\"scale_type\":\"float32\",\"key_layout\":\"token_major\","
       "\"value_layout\":\"dimension_major\"}";
-  require(json.find("\"kv\":" + kvIdentity) != std::string::npos &&
-              json.find("\"q8\":" + kvIdentity) != std::string::npos,
-          "INT8 status lost its generic or legacy identity");
+  require(json.find("\"kv\":" + kvIdentity) != std::string::npos,
+          "INT8 status lost its KV identity");
   require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
                     "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
                     "head_k_token_major_v_dimension_major\",\"block_tokens\":32}") !=
@@ -205,8 +204,7 @@ void testCleanRuntimeStatus() {
                         metrics, executorTelemetry, bf16Identity, governor, true,
                         {}, {}, {});
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
-              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
-              bf16Status.find("\"q8\":") == std::string::npos,
+              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,

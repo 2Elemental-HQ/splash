@@ -32,19 +32,10 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"kv_heads\":" << model.targetKvLayout.kvHeads << ','
       << "\"head_dimension\":" << model.targetKvLayout.headDimension << ','
       << "\"kv_page_tokens\":" << kv::kPageTokens << ','
-      << "\"kv_quantization_bits\":"
-      << (model.targetKvLayout.format == kv::Format::Int8 ? 8 : 16) << ','
       << "\"kv_format\":" << json::quote(kv::formatName(model.targetKvLayout.format)) << ','
       << "\"kv_elements_per_scale\":"
       << model.targetKvLayout.elementsPerScale() << ','
-      << "\"kv_scale_value_bytes\":"
-      << (model.targetKvLayout.format == kv::Format::Int8 ? sizeof(float) : 0) << ','
-      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
-  // Keep the legacy field for existing INT8 status consumers.
-  if (model.targetKvLayout.format == kv::Format::Int8)
-    out << ",\"q8_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
-  out
-      << ','
+      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage() << ','
       << "\"memory\":{" << "\"target_weights_bytes\":"
       << model.footprint.targetWeightsBytes << ','
       << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','

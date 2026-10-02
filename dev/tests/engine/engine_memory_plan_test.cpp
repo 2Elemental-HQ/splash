@@ -91,9 +91,9 @@ void testBf16BudgetAndStatus() {
           "BF16 KV capacity exceeded the shared budget");
   const auto json = bf16.toStatusJson();
   require(json.find("\"kv_format\":\"bf16\"") != std::string::npos &&
-              json.find("\"kv_scale_value_bytes\":0") != std::string::npos &&
-              json.find("\"q8_page_bytes\"") == std::string::npos,
-          "BF16 memory status reported INT8 scales or pages");
+              json.find("\"kv_scale_value_bytes\"") == std::string::npos &&
+              json.find("\"kv_quantization_bits\"") == std::string::npos,
+          "BF16 memory status restated its format");
   const uint64_t minimum = budget.minimumRequiredBytes;
   require(!evaluateEngineMemoryPlan(device(), profile, minimum - 1).plan,
           "BF16 startup admitted less than its minimum footprint");

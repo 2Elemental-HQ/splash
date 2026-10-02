@@ -155,8 +155,7 @@ class RealServer:
 
 
 def kv_identity(identity: dict) -> dict:
-    # Older INT8 builds expose only q8 and have no explicit format field.
-    return {"format": "int8", **identity.get("kv", identity.get("q8", {}))}
+    return identity.get("kv", {})
 
 
 def validate_status(status: dict, kv_format: str | None = None) -> None:
@@ -172,7 +171,7 @@ def validate_status(status: dict, kv_format: str | None = None) -> None:
     )
     identity = status.get("identity", {})
     kv = kv_identity(identity)
-    actual = kv["format"]
+    actual = kv.get("format")
     require(actual in ("int8", "bf16"), "unknown KV format")
     if kv_format is not None:
         require(actual == kv_format, "runtime KV format differs from requested format")

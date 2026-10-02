@@ -20,8 +20,7 @@ choice, not a general speed improvement.
   INT8 entry points, argument order, arithmetic, and dispatch policies remain.
   Both formats share the FP32 split reduction. Historical Q8 ABI names are kept
   where the underlying geometry and argument structure have not changed.
-- Status reports the selected format and its actual byte geometry. Existing
-  INT8 `identity.q8` and `q8_page_bytes` fields remain available.
+- Status reports the selected format and its actual byte geometry.
 
 ## Validation on 2026-09-21
 

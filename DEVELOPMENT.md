@@ -1411,8 +1411,10 @@ report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 
-For a same-machine HTTP regression check, retain the previous `splash` binary
-**and its adjacent `splash.metallib`**, then run from the candidate checkout:
+For a same-machine HTTP regression check, retain a `splash` binary **and its
+adjacent `splash.metallib`** built from a checkout with the same native wire
+version and status schema as this one (the server refuses any other), then run
+from the candidate checkout:
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
