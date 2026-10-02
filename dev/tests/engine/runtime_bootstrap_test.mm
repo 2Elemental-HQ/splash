@@ -368,8 +368,7 @@ void testAllNativeWarmupsPrecedeReady() {
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
       plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
-  require(report.stage == RuntimeBootstrapStage::Ready &&
-              report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready() && !harness.output().empty(),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
@@ -388,8 +387,7 @@ RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
 
 void requireReadyWithoutReducingConcurrency(
     Harness &harness, const RuntimeBootstrapReport &report) {
-  require(report.stage == RuntimeBootstrapStage::Ready &&
-              report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready(),
           "memory-limited warmup did not become ready");
   protocol::FrameParser parser;
@@ -485,7 +483,7 @@ void testResourceFailureClassificationSurvivesBootstrap() {
         const auto &report = error.report();
         require(report.stage == RuntimeBootstrapStage::ResourceAssembly &&
                     report.resourceFailure == failure &&
-                    report.message == message && report.warmup.error == message &&
+                    report.message == message &&
                     report.memoryPlanJson == "{\"budget\":1}" &&
                     report.budgetDescription == "budget details",
                 "bootstrap lost resource failure classification or diagnostics");
@@ -589,7 +587,7 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         require(error.report().stage == stages[step] &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
-                    !error.report().warmup.ready() && !harness.loop().ready() &&
+                    !harness.loop().ready() &&
                     harness.output().empty() &&
                     harness.executor().calls.back() == step,
                 "warmup failure was swallowed as a memory-limited success");

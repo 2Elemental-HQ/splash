@@ -21,7 +21,6 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
   report.resourceFailure = error.failure();
   report.message = error.message();
-  report.warmup.error = report.message;
   report.memoryPlanJson = error.statusJson();
   report.budgetDescription = error.budgetDescription();
   return report;
@@ -31,7 +30,6 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
                        RuntimeBootstrapStage stage, std::string message) {
   report.stage = stage;
   report.message = std::move(message);
-  report.warmup.error = report.message;
   throw RuntimeBootstrapError(std::move(report));
 }
 
@@ -200,13 +198,11 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          "actual memory reporting failed with an unknown exception");
   }
-  report.warmup.actualPeakBytes = actual.devicePeakAllocatedBytes;
   report.memoryAudit = auditActualMemory(memoryPlan, actual);
   if (!report.memoryAudit.valid) {
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          report.memoryAudit.describe());
   }
-  report.warmup.memoryBudgetValidated = true;
 
   try {
     nativeLoop.announceReady();
@@ -219,7 +215,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   }
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
-  report.warmup.error.clear();
   return report;
 }
 

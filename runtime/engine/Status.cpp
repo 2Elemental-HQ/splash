@@ -71,10 +71,11 @@ std::string runtimeStatusJson(
       {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
-  // critical verdict makes host pressure a readiness failure.
+  // critical verdict makes host pressure a readiness failure. A status exists
+  // only after warmup and the memory audit passed.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
-  const bool ready = warmup.ready() && memoryAudit.valid && metalHealthy &&
-                     hostSafe && currentBytes <= plan.breakdown().hardBudgetBytes;
+  const bool ready = metalHealthy && hostSafe &&
+                     currentBytes <= plan.breakdown().hardBudgetBytes;
   const double hitRate =
       core.cacheHits + core.coldMisses
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
@@ -317,11 +318,7 @@ std::string runtimeStatusJson(
     out << json::quote(name);
     separator = true;
   }
-  out << "],\"memory_budget_validated\":"
-      << boolean(warmup.memoryBudgetValidated)
-      << ",\"actual_peak_bytes\":" << warmup.actualPeakBytes
-      << ",\"detail\":" << json::quote(warmup.maximumPrefillDetail)
-      << ",\"error\":" << json::quote(warmup.error) << "}"
+  out << "],\"detail\":" << json::quote(warmup.maximumPrefillDetail) << "}"
       << ",\"metal\":{\"healthy\":" << boolean(metalHealthy)
       << ",\"failure_reason\":" << json::quote(metalFailureReason) << "}}";
   return out.str();

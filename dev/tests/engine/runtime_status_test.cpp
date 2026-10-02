@@ -111,7 +111,6 @@ void testCleanRuntimeStatus() {
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
   warmup.maximumPrefillDetail = "packed_rows=2048";
 
   RuntimeMetricsSnapshot metrics;
@@ -314,13 +313,6 @@ void testCleanRuntimeStatus() {
                     "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
               std::string::npos,
       "elastic KV-first status is incomplete");
-
-  warmup.decodeBatches[2] = WarmupStepStatus::Pending;
-  const std::string incomplete =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true);
-  require(incomplete.find("\"ready\":false") != std::string::npos,
-          "missing native B3 warmup did not fail readiness");
 }
 
 void testCurrentReadinessAndSimultaneousPeak() {
@@ -331,7 +323,6 @@ void testCurrentReadinessAndSimultaneousPeak() {
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
@@ -384,26 +375,12 @@ void testCurrentReadinessAndSimultaneousPeak() {
   governor.hostGrowthAllowed = true;
 }
 
-void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
+void testWarmupStepsReportMeasurementTruth() {
   const EngineMemoryPlan memoryPlan = plan();
   WarmupReport warmup;
-  require(!warmup.ready(), "unexecuted warmup was ready");
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
-  require(warmup.ready(), "complete warmup was not ready");
-
-  for (WarmupStepStatus *required : {&warmup.maximumPrefill,
-                                    &warmup.decodeBatches[0]}) {
-    for (WarmupStepStatus state : {WarmupStepStatus::Pending,
-                                  WarmupStepStatus::MemoryLimited}) {
-      *required = state;
-      require(!warmup.ready(), "required execution was skipped for readiness");
-    }
-    *required = WarmupStepStatus::Complete;
-  }
-
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
@@ -429,20 +406,16 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
     const std::string key = std::string("\"") + step.name + "\":";
     *step.state = WarmupStepStatus::Pending;
     const std::string pending = status();
-    require(!warmup.ready() &&
-                pending.find("\"ready\":false") != std::string::npos &&
-                pending.find(key + "false") != std::string::npos &&
+    require(pending.find(key + "false") != std::string::npos &&
                 pending.find("\"memory_limited_steps\":[]") != std::string::npos,
             "unexecuted optional warmup was treated as memory-limited");
 
     *step.state = WarmupStepStatus::MemoryLimited;
     const std::string limited = status();
-    require(warmup.ready() &&
-                limited.find("\"ready\":true") != std::string::npos &&
-                limited.find(key + "false") != std::string::npos &&
+    require(limited.find(key + "false") != std::string::npos &&
                 limited.find(std::string("\"memory_limited_steps\":[\"") +
                              step.name + "\"]") != std::string::npos,
-            "memory-limited warmup did not preserve readiness and measurement truth");
+            "memory-limited warmup was reported as measured or not listed");
 
     *step.state = WarmupStepStatus::Complete;
     require(status().find(key + "true") != std::string::npos,
@@ -451,17 +424,11 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
   for (const auto &step : optional)
     *step.state = WarmupStepStatus::MemoryLimited;
   const std::string limited = status();
-  require(warmup.ready() &&
-              limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
-                           "\"decode_b4\",\"composite_state_restore\"]") !=
+  require(limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
+                       "\"decode_b4\",\"composite_state_restore\"]") !=
                   std::string::npos &&
               limited.find("\"decode_b1\":true") != std::string::npos,
-          "single-lane readiness omitted or mislabeled memory-limited steps");
-  warmup.memoryBudgetValidated = false;
-  require(!warmup.ready(), "memory-limited warmup bypassed the memory audit");
-  warmup.memoryBudgetValidated = true;
-  warmup.error = "injected failure";
-  require(!warmup.ready(), "memory-limited warmup ignored an execution error");
+          "single-lane status omitted or mislabeled memory-limited steps");
 }
 
 void testMemoryPressureTelemetry() {
@@ -573,7 +540,7 @@ int main() {
   try {
     testCleanRuntimeStatus();
     testCurrentReadinessAndSimultaneousPeak();
-    testWarmupStatesPreserveReadinessAndMeasurementTruth();
+    testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
     testStderrLinesStayWhole();

@@ -34,22 +34,6 @@ struct WarmupReport {
   WarmupStepStatus compositeStateRestore = WarmupStepStatus::Pending;
   // Exact executor-selected kernel geometry for the fixed 2048-row path.
   std::string maximumPrefillDetail;
-  uint64_t actualPeakBytes = 0;
-  std::string error;
-  bool memoryBudgetValidated = false;
-
-  [[nodiscard]] bool ready() const noexcept {
-    const auto optionalComplete = [](WarmupStepStatus status) {
-      return status == WarmupStepStatus::Complete ||
-             status == WarmupStepStatus::MemoryLimited;
-    };
-    return error.empty() && memoryBudgetValidated &&
-           maximumPrefill == WarmupStepStatus::Complete &&
-           decodeBatches[0] == WarmupStepStatus::Complete &&
-           std::all_of(decodeBatches.begin() + 1, decodeBatches.end(),
-                       optionalComplete) &&
-           optionalComplete(compositeStateRestore);
-  }
 };
 
 // Most recently completed real batch of one work kind. Status queries during
