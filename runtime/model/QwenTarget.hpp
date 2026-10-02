@@ -215,7 +215,6 @@ struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
-  metal::MetalBuffer recurrent;
   metal::MetalBuffer gdnHidden;
   metal::MetalBuffer gdnOutput;
   metal::MetalBuffer denseIntermediate;

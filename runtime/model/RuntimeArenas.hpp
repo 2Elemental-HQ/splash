@@ -199,7 +199,6 @@ enum class DecodeTensor : uint32_t {
   Hidden1,
   InputTokens,
   Normalized,
-  Recurrent,
   GdnHidden,
   GdnOutput,
   Intermediate,

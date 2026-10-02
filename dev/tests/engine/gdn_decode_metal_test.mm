@@ -3,9 +3,10 @@
 // delta-rule recurrence over the fp32 state, the gated RMSNorm of the
 // recurrent rows and the convolution carry, for both compiled geometries,
 // every lane count, a two-layer state cell (so the layer offsets are
-// exercised) and every retained count of the commit. The recurrence and the
-// gate are checked from the kernel's own q/k/v and gates after those were
-// checked against the reference, so their tolerances stay at fp32 accuracy.
+// exercised) and every retained count of the commit. The recurrent state is
+// checked at fp32 accuracy from the kernel's own k/v and gates, after those
+// were checked against the reference; the hidden rows from the recurrent rows
+// read from that state with the reference q and rounded to bf16.
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/StateLayout.hpp"
@@ -41,6 +42,8 @@ constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kLayers = 2;
+// The scales of the normalized q and k rows.
+constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544}};
 
@@ -127,7 +130,7 @@ struct Fixture final {
   Cell cell;
   uint32_t lanes;
   MetalBuffer packed, convWeights, mixed, decayWeights, timeBias, decay, beta,
-      recurrent, hidden, retained;
+      hidden, retained;
   NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
   std::vector<MetalBuffer> packedLayer, mixedLayer, decayLayer, betaLayer;
@@ -162,10 +165,8 @@ struct Fixture final {
     fill(timeBias, 0.5F);
     decay = alloc(kLayers * kMaxLanes * gateStride * 4, "gdn decay");
     beta = alloc(kLayers * kMaxLanes * gateStride * 2, "gdn beta");
-    const uint64_t rowBytes =
-        uint64_t{kMaxLanes} * kRows * shape.valueHeads * kHeadDim * 2;
-    recurrent = alloc(rowBytes, "gdn recurrent rows");
-    hidden = alloc(rowBytes, "gdn hidden");
+    hidden = alloc(uint64_t{kMaxLanes} * kRows * shape.valueHeads * kHeadDim * 2,
+                   "gdn hidden");
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
     retained = alloc(kMaxLanes * 4, "gdn retained");
@@ -201,7 +202,7 @@ struct Fixture final {
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
       std::memset(next[lane].contents(), 0, cell.bytes);
     for (MetalBuffer *buffer :
-         {&mixed, &decay, &beta, &recurrent, &hidden})
+         {&mixed, &decay, &beta, &hidden})
       std::memset(buffer->contents(), 0, buffer->sizeBytes());
   }
 
@@ -209,7 +210,7 @@ struct Fixture final {
     return {packedLayer[layer], convWeights,     current,
             next,               mixedLayer[layer], decayWeights,
             timeBias,           decayLayer[layer], betaLayer[layer],
-            recurrent,          mixerNorm,       hidden};
+            mixerNorm,          hidden};
   }
   GdnCommitBuffers commitBuffers() const {
     return {packed, mixed, decay, beta, current, next, retained};
@@ -239,9 +240,9 @@ struct Fixture final {
            (uint64_t{layer} * kMaxLanes + lane) * gateStride +
            uint64_t{token} * shape.valueHeads;
   }
-  const uint16_t *rowsOf(const MetalBuffer &buffer, uint32_t lane,
-                         uint32_t token, uint32_t head) const {
-    return static_cast<const uint16_t *>(buffer.contents()) +
+  const uint16_t *hiddenRow(uint32_t lane, uint32_t token,
+                            uint32_t head) const {
+    return static_cast<const uint16_t *>(hidden.contents()) +
            ((uint64_t{lane} * kRows + token) * shape.valueHeads + head) *
                kHeadDim;
   }
@@ -283,36 +284,44 @@ uint16_t convolutionCarry(const Fixture &fixture, uint32_t layer,
              : fixture.packedRow(layer, lane, source - 3)[channel];
 }
 
+// The q or k row of one key head at one token, from the head's first
+// channel: the convolution RMS-normalised over the head, rounded, then scaled
+// (the kernel rounds again).
+std::vector<double> normalizedHead(const Fixture &fixture, uint32_t layer,
+                                   uint32_t lane, uint32_t token,
+                                   uint32_t first, double scale) {
+  std::vector<double> conv(kHeadDim);
+  double squares = 0.0;
+  for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
+    conv[dim] = convolutionSilu(fixture, layer, lane, token, first + dim);
+    squares += conv[dim] * conv[dim];
+  }
+  const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
+  for (double &value : conv)
+    value = roundBfloat(value * inverse) * scale;
+  return conv;
+}
+
+// The k and v rows the commit reads; the kernel writes no q rows.
 void checkConvolution(const Fixture &fixture, uint32_t layer, uint32_t lane,
                       const std::string &where) {
   const GdnShape &shape = fixture.shape;
   const uint32_t keyWidth = shape.keyHeads * kHeadDim;
   for (uint32_t token = 0; token < kRows; ++token) {
     const uint16_t *mixedRow = fixture.mixedRow(layer, lane, token);
-    std::vector<double> conv(shape.convolutionDimension);
-    for (uint32_t channel = 0; channel < shape.convolutionDimension; ++channel)
-      conv[channel] = convolutionSilu(fixture, layer, lane, token, channel);
-    // q and k: RMS-normalised per key head, rounded, then scaled and
-    // rounded again.
-    for (uint32_t part = 0; part < 2; ++part) {
-      const double scale = part == 0 ? 0.0078125 : 0.08838834765;
-      for (uint32_t head = 0; head < shape.keyHeads; ++head) {
-        const uint32_t base = part * keyWidth + head * kHeadDim;
-        double squares = 0.0;
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-          squares += conv[base + dim] * conv[base + dim];
-        const double inverse = 1.0 / std::sqrt(squares / kHeadDim + 1e-6);
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
-          const double normalized = roundBfloat(conv[base + dim] * inverse);
-          require(closeBfloat(mixedRow[base + dim], normalized * scale, 3.0,
-                              1e-6),
-                  where + ": mixed q/k row mismatch");
-        }
-      }
+    for (uint32_t head = 0; head < shape.keyHeads; ++head) {
+      const uint32_t first = keyWidth + head * kHeadDim;
+      const std::vector<double> key =
+          normalizedHead(fixture, layer, lane, token, first, kKeyScale);
+      for (uint32_t dim = 0; dim < kHeadDim; ++dim)
+        require(closeBfloat(mixedRow[first + dim], key[dim], 3.0, 1e-6),
+                where + ": mixed k row mismatch");
     }
     for (uint32_t channel = 2 * keyWidth; channel < shape.convolutionDimension;
          ++channel)
-      require(closeBfloat(mixedRow[channel], conv[channel], 3.0, 1e-6),
+      require(closeBfloat(mixedRow[channel],
+                          convolutionSilu(fixture, layer, lane, token, channel),
+                          3.0, 1e-6),
               where + ": mixed v row mismatch");
   }
 }
@@ -356,8 +365,9 @@ void checkGates(const Fixture &fixture, uint32_t layer, uint32_t lane,
 }
 
 // The delta rule over `tokens` rows of one value head from the lane's
-// incoming state, driven by the kernel's own q/k/v rows and gates. Returns
-// the final state; the recurrent output rows go to `rows` when requested.
+// incoming state, driven by the kernel's own k/v rows and gates. Returns the
+// final state; the recurrent output rows, read with the reference q, go to
+// `rows` when requested.
 std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
                                uint32_t lane, uint32_t head, uint32_t tokens,
                                std::vector<double> *rows) {
@@ -372,7 +382,10 @@ std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
     rows->assign(uint64_t{tokens} * kHeadDim, 0.0);
   for (uint32_t token = 0; token < tokens; ++token) {
     const uint16_t *mixed = fixture.mixedRow(layer, lane, token);
-    const uint16_t *query = mixed + keyHead * kHeadDim;
+    const std::vector<double> query =
+        rows ? normalizedHead(fixture, layer, lane, token, keyHead * kHeadDim,
+                              kQueryScale)
+             : std::vector<double>{};
     const uint16_t *key = mixed + keyWidth + keyHead * kHeadDim;
     const uint16_t *value = mixed + 2 * keyWidth + head * kHeadDim;
     const double decay = fixture.decayRow(layer, lane, token)[head];
@@ -385,13 +398,14 @@ std::vector<double> recurrence(const Fixture &fixture, uint32_t layer,
         memory += row[keyDim] * bf16ToFloat(key[keyDim]);
       }
       const double delta = (bf16ToFloat(value[valueDim]) - memory) * beta;
-      double output = 0.0;
-      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim) {
+      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim)
         row[keyDim] += bf16ToFloat(key[keyDim]) * delta;
-        output += row[keyDim] * bf16ToFloat(query[keyDim]);
-      }
-      if (rows)
-        (*rows)[uint64_t{token} * kHeadDim + valueDim] = output;
+      if (!rows)
+        continue;
+      double output = 0.0;
+      for (uint32_t keyDim = 0; keyDim < kHeadDim; ++keyDim)
+        output += row[keyDim] * query[keyDim];
+      (*rows)[uint64_t{token} * kHeadDim + valueDim] = output;
     }
   }
   return state;
@@ -428,51 +442,45 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
   checkConvolution(fixture, layer, lane, where);
   checkGates(fixture, layer, lane, where);
   checkCarry(fixture, layer, lane, kRows, where);
-  // Every layer writes the recurrent rows and the hidden rows into the same
-  // scratch, as the model graph does, so those hold the last layer's values.
+  // Every layer writes the hidden rows into the same scratch, as the model
+  // graph does, so those hold the last layer's values: the gated RMSNorm of
+  // the recurrent rows, here the reference's rounded to bf16 as the kernel
+  // rounds its own. Where a row cancels, the kernel's fp32 row can round to
+  // the neighbouring bf16 value, which moves its normalized value by up to a
+  // bf16 step on top of the two units of the output's own rounding, hence
+  // three units. Almost every output is the reference's own double rounding;
+  // norm weights rounded to bf16 would move a large fraction of them.
   const bool lastLayer = layer + 1 == kLayers;
+  const uint32_t zOffset = shape.convolutionDimension;
+  uint64_t inexact = 0;
   std::vector<double> rows;
   for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-    const std::vector<double> state =
-        recurrence(fixture, layer, lane, head, kRows, &rows);
+    const std::vector<double> state = recurrence(
+        fixture, layer, lane, head, kRows, lastLayer ? &rows : nullptr);
     checkState(fixture, layer, lane, head, state, where);
     if (!lastLayer)
       continue;
     for (uint32_t token = 0; token < kRows; ++token) {
-      const uint16_t *recurrent =
-          fixture.rowsOf(fixture.recurrent, lane, token, head);
+      const uint16_t *packed = fixture.packedRow(layer, lane, token);
+      std::array<uint16_t, kHeadDim> recurrent;
       for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-        require(closeBfloat(recurrent[dim], rows[token * kHeadDim + dim], 2.0,
-                            1e-6),
-                where + ": recurrent row mismatch");
-    }
-  }
-  if (!lastLayer)
-    return;
-  // The gated RMSNorm, from the kernel's own recurrent rows. Almost every
-  // output is the reference's own double rounding; norm weights rounded to
-  // bf16 would move a large fraction of them.
-  const uint32_t zOffset = shape.convolutionDimension;
-  uint64_t inexact = 0;
-  for (uint32_t token = 0; token < kRows; ++token) {
-    const uint16_t *packed = fixture.packedRow(layer, lane, token);
-    for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-      const uint16_t *recurrent =
-          fixture.rowsOf(fixture.recurrent, lane, token, head);
-      const uint16_t *hidden =
-          fixture.rowsOf(fixture.hidden, lane, token, head);
+        recurrent[dim] =
+            floatToBf16(static_cast<float>(rows[token * kHeadDim + dim]));
+      const uint16_t *hidden = fixture.hiddenRow(lane, token, head);
       const std::vector<double> exact =
-          rmsNorm(recurrent, fixture.mixerNorm, kHeadDim);
+          rmsNorm(recurrent.data(), fixture.mixerNorm, kHeadDim);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double normalized = roundBfloat(exact[dim]);
         const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
         const double reference = normalized * gate * sigmoid(gate);
-        require(closeBfloat(hidden[dim], reference, 2.0, 1e-6),
+        require(closeBfloat(hidden[dim], reference, 3.0, 1e-6),
                 where + ": hidden mismatch");
         inexact += bf16ToFloat(hidden[dim]) != roundBfloat(reference);
       }
     }
   }
+  if (!lastLayer)
+    return;
   require(inexact <= uint64_t{kRows} * shape.valueHeads * kHeadDim / 100,
           where + ": hidden differs from the reference in more than 1% of values");
 }

@@ -1433,7 +1433,6 @@ struct Runtime::Impl {
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
-    buffers.recurrent = d(DecodeTensor::Recurrent);
     buffers.gdnHidden = d(DecodeTensor::GdnHidden);
     buffers.gdnOutput = d(DecodeTensor::GdnOutput);
     buffers.denseIntermediate = d(DecodeTensor::Intermediate);

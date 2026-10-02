@@ -183,8 +183,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::Normalized,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
-  put(DecodeTensor::Recurrent,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::GdnHidden,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::GdnOutput,

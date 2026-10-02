@@ -75,7 +75,6 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer timeBias;
   metal::MetalBuffer decay;
   metal::MetalBuffer beta;
-  metal::MetalBuffer recurrent;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   LinearScratch linearScratch{};
