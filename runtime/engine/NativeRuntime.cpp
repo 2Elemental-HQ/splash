@@ -48,17 +48,18 @@ bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
         continue;
       // The parser is already past a frame it yielded, so a request-scoped
       // decode failure leaves the frames behind it to be processed.
-      auto decoded = protocol::decodeFrame(*step.frame, limits_);
+      const protocol::FrameType type = step.frame->type;
+      auto decoded = protocol::decodeFrame(std::move(*step.frame), limits_);
       if (decoded) {
         if (!handle(*decoded.value))
           return false;
-      } else if (step.frame->type == protocol::FrameType::MaskResponse &&
+      } else if (type == protocol::FrameType::MaskResponse &&
                  decoded.issue->failureClass ==
                      protocol::FailureClass::RequestError) {
         if (!handleMaskIssue(std::move(*decoded.issue)))
           return false;
       } else {
-        if (step.frame->type == protocol::FrameType::Request &&
+        if (type == protocol::FrameType::Request &&
             telemetry_.contains(decoded.issue->requestId)) {
           decoded.issue->failureClass = protocol::FailureClass::ProtocolFatal;
         }

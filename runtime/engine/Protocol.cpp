@@ -232,10 +232,9 @@ public:
     return true;
   }
 
-  bool bytes(uint64_t count, std::vector<uint8_t> &values) {
+  bool skip(uint64_t count) {
     if (count > remaining())
       return false;
-    values.assign(bytes_.begin() + offset_, bytes_.begin() + offset_ + count);
     offset_ += static_cast<size_t>(count);
     return true;
   }
@@ -646,9 +645,9 @@ EncodedEvent encodeStatusJson(const StatusJsonEvent &event,
   return success(writer.take());
 }
 
-ProtocolResult<ClientMessage> decodeRequest(const Frame &frame,
+ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
                                             const ProtocolLimits &limits) {
-  Reader reader(frame.payload);
+  Reader reader(payload);
   RequestFrame request;
   uint8_t priority = 0;
   uint8_t constraint = 0;
@@ -717,15 +716,24 @@ ProtocolResult<ClientMessage> decodeRequest(const Frame &frame,
                     request.requestId, "image span payload is malformed"));
     }
   }
+  const size_t pixelsOffset = payload.size() - reader.remaining();
   uint64_t scoreBytes = 0;
   if (!checkedMultiply(scoreCount, sizeof(uint32_t), scoreBytes) ||
       reader.remaining() != pixelBytes + scoreBytes ||
-      !reader.bytes(pixelBytes, request.imagePixels) ||
+      !reader.skip(pixelBytes) ||
       !reader.words(scoreCount, request.scoreTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                   request.requestId,
                   "image pixel or score payload does not match its counts"));
+  }
+  // The pixels are most of a large frame, so they stay in its buffer: the
+  // score words behind them are read, and moving the pixels to its front
+  // allocates nothing.
+  if (pixelBytes) {
+    payload.resize(pixelsOffset + pixelBytes);
+    payload.erase(payload.begin(), payload.begin() + pixelsOffset);
+    request.imagePixels = std::move(payload);
   }
   if (auto issue = validateRequest(request, limits)) {
     return failure<ClientMessage>(std::move(*issue));
@@ -920,7 +928,7 @@ std::string ProtocolIssue::describe() const {
   return out.str();
 }
 
-ProtocolResult<ClientMessage> decodeFrame(const Frame &frame,
+ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
                                           const ProtocolLimits &limits) {
   if (auto issue =
           validatePayloadLength(frame.type, frame.payload.size(), limits)) {
@@ -929,7 +937,7 @@ ProtocolResult<ClientMessage> decodeFrame(const Frame &frame,
   try {
     switch (frame.type) {
     case FrameType::Request:
-      return decodeRequest(frame, limits);
+      return decodeRequest(std::move(frame.payload), limits);
     case FrameType::Cancel:
       return decodeCancel(frame);
     case FrameType::MaskResponse:
@@ -1028,7 +1036,6 @@ std::optional<ProtocolIssue> FrameParser::parseHeader() {
   }
   payload_.clear();
   readingPayload_ = true;
-  payloadBytes_ = 0;
   return std::nullopt;
 }
 
@@ -1042,7 +1049,6 @@ void FrameParser::resetCurrentFrame() {
   headerBytes_ = 0;
   readingPayload_ = false;
   expectedPayloadBytes_ = 0;
-  payloadBytes_ = 0;
   payload_.clear();
 }
 
@@ -1067,14 +1073,16 @@ ParseStep FrameParser::consume(std::span<const uint8_t> bytes) {
       }
     }
 
-    size_t needed = static_cast<size_t>(expectedPayloadBytes_) - payloadBytes_;
+    size_t needed =
+        static_cast<size_t>(expectedPayloadBytes_) - payload_.size();
     size_t count = std::min(needed, bytes.size() - consumed);
     try {
       // The validated frame length is known. Reserve it once to avoid
-      // geometric growth copies; only received bytes are initialized.
+      // geometric growth copies; each received byte is copied in once.
       if (payload_.capacity() < expectedPayloadBytes_)
         payload_.reserve(static_cast<size_t>(expectedPayloadBytes_));
-      payload_.resize(payloadBytes_ + count);
+      const auto received = bytes.subspan(consumed, count);
+      payload_.insert(payload_.end(), received.begin(), received.end());
     } catch (const std::bad_alloc &) {
       return fail(consumed,
                   makeIssue(FailureClass::EngineUnhealthy,
@@ -1086,11 +1094,8 @@ ParseStep FrameParser::consume(std::span<const uint8_t> bytes) {
                             IssueCode::AllocationFailure, 0,
                             "frame payload length is not allocatable"));
     }
-    std::memcpy(payload_.data() + payloadBytes_, bytes.data() + consumed,
-                count);
-    payloadBytes_ += count;
     consumed += count;
-    if (payloadBytes_ == expectedPayloadBytes_) {
+    if (payload_.size() == expectedPayloadBytes_) {
       Frame frame{currentType_, std::move(payload_)};
       resetCurrentFrame();
       return {consumed, std::move(frame), std::nullopt};
@@ -1110,7 +1115,7 @@ std::optional<ProtocolIssue> FrameParser::finish() {
     message << "stream ended after " << headerBytes_
             << " of 24 frame-header bytes";
   } else {
-    message << "stream ended after " << payloadBytes_ << " of "
+    message << "stream ended after " << payload_.size() << " of "
             << expectedPayloadBytes_ << ' ' << frameTypeName(currentType_)
             << " payload bytes";
   }

@@ -436,7 +436,7 @@ void testClientAndEventStreams() {
   CHECK(test, frames.size() == clientMessages().size());
   for (size_t index = 0;
        index < std::min(frames.size(), clientMessages().size()); ++index) {
-    auto decoded = decodeFrame(frames[index], kLimits);
+    auto decoded = decodeFrame(std::move(frames[index]), kLimits);
     CHECK(test, decoded && *decoded.value == clientMessages()[index].second);
   }
 
@@ -473,7 +473,7 @@ void testOneByteIncrementalParsing() {
   CHECK(test, !parser.finish());
   if (!frame)
     return;
-  auto decoded = decodeFrame(*frame, kLimits);
+  auto decoded = decodeFrame(std::move(*frame), kLimits);
   CHECK(test, decoded);
   if (decoded)
     CHECK(test, std::get<RequestFrame>(*decoded.value) == request);
@@ -522,7 +522,7 @@ void testLargeIncrementalFrameHasNoGeometricCapacitySlack() {
   if (!frame)
     return;
   CHECK(test, frame->payload.capacity() == frame->payload.size());
-  auto decoded = decodeFrame(*frame, kLimits);
+  auto decoded = decodeFrame(std::move(*frame), kLimits);
   CHECK(test, decoded);
   if (decoded)
     CHECK(test, std::get<RequestFrame>(*decoded.value) == expected);
@@ -530,6 +530,30 @@ void testLargeIncrementalFrameHasNoGeometricCapacitySlack() {
   CHECK(test, !step.issue && step.frame);
   if (step.frame)
     CHECK(test, step.frame->payload.size() == 8);
+}
+
+// A request's image pixels are most of its frame: decoding keeps them in the
+// frame's buffer instead of copying them out.
+void testImagePixelsMoveOutOfThePayload() {
+  constexpr std::string_view test = "image pixels move out of the payload";
+  RequestFrame expected = exampleImageRequest();
+  expected.imageSpans[0].gridHeight = 64;
+  expected.imageSpans[0].gridWidth = 32;
+  expected.imageSpans[0].tokens = 32 * 16;
+  expected.promptTokens.assign(expected.imageSpans[0].tokens + 2, 7);
+  expected.imagePixels.resize(expected.imageSpans[0].pixelBytes());
+  for (size_t index = 0; index < expected.imagePixels.size(); ++index)
+    expected.imagePixels[index] = static_cast<uint8_t>(index * 13 + 5);
+  CHECK(test, expected.imagePixels.size() >= 1024 * 1024);
+  Frame frame = singleFrame(peer::serialize(expected), kLimits);
+  const uint8_t *buffer = frame.payload.data();
+  auto decoded = decodeFrame(std::move(frame), kLimits);
+  CHECK(test, decoded);
+  if (!decoded)
+    return;
+  const auto &request = std::get<RequestFrame>(*decoded.value);
+  CHECK(test, request.imagePixels.data() == buffer);
+  CHECK(test, request == expected);
 }
 
 void testHeaderFailures() {
@@ -647,8 +671,8 @@ void testMalformedPayloadClassification() {
   std::vector<Frame> recoverableFrames = parseAll(recoverableStream, kLimits);
   CHECK(test, recoverableFrames.size() == 2);
   if (recoverableFrames.size() == 2) {
-    auto rejected = decodeFrame(recoverableFrames[0], kLimits);
-    auto accepted = decodeFrame(recoverableFrames[1], kLimits);
+    auto rejected = decodeFrame(std::move(recoverableFrames[0]), kLimits);
+    auto accepted = decodeFrame(std::move(recoverableFrames[1]), kLimits);
     CHECK(test, rejected.issue &&
                     rejected.issue->failureClass == FailureClass::RequestError);
     CHECK(test, accepted);
@@ -967,7 +991,7 @@ void testFuzzLikeInputsAndMutations() {
       }
       offset += step.consumedBytes;
       if (step.frame) {
-        static_cast<void>(decodeFrame(*step.frame, kLimits));
+        static_cast<void>(decodeFrame(std::move(*step.frame), kLimits));
       }
       if (++steps > 1024) {
         CHECK(test, false);
@@ -998,7 +1022,7 @@ void testFuzzLikeInputsAndMutations() {
       }
       offset += step.consumedBytes;
       if (step.frame) {
-        static_cast<void>(decodeFrame(*step.frame, kLimits));
+        static_cast<void>(decodeFrame(std::move(*step.frame), kLimits));
       }
     }
     if (!failed)
@@ -1020,6 +1044,7 @@ int main(int argc, char **argv) {
     testClientAndEventStreams();
     testOneByteIncrementalParsing();
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();
+    testImagePixelsMoveOutOfThePayload();
     testHeaderFailures();
     testTruncationAtEveryBoundary();
     testMalformedPayloadClassification();

@@ -303,8 +303,9 @@ struct Frame {
   bool operator==(const Frame &) const = default;
 };
 
+// Takes the frame: a request's image pixels stay in its payload's buffer.
 [[nodiscard]] ProtocolResult<ClientMessage>
-decodeFrame(const Frame &frame, const ProtocolLimits &limits);
+decodeFrame(Frame &&frame, const ProtocolLimits &limits);
 // The whole frame, header included. An event that breaks its rules is the
 // engine's defect: the issue is EngineUnhealthy.
 [[nodiscard]] ProtocolResult<std::vector<uint8_t>>
@@ -339,7 +340,6 @@ private:
   bool readingPayload_ = false;
   FrameType currentType_ = FrameType::Request;
   uint64_t expectedPayloadBytes_ = 0;
-  size_t payloadBytes_ = 0;
   std::vector<uint8_t> payload_;
   std::optional<ProtocolIssue> terminalIssue_;
 };
