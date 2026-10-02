@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import weakref
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -272,9 +273,9 @@ class RuntimeTests(unittest.TestCase):
             request(
                 300,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda event: (
-                    (1,) * (event.words_per_mask * event.mask_rows)
-                ),
+                mask_provider=lambda event: array(
+                    "I", (1,) * (event.words_per_mask * event.mask_rows)
+                ).tobytes(),
             ),
             request(400, priority=wire.RequestPriority.BACKGROUND),
         )
@@ -717,7 +718,9 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             provider_thread.append(threading.current_thread().name)
             provider_called.set()
-            return tuple(range(1, event.words_per_mask * event.mask_rows + 1))
+            return array(
+                "I", range(1, event.words_per_mask * event.mask_rows + 1)
+            ).tobytes()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -740,38 +743,45 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(provider_thread[0].startswith("splash-mask"))
         self.assertEqual(response.request_id, call.request_id)
         self.assertEqual(response.mask_request_id, 987)
-        self.assertEqual(response.mask_words, (1, 2, 3, 4, 5, 6, 7, 8))
+        self.assertEqual(response.mask_words, array("I", range(1, 9)).tobytes())
         send_success(process, call)
         self.assertEqual(call.result(1.0).done.completion_tokens, 3)
 
     def test_bad_mask_size_cancels_and_fails_only_that_call(self):
-        factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        self.addCleanup(runtime.close)
-        process = factory.processes[0]
-        bad = runtime.submit(
-            request(
-                30,
-                constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda _event: (1,),
-            )
-        )
-        healthy = runtime.submit(request(40))
+        for mask, message in (
+            (array("I", (1,)).tobytes(), "returned 4 bytes; expected 24$"),
+            (None, "returned NoneType; expected 24 bytes$"),
+        ):
+            with self.subTest(message=message):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                self.addCleanup(runtime.close)
+                process = factory.processes[0]
+                bad = runtime.submit(
+                    request(
+                        30,
+                        constraint=wire.ConstraintMode.TOKEN_MASK,
+                        mask_provider=lambda _event, mask=mask: mask,
+                    )
+                )
+                healthy = runtime.submit(request(40))
 
-        process.send(wire.StartEvent(bad.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
-        cancel = process.stdin.wait_for(wire.CancelFrame)[0]
-        self.assertEqual(cancel.request_id, bad.request_id)
-        process.send(
-            wire.DoneEvent(
-                bad.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
-            )
-        )
-        with self.assertRaises(engine_runtime.MaskComputationFailed):
-            bad.result(1.0)
-        send_success(process, healthy)
-        self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
-        self.assertTrue(runtime.ready)
+                process.send(wire.StartEvent(bad.request_id, 0, 0))
+                process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
+                cancel = process.stdin.wait_for(wire.CancelFrame)[0]
+                self.assertEqual(cancel.request_id, bad.request_id)
+                process.send(
+                    wire.DoneEvent(
+                        bad.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
+                    )
+                )
+                with self.assertRaisesRegex(
+                    engine_runtime.MaskComputationFailed, message
+                ):
+                    bad.result(1.0)
+                send_success(process, healthy)
+                self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
+                self.assertTrue(runtime.ready)
 
     def test_cancelled_call_never_writes_a_late_mask_response(self):
         provider_started = threading.Event()
@@ -782,7 +792,7 @@ class RuntimeTests(unittest.TestCase):
             provider_started.set()
             provider_release.wait(1.0)
             provider_finished.set()
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -824,7 +834,7 @@ class RuntimeTests(unittest.TestCase):
             calls_to_provider.append(event.request_id)
             started.set()
             release.wait(5.0)
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -887,7 +897,7 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             started.set()
             release.wait(5.0)
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

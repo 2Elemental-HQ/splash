@@ -11,6 +11,7 @@ from unittest import mock
 
 from referencing import Registry
 
+from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory, request
 from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
 from server import frontend as request_frontend
@@ -280,13 +281,14 @@ class RequestContractTests(unittest.TestCase):
                 )
             self.assertEqual(caught.exception.status, 400)
 
-    def test_mask_byte_payload_is_wire_equivalent(self):
-        words = (0, 1, 0xFFFFFFFF, 42)
-        original = wire.MaskResponseFrame(1, 2, words)
-        packed = wire.MaskResponseFrame(1, 2, array.array("I", words).tobytes())
-        self.assertEqual(
-            wire.serialize_message(original), wire.serialize_message(packed)
+    def test_mask_byte_payload_round_trips(self):
+        response = wire.MaskResponseFrame(
+            1, 2, array.array("I", (0, 1, 0xFFFFFFFF, 42)).tobytes()
         )
+        encoded = wire.serialize_message(response)
+        ((decoded, raw),) = native_peer.ClientFrameReader().feed(encoded)
+        self.assertEqual(raw, encoded)
+        self.assertEqual(decoded, response)
 
     def test_unacknowledged_cancel_fails_generation_and_releases_calls(self):
         factory = FakeFactory()

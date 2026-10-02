@@ -8,7 +8,7 @@ from dev.tests.engine import test_structured_tools as structured
 from server import backend as backend_api
 from server import constraints
 from server import protocol as wire
-from server.errors import NativeError
+from server.errors import ConstraintError
 
 
 class TokenConstraintTest(unittest.TestCase):
@@ -85,14 +85,13 @@ class TokenConstraintTest(unittest.TestCase):
         for tokens in ([self.z], [self.Constraint.VOCABULARY], [-1]):
             with (
                 self.subTest(tokens=tokens),
-                self.assertRaises(NativeError) as caught,
+                self.assertRaises(ConstraintError) as caught,
             ):
                 rejecting = self.constraint()
                 rejecting.commit(tokens)
                 rejecting.finish()
-            self.assertEqual(caught.exception.code, "constraint_error")
             # The parser's state dump, generated text included, stays out.
-            self.assertNotIn("\n", caught.exception.message)
+            self.assertNotIn("\n", str(caught.exception))
 
 
 if __name__ == "__main__":

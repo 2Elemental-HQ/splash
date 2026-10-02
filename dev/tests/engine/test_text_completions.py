@@ -423,8 +423,14 @@ class TextCompletionLifecycleTests(unittest.TestCase):
         for path, body in (CHAT, COMPLETION):
             with self.subTest(path=path):
                 harness, _ = self.harness(
-                    Plan(error=("runtime_error", "broken")),
-                    Plan(error=("runtime_error", "broken")),
+                    *(
+                        Plan(
+                            exception=api.engine_runtime.RequestFailed(
+                                1, b"runtime_error", b"broken"
+                            )
+                        )
+                        for _ in range(2)
+                    )
                 )
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 500)

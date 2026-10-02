@@ -14,7 +14,7 @@ if __package__:
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
     from .diagnostics import print_status
-    from .errors import APIError, NativeError
+    from .errors import APIError, ConstraintError
     from .latency import RequestLatency
     from .metrics import metrics_dict
     from .output import hold_partial
@@ -24,7 +24,7 @@ else:
     import protocol as wire
     from constraints import TokenConstraint
     from diagnostics import print_status
-    from errors import APIError, NativeError
+    from errors import APIError, ConstraintError
     from latency import RequestLatency
     from metrics import metrics_dict
     from output import hold_partial
@@ -468,15 +468,7 @@ class NativeBackend:
             # proposals: [] for the initial mask, then [pending anchor,
             # draft...] for verification. TokenConstraint returns the mask
             # before the first simulated token and after each token.
-            payload = job.constraint.masks(event.simulation_tokens)
-            expected_bytes = event.words_per_mask * event.mask_rows * 4
-            if len(payload) != expected_bytes:
-                raise NativeError(
-                    "constraint_error",
-                    f"grammar produced {len(payload)} mask bytes; "
-                    f"expected {expected_bytes}",
-                )
-            return payload
+            return job.constraint.masks(event.simulation_tokens)
 
         return provide
 
@@ -759,13 +751,8 @@ class NativeBackend:
     def _api_error(error):
         if isinstance(error, APIError):
             return APIError(error.status, error.message, error.code)
-        if isinstance(error, NativeError):
-            status = (
-                400
-                if error.code in ("bad_request", "unsupported", "constraint_error")
-                else 500
-            )
-            return APIError(status, error.message, error.code)
+        if isinstance(error, ConstraintError):
+            return APIError(400, str(error), "constraint_error")
         if isinstance(error, engine_runtime.RequestFailed):
             code = error.code.decode("ascii", "replace")
             message = error.message_bytes.decode("utf-8", "replace")
@@ -782,6 +769,7 @@ class NativeBackend:
             request_codes = {
                 "integer_overflow",
                 "invalid_constraint",
+                "invalid_count",
                 "invalid_deadline",
                 "invalid_enum_value",
                 "invalid_request",

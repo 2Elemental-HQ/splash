@@ -200,11 +200,8 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             return wire.CancelFrame(*_ID.unpack(payload))
         case wire.FrameType.MASK_RESPONSE:
             request_id, mask_request_id, count = _MASK_RESPONSE.unpack_from(payload)
-            return wire.MaskResponseFrame(
-                request_id,
-                mask_request_id,
-                _words(payload, _MASK_RESPONSE.size, count),
-            )
+            mask = payload[_MASK_RESPONSE.size : _MASK_RESPONSE.size + 4 * count]
+            return wire.MaskResponseFrame(request_id, mask_request_id, bytes(mask))
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")

@@ -132,7 +132,7 @@ class Deadline:
         return cls(wall_time_ns() // 1000 + duration_micros, duration_micros)
 
 
-MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], Sequence[int] | bytes]
+MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], bytes]
 EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
 
@@ -1270,7 +1270,7 @@ class MultiplexedRuntime:
 
         def compute():
             if call.cancel_requested or call.done:
-                return ()
+                return b""
             return provider(event)
 
         try:
@@ -1285,15 +1285,19 @@ class MultiplexedRuntime:
                 if call.cancel_requested or call.done:
                     return
                 result = completed.result()
-                words = result if isinstance(result, bytes) else tuple(result)
-                count = len(words) // 4 if isinstance(words, bytes) else len(words)
-                expected = event.words_per_mask * event.mask_rows
-                if count != expected:
+                expected = 4 * event.words_per_mask * event.mask_rows
+                if not isinstance(result, bytes):
                     raise ValueError(
-                        f"mask provider returned {count} words; expected {expected}"
+                        f"mask provider returned {type(result).__name__}; "
+                        f"expected {expected} bytes"
+                    )
+                if len(result) != expected:
+                    raise ValueError(
+                        f"mask provider returned {len(result)} bytes; "
+                        f"expected {expected}"
                     )
                 response = wire.MaskResponseFrame(
-                    call.request_id, event.mask_request_id, words
+                    call.request_id, event.mask_request_id, result
                 )
                 encoded = wire.serialize_message(response)
                 if call.cancel_requested or call.done:

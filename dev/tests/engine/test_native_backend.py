@@ -45,16 +45,8 @@ class FakeTokenizer:
 
 
 class FakeConstraint:
-    def __init__(
-        self,
-        words_per_mask=2,
-        *,
-        omit_anchor=False,
-        commit_error=None,
-        finish_error=None,
-    ):
+    def __init__(self, words_per_mask=2, *, commit_error=None, finish_error=None):
         self.words_per_mask = words_per_mask
-        self.omit_anchor = omit_anchor
         self.commit_error = commit_error
         self.finish_error = finish_error
         self.mask_calls = []
@@ -64,7 +56,7 @@ class FakeConstraint:
     def masks(self, simulation_tokens):
         simulation_tokens = tuple(simulation_tokens)
         self.mask_calls.append(simulation_tokens)
-        rows = len(simulation_tokens) + (0 if self.omit_anchor else 1)
+        rows = len(simulation_tokens) + 1
         words = tuple(range(1, rows * self.words_per_mask + 1))
         return struct.pack(f"<{len(words)}I", *words)
 
@@ -275,9 +267,8 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(provider(simulation), array.array("I", range(1, 19)).tobytes())
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
-        with self.assertRaises(api_errors.NativeError) as caught:
+        with self.assertRaises(api_errors.ConstraintError):
             generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
-        self.assertEqual(caught.exception.code, "constraint_error")
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
@@ -435,14 +426,14 @@ class NativeBackendContractTests(unittest.TestCase):
         initial = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertEqual(initial.request_id, request.request_id)
         self.assertEqual(initial.mask_request_id, 71)
-        self.assertEqual(initial.mask_words, (1, 2))
+        self.assertEqual(initial.mask_words, array.array("I", (1, 2)).tobytes())
 
         simulation = tuple(range(100, 108))
         process.send(wire.MaskRequestEvent(request.request_id, 72, 2, simulation))
         verify = process.stdin.wait_for(wire.MaskResponseFrame, count=2)[1]
         self.assertEqual(verify.request_id, request.request_id)
         self.assertEqual(verify.mask_request_id, 72)
-        self.assertEqual(verify.mask_words, tuple(range(1, 19)))
+        self.assertEqual(verify.mask_words, array.array("I", range(1, 19)).tobytes())
         self.assertEqual(constraint.mask_calls, [(), simulation])
 
         process.send(
@@ -451,16 +442,6 @@ class NativeBackendContractTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
-
-    def test_mask_provider_rejects_missing_n_plus_one_anchor_row(self):
-        job = make_job(constraint=FakeConstraint(omit_anchor=True))
-        provider = backend_api.NativeBackend._mask_provider(job)
-        event = wire.MaskRequestEvent(1, 2, 2, (5, 6))
-
-        with self.assertRaises(api_errors.NativeError) as caught:
-            provider(event)
-        self.assertEqual(caught.exception.code, "constraint_error")
-        self.assertIn("expected 24", caught.exception.message)
 
     def test_start_tokens_and_done_are_finalized_off_callback_path(self):
         constraint = FakeConstraint()
@@ -578,7 +559,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_constraint_callback_error_cancels_and_maps_to_bad_request(self):
         constraint = FakeConstraint(
-            commit_error=api_errors.NativeError("constraint_error", "invalid token")
+            commit_error=api_errors.ConstraintError("invalid token")
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
@@ -598,7 +579,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_trailing_tokens_the_grammar_rejects_fail_the_request(self):
         constraint = FakeConstraint(
-            finish_error=api_errors.NativeError("constraint_error", "invalid token")
+            finish_error=api_errors.ConstraintError("invalid token")
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
@@ -615,7 +596,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_cancelled_request_skips_the_trailing_grammar_check(self):
         constraint = FakeConstraint(
-            finish_error=api_errors.NativeError("constraint_error", "invalid token")
+            finish_error=api_errors.ConstraintError("invalid token")
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
@@ -935,6 +916,10 @@ class NativeBackendContractTests(unittest.TestCase):
             (
                 runtime.RequestFailed(1, b"temporarily_busy", b"retry", retryable=True),
                 (503, "temporarily_busy"),
+            ),
+            (
+                runtime.RequestFailed(1, b"invalid_count", b"too many score tokens"),
+                (400, "invalid_count"),
             ),
             (runtime.EngineUnhealthy("gpu failed"), (503, "runtime_unavailable")),
             (runtime.ProtocolFatal("bad frame"), (500, "protocol_error")),

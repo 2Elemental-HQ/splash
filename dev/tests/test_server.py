@@ -425,7 +425,7 @@ class FakeRuntime:
             call.complete(error=plan.exception)
             return
         if plan.error:
-            call.complete(error=api_errors.NativeError(*plan.error))
+            call.complete(error=api_errors.ConstraintError(plan.error))
             return
         completion = 0
         if not plan.cancelled.is_set():
@@ -7593,13 +7593,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(runtime.cancel_count, 1)
 
     def test_runtime_error_does_not_poison_next_request(self):
-        runtime = FakeRuntime(Plan(error=("bad_request", "broken")), Plan([[4]]))
+        runtime = FakeRuntime(Plan(error="broken"), Plan([[4]]))
         harness = self.harness(runtime)
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body()
         )
         self.assertEqual(status, 400)
-        self.assertEqual(json.loads(payload)["error"]["code"], "bad_request")
+        self.assertEqual(json.loads(payload)["error"]["code"], "constraint_error")
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 

@@ -14,10 +14,10 @@ from llguidance.numpy import (
 
 if __package__:
     from . import runtime as engine_runtime
-    from .errors import APIError, NativeError
+    from .errors import APIError, ConstraintError
     from .tool_schema import THINK_END, THINK_END_TOKEN_ID
 else:
-    from errors import APIError, NativeError
+    from errors import APIError, ConstraintError
     from tool_schema import THINK_END, THINK_END_TOKEN_ID
 
     import runtime as engine_runtime
@@ -40,7 +40,7 @@ class TokenConstraint:
 
     def commit(self, token_ids):
         if any(not 0 <= token < self.VOCABULARY for token in token_ids):
-            raise NativeError("constraint_error", "generated token is out of range")
+            raise ConstraintError("generated token is out of range")
         with self._lock:
             self._committed.append(tuple(token_ids))
 
@@ -51,7 +51,7 @@ class TokenConstraint:
     def masks(self, simulation_tokens):
         self._consume_committed()
         if len(simulation_tokens) >= self.MAX_ROWS:
-            raise NativeError("constraint_error", "too many simulation tokens")
+            raise ConstraintError("too many simulation tokens")
         in_range = next(
             (
                 index
@@ -78,7 +78,7 @@ class TokenConstraint:
         if valid_rows < rows:
             self.bitmask[valid_rows:rows] = self.bitmask[valid_rows - 1]
         if not self.bitmask[:valid_rows].any(axis=1).all():
-            raise NativeError("constraint_error", "output grammar has no valid token")
+            raise ConstraintError("output grammar has no valid token")
         return self.bitmask[:rows].tobytes()
 
     def _consume_committed(self):
@@ -102,9 +102,8 @@ class TokenConstraint:
                 # The lines after the first dump the parser state, output
                 # included.
                 error = self.matcher.get_error()
-                raise NativeError(
-                    "constraint_error",
-                    error.splitlines()[0] if error else "invalid token",
+                raise ConstraintError(
+                    error.splitlines()[0] if error else "invalid token"
                 )
 
 

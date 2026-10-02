@@ -105,7 +105,9 @@ def client_messages():
         "request_score": example_score_request(),
         "request_ignore_eos": example_ignore_eos_request(),
         "cancel": p.CancelFrame(91),
-        "mask_response": p.MaskResponseFrame(91, 7, (0xFFFFFFFF, 0, 0xA5A5A5A5)),
+        "mask_response": p.MaskResponseFrame(
+            91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
+        ),
         "status_request": p.StatusRequestFrame(808),
     }
 
