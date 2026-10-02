@@ -376,7 +376,8 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
-        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(true));
+        while (modelPointer->reclaimIdleState(true)) {
+        }
         static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, false, true));
         resourcesPointer->memoryGovernor().markServingFootprint();
         return report;

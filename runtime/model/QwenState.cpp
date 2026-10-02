@@ -291,27 +291,14 @@ void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
   current.metadata = {};
 }
 
-uint64_t QwenStateStorage::releaseIdle(bool keepLane) noexcept {
-  return releaseIdleBeyond(keepLane ? kLaneCells : 0, keepLane ? 1 : 0);
-}
-
 uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {
-  const uint32_t cells = idleCells();
-  const uint32_t rings = idleRings();
-  if (cells > (keepLane ? kLaneCells : 0))
-    return releaseIdleBeyond(cells - 1, rings);
-  if (rings > (keepLane ? 1U : 0U))
-    return releaseIdleBeyond(cells, rings - 1);
-  return 0;
-}
-
-uint64_t QwenStateStorage::releaseIdleBeyond(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
-  while (pool_->cells.size() > keepCells)
+  if (idleCells() > (keepLane ? kLaneCells : 0))
     pool_->cells.pop_back();
-  while (pool_->rings.size() > keepRings)
+  else if (idleRings() > (keepLane ? 1U : 0U))
     pool_->rings.pop_back();
+  else
+    return 0;
   const uint64_t after = backend_.memoryStats().allocatedBytes;
   return before >= after ? before - after : 0;
 }

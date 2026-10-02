@@ -615,7 +615,8 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
 
   // Free only pooled state, keeping the image cache. A cache-only request
   // must fit a fresh state cell without recreating the reclaimed encoder.
-  static_cast<void>(states.releaseIdle(false));
+  while (states.releaseOneIdle(false)) {
+  }
   const uint64_t stateBytes = model.stateLayout().activeCellBytes();
   require(stateBytes < encoderBytes, "image budget fixture cannot deny the encoder");
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
@@ -987,7 +988,8 @@ int main(int argc, char **argv) {
     }
     require(static_cast<bool>(pages.allocateExtent(0)),
             "warmup runway fixture failed to recover its KV extent");
-    static_cast<void>(states.releaseIdle(false));
+    while (states.releaseOneIdle(false)) {
+    }
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {

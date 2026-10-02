@@ -322,10 +322,6 @@ public:
   // The buffer a state's write to the disk tier stages through; zero without
   // a tier.
   [[nodiscard]] virtual uint64_t stagingBytes() const noexcept = 0;
-  // Frees pooled idle buffers, all but what one lane starts from when
-  // keepLane, and returns the bytes released. Active lanes and cached states
-  // are never touched.
-  [[nodiscard]] virtual uint64_t releaseIdle(bool keepLane) noexcept = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,

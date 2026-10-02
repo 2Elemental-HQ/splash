@@ -195,11 +195,10 @@ public:
                   const std::function<void()> &allocateExtra = {});
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
-  // Returns pooled buffers to macOS, all but one lane's cells and ring when
-  // keepLane. Active lanes and cached states are never moved or reclaimed.
-  [[nodiscard]] uint64_t releaseIdle(bool keepLane) noexcept override;
-  // The same for one pooled buffer, a cell before a ring: what a reclaim
-  // step for a denied allocation releases. Zero when none is left to give.
+  // Returns one pooled buffer to macOS, a cell before a ring, keeping one
+  // lane's cells and ring when keepLane: what a reclaim step for a denied
+  // allocation releases. Zero when none is left to give. Active lanes and
+  // cached states are never moved or reclaimed.
   [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
@@ -267,7 +266,6 @@ private:
   // The bytes of the cells and the ring the pool lacks of that.
   [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
   static void refreshViews(Slot &slot);
-  [[nodiscard]] uint64_t releaseIdleBeyond(uint32_t cells, uint32_t rings) noexcept;
   void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot, QwenLogicalLengths lengths);

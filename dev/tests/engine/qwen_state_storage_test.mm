@@ -84,6 +84,15 @@ std::vector<std::vector<uint8_t>> stateImage(const model::QwenSlotBuffers &buffe
   return image;
 }
 
+// Every pooled buffer the storage returns to macOS, one reclaim step at a
+// time, as the engine releases them.
+uint64_t releaseAllIdle(model::QwenStateStorage &storage, bool keepLane) {
+  uint64_t released = 0;
+  while (const uint64_t buffer = storage.releaseOneIdle(keepLane))
+    released += buffer;
+  return released;
+}
+
 template <typename Ticket> bool finishWhenReady(Ticket &ticket) {
   while (!ticket.ready()) std::this_thread::yield();
   return ticket.finish();
@@ -197,7 +206,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   source.reset();
   require(storage.idleCells() == 1 && storage.idleRings() == 1,
           "demotion did not return the source buffers at once");
-  static_cast<void>(storage.releaseIdle(false));
+  releaseAllIdle(storage, false);
   require(finishWhenReady(*write), "disk write failed");
   write.reset();
   const auto beforeRestore = storage.actualAllocatedBytes();
@@ -594,7 +603,7 @@ void run(const std::string &metallib) {
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     const uint64_t releasedSlotBytes = storage.actualSlotBytes(0);
     storage.releaseSlot(0, 303);
-    require(storage.releaseIdle(false) == releasedSlotBytes,
+    require(releaseAllIdle(storage, false) == releasedSlotBytes,
             "recomputation preemption retained active backing");
     require(!storage.metadata(0).assigned && storage.actualSlotBytes(0) == 0 &&
                 storage.actualAllocatedBytes() == beforeSuspend - releasedSlotBytes,
@@ -608,8 +617,8 @@ void run(const std::string &metallib) {
 
     // Dropping a cached state returns its buffers to the storage's pool rather
     // than freeing them: accounting stays flat, and the next publication takes
-    // the pooled buffers without a governor admission. Only releaseIdle
-    // returns pooled bytes to macOS.
+    // the pooled buffers without a governor admission. Only releasing idle
+    // buffers returns pooled bytes to macOS.
     const uint64_t beforeDrop = storage.actualAllocatedBytes();
     const uint64_t backendBeforeDrop = backend.memoryStats().allocatedBytes;
     prefix.reset();
@@ -644,10 +653,10 @@ void run(const std::string &metallib) {
     pooled.reset();
     require(storage.actualAllocatedBytes() == beforeDrop,
             "second dropped cached state was freed instead of pooled");
-    require(storage.releaseIdle(false) == observedPrefixActual &&
+    require(releaseAllIdle(storage, false) == observedPrefixActual &&
                 storage.actualAllocatedBytes() ==
                     beforeDrop - observedPrefixActual,
-            "releaseIdle did not free the pooled cache slot");
+            "releasing idle buffers did not free the pooled cache slot");
     require(storage.metadata(0).assigned && storage.metadata(1).assigned &&
                 storage.actualSlotBytes(0) == observedSlotActual &&
                 storage.actualSlotBytes(1) == observedSlotActual,
@@ -668,11 +677,11 @@ void run(const std::string &metallib) {
     require(storage.idleCells() == 5 && storage.idleRings() == 3,
             "dropped cached state did not return its buffers to the pool");
     // Releasing down to one lane's worth keeps two cells and one ring warm.
-    require(storage.releaseIdle(true) ==
+    require(releaseAllIdle(storage, true) ==
                 observedSlotActual + observedPrefixActual &&
                 storage.idleCells() == 2 && storage.idleRings() == 1,
             "partial idle release did not keep the requested buffers");
-    require(storage.releaseIdle(false) == observedSlotActual,
+    require(releaseAllIdle(storage, false) == observedSlotActual,
             "idle lane buffers were not reclaimed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reclaimed buffers remain pooled");
@@ -712,7 +721,7 @@ void run(const std::string &metallib) {
                 storage.actualSlotBytes(0) == observedSlotActual,
             "the retry did not take the pooled buffers and one admission for the rest");
     storage.releaseSlot(0, 506);
-    require(storage.releaseIdle(false) == observedSlotActual &&
+    require(releaseAllIdle(storage, false) == observedSlotActual &&
                 storage.actualAllocatedBytes() == 0,
             "the lane's buffers were not reclaimed");
     // What else a request's start allocates joins the lane's admission: one
@@ -730,7 +739,7 @@ void run(const std::string &metallib) {
                 storage.actualSlotBytes(0) == observedSlotActual,
             "a start was not admitted in one piece");
     storage.releaseSlot(0, 507);
-    require(storage.releaseIdle(false) == observedSlotActual &&
+    require(releaseAllIdle(storage, false) == observedSlotActual &&
                 storage.actualAllocatedBytes() == 0,
             "the started lane's buffers were not reclaimed");
   }

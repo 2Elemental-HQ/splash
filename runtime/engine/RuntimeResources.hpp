@@ -165,9 +165,6 @@ public:
   [[nodiscard]] MemoryGovernor &memoryGovernor() noexcept {
     return *memoryGovernor_;
   }
-  [[nodiscard]] model::StateStorage &stateStorage() noexcept {
-    return *stateStorage_;
-  }
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
   }
