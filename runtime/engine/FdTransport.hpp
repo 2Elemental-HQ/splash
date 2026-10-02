@@ -31,12 +31,11 @@ public:
   // The reader stops reading once this much input waits for the loop: one
   // frame of the largest size the protocol accepts, so the reader can take a
   // whole request of any size while the loop runs. Until the loop takes it,
-  // the pipe stops the writer.
+  // the pipe stops the writer. Tests set a smaller bound through TestConfig.
   static constexpr size_t kInputQueueBytes =
       protocol::kFrameHeaderBytes + protocol::kAbsoluteMaxFramePayloadBytes;
 
-  explicit FdTransport(int inputFd, int outputFd,
-                       size_t inputQueueBytes = kInputQueueBytes);
+  explicit FdTransport(int inputFd, int outputFd);
   FdTransport(const FdTransport &) = delete;
   FdTransport &operator=(const FdTransport &) = delete;
 

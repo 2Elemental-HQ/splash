@@ -225,6 +225,9 @@ def check() -> list[str]:
             errors.append(
                 f"{name}: production backend contains client-specific behavior"
             )
+        # Tests alone substitute what production holds constant.
+        if name != "runtime/TestConfig.hpp" and "testConfigStorage" in text:
+            errors.append(f"{name}: production writes the test configuration")
     return errors
 
 

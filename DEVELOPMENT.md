@@ -797,6 +797,11 @@ a PEP 366 header. `serve_options.py` defines the options
 help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
 
+Tests substitute some of the values the native runtime holds constant, such
+as the input queue's bound, and its live host-memory estimate through
+`runtime/TestConfig.hpp` with `test::ScopedTestConfig`;
+`make architecture-check` keeps production from writing that configuration.
+
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
 original schema validates complete arguments, including cross-field conditions,

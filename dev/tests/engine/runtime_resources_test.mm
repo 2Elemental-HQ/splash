@@ -1,3 +1,4 @@
+#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
@@ -224,18 +225,20 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   TemporaryModelRoot root(2 * kGiB);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   require(root.packageBytes > 3 * kGiB, "the package must exceed the sample");
-  config.hostAvailableMemory = [] {
-    return std::optional<uint64_t>(3 * kGiB);
-  };
-  requireReachesModelLoader(config, root.path,
-                            "a package larger than reclaimable host memory "
-                            "refused to start");
+  {
+    const test::ScopedTestConfig seam(
+        {.hostAvailableMemory = [] { return std::optional<uint64_t>(3 * kGiB); }});
+    requireReachesModelLoader(config, root.path,
+                              "a package larger than reclaimable host memory "
+                              "refused to start");
+  }
 
   // Below the reserve macOS is the one at risk, so startup waits instead.
   // Unmeasurable telemetry waits the same way.
   for (std::optional<uint64_t> available :
        {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
-    config.hostAvailableMemory = [available] { return available; };
+    const test::ScopedTestConfig seam(
+        {.hostAvailableMemory = [available] { return available; }});
     try {
       auto resources = RuntimeResources::create(config);
       throw std::runtime_error("model load ignored the macOS reserve");

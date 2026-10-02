@@ -4,6 +4,7 @@
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/PreparedWeights.hpp"
+#include "TestConfig.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -211,9 +212,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
   const uint64_t preparationReserveBytes =
       hostReserveBytes + model::kWeightPreparationWorkspaceBytes;
+  // Reclaimable host memory, sampled at every Metal operation during startup
+  // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
-      config.hostAvailableMemory ? config.hostAvailableMemory
-                                 : queryHostAvailableMemory;
+      testConfig().hostAvailableMemory ? testConfig().hostAvailableMemory
+                                       : queryHostAvailableMemory;
   // What other applications leave, measured before the engine takes any.
   const std::optional<uint64_t> hostAvailableAtStart = hostAvailableMemory();
   // Startup work stops on cancellation and keeps its reserve of host memory.

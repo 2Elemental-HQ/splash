@@ -1,4 +1,5 @@
 #include "ProtocolPeer.hpp"
+#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
@@ -130,8 +131,8 @@ using splash::test::require;
 struct Harness final {
   explicit Harness(size_t inputQueueBytes = engine::FdTransport::kInputQueueBytes,
                    int inputFd = -1)
-      : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
-                  inputQueueBytes) {
+      : seam({.transportInputQueueBytes = inputQueueBytes}),
+        transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1]) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
   Pipes pipes;
@@ -139,6 +140,7 @@ struct Harness final {
   KvPool pool{storage, 8};
   engine::Cache resources{pool};
   Executor executor;
+  test::ScopedTestConfig seam;
   engine::FdTransport transport;
   // What the loop answers a status request with.
   std::function<std::string()> status = test::readyStatusJson;
