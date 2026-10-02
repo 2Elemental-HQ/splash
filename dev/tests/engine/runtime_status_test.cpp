@@ -104,6 +104,7 @@ void testCleanRuntimeStatus() {
   engine.resources.kvTier.restores = 3;
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
+  engine.resources.kvTier.fileBytes = 24680;
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
@@ -180,7 +181,8 @@ void testCleanRuntimeStatus() {
               json.find("\"kv_restores\":3") != std::string::npos,
           "disk token accounting must include transfers completed before admission retries");
   require(json.find("\"read_bytes\":12345") != std::string::npos &&
-              json.find("\"written_bytes\":67890") != std::string::npos,
+              json.find("\"written_bytes\":67890") != std::string::npos &&
+              json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,

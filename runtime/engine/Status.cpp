@@ -179,6 +179,7 @@ std::string runtimeStatusJson(
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
+      << ",\"file_bytes\":" << resources.kvTier.fileBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks

@@ -4,7 +4,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,7 +15,11 @@ namespace splash::model {
 
 // Bytes one disk quota may hold, shared by every slot file of the cache
 // tier. Reservations and releases come from the engine thread and from
-// whoever drops the last handle of a slot.
+// whoever drops the last handle of a slot. The budget bounds live slots. A
+// freed slot returns its bytes at once but its blocks only when its file's
+// worker punches them, after the transfer that worker is in, so the files'
+// blocks can briefly exceed the budget by the slots freed but not yet
+// punched; a volume sized exactly to the budget can fill.
 class DiskBudget final {
 public:
   explicit DiskBudget(uint64_t capacityBytes) noexcept : capacity_(capacityBytes) {}
@@ -41,6 +44,11 @@ public:
   [[nodiscard]] uint64_t writtenBytes() const noexcept {
     return written_.load(std::memory_order_relaxed);
   }
+  // Bytes the budget's files occupy on disk: the slots written since their
+  // blocks last went back.
+  [[nodiscard]] uint64_t fileBytes() const noexcept {
+    return file_.load(std::memory_order_relaxed);
+  }
 
 private:
   friend class SlotFile;
@@ -48,6 +56,7 @@ private:
   std::atomic<uint64_t> used_{0};
   std::atomic<uint64_t> read_{0};
   std::atomic<uint64_t> written_{0};
+  std::atomic<uint64_t> file_{0};
 };
 
 // Scratch storage of fixed-size slots in an unlinked temporary file, served
@@ -60,8 +69,11 @@ private:
 // aligned buffer of the worker's own, so the file sees only aligned
 // transfers. A slot is readable only after one complete write; a failed or
 // cancelled write leaves it unreadable, and after a failed write the file
-// accepts no further writes. So that a file-size limit fails a write rather
-// than killing the process, a file ignores SIGXFSZ from its construction on.
+// accepts no further writes. A freed slot returns its quota at once; one
+// that was written returns its blocks to the volume (F_PUNCHHOLE) on the
+// worker, after the operation in flight and before any later one
+// (DiskBudget). So that a file-size limit fails a write rather than
+// killing the process, a file ignores SIGXFSZ from its construction on.
 class SlotFile final {
   struct Backing;
 
@@ -86,6 +98,9 @@ public:
     uint32_t index_;
     // Owned by the worker: operations on one file run in submission order.
     bool written_ = false;
+    // Set when a write is submitted: freeing the slot then returns the
+    // blocks that write may have taken.
+    bool returnsBlocks_ = false;
   };
 
   class Operation final {
@@ -149,14 +164,14 @@ private:
   [[nodiscard]] std::shared_ptr<Operation> submit(Run run,
                                                   std::function<void()> completion);
   void run();
+  // On the worker: returns a freed slot's blocks to the volume.
+  void punchHole(uint32_t index) noexcept;
+  // Holds the worker's queue too, so a slot freed on any thread queues the
+  // return of its blocks.
   std::shared_ptr<Backing> backing_;
   // The worker's own, aligned for uncached IO: every chunk that does not
   // move straight between memory and the file goes through it.
   std::unique_ptr<std::byte, Free> buffer_;
-  std::mutex mutex_;
-  std::condition_variable wake_;
-  std::deque<Work> work_;
-  bool stopping_ = false;
   std::thread worker_;
 };
 

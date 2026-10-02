@@ -65,9 +65,11 @@ struct CacheLookupSnapshot final {
 };
 
 struct KvTierSnapshot final {
-  // The disk quota shared by KV pages and states, and its current use.
+  // The disk quota shared by KV pages and states, its current use, and the
+  // bytes its files occupy on disk.
   uint64_t capacityBytes = 0;
   uint64_t usedBytes = 0;
+  uint64_t fileBytes = 0;
   uint64_t readBytes = 0;
   uint64_t writtenBytes = 0;
   uint64_t demotions = 0;

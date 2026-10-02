@@ -849,6 +849,7 @@ CacheSnapshot Cache::snapshot() const {
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();
     tier.usedBytes = diskBudget_->usedBytes();
+    tier.fileBytes = diskBudget_->fileBytes();
     tier.readBytes = diskBudget_->readBytes();
     tier.writtenBytes = diskBudget_->writtenBytes();
   }

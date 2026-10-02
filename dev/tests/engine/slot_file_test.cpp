@@ -230,12 +230,60 @@ static void testCancelledDirectWrite() {
           "a cancelled write of aligned runs left its slot readable or closed the file");
 }
 
+// A freed slot gives its blocks back: two files filling one quota in turn
+// occupy what the quota holds on disk, not twice it.
+static void testFreedSlotsReturnTheirBlocks() {
+  constexpr size_t size = SlotFile::kAlignmentBytes;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile first(size, budget), second(size, budget);
+  std::vector<std::byte> source(size, std::byte{7}), output(size);
+  const auto fill = [&](SlotFile &file) {
+    std::vector<std::shared_ptr<SlotFile::Slot>> slots;
+    for (int index = 0; index < 4; ++index) {
+      slots.push_back(file.acquire());
+      require(slots.back() && file.write(slots.back(), {source}, {})->wait(),
+              "a slot of the quota could not be written");
+    }
+    return slots;
+  };
+  auto slots = fill(first);
+  require(budget->fileBytes() == 4 * size, "written slots were not counted on disk");
+  slots.clear();
+  // A read of an unwritten slot completes behind the punches queued before it.
+  require(!first.read(first.acquire(), {output}, {})->wait() && budget->fileBytes() == 0,
+          "freed slots kept their blocks");
+  slots = fill(second);
+  require(budget->fileBytes() == 4 * size,
+          "two files filling one quota in turn occupied more than it");
+}
+
+// A punched slot takes a new write like any other: the write lands in the
+// hole and reads back. The first slot goes on the worker, which drops the
+// write's hold on it last.
+static void testPunchedSlotIsReusable() {
+  constexpr size_t size = 2 * SlotFile::kAlignmentBytes;
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget);
+  std::vector<std::byte> first(size, std::byte{1}), second(size / 2, std::byte{2});
+  require(file.write(file.acquire(), {first}, {})->wait(), "the first write failed");
+  // The quota holds one slot, so this is the same one.
+  auto slot = file.acquire();
+  std::vector<std::byte> output(size), expected(size);
+  std::copy(second.begin(), second.end(), expected.begin());
+  require(slot && file.write(slot, {second}, {})->wait() &&
+              file.read(slot, {output}, {})->wait() && output == expected &&
+              budget->fileBytes() == size,
+          "a punched slot did not take a new write");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
     testScatteredSpans();
     testAlignedRunsMoveDirectly();
     testCancelledDirectWrite();
+    testFreedSlotsReturnTheirBlocks();
+    testPunchedSlotIsReusable();
     constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);

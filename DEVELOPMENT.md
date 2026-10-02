@@ -1086,9 +1086,19 @@ replaces the oldest redundant copy first, then the oldest sole copy, across
 both KV and states. Sole copies of states in use, and the KV they restore
 through, make room only for a copy that is itself in use, and last; an ordinary
 state that finds no other room is dropped. A quota smaller than the working set
-can cause repeated reads and writes; it is not a write-rate limit. Each file
-retains its allocated high-water mark until shutdown, so filesystem space can
-exceed the live-slot quota. Closing the server releases both files.
+can cause repeated reads and writes; it is not a write-rate limit. A freed slot
+returns its quota at once and its blocks to the volume (`F_PUNCHHOLE`) once its
+file's IO worker finishes the transfer it is in, so the two files together
+occupy about the live slots instead of each keeping its high-water mark;
+`/status` reports that as `disk.file_bytes` beside `disk.used_bytes`. Until the
+punch the other file can take that quota, so allocated blocks can briefly exceed
+`--max-cache-disk` by the slots freed but not yet punched, bounded by the
+transfer each file's worker is in: about 2% of a 10G tier in a 25-minute churn
+run on an M5 Max. A volume sized exactly to the quota can therefore fill; the
+write that finds it full stops that file's writes for the rest of the process,
+as below, while serving continues. On a volume that cannot punch holes the
+files keep the blocks of freed slots, which the runtime reports once. Closing
+the server releases both files.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
 whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of

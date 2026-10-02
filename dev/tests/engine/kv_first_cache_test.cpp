@@ -1615,7 +1615,8 @@ void testQuotaWithoutTheKvTier() {
           "state file IO failed");
   const auto tier = cache.snapshot().kvTier;
   require(tier.capacityBytes == 4 * size && tier.usedBytes == size && tier.readBytes == size &&
-              tier.writtenBytes == size && tier.diskBlocks == 0 && tier.diskBytes == 0,
+              tier.writtenBytes == size && tier.fileBytes == size && tier.diskBlocks == 0 &&
+              tier.diskBytes == 0,
           "the disk quota went unreported without the KV tier");
 }
 
