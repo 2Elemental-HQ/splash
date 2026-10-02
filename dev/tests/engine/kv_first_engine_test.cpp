@@ -263,14 +263,14 @@ public:
     prefillWidths.push_back(static_cast<uint32_t>(items.size()));
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
-      requireRows(item, item.promptOffset);
+      requireRows(item, item.logicalPosition);
       if (kv) {
-        const uint32_t end = item.promptOffset + item.tokenCount;
-        for (uint32_t row = (item.promptOffset + KvCache::pageTokens - 1) /
+        const uint64_t end = item.logicalPosition + item.tokenCount;
+        for (uint64_t row = (item.logicalPosition + KvCache::pageTokens - 1) /
                             KvCache::pageTokens * KvCache::pageTokens;
              row < end; row += KvCache::pageTokens) {
           kv->content.at(item.pageTable[row / KvCache::pageTokens]) =
-              rows(row / KvCache::pageTokens, item.inputTokens[row - item.promptOffset]);
+              rows(row / KvCache::pageTokens, item.inputTokens[row - item.logicalPosition]);
         }
       }
       requests.at(item.requestId).position += item.tokenCount;

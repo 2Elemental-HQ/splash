@@ -223,9 +223,7 @@ struct StateAdmission final {
 
 struct ModelBatchItem final {
   uint64_t requestId = 0;
-  uint32_t stateSlot = 0;
   uint64_t logicalPosition = 0;
-  uint32_t promptOffset = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
   // pageTableRevision names the page list and is nonzero; the list equals

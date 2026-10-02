@@ -139,7 +139,7 @@ void prefill(model::Runtime &executor, Lane &lane,
         static_cast<uint32_t>(prompt.size()) - offset);
     BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
                    {{lane.id, count, offset}}, DecodeStage::Regular};
-    ModelBatchItem item{lane.id, lane.slot, offset, offset, count, lane.pages,
+    ModelBatchItem item{lane.id, offset, count, lane.pages,
                         lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
     auto results =
@@ -170,7 +170,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});
-    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages,
+    items.push_back({lane.id, lane.position, 0, lane.pages,
                      lane.pageTableRevision});
   }
   auto results = executor.decode(plan, items);

@@ -132,7 +132,6 @@ void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
   }
   for (size_t index = 0; index < items.size(); ++index) {
     if (items[index].requestId != plan.items[index].requestId ||
-        items[index].stateSlot >= kLaneCount ||
         (expected == WorkKind::Prefill &&
          (!plan.items[index].tokenCount ||
           plan.items[index].tokenCount != items[index].tokenCount ||
@@ -649,7 +648,7 @@ struct Runtime::Impl {
   // requests add no dispatches.
   void addImageRows(CommandGraph &graph, Request &entry,
                     const ModelBatchItem &item, uint32_t rowBegin) {
-    const uint64_t chunkBegin = item.promptOffset;
+    const uint64_t chunkBegin = item.logicalPosition;
     const uint64_t chunkEnd = chunkBegin + item.tokenCount;
     for (ImageState &image : entry.images) {
       const uint64_t begin = std::max<uint64_t>(chunkBegin, image.span.offset);
@@ -1007,10 +1006,9 @@ struct Runtime::Impl {
       const ModelBatchItem &item = items[lane];
       Request &entry = request(item.requestId);
       if (item.tokenCount > kPrefillRows ||
-          item.promptOffset > entry.promptTokens ||
-          item.tokenCount > entry.promptTokens - item.promptOffset ||
-          item.logicalPosition != item.promptOffset || !entry.resident ||
-          entry.slot != item.stateSlot) {
+          item.logicalPosition > entry.promptTokens ||
+          item.tokenCount > entry.promptTokens - item.logicalPosition ||
+          !entry.resident) {
         throw std::invalid_argument("invalid packed Qwen prefill item");
       }
       const QwenSlotMetadata &metadata = states.metadata(entry.slot);
@@ -1259,8 +1257,7 @@ struct Runtime::Impl {
 
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
                          uint32_t lane) {
-    if (!entry.resident || entry.slot != item.stateSlot ||
-        !entry.promptComplete || !entry.pendingToken) {
+    if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
       throw std::logic_error("decode request is not ready");
     }
     const QwenSlotMetadata &metadata = states.metadata(entry.slot);
@@ -2209,7 +2206,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
-      const uint64_t chunkEnd = items[lane].promptOffset + items[lane].tokenCount;
+      const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
         if (!image.rows)
           continue;
@@ -2660,12 +2657,13 @@ void requireRunwayPages(const kv::PageStorage &storage,
 
 // A warmup request's batch item. Each warmup residency keeps one page list,
 // so its revision stays 1.
-ModelBatchItem warmupItem(uint64_t id, uint32_t slot, uint64_t position,
-                          uint32_t promptOffset, uint32_t tokens,
+ModelBatchItem warmupItem(uint64_t id, uint64_t position, uint32_t tokens,
                           std::span<const uint32_t> pages) {
-  ModelBatchItem item{id, slot, position, promptOffset, tokens, pages};
-  item.pageTableRevision = 1;
-  return item;
+  return {.requestId = id,
+          .logicalPosition = position,
+          .tokenCount = tokens,
+          .pageTable = pages,
+          .pageTableRevision = 1};
 }
 
 } // namespace
@@ -2704,7 +2702,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
                    BatchCohort::Greedy,
                    {{id, rows}},
                    DecodeStage::Regular};
-    ModelBatchItem item = warmupItem(id, 0, 0, 0, rows, pages);
+    ModelBatchItem item = warmupItem(id, 0, rows, pages);
     item.inputTokens = request.prompt;
     const auto phaseStart = Clock::now();
     auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -2733,10 +2731,11 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
-  // Plan order is deliberately unrelated to physical slot order. DecodeArena
-  // lanes belong to the explicit BatchPlan, while recurrent/KV state remains
-  // addressed by each item.stateSlot; batching must never assume slot 0..3.
-  constexpr std::array<uint32_t, kLaneCount> slotOrder{2, 0, 3, 1};
+  // Plan order is deliberately unrelated to state-lane order. DecodeArena
+  // lanes follow the explicit BatchPlan, while recurrent and KV state stay
+  // addressed by each request's state lane; batching must never assume lanes
+  // 0..3.
+  constexpr std::array<uint32_t, kLaneCount> stateLaneOrder{2, 0, 3, 1};
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, kLaneCount> pages;
@@ -2747,15 +2746,14 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.id = firstId + lane;
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
-      beginColdRequest(request, slotOrder[lane]);
+      beginColdRequest(request, stateLaneOrder[lane]);
       pages[lane] = {5 + lane};
       requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{WorkKind::Prefill,
                             BatchCohort::Greedy,
                             {{request.id, 1}},
                             DecodeStage::Regular};
-      ModelBatchItem item =
-          warmupItem(request.id, slotOrder[lane], 0, 0, 1, pages[lane]);
+      ModelBatchItem item = warmupItem(request.id, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
       requireLanesSucceeded(
           prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2767,8 +2765,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     std::vector<ModelBatchItem> items;
     for (uint32_t lane = 0; lane < width; ++lane) {
       plan.items.push_back({firstId + lane, 0});
-      items.push_back(
-          warmupItem(firstId + lane, slotOrder[lane], 1, 0, 0, pages[lane]));
+      items.push_back(warmupItem(firstId + lane, 1, 0, pages[lane]));
     }
     const auto phaseStart = Clock::now();
     auto decoded = decode(plan, items);
@@ -2776,7 +2773,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     requireLanesSucceeded(decoded);
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
-      const auto &lengths = impl_->states.metadata(slotOrder[lane]).lengths;
+      const auto &lengths = impl_->states.metadata(stateLaneOrder[lane]).lengths;
       committedEveryLane = !decoded[lane].outputTokens.empty() &&
                            lengths.targetTokens > 1 &&
                            lengths.targetTokens ==
@@ -2810,7 +2807,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,
-                       impl_->states.metadata(slotOrder[lane]).lengths.targetTokens});
+                       impl_->states.metadata(stateLaneOrder[lane]).lengths.targetTokens});
       end(firstId + lane);
     }
   } catch (...) {
@@ -2842,14 +2839,14 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
                           BatchCohort::Greedy,
                           {{id, 1}},
                           DecodeStage::Regular};
-    ModelBatchItem prefillItem = warmupItem(id, 0, 0, 0, 1, pages);
+    ModelBatchItem prefillItem = warmupItem(id, 0, 1, pages);
     prefillItem.inputTokens = request.prompt;
     requireLanesSucceeded(
         prefill(prefillPlan, std::span<const ModelBatchItem>(&prefillItem, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem = warmupItem(id, 0, 1, 0, 0, pages);
+    ModelBatchItem decodeItem = warmupItem(id, 1, 0, pages);
     auto result =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     requireLanesSucceeded(result);
@@ -2893,7 +2890,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                    BatchCohort::Greedy,
                    {{id, prefixTokens}},
                    DecodeStage::Regular};
-    ModelBatchItem item = warmupItem(id, 0, 0, 0, prefixTokens, pages);
+    ModelBatchItem item = warmupItem(id, 0, prefixTokens, pages);
     item.inputTokens =
         std::span<const uint32_t>(request.prompt).first(prefixTokens);
     static_cast<void>(prefill(plan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2923,8 +2920,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                          BatchCohort::Greedy,
                          {{id, suffixTokens}},
                          DecodeStage::Regular};
-    ModelBatchItem suffix =
-        warmupItem(id, 1, prefixTokens, prefixTokens, suffixTokens, pages);
+    ModelBatchItem suffix = warmupItem(id, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
     requireLanesSucceeded(
@@ -2935,7 +2931,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += continuationWallSeconds;
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem = warmupItem(id, 1, promptTokens, 0, 0, pages);
+    ModelBatchItem decodeItem = warmupItem(id, promptTokens, 0, pages);
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     requireLanesSucceeded(decoded);

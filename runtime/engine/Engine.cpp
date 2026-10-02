@@ -1217,10 +1217,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     active.resourceWait = {};
     ModelBatchItem item;
     item.requestId = active.request.id;
-    item.stateSlot = *active.stateCell;
     item.logicalPosition = position;
-    item.promptOffset =
-        plan.kind == WorkKind::Prefill ? scheduled.promptOffset : 0;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
     item.pageTable = pageTable.pages;
