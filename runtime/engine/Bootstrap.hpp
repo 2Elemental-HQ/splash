@@ -88,12 +88,18 @@ private:
                                     uint64_t hostAvailableBytes,
                                     uint32_t contextTokens);
 
+// The wire limits of a model served with maxContext tokens: prompts and
+// outputs up to the context, the engine's step and draft query rows, and a
+// mask row per draft query and the anchor.
+[[nodiscard]] protocol::ProtocolLimits
+protocolLimitsFor(const model::ModelCapabilities &capabilities,
+                  uint32_t maxContext) noexcept;
+
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
     // A zero engine maxContext is what the memory plan holds, as serve's
     // default; a larger one than that fails the bootstrap.
     NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
-    protocol::ProtocolLimits protocolLimits;
 };
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;

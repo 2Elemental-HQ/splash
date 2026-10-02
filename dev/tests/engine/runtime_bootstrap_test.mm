@@ -694,6 +694,19 @@ void testMemoryMayNotHoldBeyondHostHeadroom() {
           "the disk tier suggestion does not follow the host's headroom");
 }
 
+// The parser's limits follow the model: prompts and outputs up to the served
+// context, the engine's step and draft query rows, and a mask row of the
+// vocabulary for each draft query and the anchor.
+void testProtocolLimitsFollowTheModel() {
+  model::ModelCapabilities capabilities;
+  capabilities.vocabularySize = 248320;
+  const protocol::ProtocolLimits limits = protocolLimitsFor(capabilities, 4096);
+  require(limits.maxMaskWords == 7760 * 9 && limits.maxSimulationTokens == 8 &&
+              limits.maxTokenBatch == 9 && limits.maxPromptTokens == 4096 &&
+              limits.maxLogicalOutputTokens == 4096,
+          "the protocol limits do not follow the model and the served context");
+}
+
 } // namespace
 
 int main() {
@@ -711,6 +724,7 @@ int main() {
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
     testMemoryMayNotHoldBeyondHostHeadroom();
+    testProtocolLimitsFollowTheModel();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

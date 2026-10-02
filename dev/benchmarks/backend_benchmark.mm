@@ -804,12 +804,6 @@ int main(int argc, char **argv) {
     config.buildId = SPLASH_BUILD_ID;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
-    const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
-    bootstrapConfig.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-    bootstrapConfig.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-    bootstrapConfig.protocolLimits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
-    bootstrapConfig.protocolLimits.maxMaskWords =
-        maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;

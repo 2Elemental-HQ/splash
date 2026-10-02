@@ -281,6 +281,12 @@ struct ModelCapabilities final {
   uint32_t maximumContextTokens = 0;
 };
 
+// A token mask row holds one bit per vocabulary token in 32-bit words.
+[[nodiscard]] constexpr uint32_t
+maskWordsPerToken(uint32_t vocabularySize) noexcept {
+  return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
+}
+
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
 // target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.

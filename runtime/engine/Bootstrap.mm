@@ -101,6 +101,18 @@ bool memoryMayNotHold(const EngineMemoryPlan &plan,
          contextTokens;
 }
 
+protocol::ProtocolLimits protocolLimitsFor(
+    const model::ModelCapabilities &capabilities, uint32_t maxContext) noexcept {
+  protocol::ProtocolLimits limits;
+  limits.maxPromptTokens = maxContext;
+  limits.maxLogicalOutputTokens = maxContext;
+  limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
+  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
+                        (model::ExecutionLimits::draftQueryRows + 1);
+  return limits;
+}
+
 RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                                    std::unique_ptr<model::RuntimeModel> modelRuntime,
                                    std::unique_ptr<NativeRuntime> nativeLoop,
@@ -263,12 +275,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
                " and replays its prompt. --max-cache-disk SIZE keeps its"
                " progress and cached prefixes on SSD.");
   }
-  // The parser and engine consume the same resolved ceiling. In automatic
-  // mode these limits cannot be known until resource planning has measured
-  // the device and built the immutable page pool.
-  config.protocolLimits.maxPromptTokens = config.nativeLoop.engine.maxContext;
-  config.protocolLimits.maxLogicalOutputTokens =
-      config.nativeLoop.engine.maxContext;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
   // Images are admitted up to the server's pixel cap; a model without vision
@@ -315,10 +321,13 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
+    // The parser and engine consume the same resolved ceiling. In automatic
+    // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
         std::move(output), std::move(statusProvider), NativeLoopClocks{},
-        config.protocolLimits);
+        protocolLimitsFor(config.resources.model.capabilities,
+                          config.nativeLoop.engine.maxContext));
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,

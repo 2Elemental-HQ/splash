@@ -267,9 +267,6 @@ uint64_t engineInstanceId() {
 
 engine::RuntimeBootstrapConfig
 bootstrapConfig(const NativeArguments &arguments) {
-  const model::ModelCapabilities &capabilities = arguments.model.capabilities;
-  const uint32_t maskWordsPerToken =
-      (capabilities.vocabularySize + 31) / 32;
   engine::RuntimeBootstrapConfig config;
   config.resources.metallibPath =
       executablePath().parent_path() / "splash.metallib";
@@ -283,13 +280,6 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   config.nativeLoop.engineInstanceId = engineInstanceId();
-  config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-  config.protocolLimits.maxTokenBatch =
-      model::ExecutionLimits::maximumStepTokens;
-  config.protocolLimits.maxSimulationTokens =
-      model::ExecutionLimits::draftQueryRows;
-  config.protocolLimits.maxMaskWords =
-      maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
   return config;
 }
 

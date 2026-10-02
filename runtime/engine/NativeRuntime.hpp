@@ -18,7 +18,6 @@ namespace splash::engine {
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   uint64_t engineInstanceId = 1;
-  uint32_t maskWordsPerToken = 1;
   RuntimeMetrics *metrics = nullptr;
 };
 

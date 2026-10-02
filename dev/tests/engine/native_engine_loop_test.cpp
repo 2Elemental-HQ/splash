@@ -1447,7 +1447,8 @@ void testConstrainedMaskExchange() {
     std::vector<uint8_t> output;
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
-    config.maskWordsPerToken = 2;
+    // Three mask words per token; the prompt's tokens stay in vocabulary.
+    config.engine.vocabularySize = 96;
     double now = 100.0;
     engine::NativeRuntime loop(
         config, resources, executor,
@@ -1478,16 +1479,16 @@ void testConstrainedMaskExchange() {
         asked = *event;
     }
     require(asked && asked->requestId == 7 && asked->maskRequestId &&
-                asked->wordsPerMask == 2 && asked->simulationTokens.empty(),
+                asked->wordsPerMask == 3 && asked->simulationTokens.empty(),
             "constrained request did not ask for one initial mask row");
 
-    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0}};
+    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0, 0}};
     if (reply == Reply::WrongMaskId)
       ++response.maskRequestId;
     if (reply == Reply::WrongWordCount)
       response.maskWords.push_back(0);
     if (reply == Reply::EmptyRow)
-      response.maskWords = {0, 0};
+      response.maskWords = {0, 0, 0};
     if (reply == Reply::AfterCancel) {
       send(protocol::CancelFrame{7});
       runUntilIdle(loop);
