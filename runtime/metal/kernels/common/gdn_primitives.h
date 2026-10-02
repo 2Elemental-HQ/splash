@@ -58,17 +58,6 @@ inline GdnGates gdn_gates(device const bfloat *packed_row,
   return gates;
 }
 
-inline void gdn_write_gates(device const bfloat *packed_row,
-                            device const bfloat *dt_bias,
-                            device const float *a_scale, uint b_offset,
-                            uint a_offset, uint head, device bfloat &beta,
-                            device float &decay) {
-  const GdnGates gates =
-      gdn_gates(packed_row, dt_bias, a_scale, b_offset, a_offset, head);
-  beta = gates.beta;
-  decay = gates.decay;
-}
-
 // The position of value head `head` among the GDN output's head blocks: the
 // head itself, or with `tiled` llama.cpp's GGUF order, which puts value head
 // j of every key head next to each other (GDNGatePrefillParams).
@@ -78,49 +67,43 @@ inline uint gdn_output_head(uint head, bool tiled) {
   return tiled ? (head % HeadsPerKey) * KeyHeads + head / HeadsPerKey : head;
 }
 
-// Gated RMSNorm of the recurrent rows, one task per (token, value head) and
-// one lane per dimension, stored at the head's output position. Prefill
+// Gated RMSNorm of the recurrent row of one task (token, value head), one
+// thread per dimension, stored at the head's output position. Prefill
 // dispatches one task per threadgroup; decode runs gdn_decode_gate, which
 // reproduces these rows bitwise. The norm weights are read in their stored
 // type W: bfloat in the packed formats, float for a GGUF's F32 norms.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint Simdgroups = 8, class W>
+          uint PackedWidth, class W>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
-               device const W *norm_weight, device bfloat *hidden,
-               uint tasks, uint groups, uint packed_width, bool tiled,
-               threadgroup float *scratch, uint group, uint thread_index,
+               device const W *norm_weight, device bfloat *hidden, uint task,
+               bool tiled, threadgroup float *scratch, uint thread_index,
                uint lane, uint simd_group) {
-  constexpr uint ZOffset = ConvDim;
-  for (uint task = group; task < tasks; task += groups) {
-    uint token = task / ValueHeads;
-    uint head = task % ValueHeads;
-    ulong base = ulong(task) * HeadDim;
-    ulong hidden_base =
-        (ulong(token) * ValueHeads +
-         gdn_output_head<KeyHeads, ValueHeads>(head, tiled)) *
-        HeadDim;
-    float value =
-        thread_index < HeadDim ? float(recurrent[base + thread_index]) : 0.0f;
-    float square_sum = simd_sum(value * value);
-    if (lane == 0)
-      scratch[simd_group] = square_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index == 0) {
-      float total = 0.0f;
-      for (uint i = 0; i < Simdgroups; ++i)
-        total += scratch[i];
-      scratch[0] = rsqrt(total / HeadDim + 1e-6f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index < HeadDim) {
-      bfloat normalized =
-          bfloat(value * scratch[0] * float(norm_weight[thread_index]));
-      float gate = float(packed[token * packed_width + ZOffset +
-                                head * HeadDim + thread_index]);
-      float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr uint Simdgroups = 4, ZOffset = ConvDim;
+  static_assert(HeadDim == Simdgroups * 32, "one thread per dimension");
+  uint token = task / ValueHeads;
+  uint head = task % ValueHeads;
+  ulong base = ulong(task) * HeadDim;
+  ulong hidden_base =
+      (ulong(token) * ValueHeads +
+       gdn_output_head<KeyHeads, ValueHeads>(head, tiled)) *
+      HeadDim;
+  float value = float(recurrent[base + thread_index]);
+  float square_sum = simd_sum(value * value);
+  if (lane == 0)
+    scratch[simd_group] = square_sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index == 0) {
+    float total = 0.0f;
+    for (uint i = 0; i < Simdgroups; ++i)
+      total += scratch[i];
+    scratch[0] = rsqrt(total / HeadDim + 1e-6f);
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  bfloat normalized =
+      bfloat(value * scratch[0] * float(norm_weight[thread_index]));
+  float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
+                            thread_index]);
+  float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
+  hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
 }
