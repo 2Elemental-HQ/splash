@@ -1074,14 +1074,31 @@ void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
   scheduler.resourcesReady(1, 0);
   BatchPlan first = *scheduler.next({});
   completePrefill(scheduler, first);
+  require(!scheduler.suspended(1), "a running request was suspended");
   scheduler.suspendForResources(1);
-  require(scheduler.phase(1) == engine::Phase::WaitingResources,
+  require(scheduler.phase(1) == engine::Phase::WaitingResources && scheduler.suspended(1),
           "resident prefill did not enter resource wait");
   scheduler.resumeFromResources(1, 32, 4096);
+  require(!scheduler.suspended(1), "a resumed request stayed suspended");
   BatchPlan resumed = *scheduler.next({});
   require(resumed.kind == WorkKind::Prefill &&
               resumed.items[0].promptOffset == 32,
           "resource resume did not start from its acquired cache boundary");
+
+  // A request that ends while suspended stays so until it is removed, and
+  // submission order follows the submits.
+  engine::Scheduler ended(0.0);
+  ended.submit(request(3, 64));
+  ended.submit(request(4, 64));
+  require(ended.submissionOrder(3) < ended.submissionOrder(4),
+          "submission order did not follow the submits");
+  ended.resourcesReady(3, 0);
+  completePrefill(ended, *ended.next({}));
+  ended.suspendForResources(3);
+  ended.cancel(3);
+  require(ended.phase(3) == engine::Phase::Cancelled && ended.suspended(3),
+          "a cancelled request forgot it was suspended");
+  ended.remove(3);
 
   engine::Scheduler decode(0.0);
   decode.submit(request(2, 1, BatchCohort::Constrained));

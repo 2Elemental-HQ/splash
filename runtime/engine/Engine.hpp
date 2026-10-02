@@ -202,15 +202,11 @@ private:
     };
 
     EngineRequest request;
-    // Its place in submission order. Earlier requests' lanes hold memory it
-    // may wait for, so their work restarts its resource wait's limit.
-    uint64_t sequence = 0;
     // The admissions counted when admit() last gave it a state cell
     // (admissions_). Lanes admitted before a request was refused memory or
-    // suspended restart its wait's limit too.
+    // suspended restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> stateCell;
-    bool suspended = false;
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
@@ -453,9 +449,9 @@ private:
   // requests of a strictly higher priority than every suspended one are,
   // and, once the drain is over, the suspended ones; the others wait behind
   // the suspended lanes.
-  [[nodiscard]] static bool admissionTries(const Request &request,
-                                           std::optional<RequestPriority> tier,
-                                           bool draining) noexcept;
+  [[nodiscard]] bool admissionTries(const Request &request,
+                                    std::optional<RequestPriority> tier,
+                                    bool draining) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // The state cells admit() has obtained so far, including those it gave

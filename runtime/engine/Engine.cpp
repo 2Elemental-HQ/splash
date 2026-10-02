@@ -149,7 +149,6 @@ void Engine::submit(EngineRequest value) {
     requests_.erase(found);
   }
   Request requestState;
-  requestState.sequence = counters_.submitted;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
@@ -159,7 +158,7 @@ void Engine::submit(EngineRequest value) {
       {.id = id,
        .priority = stored.request.priority,
        .cohort = stored.request.cohort,
-       .promptTokens = stored.promptTokens,
+       .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds});
   ++counters_.submitted;
 }
@@ -215,13 +214,14 @@ bool Engine::tick(double now) {
   uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
   if (pending_) {
     for (const BatchItem &item : pending_->plan.items) {
-      const Request &working = request(item.requestId);
-      earliestWorking = std::min(earliestWorking, working.sequence);
-      earliestWorkingAdmission = std::min(earliestWorkingAdmission, working.admission);
+      earliestWorking =
+          std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
+      earliestWorkingAdmission =
+          std::min(earliestWorkingAdmission, request(item.requestId).admission);
     }
   }
   const bool draining = drainingForRecovery();
-  for (auto &[_, active] : requests_) {
+  for (auto &[id, active] : requests_) {
     // A mask request left unanswered past the limit ends its request: a lane
     // in flight commits without the mask, any other fails now.
     if (!active.pendingEnd && active.maskRequestedMilliseconds &&
@@ -243,7 +243,7 @@ bool Engine::tick(double now) {
     // it: requests that keep arriving would otherwise hold it until its
     // deadline.
     const std::optional<uint64_t> &admittedBefore = active.resourceWait.admittedBefore;
-    if (active.sequence > earliestWorking ||
+    if (scheduler_.submissionOrder(id) > earliestWorking ||
         (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
       active.resourceWait.earlierLaneWorkMilliseconds = now;
     const double deadline = resourceDeadline(active);
@@ -335,18 +335,21 @@ bool Engine::drainingForRecovery() const {
 
 std::optional<RequestPriority> Engine::suspendedTier() const {
   std::optional<RequestPriority> tier;
-  for (const auto &[_, active] : requests_) {
-    if (active.suspended && (!tier || active.request.priority < *tier))
+  for (const auto &[id, active] : requests_) {
+    // A finalized request keeps the scheduler's flag until it is swept.
+    if (!active.finalized && scheduler_.suspended(id) &&
+        (!tier || active.request.priority < *tier))
       tier = active.request.priority;
   }
   return tier;
 }
 
 bool Engine::admissionTries(const Request &active, std::optional<RequestPriority> tier,
-                            bool draining) noexcept {
+                            bool draining) const {
   if (!tier)
     return !draining;
-  return active.request.priority < *tier || (active.suspended && !draining);
+  return active.request.priority < *tier ||
+         (scheduler_.suspended(active.request.id) && !draining);
 }
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
@@ -412,7 +415,7 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
       ++result.concurrency;
     else
       ++result.memory;
-    if (active.suspended)
+    if (scheduler_.suspended(id))
       ++result.suspended;
     if (active.resourceWait.startedMilliseconds)
       result.oldestWaitMilliseconds = std::max(
@@ -519,9 +522,10 @@ bool Engine::admitQueued(double now) {
         continue;
       }
       if (resourceRetryReady(active, now)) {
-        if (!active.suspended && belowRunnable(active))
+        const bool suspended = scheduler_.suspended(id);
+        if (!suspended && belowRunnable(active))
           queue(id);
-        else if (cellsFull && !active.suspended ? waitForLane(id, active) : admit(active, now))
+        else if (cellsFull && !suspended ? waitForLane(id, active) : admit(active, now))
           return true;
       }
       held = active.refusedMemory;
@@ -674,7 +678,7 @@ bool Engine::pendingSharedPrefill(const Request &active,
 }
 
 bool Engine::admit(Request &active, double now) {
-  const bool resuming = active.suspended;
+  const bool resuming = scheduler_.suspended(active.request.id);
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
@@ -804,7 +808,7 @@ bool Engine::admit(Request &active, double now) {
 
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
-  const bool resuming = active.suspended;
+  const bool resuming = scheduler_.suspended(active.request.id);
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
@@ -829,7 +833,6 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
-    active.suspended = false;
     active.resumeKvTargetTokens = 0;
     active.replaying = true;
     armNextStateBoundary(active);
@@ -895,7 +898,7 @@ bool Engine::pollRestores(double now) {
     restore.ticket.reset();
     restore.lookup = {};
     discardPendingStateBoundaries(active);
-    if (active.suspended) model_.suspend(id);
+    if (scheduler_.suspended(id)) model_.suspend(id);
     else model_.end(id);
     cache_.endRequest(id);
     active.stateCell.reset();
@@ -1010,7 +1013,7 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   for (const auto &[id, peer] : requests_) {
     // A request finalized earlier in this admission pass is still listed
     // until the pass ends. A request that ignores the cache uses no junction.
-    if (id == active.request.id || peer.stateCell || peer.suspended ||
+    if (id == active.request.id || peer.stateCell || scheduler_.suspended(id) ||
         peer.finalized || peer.skipCache ||
         peer.request.priority < active.request.priority)
       continue;
@@ -1298,7 +1301,8 @@ Engine::Request *Engine::laneToYield() {
     if (phase != Phase::Prefill && phase != Phase::Decode)
       continue;
     if (!yielding || yieldsBefore(candidate, *yielding) ||
-        (!yieldsBefore(*yielding, candidate) && candidate.sequence > yielding->sequence))
+        (!yieldsBefore(*yielding, candidate) &&
+         scheduler_.submissionOrder(id) > scheduler_.submissionOrder(yielding->request.id)))
       yielding = &candidate;
   }
   return yielding;
@@ -1479,7 +1483,7 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
 
 void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFailure failure,
                          StateFailure reason, double now) {
-  if (!active.stateCell || active.suspended) {
+  if (!active.stateCell || scheduler_.suspended(active.request.id)) {
     throw std::logic_error("request cannot be suspended");
   }
   if (!active.stateBoundaries.empty()) {
@@ -1489,7 +1493,6 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   model_.suspend(active.request.id);
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
-  active.suspended = true;
   active.resumeKvTargetTokens = workEnd;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
@@ -1789,7 +1792,7 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 void Engine::release(Request &active) {
   active.resourceWait = {};
   active.maskRequestedMilliseconds.reset();
-  if (active.stateCell || active.suspended) {
+  if (active.stateCell || scheduler_.suspended(active.request.id)) {
     // A resident lane gives its memory back: what failed for want of it may
     // fit now, so the recovery drain ends and the next attempt finds out.
     if (active.stateCell)
@@ -1798,7 +1801,6 @@ void Engine::release(Request &active) {
     model_.end(active.request.id);
     cache_.endRequest(active.request.id);
     active.stateCell.reset();
-    active.suspended = false;
     signalResourceProgress();
   }
   // Every end comes here; this request's use of its replay point ends,

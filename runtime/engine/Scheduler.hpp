@@ -28,7 +28,9 @@ struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
   BatchCohort cohort = BatchCohort::Greedy;
-  uint32_t promptTokens = 0;
+  // Tokens to prefill: the prompt, and after resumeFromResources the
+  // replayed history.
+  uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
 };
 
@@ -105,6 +107,12 @@ public:
                 double wallMilliseconds, bool representativePrefillTiming);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
+  // Suspended by suspendForResources and not resumed since; a terminal
+  // phase keeps it until remove(), so the engine can end the request's
+  // continuation.
+  [[nodiscard]] bool suspended(uint64_t requestId) const;
+  // The request's place in submission order.
+  [[nodiscard]] uint64_t submissionOrder(uint64_t requestId) const;
   [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
 
@@ -116,7 +124,7 @@ private:
     std::optional<uint32_t> prefillBoundary;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
-    bool suspendedForResources = false;
+    bool suspended = false;
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
