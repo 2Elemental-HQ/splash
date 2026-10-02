@@ -119,6 +119,21 @@ SAMPLING_NUMBERS = {
     ),
     "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
 }
+# top_k's default, from Qwen's generation config as temperature's and top_p's
+# are. With it, the table covers every sampling option the frame carries.
+TOP_K_DEFAULT = 20
+assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
+
+
+def _drop_nulls(body, extras):
+    """The body without the null values of the sampling options and of the
+    endpoint's other nullable fields, which then take their defaults."""
+    nullable = {*wire.SAMPLING_FIELDS, *extras}
+    return {
+        key: value
+        for key, value in body.items()
+        if value is not None or key not in nullable
+    }
 
 
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
@@ -541,26 +556,9 @@ class Frontend:
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
-            nullable = {
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "n",
-                "best_of",
-                "presence_penalty",
-                "frequency_penalty",
-                "repetition_penalty",
-                "max_tokens",
-                "suffix",
-                "echo",
-                "logprobs",
-            }
-            body = {
-                key: value
-                for key, value in body.items()
-                if value is not None or key not in nullable
-            }
+            body = _drop_nulls(
+                body, ("n", "best_of", "max_tokens", "suffix", "echo", "logprobs")
+            )
             if not self.accepts_model(body.get("model", self.model)):
                 raise APIError(
                     404, f"model {body['model']} not found", "model_not_found"
@@ -990,25 +988,16 @@ class Frontend:
         output_field=None,
         clamp_output_budget=False,
     ):
-        nullable = {
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "n",
-            "presence_penalty",
-            "frequency_penalty",
-            "repetition_penalty",
-            "max_tokens",
-            "max_completion_tokens",
-            "stream",
-            "parallel_tool_calls",
-        }
-        body = {
-            key: value
-            for key, value in body.items()
-            if value is not None or key not in nullable
-        }
+        body = _drop_nulls(
+            body,
+            (
+                "n",
+                "max_tokens",
+                "max_completion_tokens",
+                "stream",
+                "parallel_tool_calls",
+            ),
+        )
         prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
         options = self._generation_options(body)
         n = body.get("n", 1)
@@ -1133,7 +1122,7 @@ class Frontend:
         # A top_k of 0 or -1 keeps every token, which the frame says with 0. A
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
-        top_k = body.get("top_k", 20)
+        top_k = body.get("top_k", TOP_K_DEFAULT)
         if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
             raise APIError(
                 400, "top_k must be 0 or -1 (disabled) or a positive integer"

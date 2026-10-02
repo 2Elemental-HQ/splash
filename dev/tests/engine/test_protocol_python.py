@@ -6,9 +6,11 @@ import struct
 import subprocess
 import tempfile
 import textwrap
+import tracemalloc
 import unittest
-from dataclasses import replace
+from dataclasses import astuple, replace
 from pathlib import Path
+from unittest import mock
 
 from server import protocol as p
 
@@ -539,6 +541,35 @@ class ProtocolPythonTests(unittest.TestCase):
                         parse_all(bytes(mutated))[0]
                     ),
                 )
+        # The kernels divide by a sampling temperature, and Metal flushes a
+        # subnormal one to zero; one that rounds to zero in float32 is greedy.
+        temperature_offset = p.FRAME_HEADER_BYTES + OFFSET["temperature"]
+        for value in (1e-40, float.fromhex("0x1.fffffcp-127")):
+            with self.subTest(temperature=value):
+                invalid = replace(
+                    request, sampling=replace(request.sampling, temperature=value)
+                )
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_SAMPLING,
+                    lambda invalid=invalid: p.serialize_message(invalid),
+                )
+                mutated = bytearray(wire)
+                struct.pack_into("<f", mutated, temperature_offset, value)
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_SAMPLING,
+                    lambda mutated=mutated: p.decode_frame(
+                        parse_all(bytes(mutated))[0]
+                    ),
+                )
+        for value in (float.fromhex("0x1p-126"), 1e-46):
+            with self.subTest(temperature=value):
+                valid = replace(
+                    request, sampling=replace(request.sampling, temperature=value)
+                )
+                decoded = p.decode_frame(parse_all(p.serialize_message(valid))[0])
+                self.assertEqual(decoded.sampling.temperature, f32(value))
         # The limits, and any top_k, 0 keeping every token.
         for limit in (
             p.SamplingParameters(f32(0.8), f32(0.95), 32, -2.0, 2.0, 2.0**-149, 0.0),
@@ -561,6 +592,67 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_SAMPLING,
                     lambda invalid=invalid: p.serialize_message(invalid),
                 )
+
+    def test_request_frame_copies_pixels_once(self):
+        span = p.ImageSpan(1, 56 * 48, 112, 96, 1, 2)
+        request = replace(
+            example_request(),
+            prompt_tokens=tuple(range(span.tokens + 2)),
+            image_spans=(span,),
+            image_pixels=bytes(range(256)) * (span.pixel_bytes // 256),
+        )
+        tracemalloc.start()
+        try:
+            frame = p.serialize_message(request)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLessEqual(peak, len(frame) + 1024 * 1024)
+        payload = (
+            struct.pack(
+                p._REQUEST.format,
+                request.request_id,
+                int(request.priority),
+                int(request.constraint),
+                request.absolute_deadline_unix_micros,
+                request.remaining_deadline_micros,
+                request.logical_max_output_tokens,
+                len(request.prompt_tokens),
+                len(request.image_spans),
+                *astuple(request.sampling),
+                request.seed,
+                request.return_progress,
+                len(request.score_tokens),
+                request.generation_prompt_tokens,
+                int(request.flags),
+            )
+            + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
+            + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
+            + request.image_pixels
+        )
+        header = struct.pack(
+            p._HEADER.format,
+            b"SPLH",
+            p.PROTOCOL_VERSION,
+            p.FRAME_HEADER_BYTES,
+            int(p.FrameType.REQUEST),
+            0,
+            len(payload),
+            0,
+        )
+        self.assertEqual(frame, header + payload)
+
+    def test_request_validation_runs_once(self):
+        labels = []
+        words = p._words
+
+        def counted(values, label):
+            labels.append(label)
+            return words(values, label)
+
+        with mock.patch.object(p, "_words", counted):
+            p.serialize_message(example_score_request())
+        self.assertEqual(sorted(labels), ["prompt tokens", "score tokens"])
 
     def test_score_request_rejects_generation_combinations(self):
         base = example_score_request()

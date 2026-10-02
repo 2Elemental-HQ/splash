@@ -922,7 +922,7 @@ class MultiplexedRuntime:
 
     def _write_bytes(
         self,
-        encoded: bytes,
+        encoded: bytes | bytearray,
         generation: int,
         *,
         call: RuntimeCall | None = None,

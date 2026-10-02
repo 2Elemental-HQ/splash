@@ -9,7 +9,7 @@ import array
 import math
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
@@ -21,6 +21,9 @@ STATUS_SCHEMA_VERSION = 6
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
+# Patches per image, the most the vision encoder takes; the server's pixel
+# cap may allow fewer.
+MAX_IMAGE_PATCHES = 16384
 ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 _MAGIC = b"SPLH"
@@ -149,7 +152,6 @@ class ProtocolLimits:
     max_token_batch: int = 4096
     max_simulation_tokens: int = 32
     max_image_spans: int = 64
-    max_image_patches: int = 16384
     max_mask_words: int = 1 << 20
 
 
@@ -188,6 +190,12 @@ class SamplingParameters:
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
     min_p: float = 0.0
+
+
+# The sampling options a request names, in the frame's order.
+SAMPLING_FIELDS: tuple[str, ...] = tuple(
+    field.name for field in fields(SamplingParameters)
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -445,6 +453,12 @@ def _sampling_values(sampling: SamplingParameters) -> tuple:
     )
 
 
+_NEUTRAL_SAMPLING = _sampling_values(SamplingParameters())
+# A sampling temperature is 0 or a normal float32: the kernels divide by it,
+# and Metal flushes a subnormal one to zero.
+_FLOAT32_MIN = float.fromhex("0x1p-126")
+
+
 def _enum_value(value: object, enum_type: type[IntEnum], label: str) -> IntEnum:
     if isinstance(value, bool):
         raise ValueError(f"{label} is not defined by native protocol")
@@ -460,18 +474,19 @@ def _bytes(value: object, label: str) -> bytes:
     return value
 
 
-def _words(values: object, label: str) -> tuple[int, ...]:
+def _words(values: object, label: str) -> array.array:
+    """A tuple of uint32 words, packed as the frame carries them."""
     if type(values) is not tuple:
         raise ValueError(f"{label} must be a tuple of uint32 values")
-    # Prompts run to a million words, so accept the common valid case in C.
-    # Anything else falls through to the per-word check for its exact error.
-    if (
-        set(map(type, values)) == {int}
-        and min(values) >= 0
-        and max(values) <= 0xFFFFFFFF
-    ):
-        return values
-    return tuple(_u32(value, f"{label} element") for value in values)
+    # Prompts run to a million words, so accept the common valid case in C:
+    # the array refuses an int outside uint32. Anything else falls through to
+    # the per-word check for its exact error.
+    if set(map(type, values)) == {int}:
+        try:
+            return array.array("I", values)
+        except OverflowError:
+            pass
+    return array.array("I", (_u32(value, f"{label} element") for value in values))
 
 
 def _limits_issue(limits: ProtocolLimits) -> ProtocolIssue | None:
@@ -486,7 +501,6 @@ def _limits_issue(limits: ProtocolLimits) -> ProtocolIssue | None:
             _u32(limits.max_simulation_tokens, "max simulation tokens"),
             _u32(limits.max_mask_words, "max mask words"),
             _u32(limits.max_image_spans, "max image spans"),
-            _u32(limits.max_image_patches, "max image patches"),
         )
     except (AttributeError, ValueError) as error:
         return _issue(
@@ -594,12 +608,6 @@ def _payload_length_issue(
     return None
 
 
-def _pack_words(values: tuple[int, ...]) -> bytes:
-    if not values:
-        return b""
-    return array.array("I", values).tobytes()
-
-
 def _unpack_words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
     if len(payload) - offset != count * 4:
         raise ValueError("word count does not match binary payload")
@@ -647,7 +655,7 @@ def _score_logits(values: object, label: str) -> tuple[float, ...]:
     return logits
 
 
-def _image_spans_check(request: RequestFrame, prompt_tokens: int, limits) -> None:
+def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
     previous_end = 0
     pixel_bytes = 0
     for span in request.image_spans:
@@ -662,7 +670,7 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int, limits) -> Non
             or grid_width < 2
             or grid_height % 2
             or grid_width % 2
-            or grid_height * grid_width > limits.max_image_patches
+            or grid_height * grid_width > MAX_IMAGE_PATCHES
         ):
             raise ValueError("image grid must be even-sided and within the patch limit")
         if tokens != (grid_height // 2) * (grid_width // 2):
@@ -677,16 +685,19 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int, limits) -> Non
         raise ValueError("image pixels do not match the image grids")
 
 
-def _request_issue(
+def _validated_request(
     request: RequestFrame, limits: ProtocolLimits
-) -> ProtocolIssue | None:
+) -> tuple[array.array, array.array, tuple]:
+    """The request's prompt and score words as uint32 arrays and its float32
+    sampling block, each checked once; raises a ProtocolError with the first
+    rule the request breaks."""
     request_id = request.request_id if type(request.request_id) is int else 0
     try:
         request_id = _u64(request.request_id, "request id")
         if not request_id:
             raise ValueError("request id must be non-zero")
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_REQUEST_ID,
             str(error),
@@ -706,7 +717,7 @@ def _request_issue(
         if flags & ~_REQUEST_FLAG_BITS:
             raise ValueError("request flags are not defined by native protocol")
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_ENUM_VALUE,
             str(error),
@@ -718,7 +729,7 @@ def _request_issue(
         if not absolute or not remaining:
             raise ValueError("absolute and remaining deadlines must be non-zero")
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_DEADLINE,
             str(error),
@@ -730,7 +741,7 @@ def _request_issue(
         scores = _words(request.score_tokens, "score tokens")
         if scores:
             if output_tokens:
-                return _issue(
+                _fail(
                     FailureClass.REQUEST_ERROR,
                     IssueCode.INVALID_COUNT,
                     "score requests must not generate output tokens",
@@ -743,14 +754,14 @@ def _request_issue(
         if len(request.image_spans) > limits.max_image_spans:
             raise ValueError("image span count exceeds its limit")
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.LIMIT_EXCEEDED,
             str(error),
             request_id,
         )
     try:
-        _image_spans_check(request, len(prompt), limits)
+        _image_spans_check(request, len(prompt))
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
@@ -766,7 +777,7 @@ def _request_issue(
                 "distinct option tokens"
             )
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_COUNT,
             str(error),
@@ -776,14 +787,14 @@ def _request_issue(
         sampling = _sampling_values(request.sampling)
         temperature, top_p, _, presence, frequency, repetition, min_p = sampling
         if (
-            not math.isfinite(temperature)
-            or temperature < 0.0
+            not (temperature == 0.0 or _FLOAT32_MIN <= temperature < math.inf)
             or not math.isfinite(top_p)
             or not 0.0 < top_p <= 1.0
             or not 0.0 <= min_p <= 1.0
         ):
             raise ValueError(
-                "sampling requires temperature>=0, top_p in (0,1] and min_p in [0,1]"
+                "sampling requires temperature 0 or at least FLT_MIN, top_p in "
+                "(0,1] and min_p in [0,1]"
             )
         if (
             not abs(presence) <= 2.0
@@ -795,17 +806,17 @@ def _request_issue(
                 "sampling requires presence and frequency penalties in "
                 "[-2,2] and a positive repetition penalty"
             )
-        if scores and sampling != _sampling_values(SamplingParameters()):
+        if scores and sampling != _NEUTRAL_SAMPLING:
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_SAMPLING,
             str(error),
             request_id,
         )
     if scores and constraint is not ConstraintMode.NONE:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_CONSTRAINT,
             "score requests do not accept output constraints",
@@ -815,7 +826,7 @@ def _request_issue(
     if flags & RequestFlag.IGNORE_END_OF_SEQUENCE and (
         scores or constraint is not ConstraintMode.NONE
     ):
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_CONSTRAINT,
             "only unconstrained generation can ignore end-of-sequence",
@@ -824,13 +835,13 @@ def _request_issue(
     try:
         _u64(request.seed, "seed")
     except ValueError as error:
-        return _issue(
+        _fail(
             FailureClass.REQUEST_ERROR,
             IssueCode.INTEGER_OVERFLOW,
             str(error),
             request_id,
         )
-    return None
+    return prompt, scores, sampling
 
 
 def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
@@ -856,7 +867,7 @@ def _mask_payload(values):
         if len(values) % 4:
             raise ValueError("mask bytes must contain complete uint32 words")
         return values
-    return _pack_words(_words(values, "mask words"))
+    return _words(values, "mask words").tobytes()
 
 
 def _mask_response_issue(
@@ -1122,51 +1133,79 @@ def _raise_issue(issue: ProtocolIssue | None) -> None:
         raise ProtocolError(issue)
 
 
+def _request_frame(request: RequestFrame, limits: ProtocolLimits) -> bytearray:
+    """The whole request frame, header included, in one buffer that each part
+    is copied into once: image pixels run to hundreds of MiB."""
+    _check_limits(limits)
+    prompt, scores, sampling = _validated_request(request, limits)
+    prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
+    spans_offset = prompt_offset + 4 * len(prompt)
+    pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
+    scores_offset = pixels_offset + len(request.image_pixels)
+    payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
+    if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes, limits):
+        _fail(FailureClass.REQUEST_ERROR, issue.code, issue.message, request.request_id)
+    frame = bytearray(FRAME_HEADER_BYTES + payload_bytes)
+    _HEADER.pack_into(
+        frame,
+        0,
+        _MAGIC,
+        PROTOCOL_VERSION,
+        FRAME_HEADER_BYTES,
+        int(FrameType.REQUEST),
+        0,
+        payload_bytes,
+        0,
+    )
+    _REQUEST.pack_into(
+        frame,
+        FRAME_HEADER_BYTES,
+        request.request_id,
+        int(request.priority),
+        int(request.constraint),
+        request.absolute_deadline_unix_micros,
+        request.remaining_deadline_micros,
+        request.logical_max_output_tokens,
+        len(request.prompt_tokens),
+        len(request.image_spans),
+        *sampling,
+        request.seed,
+        request.return_progress,
+        len(request.score_tokens),
+        request.generation_prompt_tokens,
+        request.flags,
+    )
+    for index, span in enumerate(request.image_spans):
+        _IMAGE_SPAN.pack_into(
+            frame,
+            spans_offset + index * _IMAGE_SPAN.size,
+            span.offset,
+            span.tokens,
+            span.grid_height,
+            span.grid_width,
+            span.digest_lo,
+            span.digest_hi,
+        )
+    # A bytearray copies a slice assignment's source first; its view does not.
+    with memoryview(frame) as view:
+        view[prompt_offset:spans_offset] = memoryview(prompt).cast("B")
+        view[pixels_offset:scores_offset] = request.image_pixels
+        view[scores_offset:] = memoryview(scores).cast("B")
+    return frame
+
+
 def _encode_message(
     message: Message, limits: ProtocolLimits = ProtocolLimits()
 ) -> Frame:
+    if isinstance(message, RequestFrame):
+        frame = _request_frame(message, limits)
+        return Frame(
+            FrameType.REQUEST, memoryview(frame)[FRAME_HEADER_BYTES:].tobytes()
+        )
     _check_limits(limits)
     frame_type: FrameType
     payload: bytes
-    if isinstance(message, RequestFrame):
-        _raise_issue(_request_issue(message, limits))
-        prompt = _words(message.prompt_tokens, "prompt tokens")
-        scores = _words(message.score_tokens, "score tokens")
-        sampling = _sampling_values(message.sampling)
-        payload = (
-            _REQUEST.pack(
-                message.request_id,
-                int(message.priority),
-                int(message.constraint),
-                message.absolute_deadline_unix_micros,
-                message.remaining_deadline_micros,
-                message.logical_max_output_tokens,
-                len(prompt),
-                len(message.image_spans),
-                *sampling,
-                message.seed,
-                message.return_progress,
-                len(scores),
-                message.generation_prompt_tokens,
-                message.flags,
-            )
-            + _pack_words(prompt)
-            + b"".join(
-                _IMAGE_SPAN.pack(
-                    span.offset,
-                    span.tokens,
-                    span.grid_height,
-                    span.grid_width,
-                    span.digest_lo,
-                    span.digest_hi,
-                )
-                for span in message.image_spans
-            )
-            + bytes(message.image_pixels)
-            + _pack_words(scores)
-        )
-        frame_type = FrameType.REQUEST
-    elif isinstance(message, CancelFrame):
+    if isinstance(message, CancelFrame):
         _raise_issue(_cancel_issue(message))
         payload = _CANCEL.pack(message.request_id)
         frame_type = FrameType.CANCEL
@@ -1219,21 +1258,25 @@ def _encode_message(
     elif isinstance(message, TokensEvent):
         _raise_issue(_tokens_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
         tokens = _words(message.tokens, "tokens")
-        payload = _TOKENS.pack(
-            message.request_id, message.sequence_offset, len(tokens)
-        ) + _pack_words(tokens)
+        payload = (
+            _TOKENS.pack(message.request_id, message.sequence_offset, len(tokens))
+            + tokens.tobytes()
+        )
         frame_type = FrameType.TOKENS
     elif isinstance(message, MaskRequestEvent):
         _raise_issue(
             _mask_request_issue(message, limits, FailureClass.ENGINE_UNHEALTHY)
         )
         tokens = _words(message.simulation_tokens, "simulation tokens")
-        payload = _MASK_REQUEST.pack(
-            message.request_id,
-            message.mask_request_id,
-            message.words_per_mask,
-            len(tokens),
-        ) + _pack_words(tokens)
+        payload = (
+            _MASK_REQUEST.pack(
+                message.request_id,
+                message.mask_request_id,
+                message.words_per_mask,
+                len(tokens),
+            )
+            + tokens.tobytes()
+        )
         frame_type = FrameType.MASK_REQUEST
     elif isinstance(message, DoneEvent):
         _raise_issue(_done_issue(message, FailureClass.ENGINE_UNHEALTHY))
@@ -1281,7 +1324,6 @@ def _encode_message(
 
     if issue := _payload_length_issue(frame_type, len(payload), limits):
         client = frame_type in {
-            FrameType.REQUEST,
             FrameType.CANCEL,
             FrameType.MASK_RESPONSE,
             FrameType.STATUS_REQUEST,
@@ -1361,8 +1403,17 @@ def serialize_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> 
 def serialize_message(
     message: Message,
     limits: ProtocolLimits = ProtocolLimits(),
-) -> bytes:
-    return serialize_frame(encode_message(message, limits), limits)
+) -> bytes | bytearray:
+    """Validate and serialize one typed message as a whole frame. A request
+    frame is built in place, so its image pixels are copied once."""
+    if not isinstance(message, RequestFrame):
+        return serialize_frame(encode_message(message, limits), limits)
+    try:
+        return _request_frame(message, limits)
+    except MemoryError as error:
+        raise ProtocolError(
+            _allocation_issue("allocation failed while serializing a request frame")
+        ) from error
 
 
 def refresh_request_deadline(frame: bytes, now_unix_micros: int) -> bytes:
@@ -1514,7 +1565,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         generation_prompt_tokens,
         RequestFlag(flags),
     )
-    _raise_issue(_request_issue(request, limits))
+    _validated_request(request, limits)
     return request
 
 

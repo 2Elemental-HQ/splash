@@ -6531,16 +6531,43 @@ class ServerTest(unittest.TestCase):
                 )
                 self.assertEqual(runtime.requests, [])
 
+    def test_sampling_field_lists_follow_the_wire_dataclass(self):
+        self.assertEqual(
+            set(request_frontend.SAMPLING_NUMBERS) | {"top_k"},
+            set(native_wire.SAMPLING_FIELDS),
+        )
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            self.body(**dict.fromkeys(native_wire.SAMPLING_FIELDS)),
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            runtime.requests[0].sampling,
+            native_wire.SamplingParameters(
+                temperature=1.0,
+                top_p=0.95,
+                top_k=request_frontend.TOP_K_DEFAULT,
+            ),
+        )
+
     def test_responses_forward_the_sampling_fields_chat_validates(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
+        # A value apart from its default for every sampling option the frame
+        # carries.
         fields = {
-            "top_k": 20,
+            "temperature": 0.5,
+            "top_p": 0.5,
+            "top_k": 5,
             "presence_penalty": 1.5,
             "frequency_penalty": 0.5,
             "repetition_penalty": 1.05,
             "min_p": 0.25,
         }
+        self.assertEqual(tuple(fields), native_wire.SAMPLING_FIELDS)
         status, _, payload = harness.request(
             "POST", "/v1/responses", self.responses_body(store=False, **fields)
         )
