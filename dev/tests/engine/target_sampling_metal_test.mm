@@ -1767,6 +1767,13 @@ void extremeSearches(MetalBackend &backend) {
     return fastest;
   };
   const double ordinary = run({1000, 1.0F, 1.0F, false});
+  // The default request and Qwen's recommended non-thinking sampling, timed
+  // beside it.
+  for (const SamplingPolicy &policy : {SamplingPolicy{20, 1.0F, 0.95F, false},
+                                       SamplingPolicy{20, 0.7F, 0.8F, false}})
+    std::cout << "sampling search top_k 20 temperature " << policy.temperature
+              << " top_p " << policy.topP << ": " << run(policy) * 1e3
+              << " ms, ordinary " << ordinary * 1e3 << " ms\n";
   constexpr uint32_t kTail = vocabulary - 2000;
   struct Case final {
     const char *name;
