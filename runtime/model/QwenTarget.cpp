@@ -220,7 +220,6 @@ struct QwenTarget::VerifyStep {
   std::span<const kv::ChunkedPrefillParams> chunks;
   uint32_t lanes;
   uint32_t rows;
-  ops::LinearDispatchStats &stats;
   ops::VerifyAttentionPlan attention;
   std::optional<ops::MoePlan> moe{};
   uint32_t gdnLayer = 0;
@@ -386,8 +385,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
     std::span<const SplashKvLayer> kvLayers,
-    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
-    ops::LinearDispatchStats &stats) const {
+    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
@@ -402,7 +400,7 @@ void QwenTarget::addVerify(
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> histories{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
     histories[lane] = chunks[lane].committed_tokens;
-  VerifyStep step{graph, buffers, kvLayers, chunks, lanes, rows, stats,
+  VerifyStep step{graph, buffers, kvLayers, chunks, lanes, rows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
@@ -420,7 +418,7 @@ void QwenTarget::addVerify(
     requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   }, weights_);
   addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, lanes,
-               buffers.linearScratch, stats);
+               buffers.linearScratch);
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -433,7 +431,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
       linear.decodePlan(mixer.inputProjection, step.lanes).input());
   linear.addDecodeBatch(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked[layer], step.lanes,
-                        step.stats, b.linearScratch, normalized);
+                        b.linearScratch, normalized);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
@@ -445,7 +443,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
       mixer.outputHeadOrder,
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual).input());
   linear.addResidualBatch(step.graph, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput, step.lanes,
-                          step.stats, b.linearScratch, hidden);
+                          b.linearScratch, hidden);
   return b.gdnOutput;
 }
 
@@ -457,7 +455,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
       linear.decodePlan(mixer.inputProjection, step.lanes).input());
-  linear.addDecodeBatch(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, step.stats,
+  linear.addDecodeBatch(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes,
                         b.linearScratch, normalized);
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
@@ -471,7 +469,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
       geometry_.kvLayout, step.lanes, b.linearScratch,
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual).input());
   linear.addResidualBatch(step.graph, b.attentionHidden, mixer.outputProjection, input, b.attentionOutput,
-                          step.lanes, step.stats, b.linearScratch, hidden);
+                          step.lanes, b.linearScratch, hidden);
   return b.attentionOutput;
 }
 
@@ -484,9 +482,9 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer
       b.linearScratch,
       linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp, &layer.gateProjection).input());
   linear.addGateUpBatch(step.graph, b.normalized, layer.gateProjection, layer.upProjection, b.denseGateScratch,
-                        b.denseIntermediate, step.lanes, step.stats, b.linearScratch, normalized);
+                        b.denseIntermediate, step.lanes, b.linearScratch, normalized);
   linear.addResidualBatch(step.graph, b.denseIntermediate, layer.downProjection, residual, output, step.lanes,
-                          step.stats, b.linearScratch);
+                          b.linearScratch);
 }
 
 void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
@@ -499,13 +497,13 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &la
 
 void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                               metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
-                              ops::LinearScratch scratch, ops::LinearDispatchStats &stats) const {
+                              ops::LinearScratch scratch) const {
   const ops::Linear &linear = operators_.linear();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       graph, std::move(hidden), weightsBase_.finalNorm, finalHidden, geometry_.hiddenSize,
       lanes * ExecutionLimits::targetVerifyRows, scratch, linear.decodePlan(vocabularyProjection(), lanes).input());
-  linear.addDecodeBatch(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, stats,
-                        scratch, normalized);
+  linear.addDecodeBatch(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
+                        normalized);
 }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph,

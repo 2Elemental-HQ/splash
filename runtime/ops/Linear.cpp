@@ -430,14 +430,6 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
       .storageRows();
 }
 
-void Linear::account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispatches) noexcept {
-  if (lanes == 1) return;
-  stats.fusedSourceOperations += uint64_t{lanes} * dispatches;
-  if (lanes == 2) stats.m16Dispatches += dispatches;
-  else if (lanes == 3) stats.m24Dispatches += dispatches;
-  else stats.m32Dispatches += dispatches;
-}
-
 // GPU family selects variants; core count and workload tile counts determine
 // parallelism.
 LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
@@ -546,8 +538,7 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
 
 
 PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
-    const Projection &p, const LinearPlan &selected, const Projection *gate,
-    LinearDispatchStats *stats) const {
+    const Projection &p, const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
   if (p.layout() != w.weightLayout || (gate && gate->layout() != w.weightLayout))
@@ -568,7 +559,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireBytes(b.scratch.counters, scratch.counters, "counters");
   if (p.layout() == WeightLayout::Block32) {
     if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
-    addGguf(graph, b, p, selected, gate, stats);
+    addGguf(graph, b, p, selected, gate);
     // A rotated projection's plan prepares its table, if any, from the
     // rotated rows, which no other plan reads.
     if (p.rotation) return {};
@@ -595,7 +586,6 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
         Q4Params{n, k},
         {selected.groups(), selected.configuration().splits, w.rows / SPLASH_TARGET_VERIFY_ROWS},
         {128, 1, 1});
-    if (stats) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
     return {b.input, LinearInput::Table64};
   }
   const auto dispatch = [&](std::string_view name,
@@ -645,8 +635,6 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   } else if (prefill)
     dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output, b.sums});
   else dispatch(selected.pipeline(), {b.input, weights.weights, weights.scales, weights.biases, b.output});
-  if (stats && !prefill)
-    account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, selected.secondPipeline().empty() ? 1 : 2);
   return b.prepared;
 }
 
@@ -685,27 +673,26 @@ PreparedInput Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer i
   return add(graph, {.input = input, .output = output, .scratch = scratch}, p, decodePlan(p, 1));
 }
 PreparedInput Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                                     metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
-                                     LinearScratch scratch, PreparedInput prepared) const {
+                                     metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch,
+                                     PreparedInput prepared) const {
   return add(graph, {.input = input, .output = output, .scratch = scratch, .prepared = prepared}, p,
-             decodePlan(p, lanes), nullptr, &stats);
+             decodePlan(p, lanes));
 }
 PreparedInput Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t lanes,
-                                       LinearDispatchStats &stats, LinearScratch scratch,
-                                       PreparedInput prepared) const {
+                                       LinearScratch scratch, PreparedInput prepared) const {
   return add(graph,
              {.input = input, .output = output, .residual = residual, .scratch = scratch, .prepared = prepared},
-             p, decodePlan(p, lanes, LinearEpilogue::Residual), nullptr, &stats);
+             p, decodePlan(p, lanes, LinearEpilogue::Residual));
 }
 PreparedInput Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
                                      const Projection &up, metal::MetalBuffer gateScratch,
-                                     metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
-                                     LinearScratch scratch, PreparedInput prepared) const {
+                                     metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch,
+                                     PreparedInput prepared) const {
   return add(graph,
              {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch,
               .prepared = prepared},
-             up, decodePlan(up, lanes, LinearEpilogue::GateUp, &gate), &gate, &stats);
+             up, decodePlan(up, lanes, LinearEpilogue::GateUp, &gate), &gate);
 }
 
 } // namespace splash::ops

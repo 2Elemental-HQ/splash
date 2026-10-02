@@ -201,16 +201,14 @@ public:
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths,
-                 ops::LinearDispatchStats &stats) const;
+                 std::span<const uint32_t> cacheLengths) const;
   void addSelection(metal::CommandGraph &graph,
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
                     std::span<const ops::SamplingPolicy> policies) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions,
-                        ops::LinearDispatchStats &stats) const;
+                        std::span<const uint32_t> startPositions) const;
 
 private:
   const DFlashDraftWeights &weights_;

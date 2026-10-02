@@ -201,13 +201,6 @@ struct LinearBuffers final {
   PreparedInput prepared{};
 };
 
-struct LinearDispatchStats final {
-  uint64_t fusedSourceOperations = 0;
-  uint64_t m16Dispatches = 0;
-  uint64_t m24Dispatches = 0;
-  uint64_t m32Dispatches = 0;
-};
-
 // Missing core metadata uses one intermediate estimate for all families.
 // This is a fallback, not a calibrated optimum. Reported counts always win.
 inline constexpr uint32_t kAssumedGpuCores = 32;
@@ -256,8 +249,7 @@ public:
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
                     const Projection &projection, const LinearPlan &plan,
-                    const Projection *gate = nullptr,
-                    LinearDispatchStats *stats = nullptr) const;
+                    const Projection *gate = nullptr) const;
 
   // The Q4 input sums of `rows` rows an affine prefill projection reads.
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
@@ -279,24 +271,20 @@ public:
                           metal::MetalBuffer output, LinearScratch scratch = {}) const;
   PreparedInput addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
                                const Projection &projection, metal::MetalBuffer output, uint32_t lanes,
-                               LinearDispatchStats &stats, LinearScratch scratch = {},
-                               PreparedInput prepared = {}) const;
+                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
   PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
                                const Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
-                               uint32_t lanes, LinearDispatchStats &stats, LinearScratch scratch = {},
-                               PreparedInput prepared = {}) const;
+                               uint32_t lanes, LinearScratch scratch = {}, PreparedInput prepared = {}) const;
   PreparedInput addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
                                  const Projection &projection, metal::MetalBuffer residual,
-                                 metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
-                                 LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+                                 metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch = {},
+                                 PreparedInput prepared = {}) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it
   // runs.
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload,
                                       std::span<const Projection *const> projections = {}) const;
-  // Counts `dispatches` dispatches that each fuse `lanes` request lanes.
-  static void account(LinearDispatchStats &stats, uint32_t lanes, uint32_t dispatches) noexcept;
   // GGUF policy and dispatch (LinearGguf.cpp). Block plans are not tuned.
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections) const;
@@ -304,7 +292,7 @@ private:
   [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
-               const Projection *gate, LinearDispatchStats *stats) const;
+               const Projection *gate) const;
   void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
                      const Projection &projection, const LinearPlan &plan,
                      const Projection *gate) const;

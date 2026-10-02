@@ -325,8 +325,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              splash::ops::LinearDispatchStats stats;
-              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, lanes, stats, scratch));
+              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, lanes, scratch));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
@@ -366,12 +365,11 @@ int floatOnlyChain(MetalBackend &backend) {
     const MetalBuffer input = bfloatBuffer(backend, activations(rows * K), "chain-input");
     const MetalBuffer scores = zeros(backend, bytes, "chain-scores"), chained = zeros(backend, bytes, "chain-output"),
                       alone = zeros(backend, bytes, "chain-reference");
-    splash::ops::LinearDispatchStats stats;
     CommandGraph graph, reference;
-    const PreparedInput prepared = linear.addDecodeBatch(graph, input, floats, scores, lanes, stats, scratch);
-    static_cast<void>(linear.addDecodeBatch(graph, input, blocks, chained, lanes, stats, scratch, prepared));
+    const PreparedInput prepared = linear.addDecodeBatch(graph, input, floats, scores, lanes, scratch);
+    static_cast<void>(linear.addDecodeBatch(graph, input, blocks, chained, lanes, scratch, prepared));
     static_cast<void>(backend.submitCommand(graph.dispatches()));
-    static_cast<void>(linear.addDecodeBatch(reference, input, blocks, alone, lanes, stats, scratch));
+    static_cast<void>(linear.addDecodeBatch(reference, input, blocks, alone, lanes, scratch));
     static_cast<void>(backend.submitCommand(reference.dispatches()));
     if (std::memcmp(chained.contents(), alone.contents(), bytes)) {
       printf("  float-only projection B%u: a register plan chained after it read another table FAIL\n", lanes);

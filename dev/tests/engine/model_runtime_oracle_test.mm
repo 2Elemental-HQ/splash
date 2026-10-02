@@ -2315,11 +2315,8 @@ int main(int argc, char **argv) {
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
                 !b3Decoded[1].outputTokens.empty() &&
                 !b3Decoded[2].outputTokens.empty() &&
-                b3Telemetry.lastDecodeWidth == 3 &&
-                b3Telemetry.lastDecodeM16Dispatches == 0 &&
-                b3Telemetry.lastDecodeM32Dispatches == 0 &&
-                b3Telemetry.lastDecodeM24Dispatches > 0,
-            "B3 projection graph was decomposed instead of using M24");
+                b3Telemetry.lastDecodeWidth == 3,
+            "B3 decode did not run one three-lane graph");
     for (uint64_t id : b3Ids)
       executor.end(id);
 
@@ -2468,11 +2465,8 @@ int main(int argc, char **argv) {
     const model::ModelTelemetry raggedDecodeTelemetry =
         executor.telemetry();
     require(raggedDecoded.size() == raggedIds.size() &&
-                raggedDecodeTelemetry.lastDecodeWidth == 4 &&
-                raggedDecodeTelemetry.lastDecodeM16Dispatches == 0 &&
-                raggedDecodeTelemetry.lastDecodeM24Dispatches == 0 &&
-                raggedDecodeTelemetry.lastDecodeM32Dispatches > 0,
-            "permuted ragged B4 was decomposed instead of using M32");
+                raggedDecodeTelemetry.lastDecodeWidth == 4,
+            "permuted ragged B4 did not run one four-lane graph");
     for (uint64_t id : raggedIds)
       executor.end(id);
 
@@ -2515,9 +2509,8 @@ int main(int argc, char **argv) {
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
     require(raggedReferenceDecoded.size() == raggedPermutation.size() &&
-                executor.telemetry().lastDecodeWidth == 4 &&
-                executor.telemetry().lastDecodeM32Dispatches > 0,
-            "permuted ragged reference was not one M32 graph");
+                executor.telemetry().lastDecodeWidth == 4,
+            "permuted ragged reference was not one four-lane graph");
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];
       const ModelStepResult &reference = raggedReferenceDecoded[order];
@@ -3399,16 +3392,12 @@ int main(int argc, char **argv) {
         require(!lane.step.outputTokens.empty() && lane.committedTokens > 1,
                 "decode warmup omitted its committed deterministic result");
     }
-    const model::ModelTelemetry fusedTelemetry =
+    const model::ModelTelemetry b4Telemetry =
         executor.telemetry();
-    require(batch4.wallSeconds >= fusedTelemetry.lastDecodeWallSeconds,
+    require(batch4.wallSeconds >= b4Telemetry.lastDecodeWallSeconds,
             "decode warmup excluded production work from phase wall time");
-    require(fusedTelemetry.lastDecodeWidth == 4 &&
-                fusedTelemetry.lastDecodeFusedOperations > 0 &&
-                fusedTelemetry.lastDecodeM16Dispatches == 0 &&
-                fusedTelemetry.lastDecodeM24Dispatches == 0 &&
-                fusedTelemetry.lastDecodeM32Dispatches > 0,
-            "B4 decode did not execute the fused M32 production graph");
+    require(b4Telemetry.lastDecodeWidth == 4,
+            "B4 decode did not execute one four-lane production graph");
     const auto repeatedBatch4 = executor.warmupDecodeBatch(4);
     require(repeatedBatch4.lanes == batch4.lanes,
             "repeated baseline B4 decode changed its deterministic result");
@@ -3416,11 +3405,7 @@ int main(int argc, char **argv) {
               << " b1_cycle_wall_seconds=" << batch1.wallSeconds
               << " b2_cycle_wall_seconds=" << batch2.wallSeconds
               << " b3_cycle_wall_seconds=" << batch3.wallSeconds
-              << " b4_cycle_wall_seconds=" << batch4.wallSeconds
-              << " b4_fused_source_ops="
-              << fusedTelemetry.lastDecodeFusedOperations
-              << " b4_m16=" << fusedTelemetry.lastDecodeM16Dispatches
-              << " b4_m32=" << fusedTelemetry.lastDecodeM32Dispatches << '\n';
+              << " b4_cycle_wall_seconds=" << batch4.wallSeconds << '\n';
     model::WarmupStepResult historical =
         executor.warmupCompositeStateRestore();
     require(historical.wallSeconds > 0.0,

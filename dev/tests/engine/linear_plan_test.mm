@@ -1478,8 +1478,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
       linear.add(graph, {input, b.gateScratch, b.sums, {}, {}, {}}, gate, gatePlan);
     }
     const size_t prepasses = graph.dispatches().size();
-    LinearDispatchStats stats;
-    linear.add(graph, b, p, plan, workload.epilogue == LinearEpilogue::GateUp ? &gate : nullptr, &stats);
+    linear.add(graph, b, p, plan, workload.epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
     const auto &last = graph.dispatches().back();
     require(last.pipelineName == (plan.secondPipeline().empty() ? plan.pipeline() : plan.secondPipeline()),
             "production dispatch differs from Linear plan");
@@ -1488,18 +1487,10 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
                   dispatch.threadsPerThreadgroup.y == 1 && dispatch.threadsPerThreadgroup.z == 1,
               "production dispatch threads differ from Linear plan scope");
     if (workload.phase == LinearPhase::Decode) {
-      const uint32_t lanes = workload.rows / 8;
       const uint32_t dispatches = plan.usesSimdgroup() ? 2 : plan.secondPipeline().empty() ? 1 : 2;
       require(last.threadgroups.x == plan.groups() &&
                   graph.dispatches().size() == dispatches,
               "Linear decode plan/graph geometry mismatch");
-      // These counters describe projection fusion, excluding input preparation.
-      const uint32_t projections = plan.secondPipeline().empty() ? 1 : 2;
-      require(stats.fusedSourceOperations == (lanes == 1 ? 0 : lanes * projections) &&
-                  stats.m16Dispatches == (lanes == 2 ? projections : 0) &&
-                  stats.m24Dispatches == (lanes == 3 ? projections : 0) &&
-                  stats.m32Dispatches == (lanes == 4 ? projections : 0),
-              "Linear dispatch statistics changed");
     } else {
       require(last.threadgroups.x == storageRows / 32 &&
                   last.threadgroups.y == p.outputSize / plan.tileColumns() &&

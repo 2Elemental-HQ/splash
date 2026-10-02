@@ -274,7 +274,7 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
 
 void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
                        const Projection &p, const LinearPlan &plan,
-                       const Projection *gate, LinearDispatchStats *stats) const {
+                       const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const uint32_t k = w.matrix.inputSize;
   requireSegments(p, w.matrix);
@@ -291,7 +291,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     if (!weights.segments.empty()) {
       Projection quantized(p.outputSize, p.inputSize, std::move(weights));
       quantized.rotation = p.rotation;
-      addGguf(graph, b, quantized, plan, gate, stats);
+      addGguf(graph, b, quantized, plan, gate);
     }
     return;
   }
@@ -310,7 +310,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     rotated.prepared = {};
     Projection plain = p;
     plain.rotation = {};
-    addGguf(graph, rotated, plain, plan, gate, stats);
+    addGguf(graph, rotated, plain, plan, gate);
     return;
   }
   switch (plan.configuration().tile) {
@@ -325,7 +325,6 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::Paired256:
   case LinearTile::Simdgroup: break;
   }
-  if (stats && w.phase == LinearPhase::Decode) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
 }
 
 // The staged decode tiles, for decode and prefill chunks of up to 32 rows:
