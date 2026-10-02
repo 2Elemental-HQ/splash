@@ -191,6 +191,27 @@ struct ImageSpanFrame {
   bool operator==(const ImageSpanFrame &) const = default;
 };
 
+// A request payload starts with these fields, at these byte offsets:
+//    0 u64 requestId
+//    8 u8  priority
+//    9 u8  cohort
+//   10 u8  constraint
+//   11 u64 absoluteDeadlineUnixMicros
+//   19 u64 remainingDeadlineMicros
+//   27 u32 logicalMaxOutputTokens
+//   31 u32 prompt token count
+//   35 u32 image span count
+//   39 f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
+//      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP
+//   67 u64 seed
+//   75 u8  returnProgress
+//   76 u32 score token count
+//   80 u32 generationPromptTokens
+//   84 u32 flags
+// then the prompt tokens, the 32-byte image spans, the image pixels and the
+// score tokens.
+inline constexpr uint64_t kRequestFixedBytes = 88;
+
 struct RequestFrame {
   uint64_t requestId = 0;
   RequestPriority priority = RequestPriority::Normal;

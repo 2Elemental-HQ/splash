@@ -1,3 +1,4 @@
+import itertools
 import os
 import random
 import shutil
@@ -33,6 +34,41 @@ STATUS_GOLDEN = (
 INITIAL_MASK_GOLDEN = (
     "53504c4807001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
+)
+
+# The request's fixed fields in wire order, and each one's payload offset.
+REQUEST_FIELDS = (
+    "request_id",
+    "priority",
+    "cohort",
+    "constraint",
+    "absolute_deadline",
+    "remaining_deadline",
+    "max_output",
+    "prompt_count",
+    "image_span_count",
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "min_p",
+    "seed",
+    "return_progress",
+    "score_count",
+    "generation_prompt_tokens",
+    "flags",
+)
+assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
+OFFSET = dict(
+    zip(
+        REQUEST_FIELDS,
+        itertools.accumulate(
+            (struct.calcsize("<" + code) for code in p._REQUEST.format[1:]),
+            initial=0,
+        ),
+    )
 )
 
 CPP_GOLDEN_SOURCE = r"""
@@ -407,7 +443,7 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         frame = p.encode_message(request)
         payload = bytearray(frame.payload)
-        payload[75] = 2
+        payload[OFFSET["return_progress"]] = 2
         with self.assertRaises(p.ProtocolError) as raised:
             p.decode_frame(p.Frame(p.FrameType.REQUEST, bytes(payload)))
         self.assertEqual(
@@ -425,10 +461,15 @@ class ProtocolPythonTests(unittest.TestCase):
         request = example_score_request()
         wire = p.serialize_message(request)
         self.assertEqual(
-            struct.unpack_from("<I", wire, 24 + 76)[0], len(request.score_tokens)
+            struct.unpack_from(
+                "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["score_count"]
+            )[0],
+            len(request.score_tokens),
         )
         self.assertEqual(
-            struct.unpack_from("<3I", wire, 24 + 88 + 4 * 3),
+            struct.unpack_from(
+                "<3I", wire, p.FRAME_HEADER_BYTES + p.REQUEST_FIXED_BYTES + 4 * 3
+            ),
             request.score_tokens,
         )
         self.assertEqual(
@@ -436,7 +477,7 @@ class ProtocolPythonTests(unittest.TestCase):
             request,
         )
         # A wrong score count desynchronizes the tail and must fail closed.
-        bad = mutate_u32(wire, 24 + 76, 2)
+        bad = mutate_u32(wire, p.FRAME_HEADER_BYTES + OFFSET["score_count"], 2)
         self.assert_protocol_error(
             p.FailureClass.REQUEST_ERROR,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -463,7 +504,7 @@ class ProtocolPythonTests(unittest.TestCase):
         request = example_request()
         wire = p.serialize_message(request)
         # presence, frequency, repetition and min_p follow top_k in the frame.
-        offset = p.FRAME_HEADER_BYTES + 51
+        offset = p.FRAME_HEADER_BYTES + OFFSET["presence_penalty"]
         names = ("presence_penalty", "frequency_penalty", "repetition_penalty", "min_p")
         self.assertEqual(
             struct.unpack_from("<4f", wire, offset),
@@ -576,7 +617,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_malformed_score_frames_preserve_request_error_codes(self):
         request = example_score_request()
         payload = p.encode_message(request).payload
-        score_offset = 88 + 4 * len(request.prompt_tokens)
+        score_offset = p.REQUEST_FIXED_BYTES + 4 * len(request.prompt_tokens)
         for tokens, output_tokens in (
             ((101,), 0),
             ((101, 101), 0),
@@ -587,8 +628,8 @@ class ProtocolPythonTests(unittest.TestCase):
                 tokens=tokens[:4], count=len(tokens), output=output_tokens
             ):
                 malformed = bytearray(payload[:score_offset])
-                struct.pack_into("<I", malformed, 27, output_tokens)
-                struct.pack_into("<I", malformed, 76, len(tokens))
+                struct.pack_into("<I", malformed, OFFSET["max_output"], output_tokens)
+                struct.pack_into("<I", malformed, OFFSET["score_count"], len(tokens))
                 malformed.extend(struct.pack(f"<{len(tokens)}I", *tokens))
                 wire = p.serialize_frame(p.Frame(p.FrameType.REQUEST, bytes(malformed)))
                 issue = self.assert_protocol_error(
@@ -603,7 +644,9 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = p.serialize_message(request)
         for count in (p.MAX_SCORE_TOKENS + 1, 1_000_000, 0xFFFFFFFF):
             with self.subTest(count=count):
-                bad = mutate_u32(wire, 24 + 76, count)
+                bad = mutate_u32(
+                    wire, p.FRAME_HEADER_BYTES + OFFSET["score_count"], count
+                )
                 issue = self.assert_protocol_error(
                     p.FailureClass.REQUEST_ERROR,
                     p.IssueCode.INVALID_COUNT,
@@ -720,23 +763,54 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 108, 0),
+            (
+                p.PROTOCOL_VERSION,
+                p.FRAME_HEADER_BYTES,
+                int(p.FrameType.REQUEST),
+                0,
+                p.REQUEST_FIXED_BYTES + 4 * len(request.prompt_tokens),
+                0,
+            ),
         )
-        self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
-        self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
-        self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 0)
         self.assertEqual(
-            struct.unpack_from("<II", wire, 24 + 80),
+            struct.unpack_from("<Q", wire, p.FRAME_HEADER_BYTES)[0], request.request_id
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["prompt_count"]
+            )[0],
+            5,
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["image_span_count"]
+            )[0],
+            0,
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<II", wire, p.FRAME_HEADER_BYTES + OFFSET["generation_prompt_tokens"]
+            ),
             (request.generation_prompt_tokens, request.flags),
         )
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 88), request.prompt_tokens
+            struct.unpack_from(
+                "<5I", wire, p.FRAME_HEADER_BYTES + p.REQUEST_FIXED_BYTES
+            ),
+            request.prompt_tokens,
         )
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 88 + 4 * len(image.prompt_tokens)
-        self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
+        span_offset = (
+            p.FRAME_HEADER_BYTES + p.REQUEST_FIXED_BYTES + 4 * len(image.prompt_tokens)
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["image_span_count"]
+            )[0],
+            1,
+        )
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),
             (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
@@ -749,7 +823,9 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = p.serialize_message(request)
         for tokens in (len(request.prompt_tokens), 0xFFFFFFFF):
             invalid = replace(request, generation_prompt_tokens=tokens)
-            mutated = mutate_u32(wire, 24 + 80, tokens)
+            mutated = mutate_u32(
+                wire, p.FRAME_HEADER_BYTES + OFFSET["generation_prompt_tokens"], tokens
+            )
             for side, check in (
                 ("encode", lambda invalid=invalid: p.serialize_message(invalid)),
                 (
@@ -766,7 +842,9 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_request_flags_follow_the_generation_prompt(self):
         request = example_ignore_eos_request()
         wire = p.serialize_message(request)
-        self.assertEqual(struct.unpack_from("<I", wire, 24 + 84)[0], 1)
+        self.assertEqual(
+            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + OFFSET["flags"])[0], 1
+        )
         decoded = p.decode_frame(parse_all(wire)[0])
         self.assertEqual(decoded, request)
         self.assertIs(type(decoded.flags), p.RequestFlag)
@@ -785,7 +863,7 @@ class ProtocolPythonTests(unittest.TestCase):
         for invalid, code in cases:
             mutated = mutate_u32(
                 p.serialize_message(replace(invalid, flags=p.RequestFlag(0))),
-                24 + 84,
+                p.FRAME_HEADER_BYTES + OFFSET["flags"],
                 int(invalid.flags),
             )
             for side, check in (
@@ -857,7 +935,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 absolute_deadline_unix_micros=now + request.remaining_deadline_micros,
             ),
         )
-        offset = p.FRAME_HEADER_BYTES + 11
+        offset = p.FRAME_HEADER_BYTES + OFFSET["absolute_deadline"]
         self.assertEqual(refreshed[:offset], wire[:offset])
         self.assertEqual(refreshed[offset + 8 :], wire[offset + 8 :])
         saturated = p.refresh_request_deadline(wire, 0xFFFFFFFFFFFFFFFF)
@@ -888,13 +966,19 @@ class ProtocolPythonTests(unittest.TestCase):
         request = example_request()
         wire = bytearray(p.serialize_message(request))
         # Signaling NaNs would be quieted by float32 -> Python float -> float32.
-        struct.pack_into("<II", wire, p.FRAME_HEADER_BYTES + 39, 0x7F800001, 0xFF800001)
+        struct.pack_into(
+            "<II",
+            wire,
+            p.FRAME_HEADER_BYTES + OFFSET["temperature"],
+            0x7F800001,
+            0xFF800001,
+        )
         now = 1_900_000_000_000_000
         expected = bytearray(wire)
         struct.pack_into(
             "<Q",
             expected,
-            p.FRAME_HEADER_BYTES + 11,
+            p.FRAME_HEADER_BYTES + OFFSET["absolute_deadline"],
             now + request.remaining_deadline_micros,
         )
         self.assertEqual(p.refresh_request_deadline(bytes(wire), now), bytes(expected))
@@ -968,7 +1052,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_bad_request_is_recoverable_and_next_frame_remains_aligned(self):
         valid = p.serialize_message(example_request())
         invalid = bytearray(valid)
-        invalid[p.FRAME_HEADER_BYTES + 8] = 0xFF
+        invalid[p.FRAME_HEADER_BYTES + OFFSET["priority"]] = 0xFF
         frames = parse_all(bytes(invalid) + valid)
         self.assertEqual(len(frames), 2)
         self.assert_protocol_error(
@@ -982,23 +1066,29 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = p.serialize_message(example_request())
         cases = (
             (
-                mutate_u32(wire, p.FRAME_HEADER_BYTES + 31, 0xFFFFFFFF),
+                mutate_u32(
+                    wire, p.FRAME_HEADER_BYTES + OFFSET["prompt_count"], 0xFFFFFFFF
+                ),
                 p.FailureClass.REQUEST_ERROR,
                 p.IssueCode.LIMIT_EXCEEDED,
             ),
             (
-                mutate_u64(wire, p.FRAME_HEADER_BYTES + 11, 0),
+                mutate_u64(wire, p.FRAME_HEADER_BYTES + OFFSET["absolute_deadline"], 0),
                 p.FailureClass.REQUEST_ERROR,
                 p.IssueCode.INVALID_DEADLINE,
             ),
             (
-                mutate_u32(wire, p.FRAME_HEADER_BYTES + 39, 0x7FC00000),
+                mutate_u32(
+                    wire, p.FRAME_HEADER_BYTES + OFFSET["temperature"], 0x7FC00000
+                ),
                 p.FailureClass.REQUEST_ERROR,
                 p.IssueCode.INVALID_SAMPLING,
             ),
         )
         constraint = bytearray(wire)
-        constraint[p.FRAME_HEADER_BYTES + 10] = int(p.ConstraintMode.NONE)
+        constraint[p.FRAME_HEADER_BYTES + OFFSET["constraint"]] = int(
+            p.ConstraintMode.NONE
+        )
         cases += (
             (
                 bytes(constraint),
@@ -1169,7 +1259,7 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(issue.code, p.IssueCode.TRUNCATED_FRAME)
 
         enormous = mutate_u64(valid, 12, 0xFFFFFFFFFFFFFFFF)
-        issue = parser_issue(enormous[:24])
+        issue = parser_issue(enormous[: p.FRAME_HEADER_BYTES])
         self.assertEqual(issue.code, p.IssueCode.FRAME_TOO_LARGE)
 
     def test_random_malformed_inputs_and_valid_frame_mutations_do_not_crash(self):

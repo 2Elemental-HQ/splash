@@ -269,12 +269,15 @@ def send_success(process, call, *, slot=0, tokens=(10, 11, 12)):
     )
 
 
+READY_STATUS = b'{"schema_version":%d,"ready":true}' % wire.STATUS_SCHEMA_VERSION
+
+
 def answer_status(process, message):
     process.send(
         wire.StatusJsonEvent(
             message.correlation_id,
             wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":4,"ready":true}',
+            READY_STATUS,
         )
     )
 
@@ -1117,13 +1120,13 @@ class RuntimeTests(unittest.TestCase):
             wire.StatusJsonEvent(
                 first.correlation_id,
                 wire.STATUS_SCHEMA_VERSION,
-                b'{"schema_version":4,"late":true}',
+                b'{"schema_version":%d,"late":true}' % wire.STATUS_SCHEMA_VERSION,
             )
         )
         respond.set()
         status = runtime.status(timeout=1.0)
         self.assertNotEqual(status.correlation_id, first.correlation_id)
-        self.assertEqual(status.json, b'{"schema_version":4,"ready":true}')
+        self.assertEqual(status.json, READY_STATUS)
         self.assertEqual(runtime.last_status, status)
         self.assertTrue(runtime.ready)
 
