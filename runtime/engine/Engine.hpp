@@ -102,9 +102,10 @@ public:
   // in flight. Reclaim order follows ownership and preserves reusable
   // prefixes for as long as possible: idle model state, empty KV extents,
   // disposable checkpoints, then ordinary state/KV in LRU order.
-  // Live command buffers are never eviction candidates. The result says
-  // whether the directive's target is met, waits for transfers in flight, or
-  // finds nothing left to reclaim.
+  // Live command buffers are never eviction candidates. A pass first collects
+  // the transfers that landed, so one that continues a reclaim they held back
+  // takes what they freed. The result says whether the directive's target is
+  // met, waits for transfers in flight, or finds nothing left to reclaim.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
 
 private:

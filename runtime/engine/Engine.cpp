@@ -1244,6 +1244,8 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
 MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   if (pending_)
     throw std::logic_error("memory reclaim requested while a command is in flight");
+  if (cache_.pollTransfers())
+    signalResourceProgress();
   if (!directive.reclaim)
     return {};
 

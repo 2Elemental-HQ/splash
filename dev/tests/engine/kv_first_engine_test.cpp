@@ -1618,7 +1618,8 @@ void testWarningReclaimKeepsTheServingFootprint() {
 // A KV chain gives up one leaf at a time, each after its copy is written. A
 // pass reports that transfers hold back the rest of its target, and passes
 // with that rest (MemoryPressurePolicy continues it) take the chain as the
-// copies land, each leaf after its child, and stop at the target.
+// copies land, each pass first collecting the copies that landed since the
+// last, each leaf after its child, and stop at the target.
 void testPressureReclaimFollowsTheChain() {
   test::TestKvStorage storage(4, 100, 1);
   KvPool pool(storage, 4);
@@ -1649,7 +1650,6 @@ void testPressureReclaimFollowsTheChain() {
   uint64_t target = 364 - result.releasedBytes;
   for (uint32_t demoted = 2; demoted <= 3; ++demoted) {
     tier.complete();
-    require(cache.pollTransfers(), "a written page was not consumed");
     result = reclaim(target);
     target -= result.releasedBytes;
     require(result.releasedBytes == 100 && tier.demotions == demoted &&
@@ -1657,7 +1657,6 @@ void testPressureReclaimFollowsTheChain() {
             "the rest of the target did not take the chain leaf by leaf");
   }
   tier.complete();
-  require(cache.pollTransfers(), "the last written page was not consumed");
   result = engine.reclaimMemory({.reclaim = true});
   require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Untargeted &&
               tier.demotions == 3 && pool.snapshot().pagesAllocated == 1,
