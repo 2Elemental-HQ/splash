@@ -3505,62 +3505,79 @@ void testReclaimRefusesACommandInFlight() {
           "the reclaim after the command did not take the idle memory");
 }
 
+// Three prompts of three blocks each fill pages 0 to 8, and the first
+// prompt's state and blocks go, so extent 0 keeps one page. A fourth request
+// continues the third prompt and keeps decoding; its new rows fill extent 0
+// again, so extent 2 holds its third block alone. The fake model marks the
+// pages it writes and checks them on every step (Executor::kv).
+struct ScatteredPages {
+  ScatteredPages() {
+    model.kv = &storage;
+    guardReleases(storage, engine);
+    for (uint32_t id = 1; id <= 3; ++id) {
+      engine.submit(request(id, prompt(1000 * id, 97)));
+      runUntilIdle(engine);
+    }
+    for (uint32_t victim = 0; victim < 4; ++victim) {
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+              "the first prompt was not evicted");
+    }
+    EngineRequest running = request(4, prompt(3000, 129));
+    running.maxNewTokens = 4;
+    model.decodeFinishes = false;
+    engine.submit(running);
+    for (; now < 16 && events.outputs[4].empty(); ++now)
+      static_cast<void>(engine.tick(now));
+    const PageTableView table = cache.pageTable(4);
+    const CacheSnapshot cached = cache.snapshot();
+    require(!events.outputs[4].empty() &&
+                std::vector<uint32_t>(table.pages.begin(), table.pages.end()) ==
+                    std::vector<uint32_t>{6, 7, 8, 0, 1} &&
+                cached.pool.pagesAllocated == 12 && cached.pool.pagesFree == 4,
+            "compaction setup did not leave extent 2 with one held page");
+  }
+
+  static std::vector<uint32_t> prompt(uint32_t first, uint32_t tokens) {
+    std::vector<uint32_t> result(tokens);
+    std::iota(result.begin(), result.end(), first);
+    return result;
+  }
+
+  // A fifth lane that fits only once the pool has given an extent back.
+  void submitLaneTheBudgetRefuses() {
+    model.beginGrowthBlocked = [this] {
+      return model.lastBeginId == 5 && pool.snapshot().pagesAllocated > 8;
+    };
+    model.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+    engine.submit(request(5, prompt(5000, 33)));
+  }
+
+  test::TestKvStorage storage{16, 4096, 4};
+  KvPool pool{storage, 0};
+  engine::Cache cache{pool, CacheNamespace{}};
+  Executor model;
+  Events events;
+  engine::Engine engine{EngineConfig{}, cache, model, events};
+  // The time of the next tick.
+  double now = 1;
+};
+
 // A lane the budget refuses takes the pool's free pages before any cached
 // block: the extent that holds the fewest pages is emptied into the others
 // and released. The request whose page moved finds its rows through the
 // table of its next step.
 void testStateStartGathersFreePagesBeforeEvicting() {
-  test::TestKvStorage storage(16, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
-  Executor model;
-  model.kv = &storage;
-  Events events;
-  engine::Engine engine({}, cache, model, events);
-  guardReleases(storage, engine);
-  const auto prompt = [](uint32_t first, uint32_t tokens) {
-    std::vector<uint32_t> result(tokens);
-    std::iota(result.begin(), result.end(), first);
-    return result;
-  };
-  // Three prompts of three blocks each fill pages 0 to 8.
-  for (uint32_t id = 1; id <= 3; ++id) {
-    engine.submit(request(id, prompt(1000 * id, 97)));
-    runUntilIdle(engine);
-  }
-  // The first prompt's state and blocks go: extent 0 keeps one page.
-  for (uint32_t victim = 0; victim < 4; ++victim) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
-            "the first prompt was not evicted");
-  }
-  // The third prompt continues and keeps decoding. Its new rows fill extent
-  // 0 again, so extent 2 holds its third block alone.
-  EngineRequest running = request(4, prompt(3000, 129));
-  running.maxNewTokens = 4;
-  model.decodeFinishes = false;
-  engine.submit(running);
-  for (double now = 1; now < 16 && events.outputs[4].empty(); ++now)
-    static_cast<void>(engine.tick(now));
-  const PageTableView table = cache.pageTable(4);
-  const std::vector<uint32_t> before(table.pages.begin(), table.pages.end());
-  const uint64_t revision = table.revision;
+  ScatteredPages fixture;
+  engine::Cache &cache = fixture.cache;
+  Events &events = fixture.events;
+  const uint64_t revision = cache.pageTable(4).revision;
   const CacheSnapshot cached = cache.snapshot();
-  require(!events.outputs[4].empty() &&
-              before == std::vector<uint32_t>{6, 7, 8, 0, 1} &&
-              cached.pool.pagesAllocated == 12 && cached.pool.pagesFree == 4,
-          "compaction setup did not leave extent 2 with one held page");
-
-  // A fifth lane fits only once the pool has given an extent back.
-  model.beginGrowthBlocked = [&] {
-    return model.lastBeginId == 5 && pool.snapshot().pagesAllocated > 8;
-  };
-  model.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
-  engine.submit(request(5, prompt(5000, 33)));
-  for (double now = 16; now < 32 && events.startIds.back() != 5; ++now)
-    static_cast<void>(engine.tick(now));
+  fixture.submitLaneTheBudgetRefuses();
+  for (double now = fixture.now; now < 32 && events.startIds.back() != 5; ++now)
+    static_cast<void>(fixture.engine.tick(now));
   const CacheSnapshot started = cache.snapshot();
-  require(events.startIds.back() == 5 && storage.copies.size() == 1 &&
-              storage.copies[0].from == 8 && storage.copies[0].to == 2 &&
+  require(events.startIds.back() == 5 && fixture.storage.copies.size() == 1 &&
+              fixture.storage.copies[0].from == 8 && fixture.storage.copies[0].to == 2 &&
               started.pool.extentCompactions == 1 && started.pool.extentReleases == 1 &&
               started.kvCache.blocks >= cached.kvCache.blocks &&
               started.stateCache.entries >= cached.stateCache.entries,
@@ -3569,10 +3586,40 @@ void testStateStartGathersFreePagesBeforeEvicting() {
   require(moved.pages[2] == 2 && moved.pages[0] == 6 && moved.pages[4] == 1 &&
               moved.revision > revision,
           "the running request did not follow its moved page");
-  runUntilIdle(engine);
+  runUntilIdle(fixture.engine);
   require(events.completedCount == 5 && events.failedCount == 0 &&
               events.outputs[4].size() == 4,
           "a request did not complete after its page moved");
+}
+
+// Pages move only between commands: a command reaches them through its page
+// table and may still write them, so a copy while one is in flight throws.
+// The lane the budget refuses beside a held decode waits for it, and the
+// pool empties an extent for it once the decode has completed.
+void testCompactionWaitsForTheCommandInFlight() {
+  ScatteredPages fixture;
+  engine::Engine &engine = fixture.engine;
+  Events &events = fixture.events;
+  double now = fixture.now;
+  fixture.model.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+  for (; now < 32 && !engine.commandInFlight(); ++now)
+    static_cast<void>(engine.tick(now));
+  fixture.submitLaneTheBudgetRefuses();
+  for (const double end = now + 10; now < end; ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.commandInFlight() && fixture.storage.copies.empty() &&
+              fixture.pool.snapshot().extentCompactions == 0 &&
+              events.startIds.back() != 5,
+          "pages moved while a command was in flight");
+  *fixture.model.holdDecodeUntil = true;
+  for (const double end = now + 16; now < end && events.startIds.back() != 5; ++now)
+    static_cast<void>(engine.tick(now));
+  require(events.startIds.back() == 5 && fixture.storage.copies.size() == 1 &&
+              fixture.pool.snapshot().extentCompactions == 1,
+          "the lane did not start by emptying an extent once the decode completed");
+  runUntilIdle(engine);
+  require(events.completedCount == 5 && events.failedCount == 0,
+          "a request did not complete after the held decode");
 }
 
 void testAllocationCausesRemainDistinct() {
@@ -5956,6 +6003,7 @@ int main() {
     testReclaimPassReleasesEveryEmptyExtent();
     testReclaimRefusesACommandInFlight();
     testStateStartGathersFreePagesBeforeEvicting();
+    testCompactionWaitsForTheCommandInFlight();
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
