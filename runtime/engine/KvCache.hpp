@@ -107,6 +107,8 @@ public:
 
   [[nodiscard]] Chain chain(uint64_t blockId) const;
   [[nodiscard]] bool contains(uint64_t blockId) const noexcept;
+  // The block is in the graph and not poisoned: find() can return it.
+  [[nodiscard]] bool matchable(uint64_t blockId) const noexcept;
   [[nodiscard]] uint32_t chainLength(uint64_t blockId) const;
   [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
@@ -228,7 +230,11 @@ private:
   std::vector<uint64_t> blockOnPage_;
   std::unordered_multimap<uint64_t, uint64_t> index_;
   uint64_t nextBlockId_ = 1;
-  // Any graph change invalidates previews, including a newly matched block.
+  // Bumped by every insert, erase and poison. While it is unchanged every
+  // block a probe matched is still in the graph and still matches, and no
+  // new block extends the match. Blocks leave leaf first and a poisoned
+  // block hides those below it, so after a change a probe's chain stays
+  // valid up to its first block that is no longer matchable.
   uint64_t generation_ = 1;
   RecencyOrder ramLeaves_;
   RecencyOrder duplicates_;

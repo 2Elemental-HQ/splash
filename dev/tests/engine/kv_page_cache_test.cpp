@@ -556,6 +556,32 @@ void testDiskOnlyAdoptionAndPoison() {
           "a poisoned parent outlived its subtree");
 }
 
+// A block is matchable while find() can return it: in the graph and not
+// poisoned. A poisoned block its user still holds is in the graph but no
+// longer matchable.
+void testMatchableExcludesPoisonedBlocks() {
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
+  CacheRecency recency;
+  KvCache cache(pool, cacheNamespace(), recency);
+  auto acquired = pool.acquirePages(2, false);
+  require(acquired.granted(), "test pages were not acquired");
+  auto root = cache.insert(0, page(41), acquired.pages[0]);
+  auto leaf = cache.insert(root.id, page(42), acquired.pages[1]);
+  for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
+  require(cache.matchable(root.id) && cache.matchable(leaf.id) &&
+              !cache.matchable(leaf.id + 1),
+          "a block in the graph was not matchable, or an unknown one was");
+  cache.retainActive(leaf.id);
+  cache.poison(leaf.id);
+  require(cache.contains(leaf.id) && !cache.matchable(leaf.id) && cache.matchable(root.id),
+          "a poisoned block stayed matchable");
+  cache.releaseActive(leaf.id);
+  cache.erase(root.id);
+  require(!cache.matchable(leaf.id) && !cache.matchable(root.id),
+          "an erased block stayed matchable");
+}
+
 } // namespace
 
 int main() {
@@ -569,6 +595,7 @@ int main() {
     testHashCollisionStillRequiresExactTokens();
     testDiskTierTransitions();
     testDiskOnlyAdoptionAndPoison();
+    testMatchableExcludesPoisonedBlocks();
     std::cout << "KV page cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

@@ -1124,6 +1124,8 @@ counters include:
   transfers count once, including those completed before cancellation or a
   resource retry.
 - `lost_state_misses`: lookups that matched KV where a reusable state used to be.
+- `probe_hashed_blocks`: KV pages hashed to rank waiting requests between
+  commands.
 
 ### Judgment contracts
 

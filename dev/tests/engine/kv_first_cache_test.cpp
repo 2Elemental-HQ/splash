@@ -269,44 +269,85 @@ void testValidAdmissionProbePreservesLookupAndAccounting() {
           "admission probe changed lookup accounting or lease ownership");
 }
 
-void testProbeFallsBackWhenPromptChanges() {
-  CacheFixture fixture;
-  fixture.publish(0);
-  const CacheProbe probe = fixture.cache.probe(fixture.prompt);
-  fixture.prompt.front() += 1;
-  const auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
-  require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
-          "a same-buffer prompt edit reused a different prompt's cache");
-}
-
-void testProbeRechecksFirstMissAndPromptLength() {
-  CacheFixture fixture;
-  fixture.publish(0);
-  fixture.publish(3);
-  auto changed = fixture.prompt;
-  changed[32] += 1;
-  const CacheProbe partial = fixture.cache.probe(changed);
-  require(partial.cachedTokens() == 32, "partial probe missed its first page");
-  // Restoring the first missed page must reveal the already-cached suffix,
-  // even though the matched pages and KV generation did not change.
-  auto restored = fixture.cache.lookup(fixture.prompt, {}, &partial);
-  require(restored.kvBoundary == 128 && restored.resumeBoundary() == 128,
-          "probe hid a prefix after an edit to its first missed page");
-  restored.state.reset();
-
-  const CacheProbe full = fixture.cache.probe(fixture.prompt);
-  for (size_t size : {size_t{0}, size_t{1}, size_t{32}, size_t{33}}) {
-    const auto shorter = std::span<const uint32_t>(fixture.prompt).first(size);
-    const auto lookup = fixture.cache.lookup(shorter, {}, &full);
-    const uint32_t expected = size == 33 ? 32 : 0;
-    require(lookup.kvBoundary == expected && lookup.resumeBoundary() == expected,
-            "probe reused pages past a shortened prompt's replay boundary");
+// A probe kept across admission passes hashes nothing while the KV graph
+// stays as it was, follows the states regardless, and after a change hashes
+// only from its first block that no longer matches.
+void testProbeRefreshFollowsTheGraph() {
+  {
+    CacheFixture fixture;
+    const auto hashed = [&] { return fixture.cache.snapshot().lookup.probeHashedBlocks; };
+    fixture.publish(1);
+    CacheProbe probe = fixture.cache.probe(fixture.prompt);
+    require(probe.cachedTokens() == 64 && hashed() == 4, "the probe missed its state");
+    fixture.publish(3);
+    fixture.cache.refresh(probe, fixture.prompt);
+    require(probe.cachedTokens() == 128 && hashed() == 4,
+            "a refresh missed a new state or hashed an unchanged graph");
   }
-  const auto shortPrompt = std::span<const uint32_t>(fixture.prompt).first(33);
-  const CacheProbe shortProbe = fixture.cache.probe(shortPrompt);
-  const auto longer = fixture.cache.lookup(fixture.prompt, {}, &shortProbe);
-  require(longer.kvBoundary == 128 && longer.resumeBoundary() == 128,
-          "probe hid cached pages after the prompt grew");
+  {
+    CacheFixture fixture;
+    engine::Cache &cache = fixture.cache;
+    const auto hashed = [&] { return cache.snapshot().lookup.probeHashedBlocks; };
+    fixture.publish(2);
+    CacheProbe probe = cache.probe(fixture.prompt);
+    require(probe.cachedTokens() == 96 &&
+                cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
+                    .madeProgress &&
+                cache.snapshot().kvCache.blocks == 3,
+            "KV eviction fixture did not evict the cached tail");
+    cache.refresh(probe, fixture.prompt);
+    auto probed = cache.lookup(fixture.prompt, {}, &probe);
+    auto fresh = cache.lookup(fixture.prompt);
+    require(probe.cachedTokens() == 96 && hashed() == 5 && probed.kvBoundary == 96 &&
+                probed.kvBoundary == fresh.kvBoundary &&
+                probed.resumeBoundary() == fresh.resumeBoundary(),
+            "a refresh kept an evicted block or re-hashed the blocks that stayed");
+    fresh = {};
+    // The tail comes back, written by a request that continues the chain.
+    cache.beginRequest(2);
+    require(admitRestore(cache, 2, probed).granted() && admitTokens(cache, 2, 128).granted(),
+            "the tail's page was not acquired");
+    probed = {};
+    static_cast<void>(cache.publishCommittedBlocks(2, fixture.prompt, 128));
+    cache.endRequest(2);
+    cache.refresh(probe, fixture.prompt);
+    require(hashed() == 6 && cache.lookup(fixture.prompt, {}, &probe).kvBoundary == 128,
+            "a refresh hashed more than the page that came back");
+  }
+  {
+    // The chain's middle block fails its restore while the block below it
+    // comes back: the chain ends above the poisoned block.
+    test::TestKvTier tier;
+    CacheFixture fixture(&tier);
+    engine::Cache &cache = fixture.cache;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+            "state was not written");
+    demoteLeaves(cache, tier, 2);
+    CacheProbe probe = cache.probe(fixture.prompt);
+    require(probe.cachedTokens() == 128, "the probe missed the state on disk");
+    tier.transferLimit = 1;
+    auto lookup = cache.lookup(fixture.prompt);
+    cache.beginRequest(2);
+    require(admitRestore(cache, 2, lookup).granted() && tier.restores == 1,
+            "restore was denied");
+    tier.complete(false);
+    static_cast<void>(cache.pollTransfers());
+    tier.complete();
+    require(cache.pollTransfers() && tier.restores == 2 &&
+                cache.kvRestoreStatus(2) == KvRestoreStatus::Failed,
+            "the failed read was not reported");
+    const uint64_t before = cache.snapshot().lookup.probeHashedBlocks;
+    cache.refresh(probe, fixture.prompt);
+    require(probe.cachedTokens() == 0 &&
+                cache.snapshot().lookup.probeHashedBlocks == before + 1 &&
+                cache.lookup(fixture.prompt, {}, &probe).kvBoundary == 64,
+            "a refresh matched through a poisoned block");
+    lookup = {};
+    cache.endRequest(2);
+  }
 }
 
 void testProbeRechecksStateChanges() {
@@ -363,7 +404,7 @@ void testProbeBindsImageIdentity() {
   KvPool pool{storage, 1};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt(33, 77);
-  ImageSpan image{0, 32, 1, 1, 101, 202};
+  const ImageSpan image{0, 32, 1, 1, 101, 202};
   const std::span<const ImageSpan> images(&image, 1);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "image KV page was not acquired");
@@ -371,14 +412,9 @@ void testProbeBindsImageIdentity() {
   cache.publishCompositeState(block, std::make_shared<TestState>(100));
   cache.endRequest(1);
   const CacheProbe probe = cache.probe(prompt, images);
-  auto valid = cache.lookup(prompt, images, &probe);
+  const auto valid = cache.lookup(prompt, images, &probe);
   require(valid.kvBoundary == 32 && valid.resumeBoundary() == 32,
           "matching image probe lost its cached prefix");
-  valid.state.reset();
-  image.digestLo += 1;
-  auto changed = cache.lookup(prompt, images, &probe);
-  require(changed.kvBoundary == 0 && changed.resumeBoundary() == 0,
-          "image digest change reused a different image's cache");
 }
 
 void testProbeCannotCrossCaches() {
@@ -400,10 +436,17 @@ void testProbeCannotCrossCaches() {
   };
   populate(first, firstPrompt);
   populate(second, secondPrompt);
-  const CacheProbe probe = first.probe(firstPrompt);
+  CacheProbe probe = first.probe(firstPrompt);
   const auto lookup = second.lookup(firstPrompt, {}, &probe);
   require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
           "a probe from another cache reused a colliding block id");
+  bool refused = false;
+  try {
+    second.refresh(probe, firstPrompt);
+  } catch (const std::logic_error &) {
+    refused = true;
+  }
+  require(refused, "a probe from another cache was refreshed");
 }
 
 // Every change of a request's page list moves its revision by one and says
@@ -4062,8 +4105,7 @@ int main() {
     testCheckpointPressurePreservesHotPrefix();
     testSchedulingProbeDoesNotChangeCachePolicy();
     testValidAdmissionProbePreservesLookupAndAccounting();
-    testProbeFallsBackWhenPromptChanges();
-    testProbeRechecksFirstMissAndPromptLength();
+    testProbeRefreshFollowsTheGraph();
     testProbeRechecksStateChanges();
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();

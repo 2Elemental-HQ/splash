@@ -192,6 +192,7 @@ std::string runtimeStatusJson(
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
       << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
+      << ",\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens

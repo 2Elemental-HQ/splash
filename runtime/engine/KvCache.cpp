@@ -227,6 +227,11 @@ bool KvCache::contains(uint64_t blockId) const noexcept {
   return blocks_.contains(blockId);
 }
 
+bool KvCache::matchable(uint64_t blockId) const noexcept {
+  const auto found = blocks_.find(blockId);
+  return found != blocks_.end() && !found->second.poisoned;
+}
+
 uint32_t KvCache::chainLength(uint64_t blockId) const {
   return block(blockId).depth;
 }
