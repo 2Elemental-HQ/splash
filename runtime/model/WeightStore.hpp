@@ -53,6 +53,7 @@ public:
   // One section of the parts' total bytes, as a view of each part in order.
   [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
                                                       std::string_view label);
+  // Requires the sections read to cover the whole file.
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 
