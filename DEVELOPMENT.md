@@ -225,7 +225,8 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking.
+semantics (off when omitted); judgment endpoints always disable thinking. The
+built-in chat page sends no effort unless the user picks one.
 
 A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
 passed to the template as variables and outrank the effort, so
