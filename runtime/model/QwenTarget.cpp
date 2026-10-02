@@ -452,15 +452,15 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
                         b.linearScratch, normalized);
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
-                                           ExecutionLimits::targetVerifyRows, tileRows, tileRows,
-                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes);
+                                           tileRows, tileRows, geometry_.attentionQueryHeads,
+                                           geometry_.kvLayout, step.lanes);
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
                                   b.attentionStatistics, b.fullAttention, b.pageTables},
                                  step.q8, step.verify, step.attention);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
-      step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, ExecutionLimits::targetVerifyRows, tileRows,
-      tileRows, geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, b.linearScratch,
+      step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, tileRows, tileRows,
+      geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, b.linearScratch,
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual).input());
   linear.addResidualBatch(step.graph, b.attentionHidden, mixer.outputProjection, input, b.attentionOutput,
                           step.lanes, step.stats, b.linearScratch, hidden);

@@ -18,15 +18,15 @@ struct FullPrefillParams {
 static_assert(sizeof(FullPrefillParams) == 12,
               "Full attention prefill parameters are 12 bytes on both sides");
 
+// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows.
 struct FullDecodeBatchParams {
-  uint32_t tokens;
   uint32_t cache_stride;
   uint32_t row_stride;
   uint32_t lanes;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 16,
-              "Full attention verify parameters are 16 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 12,
+              "Full attention verify parameters are 12 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final Q8 page slot before attention. Prefill and verify both read

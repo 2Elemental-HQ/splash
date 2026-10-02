@@ -277,15 +277,14 @@ public:
                       const NormWeights &queryNorm, const NormWeights &keyNorm,
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-                      metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
-                      uint32_t cacheStride, uint32_t rowStride,
-                      uint32_t queryHeads, kv::Layout layout,
-                      uint32_t lanes);
+                      metal::MetalBuffer chunkValues, uint32_t cacheStride,
+                      uint32_t rowStride, uint32_t queryHeads,
+                      kv::Layout layout, uint32_t lanes);
   // Also writes the out-projection's `input` table when it needs one.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
                                      metal::MetalBuffer packed,
                                      metal::MetalBuffer attention,
-                                     metal::MetalBuffer hidden, uint32_t rowsPerLane,
+                                     metal::MetalBuffer hidden,
                                      uint32_t cacheStride, uint32_t rowStride,
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch = {},

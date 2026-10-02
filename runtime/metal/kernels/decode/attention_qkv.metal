@@ -13,16 +13,16 @@ inline void full_qkv_decode_phase(
     uint simd_group) {
   constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   uint batch = group.y;
   if (batch >= params.lanes)
     return;
   ulong kv_lane_stride = ulong(KHeads) * params.row_stride * HeadDim;
-  FullPrefillParams lane_params{params.tokens, params.cache_stride,
-                                params.row_stride};
+  FullPrefillParams lane_params{Rows, params.cache_stride, params.row_stride};
   full_qkv_storage_phase<QHeads, KHeads>(
-      qkv + ulong(batch) * params.tokens * PackedStride, q_norm, k_norm,
-      rope_cos + ulong(batch) * params.tokens * RotaryPairs,
-      rope_sin + ulong(batch) * params.tokens * RotaryPairs,
+      qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
+      rope_cos + ulong(batch) * Rows * RotaryPairs,
+      rope_sin + ulong(batch) * Rows * RotaryPairs,
       queries + ulong(batch) * QHeads * params.row_stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,
@@ -63,8 +63,8 @@ inline bfloat full_attention_gate_value(
     constant FullDecodeBatchParams &params, uint element) {
   constexpr uint HeadDim = 256, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint HeadsPerKV = QHeads / KHeads;
-  uint per_lane = params.tokens * QHeads * HeadDim;
+  constexpr uint HeadsPerKV = QHeads / KHeads, Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint per_lane = Rows * QHeads * HeadDim;
   uint batch = element / per_lane;
   uint lane_element = element % per_lane;
   uint row = lane_element / (QHeads * HeadDim);
@@ -72,7 +72,7 @@ inline bfloat full_attention_gate_value(
   uint query_head = remainder / HeadDim;
   uint dim = remainder % HeadDim;
   float gate = float(
-      packed_qkv[(ulong(batch) * params.tokens + row) * PackedStride +
+      packed_qkv[(ulong(batch) * Rows + row) * PackedStride +
                  query_head * QStride + HeadDim + dim]);
   float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
   uint kv_head = query_head / HeadsPerKV;
@@ -91,7 +91,7 @@ inline void full_attention_gate_decode_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
     device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
     uint grid_size) {
-  const uint count = params.lanes * params.tokens * QHeads * 256;
+  const uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS * QHeads * 256;
   for (uint element = index; element < count; element += grid_size)
     hidden[element] = full_attention_gate_value<QHeads, KHeads>(
         packed_qkv, attention, params, element);

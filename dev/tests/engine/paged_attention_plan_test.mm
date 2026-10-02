@@ -755,8 +755,8 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   const auto addProjection = [&](metal::CommandGraph &graph, const ops::NormWeights &keyWeights) {
     if (verify)
       ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
-                                               queries, keys, values, rows, stride, stride,
-                                               queryHeads, layout, lanes);
+                                               queries, keys, values, stride, stride, queryHeads,
+                                               layout, lanes);
     else
       ops::PagedAttention::addPrefillProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
                                                 queries, keys, values, rows, stride, stride,
