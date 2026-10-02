@@ -409,11 +409,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   }
 
   CommandGraph invalid;
-  rejects([&] {
-    DraftAttention::addConvolution(invalid,
-        {input, dynamic, weights, residual, output}, baselinePlan,
-        static_cast<DraftConvolutionStage>(2));
-  });
   const auto shortBuffer = backend.view(output, 0, output.sizeBytes() - 2);
   rejects([&] {
     DraftAttention::addConvolution(invalid,

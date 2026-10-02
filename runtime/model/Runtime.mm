@@ -423,8 +423,6 @@ struct Runtime::Impl {
       return;
     }
     const uint64_t bytes = rows->embeddings.sizeBytes();
-    if (bytes > kEmbeddingCacheBytes)
-      return;
     embeddingCache.push_front(rows);
     rows->cached = embeddingCache.begin();
     embeddingCacheBytes += bytes;
@@ -776,14 +774,10 @@ struct Runtime::Impl {
   }
 
   static uint32_t captureRows(const DispatchDraftCapturePlan &captures) {
-    uint64_t rows = 0;
-    for (const auto &capture : captures) {
+    uint32_t rows = 0;
+    for (const auto &capture : captures)
       rows += capture.absoluteEnd - capture.absoluteBegin;
-    }
-    if (rows > kPrefillRows) {
-      throw std::logic_error("draft capture exceeds packed prefill capacity");
-    }
-    return static_cast<uint32_t>(rows);
+    return rows;
   }
 
   // The lengths after the draft ring takes rows [begin, end) at target
@@ -1019,9 +1013,6 @@ struct Runtime::Impl {
       }
       auto captures = activeDraftCaptures(entry, item);
       const uint32_t capturedRows = captureRows(captures);
-      if (capturedRows > kPrefillRows - batch.capturedRows) {
-        throw std::invalid_argument("packed draft capture exceeds row budget");
-      }
       const uint32_t attentionStride =
           ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
       const Q8ChunkedPrefillParams q8 =

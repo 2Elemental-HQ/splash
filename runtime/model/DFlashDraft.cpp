@@ -38,10 +38,6 @@ DFlashDraftRing::DFlashDraftRing(
     : tracker_(std::move(tracker)), layers_(layout.layers) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
-  if (!layout.valid() ||
-      layout.tokens != ExecutionLimits::draftContextTokens) {
-    throw std::invalid_argument("draft state layout is invalid");
-  }
   const uint64_t before = backend.memoryStats().allocatedBytes;
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
@@ -69,13 +65,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize) {
-  requireLayout(weights_.layout);
-  if (weights_.layers.size() != weights_.layout.layers ||
-      !weights_.layout.stateLayout().valid()) {
-    throw std::invalid_argument("draft weights do not match state geometry");
-  }
-}
+      selector_(weights.layout.vocabularySize) {}
 
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, DFlashSelectionBuffers buffers,
