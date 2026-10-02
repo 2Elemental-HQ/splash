@@ -115,29 +115,6 @@ chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
   return {};
 }
 
-[[nodiscard]] constexpr bool
-chunkedPrefillValid(const Q8ChunkedPrefillParams &params) noexcept {
-  return chunkedPrefillValidationError(params).empty();
-}
-
-// Call this once when preparing a request lane, not once per attention layer.
-// Cache is the sole page-table owner and structurally guarantees unique
-// leases; this boundary only has to reject page ids outside a pool of
-// poolPages pages before they are translated to entries.
-[[nodiscard]] inline bool
-chunkedPrefillPageTableInRange(const Q8ChunkedPrefillParams &params,
-                               std::span<const uint32_t> pageTable,
-                               uint32_t poolPages) {
-  const uint32_t pages = chunkedPrefillRequiredPages(params);
-  if (!chunkedPrefillValid(params) || pageTable.size() < pages)
-    return false;
-  for (uint32_t logical = 0; logical < pages; ++logical) {
-    if (pageTable[logical] >= poolPages)
-      return false;
-  }
-  return true;
-}
-
 } // namespace splash::kv
 
 namespace splash::ops {
@@ -315,11 +292,10 @@ public:
                                      LinearInput input = LinearInput::Plain);
 
   // A lane's parameters; each layer's encoding adds the layer's place in
-  // the extents (LayerStorage::kv).
+  // the extents.
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
-                uint32_t chunkStride, std::span<const uint32_t> pageTable,
-                uint32_t poolPages);
+                uint32_t chunkStride, uint32_t pageTableEntries);
 
   static void addPrefillStore(metal::CommandGraph &graph,
                               const kv::LayerStorage &layer,

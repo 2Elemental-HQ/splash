@@ -188,10 +188,8 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
   result.params = {committed, chunk, stride, pages,
                    result.pool->pages->layer(kLayer).kv};
-  require(chunkedPrefillValid(result.params), "invalid generated params");
-  require(chunkedPrefillPageTableInRange(result.params, result.pageTable,
-                                         result.pool->pages->pageCount()),
-          "invalid generated page table");
+  require(chunkedPrefillValidationError(result.params).empty(),
+          "invalid generated params");
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
   result.pool->pages->writeTable(result.pageTable, result.pageTableBuffer.contents);
   uint64_t chunkElements = uint64_t{kKvHeads} * stride * kHeadDimension;
@@ -878,7 +876,7 @@ void testContract() {
   static_assert(offsetof(Q8PrefillAttentionParams, kv) == 16);
   static_assert(offsetof(Q8PrefillAttentionParams, split_count) == 24);
   Q8ChunkedPrefillParams params{129, 8, 32, 5, {}};
-  require(chunkedPrefillValid(params),
+  require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
           "page plan must include speculative destination slots");
@@ -893,7 +891,7 @@ void testContract() {
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,
       {}};
-  require(chunkedPrefillValid(finalCycle),
+  require(chunkedPrefillValidationError(finalCycle).empty(),
           "final fixed-eight verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",

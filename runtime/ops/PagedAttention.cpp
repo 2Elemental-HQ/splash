@@ -368,17 +368,15 @@ PreparedInput PagedAttention::addVerifyGate(
 
 kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(
     uint64_t logicalPosition, uint32_t chunkTokens, uint32_t chunkStride,
-    std::span<const uint32_t> pageTable, uint32_t poolPages) {
+    uint32_t pageTableEntries) {
   if (logicalPosition > std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV logical position exceeds kernel ABI");
-  kv::Q8ChunkedPrefillParams params{
-      static_cast<uint32_t>(logicalPosition), chunkTokens, chunkStride,
-      static_cast<uint32_t>(pageTable.size()), {}};
+  kv::Q8ChunkedPrefillParams params{static_cast<uint32_t>(logicalPosition),
+                                    chunkTokens, chunkStride, pageTableEntries,
+                                    {}};
   const std::string_view error = kv::chunkedPrefillValidationError(params);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
-  if (!kv::chunkedPrefillPageTableInRange(params, pageTable, poolPages))
-    throw std::invalid_argument("invalid KV chunk page table");
   return params;
 }
 

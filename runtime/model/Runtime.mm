@@ -788,7 +788,8 @@ struct Runtime::Impl {
                                   uint32_t chunkTokens, uint32_t chunkStride,
                                   std::span<const uint32_t> pages) const {
     return ops::PagedAttention::prefillParams(
-        logicalPosition, chunkTokens, chunkStride, pages, kvPages.pageCount());
+        logicalPosition, chunkTokens, chunkStride,
+        static_cast<uint32_t>(pages.size()));
   }
 
   struct PackedPrefillSequence final {
