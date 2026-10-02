@@ -129,7 +129,6 @@ struct AttentionWorkspace final {
 struct PrefillAttentionPlan final {
   const kv::Format format;
   const uint32_t rows;
-  const uint32_t historyTokens;
   const uint32_t splits;
   const AttentionWorkspace workspace;
   const std::string_view splitPipeline;
@@ -139,12 +138,11 @@ struct PrefillAttentionPlan final {
 
 private:
   friend class PagedAttention;
-  PrefillAttentionPlan(uint32_t rows, uint32_t historyTokens, uint32_t splits,
-                       AttentionWorkspace workspace,
+  PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        kv::Format format)
-      : format(format), rows(rows), historyTokens(historyTokens),
+      : format(format), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups) {}
@@ -198,9 +196,10 @@ struct PagedVerifyBuffers final {
 // semantics.
 class PagedAttention final {
 public:
+  // The kernels read a sequence's history from its chunk parameters, so a
+  // plan depends on the rows only.
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-              uint32_t historyTokens);
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // sized to the batch width or to the maximum width with inactive lanes zero.
   [[nodiscard]] static VerifyAttentionPlan

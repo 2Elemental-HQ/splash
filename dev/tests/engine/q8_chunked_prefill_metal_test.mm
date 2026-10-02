@@ -290,8 +290,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      const Q8PrefillAttentionParams *overrideParams = nullptr) {
   const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      data.params.committed_tokens);
+      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
@@ -692,8 +691,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
   const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      data.params.committed_tokens);
+      data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
   const Q8PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,

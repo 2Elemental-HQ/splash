@@ -42,12 +42,10 @@ void attention() {
               "prefill partial workspace differs from the maximum over actual row counts");
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
-      for (uint32_t history : {0U, 4095U, 4096U, 131072U, kv::kMaximumPhysicalTokens - rows}) {
-        const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history);
-        require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                    workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-                "prefill workspace omitted actual rows at a valid context boundary");
-      }
+      const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
+      require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
+                  workspace.statisticsBytes >= plan.workspace.statisticsBytes,
+              "prefill workspace omitted the plan of its own rows");
     }
     const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
     require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},

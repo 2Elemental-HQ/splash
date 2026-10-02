@@ -17,8 +17,7 @@ public:
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-      uint32_t historyTokens) const;
+      uint32_t rows, uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
       uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
       std::span<const uint32_t> historyTokens) const;

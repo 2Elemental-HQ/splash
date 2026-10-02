@@ -77,18 +77,15 @@ uint32_t prefillSplits(uint32_t tiles) {
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-    uint32_t historyTokens) {
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
-  if (uint64_t{historyTokens} + rows > kv::kMaximumPhysicalTokens)
-    throw std::invalid_argument("prefill attention history exceeds physical context");
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
   const uint32_t splits = prefillSplits(tiles);
   const uint32_t fusedRows =
       kv::kQ8PrefillAttentionTileRows * (queryHeads / layout.kvHeads);
-  return {rows, historyTokens, splits,
+  return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
           layout.format == kv::Format::BFloat16
@@ -293,9 +290,8 @@ void PagedAttention::addPrefill(
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::Q8ChunkedPrefillParams &chunk,
     const PrefillAttentionPlan &plan) {
-  if (chunk.chunk_tokens != plan.rows ||
-      chunk.committed_tokens != plan.historyTokens)
-    throw std::invalid_argument("prefill attention rows or history do not match plan");
+  if (chunk.chunk_tokens != plan.rows)
+    throw std::invalid_argument("prefill attention rows do not match plan");
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));

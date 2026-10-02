@@ -206,6 +206,8 @@ struct QwenTarget::PrefillStep {
   std::span<const QwenTargetPrefillSequence> sequences;
   uint32_t rows;
   std::span<const SplashKvLayer> kvLayers;
+  // Each sequence's attention plan, which every attention layer runs.
+  std::vector<ops::PrefillAttentionPlan> attention{};
   std::optional<ops::MoePlan> moe{};
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
@@ -245,6 +247,9 @@ metal::MetalBuffer QwenTarget::addPrefill(
     }
   }
   PrefillStep step{graph, buffers, sequences, rows, kvLayers};
+  for (const QwenTargetPrefillSequence &sequence : sequences)
+    step.attention.push_back(operators_.prefillAttention(
+        sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
@@ -324,7 +329,8 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
   addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums,
                                  step.rows, b.linearScratch);
-  for (const QwenTargetPrefillSequence &sequence : step.sequences) {
+  for (size_t index = 0; index < step.sequences.size(); ++index) {
+    const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
     };
@@ -347,9 +353,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
                                          sequence.q8, geometry_.kvLayout);
     ops::PagedAttention::addPrefill(
         step.graph, step.kvLayers[layer], queries, attentionRows, b.attentionPartials, b.attentionStatistics,
-        sequence.pageTable, sequence.q8,
-        operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout,
-                                    sequence.q8.committed_tokens));
+        sequence.pageTable, sequence.q8, step.attention[index]);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16(b.fullPacked, geometry_.packedFullWidth), attentionRows,
         u16(b.attentionHidden, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,

@@ -48,10 +48,8 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   bool unequalAxes = false, partialTile = false, multipleSplits = false;
   // Enumerate nonsquare grids and partial final tiles. Each logical partial
   // belongs to exactly one query tile, KV head and balanced history split.
-  for (const auto [history, rows] :
-       std::array<std::array<uint32_t, 2>, 4>{{{4093, 17}, {16383, 257},
-                                              {4095, 2048}, {131072, 17}}}) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history);
+  for (const uint32_t rows : {17U, 257U, 2048U}) {
+    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
     const uint32_t tiles = (rows + 7) / 8;
     require(plan.splitGroups.x == layout.kvHeads &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
@@ -90,31 +88,28 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") + geometrySuffix;
   const std::string prefillReduce = "prefill_attention_q8_reduce" + geometrySuffix;
   checkPrefillSlotOrientation(queryHeads, layout);
-  for (uint32_t rows = 1; rows <= 2048; ++rows)
-    for (uint32_t history : {0U, 33U, 4095U, 4096U, 131072U,
-                             kv::kMaximumPhysicalTokens - rows}) {
-      const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history);
-      const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
-      require(plan.rows == rows && plan.historyTokens == history && plan.splits == splits,
-              "prefill plan lost actual rows or logical history");
-      require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
-              "prefill plan runs the wrong pipelines");
-      require(plan.splitGroups.x == layout.kvHeads &&
-                  plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
-                  plan.reduceGroups.x == layout.kvHeads &&
-                  plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
-                  plan.reduceGroups.z == tiles,
-              "prefill split/reduce geometry disagrees");
-      const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
-      require(plan.workspace.partialsBytes == fused * 256 * 4 &&
-                  plan.workspace.statisticsBytes == fused * 2 * 4,
-              "prefill split dispatch and exact scratch disagree");
-      const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
-      require(bound.partialsBytes >= plan.workspace.partialsBytes &&
-                  bound.statisticsBytes >= plan.workspace.statisticsBytes,
-              "prefill arena omitted a valid shorter/context-edge plan");
-    }
+  for (uint32_t rows = 1; rows <= 2048; ++rows) {
+    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
+    const uint32_t tiles = (rows + 7) / 8;
+    const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+    require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
+    require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
+            "prefill plan runs the wrong pipelines");
+    require(plan.splitGroups.x == layout.kvHeads &&
+                plan.splitGroups.y == tiles && plan.splitGroups.z == splits &&
+                plan.reduceGroups.x == layout.kvHeads &&
+                plan.reduceGroups.y == 8 * queryHeads / layout.kvHeads &&
+                plan.reduceGroups.z == tiles,
+            "prefill split/reduce geometry disagrees");
+    const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
+    require(plan.workspace.partialsBytes == fused * 256 * 4 &&
+                plan.workspace.statisticsBytes == fused * 2 * 4,
+            "prefill split dispatch and exact scratch disagree");
+    const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
+    require(bound.partialsBytes >= plan.workspace.partialsBytes &&
+                bound.statisticsBytes >= plan.workspace.statisticsBytes,
+            "prefill arena omitted a valid shorter plan");
+  }
   const std::string verifySplit = std::string(layout.format == kv::Format::Int8
       ? "verify_attention_q8_split" : "verify_attention_bf16_split") + geometrySuffix;
   const std::string verifyReduce = "verify_attention_q8_reduce" + geometrySuffix;
@@ -145,10 +140,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 (lanes < 4 || plan.laneSplits[3] == kv::kQ8VerifyMaximumSplits),
             "verify partition changed");
   }
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout, 0); });
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(2049, queryHeads, layout, 0); });
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(1, queryHeads, layout, kv::kMaximumPhysicalTokens); });
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(2048, queryHeads, layout, UINT32_MAX); });
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout); });
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(2049, queryHeads, layout); });
   rejects([&] { (void)ops::PagedAttention::verifyPlan(0, queryHeads, layout, zeroHistory); });
   rejects([&] { (void)ops::PagedAttention::verifyPlan(5, queryHeads, layout, zeroHistory); });
   rejects([&] {
@@ -479,8 +472,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout,
-                                             data.stores[0].committed_tokens);
+      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
     else {
       std::array<uint32_t, 4> histories{};
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
@@ -524,13 +516,6 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
                                        partials, statistics, data.tables[0], mismatch, plan);
       });
       require(shortGraph.empty(), "mismatched prefill plan partially encoded a graph");
-      mismatch = data.stores[0];
-      ++mismatch.committed_tokens;
-      rejects([&] {
-        ops::PagedAttention::addPrefill(shortGraph, data.layer, data.queries, output,
-                                       partials, statistics, data.tables[0], mismatch, plan);
-      });
-      require(shortGraph.empty(), "mismatched history partially encoded a graph");
     }
     rejects([&] {
       encode(shortGraph, backend.view(partials, 0, partials.sizeBytes() - 4),
@@ -559,7 +544,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
               "production prefill dispatch departed from its plan");
       kv::Q8PrefillAttentionParams params;
       std::memcpy(&params, dispatch.bytes[0].data, sizeof(params));
-      require(params.committed_tokens == plan.historyTokens && params.rows == data.rows &&
+      require(params.committed_tokens == data.stores[0].committed_tokens &&
+                  params.rows == data.rows &&
                   params.chunk_stride == data.stride &&
                   params.page_table_entries == data.stores[0].page_table_entries &&
                   params.kv.extent_pages == data.layer.extent_pages &&

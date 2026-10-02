@@ -95,7 +95,7 @@ void baselinePlans() {
     for (const auto &[queryHeads, kvLayout] : attentionShapes) {
       const auto memory = plans.prefillAttentionWorkspace(2048, queryHeads, kvLayout);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout, 2049).workspace, 1,
+        covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout).workspace, 1,
                attentionFields);
       const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -276,8 +276,7 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.verifyAttention(UINT32_MAX, 24, kvLayout, histories); });
   rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); });
   rejects([&] { (void)plans.verifyAttention(1, 24, {}, histories); });
-  rejects([&] { (void)plans.prefillAttention(1, 24, kvLayout, UINT32_MAX); });
-  rejects([&] { (void)plans.prefillAttention(1, 24, {}, 0); });
+  rejects([&] { (void)plans.prefillAttention(1, 24, {}); });
   rejects([&] { (void)plans.prefillAttentionWorkspace(0, 24, kvLayout); });
   rejects([&] { (void)plans.prefillAttentionWorkspace(UINT32_MAX, 24, kvLayout); });
   rejects([&] { (void)plans.moeDecode(routedShape, UINT32_MAX); });
@@ -285,12 +284,6 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
   rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
-  const auto finalPrefill = plans.prefillAttention(
-      1, 24, kvLayout, kv::kMaximumPhysicalTokens - 1);
-  require(finalPrefill.rows == 1 &&
-              finalPrefill.historyTokens == kv::kMaximumPhysicalTokens - 1 &&
-              finalPrefill.splits == 32,
-          "valid final physical token was rejected");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
   require(finalVerify.splits == kv::kQ8VerifyMaximumSplits,

@@ -29,9 +29,8 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
       appleGpuFamily_(device.appleGpuFamily) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-    uint32_t historyTokens) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens);
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
+  return PagedAttention::prefillPlan(rows, queryHeads, layout);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(

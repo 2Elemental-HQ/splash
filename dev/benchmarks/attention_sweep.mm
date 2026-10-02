@@ -73,7 +73,7 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
   const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout, history)
+      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout)
                     .workspace
               : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout, histories)
                     .workspace;
@@ -87,7 +87,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill) {
   metal::CommandGraph graph;
   if (prefill)
     fixture.addGraph(graph, PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads,
-                                                        plan.layout(), plan.histories[0]));
+                                                        plan.layout()));
   else
     fixture.addGraph(graph, PagedAttention::verifyPlan(plan.lanes, plan.shape.queryHeads,
                                                        plan.layout(), plan.histories));
