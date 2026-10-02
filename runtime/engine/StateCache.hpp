@@ -155,11 +155,11 @@ public:
   void publishCompositeState(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);
   // Publishes a state that has no RAM copy by writing it from its lane: the
-  // entry is the disk copy the ticket carries, with the write in flight. A
-  // block whose state is on disk already is published as it is. False when
-  // the one write in flight holds the staging buffer, or when the quota
-  // cannot admit the state after makeRoom gave up what it could; nothing is
-  // published then.
+  // entry is the disk copy the ticket carries, with the write in flight.
+  // False when the one write in flight holds the staging buffer, or when the
+  // quota cannot admit the state after makeRoom gave up what it could;
+  // nothing is published then. The caller reuses a stored state first
+  // (reuseStoredState); publishing over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   // Publication identity protects replacement states from stale handles.

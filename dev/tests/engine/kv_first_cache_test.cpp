@@ -24,6 +24,16 @@ void require(bool condition, const char *message) {
     throw std::runtime_error(message);
 }
 
+template <typename Error, typename Function>
+void requireThrows(Function &&function, const char *message) {
+  try {
+    function();
+  } catch (const Error &) {
+    return;
+  }
+  throw std::runtime_error(message);
+}
+
 class TestState final : public CompositeState {
 public:
   explicit TestState(uint64_t byteCount) : byteCount_(byteCount) {}
@@ -1411,8 +1421,8 @@ void testOrdinaryPublicationUpgradesDiskCheckpoint() {
                 fixture.cache.pollTransfers(), "disk checkpoint publication failed");
     const auto point = fixture.cache.checkpointState(fixture.blocks[3]);
     if (onDisk) {
-      require(fixture.cache.publishStateToDisk(fixture.blocks[3], write),
-              "ordinary disk publication failed");
+      require(fixture.cache.reuseStoredState(fixture.blocks[3]),
+              "the disk checkpoint was not reused as an ordinary state");
     } else {
       fixture.cache.publishCompositeState(fixture.blocks[3],
                                           std::make_shared<TestState>(100));
@@ -1431,8 +1441,8 @@ void testOrdinaryPublicationUpgradesDiskCheckpoint() {
 // A state no cache slot can hold is written from its lane straight to disk:
 // the entry is the disk copy with the write in flight, a hit inside the
 // write window is a disk hit, one write at a time holds the staging buffer,
-// a block already on disk is not written twice, and under KV pressure the
-// stated leaf is demoted rather than dropped.
+// a block already on disk is reused rather than published twice, and under
+// KV pressure the stated leaf is demoted rather than dropped.
 void testDiskPublicationLifecycle() {
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
@@ -1453,9 +1463,12 @@ void testDiskPublicationLifecycle() {
   require(!fixture.cache.publishStateToDisk(fixture.blocks[1], write) &&
               fixture.cache.snapshot().stateCache.entries == 1 && control->slots == 1,
           "a second write started beside the one in flight");
-  require(fixture.cache.publishStateToDisk(fixture.blocks[3], write) &&
+  require(fixture.cache.reuseStoredState(fixture.blocks[3]) &&
               fixture.cache.snapshot().stateCache.offloads == 1,
           "a block already on disk was written again");
+  requireThrows<std::logic_error>(
+      [&] { static_cast<void>(fixture.cache.publishStateToDisk(fixture.blocks[3], write)); },
+      "a second disk publication of one block was accepted");
   control->ready = true;
   require(fixture.cache.pollTransfers() && !fixture.cache.pollTransfers(),
           "the write was not consumed exactly once");

@@ -255,6 +255,8 @@ public:
   // Publishes the state of the lane at this block straight to disk, for a
   // state no cache slot can hold: `write` starts the write from the lane.
   // False when the tier cannot take the state now; nothing is published then.
+  // The caller reuses a stored state first (reuseStoredState); publishing
+  // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   // The request holding the handle is unfinished and its conversation
