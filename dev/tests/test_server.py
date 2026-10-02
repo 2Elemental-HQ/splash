@@ -32,6 +32,7 @@ from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
+from server.origins import parse_allowed_origin
 from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
@@ -642,7 +643,7 @@ class Harness:
             webui=webui,
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
-            allowed_origins=allowed_origins,
+            allowed_origins=map(parse_allowed_origin, allowed_origins),
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()

@@ -13,7 +13,6 @@ import socket
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
 try:
@@ -25,6 +24,13 @@ except ImportError:  # Executed directly by the source or packaged entry point.
     import clients
     import models as model_artifacts
     import paths
+
+    # Run as a script, the launcher has only install/ on sys.path.
+    sys.path.insert(1, str(paths.ROOT))
+
+# The server's --allowed-origin rule, in a module of the standard library
+# alone: the launcher runs before .venv exists.
+from server import origins
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -445,26 +451,12 @@ def _version():
 
 
 def _parse_allowed_origin(value):
-    # The server's rule (server/http_security.py), before any model work.
+    # The server's rule, before any model work. The server takes the value as
+    # typed.
     try:
-        origin = urllib.parse.urlsplit(value)
-        valid = value == "*" or bool(
-            all(32 < ord(c) < 127 for c in value)
-            and origin.scheme
-            and origin.hostname
-            and origin.username is None
-            and origin.password is None
-            and not (origin.path or origin.query or origin.fragment)
-            # Reading the port refuses one out of range.
-            and (origin.port is None or origin.port >= 0)
-        )
-    except ValueError:
-        valid = False
-    if not valid:
-        raise argparse.ArgumentTypeError(
-            "expected a scheme and a host, as in tauri://localhost or "
-            "http://localhost:3000, or * for every origin"
-        )
+        origins.parse_allowed_origin(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
     return value
 
 

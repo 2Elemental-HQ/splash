@@ -47,13 +47,7 @@ if __package__:
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend, validate_served_model_name
-    from .http_security import (
-        ANY_ORIGIN,
-        authenticate,
-        parse_allowed_origins,
-        validate_api_key,
-        validate_headers,
-    )
+    from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
@@ -62,6 +56,7 @@ if __package__:
         timings_dict,
         usage_dict,
     )
+    from .origins import ANY_ORIGIN, parse_allowed_origin
     from .output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -96,13 +91,7 @@ else:
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
     from frontend import Frontend, validate_served_model_name
-    from http_security import (
-        ANY_ORIGIN,
-        authenticate,
-        parse_allowed_origins,
-        validate_api_key,
-        validate_headers,
-    )
+    from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
@@ -111,6 +100,7 @@ else:
         timings_dict,
         usage_dict,
     )
+    from origins import ANY_ORIGIN, parse_allowed_origin
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -2138,7 +2128,8 @@ class FrontendServer(ThreadingHTTPServer):
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
             if host not in ("0.0.0.0", "::")
         }
-        self.allowed_origins = parse_allowed_origins(allowed_origins)
+        # As parse_allowed_origin returns them.
+        self.allowed_origins = frozenset(allowed_origins)
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
@@ -2283,6 +2274,13 @@ def _parse_model_id(value):
     return value
 
 
+def _parse_allowed_origin(value):
+    try:
+        return parse_allowed_origin(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
@@ -2337,7 +2335,13 @@ def parse_args(argv=None):
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
-    parser.add_argument("--allowed-origin", action="append", default=[])
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        type=_parse_allowed_origin,
+        metavar="ORIGIN",
+    )
     parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
@@ -2355,10 +2359,6 @@ def parse_args(argv=None):
             validate_api_key(args.api_key)
         except ValueError as error:
             parser.error(str(error))
-    try:
-        parse_allowed_origins(args.allowed_origin)
-    except ValueError as error:
-        parser.error(f"--allowed-origin {error}")
     if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
         parser.error(
             "--max-image-pixels must be in "

@@ -12,6 +12,7 @@ from openai import AuthenticationError, OpenAI
 from dev.tests.test_server import FakeRuntime, Harness, Plan
 from install import launcher
 from server import server
+from server.origins import ANY_ORIGIN
 
 # The launcher's parser and the server's, each with the arguments it requires.
 PARSERS = (
@@ -358,33 +359,24 @@ class ServerAccessTests(unittest.TestCase):
         self.assertTrue(ElementTree.fromstring(icon).tag.endswith("svg"))
 
     def test_cli_takes_origins_as_browsers_send_them(self):
-        for parse, arguments in PARSERS:
-            args = parse(
-                [*arguments, "--allowed-origin", "tauri://localhost"]
-                + ["--allowed-origin", "http://localhost:3000", "--allowed-origin", "*"]
-            )
-            self.assertEqual(
-                args.allowed_origin, ["tauri://localhost", "http://localhost:3000", "*"]
-            )
+        typed = ["tauri://localhost", "http://localhost:3000", "*"]
+        flags = [flag for origin in typed for flag in ("--allowed-origin", origin)]
+        # The launcher passes the values on as typed; the server parses them.
+        for (parse, arguments), parsed in zip(
+            PARSERS,
+            (
+                typed,
+                [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN],
+            ),
+        ):
+            self.assertEqual(parse([*arguments, *flags]).allowed_origin, parsed)
             self.assertEqual(parse(arguments).allowed_origin, [])
-            for origin in (
-                "",
-                "null",
-                "localhost:3000",
-                "http://",
-                "http://localhost:3000/",
-                "http://localhost/app",
-                "http://localhost?debug",
-                "http://user@localhost",
-                "http://localhost:99999",
-                "http://local host",
+            with (
+                mock.patch("sys.stderr", io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
             ):
-                with (
-                    self.subTest(origin=origin),
-                    mock.patch("sys.stderr", io.StringIO()),
-                    self.assertRaises(SystemExit),
-                ):
-                    parse([*arguments, "--allowed-origin", origin])
+                parse([*arguments, "--allowed-origin", "http://localhost/app"])
+            self.assertIn("expected a scheme and a host", stderr.getvalue())
 
     def test_cli_key_precedence_and_validation(self):
         for parse, arguments in PARSERS:
