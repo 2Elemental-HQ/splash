@@ -1020,10 +1020,12 @@ and checkpoints earlier requests left. So a greedy or seeded request repeats
 its output when it runs alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ.
 
-Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
-prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
-work. While requests of the same or a higher priority decode, each slice owes
-them decode time, `--decode-share` times its own, before the next slice runs.
+Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
+planned within one prefill chunk (2048 tokens) of where the request resumes or
+of its replay boundary. Contended prefill adapts toward a 500 ms slice, keeping
+2048-token chunks for long unopposed work. While requests of the same or a
+higher priority decode, each slice owes them decode time, `--decode-share`
+times its own, before the next slice runs.
 These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
@@ -1071,15 +1073,12 @@ point takes the slot of the oldest by writing that one out, and goes
 unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
-replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
-prefill chunk (2048 tokens) before the final replay boundary is captured only
-if a RAM slot is available without reclamation. Otherwise its predecessor stays
-usable for cancellation recovery; the final reusable state still uses the disk
-tier. Matched KV restores start from the root toward the selected
-state, with the state read alongside. Cancellation drops unsubmitted, unshared
-reads; submitted transfers drain before their buffers can be reused. Restored
-states remain usable even when there is no room to promote them into RAM cache.
-Promotion takes only the RAM of a state that keeps a disk copy.
+replaced or no longer needed. Matched KV restores start from the root toward
+the selected state, with the state read alongside. Cancellation drops
+unsubmitted, unshared reads; submitted transfers drain before their buffers
+can be reused. Restored states remain usable even when there is no room to
+promote them into RAM cache. Promotion takes only the RAM of a state that
+keeps a disk copy.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across

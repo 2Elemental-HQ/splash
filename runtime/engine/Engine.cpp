@@ -868,10 +868,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
-  if (const uint32_t interval = config_.prefillCheckpointTokens) {
-    for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
-         boundary < latestReplayBoundary; boundary += interval)
-      addStateBoundary(active, stateBoundary, static_cast<uint32_t>(boundary), true);
+  for (const uint32_t checkpoint : plannedCheckpoints(
+           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+    addStateBoundary(active, stateBoundary, checkpoint, true);
   }
   addStateBoundary(active, stateBoundary, junctionBoundary, false);
   addStateBoundary(active, stateBoundary, latestReplayBoundary, false);
@@ -995,17 +994,6 @@ void Engine::publishReachedStateBoundaries(Request &active,
     if (cache_.reuseCompositeState(block, checkpoint)) {
       ++counters_.deduplicatedStatePublications;
     } else {
-      std::shared_ptr<const CompositeState> state;
-      // A checkpoint close to the final reusable state is only worth
-      // capturing if it fits now. Otherwise keep the previous recovery
-      // point instead of evicting it or writing a short-lived replacement.
-      if (checkpoint && model_.canSnapshotToDisk() &&
-          uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-              replayStateBoundary(active)) {
-        state = model_.snapshot(active.request.id);
-        if (!state)
-          continue;
-      }
       // Recycle the previous recovery point before allocating its replacement.
       // A restore lease can delay this optional publication. A checkpoint
       // only on disk frees no cache slot for an ordinary state, so it stays
@@ -1015,8 +1003,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
         ++failures;
         continue;
       }
-      if (!state)
-        state = model_.snapshot(active.request.id);
+      std::shared_ptr<const CompositeState> state = model_.snapshot(active.request.id);
       // Room comes from what this publication's class may take: cached KV
       // unless it is an optional checkpoint, and states in use only for a
       // block in use. A state in use is never dropped for a busy write

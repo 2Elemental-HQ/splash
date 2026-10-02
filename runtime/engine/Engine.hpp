@@ -21,8 +21,10 @@ namespace splash::engine {
 struct EngineConfig final {
   uint32_t maxContext = kv::kMaximumLogicalTokens;
   uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
-  // Two draft windows balance recovery granularity and capture work.
-  // Zero disables progress checkpoints without changing reusable end states.
+  // Two draft windows balance recovery granularity and capture work; none is
+  // planned within one prefill chunk of where the request resumes or of its
+  // replay boundary. Zero disables progress checkpoints without changing
+  // reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the model's vision scratch covers; zero rejects images.
@@ -42,6 +44,25 @@ struct EngineConfig final {
   // (MemoryGovernor::setServing).
   std::function<void(bool)> serving;
 };
+
+// The progress checkpoints a request plans between the point it resumes from
+// and its replay boundary: the multiples of `interval` at least one prefill
+// chunk past the one and before the other, none when `interval` is zero.
+// They sit at multiples of the interval, so requests over the same prompt
+// share them. A checkpoint within one prefill chunk of either end would cost
+// a command split and a snapshot for less than a chunk of recompute.
+[[nodiscard]] inline std::vector<uint32_t>
+plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t interval) {
+  std::vector<uint32_t> checkpoints;
+  if (!interval)
+    return checkpoints;
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  for (uint64_t boundary =
+           (uint64_t{resumeBoundary} + chunk + interval - 1) / interval * interval;
+       boundary + chunk <= replayBoundary; boundary += interval)
+    checkpoints.push_back(static_cast<uint32_t>(boundary));
+  return checkpoints;
+}
 
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;

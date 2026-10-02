@@ -5418,7 +5418,8 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
     maximumEntries =
         std::max(maximumEntries, resources.snapshot().stateCache.entries);
   }
-  const uint32_t checkpoints = (prompt.size() / defaultCheckpointTokens);
+  // 24576 lies within one prefill chunk of the replay boundary at 24992.
+  const uint32_t checkpoints = 5;
   require(idle(engine) && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
@@ -5605,9 +5606,10 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   require(pinned.resumeBoundary() == defaultCheckpointTokens,
           "fixture did not pin its checkpoint");
   runUntilIdle(engine);
+  // The checkpoints at 8192 and 12288 cannot retire the pinned one; 16384
+  // lies within one prefill chunk of the replay boundary at 17984.
   require(engine.snapshot().checkpointPublications == 1 &&
-              engine.snapshot().checkpointPublicationFailures ==
-                  (prompt.size() / defaultCheckpointTokens) - 1 &&
+              engine.snapshot().checkpointPublicationFailures == 2 &&
               executor.snapshotAttempts == 2 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1 &&
@@ -5761,7 +5763,9 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   runUntilIdle(engine);
   const std::vector<uint32_t> prompt(18001, 28);
   engine.submit(request(461, prompt));
-  runUntilCheckpoint(engine, (prompt.size() / defaultCheckpointTokens));
+  // The last checkpoint is at 12288: 16384 lies within one prefill chunk of
+  // the replay boundary at 17984.
+  runUntilCheckpoint(engine, 3);
   executor.snapshotObserver = [&] {
     require(resources.snapshot().stateCache.entries == 1 &&
                 resources.lookup(hot).resumeBoundary() == 64,
@@ -5903,6 +5907,56 @@ void testCheckpointIntervalValidationAndDisable() {
   require(engine.snapshot().checkpointPublications == 0 && executor.snapshots == 1 &&
               resources.snapshot().stateCache.entries == 1,
           "disabling checkpoints changed existing replay-state behavior");
+}
+
+// A checkpoint costs a command split and a snapshot, so none is planned
+// within one prefill chunk of where a request resumes or of its replay
+// boundary: not for a follow-up resuming at 2976 whose replay boundary is
+// 4192, nor for one resuming at 4064.
+void testCheckpointsSkipNearResumeAndReplayBoundaries() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto checkpointPlanned = [&](uint64_t id) {
+    const auto &boundaries = executor.plans.at(id).boundaries;
+    return std::any_of(boundaries.begin(), boundaries.end(),
+                       [](const DraftBoundaryPlan &boundary) {
+                         return boundary.boundary == defaultCheckpointTokens;
+                       });
+  };
+  std::vector<uint32_t> prompt(3009);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest first = request(1, prompt);
+  // Its replay point lands at 2976, before the generation prompt.
+  first.generationPromptTokens = 7;
+  engine.submit(std::move(first));
+  runUntilIdle(engine);
+  const uint32_t snapshots = executor.snapshots;
+  prompt.resize(3002);
+  prompt.resize(4201, 500);
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2976} &&
+              !checkpointPlanned(2) && engine.snapshot().checkpointPublications == 0 &&
+              executor.snapshots == snapshots + 1,
+          "a follow-up checkpointed within a chunk of its resume point or replay boundary");
+
+  std::vector<uint32_t> resumed(4065);
+  std::iota(resumed.begin(), resumed.end(), 10'000);
+  engine.submit(request(3, resumed));
+  runUntilIdle(engine);
+  resumed.resize(8193, 600);
+  engine.submit(request(4, resumed));
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4064} &&
+              !checkpointPlanned(4) && engine.snapshot().checkpointPublications == 0,
+          "a request checkpointed within a chunk of the state it resumed from");
 }
 
 void testDecodeShareValidation() {
@@ -6154,7 +6208,11 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
   }
 }
 
-void testNearFinalCheckpointAvoidsDiskWrite() {
+// No checkpoint is planned within one prefill chunk of the replay boundary,
+// whether a cache slot would take it or only the disk: the replay state lands
+// in the next command. One a chunk or more away is published, on disk when no
+// cache slot takes it, and the replay state retires it.
+void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
     for (uint32_t remaining : {32u, chunk - 32, chunk}) {
@@ -6172,7 +6230,7 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
       const auto counters = engine.snapshot();
-      const uint64_t checkpoint = !denyRam || remaining >= chunk;
+      const uint64_t checkpoint = remaining >= chunk;
       require(counters.checkpointPublications == checkpoint &&
                   counters.checkpointPublicationFailures == 0 &&
                   counters.replayStatePublications == 1 &&
@@ -6181,7 +6239,8 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   counters.resources.stateCache.entries == 1 &&
                   counters.resources.stateCache.checkpointEntries == 0 &&
                   events.completedCount == 1 && events.failedCount == 0,
-              "near-final disk checkpoint policy changed RAM checkpoints or lost final state");
+              "a checkpoint within a chunk of the replay boundary was planned or the final "
+              "state was lost");
       executor.restoreControl->ready = true;
       engine.submit(request(2, prompt));
       runUntilIdle(engine);
@@ -6189,11 +6248,14 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
                                                        uint32_t(prompt.size() - 1)} &&
                   events.completedCount == 2 && events.failedCount == 0,
-              "skipping a disk checkpoint lost the final reusable prefix");
+              "skipping a checkpoint lost the final reusable prefix");
     }
   }
 }
 
+// The multiple of the interval within one prefill chunk of the replay
+// boundary is not planned: a lane cancelled past it, in RAM or with its
+// checkpoint on disk, resumes from the checkpoint before it.
 void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -6201,7 +6263,6 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     engine::Cache cache(pool, CacheNamespace{});
     Executor executor(1);
     executor.deniedSnapshots = disk ? 1000 : 0;
-    executor.denySnapshotAtBoundary = 2 * defaultCheckpointTokens;
     executor.stateTier = std::make_shared<OffloadControl>();
     executor.stateTier->ready = true;
     executor.restoreControl->ready = true;
@@ -6219,12 +6280,17 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     const auto before = engine.snapshot();
     require(!engine.commandInFlight() &&
                 executor.requests.at(1).position == 2 * defaultCheckpointTokens &&
+                std::none_of(executor.plans.at(1).boundaries.begin(),
+                             executor.plans.at(1).boundaries.end(),
+                             [](const DraftBoundaryPlan &boundary) {
+                               return boundary.boundary == 2 * defaultCheckpointTokens;
+                             }) &&
                 before.checkpointPublications == 1 &&
                 before.checkpointPublicationFailures == 0 &&
                 before.resources.stateCache.checkpointEntries == 1 &&
                 before.resources.stateCache.checkpointRetirements == 0 &&
                 executor.diskSnapshots == (disk ? 1 : 0),
-            "skipped near-final checkpoint retired or rewrote its predecessor");
+            "a near-final checkpoint was planned or replaced its predecessor");
     engine.cancel(1);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
@@ -7792,6 +7858,7 @@ int main() {
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
+    testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
     testColdPublishesReplayStateAndRebuildsALostOne();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
@@ -7811,7 +7878,7 @@ int main() {
     testStateAlreadyOnDiskIsDeduplicated();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
     testFailedFinalStateKeepsTheDiskCheckpoint();
-    testNearFinalCheckpointAvoidsDiskWrite();
+    testNoCheckpointWithinAChunkOfTheReplayBoundary();
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
