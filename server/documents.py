@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 if __package__:
     from .errors import APIError
@@ -31,13 +31,12 @@ PDF_DATA_URL_PREFIX = "data:application/pdf;base64,"
 
 @dataclass(slots=True)
 class DocumentBudget:
-    deadline: float | None = None
+    # The request's deadline; math.inf when it has none.
+    deadline: float
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
     remaining_pages: int = MAX_PAGES
 
     def remaining_time(self):
-        if self.deadline is None:
-            return -1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise APIError(504, "request timed out", "request_timeout")
@@ -74,13 +73,7 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
-    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
-
-
-def _render_limits():
-    return RenderLimits(
-        MAX_PAGES, MAX_PAGE_PIXELS, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES
-    )
+    request_bytes: int
 
 
 # Serialize cache misses so only one bounded PDF worker is active at a time.
@@ -95,11 +88,12 @@ def _render(payload, budget):
     else:
         from document_worker import render
 
-    limits = _render_limits()
-    limits = replace(
-        limits,
-        pages=min(limits.pages, budget.remaining_pages),
-        request_bytes=budget.remaining_bytes,
+    limits = RenderLimits(
+        min(MAX_PAGES, budget.remaining_pages),
+        MAX_PAGE_PIXELS,
+        MAX_TEXT_CHARACTERS,
+        MAX_RENDERED_BYTES,
+        budget.remaining_bytes,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -118,7 +112,6 @@ def render_pages(payload, budget, limits):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
-            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):

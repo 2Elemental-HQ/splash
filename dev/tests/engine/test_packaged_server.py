@@ -43,10 +43,10 @@ class PackagedServerTests(unittest.TestCase):
                     sys.executable,
                     "-I",
                     "-c",
-                    "import os, sys; sys.path.insert(0, os.getcwd()); "
+                    "import math, os, sys; sys.path.insert(0, os.getcwd()); "
                     "from server import server, documents; "
                     "file = {'file_data': sys.stdin.read()}; "
-                    "budget = documents.DocumentBudget(); "
+                    "budget = documents.DocumentBudget(deadline=math.inf); "
                     "print(documents.file_content(file, budget=budget)[0]['text'])",
                 ],
                 cwd=stage,

@@ -216,12 +216,14 @@ class PdfProtocolTests(unittest.TestCase):
         )
 
     def test_user_and_tool_files_share_one_request_budget(self):
-        budget = documents.DocumentBudget()
+        budget = documents.DocumentBudget(deadline=FOREVER)
         documents.file_content(self.file, budget=budget)
         one_file = documents.MAX_REQUEST_DOCUMENT_BYTES - budget.remaining_bytes
 
         def normalize(messages, remaining_bytes):
-            request_budget = documents.DocumentBudget(remaining_bytes=remaining_bytes)
+            request_budget = documents.DocumentBudget(
+                deadline=FOREVER, remaining_bytes=remaining_bytes
+            )
             with mock.patch.object(
                 api_shapes, "DocumentBudget", return_value=request_budget
             ):

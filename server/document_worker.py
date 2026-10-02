@@ -85,7 +85,9 @@ def _close_workers():
 
 
 def render(payload, limits, remaining):
-    duration = MAX_SECONDS if remaining < 0 else min(MAX_SECONDS, remaining)
+    """Render a PDF in a worker within the `remaining` seconds of its request,
+    infinite when it has no deadline, and the worker's own time limit."""
+    duration = min(MAX_SECONDS, remaining)
     deadline = time.monotonic() + duration
     command = [
         sys.executable,
@@ -111,7 +113,7 @@ def render(payload, limits, remaining):
         try:
             while process.poll() is None:
                 if time.monotonic() >= deadline:
-                    if 0 <= remaining <= MAX_SECONDS:
+                    if remaining <= MAX_SECONDS:
                         raise APIError(504, "request timed out", "request_timeout")
                     raise APIError(400, "PDF processing exceeded the time limit")
                 try:
