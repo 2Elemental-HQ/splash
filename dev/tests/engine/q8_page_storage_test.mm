@@ -218,7 +218,7 @@ void run(const std::string &metallib) {
             "low availability escalated to destructive system pressure");
     fakeHostAvailable = hostReserve + giB / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                !bounded.snapshot().growthAllowed &&
+                !bounded.snapshot().hostGrowthAllowed &&
                 !bounded.tryReserve(1).has_value(),
             "low host headroom did not request proactive cache reclaim");
     fakeHostAvailable = hostReserve + 3 * giB / 2;
@@ -226,13 +226,13 @@ void run(const std::string &metallib) {
             "warning pressure recovered without crossing the hysteresis");
     fakeHostAvailable = hostReserve + 3 * giB;
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
-                bounded.snapshot().growthAllowed,
+                bounded.snapshot().hostGrowthAllowed,
             "host recovery did not reopen admission");
     {
         auto reservation = bounded.tryReserve(64 * 1024);
         require(reservation.has_value(), "engine capacity reservation failed");
         const auto full = bounded.snapshot();
-        require(!full.growthAllowed && full.hostGrowthAllowed,
+        require(full.headroomBytes == 0 && full.hostGrowthAllowed,
                 "engine budget exhaustion was confused with host pressure");
     }
     fakeHostAvailable.reset();
@@ -268,13 +268,13 @@ void run(const std::string &metallib) {
             "low reclaimable memory bypassed bounded pressure recovery");
     pressurePages.fileBacked = 3 * giB;
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
-    require(bounded.snapshot().growthAllowed &&
+    require(bounded.snapshot().hostGrowthAllowed &&
                 bounded.tryReserve(1).has_value() &&
                 !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaim,
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                bounded.snapshot().growthAllowed &&
+                bounded.snapshot().hostGrowthAllowed &&
                 bounded.tryReserve(1).has_value(),
             "system warning blocked growth despite sufficient host headroom");
     fakeHostAvailable = hostReserve + giB / 2;

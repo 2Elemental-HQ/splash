@@ -135,13 +135,12 @@ void testCleanRuntimeStatus() {
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
   governor.chargedBytes = metal.allocatedBytes;
-  governor.servingFootprintBytes = 3 * kGiB;
   governor.headroomBytes = governor.limitBytes - governor.chargedBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
 
   model::ModelTelemetry executorTelemetry;
   executorTelemetry.stateAllocatedBytes = 350'224'384;
@@ -233,9 +232,9 @@ void testCleanRuntimeStatus() {
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
                   std::string::npos,
           "status omitted the host-side growth constraints");
-  require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
-              std::string::npos,
-          "status omitted the serving footprint");
+  require(json.find("\"serving_footprint_bytes\"") == std::string::npos &&
+              json.find("\"reserved_bytes\"") == std::string::npos,
+          "status reported a governor field nothing reads");
   require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
@@ -340,7 +339,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   // governor's critical verdict marks it not ready.
   governor.hostAvailableBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Warning;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   require(status().find("\"ready\":true") != std::string::npos,
           "reaching the host reserve under warning marked the server not ready");
   governor.hostAvailableBytes = 1 * kGiB;
@@ -349,7 +348,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
           "critical memory pressure was marked ready");
   governor.hostAvailableBytes = 8 * kGiB;
   governor.pressure = MemoryPressure::Normal;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
 }
 
 void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
@@ -443,7 +442,7 @@ void testMemoryPressureTelemetry() {
   governor.hostAvailableBytes = 2 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Critical;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true);
   };

@@ -397,7 +397,7 @@ int runNative(const NativeArguments &arguments) {
     const engine::ResourceWaitSnapshot wait =
         published->nativeLoop().resourceWaitSnapshot();
     const std::string diagnostic =
-        memoryReporter.update(wait, memory.growthAllowed);
+        memoryReporter.update(wait, memory.hostGrowthAllowed);
     if (!diagnostic.empty())
       writeStderrLine(diagnostic);
     engine::MemoryReclaimDirective directive =

@@ -383,7 +383,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         while (modelPointer->reclaimIdleState(true)) {
         }
         static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, true));
-        resourcesPointer->memoryGovernor().markServingFootprint();
         return report;
       },
       *nativeLoop);

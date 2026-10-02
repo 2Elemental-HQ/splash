@@ -258,11 +258,6 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
-void MemoryGovernor::markServingFootprint() noexcept {
-  std::lock_guard lock(mutex_);
-  servingFootprintBytes_ = chargedBytes(true);
-}
-
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
@@ -285,11 +280,9 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostAvailable, reservedBytes_);
   bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
       !hostHeld() && hostHeadroom >= kHostWarningMarginBytes;
-  bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
       observed,
-      servingFootprintBytes_,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
@@ -299,7 +292,6 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostReserveBytes_,
       hostHeadroom,
       systemPressure_,
-      growthAllowed,
       hostGrowthAllowed,
   };
 }

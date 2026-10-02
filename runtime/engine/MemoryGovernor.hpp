@@ -73,10 +73,9 @@ struct MemoryGovernorSnapshot {
   // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
   uint64_t chargedBytes = 0;
-  // The charged bytes once warmup released all but one lane's state and one
-  // empty KV extent (markServingFootprint); zero until then.
-  uint64_t servingFootprintBytes = 0;
   uint64_t reservedBytes = 0;
+  // Room under the limit beside what is charged and reserved: zero once the
+  // engine's limit is reached.
   uint64_t headroomBytes = 0;
   MemoryPressure pressure = MemoryPressure::Normal;
   // Failed reservation attempts, including retries of the same request.
@@ -86,7 +85,6 @@ struct MemoryGovernorSnapshot {
   uint64_t hostReserveBytes = 0;
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
-  bool growthAllowed = true;
   // Whether the host has room for growth that no request in service needs.
   // tryReserve still grants what such a request needs while this is false,
   // short of critical pressure.
@@ -205,10 +203,6 @@ public:
   // A pass that releases or waits for memory again, or the host's recovery,
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
-  // Records what is charged once warmup has released all but one lane's
-  // state and one empty KV extent: the footprint an idle server keeps
-  // through warning pressure, which /status reports.
-  void markServingFootprint() noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -235,7 +229,6 @@ private:
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
-  uint64_t servingFootprintBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   mutable bool hostConstrained_ = false;

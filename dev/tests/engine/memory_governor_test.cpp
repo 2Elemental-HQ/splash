@@ -332,9 +332,6 @@ void testRequestInServiceGrowsThroughHostPressure() {
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
   MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
-  governor.markServingFootprint();
-  require(governor.snapshot().servingFootprintBytes == 14 * kGiB,
-          "the snapshot did not report the serving footprint");
   const auto grow = [&](uint64_t bytes, metal::AllocationFailure *failure = nullptr) {
     auto reservation = governor.tryReserve(bytes, failure);
     if (!reservation)
