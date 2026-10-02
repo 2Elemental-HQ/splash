@@ -1163,6 +1163,12 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
 
+Each phase's record keeps what its requests reused of the cache (`reuse`).
+Every request after a phase's first resends the conversation, so a phase other
+than the cancellation phase (`cancel`) that completed two or more requests and
+reused no cached prompt token fails. Replay points of unfinished requests
+evicted during a phase only print a warning.
+
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 

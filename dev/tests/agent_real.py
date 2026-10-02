@@ -320,6 +320,22 @@ def idle_status():
     raise AgentFailure("server did not return to idle")
 
 
+def prefix_reuse(before, after):
+    """What a phase's requests reused of the cache, from the idle status
+    before and after it."""
+
+    def delta(section, key):
+        return after[section][key] - before[section][key]
+
+    return {
+        "reused_tokens": delta("cache", "reused_tokens"),
+        "prefill_input_tokens": delta("metrics", "prefill_input_tokens"),
+        "lost_state_misses": delta("cache", "lost_state_misses"),
+        "in_use_evictions": delta("state", "in_use_evictions"),
+        "completed": delta("requests", "completed"),
+    }
+
+
 def pressure_stop_level():
     """macOS pressure level at which a client workflow stops: 1 normal, 2
     warning, 4 critical. The default stops at any warning; set
@@ -735,6 +751,8 @@ class ClientRun:
             "log": str(log),
             "executed_commands": executed_commands(self.name, parsed, messages, turns),
         }
+        if after is not None:
+            row["reuse"] = prefix_reuse(before, after)
         self.phases.append(row)
         atomic_json(self.folder / f"{label}.json", row)
         atomic_json(self.folder / "session.json", {"session": self.session})
@@ -751,6 +769,16 @@ class ClientRun:
             raise AgentFailure("client did not expose a real session id")
         if after["requests"]["failed"] != before["requests"]["failed"]:
             raise AgentFailure("native request failed")
+        reuse = row["reuse"]
+        # Running work takes the replay points unfinished requests hold after
+        # everything else; at a tight --max-memory that is legitimate, so it
+        # is recorded, not gated.
+        if reuse["in_use_evictions"]:
+            print(
+                f"{self.name}/{label}: warning: {reuse['in_use_evictions']} replay "
+                "points of unfinished requests were evicted",
+                flush=True,
+            )
         if cancel:
             if (
                 not interrupted
@@ -799,6 +827,13 @@ class ClientRun:
                     raise AgentFailure(
                         "OpenCode did not finish its user turn with assistant text"
                     )
+            # Every request after a phase's first resends the conversation, so
+            # a working replay point always reuses some of it.
+            if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
+                raise AgentFailure(
+                    "phase reused no cached prompt tokens across "
+                    f"{reuse['completed']} requests"
+                )
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
