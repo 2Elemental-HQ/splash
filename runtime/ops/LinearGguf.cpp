@@ -341,7 +341,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
       graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
-                GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
+                GgufPrefillParams{k, w.rows, n, s.columnOffset},
                 {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
                 {GGUF_PREFILL_THREADS, 1, 1});
     }

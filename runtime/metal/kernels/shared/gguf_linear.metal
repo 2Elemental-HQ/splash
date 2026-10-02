@@ -36,12 +36,8 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 // threadgroup, measured up to 4% slower on an M5 Max and no faster on an M3 Max.
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
-                    uint output_size, uint input_size, uint output_origin, uint rows, threadgroup half *stage,
-                    threadgroup half2 *tl, uint simd_lane, uint simd_group, uint out_stride = 0, uint out_offset = 0,
-                    device bfloat *aux = nullptr) {
-  // 0 = output_size (Gguf.h). The host always passes the stride, but dropping the fallback changes these kernels'
-  // code, a change to measure on its own.
-  if (out_stride == 0) out_stride = output_size;
+                    uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
+                    uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
   // Prefetch: the steps whose weights are loaded ahead of the one being staged.
   constexpr ushort Prefetch = 1, Threads = Simdgroups * 32, GPS = KS / 32, Items = TileN * GPS,
@@ -227,20 +223,19 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
     GGUF_PREFILL_TABLES(F);                                                                                        \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
-                                         output + ulong(first) * (p.out_stride ? p.out_stride : p.output_size),   \
-                                         p.output_size, p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, \
-                                         simd_lane, simd_group, p.out_stride, p.out_offset);                      \
+                                         output + ulong(first) * p.out_stride, p.input_size,                       \
+                                         group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,      \
+                                         p.out_stride, p.out_offset);                                              \
   }
 #define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
     GGUF_PREFILL_TABLES(F);                                                                                        \
-    const uint rs = p.out_stride ? p.out_stride : p.output_size;                                                   \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
-                                             output + ulong(first) * rs, p.output_size, p.input_size,              \
+                                             output + ulong(first) * p.out_stride, p.input_size,                   \
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
-                                             p.out_stride, p.out_offset, aux + ulong(first) * rs);                 \
+                                             p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);       \
   }
 #define GGUF_PREFILL_FORMAT(F, f) \
   GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)

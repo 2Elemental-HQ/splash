@@ -28,7 +28,6 @@ static_assert([] {
     if (format.meta_groups * 32 != format.block_elements) return false;
   return true;
 }(), "a meta unit is one native block");
-static_assert(GGUF_TYPE_F32 == ggml::kF32, "float segments carry the GGUF type id");
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }

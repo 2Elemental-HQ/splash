@@ -1,11 +1,10 @@
 #pragma once
-#include "metal/abi/Gguf.h"
 #include <metal_stdlib>
 using namespace metal;
 
 // What both GGUF GEMM families (kernels/shared/gguf_linear.metal and
 // kernels/decode/linear_gguf_sgmatrix.metal) do to a finished fp32 sum.
-enum GgufEpilogue : ushort { EpNone = GGUF_EPILOGUE_NONE, EpResidual = GGUF_EPILOGUE_RESIDUAL, EpUpWithGate = GGUF_EPILOGUE_UP_WITH_GATE };
+enum GgufEpilogue : ushort { EpNone, EpResidual, EpUpWithGate };
 
 inline float gguf_silu(float g) { return g / (1.0f + fast::exp2(-1.44269504089f * g)); }
 
