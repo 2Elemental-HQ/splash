@@ -153,7 +153,7 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"recommended_working_set_bytes\":" << recommendedWorkingSetBytes
       << ','
       << "\"configured_memory_limit_bytes\":" << configuredMemoryLimitBytes
-      << ',' << "\"headroom_bytes\":" << headroomBytes << ','
+      << ',' << "\"working_set_margin_bytes\":" << workingSetMarginBytes << ','
       << "\"hard_budget_bytes\":" << hardBudgetBytes << ','
       << "\"target_weights_bytes\":" << targetWeightsBytes << ','
       << "\"draft_weights_bytes\":" << draftWeightsBytes << ','
@@ -190,7 +190,7 @@ std::string EngineMemoryBreakdown::describe() const {
                                      : "automatic")
       << '\n'
       << "working-set margin (max of 1 GiB or 2%): "
-      << bytesAndMiB(headroomBytes) << '\n'
+      << bytesAndMiB(workingSetMarginBytes) << '\n'
       << "hard budget: " << bytesAndMiB(hardBudgetBytes) << '\n'
       << "target weights: " << bytesAndMiB(targetWeightsBytes) << '\n'
       << "draft weights: " << bytesAndMiB(draftWeightsBytes) << '\n'
@@ -306,12 +306,14 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                                   std::move(breakdown))};
   }
 
-  breakdown.headroomBytes = EngineMemoryPolicy::workingSetMarginBytes(
+  breakdown.workingSetMarginBytes = EngineMemoryPolicy::workingSetMarginBytes(
       breakdown.recommendedWorkingSetBytes);
-  if (breakdown.recommendedWorkingSetBytes <= breakdown.headroomBytes) {
+  if (breakdown.recommendedWorkingSetBytes <=
+      breakdown.workingSetMarginBytes) {
     return {std::nullopt,
             failure(BudgetErrorCode::WorkingSetTooSmall,
-                    "recommended working set does not exceed required headroom",
+                    "recommended working set does not exceed the working-set "
+                    "margin",
                     std::move(breakdown))};
   }
   breakdown.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(

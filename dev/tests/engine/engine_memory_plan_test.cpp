@@ -72,6 +72,11 @@ void testUnifiedElasticBudget() {
   require(json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
               json.find("\"kv_extent_pages\":128") != std::string::npos,
           "elastic state/KV budget is missing from memory status");
+  require(json.find("\"working_set_margin_bytes\":" +
+                    std::to_string(budget.workingSetMarginBytes)) !=
+                  std::string::npos &&
+              json.find("\"headroom_bytes\"") == std::string::npos,
+          "memory status did not name the working-set margin");
 }
 
 void testBf16BudgetAndStatus() {

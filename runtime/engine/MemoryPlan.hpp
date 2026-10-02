@@ -109,7 +109,7 @@ struct EngineMemoryBreakdown {
   // Optional user ceiling. Zero means the automatic safe working-set
   // ceiling. A higher value never overrides the OS-safe ceiling.
   uint64_t configuredMemoryLimitBytes = 0;
-  uint64_t headroomBytes = 0;
+  uint64_t workingSetMarginBytes = 0;
   uint64_t hardBudgetBytes = 0;
 
   uint64_t targetWeightsBytes = 0;
