@@ -532,6 +532,27 @@ void testDecodeRepaysItsShareOfContendedPrefill() {
   }
 }
 
+// A constrained lane waits for its first mask while an equal-priority prompt
+// prefills: decode could not have used that time, so once the mask arrives
+// the kinds alternate without banked debt.
+void testMaskWaitAccruesNoDecodeDebt() {
+  engine::Scheduler scheduler(0.5);
+  scheduler.submit(request(1, 1, BatchCohort::Constrained));
+  scheduler.resourcesReady(1, 1);
+  const BatchPlan initial = *scheduler.next();
+  scheduler.commit(initial);
+  const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+  scheduler.complete(initial, result);
+  scheduler.submit(request(2, 20'000));
+  scheduler.resourcesReady(2, 0);
+  for (uint32_t command = 0; command < 3; ++command)
+    completePrefill(scheduler, *scheduler.next(), 500.0);
+  scheduler.maskReady(1);
+  completeDecode(scheduler, false, 50.0);
+  require(scheduler.next()->kind == WorkKind::Prefill,
+          "prefill beside a lane waiting for its mask banked decode debt");
+}
+
 void testDecodeDebtLeavesWithTheLastDecoder() {
   for (const bool finished : {true, false}) {
     engine::Scheduler scheduler(0.5);
@@ -1062,6 +1083,7 @@ int main() {
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testDecodeRepaysItsShareOfContendedPrefill();
+    testMaskWaitAccruesNoDecodeDebt();
     testDecodeDebtLeavesWithTheLastDecoder();
     testHigherPriorityPrefillPrecedesDecodeDebt();
     testMeasuredBudgetOnlyLimitsContendedWork();

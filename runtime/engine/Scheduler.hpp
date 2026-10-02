@@ -153,8 +153,9 @@ private:
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
   double decodeShare_;
-  // Decode time that contended prefill still owes: equal-priority decode
-  // runs until its commands' wall time has worked it off.
+  // Decode time that prefill still owes the lanes that decoded beside it
+  // (not those waiting for a mask): equal-priority decode runs until its
+  // commands' wall time has worked it off.
   double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;

@@ -502,7 +502,9 @@ void Scheduler::complete(const BatchPlan &plan,
   }
   // While requests of the same or a higher priority decode, lanes this
   // prefill finished included, it owes decode a share of its time; decode
-  // commands work the debt off with their own.
+  // commands work the debt off with their own. A lane waiting for its mask
+  // is owed nothing: it could not have decoded meanwhile, and the slice
+  // already bounds the prefill it waits behind.
   if (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
     if (plan.kind == WorkKind::Decode) {
       decodeDebtMilliseconds_ =
@@ -513,9 +515,7 @@ void Scheduler::complete(const BatchPlan &plan,
       const bool contended = std::any_of(
           requests_.begin(), requests_.end(), [&](const auto &entry) {
             const Request &peer = entry.second;
-            return (peer.phase == Phase::Decode ||
-                    peer.phase == Phase::WaitingMask) &&
-                   peer.spec.priority <= priority;
+            return peer.phase == Phase::Decode && peer.spec.priority <= priority;
           });
       if (contended)
         decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
