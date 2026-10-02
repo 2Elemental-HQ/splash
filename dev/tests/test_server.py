@@ -6431,10 +6431,7 @@ class ServerTest(unittest.TestCase):
                 {"repetition_penalty": True},
                 "repetition_penalty must be a positive number",
             ),
-            (
-                {"logit_bias": {"1": 2}},
-                "logit_bias is not supported with speculative decoding",
-            ),
+            ({"logit_bias": {"1": 2}}, "logit_bias is not supported"),
         )
         for fields, message in refused:
             with self.subTest(fields=fields):
@@ -6501,8 +6498,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 400, payload)
         self.assertEqual(
-            json.loads(payload)["error"]["message"],
-            "logit_bias is not supported with speculative decoding",
+            json.loads(payload)["error"]["message"], "logit_bias is not supported"
         )
         self.assertEqual(len(runtime.requests), 1)
 

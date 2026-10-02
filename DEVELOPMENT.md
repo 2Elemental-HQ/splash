@@ -832,10 +832,10 @@ one for every token of the prompt or of the output so far, and presence and
 frequency lower the logit of every output token by `presence_penalty` plus
 `frequency_penalty` times its count. Speculative decoding stays exact: each
 verified draft position counts the draft tokens before it, so a penalized
-request samples as it would without a draft. Like vLLM with speculative
-decoding, which Splash always uses, any `logit_bias` returns 400. Like vLLM
-and HF, repetition counts every prompt token: with the Qwen templates that
-includes the tool-call syntax every tool-enabled system prompt carries,
+request samples as it would without a draft. Splash does not implement
+`logit_bias`: a non-empty one returns 400; `null` and `{}` are accepted. Like
+vLLM and HF, repetition counts every prompt token: with the Qwen templates
+that includes the tool-call syntax every tool-enabled system prompt carries,
 earlier tool calls and reasoning, and the `<think>` markers of the generation
 prompt, so a `repetition_penalty` above 1 can delay tool calls and the end of
 reasoning and change names copied from the context. Anthropic Messages defines

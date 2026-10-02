@@ -91,8 +91,7 @@ PREPARATION_WAIT_SECONDS = 30.0
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 FLOAT32_MAX = float.fromhex("0x1.fffffep127")
 # vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
-# vllm/sampling_params.py), which also keeps the sampler's reciprocal of the
-# temperature finite.
+# vllm/sampling_params.py); Splash does the same.
 MIN_SAMPLING_TEMPERATURE = 0.01
 
 # The sampling numbers a request may set: each with its default (Qwen's
@@ -1149,10 +1148,10 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
-        # vLLM refuses any logit_bias with speculative decoding, which Splash
-        # always uses, so a request may send only an empty one.
+        # Splash does not implement logit_bias, so only an empty one (null or
+        # {}) is accepted; a non-empty one is refused rather than ignored.
         if body.get("logit_bias") not in (None, {}):
-            raise APIError(400, "logit_bias is not supported with speculative decoding")
+            raise APIError(400, "logit_bias is not supported")
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
