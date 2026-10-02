@@ -6,7 +6,6 @@
 #include <filesystem>
 #include <optional>
 #include <span>
-#include <vector>
 
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
@@ -28,7 +27,7 @@ public:
 
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.
-  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return weights_; }
+  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return images_.weights(); }
   // Writes every missing image and maps none.
   void prepare();
 
@@ -40,15 +39,10 @@ public:
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
 private:
-  [[nodiscard]] WeightWriter writer(size_t index);
-  [[nodiscard]] WeightFile open(size_t index);
-
   metal::MetalBackend &backend_;
   WeightSource source_;
-  std::vector<gguf::Image> images_; // layers, head, embedding
   std::optional<GgufRotation> rotation_;
-  std::vector<PreparedWeight> weights_;
-  PreparedFiles files_;
+  PreparedImages<gguf::Image> images_; // layers, head, embedding
 };
 
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE

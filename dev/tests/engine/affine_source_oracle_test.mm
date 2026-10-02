@@ -78,8 +78,9 @@ int main(int argc, char **argv) {
         model::AffineTargetLoader loader(backend, argv[2], layout);
         const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
         const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
+        const std::vector<model::affine::Image> images = model::affineTargetImages(layout);
         for (uint32_t layer = begin; layer < end; ++layer) {
-          const auto sections = model::affineLayerImage(layout, layer).sections;
+          const auto &sections = images.at(layer).sections;
           const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
                                                &model::affine::Section::kind);
           const bool gdn = decay != sections.end();

@@ -135,14 +135,18 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
-    for (const gguf::Image &image :
-         std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
-                    descriptor.target))
-      bytes += image.bytes;
+    bytes = std::visit(
+        [&](const auto &layout) {
+          return PreparedImages<gguf::Image>::bytes(gguf::planImages(file, ggufTargetGeometry(layout)));
+        },
+        descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
-    bytes = std::visit([](const auto &layout) { return preparedAffineBytes(layout); }, descriptor.target);
+    bytes = std::visit(
+        [](const auto &layout) { return PreparedImages<affine::Image>::bytes(affineTargetImages(layout)); },
+        descriptor.target);
   }
-  if (descriptor.draftSource == DraftSource::Checkpoint) bytes += preparedDraftBytes(descriptor.draft);
+  if (descriptor.draftSource == DraftSource::Checkpoint)
+    bytes += PreparedImages<affine::Image>::bytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += preparedVisionBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {

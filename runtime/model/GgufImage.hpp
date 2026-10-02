@@ -92,6 +92,7 @@ struct Repack {
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin
+  std::string magic; // kGgufImageMagic
   uint32_t layer = 0;
   uint32_t type = 0;
   uint64_t bytes = 0;

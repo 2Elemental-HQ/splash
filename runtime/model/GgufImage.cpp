@@ -48,9 +48,10 @@ public:
           std::string name, uint32_t layer, uint32_t type)
       : file_(file), geometry_(geometry), problems_(problems) {
     image_.name = std::move(name);
+    image_.magic = kGgufImageMagic;
     image_.layer = layer;
     image_.type = type;
-    const auto header = weightFileHeader(kGgufImageMagic, layer, type);
+    const auto header = weightFileHeader(image_.magic, layer, type);
     image_.fills.push_back({0, {header.begin(), header.end()}});
     cursor_ = header.size();
   }

@@ -449,7 +449,9 @@ target, `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) and `AffinePreparation`
 for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`)
 and `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation`
 for an MLX or GGUF vision tower. They open their files through `PreparedFiles`,
-the `PreparedWeights` cache with the load's guards. `AffinePreparation` reorders
+the `PreparedWeights` cache with the load's guards; the target and draft loaders
+keep their planned images in `PreparedImages` (`PreparedFiles.hpp`), whose
+sizes `preparedModelWeightBytes` sums. `AffinePreparation` reorders
 an MLX target's codes, scales and biases into 256-row tiles without
 requantization, quantizes the draft's BF16 projections into the same tiles
 ([Drafts](#drafts)) and computes GDN decay as `float(-exp(double(A_log)))`,
