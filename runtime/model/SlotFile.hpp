@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Checked.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -66,23 +68,22 @@ private:
 // a span that start at an aligned offset of the slot, in memory aligned
 // like slot offsets, move straight between memory and the file; everything
 // else, such as the rest of a span short of a chunk, moves through an
-// aligned buffer of the worker's own, so the file sees only aligned
-// transfers. A slot is readable only after one complete write; a failed or
-// cancelled write leaves it unreadable, and after a failed write the file
-// accepts no further writes. A freed slot returns its quota at once; one
-// that was written returns its blocks to the volume (F_PUNCHHOLE) on the
-// worker, after the operation in flight and before any later one
-// (DiskBudget). So that a file-size limit fails a write rather than
+// aligned buffer of the worker's own, so the file sees only transfers
+// aligned to the host page (kHostPageBytes), as uncached IO wants; a slot is
+// a whole number of host pages. A slot is readable only after one complete
+// write; a failed or cancelled write leaves it unreadable, and after a
+// failed write the file accepts no further writes. A freed slot returns its
+// quota at once; one that was written returns its blocks to the volume
+// (F_PUNCHHOLE) on the worker, after the operation in flight and before any
+// later one (DiskBudget). So that a file-size limit fails a write rather than
 // killing the process, a file ignores SIGXFSZ from its construction on.
 class SlotFile final {
   struct Backing;
 
 public:
-  // Slot offsets and every transfer stay aligned to this for uncached IO.
-  static constexpr uint64_t kAlignmentBytes = 16384;
   // The slot that holds payloadBytes: writes zero the rest.
   [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
-    return (payloadBytes + kAlignmentBytes - 1) / kAlignmentBytes * kAlignmentBytes;
+    return alignUp(payloadBytes);
   }
 
   class Slot final {

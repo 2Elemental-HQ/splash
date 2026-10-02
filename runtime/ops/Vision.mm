@@ -1,5 +1,6 @@
 #include "Vision.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Vision.h"
 
 #include <algorithm>
@@ -21,16 +22,11 @@ constexpr uint32_t kMergerColumnTile = 256;
 constexpr uint32_t kKeyTile = 128;
 constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
-constexpr uint64_t kArenaAlignment = 16 * 1024;
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
-}
-
-uint64_t alignArena(uint64_t bytes) noexcept {
-  return (bytes + kArenaAlignment - 1) / kArenaAlignment * kArenaAlignment;
 }
 
 // Scratch tensor byte sizes for one encoder sized to maximumPatches. GEMM
@@ -89,7 +85,7 @@ uint64_t Vision::scratchBytes(const VisionLayout &layout,
   }
   uint64_t total = 0;
   for (uint64_t bytes : scratchLayout(layout, maximumPatches)) {
-    const uint64_t aligned = alignArena(bytes);
+    const uint64_t aligned = alignUp(bytes);
     if (aligned > std::numeric_limits<uint64_t>::max() - total) {
       throw std::overflow_error("vision scratch byte count overflows");
     }
@@ -114,7 +110,7 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
   const auto layout = scratchLayout(model.layout, maximumPatches);
   for (uint32_t index = 0; index < layout.size(); ++index) {
     scratch_[index] = backend.view(arena_, cursor, layout[index]);
-    cursor += alignArena(layout[index]);
+    cursor += alignUp(layout[index]);
   }
   if (cursor != total)
     throw std::logic_error("vision scratch arena mismatch");

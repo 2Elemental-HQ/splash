@@ -1,3 +1,4 @@
+#include "Checked.hpp"
 #include "TestCache.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
@@ -1649,7 +1650,7 @@ void testDiskReplacementSpansStatesAndKv() {
 // When only the KV tier failed to start, the states' file still draws on the
 // disk quota, and the quota and its IO are reported all the same.
 void testQuotaWithoutTheKvTier() {
-  constexpr uint64_t size = model::SlotFile::kAlignmentBytes;
+  constexpr uint64_t size = kHostPageBytes;
   auto budget = std::make_shared<model::DiskBudget>(4 * size);
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};

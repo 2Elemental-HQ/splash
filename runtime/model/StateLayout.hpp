@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Checked.hpp"
+
 #include <cstdint>
 
 namespace splash::model {
@@ -11,7 +13,6 @@ inline constexpr uint32_t kGdnConvolutionTaps = 4;
 // Physical state geometry is supplied by the paired target and draft models.
 // The engine sees only opaque CompositeState handles and byte accounting.
 struct GdnStateLayout final {
-  static constexpr uint32_t alignmentBytes = 16 * 1024;
   static constexpr uint32_t bfloat16Bytes = 2;
 
   uint32_t layers = 0;
@@ -25,19 +26,16 @@ struct GdnStateLayout final {
     return layers && convolutionHistory && convolutionChannels &&
            recurrentGroups && recurrentRows && recurrentColumns;
   }
-  [[nodiscard]] static constexpr uint64_t align(uint64_t bytes) noexcept {
-    return (bytes + alignmentBytes - 1) & ~uint64_t(alignmentBytes - 1);
-  }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
-    return align(uint64_t{convolutionHistory} * convolutionChannels *
-                 bfloat16Bytes);
+    return alignUp(uint64_t{convolutionHistory} * convolutionChannels *
+                   bfloat16Bytes);
   }
   [[nodiscard]] constexpr uint64_t convolutionBytes() const noexcept {
     return uint64_t{layers} * convolutionLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t recurrentLayerBytes() const noexcept {
-    return align(uint64_t{recurrentGroups} * recurrentRows *
-                 recurrentColumns * sizeof(float));
+    return alignUp(uint64_t{recurrentGroups} * recurrentRows *
+                   recurrentColumns * sizeof(float));
   }
   [[nodiscard]] constexpr uint64_t recurrentBytes() const noexcept {
     return uint64_t{layers} * recurrentLayerBytes();

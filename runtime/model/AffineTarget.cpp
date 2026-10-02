@@ -1,4 +1,5 @@
 #include "model/AffineTarget.hpp"
+#include "Checked.hpp"
 #include "model/AffinePlan.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
@@ -27,8 +28,8 @@ void projection(Image &image, std::initializer_list<std::pair<std::string, uint3
   section.columns = columns;
   section.bits = bits;
   section.experts = experts;
-  section.bytes = checkedWeightMultiply(uint64_t(rows) * columns * bits / 8 +
-                                        uint64_t(rows) * columns / 16, experts, "affine projection");
+  section.bytes = checkedMultiply<WeightStoreError>(
+      uint64_t(rows) * columns * bits / 8 + uint64_t(rows) * columns / 16, experts, "affine projection");
   uint64_t sourceRows = 0;
   for (const auto &[name, count] : parts) {
     image.quantized.emplace_back(name, bits);

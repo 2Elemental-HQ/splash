@@ -1,5 +1,6 @@
 #include "WeightStore.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufImageLayout.hpp"
 #include "model/PreparedWeights.hpp"
@@ -23,37 +24,23 @@
 
 namespace splash::model {
 
-uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
-                         std::string_view description) {
-    if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-        throw WeightStoreError(std::string(description) + " overflows");
-    }
-    return left * right;
-}
+static_assert(kWeightFileAlignment == kHostPageBytes, "weight files are mapped at host page boundaries");
 
 namespace {
-
-[[nodiscard]] uint64_t checkedWeightAdd(uint64_t left, uint64_t right,
-                                        std::string_view description) {
-    if (left > std::numeric_limits<uint64_t>::max() - right) {
-        throw WeightStoreError(std::string(description) + " overflows");
-    }
-    return left + right;
-}
 
 [[nodiscard]] uint64_t q4Elements(uint32_t outputSize, uint32_t inputSize) {
     if (!outputSize || !inputSize || inputSize % kQ4GroupElements) {
         throw WeightStoreError(
             "Q4 projection dimensions must be positive and input-aligned");
     }
-    return checkedWeightMultiply(outputSize, inputSize, "Q4 element count");
+    return checkedMultiply<WeightStoreError>(outputSize, inputSize, "Q4 element count");
 }
 
 } // namespace
 
 uint64_t q4PackedBytes(uint32_t outputSize, uint32_t inputSize) {
     uint64_t elements = q4Elements(outputSize, inputSize);
-    return checkedWeightMultiply(elements / 16, 9, "Q4 packed byte count");
+    return checkedMultiply<WeightStoreError>(elements / 16, 9, "Q4 packed byte count");
 }
 
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize) {
@@ -70,7 +57,8 @@ namespace {
 constexpr uint64_t kHeaderBytes = std::tuple_size_v<decltype(weightFileHeader({}, 0, 0))>;
 
 uint64_t alignPacked(uint64_t value) {
-    static_cast<void>(checkedWeightAdd(value, kWeightFileAlignment - 1, "packed file alignment"));
+    static_cast<void>(
+        checkedAdd<WeightStoreError>(value, kWeightFileAlignment - 1, "packed file alignment"));
     return alignWeightOffset(value);
 }
 
@@ -202,7 +190,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
                                        std::string_view label) {
     if (!bytes) throw WeightStoreError("packed section must not be empty");
     uint64_t start = alignPacked(impl_->offset);
-    uint64_t end = checkedWeightAdd(start, bytes, "packed section end");
+    uint64_t end = checkedAdd<WeightStoreError>(start, bytes, "packed section end");
     if (start % kWeightFileAlignment || end > impl_->mapping->bytes()) {
         throw WeightStoreError(
             "packed file is truncated at section " + std::string(label));
@@ -214,7 +202,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
 std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t> parts,
                                                   std::string_view label) {
     uint64_t bytes = 0;
-    for (uint64_t part : parts) bytes = checkedWeightAdd(bytes, part, "packed section size");
+    for (uint64_t part : parts) bytes = checkedAdd<WeightStoreError>(bytes, part, "packed section size");
     const metal::MetalBuffer whole = section(bytes, label);
     std::vector<metal::MetalBuffer> views;
     uint64_t offset = 0;
@@ -348,8 +336,8 @@ readAffineExpertProjection(WeightFile &file, uint32_t experts,
     validateQ4Layout(outputSize, inputSize);
     const uint64_t stride = q4PackedBytes(outputSize, inputSize);
     return {
-        file.section(checkedWeightMultiply(experts, stride,
-                                           "expert Q4 slab bytes"),
+        file.section(checkedMultiply<WeightStoreError>(experts, stride,
+                                                       "expert Q4 slab bytes"),
                      label),
         experts,
         outputSize,

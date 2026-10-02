@@ -136,7 +136,7 @@ uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                             const ops::ExecutionPlans &operators) {
   uint64_t bytes = 0;
   for (uint64_t value : prefillTensorBytes(geometry, operators)) {
-    bytes = checkedAdd(bytes, alignArena(value), "prefill arena");
+    bytes = checkedAdd(bytes, alignUp(value), "prefill arena");
   }
   return bytes;
 }
@@ -316,7 +316,7 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
   uint64_t bytes = 0;
   for (uint64_t value : decodeTensorBytes(geometry, operators)) {
     bytes = checkedAdd(
-        bytes, alignArena(checkedMultiply(value, kLaneCount, "decode tensor")),
+        bytes, alignUp(checkedMultiply(value, kLaneCount, "decode tensor")),
         "decode arena");
   }
   return bytes;

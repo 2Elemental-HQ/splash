@@ -6,6 +6,7 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenTarget.hpp"
 
+#include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/PagedKv.hpp"
@@ -15,10 +16,7 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
-#include <string>
-#include <string_view>
 
 namespace splash::model {
 
@@ -32,7 +30,6 @@ inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kPackedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
-inline constexpr uint64_t kArenaAlignment = 16 * 1024;
 inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
@@ -72,26 +69,6 @@ struct RuntimeGeometry final {
     return (maximumInput + kQ4GroupElements - 1) / kQ4GroupElements;
   }
 };
-
-constexpr uint64_t alignArena(uint64_t bytes) noexcept {
-  return (bytes + kArenaAlignment - 1) & ~(kArenaAlignment - 1);
-}
-
-inline uint64_t checkedAdd(uint64_t left, uint64_t right,
-                    std::string_view description) {
-  if (left > std::numeric_limits<uint64_t>::max() - right) {
-    throw std::overflow_error(std::string(description) + " overflows");
-  }
-  return left + right;
-}
-
-inline uint64_t checkedMultiply(uint64_t left, uint64_t right,
-                         std::string_view description) {
-  if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-    throw std::overflow_error(std::string(description) + " overflows");
-  }
-  return left * right;
-}
 
 template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
   return elements * sizeof(T);
@@ -175,7 +152,7 @@ public:
     for (uint32_t index = 0; index < sizes.size(); ++index) {
       if (sizes[index])
         tensors_[index] = backend.view(base_, cursor, sizes[index]);
-      cursor += alignArena(sizes[index]);
+      cursor += alignUp(sizes[index]);
     }
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
@@ -347,7 +324,7 @@ public:
         }
       }
       cursor +=
-          alignArena(checkedMultiply(stride, kLaneCount, "decode tensor"));
+          alignUp(checkedMultiply(stride, kLaneCount, "decode tensor"));
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");

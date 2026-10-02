@@ -62,8 +62,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
-                                             std::string_view description);
 [[nodiscard]] uint64_t q4PackedBytes(uint32_t outputSize,
                                      uint32_t inputSize);
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
