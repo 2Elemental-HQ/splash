@@ -63,7 +63,6 @@ enum class IssueCode : uint16_t {
   FrameTooLarge,
   InvalidPayloadLength,
   TruncatedFrame,
-  ParserAlreadyFailed,
   InvalidRequestId,
   InvalidEnumValue,
   InvalidDeadline,
@@ -98,6 +97,8 @@ template <typename T> struct ProtocolResult {
   }
 };
 
+// Valid as validateLimits checks them: NativeRuntime checks its limits once,
+// and the codec and the frame parser rely on that.
 struct ProtocolLimits {
   uint64_t maxFramePayloadBytes = kAbsoluteMaxFramePayloadBytes;
   uint64_t maxStatusJsonBytes = 32ULL * 1024 * 1024;
@@ -112,6 +113,10 @@ struct ProtocolLimits {
   // value, so a frame limit violation is never a late allocation failure.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
+
+[[nodiscard]] std::optional<ProtocolIssue>
+validateLimits(const ProtocolLimits &limits);
+
 // Direct finite-option scoring (SemIf/Jev System One): a request carrying
 // scoreTokens runs prefill only and returns the raw final-position logits at
 // those token ids in DoneEvent.optionLogits. The option count is bounded by

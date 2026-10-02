@@ -90,18 +90,17 @@ class IssueCode(IntEnum):
     FRAME_TOO_LARGE = 7
     INVALID_PAYLOAD_LENGTH = 8
     TRUNCATED_FRAME = 9
-    PARSER_ALREADY_FAILED = 10
-    INVALID_REQUEST_ID = 11
-    INVALID_ENUM_VALUE = 12
-    INVALID_DEADLINE = 13
-    INVALID_SAMPLING = 14
-    INVALID_COUNT = 15
-    INVALID_COHORT_CONSTRAINT = 16
-    INVALID_ERROR_CLASSIFICATION = 17
-    INVALID_STATUS_SCHEMA = 18
-    LIMIT_EXCEEDED = 19
-    INTEGER_OVERFLOW = 20
-    ALLOCATION_FAILURE = 21
+    INVALID_REQUEST_ID = 10
+    INVALID_ENUM_VALUE = 11
+    INVALID_DEADLINE = 12
+    INVALID_SAMPLING = 13
+    INVALID_COUNT = 14
+    INVALID_COHORT_CONSTRAINT = 15
+    INVALID_ERROR_CLASSIFICATION = 16
+    INVALID_STATUS_SCHEMA = 17
+    LIMIT_EXCEEDED = 18
+    INTEGER_OVERFLOW = 19
+    ALLOCATION_FAILURE = 20
 
 
 def frame_type_name(frame_type: FrameType) -> str:
@@ -1810,13 +1809,7 @@ class FrameParser:
         """Consume up to one frame and report exactly how many bytes were used."""
 
         if self._terminal_issue:
-            return ParseStep(
-                issue=_issue(
-                    FailureClass.PROTOCOL_FATAL,
-                    IssueCode.PARSER_ALREADY_FAILED,
-                    self._terminal_issue.describe(),
-                )
-            )
+            raise RuntimeError("frame parser used after it failed")
         try:
             view = memoryview(data).cast("B")
         except (TypeError, ValueError) as error:
@@ -1877,7 +1870,7 @@ class FrameParser:
         """Finish EOF processing, making any partial frame terminally fatal."""
 
         if self._terminal_issue:
-            return self._terminal_issue
+            raise RuntimeError("frame parser used after it failed")
         if not self._header and not self._reading_payload:
             return None
         if not self._reading_payload:

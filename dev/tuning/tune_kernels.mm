@@ -306,8 +306,6 @@ std::vector<Confirmation> confirm(const std::filesystem::path &metallib,
   auto bootstrap = engine::RuntimeBootstrap::start(
       std::move(config), [](std::span<const uint8_t>) {},
       []() -> std::string { throw std::logic_error("no status requests during tuning"); });
-  if (!bootstrap->report().ready)
-    throw std::runtime_error("production bootstrap did not reach Ready");
   auto &resources = bootstrap->resources();
   auto &runtime = bootstrap->modelRuntime();
   const OperatorChoices &choices = winners;

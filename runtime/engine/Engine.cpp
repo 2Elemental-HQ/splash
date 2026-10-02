@@ -297,8 +297,6 @@ bool Engine::tick(double now) {
   return progressed;
 }
 
-bool Engine::idle() const noexcept { return requests_.empty() && !pending_; }
-
 bool Engine::drainingForRecovery() const {
   return drainEndMilliseconds_ > 0.0 &&
          std::any_of(requests_.begin(), requests_.end(),

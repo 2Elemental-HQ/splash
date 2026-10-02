@@ -541,6 +541,13 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
+// Every submitted request has ended and no command is in flight.
+bool idle(const engine::Engine &engine) {
+  const EngineSnapshot counts = engine.snapshot();
+  return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
+         !engine.commandInFlight();
+}
+
 EngineRequest request(uint64_t id, const std::vector<uint32_t> &prompt) {
   EngineRequest result;
   result.id = id;
@@ -570,10 +577,10 @@ std::vector<CacheLookup> runUntilStatesHeld(engine::Engine &engine, engine::Cach
 }
 
 void runUntilIdle(engine::Engine &engine) {
-  for (uint32_t step = 0; step < 32 && !engine.idle(); ++step) {
+  for (uint32_t step = 0; step < 32 && !idle(engine); ++step) {
     static_cast<void>(engine.tick(step + 1));
   }
-  require(engine.idle(), "engine did not reach idle");
+  require(idle(engine), "engine did not reach idle");
 }
 
 // Ticks on from `now` until done() holds.
@@ -611,12 +618,12 @@ void testScoreRequestsCarryNoSamplingOptions() {
     }
     require(refused, "a score request with a penalty or min_p was accepted");
   }
-  require(engine.idle(), "a refused score request was queued");
+  require(idle(engine), "a refused score request was queued");
   EngineRequest neutral = request(1, std::vector<uint32_t>(8, 7));
   neutral.maxNewTokens = 0;
   neutral.scoreTokens = {3, 4};
   engine.submit(std::move(neutral));
-  require(!engine.idle(), "a neutral score request was not queued");
+  require(!idle(engine), "a neutral score request was not queued");
 }
 
 void testConcurrentColdPrefixesComputeOnce() {
@@ -880,9 +887,9 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   guardReleases(storage, engine);
   for (uint32_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(193, 7)));
-  for (uint32_t step = 0; step < 64 && !engine.idle(); ++step)
+  for (uint32_t step = 0; step < 64 && !idle(engine); ++step)
     static_cast<void>(engine.tick(step * 1000));
-  require(engine.idle() && cache.snapshot().activeRequests == 0 &&
+  require(idle(engine) && cache.snapshot().activeRequests == 0 &&
               model.requests.empty() && events.emitted == 0,
           "capacity failure stranded a shared prefix producer or waiter");
   engine.submit(request(5, std::vector<uint32_t>(33, 9)));
@@ -1862,9 +1869,9 @@ void testFullStateCellsSkipAdmissionAttempts() {
           "a released state cell did not admit the waiting request");
   for (uint64_t id : {2, 3, 4, 5})
     engine.cancel(id);
-  for (double now = 1203; now < 1220 && !engine.idle(); ++now)
+  for (double now = 1203; now < 1220 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && resources.snapshot().activeRequests == 0,
+  require(idle(engine) && resources.snapshot().activeRequests == 0,
           "full state cell fixture leaked its lanes");
 }
 
@@ -1940,9 +1947,9 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
           "paused state admission drained the cache or retried without backoff");
 
   pressure = MemoryPressure::Normal;
-  for (double now = 120.0; now < 140.0 && !engine.idle(); ++now)
+  for (double now = 120.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.completedCount == 2 &&
+  require(idle(engine) && events.completedCount == 2 &&
               resources.snapshot().lookup.lookups == cached.lookup.lookups + 1 &&
               engine.snapshot().coldMisses == coldMisses + 1 &&
               events.capacityExhaustedCount == 0 && events.failedCount == 0,
@@ -1973,7 +1980,7 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   engine.submit(request(211, std::vector<uint32_t>(65, 211)));
   runUntilIdle(engine);
   const auto after = engine.snapshot();
-  require(engine.idle() && events.completedCount == 2 &&
+  require(idle(engine) && events.completedCount == 2 &&
               executor.snapshotAttempts == attempts + 2 &&
               after.recycledStatePublications == 1 &&
               after.replayStatePublications == 2 &&
@@ -2305,7 +2312,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   engine.submit(request(231, std::vector<uint32_t>(65, 231)));
   runUntilIdle(engine);
-  require(engine.idle() && events.completedCount == 2 &&
+  require(idle(engine) && events.completedCount == 2 &&
               events.failedCount == 0 && events.capacityExhaustedCount == 0,
           "lone request under host pressure did not complete on idle cache");
   require(executor.suspensions == 0 &&
@@ -2348,7 +2355,7 @@ void testAdmissionWaitsOutEarlierLanes() {
     executor.decodeFinishes = true;
     while (!events.completedCount && now < 1000)
       static_cast<void>(engine.tick(now += 10));
-    for (const double end = now + 150; now < end && !engine.idle();)
+    for (const double end = now + 150; now < end && !idle(engine);)
       static_cast<void>(engine.tick(now += 10));
     if (hostRecovers)
       require(events.completedCount == 2 && events.failedCount == 0,
@@ -2357,7 +2364,7 @@ void testAdmissionWaitsOutEarlierLanes() {
       require(events.completedCount == 1 &&
                   events.failures == std::vector<std::string>{"resource_timeout"},
               "a wait that no resident lane could end did not expire");
-    require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
+    require(idle(engine) && executor.requests.empty(), "the resource wait leaked a request");
   }
 }
 
@@ -2405,9 +2412,9 @@ void testLaterLanesDoNotExtendAResourceWait() {
               "macOS is short of memory; close memory-heavy applications",
           "a wait the host refused did not name the shortage");
   engine.cancel(321);
-  for (const double end = now + 100; now < end && !engine.idle();)
+  for (const double end = now + 100; now < end && !idle(engine);)
     static_cast<void>(engine.tick(now += 10));
-  require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
+  require(idle(engine) && executor.requests.empty(), "the resource wait leaked a request");
 }
 
 // The scheduler admits the shortest prompt first, so a request submitted
@@ -2514,7 +2521,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     if (outcome == 0) {
       pressure = MemoryPressure::Normal;
       storage.growthBlocked = false;
-      for (double now = 121.0; now < 140.0 && !engine.idle(); ++now)
+      for (double now = 121.0; now < 140.0 && !idle(engine); ++now)
         static_cast<void>(engine.tick(now));
       // The resumed lane re-arms its replay boundary and publishes normally.
       require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -2541,7 +2548,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
       require(events.completedCount + events.failedCount == 2,
               "host-pressure wait ignored deadline");
     }
-    require(engine.idle() && executor.requests.empty() &&
+    require(idle(engine) && executor.requests.empty() &&
                 resources.snapshot().activeRequests == 0 &&
                 resources.snapshot().pool.pagesActive == 0 &&
                 events.capacityExhaustedCount == 0 &&
@@ -2712,7 +2719,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
   engine.submit(request(40, std::vector<uint32_t>(33, 40)));
   runUntilIdle(engine);
   require(events.completedCount == 0 && events.failedCount == 1 &&
-              events.capacityExhaustedCount == 1 && engine.idle(),
+              events.capacityExhaustedCount == 1 && idle(engine),
           "B1 capacity failure did not emit exactly one terminal event");
   require(resources.snapshot().activeRequests == 0 && executor.requests.empty(),
           "B1 capacity failure leaked backend resources");
@@ -2735,9 +2742,9 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
   require(engine.tick(3) && executor.requests.contains(5) &&
               executor.requests.at(5).position > 0 && events.completedCount == 0,
           "short arrival waited for a long prefill to finish");
-  for (uint32_t now = 4; now < 200 && !engine.idle(); ++now)
+  for (uint32_t now = 4; now < 200 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.completedCount == 5 &&
+  require(idle(engine) && events.completedCount == 5 &&
               events.failedCount == 0 && events.capacityExhaustedCount == 0 &&
               executor.prefillRows == 4 * 8193 + 65 && executor.suspensions == 0,
           "admission lost work, introduced replay, or stranded queued requests");
@@ -2790,7 +2797,7 @@ void testMemoryWaitHoldsBackLaterArrivals() {
             "the later arrival did not start after the request it waited behind");
   require(events.startIds == std::vector<uint64_t>{1, 2},
           "the requests did not start in the order they arrived");
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 2 && events.failedCount == 0,
           "a request held back behind a memory wait did not finish");
 }
@@ -2833,7 +2840,7 @@ void testMemoryWaitClosesAdmissionBesideAResidentLane() {
   now += 100;
   tickUntil(engine, now, [&] { return executor.requests.contains(2); },
             "the waiting request did not start once its memory was there");
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   const auto started = [&](uint64_t id) {
     return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
   };
@@ -2868,7 +2875,7 @@ void testClosedAdmissionReopensWhenTheWaitEnds() {
   engine.cancel(2);
   tickUntil(engine, now, [&] { return executor.requests.contains(3) || events.usage.contains(3); },
             "admission stayed closed after the waiting request was cancelled");
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   // The cancelled request is reported as ended, without a row of its own.
   require(events.completedCount == 3 && events.failedCount == 0 &&
               engine.snapshot().cancelled == 1 && executor.prefillRows == 16385 + 65,
@@ -2920,7 +2927,7 @@ void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
             "a later arrival started while a refused request waited for a prefix");
     static_cast<void>(engine.tick(now++));
   }
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   const auto started = [&](uint64_t id) {
     return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
   };
@@ -2974,12 +2981,12 @@ void testRefusedResumeHoldsBackLaterSuspendedLanes() {
   require(executor.resumeAttempts >= 3 && executor.requests.at(1).resident,
           "the refused resume was not retried beside the resident lane");
   executor.decodeFinishes = true;
-  for (const double end = now + 2000; now < end && !engine.idle(); now += 101)
+  for (const double end = now + 2000; now < end && !idle(engine); now += 101)
     static_cast<void>(engine.tick(now));
   // The executor records every state it grants, request 2's refused
   // resumes included: request 3's is the last.
   const auto &resumed = executor.resumedPrompts;
-  require(engine.idle() && events.completedCount == 3 && events.failedCount == 0 &&
+  require(idle(engine) && events.completedCount == 3 && events.failedCount == 0 &&
               engine.snapshot().resourceResumptions == 2 &&
               std::find(resumed.begin(), resumed.end(), second) == resumed.end() - 1,
           "the suspended requests did not resume in admission order");
@@ -3023,7 +3030,7 @@ void testHeldSuspendedRequestNeitherWakesNorExpires() {
   require(events.failures == std::vector<std::string>{"resource_timeout"},
           "the refused resume did not end at its wait limit alone");
   executor.resumeDenied = false;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 1 && events.failedCount == 1 &&
               engine.snapshot().resourceResumptions == 1,
           "a request held behind a refused resume ran out its wait meanwhile");
@@ -3076,7 +3083,7 @@ void testStatusCountsRequestsHeldBehindARefusal() {
           "the refused request's wait age restarted when a pass deferred it");
   refused = false;
   now += 100;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   wait = engine.resourceWaitSnapshot(now);
   require(events.completedCount == 5 && events.failedCount == 0 && wait.heldBehindRefusal == 0,
           "the requests held behind a refusal did not finish");
@@ -3125,7 +3132,7 @@ void testStatusCountsSuspendedRequestsHeldDuringRecovery() {
   hostRefuses = false;
   storage.growthBlocked = false;
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 4 && events.failedCount == 0,
           "the requests did not finish once memory was there");
 }
@@ -3156,9 +3163,9 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   require(engine.tick(102) && engine.resourceWaitSnapshot(102).memory == 0 &&
               executor.requests.contains(2) && !executor.requests.contains(1),
           "scheduler delay retained a stale memory wait");
-  for (uint32_t now = 1100; now < 1200 && !engine.idle(); ++now)
+  for (uint32_t now = 1100; now < 1200 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0,
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0,
           "scheduling delay triggered the memory wait timeout");
 }
 
@@ -3344,9 +3351,9 @@ void testPressureRetryIsBackedOffWithoutProgress() {
   storage.growthBlocked = false;
   pressure = MemoryPressure::Normal;
   require(engine.tick(102.0), "resource retry timer did not wake the engine");
-  for (double now = 103.0; now < 120.0 && !engine.idle(); ++now)
+  for (double now = 103.0; now < 120.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.resumptions == 2 &&
+  require(idle(engine) && executor.resumptions == 2 &&
               events.completedCount == 2 && events.failedCount == 0,
           "backed-off resource requests did not recover cleanly");
 }
@@ -3375,9 +3382,9 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
                 engine.nextWakeupMilliseconds() == 1150.0,
             "a lane wait asked for a wake-up while a command was in flight");
     *executor.holdDecodeUntil = true;
-    for (double now = 151; now < 170 && !engine.idle(); ++now)
+    for (double now = 151; now < 170 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
-    require(engine.idle() && events.completedCount == 2,
+    require(idle(engine) && events.completedCount == 2,
             "lane wait did not complete after the command");
   }
   {
@@ -3403,9 +3410,9 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
             "a lane wait asked for a wake-up only the suspended request gets");
     paused = false;
     storage.growthBlocked = false;
-    for (double now = 201; now < 220 && !engine.idle(); ++now)
+    for (double now = 201; now < 220 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
-    require(engine.idle() && events.completedCount == 2,
+    require(idle(engine) && events.completedCount == 2,
             "lane wait did not complete after the suspended request");
   }
 }
@@ -3456,9 +3463,9 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
               "drain outlived its limit or hid the elapsed resource wait");
     }
     *executor.holdDecodeUntil = true;
-    for (double now = 30007; now < 30100 && !engine.idle(); ++now)
+    for (double now = 30007; now < 30100 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
-    require(engine.idle() && resources.snapshot().activeRequests == 0,
+    require(idle(engine) && resources.snapshot().activeRequests == 0,
             "drain fixture did not release its resources");
     if (!expireRequest)
       require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -3508,9 +3515,9 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               events.startIds.size() == 2 && executor.resumeAttempts == 0,
           "draining recovery busy-woke or admitted a competing request");
   *executor.holdDecodeUntil = true;
-  for (double now = 151; now < 210 && !engine.idle(); ++now)
+  for (double now = 151; now < 210 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.resumptions == 2 &&
+  require(idle(engine) && executor.resumptions == 2 &&
               events.completedCount == 3 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0,
           "decode preemption did not finish all original/new requests");
@@ -3607,9 +3614,9 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
               plan.boundaries.front().boundary == 4096,
           "resumed draft plan did not rebuild the prompt's replay point first");
   const double finishBy = now + 100;
-  for (; now < finishBy && !engine.idle(); ++now)
+  for (; now < finishBy && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.resumptions == 1 &&
+  require(idle(engine) && executor.resumptions == 1 &&
               events.completedCount == 1 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0,
           "long decode did not complete after partial KV reclamation");
@@ -3689,7 +3696,7 @@ struct LostReplayPoint {
     executor.deniedSnapshots = 0;
     executor.decodeFinishes = true;
     now += 101;
-    for (const double end = now + 1000; now < end && !engine.idle(); ++now)
+    for (const double end = now + 1000; now < end && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
   }
 
@@ -3727,7 +3734,7 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
   const Events &events = fixture.events;
   const Executor &executor = fixture.executor;
   const auto after = engine.snapshot();
-  require(engine.idle() && executor.resumptions == 1 && events.completedCount == 1 &&
+  require(idle(engine) && executor.resumptions == 1 && events.completedCount == 1 &&
               events.failedCount == 0 && after.recycledStatePublications == 1 &&
               after.resources.stateCache.inUseEvictions == 0 &&
               after.resources.stateCache.inUse == 0,
@@ -3755,7 +3762,7 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   fixture.finish();
   std::vector<uint32_t> next = fixture.prompt;
   next.resize(next.size() + 40, 9);
-  require(fixture.engine.idle() && fixture.events.completedCount == 1 &&
+  require(idle(fixture.engine) && fixture.events.completedCount == 1 &&
               fixture.storage.releasedExtents == fixture.releases + 1 &&
               fixture.resources.lookup(fixture.other).kvBoundary >= 256 - 4 * 32 &&
               fixture.resources.probe(next).cachedTokens() == 0,
@@ -3788,7 +3795,7 @@ void testPausedPublicationInUseTakesNoKv() {
   double now = 1;
   require(engine.tick(now++) && executor.requests.contains(1), "the request did not start");
   paused = true;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 1 && events.failedCount == 0 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
               storage.releasedExtents == releases && storage.copies.empty() &&
@@ -3815,9 +3822,9 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   // for pages: the preempted lane then resumes from its own.
   const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {260, 261});
   const uint64_t lookups = engine.snapshot().resources.lookup.lookups;
-  for (double now = 100; now < 400 && !engine.idle(); ++now)
+  for (double now = 100; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.suspensions == 1 &&
+  require(idle(engine) && executor.suspensions == 1 &&
               executor.resumptions == 1 && executor.restored == 64 &&
               executor.resumedPrompts.size() == 1 &&
               executor.resumedPrompts.front().size() == 89 &&
@@ -3855,9 +3862,9 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
     engine.submit(std::move(value));
   }
   const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {262, 263});
-  for (double now = 100; now < 400 && !engine.idle(); ++now)
+  for (double now = 100; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.suspensions == 1 &&
+  require(idle(engine) && executor.suspensions == 1 &&
               executor.resumedPrompts.size() == 1 &&
               executor.resumedPrompts.front().size() == 89 &&
               events.completedCount == 2,
@@ -3910,7 +3917,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
     } else {
       static_cast<void>(engine.tick(350));
     }
-    require(engine.idle() && executor.requests.empty() &&
+    require(idle(engine) && executor.requests.empty() &&
                 events.completedCount == (cancel ? 1U : 0U) &&
                 events.failedCount == (cancel ? 0U : 1U) &&
                 events.capacityExhaustedCount == 0 && events.emitted == 0,
@@ -3950,17 +3957,17 @@ void testBudgetDenialRetriesAfterRelease() {
     if (recovers) {
       require(executor.requests.size() == 1 && events.failedCount == 0,
               "the retry after the release did not admit the request");
-      for (double now = 2; now < 400 && !engine.idle(); ++now)
+      for (double now = 2; now < 400 && !idle(engine); ++now)
         static_cast<void>(engine.tick(now));
       require(events.completedCount == 1 && events.failedCount == 0,
               "state admission did not proceed once its release made room");
     } else {
-      require(pool.snapshot().pagesAllocated == 0 && engine.idle() &&
+      require(pool.snapshot().pagesAllocated == 0 && idle(engine) &&
                   events.failures == std::vector<std::string>{"capacity_exhausted"},
               "a budget that nothing more frees did not fail as exhausted "
               "capacity at once");
     }
-    require(engine.idle() && cache.snapshot().activeRequests == 0 &&
+    require(idle(engine) && cache.snapshot().activeRequests == 0 &&
                 executor.requests.empty(),
             "a budget denial leaked request ownership");
   }
@@ -3987,7 +3994,7 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
     }
     engine.submit(request(286, {286}));
     static_cast<void>(engine.tick(1));
-    require(engine.idle() &&
+    require(idle(engine) &&
                 events.failures == std::vector<std::string>{"capacity_exhausted"} &&
                 (executor.pooledLaneBytes != 0) == state,
             state ? "a lane's admission released the pooled buffers it starts from"
@@ -4024,15 +4031,15 @@ void testPausedStateAdmissionReusesCachedStates() {
     executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
     executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
     engine.submit(request(288, {288}));
-    for (double now = 10; now < 20 && !engine.idle(); ++now)
+    for (double now = 10; now < 20 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
     const auto after = cache.snapshot().stateCache;
     if (lacked == 1) {
-      require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+      require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
                   after.evictions == cached.evictions + 1,
               "a paused admission did not take the cached state's buffers");
     } else {
-      require(!engine.idle() && events.completedCount == 1 &&
+      require(!idle(engine) && events.completedCount == 1 &&
                   engine.snapshot().scheduler.waitingResources == 1 &&
                   after.entries == 1 && after.evictions == cached.evictions,
               "a paused admission evicted a state that could not cover its lane");
@@ -4103,7 +4110,7 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
   engine.submit(request(287, std::vector<uint32_t>(16 * 4 * 32 + 1, 287)));
   static_cast<void>(engine.tick(1));
   const KvPoolSnapshot after = pool.snapshot();
-  require(engine.idle() && executor.prefillRows == 0 &&
+  require(idle(engine) && executor.prefillRows == 0 &&
               events.failures == std::vector<std::string>{"capacity_exhausted"},
           "a request beyond the budget did not fail at once");
   require(after.extentAllocations == 8 && after.extentReleases == 0 &&
@@ -4326,13 +4333,13 @@ void testAllocationCausesRemainDistinct() {
       engine.submit(request(285, {285}));
       static_cast<void>(engine.tick(1));
       if (reason == metal::AllocationFailure::HostPressure) {
-        require(!engine.idle() && events.failedCount == 0 &&
+        require(!idle(engine) && events.failedCount == 0 &&
                     executor.prefillRows == 0,
                 "temporary host admission failure became a terminal error");
         engine.cancel(285);
         static_cast<void>(engine.tick(2));
       } else {
-        require(engine.idle() && events.failures ==
+        require(idle(engine) && events.failures ==
                     std::vector<std::string>{"capacity_exhausted"} &&
                     events.failureDetails.size() == 1 &&
                     !events.failureDetails[0].second &&
@@ -4340,7 +4347,7 @@ void testAllocationCausesRemainDistinct() {
                         metal::allocationFailureName(reason)) != std::string::npos,
                 "allocation failure lost its cause or became retryable");
       }
-      require(engine.idle() && executor.requests.empty() &&
+      require(idle(engine) && executor.requests.empty() &&
                   cache.snapshot().activeRequests == 0,
               "allocation denial leaked request ownership");
     }
@@ -4402,13 +4409,13 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     require(reported.back() == 128, "prefill recovery lost completed progress");
     storage.growthBlocked = false;
     require(engine.tick(403), "recovery did not resume when KV became available");
-    for (double now = 404; now < 425 && !engine.idle(); ++now)
+    for (double now = 404; now < 425 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
     auto expected = reported;
     expected.push_back(129);
     require(events.progress.at(280) == expected,
             "prefill recovery duplicated or regressed progress");
-    require(engine.idle() && engine.snapshot().resourceResumptions == 1 &&
+    require(idle(engine) && engine.snapshot().resourceResumptions == 1 &&
                 executor.restored == restored + 128 &&
                 engine.snapshot().resourceReplayTokens == 1 &&
                 events.outputs.at(280) == std::vector<uint32_t>{42} &&
@@ -4472,9 +4479,9 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
             "replay started without the KV of the dispatch that suspended it");
   }
   storage.growthAllowed = {};
-  for (double now = 504; now < 530 && !engine.idle(); ++now)
+  for (double now = 504; now < 530 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && executor.prefillRows == 128 + 129 &&
+  require(idle(engine) && executor.prefillRows == 128 + 129 &&
               engine.snapshot().resourceResumptions == 1 &&
               events.outputs.at(290) == std::vector<uint32_t>{42} &&
               events.failedCount == 0 && cache.snapshot().activeRequests == 0,
@@ -4515,9 +4522,9 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
           "finished resource recovery blocked new work until decode completed");
   engine.cancel(271);
   engine.cancel(272);
-  for (double now = 115; now < 125 && !engine.idle(); ++now)
+  for (double now = 115; now < 125 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && resources.snapshot().activeRequests == 0,
+  require(idle(engine) && resources.snapshot().activeRequests == 0,
           "recovery admission fixture did not release its lanes");
 }
 
@@ -4670,9 +4677,9 @@ void testRecoveryDrainEndsWithItsCause() {
     }
     for (uint64_t id : {1, 2, 3})
       engine.cancel(id);
-    for (double now = 2010; now < 2030 && !engine.idle(); ++now)
+    for (double now = 2010; now < 2030 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
-    require(engine.idle() && resources.snapshot().activeRequests == 0,
+    require(idle(engine) && resources.snapshot().activeRequests == 0,
             "recovery drain fixture leaked its lanes");
   }
 }
@@ -4690,7 +4697,7 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   advanceToOverlappedVerify(engine, executor, events, 200);
   const std::array<uint32_t, 1> verifyMask{1};
   engine.provideMask(200, verifyMask);
-  require(engine.tick(7) && engine.idle() && events.completedCount == 1 &&
+  require(engine.tick(7) && idle(engine) && events.completedCount == 1 &&
               events.failedCount == 0 && events.emitted == 1,
           "overlapped verify mask did not complete the owning batch");
 }
@@ -4710,7 +4717,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     const std::array<uint32_t, 1> lateMask{1};
     engine.provideMask(201, lateMask);
     engine.failRequest(201, LaneOutcome::InvalidMask, "late mask");
-    require(executor.overlap->abandoned && engine.tick(7) && engine.idle() &&
+    require(executor.overlap->abandoned && engine.tick(7) && idle(engine) &&
                 events.completedCount == 1 && events.failedCount == 0 &&
                 events.emitted == 0,
             "cancelled mask wait left an active scheduler batch");
@@ -4727,7 +4734,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     engine.submit(constrainedRequest(202, 100.0));
     advanceToOverlappedVerify(engine, executor, events, 202);
     require(engine.tick(100.0) && executor.overlap->abandoned &&
-                engine.idle() && events.failedCount == 1,
+                idle(engine) && events.failedCount == 1,
             "deadline did not terminate an in-flight host mask wait");
   }
 }
@@ -4781,9 +4788,9 @@ void testExpiredMaskWaitFinalizesWhileAnotherCommandRuns() {
               engine.commandInFlight(),
           "expired mask wait was not finalized behind an in-flight command");
   *executor.holdDecodeUntil = true;
-  for (double now = 151.0; now < 160.0 && !engine.idle(); ++now)
+  for (double now = 151.0; now < 160.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.completedCount == 1 &&
+  require(idle(engine) && events.completedCount == 1 &&
               events.failedCount == 1,
           "peer request did not complete after the expired wait was removed");
 }
@@ -4821,7 +4828,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
     // A held prefill expires at its armed boundary and never snapshots; a
     // held decode follows the prefill that already published at 64.
     const uint32_t expectedSnapshots = heldKind == WorkKind::Prefill ? 0 : 1;
-    require(engine.tick(102) && engine.idle() && events.failedCount == 1 &&
+    require(engine.tick(102) && idle(engine) && events.failedCount == 1 &&
                 events.failures.front() == "deadline_exceeded" &&
                 events.failureDetails.front().first ==
                     "request deadline exceeded" &&
@@ -4857,9 +4864,9 @@ void testStalledSuspensionFailsWithCapacity() {
 
   // Nothing completes between suspension and retry, so suspending again would
   // only rotate the same two lanes forever.
-  for (double now = 102.0; now < 140.0 && !engine.idle(); ++now)
+  for (double now = 102.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.capacityExhaustedCount == 2 &&
+  require(idle(engine) && events.capacityExhaustedCount == 2 &&
               engine.snapshot().resourceSuspensions == 1 &&
               engine.snapshot().resourceResumptions == 0 && executor.prefillRows == 0,
           "stalled suspension did not converge to a capacity failure");
@@ -4993,13 +5000,13 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
   engine.submit(request(410, prompt));
   engine.submit(request(411, prompt));
   uint32_t maximumEntries = 0;
-  for (uint32_t step = 0; step < 128 && !engine.idle(); ++step) {
+  for (uint32_t step = 0; step < 128 && !idle(engine); ++step) {
     static_cast<void>(engine.tick(step + 1));
     maximumEntries =
         std::max(maximumEntries, resources.snapshot().stateCache.entries);
   }
   const uint32_t checkpoints = (prompt.size() / defaultCheckpointTokens);
-  require(engine.idle() && events.completedCount == 2 &&
+  require(idle(engine) && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
               engine.snapshot().cacheHits == 1 &&
@@ -5847,8 +5854,9 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     auto cached = std::make_shared<OffloadControl>();
     cache.beginRequest(998);
     require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
-    const auto idle = cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
-    cache.publishCompositeState(idle, std::make_shared<OffloadState>(cached));
+    const auto cachedBlock =
+        cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
+    cache.publishCompositeState(cachedBlock, std::make_shared<OffloadState>(cached));
     cache.endRequest(998);
     // Every further page needs an extent the budget, or the host, refuses.
     storage.allocationFailure = paused ? metal::AllocationFailure::HostPressure
@@ -5865,7 +5873,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
                 cached->released,
             "the cached state was not written once the staging buffer was free");
     cached->ready = true;
-    for (uint32_t step = 4; step < 20 && !engine.idle(); ++step)
+    for (uint32_t step = 4; step < 20 && !idle(engine); ++step)
       static_cast<void>(engine.tick(step));
     require(events.completedCount == 1 && events.failedCount == 0 && executor.suspensions == 0 &&
                 executor.prefillRows == 33,
@@ -5909,11 +5917,11 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   require(wakeup.has_value() && *wakeup <= 1.0 + 100.0,
           "a waiting lane left the engine without a bounded wakeup");
   // The wait ends on its own once the pages are back.
-  for (uint32_t step = 2; step < 40 && !engine.idle(); ++step) {
+  for (uint32_t step = 2; step < 40 && !idle(engine); ++step) {
     tier.complete();
     static_cast<void>(engine.tick(step));
   }
-  require(engine.idle() && events.outputs.contains(1) && events.failedCount == 0,
+  require(idle(engine) && events.outputs.contains(1) && events.failedCount == 0,
           "the lane never ran");
 }
 
@@ -5944,7 +5952,7 @@ void testNothingInFlightIsNotPending() {
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   runUntilIdle(engine);
-  require(engine.idle() && events.outputs.contains(1) && events.failedCount == 0 &&
+  require(idle(engine) && events.outputs.contains(1) && events.failedCount == 0 &&
               tier.demotions == 0 && executor.prefillRows == 97,
           "the lane did not run on leaves the unwritable tier had to drop");
 }
@@ -5993,11 +6001,11 @@ void testPageShortfallDemotesInBulk() {
           "the demotions did not start in the one reclaim step after the denial");
   static_cast<void>(engine.tick(2));
   require(tier.demotions == 3, "waiting demoted more");
-  for (uint32_t step = 3; step < 40 && !engine.idle(); ++step) {
+  for (uint32_t step = 3; step < 40 && !idle(engine); ++step) {
     tier.complete();
     static_cast<void>(engine.tick(step));
   }
-  require(engine.idle() && events.outputs.contains(1) && executor.prefillRows == 161 &&
+  require(idle(engine) && events.outputs.contains(1) && executor.prefillRows == 161 &&
               executor.suspensions == 0 && events.failedCount == 0 && tier.demotions == 4 &&
               cache.snapshot().kvTier.diskBlocks == 4,
           "the lane did not run on the pages the demotions gave back");
@@ -6244,7 +6252,7 @@ void testRestoringRequestIsNotWaitingForMemory() {
   require(executor.diskReads == 1 && restoring.restoring == 1 && restoring.memory == 0,
           "a request reading its prefix from disk was counted as waiting for memory");
   executor.restoreControl->ready = true;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 1 && executor.restored == 64 &&
               engine.resourceWaitSnapshot(now).restoring == 0,
           "the restored request did not finish");
@@ -6284,7 +6292,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
     static_cast<void>(engine.tick(tick));
   }
   const auto stats = cache.snapshot();
-  require(tier.restores == 1 && !tier.inFlight() && engine.idle() &&
+  require(tier.restores == 1 && !tier.inFlight() && idle(engine) &&
               stats.stateCache.pinned == 0 && stats.activeRequests == 0 &&
               executor.requests.empty() && !events.outputs.contains(1),
           "cancelled prefix read unused pages or retained active resources");
@@ -6343,11 +6351,11 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   require(tier.demotions == 1 && executor.prefillRows == 0, "waiting demoted more");
   // The lane lacks two pages in all: one for its first command, one for the
   // last token. Exactly two blocks are written.
-  for (uint32_t step = 4; step < 40 && !engine.idle(); ++step) {
+  for (uint32_t step = 4; step < 40 && !idle(engine); ++step) {
     tier.complete();
     static_cast<void>(engine.tick(step));
   }
-  require(engine.idle(), "engine did not reach idle");
+  require(idle(engine), "engine did not reach idle");
   require(events.outputs.contains(1) && executor.prefillRows == 97 && executor.suspensions == 0 &&
               events.failedCount == 0 && tier.demotions == 2,
           "lane did not run on the returned pages, or more was written than it lacked");
@@ -6432,12 +6440,12 @@ void testRefusedRestoreClosesAdmission() {
     }
     executor.decodeFinishes = true;
     storage.growthBlocked = false;
-    for (uint32_t step = 0; step < 100 && !engine.idle(); ++step) {
+    for (uint32_t step = 0; step < 100 && !idle(engine); ++step) {
       tier.complete();
       static_cast<void>(engine.tick(now++));
     }
     // A cancelled request is reported as ended.
-    require(engine.idle() && events.completedCount == 3 && events.failedCount == 0,
+    require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
             "the requests did not finish");
     if (cause == Cause::GrowthBlocked)
       require(events.startIds == std::vector<uint64_t>{1, 2, 3} && executor.restored == 64,
@@ -6494,12 +6502,12 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   waiting.deadlineMilliseconds = 1e9;
   engine.submit(std::move(waiting));
   double now = 1.0;
-  for (int round = 0; round < 40 && !engine.idle(); ++round) {
+  for (int round = 0; round < 40 && !idle(engine); ++round) {
     static_cast<void>(engine.tick(now));
     tier.complete();
     now += 20000.0;
   }
-  require(engine.idle(), "lane did not finish");
+  require(idle(engine), "lane did not finish");
   require(now > 90000.0, "the wait did not cross the resource limit");
   require(events.failedCount == 0 && events.starts.size() == 1 &&
               events.starts[0].first == EngineCacheStatus::PrefixHit &&
@@ -6587,11 +6595,11 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   // takes the pages.
   *hold = true;
   executor.decodeFinishes = true;
-  for (int step = 0; step < 40 && !engine.idle(); ++step, now += 1.0) {
+  for (int step = 0; step < 40 && !idle(engine); ++step, now += 1.0) {
     static_cast<void>(engine.tick(now));
     tier.complete();
   }
-  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
               events.starts.size() == 2 &&
               events.starts[1].first == EngineCacheStatus::PrefixHit &&
               events.starts[1].second == 256 && executor.restored == 256,
@@ -6652,7 +6660,7 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
             "a lane resident at a suspension did not hold the wait open");
   }
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 2 && events.failedCount == 0 &&
               engine.snapshot().resourceResumptions == 1,
           "the suspended lane did not resume once the lane beside it finished");
@@ -6701,11 +6709,11 @@ void testRestoringLaneWaitsForResidentLanes() {
   require(events.failedCount == 0 && executor.suspensions == 0 && events.starts.size() == 1,
           "the restoring lane failed or yielded instead of waiting");
   *hold = true;
-  for (int step = 20; step < 60 && !engine.idle(); ++step) {
+  for (int step = 20; step < 60 && !idle(engine); ++step) {
     static_cast<void>(engine.tick(step));
     tier.complete();
   }
-  require(engine.idle() && events.failedCount == 0 && executor.suspensions == 0 &&
+  require(idle(engine) && events.failedCount == 0 && executor.suspensions == 0 &&
               events.starts.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
               events.starts[1].second == 64 && executor.restored == 64,
           "the restoring lane did not run on its prefix once pages returned");
@@ -6810,7 +6818,7 @@ void testRunningRequestKeepsItsReplayPoint() {
   next.insert(next.end(), events.outputs[1].begin(), events.outputs[1].end());
   next.resize(next.size() + 40, 7);
   engine.submit(request(4, next));
-  tickUntil(engine, now, [&] { return engine.idle(); }, "the next turn did not finish");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the next turn did not finish");
   require(events.starts.back() ==
               std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64},
           "the next turn lost the replay point its predecessor ran from");
@@ -6867,13 +6875,13 @@ void testSuspendedRequestKeepsItsReplayPoint() {
           "the growing peer took the suspended lane's replay point");
   paused = false;
   storage.growthBlocked = false;
-  tickUntil(engine, now, [&] { return engine.idle(); }, "the suspended lane did not finish");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the suspended lane did not finish");
   require(executor.restored == 64, "the suspended lane did not resume from its replay point");
   std::vector<uint32_t> next = first;
   next.insert(next.end(), events.outputs[1].begin(), events.outputs[1].end());
   next.resize(next.size() + 40, 7);
   engine.submit(request(4, next));
-  tickUntil(engine, now, [&] { return engine.idle(); }, "the next turn did not finish");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the next turn did not finish");
   require(events.starts.back() ==
                   std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
               resources.snapshot().stateCache.inUse == 0,
@@ -6925,12 +6933,12 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   next.resize(80, 7);
   require(resources.probe(next).cachedTokens() == 32,
           "the history's replay point outlasted the prompt's");
-  for (; now < 400 && !engine.idle(); ++now)
+  for (; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   engine.submit(request(266, next));
-  for (; now < 500 && !engine.idle(); ++now)
+  for (; now < 500 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && events.starts.back() ==
+  require(idle(engine) && events.starts.back() ==
               std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 32},
           "the next turn did not resume from the prompt's replay point");
 }
@@ -6959,9 +6967,9 @@ void testSharedReplayPointCountsEachRequest() {
           "the fixture did not overlap two requests on one replay point");
   require(resources.snapshot().stateCache.inUse == 1,
           "the first request to end released its peer's replay point");
-  for (; now < 200 && !engine.idle(); ++now)
+  for (; now < 200 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && resources.snapshot().stateCache.inUse == 0,
+  require(idle(engine) && resources.snapshot().stateCache.inUse == 0,
           "the last request to end kept its replay point in use");
 }
 
@@ -6989,9 +6997,9 @@ void testRestoredEndpointIsInUse() {
                   std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
               resources.snapshot().stateCache.inUse == 1,
           "a restored replay point was not in use");
-  for (; now < 200 && !engine.idle(); ++now)
+  for (; now < 200 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(engine.idle() && resources.snapshot().stateCache.inUse == 0,
+  require(idle(engine) && resources.snapshot().stateCache.inUse == 0,
           "the restored replay point stayed in use");
 }
 
@@ -7045,7 +7053,7 @@ void testWarningShrinkKeepsTheFinishedPoint() {
   guardReleases(storage, engine);
   double now = 1;
   engine.submit(request(1, std::vector<uint32_t>(65, 1)));
-  tickUntil(engine, now, [&] { return engine.idle(); }, "the older conversation did not finish");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the older conversation did not finish");
   executor.decodeFinishes = false;
   auto running = request(2, std::vector<uint32_t>(65, 2));
   running.maxNewTokens = 1000;
@@ -7150,11 +7158,11 @@ void testHeldBackStartTakesNothingInUse() {
     executor.deniedBegins = 0;
     hostRefuses = false;
     executor.restoreControl->ready = true;
-    for (const double end = now + 200; now < end && !engine.idle(); ++now) {
+    for (const double end = now + 200; now < end && !idle(engine); ++now) {
       static_cast<void>(engine.tick(now));
       tier.complete();
     }
-    require(engine.idle() && events.completedCount == 2 && events.failedCount == 0 &&
+    require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
                 events.startIds.back() == 2 &&
                 executor.diskReads == (refused == Refused::Restore ? 1U : 0U),
             "the held-back start did not run once the lane finished");
@@ -7196,10 +7204,10 @@ void testEveryEndReleasesTheReplayPoint() {
     require(end == End::Deadline || end == End::Capacity ||
                 resources.snapshot().stateCache.inUse == 0,
             "the request's end did not release its replay point at once");
-    for (now = 100; now < 200 && !engine.idle(); ++now)
+    for (now = 100; now < 200 && !idle(engine); ++now)
       static_cast<void>(engine.tick(now));
     const auto state = resources.snapshot().stateCache;
-    require(engine.idle() && state.inUse == 0 &&
+    require(idle(engine) && state.inUse == 0 &&
                 state.entries == (end == End::Capacity ? 0U : 1U) &&
                 events.capacityExhaustedCount == (end == End::Capacity ? 1U : 0U),
             "a request's end did not release its replay point");
@@ -7249,7 +7257,7 @@ void testWaitingEndsReleaseTheReplayPoint() {
       executor.resumeDenied = true;
       executor.restoreControl->success = false;
       static_cast<void>(engine.tick(104));
-      require(!engine.idle() && !engine.commandInFlight() &&
+      require(!idle(engine) && !engine.commandInFlight() &&
                   cache.snapshot().stateCache.inUse == 1,
               "a failed read ended the replay point's use");
       engine.cancel(290);
@@ -7257,7 +7265,7 @@ void testWaitingEndsReleaseTheReplayPoint() {
               "cancelling the waiting lane did not release its replay point");
       static_cast<void>(engine.tick(105));
     }
-    require(engine.idle() && cache.snapshot().stateCache.inUse == 0 &&
+    require(idle(engine) && cache.snapshot().stateCache.inUse == 0 &&
                 events.completedCount + events.failedCount == 1,
             "a waiting request's end did not release its replay point");
   }

@@ -177,6 +177,13 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
+// Every submitted request has ended and no command is in flight.
+bool idle(const engine::NativeRuntime &loop) {
+  const EngineSnapshot counts = loop.snapshot();
+  return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
+         !loop.commandInFlight();
+}
+
 std::vector<protocol::Message> decodeMessages(std::span<const uint8_t> bytes) {
   protocol::FrameParser parser;
   std::vector<protocol::Message> result;
@@ -213,10 +220,10 @@ protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
 }
 
 void runUntilIdle(engine::NativeRuntime &loop) {
-  for (uint32_t step = 0; step < 32 && !loop.idle(); ++step) {
+  for (uint32_t step = 0; step < 32 && !idle(loop); ++step) {
     static_cast<void>(loop.tick());
   }
-  require(loop.idle(), "native loop did not become idle");
+  require(idle(loop), "native loop did not become idle");
 }
 
 void testPromptProgress() {
@@ -694,7 +701,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       require(loop.engineHealthy() && loop.commandInFlight(),
               "a model-side wait was mistaken for a pending GPU command");
       *executor.ticketReady = true;
-      require(loop.tick() && loop.idle(), "completed GPU ownership did not drain");
+      require(loop.tick() && idle(loop), "completed GPU ownership did not drain");
     } else {
       uint32_t errors = 0;
       for (const auto &message : decodeMessages(output)) {
@@ -707,7 +714,7 @@ void testCommandWatchdogAndPendingHealthWake() {
         }
       }
       require(errors == 1 && loop.connectionMustClose() &&
-                  loop.commandInFlight() && !loop.idle(),
+                  loop.commandInFlight() && !idle(loop),
               "watchdog released command ownership or emitted duplicate failures");
     }
   }
@@ -720,7 +727,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  require(!loop.tick() && loop.idle() && !loop.millisecondsUntilNextWakeup(),
+  require(!loop.tick() && idle(loop) && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
 
@@ -894,6 +901,27 @@ void testFrameFailureUsesExecutionBoundary() {
                                (thrown == Thrown::Metal ? 1U : 0U),
             "a frame exception was reported or counted more than once");
   }
+}
+
+// The loop checks its protocol limits once, when it is built; the codec and
+// the parser rely on them.
+void testInvalidLimitsAreRejectedAtConstruction() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 8);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  protocol::ProtocolLimits limits;
+  limits.maxMaskWords = 0;
+  bool refused = false;
+  try {
+    engine::NativeRuntime loop(
+        {}, resources, executor, [](std::span<const uint8_t>) {},
+        [] { return std::string("{}"); }, {}, limits);
+  } catch (const std::invalid_argument &error) {
+    refused = std::string(error.what()).find("limit_exceeded") !=
+              std::string::npos;
+  }
+  require(refused, "the loop accepted invalid protocol limits");
 }
 
 // An exception while the engine admits a request is engine-fatal: nothing
@@ -1518,6 +1546,7 @@ int main() {
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();
+    testInvalidLimitsAreRejectedAtConstruction();
     testRequestErrorKeepsFraming();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();

@@ -94,6 +94,8 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
       !statusProvider_) {
     throw std::invalid_argument("invalid native engine loop config");
   }
+  if (auto issue = protocol::validateLimits(limits_))
+    throw std::invalid_argument(issue->describe());
   NativeLoopClocks defaults = defaultClocks();
   if (!clocks_.unixMicros) {
     clocks_.unixMicros = std::move(defaults.unixMicros);

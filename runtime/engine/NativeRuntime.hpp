@@ -73,7 +73,6 @@ public:
   [[nodiscard]] const std::string &engineFailure() const noexcept {
     return engineFailure_;
   }
-  [[nodiscard]] bool idle() const { return core_.idle(); }
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
   }

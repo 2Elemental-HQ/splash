@@ -950,12 +950,12 @@ class ProtocolPythonTests(unittest.TestCase):
             self.assertEqual(issue.failure_class, p.FailureClass.PROTOCOL_FATAL)
             self.assertEqual(issue.code, code)
 
+        # A caller that keeps feeding a failed parser is a bug.
         parser = p.FrameParser()
         first = parser.consume(mutations[0][0])
         self.assertEqual(first.issue.code, p.IssueCode.BAD_MAGIC)
-        second = parser.consume(valid)
-        self.assertEqual(second.consumed_bytes, 0)
-        self.assertEqual(second.issue.code, p.IssueCode.PARSER_ALREADY_FAILED)
+        with self.assertRaisesRegex(RuntimeError, "used after it failed"):
+            parser.consume(valid)
 
     def test_every_nonempty_truncation_is_fatal(self):
         wire = p.serialize_message(example_request())
@@ -1128,8 +1128,8 @@ class ProtocolPythonTests(unittest.TestCase):
         invalid_limits = p.ProtocolLimits(max_frame_payload_bytes=0xFFFFFFFFFFFFFFFF)
         parser = p.FrameParser(invalid_limits)
         self.assertTrue(parser.failed)
-        step = parser.consume(b"")
-        self.assertEqual(step.issue.code, p.IssueCode.PARSER_ALREADY_FAILED)
+        with self.assertRaisesRegex(RuntimeError, "used after it failed"):
+            parser.consume(b"")
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.LIMIT_EXCEEDED,
@@ -1192,7 +1192,8 @@ class ProtocolPythonTests(unittest.TestCase):
                         pass
                 steps += 1
                 self.assertLess(steps, 1024)
-            parser.finish()
+            if not parser.failed:
+                parser.finish()
 
         valid = p.serialize_message(example_request())
         for _ in range(2000):
@@ -1212,7 +1213,8 @@ class ProtocolPythonTests(unittest.TestCase):
                         p.decode_frame(step.frame)
                     except p.ProtocolError:
                         pass
-            parser.finish()
+            if not parser.failed:
+                parser.finish()
 
 
 if __name__ == "__main__":

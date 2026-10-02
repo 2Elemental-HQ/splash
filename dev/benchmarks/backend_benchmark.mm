@@ -321,7 +321,7 @@ public:
           {}) {
     const auto deadline = Clock::now() + std::chrono::hours(2);
     uint64_t observedBatchSequence = events_.batchSequence();
-    while (!engine_.idle()) {
+    while (!drained()) {
       if (engine_.tick(milliseconds(Clock::now()))) {
         const uint64_t sequence = events_.batchSequence();
         if (sequence != observedBatchSequence) {
@@ -357,6 +357,15 @@ private:
     std::condition_variable condition;
     bool notified = false;
   };
+
+  // Every submitted request has ended and no command is in flight.
+  [[nodiscard]] bool drained() const {
+    const engine::EngineSnapshot counts = engine_.snapshot();
+    return counts.submitted ==
+               counts.completed + counts.cancelled + counts.failed &&
+           !engine_.commandInFlight();
+  }
+
   engine::Engine &engine_;
   Events &events_;
   std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
@@ -831,8 +840,8 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
       }
     }
-    if (!bootstrap->report().ready || !bootstrap->nativeLoop().ready() ||
-        !bootstrap->nativeLoop().engineHealthy() || !bootstrap->nativeLoop().idle() ||
+    if (!bootstrap->nativeLoop().ready() ||
+        !bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
     // Non-owning borrows. This scope never feeds or ticks the bootstrap loop;

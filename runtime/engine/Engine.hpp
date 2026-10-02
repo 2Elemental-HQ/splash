@@ -114,7 +114,6 @@ public:
   void setCompletionNotifier(std::function<void()> notifier);
 
   [[nodiscard]] bool tick(double nowMilliseconds);
-  [[nodiscard]] bool idle() const noexcept;
   [[nodiscard]] bool commandInFlight() const noexcept {
     return pending_.has_value();
   }
