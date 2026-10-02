@@ -36,7 +36,7 @@ public:
     kickQueue_ = [device newCommandQueue];
     kickTarget_ = [device newBufferWithLength:sizeof(uint32_t)
                                       options:MTLResourceStorageModePrivate];
-    if (!set_ || !kick_ || !kickQueue_ || !kickTarget_)
+    if (!set_ || !kickQueue_ || !kickTarget_)
       throw MetalBackendError("unable to create the Metal residency set");
     [commands_ addResidencySet:set_];
     queue_ = dispatch_queue_create(
@@ -54,11 +54,9 @@ public:
     // Metal applies the end at the process's next GPU operation, or frees
     // the set at exit.
     dispatch_sync(queue_, ^{
-      @autoreleasepool {
-        [commands_ removeResidencySet:set_];
-        std::lock_guard lock(mutex_);
-        if (held_) [set_ endResidency];
-      }
+      [commands_ removeResidencySet:set_];
+      std::lock_guard lock(mutex_);
+      if (held_) [set_ endResidency];
     });
   }
 

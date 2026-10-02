@@ -530,6 +530,35 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     std::cout << "PASS residency ends without blits\n";
 }
 
+// A kept buffer's memory returns once its last view is gone, and a set the
+// backend still holds lets its buffers go with the backend, though the
+// serving thread's autorelease pool, like this one, never drains.
+void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
+    constexpr uint64_t kBytes = 64ull << 20;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    {
+        MetalBackend backend(metallibPath);
+        const uint64_t before = device.currentAllocatedSize;
+        MetalBuffer kept = backend.allocateBuffer(kBytes);
+        backend.keepResident(kept);
+        kept = {};
+        require(device.currentAllocatedSize <= before + (1ull << 20),
+                "a buffer taken out of the residency set kept its memory");
+    }
+    const uint64_t before = device.currentAllocatedSize;
+    {
+        MetalBuffer kept;
+        {
+            MetalBackend backend(metallibPath);
+            kept = backend.allocateBuffer(kBytes);
+            backend.keepResident(kept);
+        }
+    }
+    require(device.currentAllocatedSize <= before + (32ull << 20),
+            "a destroyed backend's residency set kept its buffers");
+    std::cout << "PASS residency returns removed buffers\n";
+}
+
 // Kept buffers stay held until the keep-alive passes without a command, the
 // next command holds them again at once, and a buffer's last view takes it
 // out of the set.
@@ -1597,6 +1626,7 @@ int main(int argc, const char *argv[]) {
             keptBuffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
+            residencyReturnsRemovedBuffers(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()
