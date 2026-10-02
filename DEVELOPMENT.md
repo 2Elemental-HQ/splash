@@ -839,8 +839,7 @@ that includes the tool-call syntax every tool-enabled system prompt carries,
 earlier tool calls and reasoning, and the `<think>` markers of the generation
 prompt, so a `repetition_penalty` above 1 can delay tool calls and the end of
 reasoning and change names copied from the context. Anthropic Messages defines
-no penalties and no `min_p`. The engine receives these fields as one block
-after `top_k` in the request frame (native wire version 7).
+no penalties and no `min_p`.
 
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
