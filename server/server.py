@@ -2422,7 +2422,7 @@ def parse_args(argv=None):
         type=int,
         default=image_input.MAX_PIXELS,
         help=f"maximum resized pixels per image (default: {image_input.MAX_PIXELS}); "
-        "also sizes the engine's vision scratch",
+        "bounds the vision scratch one image needs",
     )
     parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)

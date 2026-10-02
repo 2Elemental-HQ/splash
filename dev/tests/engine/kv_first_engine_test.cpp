@@ -394,7 +394,7 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
-  uint64_t reclaimIdleState(bool keepLane) noexcept override {
+  uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
     keptLane = keepLane;
     // The buffers of states the cache let go of refill the lane's footprint;
     // the rest is idle.
@@ -410,7 +410,14 @@ public:
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
       *kvGrowthBlocked = false;
-    return released;
+    if (released || scope == model::IdleMemory::Buffers)
+      return released;
+    ++cacheReclaims;
+    if (cacheUnits.empty())
+      return 0;
+    const uint64_t unit = cacheUnits.back();
+    cacheUnits.pop_back();
+    return unit;
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t>) override {
@@ -507,6 +514,10 @@ public:
   // The cached states whose buffers the pool lacks for one activation.
   std::function<uint32_t()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
+  // Caches the model can rebuild, one released per reclaim step that may
+  // take them once no buffer is idle; cacheReclaims counts those steps.
+  std::vector<uint64_t> cacheUnits;
+  uint32_t cacheReclaims = 0;
   bool keptLane = false;
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
@@ -1832,6 +1843,31 @@ void testKvGrowthDenialKeepsEveryLaneReplayState() {
               after.resources.stateCache.entries == 2 &&
               after.resources.stateCache.evictions == 0,
           "KV growth denial cost a lane its replay state");
+}
+
+// A pressure pass without a byte target keeps the caches the model can
+// rebuild and returns only its idle buffers; a targeted pass takes the
+// caches one at a time and stops once its target is met.
+void testPressurePassKeepsCachesWithoutATarget() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.reclaimableIdleStateBytes = 64;
+  executor.cacheUnits = {100, 100, 100};
+  static_cast<void>(
+      engine.reclaimMemory({.reclaim = true, .keepServingFootprint = true}));
+  require(executor.reclaimedIdleStateBytes == 64 && executor.cacheReclaims == 0 &&
+              executor.cacheUnits.size() == 3,
+          "a pass without a target took the model's caches");
+  const MemoryReclaimResult targeted = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 150, .keepServingFootprint = true});
+  require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
+              targeted.releasedBytes >= 200,
+          "a targeted pass did not stop taking caches at its target");
 }
 
 void testPressureReclaimRespectsStateLifetimes() {
@@ -8306,6 +8342,7 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testPressurePassKeepsCachesWithoutATarget();
     testWarningReclaimKeepsTheServingFootprint();
     testWarningReclaimCountsOnlyWhatReachesTheHost();
     testWarningReclaimWakesARefusedStart();

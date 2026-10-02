@@ -1299,8 +1299,9 @@ bool Engine::growthPaused() const {
 
 // The reclaim step for a lane's state the engine's limit refused. The pooled
 // buffers a lane starts from stay for its activation to take: idle model
-// state beyond them goes first, then one empty extent, or else one victim of
-// the cache with the extent it empties.
+// memory beyond them goes first (a pooled buffer, else the idle vision
+// arena, else one rebuildable cache entry), then one empty extent, or else
+// one victim of the cache with the extent it empties.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
@@ -1329,7 +1330,7 @@ CacheReclaimResult Engine::reclaimForKv(uint32_t pages, ReclaimClass upTo) {
 }
 
 bool Engine::reclaimIdleState(bool keepLane) noexcept {
-  if (!model_.reclaimIdleState(keepLane))
+  if (!model_.reclaimIdleState(keepLane, model::IdleMemory::BuffersThenCaches))
     return false;
   signalResourceProgress();
   return true;
@@ -1422,13 +1423,26 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   // extent that stays or buffers that refill the lane's footprint, and a
   // waiting request may fit in it all the same.
   bool reclaimed = false;
+  // Pages whose copies are being written count toward the target.
+  const auto targetUnmet = [&] {
+    return released + cache_.pendingBytes() < directive.targetBytes;
+  };
   // Evicted states park their buffers in the model's pool, which a pass
   // returns to the host at once, or uses to refill the buffers it keeps.
   const auto releaseIdle = [&] {
-    while (const uint64_t idle = model_.reclaimIdleState(keep))
+    while (const uint64_t idle = model_.reclaimIdleState(keep, model::IdleMemory::Buffers))
       released += idle;
   };
   releaseIdle();
+  // Caches the model can rebuild go only toward a byte target: a pass
+  // without one keeps the embedding rows and the vision encoder.
+  while (targetUnmet()) {
+    const uint64_t cache =
+        model_.reclaimIdleState(keep, model::IdleMemory::BuffersThenCaches);
+    if (!cache)
+      break;
+    released += cache;
+  }
   if (directive.evictAllUnpinnedPrefixes) {
     const CacheReclaimResult evicted = cache_.evictAll();
     reclaimed = evicted.madeProgress;
@@ -1437,8 +1451,7 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   } else {
     // Even a zero-byte directive releases completely empty KV extents.
     released += cache_.releaseEmptyExtents(keep);
-    // Pages whose copies are being written count toward the target.
-    while (released + cache_.pendingBytes() < directive.targetBytes) {
+    while (targetUnmet()) {
       const CacheReclaimResult step =
           cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
                             directive.keepResumePoint, keep);
@@ -1453,8 +1466,7 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     signalResourceProgress();
   if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)
     return {released, ReclaimOutcome::Untargeted};
-  if (!directive.evictAllUnpinnedPrefixes &&
-      released + cache_.pendingBytes() >= directive.targetBytes)
+  if (!directive.evictAllUnpinnedPrefixes && !targetUnmet())
     return {released, ReclaimOutcome::Met};
   return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
                                                : ReclaimOutcome::Exhausted};

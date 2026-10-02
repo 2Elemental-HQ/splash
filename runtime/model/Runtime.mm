@@ -154,18 +154,21 @@ QwenStateStorage &requireQwenStateStorage(StateStorage &storage) {
   return *qwen;
 }
 
+// The lane a start's admission gave it, or the cause of its refusal.
+StateAdmission laneAdmission(uint32_t slot, const metal::AllocationResult &result) {
+  if (result)
+    return {slot, StateFailure::None};
+  return {{}, StateFailure::MemoryPressure, result.failure};
+}
+
 // Any unassigned slot works: its buffers come from the storage's pool, and
 // the governor is asked only for what the pool lacks.
 template <class Activate>
 StateAdmission admitIdleSlot(const QwenStateStorage &states,
                              Activate activate) {
   for (uint32_t slot = 0; slot < kLaneCount; ++slot) {
-    if (states.metadata(slot).assigned)
-      continue;
-    const metal::AllocationResult admission = activate(slot);
-    if (admission)
-      return {slot, StateFailure::None};
-    return {{}, StateFailure::MemoryPressure, admission.failure};
+    if (!states.metadata(slot).assigned)
+      return activate(slot);
   }
   return {{}, StateFailure::ConcurrencyLimit};
 }
@@ -286,9 +289,11 @@ struct Runtime::Impl {
   // its request's slot, which need not be its lane.
   MetalBuffer penaltyTable;
   std::unordered_map<uint64_t, Request> requests;
-  // Allocated for images that need an encode and reclaimable once no image
-  // waits for one. Injecting already encoded rows needs no vision arena.
-  std::unique_ptr<ops::Vision> vision;
+  // Allocated for images that need an encode, sized for the largest one the
+  // start that built it staged, and reclaimable once no image waits for one
+  // and no refused start holds it. Injecting already encoded rows needs no
+  // vision arena.
+  std::shared_ptr<ops::Vision> vision;
   // Every image's rows while anything holds them, so that a placement of
   // the same image anywhere shares them. Entries of rows nothing holds any
   // more go when a lookup or a walk finds them.
@@ -296,11 +301,10 @@ struct Runtime::Impl {
   // Encoded rows kept for reuse once no placement has rows of them left to
   // inject, including prefix hits that land inside an image and still need
   // its remaining rows. Most recently used first, bounded by bytes; the
-  // memory reclaimer drops it entirely.
+  // memory reclaimer drops the least recently used entry nothing else holds.
   static constexpr uint64_t kEmbeddingCacheBytes = 512ULL * 1024 * 1024;
   std::list<std::shared_ptr<ImageRows>> embeddingCache;
   uint64_t embeddingCacheBytes = 0;
-  uint32_t maximumImagePatches = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
@@ -315,7 +319,6 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
-        maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
         sampling(geometry.target.vocabularySize),
@@ -435,45 +438,65 @@ struct Runtime::Impl {
     entry.images.clear();
   }
 
-  // Empties the embedding cache and returns what that frees: rows a
-  // placement still holds stay allocated.
-  uint64_t dropEmbeddingCache() noexcept {
-    uint64_t released = 0;
-    while (!embeddingCache.empty()) {
-      const bool held = embeddingCache.front().use_count() > 1;
-      const uint64_t bytes = uncache(embeddingCache.begin());
-      if (!held)
-        released += bytes;
+  // Frees one cache that can be rebuilt and returns its bytes. The vision
+  // arena goes first, when no image waits for its encode and nothing holds
+  // it: an image whose rows are encoded never needs it, and the next start
+  // that does builds one sized for its own images. Then the least recently
+  // used embedding entry nothing else holds, one at a time, since only an
+  // encode rebuilds it. An entry something else holds is skipped, since
+  // dropping it frees nothing.
+  uint64_t releaseOneCache() noexcept {
+    if (vision && vision.use_count() == 1 && visionIdle()) {
+      const uint64_t bytes = vision->arenaBytes();
+      vision.reset();
+      return bytes;
     }
-    return released;
+    for (auto entry = embeddingCache.end(); entry != embeddingCache.begin();) {
+      if ((--entry)->use_count() == 1)
+        return uncache(entry);
+    }
+    return 0;
   }
 
-  // Drops the encoder a start built unless the start completes: an
-  // admission granted it, but a later step of the start threw.
+  // Puts back the encoder a start replaced, or drops the one it built,
+  // unless the start completes: an admission granted it, but a later step of
+  // the start threw.
   struct VisionRollback final {
     Impl &runtime;
-    bool hadVision;
+    std::shared_ptr<ops::Vision> previous;
     bool committed = false;
     ~VisionRollback() {
-      if (!committed && !hadVision)
-        runtime.vision.reset();
+      if (!committed)
+        runtime.vision = std::move(previous);
     }
   };
 
+  // What a refused start matched (StateAdmission::held): the rows it would
+  // share and, when an image still needs its encode and the live encoder
+  // covers it, that encoder.
+  struct Matched final {
+    std::vector<std::shared_ptr<ImageRows>> rows;
+    std::shared_ptr<ops::Vision> encoder;
+  };
+
   // A request's lane with everything else its start allocates, in one
-  // admission: the shared vision scratch when an image still needs an
-  // encode and no encoder exists, and the pixel and embedding buffers of
-  // the images nothing holds yet. Rows something holds are shared, encoded
+  // admission: the pixel and embedding buffers of the images nothing holds
+  // yet and, when an image still needs an encode that the live encoder does
+  // not cover, a vision scratch sized for the largest such image. That
+  // encoder replaces the live one, which covers fewer patches, so every
+  // image waiting on the old one fits the new; a command in flight keeps the
+  // old arena until it completes. Rows something holds are shared, encoded
   // or not. Images the restored prefix covers are left out: only their
   // spans are kept. At the budget the engine retries a denied start after
   // each reclaim step, and a denial builds nothing, so no encoder arena,
   // image buffer or state cell is built and dropped every time. The refusal
-  // keeps its cause; a grant hands the request's images to `images` and
+  // keeps its cause and holds what it matched, so the reclaim before the
+  // retry spares it; a grant hands the request's images to `images` and
   // counts the rows it shares as reuses, each once.
-  metal::AllocationResult activate(const ModelRequest &request, uint32_t slot,
-                                   std::vector<ImageState> &images) {
+  StateAdmission activate(const ModelRequest &request, uint32_t slot,
+                          std::vector<ImageState> &images) {
     if (request.images.empty())
-      return states.tryActivateSlot(slot, request.id);
+      return laneAdmission(slot, states.tryActivateSlot(slot, request.id));
     // The engine rejects image requests at submission when there is no vision.
     if (!package.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
@@ -481,7 +504,8 @@ struct Runtime::Impl {
     staged.reserve(request.images.size());
     std::vector<std::shared_ptr<ImageRows>> shared;
     uint64_t bytes = 0;
-    bool encodes = false;
+    // The patches of the largest staged image that still needs its encode.
+    uint32_t encodePatches = 0;
     for (const ImageSpan &span : request.images) {
       if (span.end() <= request.restoredTokens) {
         staged.push_back({span, nullptr});
@@ -498,20 +522,20 @@ struct Runtime::Impl {
       } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
         shared.push_back(rows);
       }
-      encodes |= !rows->encoded;
+      if (!rows->encoded)
+        encodePatches = std::max(encodePatches, span.gridHeight * span.gridWidth);
       staged.push_back({span, std::move(rows)});
     }
     const uint64_t encoderBytes =
-        encodes && !vision ? ops::Vision::scratchBytes(
-                                 package.vision.tensors.layout,
-                                 maximumImagePatches)
-                           : 0;
-    std::unique_ptr<ops::Vision> encoder;
+        encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
+            ? ops::Vision::scratchBytes(package.vision.tensors.layout, encodePatches)
+            : 0;
+    std::shared_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
-        encoder = std::make_unique<ops::Vision>(
-            backend, package.vision.tensors, maximumImagePatches);
+        encoder = std::make_shared<ops::Vision>(
+            backend, package.vision.tensors, encodePatches);
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -527,19 +551,22 @@ struct Runtime::Impl {
         pixels += span.pixelBytes();
       }
     };
-    if (auto admission = states.tryActivateSlot(slot, request.id,
-                                                encoderBytes + bytes, allocate);
-        !admission)
+    StateAdmission admission = laneAdmission(
+        slot, states.tryActivateSlot(slot, request.id, encoderBytes + bytes, allocate));
+    if (!admission.granted()) {
+      admission.held = std::make_shared<const Matched>(
+          Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
       return admission;
+    }
     if (encoder)
       vision = std::move(encoder);
     counters.imageEmbeddingReuses += shared.size();
     images = std::move(staged);
-    return {};
+    return admission;
   }
 
   // No image waits for its encode, so the vision arena can go.
-  [[nodiscard]] bool visionIdle() {
+  [[nodiscard]] bool visionIdle() noexcept {
     for (auto entry = imageRows.begin(); entry != imageRows.end();) {
       const std::shared_ptr<ImageRows> rows = entry->second.lock();
       if (!rows) {
@@ -1849,10 +1876,11 @@ void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateSlot) {
-  if (auto admission = beginAt(request, stateSlot); !admission) {
+  if (const StateAdmission admission = beginAt(request, stateSlot); !admission.granted()) {
     throw metal::MetalAllocationError(
         std::string("unable to allocate sequence state cell: ") +
-            metal::allocationFailureName(admission.failure), admission.failure);
+            metal::allocationFailureName(admission.allocationFailure),
+        admission.allocationFailure);
   }
   try {
     setDraftContextPlan(
@@ -1866,7 +1894,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
-  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
+  Impl::VisionRollback rollback{*impl_, impl_->vision};
   StateAdmission admission = admitIdleSlot(
       impl_->states, [&](uint32_t slot) { return beginAt(request, slot); });
   rollback.committed = admission.granted();
@@ -1897,7 +1925,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
-  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
+  Impl::VisionRollback rollback{*impl_, impl_->vision};
   std::vector<Impl::ImageState> images;
   StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
     return impl_->activate(request, slot, images);
@@ -1914,7 +1942,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   return admission;
 }
 
-metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t stateSlot) {
+StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateSlot) {
   if (!request.id || stateSlot >= kLaneCount || request.prompt.empty()) {
     throw std::invalid_argument("invalid executor request activation");
   }
@@ -1975,7 +2003,8 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
   std::vector<Impl::ImageState> images;
-  if (auto admission = impl_->activate(request, stateSlot, images); !admission)
+  const StateAdmission admission = impl_->activate(request, stateSlot, images);
+  if (!admission.granted())
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
@@ -1986,7 +2015,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   if (!inserted) {
     throw std::logic_error("request insertion lost uniqueness");
   }
-  return {};
+  return admission;
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
@@ -2471,18 +2500,12 @@ uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 
-uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
-  // One idle buffer per call, so a denied allocation frees only what it
-  // needs; rebuildable caches go once the pool has nothing more to give.
+uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
+  // One unit per call, so a denied allocation frees only what it needs;
+  // rebuildable caches go once the pool has nothing more to give.
   if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
     return buffer;
-  uint64_t released = 0;
-  released += impl_->dropEmbeddingCache();
-  if (impl_->vision && impl_->visionIdle()) {
-    released += impl_->vision->arenaBytes();
-    impl_->vision.reset();
-  }
-  return released;
+  return scope == IdleMemory::BuffersThenCaches ? impl_->releaseOneCache() : 0;
 }
 
 std::optional<std::string>

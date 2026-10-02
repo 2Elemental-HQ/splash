@@ -352,7 +352,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
-        while (modelPointer->reclaimIdleState(true)) {
+        while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {
         }
         static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
         return report;

@@ -79,9 +79,9 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
-  // Patches per image the vision scratch covers, from --max-image-patches;
-  // the engine admits images up to it when the model loaded vision and none
-  // otherwise. The wire parser keeps the protocol ceiling.
+  // Patches per image, from --max-image-patches: the engine admits images up
+  // to it when the model loaded vision and none otherwise. The wire parser
+  // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
@@ -207,7 +207,6 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches,
                    std::optional<uint64_t> hostAvailableAtStart);
 
   std::unique_ptr<metal::MetalBackend> backend_;
@@ -222,7 +221,6 @@ private:
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
-  uint32_t maximumImagePatches_ = 0;
   std::optional<uint64_t> hostAvailableAtStart_;
 };
 

@@ -103,6 +103,10 @@ public:
   [[nodiscard]] uint64_t arenaBytes() const noexcept {
     return arena_.sizeBytes();
   }
+  // The most patches an image it encodes may have.
+  [[nodiscard]] uint32_t maximumPatches() const noexcept {
+    return maximumPatches_;
+  }
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,

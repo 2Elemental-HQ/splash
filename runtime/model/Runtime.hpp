@@ -46,7 +46,8 @@ public:
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
-  [[nodiscard]] uint64_t reclaimIdleState(bool keepLane) noexcept override;
+  [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
+                                          IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;
@@ -69,7 +70,7 @@ private:
   [[nodiscard]] uint32_t committedStateSlot(uint64_t requestId);
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
-  [[nodiscard]] metal::AllocationResult beginAt(const ModelRequest &request,
+  [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateSlot);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   prefillAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
