@@ -133,9 +133,13 @@ class DefaultReasoningTests(unittest.TestCase):
                 fixtures.ServerTest.reasoning_template(default=default)
             )
             harness = self.harness(tokenizer=tokenizer)
-            job = harness.app.prepare(fixtures.ServerTest.body())
+            job = harness.app.prepare(
+                fixtures.ServerTest.body(), deadline=fixtures.FOREVER
+            )
             self.assertEqual(job.thinking, default)
-            job = harness.app.prepare_responses(fixtures.ServerTest.responses_body())
+            job = harness.app.prepare_responses(
+                fixtures.ServerTest.responses_body(), deadline=fixtures.FOREVER
+            )
             self.assertEqual(job.thinking, default)
 
     def test_scoring_is_independent_of_generation_default(self):
@@ -144,7 +148,9 @@ class DefaultReasoningTests(unittest.TestCase):
             harness = self.harness(
                 effort, tokenizer=fixtures.ServerTest.CharTokenizer(), max_context=8192
             )
-            job, _ = harness.app.prepare_judgment(fixtures.ServerTest.judgment_body())
+            job, _ = harness.app.prepare_judgment(
+                fixtures.ServerTest.judgment_body(), deadline=fixtures.FOREVER
+            )
             self.assertFalse(job.thinking)
             jobs.append((job.prompt_tokens, job.score_tokens))
             systemone = harness.app.prepare_systemone(
@@ -152,7 +158,8 @@ class DefaultReasoningTests(unittest.TestCase):
                     "model": "test-model",
                     "state": {},
                     "questions": {"q": {"type": "noul"}},
-                }
+                },
+                deadline=fixtures.FOREVER,
             )
             self.assertFalse(systemone[0][2].thinking)
         self.assertEqual(jobs, [jobs[0]] * 3)

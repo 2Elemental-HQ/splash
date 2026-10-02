@@ -39,6 +39,9 @@ from server.origins import ANY_ORIGIN, parse_allowed_origin
 from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
+# The deadline of a request prepared directly, which never expires.
+FOREVER = math.inf
+
 
 def _byte_alphabet():
     byte_values = [
@@ -1481,11 +1484,12 @@ class ServerTest(unittest.TestCase):
             ],
             timeout=1.0,
         )
+        deadline = app.request_deadline(body, clock[0])
         with (
             mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
             self.assertRaises(api.APIError) as error,
         ):
-            app.prepare_judgment(body)
+            app.prepare_judgment(body, deadline=deadline)
         self.assertEqual(
             (error.exception.status, error.exception.code), (504, "request_timeout")
         )
@@ -1502,7 +1506,8 @@ class ServerTest(unittest.TestCase):
                         {"id": f"opt{index}", "description": f"case {index}"}
                         for index in range(16)
                     ]
-                )
+                ),
+                deadline=FOREVER,
             )
         self.assertEqual(
             (error.exception.status, error.exception.code),
@@ -2160,17 +2165,20 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(kinds[0], "image_url")
                 self.assertEqual(kinds[-1], "file")
                 with self.assertRaisesRegex(api.APIError, "^image input"):
-                    api_shapes.normalize_messages(messages, vision=False)
+                    api_shapes.normalize_messages(
+                        messages, vision=False, deadline=FOREVER
+                    )
                 with self.assertRaisesRegex(api.APIError, "^PDF input"):
                     api_shapes.normalize_messages(
                         [{"role": "user", "content": messages[0]["content"][1:]}],
                         vision=False,
+                        deadline=FOREVER,
                     )
         # Normalization renders the document's PDF after its title and context.
         self.assertEqual(
-            api_shapes.normalize_messages(converted["anthropic"], vision=True)[0][
-                "content"
-            ][1:],
+            api_shapes.normalize_messages(
+                converted["anthropic"], vision=True, deadline=FOREVER
+            )[0]["content"][1:],
             [
                 {"type": "text", "text": "Report\n"},
                 {"type": "text", "text": "Fixture\n"},
@@ -2267,16 +2275,16 @@ class ServerTest(unittest.TestCase):
             )
         )
         app.images = api.image_input.ImageCache()
-        job = app.prepare(self.body(messages=[self._image_message()]))
+        job = app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         native_request = app.backend._generation_request(job)
         self.assertIs(native_request.image_owner, job.image_owner)
         del job
         with self.assertRaisesRegex(api.APIError, "image memory budget") as failure:
-            app.prepare(self.body(messages=[self._image_message()]))
+            app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         self.assertEqual(failure.exception.status, 503)
         del native_request
         self.assertEqual(app.images.stats()["request_bytes"], 0)
-        job = app.prepare(self.body(messages=[self._image_message()]))
+        job = app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         self.assertGreater(app.images.stats()["request_bytes"], 0)
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
@@ -2720,7 +2728,7 @@ class ServerTest(unittest.TestCase):
                 chat, _ = api.anthropic_to_chat_body(
                     {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
                 )
-                job = harness.app.prepare(chat)
+                job = harness.app.prepare(chat, deadline=FOREVER)
                 self.assertEqual(counted["input_tokens"], len(job.prompt_tokens))
                 self.assertEqual(job.request_id, index + 1)
                 counts.append(counted["input_tokens"])
@@ -2758,9 +2766,9 @@ class ServerTest(unittest.TestCase):
             {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
         )
         with self.assertRaisesRegex(api.APIError, "context window"):
-            harness.app.prepare(chat)
+            harness.app.prepare(chat, deadline=FOREVER)
         harness.app.max_context = 256
-        job = harness.app.prepare(chat)
+        job = harness.app.prepare(chat, deadline=FOREVER)
         self.assertEqual(len(job.prompt_tokens), 130)
         del job
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
@@ -3548,7 +3556,9 @@ class ServerTest(unittest.TestCase):
         # No server option bounds the output of a request that names no
         # limit: it may use what the two-token prompt leaves of the window.
         app = make_frontend(tokenizer, backend, "test-model", 40000, 1, 2, vision=True)
-        self.assertEqual(app.prepare(self.body()).max_new_tokens, 39998)
+        self.assertEqual(
+            app.prepare(self.body(), deadline=FOREVER).max_new_tokens, 39998
+        )
         with mock.patch("sys.stderr"):
             for option, value in (
                 ("--max-context", "0"),
@@ -3588,8 +3598,8 @@ class ServerTest(unittest.TestCase):
             second = make_frontend(
                 tokenizer, second_backend, "test-model", 128, 1, 2, vision=True
             )
-        first_job = first.prepare(self.body(seed=1))
-        second_job = second.prepare(self.body(seed=1))
+        first_job = first.prepare(self.body(seed=1), deadline=FOREVER)
+        second_job = second.prepare(self.body(seed=1), deadline=FOREVER)
         self.assertEqual((first_job.request_id, second_job.request_id), (1, 1))
         self.assertNotEqual(first_job.public_id, second_job.public_id)
         result = backend_api.NativeResult("stop", 2, 1, 1, 1, 1)
@@ -5401,7 +5411,7 @@ class ServerTest(unittest.TestCase):
         )
         for extra, required, parallel, start in cases:
             with self.subTest(**extra):
-                job = app.prepare(self.body(tools=tools, **extra))
+                job = app.prepare(self.body(tools=tools, **extra), deadline=FOREVER)
                 rendered, kwargs = tokenizer.templates[-1]
                 self.assertEqual(rendered, [{"role": "user", "content": "hello"}])
                 self.assertEqual(kwargs["tools"], tools)
@@ -5428,14 +5438,19 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [{"type": "function", "function": {"name": "f"}}]
-        job = app.prepare(self.body(tools=tools, tool_choice="none", stop=["x"]))
+        job = app.prepare(
+            self.body(tools=tools, tool_choice="none", stop=["x"]), deadline=FOREVER
+        )
         self.assertEqual(job.tool_policy.schemas, {})
         for choice in ("auto", "required"):
             with (
                 self.subTest(tool_choice=choice),
                 self.assertRaisesRegex(api.APIError, "stop cannot be combined"),
             ):
-                app.prepare(self.body(tools=tools, tool_choice=choice, stop=["x"]))
+                app.prepare(
+                    self.body(tools=tools, tool_choice=choice, stop=["x"]),
+                    deadline=FOREVER,
+                )
 
     def test_tool_names_accept_long_mcp_names_up_to_128_characters(self):
         runtime = FakeRuntime(Plan([[4]]))
@@ -5776,11 +5791,11 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         for effort in ("xhigh", "medium", "low"):
-            app.prepare(self.body(reasoning_effort=effort))
+            app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
             template = tokenizer.templates[-1][1]
             self.assertTrue(template["enable_thinking"])
             self.assertEqual(template["reasoning_effort"], effort)
-        app.prepare(self.body(reasoning_effort="none"))
+        app.prepare(self.body(reasoning_effort="none"), deadline=FOREVER)
         template = tokenizer.templates[-1][1]
         self.assertFalse(template["enable_thinking"])
         self.assertNotIn("reasoning_effort", template)
@@ -5872,9 +5887,11 @@ class ServerTest(unittest.TestCase):
                     "content": "A historical <think> must not open thinking.",
                 },
             )
-            job = app.prepare(body)
+            job = app.prepare(body, deadline=FOREVER)
             self.assertEqual(job.thinking, expected)
-            self.assertEqual(app.count_tokens(body), len(job.prompt_tokens))
+            self.assertEqual(
+                app.count_tokens(body, deadline=FOREVER), len(job.prompt_tokens)
+            )
         self.assertIn("think:", factory.grammars[-1])
 
     def test_responses_omitted_or_null_effort_preserves_native_thinking_off(self):
@@ -5913,7 +5930,9 @@ class ServerTest(unittest.TestCase):
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
                 with self.subTest(accepted=accepted, effort=effort):
                     tokenizer.templates.clear()
-                    job = app.prepare(self.body(reasoning_effort=effort))
+                    job = app.prepare(
+                        self.body(reasoning_effort=effort), deadline=FOREVER
+                    )
                     self.assertTrue(job.thinking)
                     self.assertEqual(
                         [
@@ -5928,7 +5947,7 @@ class ServerTest(unittest.TestCase):
         app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
         tokenizer.templates.clear()
         with self.assertRaises(api.APIError):
-            app.prepare(self.body(reasoning_effort="high"))
+            app.prepare(self.body(reasoning_effort="high"), deadline=FOREVER)
         self.assertEqual(
             [kwargs["reasoning_effort"] for _, kwargs in tokenizer.templates],
             ["high", "xhigh"],
@@ -5937,7 +5956,7 @@ class ServerTest(unittest.TestCase):
             tokenizer, "apply_chat_template", side_effect=ValueError("bad content")
         ) as render:
             with self.assertRaises(api.APIError) as caught:
-                app.prepare(self.body(reasoning_effort="high"))
+                app.prepare(self.body(reasoning_effort="high"), deadline=FOREVER)
             render.assert_called_once()
             self.assertIsInstance(caught.exception.__cause__, ValueError)
 
@@ -5950,9 +5969,9 @@ class ServerTest(unittest.TestCase):
                 self.subTest(effort=effort),
                 self.assertRaisesRegex(api.APIError, "invalid reasoning_effort"),
             ):
-                app.prepare(self.body(reasoning_effort=effort))
+                app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
         self.assertEqual(tokenizer.templates, [])
-        job = app.prepare(self.body(reasoning_effort=None))
+        job = app.prepare(self.body(reasoning_effort=None), deadline=FOREVER)
         self.assertTrue(job.thinking)
         self.assertNotIn("enable_thinking", tokenizer.templates[-1][1])
 
@@ -5970,7 +5989,7 @@ class ServerTest(unittest.TestCase):
                 self.subTest(effort=effort),
                 self.assertRaisesRegex(api.APIError, "requested thinking mode"),
             ):
-                app.prepare(self.body(reasoning_effort=effort))
+                app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
 
     def test_generation_prompt_decides_thinking_and_its_token_count(self):
         history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
@@ -6014,13 +6033,14 @@ class ServerTest(unittest.TestCase):
             chat, _ = api.anthropic_to_chat_body(
                 body, thinking_resolver=no_signed_thinking
             )
-            job = app.prepare(chat)
+            job = app.prepare(chat, deadline=FOREVER)
             self.assertFalse(job.thinking)
             self.assertEqual(
                 app.count_tokens(
                     api.anthropic_to_chat_prompt(
                         body, thinking_resolver=no_signed_thinking
-                    )
+                    ),
+                    deadline=FOREVER,
                 ),
                 len(job.prompt_tokens),
             )
@@ -6124,7 +6144,7 @@ class ServerTest(unittest.TestCase):
                     },
                 )
                 original = json.dumps(body, sort_keys=True)
-                prompt = harness.app._prepare_prompt(body, None)
+                prompt = harness.app._prepare_prompt(body, None, deadline=FOREVER)
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
                 self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)
@@ -6221,10 +6241,12 @@ class ServerTest(unittest.TestCase):
     def test_reasoning_effort_is_preserved_until_the_template_renders(self):
         harness = self.harness(FakeRuntime())
         prompt = harness.app._prepare_prompt(
-            self.body(reasoning_effort="minimal"), None
+            self.body(reasoning_effort="minimal"), None, deadline=FOREVER
         )
         self.assertEqual(prompt.reasoning_effort, "minimal")
-        job = harness.app.prepare(self.body(reasoning_effort="minimal"))
+        job = harness.app.prepare(
+            self.body(reasoning_effort="minimal"), deadline=FOREVER
+        )
         self.assertTrue(job.thinking)
 
     def test_chat_length_safely_finishes_partial_structured_and_tool_output(self):
@@ -6641,7 +6663,7 @@ class ServerTest(unittest.TestCase):
         def prepare(index):
             try:
                 operation = app.count_tokens if index == 1 else app.prepare
-                results.append(operation(self.body()))
+                results.append(operation(self.body(), deadline=FOREVER))
             except Exception as error:
                 errors.append(error)
 
@@ -6820,14 +6842,14 @@ class ServerTest(unittest.TestCase):
             with mock.patch.object(
                 FakeTokenizer, "__call__", return_value={"input_ids": [101] * length}
             ):
-                job = harness.app.prepare(self.body())
+                job = harness.app.prepare(self.body(), deadline=FOREVER)
             self.assertEqual(job.max_new_tokens, expected)
             self.assertEqual(len(job.prompt_tokens), length)
         with mock.patch.object(
             FakeTokenizer, "__call__", return_value={"input_ids": [101] * 100000}
         ):
             with self.assertRaisesRegex(api.APIError, "prompt exceeds") as caught:
-                harness.app.prepare(self.body())
+                harness.app.prepare(self.body(), deadline=FOREVER)
             self.assertEqual(caught.exception.code, "context_length_exceeded")
 
     def test_preparation_consumes_original_deadline_and_releases_slots(self):
@@ -6848,12 +6870,14 @@ class ServerTest(unittest.TestCase):
                     app.tokenizer, "apply_chat_template", side_effect=tokenize
                 ),
             ):
+                body = self.body(timeout=1)
+                deadline = app.request_deadline(body, clock[0])
                 if elapsed < 1:
-                    job = app.prepare(self.body(timeout=1))
+                    job = app.prepare(body, deadline=deadline)
                     self.assertEqual(job.deadline, 101.0)
                 else:
                     with self.assertRaises(api.APIError) as error:
-                        app.prepare(self.body(timeout=1))
+                        app.prepare(body, deadline=deadline)
                     self.assertEqual(
                         (error.exception.status, error.exception.code),
                         (504, "request_timeout"),
@@ -6871,8 +6895,9 @@ class ServerTest(unittest.TestCase):
         app.tokenizer.templates.clear()
         app.preparation_slots.acquire()
         try:
+            body = self.body(timeout=0.02)
             with self.assertRaises(api.APIError) as error:
-                app.prepare(self.body(timeout=0.02))
+                app.prepare(body, deadline=app.request_deadline(body, time.monotonic()))
             self.assertEqual(
                 (error.exception.status, error.exception.code), (504, "request_timeout")
             )
@@ -6908,10 +6933,9 @@ class ServerTest(unittest.TestCase):
                     factory.create.side_effect = expire
                 else:
                     images.side_effect = expire
+                body = self.body(timeout=1, response_format={"type": "json_object"})
                 with self.assertRaises(api.APIError) as error:
-                    app.prepare(
-                        self.body(timeout=1, response_format={"type": "json_object"})
-                    )
+                    app.prepare(body, deadline=app.request_deadline(body, clock[0]))
                 self.assertEqual(error.exception.status, 504)
                 if stage == "grammar":
                     images.assert_called_once()
@@ -7554,7 +7578,7 @@ class ServerTest(unittest.TestCase):
         body = self.body()
         body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
-            job = app.prepare(body)
+            job = app.prepare(body, deadline=FOREVER)
         self.assertEqual(
             (job.sampling, job.seed),
             (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
@@ -7564,7 +7588,7 @@ class ServerTest(unittest.TestCase):
         blocking = Plan([[4]], block=True)
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime, queue_size=1)
-        head = harness.app.prepare(self.body(timeout=2))
+        head = harness.app.prepare(self.body(timeout=2), deadline=FOREVER)
         harness.backend.submit(head)
         self.assertTrue(blocking.started.wait(1))
 
@@ -7591,8 +7615,10 @@ class ServerTest(unittest.TestCase):
         harness = self.harness(FakeRuntime())
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
-                harness.app.prepare(self.body(priority=value))
-        job = harness.app.prepare_responses(self.responses_body(priority="foreground"))
+                harness.app.prepare(self.body(priority=value), deadline=FOREVER)
+        job = harness.app.prepare_responses(
+            self.responses_body(priority="foreground"), deadline=FOREVER
+        )
         self.assertEqual(job.priority, native_wire.RequestPriority.FOREGROUND)
 
     def test_active_timeout_signals_and_next_request_runs(self):
@@ -9258,6 +9284,7 @@ class MessageNormalizationTest(unittest.TestCase):
                 {"role": "user", "content": "continue"},
             ],
             vision=True,
+            deadline=FOREVER,
         )
         call = messages[1]["tool_calls"][0]["function"]
         self.assertEqual(call["name"], "shell")
@@ -9283,6 +9310,7 @@ class MessageNormalizationTest(unittest.TestCase):
                         },
                     ],
                     vision=True,
+                    deadline=FOREVER,
                 )
                 self.assertEqual(
                     complete[1]["tool_calls"][0]["function"]["arguments"], expected
@@ -9307,6 +9335,7 @@ class MessageNormalizationTest(unittest.TestCase):
                         },
                     ],
                     vision=True,
+                    deadline=FOREVER,
                 )
         with self.assertRaises(api.APIError):
             api_shapes.normalize_messages(
@@ -9324,6 +9353,7 @@ class MessageNormalizationTest(unittest.TestCase):
                     },
                 ],
                 vision=True,
+                deadline=FOREVER,
             )
 
 

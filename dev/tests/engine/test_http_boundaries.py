@@ -8,7 +8,7 @@ from unittest import mock
 
 from PIL import Image
 
-from dev.tests.test_server import FakeRuntime, Harness
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness
 from server import crash_trace, http_security, images, origins
 from server.errors import APIError
 
@@ -213,8 +213,8 @@ class HttpBoundaryTests(unittest.TestCase):
             "server.server.secrets.token_hex",
             side_effect=("first-random-id", "second-random-id"),
         ):
-            first = harness.app.prepare(body)
-            second = harness.app.prepare(body)
+            first = harness.app.prepare(body, deadline=FOREVER)
+            second = harness.app.prepare(body, deadline=FOREVER)
         self.assertEqual(
             (first.public_id, second.public_id), ("first-random-id", "second-random-id")
         )

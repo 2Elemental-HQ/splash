@@ -14,6 +14,7 @@ from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.engine.test_runtime import FakeFactory, request
 from dev.tests.test_server import (
+    FOREVER,
     FakeConstraintFactory,
     FakeRuntime,
     Harness,
@@ -45,8 +46,7 @@ class RequestContractTests(unittest.TestCase):
         }
         status, _, payload = harness.request("POST", "/v1/chat/completions", body)
         self.assertEqual(status, 200, payload)
-        with mock.patch.object(api.time, "monotonic", return_value=10):
-            deadline = harness.app.request_deadline({"timeout": 1e6})
+        deadline = harness.app.request_deadline({"timeout": 1e6}, 10)
         self.assertEqual(deadline, 10 + harness.app.request_timeout)
 
     def test_invalid_generation_fields_fail_before_document_rendering(self):
@@ -136,7 +136,9 @@ class RequestContractTests(unittest.TestCase):
         ]
         self.assertEqual(
             normalize_messages(
-                [{"role": "user", "content": "Hi"}, *messages], vision=True
+                [{"role": "user", "content": "Hi"}, *messages],
+                vision=True,
+                deadline=FOREVER,
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
@@ -293,7 +295,8 @@ class RequestContractTests(unittest.TestCase):
                     {
                         "model": "test-model",
                         "messages": [{"role": "user", "content": "hello"}],
-                    }
+                    },
+                    deadline=FOREVER,
                 )
         self.assertEqual(
             log.call_args.args[0], "Template error · ValueError · <template>:2"

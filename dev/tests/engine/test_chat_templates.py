@@ -569,17 +569,20 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                         "messages": messages,
                         "reasoning_effort": effort,
                     }
-                    job = app.prepare(body)
+                    job = app.prepare(body, deadline=fixtures.FOREVER)
                     self.assertEqual(job.generation_prompt_tokens, expected)
                     history = app.apply_template(
-                        {**body, "add_generation_prompt": False}
+                        {**body, "add_generation_prompt": False},
+                        deadline=fixtures.FOREVER,
                     )
                     self.assertEqual(
                         job.prompt_tokens[:-expected],
                         app.tokenizer(history, add_special_tokens=False)["input_ids"],
                     )
                     # Images precede it, so expanding them keeps its length.
-                    image_job = app.prepare({**body, "messages": with_image})
+                    image_job = app.prepare(
+                        {**body, "messages": with_image}, deadline=fixtures.FOREVER
+                    )
                     self.assertEqual(image_job.generation_prompt_tokens, expected)
                     self.assertEqual(
                         image_job.prompt_tokens[-expected:],
@@ -589,8 +592,10 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # without a turn-start token finds the same boundary.
         app = frontend("qwen36_gguf", "<|im_end|>")
         body = {"model": "test-model", "messages": messages}
-        job = app.prepare(body)
-        history = app.apply_template({**body, "add_generation_prompt": False})
+        job = app.prepare(body, deadline=fixtures.FOREVER)
+        history = app.apply_template(
+            {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
+        )
         self.assertGreater(job.generation_prompt_tokens, 0)
         self.assertEqual(
             job.prompt_tokens[: -job.generation_prompt_tokens],
@@ -645,7 +650,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 template_tokenizer, None, "test-model", 4096, 10, 2, vision=False
             )
 
-        job = frontend(gemma_tokenizer).prepare(body)
+        job = frontend(gemma_tokenizer).prepare(body, deadline=fixtures.FOREVER)
         self.assertEqual(
             (job.generation_prompt_tokens, job.thinking), (len(ids), False)
         )
@@ -656,7 +661,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 chosen = ChatTemplates(template_tokenizer).select(None)
                 self.assertEqual(chosen.generation_prompts, {})
                 with self.assertRaisesRegex(APIError, "assistant generation prefix"):
-                    frontend(template_tokenizer).prepare(body)
+                    frontend(template_tokenizer).prepare(
+                        body, deadline=fixtures.FOREVER
+                    )
 
     def test_template_kwargs_are_template_variables(self):
         """A request's chat_template_kwargs reach the template: its own
@@ -691,7 +698,8 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                         "messages": messages,
                         "chat_template_kwargs": kwargs,
                         **extra,
-                    }
+                    },
+                    deadline=fixtures.FOREVER,
                 )
                 self.assertEqual(
                     (job.thinking, job.generation_prompt_tokens), (thinking, tokens)
@@ -705,7 +713,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         app = frontend(switch)
         body = {"model": "test-model", "messages": messages}
         for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
-            job = app.prepare({**body, "chat_template_kwargs": kwargs})
+            job = app.prepare(
+                {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
+            )
             self.assertEqual(job.thinking, expected)
         self.assertEqual(app.chat_templates.select(None).probe.cache_info().misses, 1)
         for kwargs, error in (
@@ -714,7 +724,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             ({"add_generation_prompt": False}, "cannot set add_generation_prompt"),
         ):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(APIError, error):
-                app.prepare({**body, "chat_template_kwargs": kwargs})
+                app.prepare(
+                    {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
+                )
 
     class ScoringTokenizer(
         fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer
@@ -727,9 +739,12 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             tokenizer, None, "test-model", 8192, 10, 2, vision=True
         )
         tokenizer.templates.clear()
-        app.prepare_judgment(fixtures.ServerTest.judgment_body())
+        app.prepare_judgment(
+            fixtures.ServerTest.judgment_body(), deadline=fixtures.FOREVER
+        )
         app.prepare_systemone(
-            {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}}
+            {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
+            deadline=fixtures.FOREVER,
         )
         self.assertEqual(
             [kwargs.get("chat_template") for _, kwargs in tokenizer.templates],
@@ -750,7 +765,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         }
         chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
-            harness.app._prepare_prompt(chat, None), float("inf"), check_context=False
+            harness.app._prepare_prompt(chat, None, deadline=fixtures.FOREVER),
+            float("inf"),
+            check_context=False,
         ).text
         self.assertTrue(
             prompt.startswith(
@@ -822,6 +839,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "system", "content": "Later still"},
             ],
             vision=True,
+            deadline=fixtures.FOREVER,
         )
         self.assertEqual(
             merged,
@@ -839,6 +857,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                     {"role": "user", "content": "x"},
                 ],
                 vision=True,
+                deadline=fixtures.FOREVER,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
@@ -865,7 +884,9 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(messages, vision=True),
+                    api_shapes.normalize_messages(
+                        messages, vision=True, deadline=fixtures.FOREVER
+                    ),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},

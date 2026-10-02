@@ -82,7 +82,8 @@ class ResponseLifecycleTests(unittest.TestCase):
                 "input": "continue",
                 "previous_response_id": "resp_previous",
                 "store": False,
-            }
+            },
+            deadline=fixtures.FOREVER,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
         self.assertIsNone(job.response_history_items)
@@ -97,7 +98,7 @@ class ResponseLifecycleTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": "answer"}],
         }
         body = {"input": [dict(question)]}
-        job = harness.app.prepare_responses(body)
+        job = harness.app.prepare_responses(body, deadline=fixtures.FOREVER)
         output = [copy.deepcopy(answer)]
         harness.app.persist_response(job, {"id": "resp_stored"}, output)
         # The record was encoded when it was stored.

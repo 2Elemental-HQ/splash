@@ -4,7 +4,6 @@ import hashlib
 import json
 import secrets
 import threading
-import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -513,9 +512,7 @@ class Frontend:
         pixels = b"".join(image.pixels for image in prepared)
         return expanded, tuple(spans), pixels
 
-    def request_deadline(self, body, started_at=None):
-        if started_at is None:
-            started_at = time.monotonic()
+    def request_deadline(self, body, started_at):
         timeout = body.get("timeout")
         if timeout is None:
             timeout = self.request_timeout
@@ -527,7 +524,7 @@ class Frontend:
         self,
         body,
         *,
-        deadline=None,
+        deadline,
         output_field=None,
         clamp_output_budget=False,
         thinking_display="summarized",
@@ -537,8 +534,6 @@ class Frontend:
         clamp_output_budget, a limit larger than what the context leaves is
         lowered to it instead of refused. thinking_display "omitted" hides
         Messages reasoning behind a signature."""
-        if deadline is None:
-            deadline = self.request_deadline(body)
         with self._preparation(deadline):
             return self._prepare(
                 body,
@@ -549,11 +544,9 @@ class Frontend:
                 thinking_display=thinking_display,
             )
 
-    def prepare_completion(self, body, *, deadline=None):
+    def prepare_completion(self, body, *, deadline):
         """A text completion: the prompt generates as given, with no chat
         template, reasoning split, tools or images."""
-        if deadline is None:
-            deadline = self.request_deadline(body)
         with self._preparation(deadline):
             body = _drop_nulls(
                 body, ("n", "best_of", "max_tokens", "suffix", "echo", "logprobs")
@@ -605,9 +598,7 @@ class Frontend:
             raise APIError(400, "prompt must not be empty")
         return list(tokens)
 
-    def count_tokens(self, body, *, deadline=None):
-        if deadline is None:
-            deadline = self.request_deadline(body)
+    def count_tokens(self, body, *, deadline):
         with self._preparation(deadline):
             prompt = self._prepare_prompt(body, None, deadline=deadline)
             rendered = self._render_prompt(prompt, deadline, check_context=False)
@@ -615,7 +606,7 @@ class Frontend:
                 rendered.tokens, rendered.images, rendered.image_positions
             )
 
-    def tokenize(self, body, *, deadline=None):
+    def tokenize(self, body, *, deadline):
         content = body.get("content")
         if not isinstance(content, str):
             raise APIError(400, "content must be a string")
@@ -627,8 +618,6 @@ class Frontend:
                 raise APIError(
                     400, f"only {option}={str(supported).lower()} is supported"
                 )
-        if deadline is None:
-            deadline = self.request_deadline(body)
         with self._preparation(deadline):
             try:
                 tokens = self._tokenize(content, add_special_tokens=add_special)[
@@ -680,7 +669,7 @@ class Frontend:
         except Exception as error:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
-    def prepare_judgment(self, body, *, deadline=None):
+    def prepare_judgment(self, body, *, deadline):
         unknown = sorted(
             set(body)
             - {"id", "state", "question", "options", "model", "timeout", "priority"}
@@ -693,8 +682,6 @@ class Frontend:
             judgments.validate_row(body)
         except ValueError as error:
             raise APIError(400, str(error)) from error
-        if deadline is None:
-            deadline = self.request_deadline(body)
         priority = self._priority(body)
         with self._preparation(deadline):
 
@@ -716,7 +703,7 @@ class Frontend:
             )
         return job, body
 
-    def prepare_systemone(self, body, *, deadline=None):
+    def prepare_systemone(self, body, *, deadline):
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
@@ -735,8 +722,6 @@ class Frontend:
             details.append(judgments.detail(["priority"], error.message))
         if details:
             raise judgments.SystemOneError(details)
-        if deadline is None:
-            deadline = self.request_deadline(body)
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):
@@ -787,12 +772,10 @@ class Frontend:
                 )
         return jobs
 
-    def apply_template(self, body, *, deadline=None):
+    def apply_template(self, body, *, deadline):
         add_generation_prompt = body.get("add_generation_prompt", True)
         if not isinstance(add_generation_prompt, bool):
             raise APIError(400, "add_generation_prompt must be a boolean")
-        if deadline is None:
-            deadline = self.request_deadline(body)
         with self._preparation(deadline):
             prompt = self._prepare_prompt(body, None, deadline=deadline)
             return self._render_prompt(
@@ -831,7 +814,7 @@ class Frontend:
                 self.preparation_active -= 1
             self.preparation_slots.release()
 
-    def _prepare_prompt(self, body, tool_namespaces, *, deadline=None):
+    def _prepare_prompt(self, body, tool_namespaces, *, deadline):
         if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
@@ -1179,9 +1162,7 @@ class Frontend:
             **fields,
         )
 
-    def prepare_responses(self, body, *, deadline=None, reserve_input=None):
-        if deadline is None:
-            deadline = self.request_deadline(body)
+    def prepare_responses(self, body, *, deadline, reserve_input=None):
         store = body.get("store")
         if store is not None and not isinstance(store, bool):
             raise APIError(400, "store must be a boolean")

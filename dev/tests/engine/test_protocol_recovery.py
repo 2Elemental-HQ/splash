@@ -4,7 +4,7 @@ import unittest
 from itertools import product
 from unittest import mock
 
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness, Plan
 from dev.tests.tool_output import argument_grammar, project
 from server import errors as api_errors
 from server import server as api
@@ -130,7 +130,9 @@ class ProtocolRecoveryTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         message = json.loads(payload)["choices"][0]["message"]
         self.assertEqual(message["reasoning_content"], "because ")
-        self.assertEqual(harness.app.prepare(body).thinking_display, "summarized")
+        self.assertEqual(
+            harness.app.prepare(body, deadline=FOREVER).thinking_display, "summarized"
+        )
 
     def test_omitted_tool_roundtrip_and_summarized_compatibility(self):
         codec = ThinkingCodec()
@@ -343,7 +345,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "interrupted", "content": "interrupted"},
         ]
         original = copy.deepcopy(source)
-        normalized = normalize_messages(source, vision=True)
+        normalized = normalize_messages(source, vision=True, deadline=FOREVER)
         projected = template_messages(normalized)
         self.assertEqual(source, original)
         self.assertEqual(

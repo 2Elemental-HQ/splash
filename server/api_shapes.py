@@ -206,7 +206,7 @@ def _unfinished_json(text):
     return stack != ["done"]
 
 
-def normalize_messages(messages, *, vision, deadline=None):
+def normalize_messages(messages, *, vision, deadline):
     document_budget = DocumentBudget(deadline=deadline)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")

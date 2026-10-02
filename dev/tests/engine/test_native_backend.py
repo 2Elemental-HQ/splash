@@ -11,7 +11,7 @@ from unittest import mock
 
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory
-from dev.tests.test_server import _byte_backend, make_frontend
+from dev.tests.test_server import FOREVER, _byte_backend, make_frontend
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -302,7 +302,8 @@ class NativeBackendContractTests(unittest.TestCase):
                 "repetition_penalty": 1.05,
                 "seed": 99,
                 "priority": "background",
-            }
+            },
+            deadline=FOREVER,
         )
 
         transport.submit(job)
@@ -371,7 +372,8 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         self.assertEqual(app.request_deadline({"timeout": 5}, 10), 15)
         job = app.prepare(
-            {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+            {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]},
+            deadline=FOREVER,
         )
         self.assertEqual(
             backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX

@@ -6,7 +6,7 @@ from unittest import mock
 
 from dev.tests import test_server
 from dev.tests.engine.test_documents import pdf_bytes, render_pdf
-from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.test_server import FOREVER, FakeRuntime, Harness, Plan
 from server import api_shapes, documents
 from server.errors import APIError
 
@@ -19,7 +19,7 @@ class PdfProtocolTests(unittest.TestCase):
             "file_data": "data:application/pdf;base64," + self.encoded,
         }
 
-    def chat(self, file=None, **kwargs):
+    def chat(self, file=None, deadline=FOREVER):
         return api_shapes.normalize_messages(
             [
                 {
@@ -29,8 +29,8 @@ class PdfProtocolTests(unittest.TestCase):
                     ],
                 }
             ],
-            **kwargs,
             vision=True,
+            deadline=deadline,
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
@@ -50,9 +50,9 @@ class PdfProtocolTests(unittest.TestCase):
                 }
             ],
         )
-        actual = api_shapes.normalize_messages(response["messages"], vision=True)[0][
-            "content"
-        ]
+        actual = api_shapes.normalize_messages(
+            response["messages"], vision=True, deadline=FOREVER
+        )[0]["content"]
         self.assertEqual(
             actual,
             [
@@ -225,7 +225,7 @@ class PdfProtocolTests(unittest.TestCase):
             with mock.patch.object(
                 api_shapes, "DocumentBudget", return_value=request_budget
             ):
-                api_shapes.normalize_messages(messages, vision=True)
+                api_shapes.normalize_messages(messages, vision=True, deadline=FOREVER)
 
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
@@ -288,6 +288,7 @@ class PdfProtocolTests(unittest.TestCase):
                     api_shapes.normalize_messages(
                         [{"role": "user", "content": [{"type": "file", "file": file}]}],
                         vision=True,
+                        deadline=FOREVER,
                     )
 
     def test_input_bound_checked_before_decode(self):

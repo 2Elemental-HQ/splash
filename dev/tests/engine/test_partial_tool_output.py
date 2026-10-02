@@ -6,6 +6,7 @@ import unittest
 from jsonschema import Draft202012Validator
 
 from dev.tests.test_server import (
+    FOREVER,
     FakeRuntime,
     FakeTokenizer,
     Harness,
@@ -413,6 +414,7 @@ class PartialToolOutputTests(unittest.TestCase):
                                 {"role": "user", "content": "Continue"},
                             ],
                             vision=True,
+                            deadline=FOREVER,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)

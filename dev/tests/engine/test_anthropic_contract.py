@@ -5,6 +5,7 @@ import unittest
 from dev.tests import test_server
 from dev.tests.engine.test_documents import document_block
 from dev.tests.test_server import (
+    FOREVER,
     FakeConstraintFactory,
     FakeRuntime,
     Harness,
@@ -443,9 +444,9 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                         }
                     ],
                 )
-                parts = normalize_messages(translated["messages"], vision=True)[-1][
-                    "content"
-                ]
+                parts = normalize_messages(
+                    translated["messages"], vision=True, deadline=FOREVER
+                )[-1]["content"]
                 self.assertIn("ALPHA 42", parts[0]["text"])
                 self.assertEqual(parts[1]["type"], "image_url")
                 status, _, payload = harness.request(
@@ -453,7 +454,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 200, payload)
                 counted = json.loads(payload)["input_tokens"]
-                job = harness.app.prepare(translated)
+                job = harness.app.prepare(translated, deadline=FOREVER)
                 self.assertEqual(len(job.prompt_tokens), counted)
                 self.assertGreater(counted, 2)
                 self.assertEqual(len(job.image_spans), 1)

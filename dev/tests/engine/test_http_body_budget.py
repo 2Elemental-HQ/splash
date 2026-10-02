@@ -434,6 +434,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 "store": False,
             },
             reserve_input=reservation.grow,
+            deadline=fixtures.FOREVER,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
         self.assertIsNone(job.response_history_items)
