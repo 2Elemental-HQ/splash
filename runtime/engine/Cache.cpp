@@ -129,6 +129,14 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
   }
   if (!blocks.empty()) {
     kv_.touch(blocks.back());
+    // A chain with a disk suffix keeps its resident boundary as warm as its
+    // tip: a restore adopts the disk blocks below it.
+    const auto resident =
+        std::find_if(blocks.rbegin(), blocks.rend(), [&](uint64_t block) {
+          return kv_.page(block) != KvCache::noPage;
+        });
+    if (resident != blocks.rbegin() && resident != blocks.rend())
+      kv_.touch(*resident);
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
     result.state = states_.acquireDeepest(blocks);
   }
@@ -486,29 +494,12 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   const auto firstOnDisk = std::find(chain.pages.begin(), chain.pages.end(), KvCache::noPage);
   const auto missing = static_cast<uint32_t>(chain.pages.end() - firstOnDisk);
   std::vector<uint32_t> fresh;
-  // The last resident block has only disk children, so it is a leaf the
-  // eviction that makes room could drop; it stays until its child is adopted.
-  uint64_t extended = 0;
   if (missing) {
     if (!tier_)
       throw std::logic_error("disk-only KV block without a disk tier");
-    if (firstOnDisk != chain.pages.begin()) {
-      extended = chain.blocks[firstOnDisk - chain.pages.begin() - 1];
-      kv_.retainActive(extended);
-    }
-    TokenAdmission admission;
-    try {
-      admission = admitPages(missing, fresh);
-    } catch (...) {
-      if (extended)
-        kv_.releaseActive(extended);
-      throw;
-    }
-    if (!admission.granted()) {
-      if (extended)
-        kv_.releaseActive(extended);
+    const TokenAdmission admission = admitPages(missing, fresh);
+    if (!admission.granted())
       return admission;
-    }
   }
   std::vector<uint32_t> retained;
   retained.reserve(chain.pages.size());
@@ -537,13 +528,9 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     for (uint32_t page : fresh)
       pool_.releasePage(page, false);
     kv_.releaseActive(chain.blocks.back());
-    if (extended)
-      kv_.releaseActive(extended);
     active.pendingRestores = 0;
     throw;
   }
-  if (extended)
-    kv_.releaseActive(extended);
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
   ++active.pageTableRevision;

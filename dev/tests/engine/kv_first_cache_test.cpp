@@ -2239,6 +2239,51 @@ void testBusyTierPreservesDiskVictim() {
   }
 }
 
+// A lookup touches the resident boundary of a chain with a disk suffix, not
+// only its tip: the boundary is a leaf, and the reclaim that makes room for
+// the restore must take an older one, not the block the restore extends.
+void testLookupKeepsADiskChainsResidentBoundaryWarm() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  std::vector<uint32_t> chain(65);
+  for (uint32_t i = 0; i < chain.size(); ++i)
+    chain[i] = 1000 + i;
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 64).granted(), "chain KV admission failed");
+  const uint64_t leaf = cache.publishCommittedBlocks(1, chain, 64);
+  cache.endRequest(1);
+  cache.publishCompositeState(leaf, std::make_shared<TieredState>(control));
+  require(cache.reclaimOne(reuse).madeProgress && cache.pollTransfers(),
+          "the chain's state was not demoted");
+  demoteLeaves(cache, tier, 1);
+  // The chain is its resident root and its leaf on disk. A newer chain
+  // follows.
+  const std::vector<uint32_t> newer(33, 7);
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 32).granted(), "newer KV admission failed");
+  static_cast<void>(cache.publishCommittedBlocks(2, newer, 32));
+  cache.endRequest(2);
+  require(pool.freePageCount() == 2 && tier.demotions == 1,
+          "fixture geometry changed");
+
+  {
+    const auto lookup = cache.lookup(chain);
+    require(lookup.resumeBoundary() == 64, "the disk chain did not match");
+    require(cache.reclaimOne(reuse).madeProgress && pool.freePageCount() == 3 &&
+                tier.demotions == 1,
+            "the reclaim took the chain's resident boundary");
+  }
+  require(cache.lookup(newer).kvBoundary == 0 &&
+              cache.lookup(chain).resumeBoundary() == 64 &&
+              cache.snapshot().kvCache.diskBlocks == 1,
+          "the reclaim did not take the older leaf alone");
+}
+
 // A restore takes its pages before it pins its chain, and the chain's last
 // resident block has only disk children, which makes it a leaf. The eviction
 // that makes room must not take it: the restore adopts pages under it.
@@ -2424,6 +2469,7 @@ void testLargeSharedDiskRestore() {
 int main() {
   try {
     testLargeSharedDiskRestore();
+    testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();
     testCancelledRestoreKeepsThePageUnderANewState();
