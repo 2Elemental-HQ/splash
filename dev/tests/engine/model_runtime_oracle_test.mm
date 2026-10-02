@@ -219,8 +219,7 @@ void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          const std::shared_ptr<const CompositeState> &state) {
   require(!executor.beginRestore(requestId, boundary, state, true, {}),
           "resident restore returned a read");
-  executor.setDraftContextPlan(
-      requestId, planDraftContext(boundary, promptTokens, boundary, {}));
+  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}));
 }
 
 ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
@@ -614,8 +613,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "straddling image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()),
-                                   std::nullopt, {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
@@ -750,8 +748,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint32_t lane = *admitted.cell;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, checkpoints));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
@@ -948,8 +945,7 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
   for (uint32_t lane = 0; lane < 2; ++lane) {
     const EngineRequest &request = lane ? second : first;
     executor.setDraftContextPlan(
-        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                                     std::nullopt, {}));
+        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
     const auto tokens = static_cast<uint32_t>(request.prompt.size());
     plan.items.push_back({request.id, tokens});
     items[lane] =
@@ -982,14 +978,14 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "suspended image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0, prompt.first(32), pages, BatchCohort::Greedy, false);
   executor.suspend(request.id);
   const StateAdmission resumed = executor.resume(request.modelView());
   require(resumed.granted(), "suspended image request did not resume");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   prefillChunk(executor, request.id, 0, prompt, pages, BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes + 1,
           "a resumed lane encoded its image again");
@@ -1012,8 +1008,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "reclaimable image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                                   std::nullopt, {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
   prefillChunk(executor, request.id, 0, request.prompt, pageRange(120, 4),
                BatchCohort::Greedy, false);
   const model::ModelTelemetry injected = executor.telemetry();
@@ -1055,8 +1050,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
   const StateAdmission producer = executor.begin(request.modelView());
   require(producer.granted(), "covered image producer was not admitted");
   const std::array<uint32_t, 2> checkpoints{32, 64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, checkpoints));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
   prefillChunk(executor, request.id, 0, std::span<const uint32_t>(prompt).first(32), pages);
   std::shared_ptr<const CompositeState> beforeImage = executor.snapshot(request.id);
   prefillChunk(executor, request.id, 32,
@@ -1142,8 +1136,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const StateAdmission admitted = executor.begin(cached.modelView());
   require(admitted.granted(), "refused-start fixture was not admitted");
-  executor.setDraftContextPlan(
-      cached.id, planDraftContext(0, prompt.size(), std::nullopt, {}));
+  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}));
   prefillChunk(executor, cached.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
@@ -1229,8 +1222,7 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
     request.imagePixels[index] = static_cast<uint8_t>(index * 9 + 4);
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "two-image request was not admitted");
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, {}));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}));
   prefillChunk(executor, request.id, 0, prompt, pageRange(120, 4),
                BatchCohort::Greedy, false);
   executor.end(request.id);
@@ -1283,8 +1275,7 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
   const uint64_t encodes = executor.telemetry().imageEncodes;
   for (const EngineRequest *request : {&small, &smaller, &large}) {
     executor.setDraftContextPlan(
-        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()),
-                                      std::nullopt, {}));
+        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {}));
     prefillChunk(executor, request->id, 0, request->prompt, pageRange(120, 4));
     executor.end(request->id);
   }
@@ -1337,8 +1328,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   const StateAdmission first = executor.begin(request.modelView());
   require(first.granted(), "replay point image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, boundary));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
@@ -2812,8 +2802,7 @@ int main(int argc, char **argv) {
         }
         stateLane = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
-        executor.setDraftContextPlan(
-            sequence.id, planDraftContext(0, length, std::nullopt, {}));
+        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
         if (repeatDuringReplay) {
           requireOpen(prefillChunk(executor, sequence.id, 0,
                                    std::span(sequence.prompt).first(32),
@@ -2823,8 +2812,7 @@ int main(int argc, char **argv) {
           require(!states.metadata(stateLane).assigned(),
                   "repeated preemption retained its state buffers");
           stateLane = resume();
-          executor.setDraftContextPlan(
-              sequence.id, planDraftContext(0, length, std::nullopt, {}));
+          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
         }
         ModelStepResult replay = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable, cohort);
@@ -3144,6 +3132,105 @@ int main(int argc, char **argv) {
                 << (resumed.transcript == reference.transcript)
                 << " rows=" << reference.transcript.size()
                 << " min_p 1 greedy_rows=" << greedy.transcript.size() << '\n';
+    }
+
+    // Prefill telemetry counts the captures each dispatch makes: a cold
+    // prompt with a checkpoint, prefilled in budget-sized chunks, adds what
+    // its plan's spans and boundaries hold, a skipped gap and two windows
+    // included.
+    {
+      std::vector<uint32_t> prompt(3800);
+      for (uint32_t index = 0; index < prompt.size(); ++index)
+        prompt[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
+      const std::array<uint32_t, 1> checkpoints{1024};
+      const DraftContextPlan plan = planDraftContext(
+          0, static_cast<uint32_t>(prompt.size()), checkpoints);
+      uint64_t capturedRows = 0;
+      uint64_t resets = 0;
+      for (const DraftCaptureSpan &span : plan.captureSpans) {
+        capturedRows += span.end - span.begin;
+        if (span.resetDraftState)
+          ++resets;
+      }
+      uint64_t activeRows = 0;
+      uint64_t materializationRows = 0;
+      for (const DraftBoundaryPlan &boundary : plan.boundaries) {
+        const uint64_t rows = boundary.boundary - boundary.captureBegin;
+        if (boundary.purpose == DraftBoundaryPurpose::Active)
+          activeRows += rows;
+        else
+          materializationRows += rows;
+      }
+      require(resets == 2 && capturedRows < prompt.size(),
+              "draft telemetry fixture neither resets twice nor skips rows");
+      const model::ModelTelemetry before = executor.telemetry();
+      beginCold(executor, makeRequest(91, prompt, 1), 0);
+      executor.setDraftContextPlan(91, plan);
+      const std::vector<uint32_t> pages = pageRange(0, 119);
+      for (uint32_t begin = 0; begin < prompt.size();) {
+        const uint32_t rows =
+            std::min<uint32_t>(model::ExecutionLimits::prefillTokenBudget,
+                               static_cast<uint32_t>(prompt.size()) - begin);
+        prefillChunk(executor, 91, begin,
+                     std::span<const uint32_t>(prompt).subspan(begin, rows),
+                     pages);
+        begin += rows;
+      }
+      executor.end(91);
+      const model::ModelTelemetry after = executor.telemetry();
+      require(after.targetPrefillRows - before.targetPrefillRows ==
+                      prompt.size() &&
+                  after.draftContextRowsActive -
+                          before.draftContextRowsActive ==
+                      activeRows &&
+                  after.draftContextRowsMaterialization -
+                          before.draftContextRowsMaterialization ==
+                      materializationRows &&
+                  after.draftContextRowsAvoided -
+                          before.draftContextRowsAvoided ==
+                      prompt.size() - capturedRows &&
+                  after.draftStateResets - before.draftStateResets == resets,
+              "prefill draft telemetry does not follow the plan");
+      std::cout << "draft_telemetry_follows_plan=PASS\n";
+    }
+
+    // A plan whose first capture continues a draft ring the restore skipped
+    // fails the prefill that would continue the empty ring, rather than
+    // building a shorter window that decode then finds incomplete.
+    {
+      const std::vector<uint32_t> pages = pageRange(0, 8);
+      beginCold(executor, makeRequest(92, prompt128, 1), 0);
+      prefillChunk(executor, 92, 0, prompt128, pages);
+      std::shared_ptr<const CompositeState> state = executor.snapshot(92);
+      require(state != nullptr, "discontinuity fixture snapshot allocation failed");
+      executor.end(92);
+      std::vector<uint32_t> extended = prompt128;
+      extended.insert(extended.end(), prompt128.begin(), prompt128.begin() + 100);
+      beginCold(executor, makeRequest(93, extended, 1), 0);
+      require(!executor.beginRestore(93, 128, state, false, {}),
+              "resident restore returned a read");
+      executor.setDraftContextPlan(
+          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}));
+      BatchPlan plan{WorkKind::Prefill,
+                     BatchCohort::Greedy,
+                     {{93, 100}},
+                     DecodeStage::Regular};
+      ModelBatchItem item = withRevision({.requestId = 93,
+                                          .logicalPosition = 128,
+                                          .tokenCount = 100,
+                                          .pageTable = pages});
+      item.inputTokens = std::span<const uint32_t>(extended).subspan(128, 100);
+      auto ticket =
+          executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
+      bool threw = false;
+      try {
+        static_cast<void>(ticket->wait());
+      } catch (const std::logic_error &) {
+        threw = true;
+      }
+      executor.end(93);
+      require(threw, "a capture continued a draft ring its restore skipped");
+      std::cout << "discontinuous_capture_fails=PASS\n";
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;

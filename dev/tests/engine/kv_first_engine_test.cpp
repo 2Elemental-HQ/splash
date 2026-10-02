@@ -1,6 +1,7 @@
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using benchmark::draftContextRows;
 
 namespace {
 
@@ -1602,7 +1604,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
   const DraftContextPlan &plan = executor.plans.at(3);
   require(plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64 &&
               plan.boundaries[1].boundary == 65 &&
-              plan.draftContextRows() == prompt.size(),
+              draftContextRows(plan) == prompt.size(),
           "replay boundary was not armed without reservation");
   require(executor.snapshotAttempts == 1 && executor.snapshots == 0 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
@@ -1741,7 +1743,7 @@ void testLongSuffixSkipsDraftRestore() {
   engine.submit(request(11, extended));
   runUntilIdle(engine);
   require(!executor.restoredDraft &&
-              executor.plans.at(11).draftStateRestoreSkipped,
+              !executor.plans.at(11).restoresDraftState,
           "long suffix copied a draft ring that its final window overwrites");
 }
 
@@ -6488,8 +6490,8 @@ void testShortSuffixContinuesCheckpointDraftState() {
   runUntilIdle(engine);
   require(events.starts.back().second == defaultCheckpointTokens &&
               executor.restoredDraft &&
-              executor.plans.at(481).draftContextRows() == 209 &&
-              !executor.plans.at(481).draftStateRestoreSkipped,
+              draftContextRows(executor.plans.at(481)) == 209 &&
+              executor.plans.at(481).restoresDraftState,
           "short checkpoint suffix discarded or rebuilt its restored draft window");
 }
 

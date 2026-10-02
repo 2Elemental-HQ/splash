@@ -753,6 +753,7 @@ $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
 $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
+		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/kv_first_engine_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \

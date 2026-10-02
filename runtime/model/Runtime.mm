@@ -245,8 +245,6 @@ struct Runtime::Impl {
     bool verifyMaskInFlight = false;
     uint64_t rngCounter = 0;
     DecodeStage decodeStage = DecodeStage::Regular;
-    bool draftContextValid = false;
-    uint64_t draftContextThrough = 0;
     std::optional<DraftContextPlan> draftContextPlan;
     std::vector<ImageState> images;
     // What its activation took from a cached state: the images that end
@@ -785,25 +783,20 @@ struct Runtime::Impl {
     return static_cast<uint32_t>(rows);
   }
 
+  // The lengths after the draft ring takes rows [begin, end) at target
+  // length targetTokens. Unless `reset` starts a new window there, the rows
+  // continue the ring, which must hold rows ending at `begin`.
   static QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      const DispatchDraftCaptureSpan &capture) {
+                      uint64_t begin, uint64_t end, bool reset) {
+    if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
+      throw std::logic_error("draft capture does not continue the draft ring");
+    const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
     QwenLogicalLengths next = previous;
     next.targetTokens = targetTokens;
-    const uint32_t rows = capture.absoluteEnd - capture.absoluteBegin;
-    if (!rows)
-      return next;
-    const bool continues =
-        !capture.resetDraftState &&
-        previous.draftEnd() == capture.absoluteBegin &&
-        previous.draftCommitCursor == capture.absoluteBegin % kDraftCacheStride;
-    const uint64_t combined =
-        continues ? uint64_t{previous.draftLength} + rows : rows;
     next.draftLength =
         static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
-    next.draftBase = capture.absoluteEnd - next.draftLength;
-    next.draftCommitCursor =
-        static_cast<uint32_t>(capture.absoluteEnd % kDraftCacheStride);
+    next.draftBase = end - next.draftLength;
     return next;
   }
 
@@ -1113,9 +1106,11 @@ struct Runtime::Impl {
         batch.capturedRows, std::span(spans).first(spanCount));
   }
 
-  void encodePackedPrefillGraph(CommandGraph &graph,
-                                std::span<const ModelBatchItem> items,
-                                std::array<Request *, kLaneCount> &entries) {
+  // Returns each lane's draft captures, indexed like `entries`.
+  std::array<DispatchDraftCapturePlan, kLaneCount>
+  encodePackedPrefillGraph(CommandGraph &graph,
+                           std::span<const ModelBatchItem> items,
+                           std::array<Request *, kLaneCount> &entries) {
     PackedPrefillBatch batch = preparePackedPrefill(items, entries);
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
 
@@ -1250,6 +1245,10 @@ struct Runtime::Impl {
         addPrefillPolicy(graph, entry, sequence.lane, lastRows - 1);
       }
     }
+    std::array<DispatchDraftCapturePlan, kLaneCount> captures{};
+    for (const PackedPrefillSequence &sequence : batch.sequences)
+      captures[sequence.lane] = sequence.captures;
+    return captures;
   }
 
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
@@ -1685,13 +1684,11 @@ struct Runtime::Impl {
       states.swapParity(entry.stateLane);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
-      const QwenLogicalLengths previous = states.metadata(entry.stateLane).lengths;
       states.updateLengths(
           entry.stateLane,
-          advanceDraftContext(
-              previous, nextLength,
-              {static_cast<uint32_t>(items[lane].logicalPosition),
-               static_cast<uint32_t>(nextLength), 0, false}));
+          advanceDraftContext(states.metadata(entry.stateLane).lengths,
+                              nextLength, items[lane].logicalPosition,
+                              nextLength, false));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
@@ -1939,8 +1936,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
   try {
     setDraftContextPlan(
         request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                         std::nullopt, {}));
+        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
   } catch (...) {
     end(request.id);
     throw;
@@ -1964,8 +1960,6 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->pageTableBindings[entry.stateLane] = {};
   impl_->releaseImages(entry);
   entry.draftContextPlan.reset();
-  entry.draftContextValid = false;
-  entry.draftContextThrough = 0;
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
@@ -2116,8 +2110,6 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
     entry.finalTargetHidden.clear();
     entry.pendingToken.reset();
   }
-  entry.draftContextValid = restoreDraftState;
-  entry.draftContextThrough = restoreDraftState ? restoredPrefixLength : 0;
   entry.draftContextPlan.reset();
 }
 
@@ -2128,12 +2120,8 @@ void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
   }
   const uint64_t current =
       impl_->states.metadata(entry.stateLane).lengths.targetTokens;
-  if (plan.replayBegin != current ||
-      plan.restoredDraftBoundary !=
-          (current ? std::optional<uint32_t>(static_cast<uint32_t>(current))
-                   : std::nullopt)) {
+  if (plan.replayBegin != current)
     throw std::invalid_argument("draft context plan restore boundary is stale");
-  }
   entry.draftContextPlan = std::move(plan);
 }
 
@@ -2165,7 +2153,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph;
-  impl_->encodePackedPrefillGraph(graph, items, entries);
+  const auto captures = impl_->encodePackedPrefillGraph(graph, items, entries);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
@@ -2181,7 +2169,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   CommandTicket command =
       impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
   Impl *impl = impl_.get();
-  auto finish = [impl, entries,
+  auto finish = [impl, entries, captures,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
@@ -2208,31 +2196,6 @@ Runtime::prefillAsync(const BatchPlan &plan,
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
-      const auto captures = Impl::activeDraftCaptures(entry, item);
-      const uint32_t capturedRows = Impl::captureRows(captures);
-      uint32_t activeRows = 0;
-      uint32_t materializationRows = 0;
-      for (const auto &capture : captures) {
-        activeRows += capture.activeRows;
-        materializationRows += capture.materializationRows;
-      }
-      if (activeRows + materializationRows != capturedRows) {
-        throw std::logic_error("draft capture telemetry is inconsistent");
-      }
-      impl->counters.targetPrefillRows += item.tokenCount;
-      impl->counters.draftContextRowsActive += activeRows;
-      impl->counters.draftContextRowsMaterialization += materializationRows;
-      impl->counters.draftContextRowsAvoided += item.tokenCount - capturedRows;
-      for (const auto &capture : captures) {
-        const bool continues =
-            !capture.resetDraftState && entry.draftContextValid &&
-            entry.draftContextThrough == capture.absoluteBegin;
-        if (!continues) {
-          ++impl->counters.draftStateResets;
-        }
-        entry.draftContextValid = true;
-        entry.draftContextThrough = capture.absoluteEnd;
-      }
       const uint64_t nextLength = item.logicalPosition + item.tokenCount;
       // The anchor this chunk selects when it completes a generation prompt.
       std::optional<uint32_t> selected;
@@ -2254,9 +2217,20 @@ Runtime::prefillAsync(const BatchPlan &plan,
       impl->states.swapParity(entry.stateLane);
       QwenLogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
       lengths.targetTokens = nextLength;
-      for (const auto &capture : captures) {
-        lengths = Impl::advanceDraftContext(lengths, nextLength, capture);
+      for (const DispatchDraftCaptureSpan &capture : captures[lane]) {
+        lengths = Impl::advanceDraftContext(lengths, nextLength,
+                                            capture.absoluteBegin,
+                                            capture.absoluteEnd,
+                                            capture.resetDraftState);
+        impl->counters.draftContextRowsActive += capture.activeRows;
+        impl->counters.draftContextRowsMaterialization +=
+            capture.materializationRows;
+        if (capture.resetDraftState)
+          ++impl->counters.draftStateResets;
       }
+      impl->counters.targetPrefillRows += item.tokenCount;
+      impl->counters.draftContextRowsAvoided +=
+          item.tokenCount - Impl::captureRows(captures[lane]);
       impl->states.updateLengths(entry.stateLane, lengths);
       entry.promptComplete = nextLength == entry.promptTokens;
       ModelStepResult result{entry.id, item.tokenCount, {}, false,
@@ -2833,8 +2807,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     beginColdRequest(request, 1);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
-    setDraftContextPlan(
-        id, planDraftContext(prefixTokens, promptTokens, prefixTokens, {}));
+    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
     const auto &restored = impl_->states.metadata(1).lengths;
     if (restored.targetTokens != prefixTokens ||
         !restored.hasCompleteDraftWindow(kDraftCacheStride)) {

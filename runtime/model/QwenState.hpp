@@ -50,7 +50,6 @@ struct QwenLogicalLengths final {
   uint64_t targetTokens = 0;
   uint64_t draftBase = 0;
   uint32_t draftLength = 0;
-  uint32_t draftCommitCursor = 0;
 
   [[nodiscard]] uint64_t draftEnd() const noexcept {
     return draftBase + draftLength;
@@ -58,8 +57,7 @@ struct QwenLogicalLengths final {
   [[nodiscard]] bool
   hasCompleteDraftWindow(uint32_t draftCapacity) const noexcept {
     return draftCapacity && draftEnd() == targetTokens &&
-           draftLength == std::min<uint64_t>(targetTokens, draftCapacity) &&
-           draftCommitCursor == targetTokens % draftCapacity;
+           draftLength == std::min<uint64_t>(targetTokens, draftCapacity);
   }
 
   bool operator==(const QwenLogicalLengths &) const = default;

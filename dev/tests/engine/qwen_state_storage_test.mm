@@ -131,7 +131,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
   model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
   require(static_cast<bool>(storage.tryActivateLane(0, 1)), "fault source activation failed");
-  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  storage.updateLengths(0, {4096, 2048, 2048});
   auto source = storage.snapshot(0);
   auto held = file->acquire();
   std::vector<std::byte> bytes(layout.cachedBytes());
@@ -200,7 +200,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
     word(ring[layer].values) = 200 + layer;
   }
   const auto images = stateImage(storage, 0);
-  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  storage.updateLengths(0, {4096, 2048, 2048});
   auto source = storage.snapshot(0);
   auto write = source->offload({});
   require(write != nullptr, "disk offload not admitted");
@@ -288,7 +288,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   }
   const auto inactive = bytesOf(next.stateBase);
   const auto images = stateImage(storage, 0);
-  storage.updateLengths(0, {4096, 2048, 2048, 0});
+  storage.updateLengths(0, {4096, 2048, 2048});
   const uint64_t before = storage.actualAllocatedBytes();
   auto write = storage.snapshotToDisk(0, {});
   require(write != nullptr, "direct disk snapshot was not admitted");
@@ -352,7 +352,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
       fill(ring[layer].values, 33 + 2 * layer);
     }
     const auto images = stateImage(storage, 0);
-    storage.updateLengths(0, {4096, 2048, 2048, 0});
+    storage.updateLengths(0, {4096, 2048, 2048});
     auto write = storage.snapshotToDisk(0, {});
     require(write && finishWhenReady(*write), "a state did not reach a larger slot");
     auto disk = write->state();
@@ -471,10 +471,8 @@ void run(const std::string &metallib) {
     word(storage.draft(0)[0].keys) = 0x41414141;
     word(storage.draft(0)[4].values,
          kDraftState.tensorBytes() - sizeof(uint32_t)) = 0x51515151;
-    QwenLogicalLengths lengths{2'048, 0, 2'048, 0};
+    QwenLogicalLengths lengths{2'048, 0, 2'048};
     storage.updateLengths(0, lengths);
-    require(storage.metadata(0).lengths.draftCommitCursor == 0,
-            "draft ring cursor is wrong");
     require(storage.metadata(0).lengths.draftLength == 2'048,
             "draft resident length is wrong");
     require(word(storage.next(0).convolutionLayers[0]) == 0x21212121 &&
@@ -599,7 +597,7 @@ void run(const std::string &metallib) {
 
     // Rejected publications fail before any cache slot is taken or admitted.
     const uint64_t beforeRejected = storage.actualAllocatedBytes();
-    storage.updateLengths(0, {128, 0, 127, 127});
+    storage.updateLengths(0, {128, 0, 127});
     requireThrows<std::logic_error>([&] { storage.clearForColdStart(0); },
                                     "a lane past length zero was cleared for a cold start");
     requireThrows<std::invalid_argument>(
@@ -607,7 +605,7 @@ void run(const std::string &metallib) {
         "snapshot accepted divergent target/draft lengths");
     requireThrows<std::invalid_argument>(
         [&] {
-          storage.updateLengths(0, {129, 0, 129, 129});
+          storage.updateLengths(0, {129, 0, 129});
           static_cast<void>(storage.snapshot(0));
         },
         "unaligned prefix snapshot was accepted");

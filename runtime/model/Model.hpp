@@ -135,27 +135,12 @@ struct DraftBoundaryPlan final {
 struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
-  std::optional<uint32_t> restoredDraftBoundary;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
-
-  uint64_t targetPrefillRows = 0;
-  uint64_t draftContextRowsActive = 0;
-  uint64_t draftContextRowsMaterialization = 0;
-  uint64_t draftContextRowsAvoided = 0;
-  uint64_t draftStateRestoreSkipped = 0;
-  uint64_t draftStateResets = 0;
-
-  [[nodiscard]] uint64_t draftContextRows() const noexcept {
-    return draftContextRowsActive + draftContextRowsMaterialization;
-  }
-  [[nodiscard]] std::span<const DraftCaptureSpan> captures() const noexcept {
-    return captureSpans;
-  }
-  [[nodiscard]] std::span<const DraftBoundaryPlan>
-  plannedBoundaries() const noexcept {
-    return boundaries;
-  }
+  // The first capture continues the restored draft ring: a non-zero replay
+  // whose first boundary is within one draft window of it. Otherwise the
+  // restore skips the ring.
+  bool restoresDraftState = false;
 };
 
 struct DispatchDraftCaptureSpan final {
@@ -180,9 +165,10 @@ struct DispatchDraftCapturePlan final {
   [[nodiscard]] auto end() const noexcept { return values.begin() + count; }
 };
 
+// A replay from a non-zero boundary starts from the composite state restored
+// there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::optional<uint32_t> restoredDraftBoundary,
                  std::span<const uint32_t> materializationBoundaries);
 
 [[nodiscard]] DispatchDraftCapturePlan

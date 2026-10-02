@@ -790,7 +790,7 @@ bool Engine::admit(Request &active, double now) {
   std::unique_ptr<StateRestore> transfer;
   if (lookup.state) {
     transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
-                                   !draft.draftStateRestoreSkipped,
+                                   draft.restoresDraftState,
                                    completionNotifier_);
   }
   if (transfer || cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending) {
@@ -1026,10 +1026,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(
-      stateBoundary, active.replayTokens,
-      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-      boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
 }
 
 void Engine::armNextStateBoundary(Request &active) {

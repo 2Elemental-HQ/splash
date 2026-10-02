@@ -436,7 +436,6 @@ void QwenStateStorage::restoreLengths(uint32_t index, QwenLogicalLengths lengths
   if (!restoreDraftState) {
     lengths.draftBase = lengths.targetTokens;
     lengths.draftLength = 0;
-    lengths.draftCommitCursor = lengths.targetTokens % layout_.draft.tokens;
   }
   destination.metadata.lengths = lengths;
 }
@@ -487,7 +486,6 @@ const QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) const {
 void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
                                        bool cacheSnapshot) const {
   if (lengths.draftLength > layout_.draft.tokens ||
-      lengths.draftCommitCursor >= layout_.draft.tokens ||
       lengths.draftEnd() > lengths.targetTokens) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
