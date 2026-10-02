@@ -25,6 +25,13 @@ except ImportError:  # Executed directly by the source or packaged entry point.
     import models as model_artifacts
     import paths
 
+    # Run as a script, the launcher has only install/ on sys.path.
+    sys.path.insert(1, str(paths.ROOT))
+
+# The server's --allowed-origin rule, in a module of the standard library
+# alone: the launcher runs before .venv exists.
+from server import origins
+
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
@@ -294,6 +301,8 @@ def serve(args):
             command.append("--no-webui")
         for host in args.allowed_host:
             command.extend(["--allowed-host", host])
+        for origin in args.allowed_origin:
+            command.extend(["--allowed-origin", origin])
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
@@ -439,6 +448,16 @@ def _version():
     return "Splash " + str(
         json.loads((paths.ROOT / "release.json").read_text())["version"]
     )
+
+
+def _parse_allowed_origin(value):
+    # The server's rule, before any model work. The server takes the value as
+    # typed.
+    try:
+        origins.parse_allowed_origin(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return value
 
 
 def _parse_served_model_name(value):
@@ -624,6 +643,15 @@ def parse_args(argv=None):
         metavar="HOST",
         help="additional HTTP Host name to accept, e.g. mymac.local; does not change "
         "the bind address (repeatable)",
+    )
+    server.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        type=_parse_allowed_origin,
+        metavar="ORIGIN",
+        help="origin whose pages may call the API from a browser or webview, e.g. "
+        "tauri://localhost; '*' for any (repeatable)",
     )
     server.add_argument(
         "--max-request-size",

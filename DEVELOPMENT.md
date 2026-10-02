@@ -88,6 +88,23 @@ gets 403 with the `--allowed-host` flag that would accept it; the check keeps ou
 web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
 
+A page served elsewhere, or an application's webview such as Jan's and other
+Tauri apps', calls the API from another origin, which its browser names in
+`Origin`. `--allowed-origin ORIGIN` admits one, such as `tauri://localhost` or
+`http://localhost:3000`; repeat it for more, or pass `'*'` for every origin,
+which is vLLM's default. The server then answers the browser's preflight
+`OPTIONS` request and names the origin in `Access-Control-Allow-Origin` on its
+responses, which let the page read `Retry-After` and `WWW-Authenticate` too. A
+page of any other origin gets 403. Its browser hides that response from the
+page, which sees a network error, so the server prints the refused origin and
+the `--allowed-origin` flag that would accept it, once per origin. A `file://`
+page or a sandboxed frame sends `Origin: null` instead, which only `'*'`
+admits; the server does not print its refusal. Origins match exactly: a pattern
+such as `tauri://*` or `http://*.example.com` is refused at startup; only a
+bare `'*'` admits every origin. With `'*'` every page open in a browser that
+reaches the server can use it, so set `--api-key` too; the server warns at
+startup without one.
+
 Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
 `SPLASH_PORT` in the local agent shell. Separate ports allow separate servers;
 their memory limits are independent. The packaged agent launchers connect to
@@ -113,6 +130,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
+| `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--no-webui` | Off | Disable the chat page. |
 
@@ -933,8 +951,9 @@ multiple speculative tokens; they are not per-token latency. Native queue timing
 is recorded from successful completions. These histograms live with the HTTP
 process and survive a native engine restart.
 
-HTTP bodies require Content-Length, and browser
-Origin must match Host. `--allowed-host` permits additional hostnames. Request
+HTTP bodies require Content-Length, and a browser's
+Origin must match Host or be one `--allowed-origin` names. `--allowed-host`
+permits additional hostnames. Request
 logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data. A frame over 16 MiB, such as a request
 with large images, is kept only as a marker with its size and SHA-256
