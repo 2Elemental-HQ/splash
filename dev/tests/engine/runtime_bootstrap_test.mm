@@ -293,7 +293,7 @@ class Harness final {
 public:
   explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16, 4096, 4), pool_(backing_, 16),
-        resources_(pool_),
+        resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
             loopConfig(), resources_, executor_,

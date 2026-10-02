@@ -217,7 +217,7 @@ void testReservationsAndAdmissionClasses() {
   const uint64_t limit = 64 * 1024;
   MemoryGovernor governor(backend, limit, hostReserve, [] {
     return std::optional<uint64_t>(hostReserve + 3 * kGiB);
-  });
+  }, 0);
   const metal::AllocationResult held = admit(governor, limit - 1, [&] {
     require(static_cast<bool>(admit(governor, 1)),
             "memory governor held more than the reserved bytes");
@@ -258,7 +258,7 @@ void testHostHeadroomHysteresis() {
   const uint64_t limit = 64 * 1024;
   std::optional<uint64_t> available = hostReserve + 3 * kGiB;
   MemoryGovernor governor(backend, limit, hostReserve,
-                          [&available] { return available; });
+                          [&available] { return available; }, 0);
   // Whether one byte more is admitted.
   const auto admitsMore = [&governor] { return static_cast<bool>(admit(governor, 1)); };
   governor.setPressure(MemoryPressure::Critical);
@@ -319,7 +319,7 @@ void testReclaimablePagesReopenGrowth() {
   const uint64_t limit = 64 * 1024;
   std::optional<uint64_t> available = hostReserve + 3 * kGiB;
   MemoryGovernor governor(backend, limit, hostReserve,
-                          [&available] { return available; });
+                          [&available] { return available; }, 0);
   const auto admitsMore = [&governor] { return static_cast<bool>(admit(governor, 1)); };
   HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = kGiB / 2};
   available = estimateHostAvailableMemory(pressurePages, 1, false);
@@ -408,7 +408,7 @@ void testHostRefusalStartsReclaim() {
   const uint64_t laneState = 350'224'384;
   std::optional<uint64_t> available = hostReserve + 64 * kGiB;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve,
-                          [&available] { return available; });
+                          [&available] { return available; }, 0);
   const metal::AllocationResult beyondLimit = admit(governor, 40 * kGiB);
   require(!beyondLimit && beyondLimit.failure == metal::AllocationFailure::EngineBudget,
           "an engine budget refusal was taken for host pressure");
@@ -447,7 +447,7 @@ void testHostRefusalComesBeforeTheEngineLimit() {
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
-  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; }, 0);
   const metal::AllocationResult shared = admit(governor, 2 * kGiB);
   require(!shared && shared.failure == metal::AllocationFailure::HostPressure,
           "a refusal the host shares was reported as the engine's");
@@ -503,7 +503,7 @@ void testExhaustedReclaimWaivesTheHold() {
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
-  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; }, 0);
   const metal::AllocationResult pastMargin = admit(governor, kGiB);
   require(!pastMargin && pastMargin.failure == metal::AllocationFailure::HostPressure,
           "growth past the warning margin was admitted");
@@ -540,7 +540,7 @@ void testRequestInServiceGrowsThroughHostPressure() {
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
-  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; }, 0);
   const auto grow = [&](uint64_t bytes) {
     return admit(governor, bytes, [bytes] { allocate(bytes); });
   };

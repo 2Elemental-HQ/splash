@@ -440,7 +440,8 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   engine::MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+      engine::queryHostAvailableMemory, 0);
   for (const auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B

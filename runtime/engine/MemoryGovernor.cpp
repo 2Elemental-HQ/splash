@@ -100,12 +100,6 @@ void MemoryGovernor::Reservation::release() noexcept {
   bytes_ = 0;
 }
 
-MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend,
-                               uint64_t limitBytes,
-                               uint64_t hostReserveBytes)
-    : MemoryGovernor(backend, limitBytes, hostReserveBytes,
-                     queryHostAvailableMemory) {}
-
 MemoryGovernor::MemoryGovernor(
     metal::MetalBackend &backend, uint64_t limitBytes,
     uint64_t hostReserveBytes,

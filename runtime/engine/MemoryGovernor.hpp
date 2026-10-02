@@ -152,15 +152,13 @@ public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
 
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes);
   // Metal memory outside the backend's buffers (pipelines, driver
   // allocations) is charged only beyond untrackedReserveBytes, the part of
   // the limit the caller has set aside for it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes,
                  HostAvailableMemoryProvider hostAvailableMemory,
-                 uint64_t untrackedReserveBytes = 0);
+                 uint64_t untrackedReserveBytes);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed

@@ -290,7 +290,7 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
   const metal::MetalMemoryStats memory = backend.memoryStats();
   MemoryGovernor governor(
       backend, std::max(memory.allocatedBytes, memory.deviceCurrentAllocatedBytes) + kGiB,
-      hostReserve, [&available] { return available; });
+      hostReserve, [&available] { return available; }, 0);
   EngineConfig config;
   connectToGovernor(config, governor);
   require(config.growthPaused && config.serving && !config.growthPaused(),

@@ -138,7 +138,7 @@ struct Harness final {
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool};
+  engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
   test::ScopedTestConfig seam;
   engine::FdTransport transport;
@@ -360,7 +360,7 @@ void testLoopWakesForAnEngineDeadline() {
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool};
+  engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
   std::vector<protocol::ErrorEvent> errors;

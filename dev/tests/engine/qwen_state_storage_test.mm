@@ -121,7 +121,8 @@ void testLayoutFormulas() {
 }
 
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -179,7 +180,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 }
 
 void testDiskRestore(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -266,7 +268,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
 // cache buffer is taken, the disk copy restores every byte of the active
 // parity, and a full quota refuses until a disk copy is dropped.
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -334,7 +337,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1}};
   static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
                 unaligned.cachedBytes() % kHostPageBytes != 0);
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -383,7 +387,8 @@ void run(const std::string &metallib) {
   testDirectDiskSnapshot(backend);
   testStateSmallerThanSlot(backend);
   MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+      queryHostAvailableMemory, 0);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;

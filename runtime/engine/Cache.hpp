@@ -184,8 +184,8 @@ class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
   // the states' file can run on it without the tier.
-  Cache(KvPool &pool, KvTier *kvTier = nullptr,
-        std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
+  Cache(KvPool &pool, KvTier *kvTier,
+        std::shared_ptr<const model::DiskBudget> diskBudget);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -206,12 +206,12 @@ public:
   // Scheduling probe only: does not pin, touch recency, or count a hit.
   [[nodiscard]] CacheProbe
   probe(std::span<const uint32_t> prompt,
-        std::span<const ImageSpan> images = {});
+        std::span<const ImageSpan> images);
   // Brings a probe this cache made up to date: after a change of the KV
   // graph its chain is cut at the first block that no longer matches and
   // matched on from there; its cached tokens follow the states either way.
   void refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
-               std::span<const ImageSpan> images = {});
+               std::span<const ImageSpan> images);
 
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
@@ -219,7 +219,7 @@ public:
   // matched chain; otherwise the prompt is matched again.
   [[nodiscard]] CacheLookup lookup(
       std::span<const uint32_t> prompt,
-      std::span<const ImageSpan> images = {},
+      std::span<const ImageSpan> images,
       const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
   void promoteState(const CacheLookup &lookup, StateRestore &transfer);
@@ -243,22 +243,22 @@ public:
   void publishCommittedBlocks(uint64_t requestId,
                               std::span<const uint32_t> exactTokens,
                               uint32_t committedTokens,
-                              std::span<const ImageSpan> images = {});
+                              std::span<const ImageSpan> images);
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
-  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint);
   // Reuses the state at this block in either tier, as reuseCompositeState()
   // does a RAM copy.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
-                             bool checkpoint = false);
+                             bool checkpoint);
   // Publishes the state of the lane at this block straight to disk, for a
   // state no cache slot can hold: `write` starts the write from the lane.
   // False when the tier cannot take the state now; nothing is published then.
   // The caller reuses a stored state first (reuseStoredState); publishing
   // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
-                                        bool checkpoint = false);
+                                        bool checkpoint);
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }

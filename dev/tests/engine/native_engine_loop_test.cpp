@@ -243,7 +243,7 @@ struct LoopFixture {
       : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
               .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
         storage(shape.pages, 4096, shape.extentPages),
-        pool(storage, shape.runwayPages), cache(pool),
+        pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
         loop(
             std::move(config), cache, executor,
             [this](std::span<const uint8_t> bytes) {
@@ -1355,7 +1355,7 @@ void testControlPassReclaimsUnderHostPressure() {
   constexpr uint64_t hostReserve = 2ULL << 30;
   std::optional<uint64_t> available = hostReserve + kHostWarningMarginBytes / 2;
   MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
-                          [&available] { return available; });
+                          [&available] { return available; }, 0);
   MemoryControl control(governor, backend, loop);
   require(!control.run(MemoryPressure::Normal), "a paced pass waited for a transfer");
   const auto paced = resources.snapshot();

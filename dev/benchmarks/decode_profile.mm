@@ -241,7 +241,8 @@ int main(int argc, char **argv) {
       const uint32_t pageCount =
           (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+          queryHostAvailableMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
                             pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {

@@ -219,7 +219,8 @@ int main(int argc, char **argv) {
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(
           backend, budget,
-          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
+          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes),
+          engine::queryHostAvailableMemory, 0);
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
         return state.pressure != engine::MemoryPressure::Normal ||

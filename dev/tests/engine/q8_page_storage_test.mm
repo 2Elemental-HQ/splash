@@ -120,7 +120,7 @@ void run(const std::string &metallib) {
     MemoryGovernor hostGated(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
         128ULL * 1024 * 1024,
-        [&elasticHostAvailable] { return elasticHostAvailable; });
+        [&elasticHostAvailable] { return elasticHostAvailable; }, 0);
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
@@ -139,7 +139,7 @@ void run(const std::string &metallib) {
             "KV growth did not recover after host memory became available");
 
     MemoryGovernor governor(
-        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, queryHostAvailableMemory, 0);
     requireThrows<std::invalid_argument>(
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
         "a pool of a part of an extent was accepted");

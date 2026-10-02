@@ -1475,7 +1475,8 @@ int main(int argc, char **argv) {
             "runtime reserves consume the oracle Metal budget");
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
-    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
+    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
+                            queryHostAvailableMemory, 0);
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {
