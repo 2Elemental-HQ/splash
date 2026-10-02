@@ -768,7 +768,10 @@ output requirements in their own messages.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 
-`/status.admission` distinguishes memory and concurrency waits, reports suspended
+`/status.admission` distinguishes memory and concurrency waits, counts the
+requests held back behind one refused memory (`held_behind_refusal`, the
+refused request included while a pass defers it; during recovery, the suspended
+ones) and those waiting for a disk restore (`restoring`), reports suspended
 requests, recovery draining and the oldest current wait age, which for a request
 holding admission closed runs from when its wait began. Memory transitions
 also appear in the console. When macOS runs short of memory, growth that no

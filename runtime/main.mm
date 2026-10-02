@@ -400,8 +400,10 @@ int runNative(const NativeArguments &arguments) {
         memoryReporter.update(wait, memory.hostGrowthAllowed);
     if (!diagnostic.empty())
       writeStderrLine(diagnostic);
-    engine::MemoryReclaimDirective directive =
-        pressurePolicy.update(memory, now, wait.memory || wait.suspended);
+    // Requests held back by a refusal wait for memory too, the refused one
+    // included while a pass defers it.
+    engine::MemoryReclaimDirective directive = pressurePolicy.update(
+        memory, now, wait.memory || wait.suspended || wait.heldBehindRefusal);
     if (!directive.reclaim)
       return false;
     const engine::MemoryReclaimResult reclaim =

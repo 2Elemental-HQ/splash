@@ -46,6 +46,14 @@ struct EngineConfig final {
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
+  // Requests that admission holds back behind the first one refused memory,
+  // whatever they wait for themselves, and that request itself while a pass
+  // keeps it out of its memory wait. During recovery only suspended
+  // requests are admitted, and only they count.
+  uint32_t heldBehindRefusal = 0;
+  // Requests admitted into a restore of their prefix from disk, waiting for
+  // its reads rather than for memory.
+  uint32_t restoring = 0;
   uint32_t suspended = 0;
   double oldestWaitMilliseconds = 0.0;
   bool draining = false;
@@ -338,6 +346,8 @@ private:
   // memory is still short (growth is paused or allocationFailed_), up to the
   // drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
+  // Admission recovers from a suspension: only suspended requests start.
+  [[nodiscard]] bool anySuspended() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // The state cells admit() has obtained so far, including those it gave

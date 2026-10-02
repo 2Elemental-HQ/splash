@@ -327,6 +327,11 @@ bool Engine::drainingForRecovery() const {
          (allocationFailed_ || growthPaused());
 }
 
+bool Engine::anySuspended() const {
+  return std::any_of(requests_.begin(), requests_.end(),
+                     [](const auto &entry) { return entry.second.suspended; });
+}
+
 std::optional<double> Engine::nextWakeupMilliseconds() const {
   std::optional<double> result;
   if (pending_)
@@ -338,9 +343,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   // for suspended requests; those held behind one refused memory have no
   // retry time (admitQueued). Other retry times would wake the loop with
   // nothing to do; the command completion or resumption wakes it instead.
-  const bool recovering = std::any_of(
-      requests_.begin(), requests_.end(),
-      [](const auto &entry) { return entry.second.suspended; });
+  const bool recovering = anySuspended();
   for (const auto &[_, active] : requests_) {
     if (active.finalized || active.failure)
       continue;
@@ -373,7 +376,14 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
   ResourceWaitSnapshot result;
   result.draining = drainingForRecovery();
   for (const auto &[id, active] : requests_) {
-    if (active.finalized || scheduler_.phase(id) != Phase::WaitingResources)
+    if (active.finalized)
+      continue;
+    // Admitted, it waits for disk reads, not for memory.
+    if (active.restore) {
+      ++result.restoring;
+      continue;
+    }
+    if (scheduler_.phase(id) != Phase::WaitingResources)
       continue;
     if (active.resourceWait.reason == StateFailure::ConcurrencyLimit)
       ++result.concurrency;
@@ -385,13 +395,25 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
       result.oldestWaitMilliseconds = std::max(
           result.oldestWaitMilliseconds, now - *active.resourceWait.startedMilliseconds);
   }
+  // As admitQueued tries them: the requests after the first one refused
+  // memory are held back behind it, in whatever phase the latest pass left
+  // them, and so is that request while a pass defers it for scheduling or a
+  // prefix. During recovery only suspended requests are tried.
+  const bool recovering = anySuspended();
+  bool closed = false;
+  for (uint64_t id : scheduler_.admissionOrder()) {
+    const Request &held = requests_.at(id);
+    if (held.finalized || held.restore || (recovering && !held.suspended))
+      continue;
+    if (closed || (held.refusedMemory && scheduler_.phase(id) != Phase::WaitingResources))
+      ++result.heldBehindRefusal;
+    closed = closed || held.refusedMemory;
+  }
   return result;
 }
 
 bool Engine::admitQueued(double now) {
-  const bool recovering = std::any_of(
-      requests_.begin(), requests_.end(),
-      [](const auto &entry) { return entry.second.suspended; });
+  const bool recovering = anySuspended();
   // Once pressure has preempted work, let resident lanes finish while memory
   // is still short before spending their released headroom on a retry or a
   // new request; this prevents repeated B4 admission/preemption churn. The

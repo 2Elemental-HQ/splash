@@ -34,7 +34,8 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
   const unsigned state = (!hostGrowthAllowed ? 1u : 0u) |
                          (wait.memory ? 2u : 0u) |
                          (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u);
+                         (wait.draining ? 8u : 0u) |
+                         (wait.heldBehindRefusal ? 16u : 0u);
   if (state == state_)
     return {};
   state_ = state;
@@ -43,6 +44,8 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
   std::ostringstream out;
   out << "Memory: growth " << (hostGrowthAllowed ? "available" : "paused")
       << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
+  if (wait.heldBehindRefusal)
+    out << "; held=" << wait.heldBehindRefusal;
   if (wait.draining)
     out << "; waiting for resident requests to finish";
   return out.str();
@@ -98,6 +101,8 @@ std::string runtimeStatusJson(
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
       << ",\"waiting_concurrency\":" << resourceWait.concurrency
+      << ",\"held_behind_refusal\":" << resourceWait.heldBehindRefusal
+      << ",\"restoring\":" << resourceWait.restoring
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
