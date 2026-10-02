@@ -2304,9 +2304,10 @@ void testAdmissionWaitsOutEarlierLanes() {
 }
 
 // A lane submitted after a waiting request does not extend its wait, or
-// requests that keep arriving could hold it until its deadline: it fails at
-// its limit, retryably, while the later lane still runs. The host refused its
-// memory, so the failure says so, though growth is not paused as it expires.
+// requests that keep arriving could hold it until its deadline. With
+// admission closed behind the waiting request only a higher priority starts
+// after it; the wait fails at its limit, retryably, while that lane still
+// runs. The host refused its memory, so the failure says so.
 void testLaterLanesDoNotExtendAResourceWait() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
@@ -2318,20 +2319,28 @@ void testLaterLanesDoNotExtendAResourceWait() {
   executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 320; };
   Events events;
   EngineConfig config;
-  config.resourceWaitTimeoutMilliseconds = 300;
+  // Shorter than the retry backoff: the limit runs out before the first
+  // retry, which a decoding higher priority would defer for scheduling.
+  config.resourceWaitTimeoutMilliseconds = 50;
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   engine.submit(request(320, {320}));
   static_cast<void>(engine.tick(1));
+  require(engine.resourceWaitSnapshot(1).memory == 1 && !executor.requests.contains(320),
+          "the first request did not wait for memory");
+  // A higher priority is ahead of the waiting request in admission order and
+  // is not held back.
   auto later = request(321, {321});
+  later.priority = RequestPriority::Foreground;
   later.maxNewTokens = 1000;
   engine.submit(std::move(later));
   double now = 1;
-  while (!events.failedCount && now < 1000)
+  while (!events.failedCount && now < 1000) {
     static_cast<void>(engine.tick(now += 10));
-  require(now == 301 && events.failures == std::vector<std::string>{"resource_timeout"} &&
-              events.failureDetails.back().second && !events.completedCount &&
-              executor.requests.contains(321),
+    require(executor.requests.contains(321), "the higher priority did not run beside the wait");
+  }
+  require(now == 51 && events.failures == std::vector<std::string>{"resource_timeout"} &&
+              events.failureDetails.back().second && !events.completedCount,
           "a lane submitted after a waiting request extended its wait");
   require(events.failureDetails.back().first ==
               "memory did not become available within the resource wait limit: "
