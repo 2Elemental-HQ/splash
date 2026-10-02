@@ -6318,6 +6318,94 @@ void testPagesReturnFromDemotionWithoutSuspending() {
           "tier accounting after the wait is off");
 }
 
+// A request whose prefix is on disk is refused the pages to restore it into.
+// Like a refused state, that closes admission behind it, so a later, short
+// request does not take the pages it waits for. Refused by the engine's limit
+// beside a resident lane, it starts first once the lane finishes; waiting for
+// the demotions that free its pages, it holds the short request back until it
+// is cancelled.
+void testRefusedRestoreClosesAdmission() {
+  enum class Cause { GrowthBlocked, Pending };
+  for (const Cause cause : {Cause::GrowthBlocked, Cause::Pending}) {
+    test::TestKvStorage storage(16, 4096, 4);
+    storage.budgetPages = 8;
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    executor.decodeFinishes = false;
+    executor.restoreControl->ready = true;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    // Request 2's prompt: its state and both of its KV blocks are on disk.
+    const std::vector<uint32_t> prompt(65, 17);
+    cache.beginRequest(999);
+    require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+    demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+    cache.endRequest(999);
+    for (uint32_t written = 1; written <= 2; ++written) {
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+              "KV block was not written");
+      tier.complete();
+      require(cache.pollTransfers(), "written block did not land");
+    }
+    // Pending: cached blocks under states on disk take the first extent, whose
+    // pages come back only once their copies are written.
+    if (cause == Cause::Pending) {
+      for (uint64_t id = 900; id < 904; ++id) {
+        cache.beginRequest(id);
+        require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+        demoteState(cache, cache.publishCommittedBlocks(
+                               id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+        cache.endRequest(id);
+      }
+    }
+    // Lane 1 takes the remaining pages and decodes within them.
+    auto resident = request(1, std::vector<uint32_t>(97, 1));
+    resident.maxNewTokens = 1000;
+    engine.submit(std::move(resident));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.emitted != 0; }, "the resident lane did not decode");
+    if (cause == Cause::GrowthBlocked) {
+      storage.growthBlocked = true;
+      storage.allocationFailure = metal::AllocationFailure::EngineBudget;
+    }
+    require(pool.freePageCount() == 0, "the fixture left pages free");
+    engine.submit(request(2, prompt));
+    tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
+              "the restore's pages were not refused");
+    require(cause == Cause::GrowthBlocked ? tier.demotions == 2 : tier.inFlight() != 0,
+            "the refusal did not come from the intended cause");
+    engine.submit(request(3, {3}));
+    for (uint32_t step = 0; step < 10; ++step, now += 101) {
+      static_cast<void>(engine.tick(now));
+      require(!executor.requests.contains(3) && !events.usage.contains(3) &&
+                  engine.resourceWaitSnapshot(now).heldBehindRefusal == 1 &&
+                  events.failedCount == 0,
+              "a later arrival started ahead of a restore refused its pages");
+    }
+    if (cause == Cause::Pending) {
+      engine.cancel(2);
+      tickUntil(engine, now, [&] { return executor.requests.contains(3) || events.usage.contains(3); },
+                "admission stayed closed after the refused restore was cancelled");
+    }
+    executor.decodeFinishes = true;
+    storage.growthBlocked = false;
+    for (uint32_t step = 0; step < 100 && !engine.idle(); ++step) {
+      tier.complete();
+      static_cast<void>(engine.tick(now++));
+    }
+    // A cancelled request is reported as ended.
+    require(engine.idle() && events.completedCount == 3 && events.failedCount == 0,
+            "the requests did not finish");
+    if (cause == Cause::GrowthBlocked)
+      require(events.startIds == std::vector<uint64_t>{1, 2, 3} && executor.restored == 64,
+              "the refused restore did not start from its prefix before the request behind it");
+  }
+}
+
 // A lane whose pages keep landing is never failed for waiting: the resource
 // limit measures time without progress. With one transfer at a time every
 // round moves one page, so the restore takes many rounds and several times
@@ -7168,6 +7256,7 @@ int main() {
     testRestoringRequestIsNotWaitingForMemory();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
+    testRefusedRestoreClosesAdmission();
     testFailedDiskRestoreKeepsShallowerState();
     testRepeatedDiskHitPromotesToMemory();
     testGrowthWaitsForTheStateWriteInFlight();
