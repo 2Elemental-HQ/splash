@@ -95,7 +95,7 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
     ComputeDispatch sum;
     sum.pipelineName = "prefill_linear_q4_sums32";
     sum.buffers = {{0, input}, {1, sums}};
-    sum.bytes = {{2, &params, sizeof(params)}};
+    sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {rowTiles, 1, 1};
     sum.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(sum);
@@ -274,7 +274,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
     ComputeDispatch sum;
     sum.pipelineName = "prefill_linear_q4_sums32";
     sum.buffers = {{0, input}, {1, sums}};
-    sum.bytes = {{2, &prefillParams, sizeof(prefillParams)}};
+    sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {1, 1, 1};
     sum.threadsPerThreadgroup = {256, 1, 1};
     (void)backend.submit(sum);

@@ -634,8 +634,7 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
   const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
   requireBytes(input, storageRows * consumer.inputSize * 2, "input");
   requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
-  graph.add("prefill_linear_q4_sums32", {input, sums},
-            Q4Params{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
+  graph.add("prefill_linear_q4_sums32", {input, sums}, consumer.inputSize, {tiles, 1, 1});
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                         metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
