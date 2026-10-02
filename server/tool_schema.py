@@ -336,8 +336,11 @@ def _schema_with_root(schema, root):
     return output
 
 
-def raw_string_schema(schema, root):
-    return _raw_string_schema(schema, root, frozenset(), {})
+def raw_string_schema(schema):
+    """How a parameter value is written: ("raw", None) as raw text,
+    ("literal", values) as one of `values`, or None as JSON. Framing makes
+    each parameter schema self-contained, so it is its own reference root."""
+    return _raw_string_schema(schema, schema, frozenset(), {})
 
 
 def _raw_string_schema(schema, root, ancestors, results):
@@ -615,7 +618,7 @@ def tool_argument_schema(root, budget):
 def _parameter_rules(rule, prefix, value_schema):
     rules = []
     closing = json.dumps(PARAMETER_CLOSE)
-    string_schema = raw_string_schema(value_schema, value_schema)
+    string_schema = raw_string_schema(value_schema)
     value_schema = _grammar_compatible_schema(value_schema)
     if string_schema is None:
         rules.append(

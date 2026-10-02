@@ -121,8 +121,7 @@ class StreamingToolCallProjector:
         self.call_id = None
         self.function_name = None
         self.parameter_name = None
-        self.parameter_schema = None
-        self.parameter_root = None
+        self.string_schema = None
         self.parameter_value_fragments = []
         self.streaming_string = False
         self.arguments = {}
@@ -237,9 +236,7 @@ class StreamingToolCallProjector:
             value = "".join(self.parameter_value_fragments)
             self._emit_argument('"', events)
         else:
-            value = _typed_tool_value(
-                raw_value, self.parameter_schema, self.parameter_root
-            )
+            value = _typed_tool_value(raw_value, self.string_schema)
             prefix = "" if len(self.arguments) == 0 else ","
             fragment = (
                 prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
@@ -247,8 +244,7 @@ class StreamingToolCallProjector:
             self._emit_argument(fragment, events)
         self.arguments[self.parameter_name] = value
         self.parameter_name = None
-        self.parameter_schema = None
-        self.parameter_root = None
+        self.string_schema = None
         self.parameter_value_fragments = []
         self.streaming_string = False
         self.state = "body"
@@ -342,14 +338,11 @@ class StreamingToolCallProjector:
                     )
                 self.pending = self.pending[name_end + 2 :]
                 self.parameter_name = name
-                self.parameter_schema, self.parameter_root = _tool_property_schema(
-                    self.policy, self.function_name, name
+                self.string_schema = raw_string_schema(
+                    _tool_property_schema(self.policy, self.function_name, name)
                 )
-                string_schema = raw_string_schema(
-                    self.parameter_schema, self.parameter_root
-                )
-                self.streaming_string = bool(
-                    string_schema is not None and string_schema[0] == "raw"
+                self.streaming_string = (
+                    self.string_schema is not None and self.string_schema[0] == "raw"
                 )
                 self.parameter_value_fragments = []
                 if self.streaming_string:
@@ -439,24 +432,20 @@ def argument_deltas(arguments):
 
 def _tool_property_schema(policy, tool_name, parameter_name):
     if policy is None:
-        return None, None
+        return None
     root = policy.argument_schemas.get(tool_name)
     if not isinstance(root, dict):
-        return None, None
-    schema = root.get("properties", {}).get(
+        return None
+    return root.get("properties", {}).get(
         parameter_name, root.get("additionalProperties", {})
     )
-    return schema, schema
 
 
-def _typed_tool_value(value, schema, root):
+def _typed_tool_value(value, string_schema):
     parsed = json_value(value)
-    string_schema = raw_string_schema(schema, root) if root is not None else None
     if string_schema is None:
         return parsed
-    if string_schema[0] == "raw" or value in string_schema[1]:
-        return value
-    return parsed
+    return value if string_schema[0] == "raw" or value in string_schema[1] else parsed
 
 
 def parse_tool_calls(text, request_id, policy=None):
@@ -496,9 +485,9 @@ def parse_tool_calls(text, request_id, policy=None):
                 raise APIError(
                     500, "model returned malformed tool XML", "invalid_model_output"
                 )
-            schema, root = _tool_property_schema(policy, name, parameter_name)
             arguments[parameter_name] = _typed_tool_value(
-                text[value_start:value_end], schema, root
+                text[value_start:value_end],
+                raw_string_schema(_tool_property_schema(policy, name, parameter_name)),
             )
             cursor = value_end + len(PARAMETER_CLOSE)
         if not text.startswith(FUNCTION_CLOSE, cursor):

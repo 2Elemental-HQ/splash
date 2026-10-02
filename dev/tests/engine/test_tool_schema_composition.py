@@ -36,7 +36,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         for name in names:
             value = arguments[name]
             value_schema = shape["properties"].get(name, shape["additionalProperties"])
-            raw = tool_schema.raw_string_schema(value_schema, value_schema)
+            raw = tool_schema.raw_string_schema(value_schema)
             encoded = value if isinstance(value, str) and raw else json.dumps(value)
             xml += f"<parameter={name}>\n{encoded}\n</parameter>\n"
         xml += "</function>\n</tool_call>"
@@ -155,7 +155,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     APIError, "cyclic tool parameter alternatives"
                 ) as error:
-                    tool_schema.raw_string_schema(schema, schema)
+                    tool_schema.raw_string_schema(schema)
                 self.assertEqual(error.exception.status, 400)
                 parameters = {
                     "$defs": schema["$defs"],
@@ -178,13 +178,15 @@ class ToolSchemaCompositionTests(unittest.TestCase):
 
     def test_shared_string_alternatives_are_not_cycles(self):
         schema = {
-            "$defs": {"text": {"type": "string"}},
-            "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}],
+            "$defs": {
+                "text": {"type": "string"},
+                "choice": {
+                    "anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/text"}]
+                },
+            },
+            "$ref": "#/$defs/choice",
         }
-        self.assertEqual(
-            tool_schema.raw_string_schema({"anyOf": schema["anyOf"]}, schema),
-            ("raw", None),
-        )
+        self.assertEqual(tool_schema.raw_string_schema(schema), ("raw", None))
 
     def test_shared_references_are_projected_once(self):
         # Two references per level to the next definition used to double the
