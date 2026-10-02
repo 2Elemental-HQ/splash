@@ -15,13 +15,13 @@ inline void full_qkv_decode_phase(
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   uint batch = group.y;
-  ulong kv_lane_stride = ulong(KHeads) * params.row_stride * HeadDim;
-  FullPrefillParams lane_params{Rows, params.cache_stride, params.row_stride};
+  ulong kv_lane_stride = ulong(KHeads) * params.stride * HeadDim;
+  FullPrefillParams lane_params{Rows, params.stride};
   full_qkv_storage_phase<QHeads, KHeads>(
       qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
       rope_cos + ulong(batch) * Rows * RotaryPairs,
       rope_sin + ulong(batch) * Rows * RotaryPairs,
-      queries + ulong(batch) * QHeads * params.row_stride * HeadDim,
+      queries + ulong(batch) * QHeads * params.stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,
       normalized, group.x, thread_index, lane, simd_group);
@@ -76,7 +76,7 @@ inline bfloat full_attention_gate_value(
   uint kv_head = query_head / HeadsPerKV;
   uint local_head = query_head % HeadsPerKV;
   ulong attention_index =
-      (((ulong(batch) * KHeads + kv_head) * params.row_stride + row) *
+      (((ulong(batch) * KHeads + kv_head) * params.stride + row) *
            HeadsPerKV +
        local_head) *
           HeadDim +

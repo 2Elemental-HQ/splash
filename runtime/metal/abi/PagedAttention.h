@@ -9,24 +9,24 @@
 
 #include "metal/abi/KvExtent.h"
 
+// stride: rows of one KV head's (and one query group's) chunk staging;
+// equals the store's chunk_stride.
 struct FullPrefillParams {
   uint32_t tokens;
-  uint32_t cache_stride;
-  uint32_t row_stride;
+  uint32_t stride;
 };
 
-static_assert(sizeof(FullPrefillParams) == 12,
-              "Full attention prefill parameters are 12 bytes on both sides");
+static_assert(sizeof(FullPrefillParams) == 8,
+              "Full attention prefill parameters are 8 bytes on both sides");
 
-// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows.
+// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows; stride as above.
 struct FullDecodeBatchParams {
-  uint32_t cache_stride;
-  uint32_t row_stride;
+  uint32_t stride;
   uint32_t lanes;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 12,
-              "Full attention verify parameters are 12 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 8,
+              "Full attention verify parameters are 8 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final Q8 page slot before attention. Prefill and verify both read

@@ -164,12 +164,12 @@ void PagedAttention::addPrefillProjection(
     const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-    metal::MetalBuffer chunkValues, uint32_t tokens, uint32_t cacheStride,
-    uint32_t rowStride, uint32_t queryHeads, kv::Layout layout) {
+    metal::MetalBuffer chunkValues, uint32_t tokens, uint32_t stride,
+    uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!tokens || !cacheStride || !rowStride)
+  if (!tokens || !stride)
     throw std::invalid_argument("invalid paged prefill projection geometry");
-  const FullPrefillParams params{tokens, cacheStride, rowStride};
+  const FullPrefillParams params{tokens, stride};
   graph.add(qkNormKernel(pipeline(kernel, "prefill_attention_qkv",
                                   "prefill_attention_qkv_kv2_g8"),
                          queryNorm, keyNorm, layout.headDimension),
@@ -183,12 +183,11 @@ void PagedAttention::addPrefillProjection(
 void PagedAttention::addPrefillGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden, uint32_t tokens,
-    uint32_t cacheStride, uint32_t rowStride, uint32_t queryHeads,
-    kv::Layout layout) {
+    uint32_t stride, uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!tokens || !cacheStride || !rowStride)
+  if (!tokens || !stride)
     throw std::invalid_argument("invalid paged prefill gate geometry");
-  const FullPrefillParams params{tokens, cacheStride, rowStride};
+  const FullPrefillParams params{tokens, stride};
   graph.add(std::string(pipeline(kernel, "prefill_attention_gate",
                                  "prefill_attention_gate_kv2_g8")),
             {std::move(packed), std::move(attention), std::move(hidden)}, params,
@@ -200,13 +199,12 @@ void PagedAttention::addVerifyProjection(
     const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-    metal::MetalBuffer chunkValues, uint32_t cacheStride, uint32_t rowStride,
-    uint32_t queryHeads, kv::Layout layout, uint32_t lanes) {
+    metal::MetalBuffer chunkValues, uint32_t stride, uint32_t queryHeads,
+    kv::Layout layout, uint32_t lanes) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!cacheStride || !rowStride || !lanes ||
-      lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!stride || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify projection geometry");
-  const FullDecodeBatchParams params{cacheStride, rowStride, lanes};
+  const FullDecodeBatchParams params{stride, lanes};
   graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
                                   "verify_attention_qkv_kv2_g8"),
                          queryNorm, keyNorm, layout.headDimension),
@@ -221,14 +219,12 @@ void PagedAttention::addVerifyProjection(
 PreparedInput PagedAttention::addVerifyGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
-    uint32_t cacheStride, uint32_t rowStride, uint32_t queryHeads,
-    kv::Layout layout, uint32_t lanes, LinearScratch scratch,
-    LinearInput input) {
+    uint32_t stride, uint32_t queryHeads, kv::Layout layout, uint32_t lanes,
+    LinearScratch scratch, LinearInput input) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!cacheStride || !rowStride || !lanes ||
-      lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!stride || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
-  const FullDecodeBatchParams params{cacheStride, rowStride, lanes};
+  const FullDecodeBatchParams params{stride, lanes};
   const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
   if (input != LinearInput::Plain && scratch.input) {
     const uint32_t width = queryHeads * layout.headDimension;

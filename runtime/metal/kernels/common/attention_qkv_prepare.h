@@ -9,7 +9,7 @@ inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
     device const float *rope_sin, device bfloat *queries,
-    device bfloat *key_cache, device bfloat *value_cache,
+    device bfloat *chunk_keys, device bfloat *chunk_values,
     FullPrefillParams params, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
     uint simd_group) {
@@ -31,14 +31,14 @@ inline void full_qkv_storage_phase(
   uint kv_head = head_index / (QHeads / KHeads);
   uint local_head = head_index % (QHeads / KHeads);
   device bfloat *destination =
-      queries + ((ulong(kv_head) * params.row_stride + row) *
+      queries + ((ulong(kv_head) * params.stride + row) *
                      (QHeads / KHeads) +
                  local_head) *
                     HeadDim;
   if (!query) {
     ulong key_offset =
-        (ulong(head_index) * params.cache_stride + position) * HeadDim;
-    destination = key_cache + key_offset;
+        (ulong(head_index) * params.stride + position) * HeadDim;
+    destination = chunk_keys + key_offset;
   }
 
   float element = float(source[thread_index]);
@@ -57,9 +57,9 @@ inline void full_qkv_storage_phase(
       bfloat(element * reductions[0] * float(weight[thread_index]));
   if (!query) {
     ulong value_offset =
-        (ulong(head_index) * HeadDim + thread_index) * params.cache_stride +
+        (ulong(head_index) * HeadDim + thread_index) * params.stride +
         position;
-    value_cache[value_offset] = source[KWidth + thread_index];
+    chunk_values[value_offset] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < 32) {
