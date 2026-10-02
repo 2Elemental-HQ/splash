@@ -3989,6 +3989,59 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
           "the resumed lane did not rebuild the prompt's replay point");
 }
 
+// A sibling that arrives while a producer is suspended waits for it once
+// it resumes, as for any producer, and the resumed producer plans the
+// junction at their shared boundary as any producer does: the sibling
+// resumes there instead of prefilling up to a checkpoint interval of the
+// prefix it shares.
+void testResumedProducerPlansJunctionsForSiblings() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(20001);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return !engine.commandInFlight() && executor.prefillRows >= 10'000; },
+            "the producer did not pass its checkpoint at 8192");
+  // The host refuses the producer's next pages: it yields its lane.
+  paused = true;
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+            "the producer was not suspended");
+  std::vector<uint32_t> sibling(prompt.begin(), prompt.begin() + 18'000);
+  sibling.resize(18'065, 0);
+  engine.submit(request(2, sibling));
+  const uint32_t rows = executor.prefillRows;
+  paused = false;
+  storage.growthBlocked = false;
+  now += 101;
+  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.waitingPrefix == 1; },
+            "the sibling did not wait for the resumed producer");
+  const auto &boundaries = executor.plans.at(1).boundaries;
+  require(executor.resumptions == 1 && executor.restored == 8192 &&
+              std::any_of(boundaries.begin(), boundaries.end(),
+                          [](const DraftBoundaryPlan &boundary) {
+                            return boundary.boundary == 17'984;
+                          }),
+          "the resumed producer planned no junction at the shared boundary");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 17'984} &&
+              executor.prefillRows - rows == (prompt.size() - 8192) + (sibling.size() - 17'984) &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "the sibling did not resume from the resumed producer's junction");
+}
+
 // The field case of a lane suspended mid-decode: it resumes with its
 // prompt's replay point lost, and the only memory left is another
 // conversation's cached KV, two whole extents with no state to recycle.
@@ -8083,6 +8136,7 @@ int main() {
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
+    testResumedProducerPlansJunctionsForSiblings();
     testResumedLaneRebuildsItsPointFromCachedKv(1);
     testResumedLaneRebuildsItsPointFromCachedKv(2);
     testDeniedSnapshotTakesAtMostOneSnapshotOfExtents();

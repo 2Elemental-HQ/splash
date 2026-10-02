@@ -909,8 +909,6 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
 }
 
 bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
-  if (active.suspended || active.replaying)
-    return false;
   bool changed = false;
   for (const auto &[id, peer] : requests_) {
     if (id == active.request.id || peer.stateCell || peer.suspended ||
