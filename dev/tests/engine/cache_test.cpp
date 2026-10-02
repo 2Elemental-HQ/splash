@@ -90,15 +90,15 @@ void testKvDeeperThanStateAndDependencyEviction() {
     return resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
         .madeProgress;
   };
-  require(step() && resources.snapshot().kvCache.blocks == 2 &&
+  require(step() && resources.snapshot().pool.pagesPrefix == 2 &&
               resources.snapshot().stateCache.entries == 1,
           "reclaim did not remove the KV leaf no state restores through first");
   require(step() && resources.snapshot().stateCache.entries == 0 &&
-              resources.snapshot().kvCache.blocks == 2,
+              resources.snapshot().pool.pagesPrefix == 2,
           "unreferenced composite state was not reclaimed before its KV");
   while (step()) {
   }
-  require(resources.snapshot().kvCache.blocks == 0 && storage.releasedExtents == 1,
+  require(resources.snapshot().pool.pagesPrefix == 0 && storage.releasedExtents == 1,
           "KV was not reclaimed after cached state");
 }
 
@@ -118,7 +118,7 @@ void testActiveTipProtectsTheContentChain() {
   require(
       !blocked.granted() &&
           !resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
-          resources.snapshot().kvCache.blocks == 2,
+          resources.snapshot().pool.pagesPrefix == 2,
       "memory pressure evicted an active request KV tip");
 
   resources.endRequest(1);
@@ -139,7 +139,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
           "initial KV extent allocation failed");
   resources.publishCommittedBlocks(1, prompt, 128);
   resources.endRequest(1);
-  require(resources.snapshot().kvCache.blocks == 4 &&
+  require(resources.snapshot().pool.pagesPrefix == 4 &&
               resources.snapshot().pool.pagesAllocated == 4,
           "cached extent setup is wrong");
 
@@ -153,7 +153,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   require(resources.ensureTokens(2, 1).granted(),
           "explicit reclaim did not release the cached KV extent");
   const auto snapshot = resources.snapshot();
-  require(snapshot.kvCache.blocks == 0 && snapshot.pool.pagesAllocated == 4 &&
+  require(snapshot.pool.pagesPrefix == 0 && snapshot.pool.pagesAllocated == 4 &&
               snapshot.pool.pagesActive == 1,
           "growth reclaim did not atomically replace the cached extent");
   resources.endRequest(2);
@@ -175,7 +175,7 @@ void testFragmentedColdKvPrecedesNewerState() {
   const auto reclaimed =
       resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 3 &&
+              resources.snapshot().pool.pagesPrefix == 3 &&
               resources.snapshot().stateCache.entries == 1 &&
               storage.releasedExtents == 0,
           "released-byte preference evicted newer state before cold KV");
@@ -194,7 +194,7 @@ void testReplacementKeepsTheExtentItEmpties() {
 
   const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 0 &&
+              resources.snapshot().pool.pagesPrefix == 0 &&
               storage.allocatedPages() == 4 && storage.releasedExtents == 0,
           "replacement released the newly reusable extent");
   resources.beginRequest(2);
@@ -227,20 +227,20 @@ void testReclaimPassReleasesEveryEmptyExtent() {
           "empty extent allocation failed");
   resources.endRequest(2);
   require(resources.snapshot().pool.reclaimableBytes == uint64_t{empty} * 4 * 4096 &&
-              resources.snapshot().kvCache.blocks == 1,
+              resources.snapshot().pool.pagesPrefix == 1,
           "release setup geometry changed");
 
   require(resources.releaseEmptyExtents(false) == uint64_t{empty} * 4 * 4096 &&
               storage.releasedExtents == empty &&
               resources.snapshot().pool.reclaimableBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 1,
+              resources.snapshot().pool.pagesPrefix == 1,
           "a pass did not release every empty extent before evicting");
   const CacheReclaimResult step =
       resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 4 * 4096 &&
               storage.releasedExtents == empty + 1 &&
               storage.allocatedPages() == 0 &&
-              resources.snapshot().kvCache.blocks == 0,
+              resources.snapshot().pool.pagesPrefix == 0,
           "a pass did not evict the cache and release its extent");
 }
 
@@ -262,7 +262,7 @@ void testReleaseTimeCoversOneExtent() {
     resources.endRequest(id);
   }
   require(resources.snapshot().pool.reclaimableBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 4 * extents,
+              resources.snapshot().pool.pagesPrefix == 4 * extents,
           "release time setup geometry changed");
   static_cast<void>(resources.evictAll());
   // The pool's timer runs around one release: no less than the storage saw
@@ -305,15 +305,15 @@ void testPublicationReleasesTheExtentItEmpties() {
 
   // An extent is room only for a snapshot that can allocate its bytes.
   require(!resources.reclaimOneState(false, point, false) && storage.releasedExtents == 0 &&
-              resources.snapshot().kvCache.blocks == 10,
+              resources.snapshot().pool.pagesPrefix == 10,
           "a publication that cannot allocate released an extent or took KV");
   StateRoom room = resources.reclaimOneState(false, point, true);
   require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 1 &&
-              resources.snapshot().kvCache.blocks == 10,
+              resources.snapshot().pool.pagesPrefix == 10,
           "the publication did not release the empty extent first");
   room = resources.reclaimOneState(false, point, true);
   require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 2 &&
-              storage.allocatedPages() == 8 && resources.snapshot().kvCache.blocks == 8,
+              storage.allocatedPages() == 8 && resources.snapshot().pool.pagesPrefix == 8,
           "the publication took more KV than its extent or kept the extent it emptied");
   resources.endRequest(1);
 }

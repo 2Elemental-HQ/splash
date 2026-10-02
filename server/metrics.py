@@ -84,7 +84,6 @@ def prometheus_metrics(status):
             "decode_batches_by_width",
             "b4",
         ),
-        "splash_kv_blocks": ("kv", "blocks"),
         "splash_kv_pages_allocated": ("kv", "pages_allocated"),
         "splash_kv_pages_active": ("kv", "pages_active"),
         "splash_kv_pages_cache": ("kv", "pages_cache"),

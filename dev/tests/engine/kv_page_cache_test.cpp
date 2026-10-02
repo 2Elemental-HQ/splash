@@ -107,8 +107,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   auto left = cache.insert(root.id, leftTokens, acquired.pages[1]);
   auto right = cache.insert(root.id, rightTokens, acquired.pages[2]);
   auto other = cache.insert(0, otherTokens, acquired.pages[3]);
-  require(cache.snapshot().blocks == 4 &&
-              cache.snapshot().bytes == 400,
+  require(pool.snapshot().pagesPrefix == 4,
           "page cache did not retain four physical blocks");
 
   for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
@@ -133,7 +132,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   auto duplicate = cache.insert(root.id, leftTokens, acquired.pages[1]);
   require(duplicate.id == left.id &&
               duplicate.physicalPage == acquired.pages[1] &&
-              cache.snapshot().blocks == 4,
+              pool.snapshot().pagesPrefix == 4,
           "exact duplicate created a second KV block");
 
   requireThrows<std::logic_error>([&] { cache.erase(root.id); },
@@ -160,9 +159,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   cache.erase(left.id);
   cache.erase(root.id);
   cache.erase(other.id);
-  require(cache.snapshot().blocks == 0 &&
-              pool.snapshot().pagesPrefix == 0 &&
-              pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "page cache erase leaked physical references");
 }
 
@@ -201,7 +198,7 @@ void testErasedLeafParentInheritsRecency() {
               !cache.evictionCandidate(b0.id),
           "last exposed parent was not the sole candidate");
   cache.erase(b0.id);
-  require(cache.snapshot().blocks == 0 &&
+  require(pool.snapshot().pagesPrefix == 0 &&
               pool.freePageCount() == pool.pageCount(),
           "recency test leaked physical references");
 }
@@ -312,7 +309,7 @@ void testCandidateOrderThroughChurn() {
       cache.releaseActive(id);
   }
   while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == count,
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == count,
           "candidate churn leaked a block or physical reference");
 }
 
@@ -392,7 +389,7 @@ void testSubtreeThroughChurn() {
   for (uint64_t id = 1; id <= inserted; ++id)
     if (blocks[id].live && blocks[id].used) cache.releaseActive(id);
   while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "subtree churn leaked a block or a page reference");
 }
 
@@ -424,10 +421,10 @@ void testDiskTierTransitions() {
   require(cache.diskCandidate(true).value().id == leaf.id &&
               !cache.diskCandidate(false) &&
               cache.evictionCandidate().value().id == leaf.id &&
-              cache.snapshot().blocks == 2 && cache.snapshot().diskBlocks == 1,
+              pool.snapshot().pagesPrefix == 2 && cache.diskBlocks() == 1,
           "a resident block with a disk copy is not a duplicate");
   cache.setSlot(leaf.id, nullptr);
-  require(!cache.diskCandidate(true) && cache.snapshot().diskBlocks == 0,
+  require(!cache.diskCandidate(true) && cache.diskBlocks() == 0,
           "a resident block could not drop its copy");
   cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
 
@@ -437,8 +434,8 @@ void testDiskTierTransitions() {
   const uint64_t leafUsed = cache.evictionCandidate().value().lastUsed;
   const uint32_t freePages = pool.freePageCount();
   cache.dropPage(leaf.id);
-  require(pool.freePageCount() == freePages + 1 && cache.snapshot().blocks == 1 &&
-              cache.snapshot().diskBlocks == 1 && cache.page(leaf.id) == KvCache::noPage,
+  require(pool.freePageCount() == freePages + 1 && pool.snapshot().pagesPrefix == 1 &&
+              cache.diskBlocks() == 1 && cache.page(leaf.id) == KvCache::noPage,
           "dropped page did not return to the pool");
   require(cache.evictionCandidate().value().id == root.id &&
               cache.evictionCandidate().value().lastUsed == leafUsed &&
@@ -474,7 +471,7 @@ void testDiskTierTransitions() {
   const uint32_t adoptedFreePages = pool.freePageCount();
   pool.releasePage(acquired.pages[2], false);
   require(cache.page(leaf.id) == acquired.pages[2] && !cache.evictionCandidate() &&
-              cache.snapshot().blocks == 2 && pool.freePageCount() == adoptedFreePages,
+              pool.snapshot().pagesPrefix == 2 && pool.freePageCount() == adoptedFreePages,
           "adopted page was not retained by the block");
   auto writer = cache.insert(root.id, leafTokens, acquired.pages[3]);
   require(writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
@@ -489,7 +486,7 @@ void testDiskTierTransitions() {
 
   cache.erase(leaf.id);
   cache.erase(root.id);
-  require(cache.snapshot().blocks == 0 && cache.snapshot().diskBlocks == 0 &&
+  require(pool.snapshot().pagesPrefix == 0 && cache.diskBlocks() == 0 &&
               pool.freePageCount() == pool.pageCount(),
           "erasing both tiers leaked a page or a copy");
 }
@@ -532,7 +529,7 @@ void testDiskOnlyAdoptionAndPoison() {
   cache.setTransferring(leaf.id, false);
   cache.poison(leaf.id);
   require(!cache.find(root.id, leafTokens) && cache.contains(leaf.id) &&
-              cache.snapshot().diskBlocks == 0 && !cache.evictionCandidate() &&
+              cache.diskBlocks() == 0 && !cache.evictionCandidate() &&
               !cache.diskCandidate(true) && !cache.diskCandidate(false),
           "poisoned block still matched or waited in an order");
   auto fresh = cache.insert(root.id, leafTokens, acquired.pages[3]);
@@ -542,14 +539,14 @@ void testDiskOnlyAdoptionAndPoison() {
           "poisoned block blocked republication of its content");
   cache.releaseActive(leaf.id);
   require(!cache.contains(leaf.id) && pool.freePageCount() == freePages + 1 &&
-              cache.snapshot().blocks == 2,
+              pool.snapshot().pagesPrefix == 2,
           "poisoned block outlived its last user");
 
   cache.poison(root.id);
   require(cache.contains(root.id) && !cache.find(0, rootTokens),
           "a poisoned parent left before its child");
   cache.erase(fresh.id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "a poisoned parent outlived its subtree");
 }
 

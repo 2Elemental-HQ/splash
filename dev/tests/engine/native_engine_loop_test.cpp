@@ -1363,7 +1363,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   runUntilIdle(loop);
 
   ScoreBesideChat result;
-  result.publishedBlocks = resources.snapshot().kvCache.blocks;
+  result.publishedBlocks = resources.snapshot().pool.pagesPrefix;
   result.healthy = loop.engineHealthy() && !loop.connectionMustClose();
   result.slotsReleased = !executor.holdsSlot(21) && !executor.holdsSlot(22);
   result.scoreChunks = executor.prefillChunks[21];

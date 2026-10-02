@@ -1764,7 +1764,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
   engine.submit(request(4, prompt));
   require(engine.tick(1) && engine.tick(2),
           "long request did not complete its first prefill command");
-  require(resources.snapshot().kvCache.blocks == 64 &&
+  require(resources.snapshot().pool.pagesPrefix == 64 &&
               executor.snapshotAttempts == 0,
           "first prefill command changed the state cache");
   require(engine.tick(3) && engine.commandInFlight(),
@@ -1781,7 +1781,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
               snapshot.replayStatePublicationFailures == 0 &&
               snapshot.cancelled == 1,
           "cancelled command snapshotted or counted its boundary");
-  require(snapshot.resources.kvCache.blocks == 64 &&
+  require(snapshot.resources.pool.pagesPrefix == 64 &&
               snapshot.resources.pool.pagesActive == 0 &&
               snapshot.resources.activeRequests == 0 &&
               executor.requests.empty(),
@@ -1973,7 +1973,7 @@ void testPressureReclaimRespectsStateLifetimes() {
   engine.submit(request(27, std::vector<uint32_t>(65, 27)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
-  require(cached.stateCache.entries == 1 && cached.kvCache.blocks == 2,
+  require(cached.stateCache.entries == 1 && cached.pool.pagesPrefix == 2,
           "pressure setup did not retain KV and composite state");
 
   // A shrink that nothing is waiting for stops at the resume point. Freeing
@@ -2005,7 +2005,7 @@ void testPressureReclaimRespectsStateLifetimes() {
           "pressure reclaim did not release immutable cached state");
   const auto stateEvicted = resources.snapshot();
   require(stateEvicted.stateCache.entries == 0 &&
-              stateEvicted.kvCache.blocks == 2,
+              stateEvicted.pool.pagesPrefix == 2,
           "cached-state eviction incorrectly removed target KV");
 
   require(engine.reclaimMemory({.reclaim = true,
@@ -2014,7 +2014,7 @@ void testPressureReclaimRespectsStateLifetimes() {
                   .outcome == ReclaimOutcome::Exhausted,
           "evicting everything left something to reclaim");
   const auto critical = resources.snapshot();
-  require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
+  require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
               critical.pool.allocatedBytes == 0,
           "critical pressure left evictable cached state or KV extents");
   const MemoryReclaimResult empty =
@@ -2048,7 +2048,7 @@ void testWarningReclaimKeepsTheServingFootprint() {
        .keepServingFootprint = true}));
   const auto warning = resources.snapshot();
   require(executor.keptLane && warning.stateCache.entries == 0 &&
-              warning.kvCache.blocks == 0 &&
+              warning.pool.pagesPrefix == 0 &&
               warning.pool.allocatedBytes == extentBytes,
           "warning pressure did not keep only the serving footprint");
 
@@ -2297,7 +2297,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   require(executor.beginAttempts == attempts + 2 &&
               resources.snapshot().stateCache.entries ==
                   cached.stateCache.entries &&
-              resources.snapshot().kvCache.blocks == cached.kvCache.blocks &&
+              resources.snapshot().pool.pagesPrefix == cached.pool.pagesPrefix &&
               resources.snapshot().lookup.lookups == cached.lookup.lookups &&
               engine.snapshot().coldMisses == coldMisses &&
               engine.snapshot().scheduler.waitingResources == 1,
@@ -2347,7 +2347,7 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
                   cached.stateCache.evictions + 1 &&
               after.resources.stateCache.entries == cached.stateCache.entries &&
               after.resources.stateCache.bytes == cached.stateCache.bytes &&
-              after.resources.kvCache.blocks == cached.kvCache.blocks + 2,
+              after.resources.pool.pagesPrefix == cached.pool.pagesPrefix + 2,
           "recycling under host pressure grew state or drained KV cache");
 }
 
@@ -2397,7 +2397,7 @@ void testRequestInServiceGrowsThroughTheHostPause() {
   // A finished prompt leaves two cached blocks under a state.
   engine.submit(request(1, std::vector<uint32_t>(65, 1)));
   runUntilIdle(engine);
-  require(resources.snapshot().kvCache.blocks == 2 &&
+  require(resources.snapshot().pool.pagesPrefix == 2 &&
               resources.snapshot().stateCache.entries == 1,
           "host pause fixture did not cache the first prompt");
   executor.decodeFinishes = false;
@@ -2500,7 +2500,7 @@ void testFirstRequestStartsThroughTheHostPause() {
   static_cast<void>(engine.tick(now++));
   require(!executor.requests.contains(2) && events.startIds.size() == 1 &&
               engine.resourceWaitSnapshot(now).memory == 1 &&
-              resources.snapshot().kvCache.blocks >= before.kvCache.blocks &&
+              resources.snapshot().pool.pagesPrefix >= before.pool.pagesPrefix &&
               resources.snapshot().stateCache.evictions == before.stateCache.evictions,
           "a second request grew, or evicted for the host, beside one in service");
   while (now < 1000 && events.completedCount < 2)
@@ -2701,7 +2701,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
-  require(cached.kvCache.blocks >= 1 && cached.pool.pagesPrefix >= 2 &&
+  require(cached.pool.pagesPrefix >= 2 &&
               cached.pool.pagesFree + cached.pool.pagesPrefix >= 3,
           "idle-cache reuse fixture geometry changed");
 
@@ -2901,7 +2901,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     // Suspension drops the lane's armed boundary silently: it is neither a
     // snapshot attempt nor a publication failure.
     require(executor.suspensions == 1 && events.capacityExhaustedCount == 0 &&
-                resources.snapshot().kvCache.blocks == cached.kvCache.blocks &&
+                resources.snapshot().pool.pagesPrefix == cached.pool.pagesPrefix &&
                 resources.snapshot().stateCache.evictions ==
                     cached.stateCache.evictions &&
                 executor.snapshotAttempts == 1 &&
@@ -4206,7 +4206,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   // resumed lane rebuilds the state where the conversation's next turn
   // resumes, then captures the generated history's end.
   constexpr uint32_t retainedKvTokens = 6144;
-  while (resources.snapshot().kvCache.blocks >
+  while (resources.snapshot().pool.pagesPrefix >
          retainedKvTokens / KvCache::pageTokens) {
     require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "could not reclaim the suspended decode's KV tail");
@@ -4338,7 +4338,7 @@ struct LostReplayPoint {
     while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
                .madeProgress) {
     }
-    require(resources.snapshot().kvCache.blocks == 0 && pool.snapshot().pagesAllocated == 0,
+    require(resources.snapshot().pool.pagesPrefix == 0 && pool.snapshot().pagesAllocated == 0,
             "the suspended lane's KV stayed");
     storage.growthBlocked = false;
     pressure = MemoryPressure::Normal;
@@ -4776,7 +4776,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   };
   const KvPoolSnapshot before = pool.snapshot();
   const uint32_t attemptsBefore = storage.allocationAttempts;
-  const uint32_t blocksBefore = cache.snapshot().kvCache.blocks;
+  const uint32_t blocksBefore = cache.snapshot().pool.pagesPrefix;
   // The first chunk's 64 pages need 16 new extents; the budget has room for
   // 8, and evicting cached prefixes frees the other 32 pages.
   engine.submit(request(286, std::vector<uint32_t>(16 * 4 * 32 + 1, 286)));
@@ -4792,7 +4792,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   // more, and a retry the free pages cover.
   require(storage.allocationAttempts - attemptsBefore ==
                   budgetExtents - cachedExtents + 1 &&
-              blocksBefore - cache.snapshot().kvCache.blocks == 32,
+              blocksBefore - cache.snapshot().pool.pagesPrefix == 32,
           "the denial was retried per evicted page or evicted more than it lacked");
 }
 
@@ -4973,7 +4973,7 @@ void testStateStartGathersFreePagesBeforeEvicting() {
   require(events.startIds.back() == 5 && fixture.storage.copies.size() == 1 &&
               fixture.storage.copies[0].from == 8 && fixture.storage.copies[0].to == 2 &&
               started.pool.extentCompactions == 1 && started.pool.extentReleases == 1 &&
-              started.kvCache.blocks >= cached.kvCache.blocks &&
+              started.pool.pagesPrefix >= cached.pool.pagesPrefix &&
               started.stateCache.entries >= cached.stateCache.entries,
           "the lane's start evicted instead of gathering the free pages");
   const PageTableView moved = cache.pageTable(4);
@@ -5898,7 +5898,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
             "expired ordinary command emitted output or lost its deadline");
     const auto after = resources.snapshot();
     require(after.stateCache.publications == before.stateCache.publications &&
-                after.kvCache.blocks == before.kvCache.blocks &&
+                after.pool.pagesPrefix == before.pool.pagesPrefix &&
                 after.pool.pagesActive == 0 && after.activeRequests == 0,
             "expired ordinary command published cache state or leaked resources");
   }
@@ -5949,7 +5949,7 @@ void testTerminalAnchorWithoutKvIsNotCached() {
     runUntilIdle(engine);
     require(events.completedCount == 1 && events.emitted == 1,
             "terminal anchor request did not complete");
-    require(resources.snapshot().kvCache.blocks == (withoutKv ? 0U : 1U),
+    require(resources.snapshot().pool.pagesPrefix == (withoutKv ? 0U : 1U),
             "token without a KV row changed the cached block count");
   }
 }
@@ -6403,7 +6403,7 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
   runUntilIdle(engine);
   require(executor.snapshotAttempts == 0 &&
               engine.snapshot().checkpointPublications == 0 &&
-              resources.snapshot().kvCache.blocks == 6144 / KvCache::pageTokens,
+              resources.snapshot().pool.pagesPrefix == 6144 / KvCache::pageTokens,
           "cancellation published a checkpoint from the draining command");
 }
 
@@ -6514,7 +6514,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   const auto committed = engine.snapshot();
   require(!engine.commandInFlight() && executor.prefillRows == 22528 &&
               executor.requests.at(600).position == 22528 &&
-              committed.resources.kvCache.blocks == 22528 / KvCache::pageTokens,
+              committed.resources.pool.pagesPrefix == 22528 / KvCache::pageTokens,
           "fixture did not commit 22528 prompt tokens before cancellation");
   require(committed.checkpointPublications == 5 &&
               committed.checkpointPublicationFailures == 0 &&
@@ -7425,7 +7425,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(cache.snapshot().kvCache.blocks == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+  require(cache.snapshot().pool.pagesPrefix == 0 && cache.snapshot().kvTier.diskBlocks == 2,
           "prefix did not move to disk whole");
 
   engine.submit(request(1, prompt));
@@ -7447,7 +7447,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
           "restored prefix was not used");
   const auto stats = cache.snapshot();
   require(stats.kvTier.restores == 2 &&
-              stats.kvCache.blocks == 2 && stats.kvTier.diskBlocks == 2,
+              stats.pool.pagesPrefix == 2 && stats.kvTier.diskBlocks == 2,
           "restore accounting is off");
 }
 
@@ -7779,7 +7779,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
               stats.stateCache.pinned == 0 && stats.activeRequests == 0 &&
               executor.requests.empty() && !events.outputs.contains(1),
           "cancelled prefix read unused pages or retained active resources");
-  require(stats.kvTier.diskBlocks == 4 && stats.kvCache.blocks == 1,
+  require(stats.kvTier.diskBlocks == 4 && stats.pool.pagesPrefix == 1,
           "cancellation destroyed reusable disk pages");
   executor.restoreControl = std::make_shared<RestoreControl>();
   executor.restoreControl->ready = true;

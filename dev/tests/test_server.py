@@ -1153,7 +1153,6 @@ class ServerTest(unittest.TestCase):
                         },
                     },
                     "kv": {
-                        "blocks": 6,
                         "pages_allocated": 8,
                         "pages_active": 4,
                         "pages_cache": 4,

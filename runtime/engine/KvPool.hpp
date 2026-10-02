@@ -61,16 +61,17 @@ struct KvPageAcquisition {
   }
 };
 
-// Sole owner of KV page references and of which extents are allocated. It
-// alone allocates and releases extents, starting with the runway its
-// constructor allocates. Resource policy may ask for pages or release
-// references, but cannot directly allocate or release Metal memory. Free
-// pages are handed out from the allocated extent with the most live pages
-// first, so partially used extents fill up, empty extents are touched last,
-// and cold extents drain to empty, the only state in which an extent can be
-// released. Held pages are scattered over the extents all the same;
-// compactExtent() empties one more extent whenever the free pages of the
-// others cover it.
+// Sole owner of KV page references and of which extents are allocated.
+// Requests hold counted references to a page; the cache owns a page once,
+// for the one block on it (prefixOwner). The pool alone allocates and
+// releases extents, starting with the runway its constructor allocates.
+// Resource policy may ask for pages or release references, but cannot
+// directly allocate or release Metal memory. Free pages are handed out from
+// the allocated extent with the most live pages first, so partially used
+// extents fill up, empty extents are touched last, and cold extents drain to
+// empty, the only state in which an extent can be released. Held pages are
+// scattered over the extents all the same; compactExtent() empties one more
+// extent whenever the free pages of the others cover it.
 class KvPool final {
 public:
   // Allocates the runway, the extents that hold pages [0, runwayPages), or
@@ -118,9 +119,9 @@ private:
 
   struct PageRecord {
     uint32_t activeReferences = 0;
-    uint32_t prefixReferences = 0;
     uint32_t previousFree = noIndex;
     uint32_t nextFree = noIndex;
+    bool prefixOwned = false;
     bool onFreeList = false;
   };
 

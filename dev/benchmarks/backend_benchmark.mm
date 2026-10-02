@@ -476,7 +476,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 void evictAllCache(engine::Cache &resources) {
   static_cast<void>(resources.evictAll());
   const engine::CacheSnapshot snapshot = resources.snapshot();
-  if (snapshot.stateCache.entries || snapshot.kvCache.blocks)
+  if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
     throw std::logic_error("native benchmark cache did not drain");
 }
 
@@ -1322,7 +1322,7 @@ int main(int argc, char **argv) {
     std::cout << "],\"final\":{\"cache_hits\":" << snapshot.cacheHits
               << ",\"cold_misses\":" << snapshot.coldMisses
               << ",\"reused_tokens\":" << snapshot.reusedTokens
-              << ",\"kv_blocks\":" << snapshot.resources.kvCache.blocks
+              << ",\"kv_pages_cache\":" << snapshot.resources.pool.pagesPrefix
               << ",\"state_entries\":" << snapshot.resources.stateCache.entries
               << "}}\n";
     if (progress)

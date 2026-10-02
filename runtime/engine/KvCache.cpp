@@ -141,7 +141,6 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
     throw std::logic_error("duplicate KV cache block id");
   index_.emplace(position->second.indexHash, position->first);
   const uint64_t id = nextBlockId_++;
-  ++residentBlocks_;
   blockOnPage_[physicalPage] = id;
   Block &placed = block(id);
   if (parentBlock) {
@@ -354,7 +353,6 @@ void KvCache::dropPage(uint64_t blockId) {
   const uint32_t page = entry.page;
   entry.page = noPage;
   blockOnPage_[page] = 0;
-  --residentBlocks_;
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -387,7 +385,6 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
   pool_.retainPage(page, true);
   entry.page = page;
   blockOnPage_[page] = blockId;
-  ++residentBlocks_;
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -464,10 +461,8 @@ void KvCache::erase(uint64_t blockId) {
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
-  if (page != noPage) {
+  if (page != noPage)
     blockOnPage_[page] = 0;
-    --residentBlocks_;
-  }
   if (disk)
     --diskBlocks_;
   if (parentId) {
@@ -485,15 +480,6 @@ void KvCache::erase(uint64_t blockId) {
   }
   if (page != noPage)
     pool_.releasePage(page, true);
-}
-
-KvCache::Snapshot KvCache::snapshot() const noexcept {
-  const uint64_t count = residentBlocks_;
-  const uint64_t bytes =
-      count > std::numeric_limits<uint64_t>::max() / pool_.bytesPerPage()
-          ? std::numeric_limits<uint64_t>::max()
-          : count * pool_.bytesPerPage();
-  return {residentBlocks_, bytes, diskBlocks_};
 }
 
 KvCache::Block &KvCache::block(uint64_t blockId) {

@@ -859,7 +859,7 @@ bool Cache::pollTransfers() {
 CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
   tier.pendingPages = pendingPages();
-  tier.diskBlocks = kv_.snapshot().diskBlocks;
+  tier.diskBlocks = kv_.diskBlocks();
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();
     tier.usedBytes = diskBudget_->usedBytes();
@@ -870,7 +870,6 @@ CacheSnapshot Cache::snapshot() const {
   if (tier_)
     tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
   return {pool_.snapshot(),
-          kv_.snapshot(),
           states_.snapshot(),
           tier,
           lookup_,

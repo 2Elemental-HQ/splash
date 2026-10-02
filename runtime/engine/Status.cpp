@@ -138,8 +138,6 @@ std::string runtimeStatusJson(
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
-      << ",\"blocks\":" << resources.kvCache.blocks
-      << ",\"cache_bytes\":" << resources.kvCache.bytes
       << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix

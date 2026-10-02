@@ -84,27 +84,30 @@ void KvPool::retainPage(uint32_t page, bool prefixOwner) {
   if (!extents_[extentOf(page)].allocated) {
     throw std::logic_error("cannot retain a KV page of an unallocated extent");
   }
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (references == std::numeric_limits<uint32_t>::max()) {
+  if (prefixOwner && record.prefixOwned)
+    throw std::logic_error("KV page already belongs to a cached block");
+  if (!prefixOwner && record.activeReferences == std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV page reference overflow");
-  }
   if (pageFree(page))
     markUsed(page);
-  if (!references)
-    ++(prefixOwner ? prefixPages_ : activePages_);
-  ++references;
+  if (prefixOwner) {
+    record.prefixOwned = true;
+    ++prefixPages_;
+  } else if (!record.activeReferences++) {
+    ++activePages_;
+  }
 }
 
 void KvPool::releasePage(uint32_t page, bool prefixOwner) {
   PageRecord &record = pages_.at(page);
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (!references)
+  if (prefixOwner ? !record.prefixOwned : !record.activeReferences)
     throw std::logic_error("invalid KV page release");
-  --references;
-  if (!references)
-    --(prefixOwner ? prefixPages_ : activePages_);
+  if (prefixOwner) {
+    record.prefixOwned = false;
+    --prefixPages_;
+  } else if (!--record.activeReferences) {
+    --activePages_;
+  }
   if (pageFree(page))
     markFree(page);
 }
@@ -125,7 +128,7 @@ bool KvPool::pageActive(uint32_t page) const {
 
 bool KvPool::pageFree(uint32_t page) const {
   const PageRecord &record = pages_.at(page);
-  return !record.activeReferences && !record.prefixReferences;
+  return !record.activeReferences && !record.prefixOwned;
 }
 
 uint64_t KvPool::allocatedBytes() const noexcept {
@@ -225,8 +228,7 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
     markUsed(copy.to);
     pages_[copy.to].activeReferences =
         std::exchange(pages_[copy.from].activeReferences, 0);
-    pages_[copy.to].prefixReferences =
-        std::exchange(pages_[copy.from].prefixReferences, 0);
+    pages_[copy.to].prefixOwned = std::exchange(pages_[copy.from].prefixOwned, false);
     markFree(copy.from);
     moves.destinations[copy.from - moves.firstPage] = copy.to;
   }

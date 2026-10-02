@@ -249,6 +249,26 @@ void testPrefixAndActiveReferencesHoldTheExtent() {
             "last prefix release did not make extent reclaimable");
 }
 
+// The cache owns a page once, for the one block on it: a second claim or a
+// second release is a broken invariant, refused before anything changes.
+void testCacheOwnsAPageOnce() {
+    TestKvStorage storage(4, 100, 4);
+    KvPool pool(storage, 4);
+    auto active = pool.acquirePages(1);
+    require(active.granted(), "ownership setup failed");
+    const uint32_t page = active.pages.front();
+    pool.retainPage(page, true);
+    require(pool.snapshot().pagesPrefix == 1, "the cache did not own the page");
+    requireThrows<std::logic_error>([&] { pool.retainPage(page, true); },
+                                    "the cache owned a page twice");
+    pool.releasePage(page, true);
+    requireThrows<std::logic_error>([&] { pool.releasePage(page, true); },
+                                    "the cache gave up a page it did not own");
+    require(pool.snapshot().pagesPrefix == 0 && pool.pageActive(page),
+            "a refused claim or release changed the page's references");
+    pool.releasePage(page, false);
+}
+
 // The pool with every page allocated and held by a request, less the pages
 // in `released`. Every page starts with content of its own.
 KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
@@ -376,6 +396,7 @@ int main() {
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
+        testCacheOwnsAPageOnce();
         testCompactionEmptiesTheExtentWithTheFewestPages();
         testCompactionFillsTheFullestExtentsFirst();
         testCompactionNeedsFreePagesInExtentsInUse();

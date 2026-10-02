@@ -87,7 +87,6 @@ struct KvTierSnapshot final {
 
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
-  KvCache::Snapshot kvCache;
   StateCacheSnapshot stateCache;
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;

@@ -62,12 +62,6 @@ public:
     std::vector<uint32_t> pages;
   };
 
-  struct Snapshot {
-    uint32_t blocks = 0;
-    uint64_t bytes = 0;
-    uint32_t diskBlocks = 0;
-  };
-
   KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
       : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency),
         blockOnPage_(pool.pageCount()) {}
@@ -159,7 +153,9 @@ public:
   // caller handles any composite state attached to it first.
   void erase(uint64_t blockId);
 
-  [[nodiscard]] Snapshot snapshot() const noexcept;
+  // Blocks with a disk copy, resident or not; the pool counts the resident
+  // blocks (KvPoolSnapshot::pagesPrefix).
+  [[nodiscard]] uint32_t diskBlocks() const noexcept { return diskBlocks_; }
 
 private:
   struct Block {
@@ -223,7 +219,6 @@ private:
   RecencyOrder ramLeaves_;
   RecencyOrder duplicates_;
   RecencyOrder diskLeaves_;
-  uint32_t residentBlocks_ = 0;
   uint32_t diskBlocks_ = 0;
 };
 
