@@ -2,6 +2,7 @@
 #include "Q8PageFormatReference.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "TestModel.hpp"
@@ -304,7 +305,7 @@ public:
               }
               output_.insert(output_.end(), bytes.begin(), bytes.end());
             },
-            [] { return std::string("{\"schema_version\":5}"); }) {
+            test::readyStatusJson) {
     backing_.commandInFlight = [this] { return loop_.commandInFlight(); };
   }
 

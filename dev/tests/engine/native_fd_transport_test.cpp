@@ -1,6 +1,7 @@
 #include "ProtocolPeer.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/FdTransport.hpp"
 
@@ -142,9 +143,7 @@ struct Harness final {
   Executor executor;
   engine::FdTransport transport;
   // What the loop answers a status request with.
-  std::function<std::string()> status = [] {
-    return std::string("{\"schema_version\":5}");
-  };
+  std::function<std::string()> status = test::readyStatusJson;
   engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
                              [this] { return status(); }};
 };
@@ -375,7 +374,7 @@ void testLoopWakesForAnEngineDeadline() {
           }
         }
       },
-      [] { return std::string("{\"schema_version\":5}"); }};
+      test::readyStatusJson};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));
@@ -574,7 +573,7 @@ void testShutdownInterruptsABlockedOutputWrite() {
   std::promise<void> answering;
   harness.status = [&] {
     answering.set_value();
-    return std::string("{\"schema_version\":5}");
+    return test::readyStatusJson();
   };
   // Like the process's own handler, without SA_RESTART: the signal interrupts
   // the write.
