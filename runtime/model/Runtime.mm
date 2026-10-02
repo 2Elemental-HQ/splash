@@ -288,7 +288,7 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
-        sampling(geometry.target.vocabularySize, kDecodeRows),
+        sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return QwenTarget(weights, value.backend, operators,

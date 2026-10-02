@@ -10,7 +10,9 @@
 // shared by the row's kVocabularyGroups groups: each sums ranges of the
 // vocabulary, and the one that finishes last (split_arrive_last) draws.
 // Every reduction runs in a fixed order, so a row selects the same token on
-// every run.
+// every run. The same kernels select the first token after a prompt and the
+// verify rows (TargetSamplingParams): each dispatch covers the selected rows
+// of every lane, and the groups of the other policy's lanes return at once.
 
 // The row a lane selects from: its logits, the tokens it admits (its
 // constraint mask row, less the stop tokens when the lane ignores
@@ -37,37 +39,32 @@ struct TargetRow {
   }
 };
 
-// The row of the first token after a prompt, and verify row global_row of a
-// batch.
-inline TargetRow first_token_row(device const float *logits,
-                                 device const uint *token_mask,
-                                 constant TargetSamplingParams &params) {
-  return {logits + ulong(params.row_offset) * params.vocabulary,
-          token_mask + ulong(params.mask_row_offset) * params.mask_words,
-          params.constrained != 0,
-          params.exclude_stop_tokens != 0,
-          params.stop_token_0,
-          params.stop_token_1,
-          params.vocabulary,
-          params.temperature,
-          0.0f};
+// The lane of selected row s, and whether it samples.
+inline uint selected_lane(constant TargetSamplingParams &params, uint s) {
+  return s / params.rows;
 }
-inline TargetRow verify_row(device const float *logits,
-                            device const uint *token_mask,
-                            constant TargetSamplingBatchParams &params,
-                            uint global_row) {
-  const uint batch = global_row / params.rows_per_lane;
-  const uint row_index = global_row % params.rows_per_lane;
-  return {logits + ulong(global_row) * params.vocabulary,
-          token_mask +
-              (ulong(batch) * (SPLASH_TARGET_VERIFY_ROWS + 1) + row_index + 1) *
-                  params.mask_words,
-          (params.constrained_mask & (1u << batch)) != 0,
-          (params.exclude_stop_mask & (1u << batch)) != 0,
+inline bool lane_samples(constant TargetSamplingParams &params, uint s) {
+  return (params.sampling_mask & (1u << selected_lane(params, s))) != 0;
+}
+
+// Selected row s of a dispatch (TargetSamplingParams).
+inline TargetRow selected_row(device const float *logits,
+                              device const uint *token_mask,
+                              constant TargetSamplingParams &params, uint s) {
+  const uint lane = selected_lane(params, s);
+  const uint index = s % params.rows;
+  return {logits + (ulong(lane) * SPLASH_TARGET_VERIFY_ROWS +
+                    params.logits_row + index) *
+                       params.vocabulary,
+          token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+                        params.mask_row + index) *
+                           params.mask_words,
+          (params.constrained_mask & (1u << lane)) != 0,
+          (params.exclude_stop_mask & (1u << lane)) != 0,
           params.stop_token_0,
           params.stop_token_1,
           params.vocabulary,
-          params.temperature[batch],
+          params.temperature[lane],
           0.0f};
 }
 
@@ -128,7 +125,7 @@ inline void shard_mass(TargetRow row, uint shard,
     partial = merge_masses(group_masses, 8, row.temperature);
 }
 
-// One shard of the sampled row at row_offset.
+// One shard of each selected row of the sampled lanes.
 kernel void decode_sample_mass_sharded(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -139,28 +136,10 @@ kernel void decode_sample_mass_sharded(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup TargetShardMass group_masses[8];
-  shard_mass(first_token_row(logits, token_mask, params), group,
-             partial_masses[group], group_masses, thread_index, lane,
-             simd_group);
-}
-
-// One shard of one verify row of each sampled lane; the groups of the other
-// lanes return at once.
-kernel void decode_sample_mass_sharded_batch(
-    device const float *logits [[buffer(0)]],
-    device const uint *token_mask [[buffer(1)]],
-    device TargetShardMass *partial_masses [[buffer(2)]],
-    constant TargetSamplingBatchParams &params [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup TargetShardMass group_masses[8];
-  const uint global_row = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  const uint batch = global_row / params.rows_per_lane;
-  if (batch >= params.lanes || (params.sampling_mask & (1u << batch)) == 0)
+  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
+  if (!lane_samples(params, s))
     return;
-  shard_mass(verify_row(logits, token_mask, params, global_row),
+  shard_mass(selected_row(logits, token_mask, params, s),
              group % SPLASH_TARGET_SAMPLING_SHARDS, partial_masses[group],
              group_masses, thread_index, lane, simd_group);
 }
@@ -773,77 +752,33 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
               0.0f, 0xffffffffu};
 }
 
-// The first token after a prompt of a sampled lane: where its distribution
-// ends (one group), then its draw (kVocabularyGroups groups).
+// Where the distribution of each selected row of the sampled lanes ends, one
+// group per row.
 kernel void decode_sample_vocabulary_search(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device const TargetShardMass *partial_masses [[buffer(2)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
     constant TargetSamplingParams &params [[buffer(4)]],
+    uint s [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup VocabularyScratch scratch;
-  search_row(first_token_row(logits, token_mask, params), partial_masses,
-             params.min_p, params.top_k, params.top_p, vocabulary_rows[0],
-             scratch, thread_index, lane, simd_group);
-}
-
-kernel void decode_sample_vocabulary_draw(
-    device const float *logits [[buffer(0)]],
-    device const uint *token_mask [[buffer(1)]],
-    device const TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
-    device uint *tokens [[buffer(4)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(5)]],
-    device atomic_uint *arrivals [[buffer(6)]],
-    constant TargetSamplingParams &params [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup DrawScratch scratch;
-  const TargetVocabularyRow record = vocabulary_rows[0];
-  TargetRow row = first_token_row(logits, token_mask, params);
-  row.maximum = record.maximum;
-  uint token;
-  float unused;
-  if (vocabulary_draw(row, {record.end_key, record.end_last}, false, 0,
-                      nullptr, nullptr, uniforms[0], ranges, arrivals, group,
-                      scratch, thread_index, lane, simd_group, token,
-                      unused) &&
-      thread_index == 0)
-    tokens[0] = token;
-}
-
-// The verify rows of every sampled lane: where each row's distribution ends
-// (one group per row), then its draft token's probability and the
-// correction a rejection takes or, for the last row, which follows the whole
-// draft, its bonus token (kVocabularyGroups groups per row). The groups of
-// the other lanes return at once.
-kernel void decode_sample_vocabulary_search_batch(
-    device const float *logits [[buffer(0)]],
-    device const uint *token_mask [[buffer(1)]],
-    device const TargetShardMass *partial_masses [[buffer(2)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
-    constant TargetSamplingBatchParams &params [[buffer(4)]],
-    uint global_row [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup VocabularyScratch scratch;
-  const uint batch = global_row / params.rows_per_lane;
-  if (batch >= params.lanes || (params.sampling_mask & (1u << batch)) == 0)
+  if (!lane_samples(params, s))
     return;
-  search_row(verify_row(logits, token_mask, params, global_row),
-             partial_masses + ulong(global_row) * SPLASH_TARGET_SAMPLING_SHARDS,
+  const uint batch = selected_lane(params, s);
+  search_row(selected_row(logits, token_mask, params, s),
+             partial_masses + ulong(s) * SPLASH_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
-             vocabulary_rows[global_row], scratch, thread_index, lane,
-             simd_group);
+             vocabulary_rows[s], scratch, thread_index, lane, simd_group);
 }
 
-kernel void decode_sample_vocabulary_draw_batch(
+// The draw of each selected row of the sampled lanes, kVocabularyGroups
+// groups per row: the first token after a prompt, a verify row's draft
+// token's probability and the correction a rejection takes or, for the last
+// verify row, which follows the whole draft, its bonus token.
+kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
@@ -851,39 +786,41 @@ kernel void decode_sample_vocabulary_draw_batch(
     device const uint *draft_ids [[buffer(4)]],
     device const float *draft_probabilities [[buffer(5)]],
     device const float *uniforms [[buffer(6)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(7)]],
-    device atomic_uint *arrivals [[buffer(8)]],
-    constant TargetSamplingBatchParams &params [[buffer(9)]],
+    device uint *tokens [[buffer(7)]],
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
+    device atomic_uint *arrivals [[buffer(9)]],
+    constant TargetSamplingParams &params [[buffer(10)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
-  const uint global_row = group / kVocabularyGroups;
-  const uint batch = global_row / params.rows_per_lane;
-  const uint row_index = global_row % params.rows_per_lane;
-  if (batch >= params.lanes || (params.sampling_mask & (1u << batch)) == 0)
+  const uint s = group / kVocabularyGroups;
+  if (!lane_samples(params, s))
     return;
-  device TargetVocabularyRow &record = vocabulary_rows[global_row];
-  TargetRow row = verify_row(logits, token_mask, params, global_row);
+  const uint batch = selected_lane(params, s);
+  const uint index = s % params.rows;
+  device TargetVocabularyRow &record = vocabulary_rows[s];
+  TargetRow row = selected_row(logits, token_mask, params, s);
   row.maximum = record.maximum;
-  // Verify row r follows draft token r, which is verify input row r + 1.
-  const bool drafted = row_index < SPLASH_DRAFT_PROPOSAL_TOKENS;
+  // A drafted row follows its draft token, the next verify input row.
+  const bool drafted = index < params.drafted_rows;
   const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? row_index : 0);
+      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
   uint token;
   float draft_probability;
   if (vocabulary_draw(
           row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[global_row + 1] : 0u,
+          drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
           uniforms[ulong(batch) * 2 * SPLASH_TARGET_VERIFY_ROWS +
-                   2 * SPLASH_TARGET_VERIFY_ROWS - 1],
-          ranges + ulong(global_row) * kVocabularyRanges, arrivals + global_row,
+                   params.uniform],
+          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
           token, draft_probability) &&
       thread_index == 0) {
+    tokens[s] = token;
     record.draft_probability = draft_probability;
     record.token = token;
   }
@@ -915,7 +852,7 @@ inline void penalize_token(device float *logits, device const uint *words,
     return;
   device float *column =
       logits +
-      (ulong(params.logits_lane[entry]) * params.row_stride +
+      (ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS +
        params.row_offset) * params.vocabulary +
       token;
   for (uint row = 0; row < params.rows; ++row) {
@@ -1429,7 +1366,7 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
   }
 }
 
-// One shard of the greedy row at row_offset.
+// One shard of each selected row of the greedy lanes.
 kernel void decode_sample_argmax_sharded(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -1440,28 +1377,10 @@ kernel void decode_sample_argmax_sharded(
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float group_values[8];
   threadgroup uint group_indices[8];
-  argmax_shard(first_token_row(logits, token_mask, params), group,
-               partial_values[group], partial_indices[group], group_values,
-               group_indices, thread_index);
-}
-
-// One shard of one verify row of each greedy lane; the groups of the other
-// lanes return at once.
-kernel void decode_sample_argmax_sharded_batch(
-    device const float *logits [[buffer(0)]],
-    device const uint *token_mask [[buffer(1)]],
-    device float *partial_values [[buffer(2)]],
-    device uint *partial_indices [[buffer(3)]],
-    constant TargetSamplingBatchParams &params [[buffer(4)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float group_values[8];
-  threadgroup uint group_indices[8];
-  const uint global_row = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  const uint batch = global_row / params.rows_per_lane;
-  if (batch >= params.lanes || (params.sampling_mask & (1u << batch)) != 0)
+  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
+  if (lane_samples(params, s))
     return;
-  argmax_shard(verify_row(logits, token_mask, params, global_row),
+  argmax_shard(selected_row(logits, token_mask, params, s),
                group % SPLASH_TARGET_SAMPLING_SHARDS, partial_values[group],
                partial_indices[group], group_values, group_indices,
                thread_index);
@@ -1480,29 +1399,19 @@ inline uint argmax_reduce(device const float *partial_values,
   return simd_min(index);
 }
 
-kernel void decode_sample_argmax_reduce(device const float *partial_values [[buffer(0)]],
-                             device const uint *partial_indices [[buffer(1)]],
-                             device uint *tokens [[buffer(2)]],
-                             uint row [[threadgroup_position_in_grid]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-  const uint token = argmax_reduce(partial_values, partial_indices, row, lane);
-  if (lane == 0)
-    tokens[row] = token;
-}
-
-kernel void decode_sample_argmax_reduce_batch(
+// The token of each selected row of the greedy lanes.
+kernel void decode_sample_argmax_reduce(
     device const float *partial_values [[buffer(0)]],
     device const uint *partial_indices [[buffer(1)]],
     device uint *tokens [[buffer(2)]],
-    constant TargetSamplingBatchParams &params [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]],
+    constant TargetSamplingParams &params [[buffer(3)]],
+    uint s [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  const uint batch = row / params.rows_per_lane;
-  if (batch >= params.lanes || (params.sampling_mask & (1u << batch)) != 0)
+  if (lane_samples(params, s))
     return;
-  const uint token = argmax_reduce(partial_values, partial_indices, row, lane);
+  const uint token = argmax_reduce(partial_values, partial_indices, s, lane);
   if (lane == 0)
-    tokens[row] = token;
+    tokens[s] = token;
 }
 
 kernel void verify_input_tokens(

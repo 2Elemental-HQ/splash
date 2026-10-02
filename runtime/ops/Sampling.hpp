@@ -83,18 +83,18 @@ struct SamplingBuffers final {
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
   // Verify input tokens [rows]: row 0 of a lane is its anchor, rows 1..7 its
-  // draft tokens. Only penalized and sampled verify rows read them.
-  metal::MetalBuffer inputTokens{};
+  // draft tokens, which penalized and sampled verify rows read.
+  metal::MetalBuffer inputTokens;
   // The draft's candidates and their probabilities at each proposal
   // position (AcceptanceBuffers), which a sampled verify row draws its
   // correction's residual from.
-  metal::MetalBuffer draftCandidates{};
-  metal::MetalBuffer draftProbabilities{};
+  metal::MetalBuffer draftCandidates;
+  metal::MetalBuffer draftProbabilities;
   // Per sampled row, the ranges of its draw (TargetVocabularyRange), which
   // the groups that share the draw sum, and how many of those groups have
   // finished: a count every draw returns to zero, where it starts.
-  metal::MetalBuffer vocabularyRanges{};
-  metal::MetalBuffer vocabularyArrivals{};
+  metal::MetalBuffer vocabularyRanges;
+  metal::MetalBuffer vocabularyArrivals;
 };
 
 struct DraftSelectorBuffers final {
@@ -130,8 +130,7 @@ struct AcceptanceBuffers final {
 // words and its stop tokens.
 class Sampling final {
 public:
-  // rowsPerLane is the kernels' SPLASH_TARGET_VERIFY_ROWS.
-  Sampling(uint32_t vocabulary, uint32_t rowsPerLane);
+  explicit Sampling(uint32_t vocabulary);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a packed batch; the operator owns sharding.
@@ -154,17 +153,18 @@ public:
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, both among the tokens the lane
-  // admits: the first token directly, a verify row as its draft token's
-  // probability and correction, which acceptance reads from the vocabulary
-  // rows.
+  // admits: the first token after a prompt from one lane's row at
+  // rowOffset, and every verify row of a batch, whose draft token's
+  // probability and correction acceptance reads from the vocabulary rows.
+  // Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
                   SamplingBuffers buffers, uint32_t rowOffset,
                   uint32_t stopToken0, uint32_t stopToken1,
-                  PenaltyTable penalties = {}) const;
+                  const PenaltyTable &penalties) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
-                 uint32_t stopToken1, PenaltyTable penalties = {}) const;
+                 uint32_t stopToken1, const PenaltyTable &penalties) const;
   // proposalTokens is the kernels' SPLASH_DRAFT_PROPOSAL_TOKENS.
   void addDraftSelector(
       metal::CommandGraph &graph, DraftSelectorBuffers buffers,
@@ -182,15 +182,29 @@ public:
                       uint32_t lanes) const;
 
 private:
+  // The rows a selection takes from each lane (metal/abi/Sampling.h
+  // TargetSamplingParams).
+  struct TargetRows final {
+    uint32_t rows = 0;
+    uint32_t logitsRow = 0;
+    uint32_t maskRow = 0;
+    uint32_t uniform = 0;
+    uint32_t draftedRows = 0;
+  };
+
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
   // all its rows, each also counting the draft tokens its context adds.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
+  // Selects the rows that rows names of every lane.
+  void addSelection(metal::CommandGraph &graph,
+                    std::span<const SamplingPolicy> policies,
+                    const SamplingBuffers &buffers, const TargetRows &rows,
+                    uint32_t stopToken0, uint32_t stopToken1) const;
 
   uint32_t vocabulary_ = 0;
-  uint32_t rowsPerLane_ = 0;
   uint32_t maskWords_ = 0;
 };
 

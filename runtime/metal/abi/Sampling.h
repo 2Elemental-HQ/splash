@@ -8,31 +8,23 @@
 #include <stdint.h>
 #endif
 
+// One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
+// rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
+// 2 * SPLASH_TARGET_VERIFY_ROWS uniforms each. Selected row s is row s % rows
+// of lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
+// logits_row + s % rows, its mask row lane * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+// mask_row + s % rows, and its draw takes uniform
+// lane * 2 * SPLASH_TARGET_VERIFY_ROWS + uniform; workspaces and output
+// tokens are indexed by s. Rows below drafted_rows follow draft token
+// s % rows (verify input row s % rows + 1).
 struct TargetSamplingParams {
   uint32_t vocabulary;
-  uint32_t row_offset;
-  uint32_t top_k;
-  float temperature;
-  float top_p;
-  float min_p;
   uint32_t mask_words;
-  uint32_t mask_row_offset;
-  uint32_t constrained;
-  // Nonzero when the lane ignores end-of-sequence: it never selects a stop
-  // token.
-  uint32_t exclude_stop_tokens;
-  uint32_t stop_token_0;
-  uint32_t stop_token_1;
-};
-
-static_assert(sizeof(TargetSamplingParams) == 48,
-              "Target sampling parameters are 48 bytes on both sides");
-
-struct TargetSamplingBatchParams {
-  uint32_t vocabulary;
-  uint32_t rows_per_lane;
-  uint32_t lanes;
-  uint32_t mask_words;
+  uint32_t rows;
+  uint32_t logits_row;
+  uint32_t mask_row;
+  uint32_t uniform;
+  uint32_t drafted_rows;
   uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -46,8 +38,8 @@ struct TargetSamplingBatchParams {
   uint32_t stop_token_1;
 };
 
-static_assert(sizeof(TargetSamplingBatchParams) == 100,
-              "Batched target sampling parameters are 100 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 112,
+              "Target sampling parameters are 112 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -102,12 +94,11 @@ static_assert(sizeof(TargetVocabularyRange) == 8,
 
 // The penalized lanes of one penalty dispatch. Each entry names the lane of
 // its logits and the penalty table row it reads; rows penalizes that many
-// rows of the lane's row_stride, from row_offset. repetition_inverse is
-// 1 / repetition, saturated to the largest float.
+// rows of the lane's SPLASH_TARGET_VERIFY_ROWS, from row_offset.
+// repetition_inverse is 1 / repetition, saturated to the largest float.
 struct SamplingPenaltyParams {
   uint32_t vocabulary;
   uint32_t rows;
-  uint32_t row_stride;
   uint32_t row_offset;
   uint32_t entries;
   uint32_t logits_lane[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -118,8 +109,8 @@ struct SamplingPenaltyParams {
   float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 116,
-              "Sampling penalty parameters are 116 bytes on both sides");
+static_assert(sizeof(SamplingPenaltyParams) == 112,
+              "Sampling penalty parameters are 112 bytes on both sides");
 
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];

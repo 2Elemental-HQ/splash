@@ -69,8 +69,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize,
-                ExecutionLimits::draftQueryRows) {
+      selector_(weights.layout.vocabularySize) {
   requireLayout(weights_.layout);
   if (weights_.layers.size() != weights_.layout.layers ||
       !weights_.layout.stateLayout().valid()) {

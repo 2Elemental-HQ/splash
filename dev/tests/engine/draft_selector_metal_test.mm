@@ -143,7 +143,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = Sampling::draftWorkspace(positions);
-  Sampling sampling(c.vocabulary, kRows);
+  Sampling sampling(c.vocabulary);
 
   MetalBuffer logits = allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
@@ -274,7 +274,7 @@ void runCase(MetalBackend &backend, const Case &c) {
 }
 
 void invalidRequests(MetalBackend &backend) {
-  Sampling sampling(1024, kRows);
+  Sampling sampling(1024);
   const auto workspace = Sampling::draftWorkspace(kPositions);
   DraftSelectorBuffers buffers{
       allocate(backend, uint64_t{kRows} * 1024 * sizeof(float)),
@@ -294,14 +294,12 @@ void invalidRequests(MetalBackend &backend) {
   rejects([&] {
     sampling.addDraftSelector(graph, buffers, anchors, policies, kPositions);
   });
-  // The kernels compile the proposal count and a lane's rows in.
+  // The kernels compile the proposal count in.
   for (const uint32_t proposals : {0U, kPositions - 1, kPositions + 1})
     rejects([&] {
       sampling.addDraftSelector(graph, buffers, std::span(anchors).first(1),
                                 policies, proposals);
     });
-  for (const uint32_t rows : {0U, kRows - 1, kRows + 1})
-    rejects([&] { (void)Sampling(1024, rows); });
   require(graph.empty(), "invalid draft selector request encoded a graph");
 }
 
