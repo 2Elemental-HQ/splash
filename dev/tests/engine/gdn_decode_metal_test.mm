@@ -613,10 +613,15 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   Fixture fixture(backend, shape, lanes, float32);
   const PreparedTables tables(backend, layout, shape.valueHeads * shape.headDimension, lanes);
   CommandGraph reference;
-  // Without scratch the table cannot be written: GDN runs the plain kernel and says so.
-  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
-                         GdnHeadOrder::Grouped, layout).layout == LinearInput::Plain,
-          what + " without scratch claimed a table");
+  // Without scratch the table cannot be written: GDN refuses it before it
+  // encodes anything.
+  rejects([&] {
+    GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                   GdnHeadOrder::Grouped, layout);
+  });
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+                  .layout == LinearInput::Plain,
+          what + " plain kernel claimed a table");
   tables.addReference(reference, fixture.hidden);
   (void)backend.submitCommand(reference.dispatches());
   // The active lanes' bf16 hidden rows.

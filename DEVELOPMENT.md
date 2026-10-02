@@ -659,7 +659,9 @@ installer screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input
-as it is; the table gathers each row through the inverse (`gguf_embed_rotated_pq20`).
+as it is; the register tile prepares its table from the rotated rows, so the
+input's producer writes plain rows. The token table gathers each row through
+the inverse (`gguf_embed_rotated_pq20`).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,

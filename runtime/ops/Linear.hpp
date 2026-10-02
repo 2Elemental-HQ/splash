@@ -142,6 +142,13 @@ enum class LinearInput : uint8_t {
   return uint64_t{width} * rows * 2;
 }
 [[nodiscard]] uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept;
+// Throws unless `scratch` holds the `layout` table a producer writes for `rows`
+// rows of `width` inputs: a table layout, whole lanes of rows and whole
+// 64-input spans.
+void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows);
+// The kernel name suffix of a producer that writes the `layout` table:
+// "_table16", "_table64", or none for Plain.
+[[nodiscard]] const char *tableSuffix(LinearInput layout) noexcept;
 // The scratch table currently holds `source` in `layout`. Plain means the
 // scratch describes nothing. Producers return it, consumers accept it and
 // return what the scratch describes after their dispatch.
@@ -162,6 +169,9 @@ public:
   [[nodiscard]] uint32_t groups() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
+  // The layout the producer of this plan's input writes. A rotated
+  // projection prepares its table from the rotated rows itself
+  // (LinearGguf.cpp), so its producer writes plain rows.
   [[nodiscard]] LinearInput input() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
@@ -183,6 +193,8 @@ private:
   LinearWorkload workload_;
   LinearConfig config_;
   FloatOutput destination_;
+  // The plan's projection multiplies the rotated input (InputRotation).
+  bool rotated_ = false;
   std::string_view pipeline_;
   std::string_view secondPipeline_;
 };

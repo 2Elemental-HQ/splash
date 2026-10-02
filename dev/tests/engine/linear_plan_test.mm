@@ -1,5 +1,8 @@
 #include "AffineQ4Fixture.hpp"
+#include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
+#include "ops/PagedAttention.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
@@ -1255,6 +1258,74 @@ void ggufProjectionMatrix(metal::MetalBackend &backend) {
           "the fp32 block projection did not encode its fp32 kernel");
 }
 
+// A producer writes the table its consumer's plan reads into scratch that
+// holds it: a table layout without that scratch is refused before anything
+// is encoded, and Plain runs the plain kernel.
+void producerTableContract(metal::MetalBackend &backend) {
+  constexpr uint32_t kLanes = 1, kRows = 8, kHidden = 5120;
+  const NormWeights norm{allocate(backend, kHidden * 2)};
+  const auto plainKernel = [](const metal::CommandGraph &graph, std::string_view kernel) {
+    return graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == kernel;
+  };
+  {
+    metal::CommandGraph graph;
+    rejects([&] { (void)Normalization::addRms(graph, {}, norm, {}, kHidden, kRows, {}, LinearInput::Table64); });
+    require(graph.empty() && Normalization::addRms(graph, {}, norm, {}, kHidden, kRows).layout == LinearInput::Plain &&
+                plainKernel(graph, "norm_rms"),
+            "the norm's table contract");
+  }
+  {
+    const GdnShape shape{16, 32, 128, 8192, 12544};
+    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{};
+    GdnDecodeBuffers buffers;
+    buffers.currentStates = states;
+    buffers.nextStates = states;
+    buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
+    metal::CommandGraph graph;
+    rejects([&] {
+      (void)GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}, GdnHeadOrder::Grouped, LinearInput::Table16);
+    });
+    require(graph.empty() && GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}).layout == LinearInput::Plain &&
+                plainKernel(graph, "verify_gdn_fused_vh32"),
+            "the GDN decode's table contract");
+  }
+  {
+    const kv::Layout layout{1, 4, 256};
+    metal::CommandGraph graph;
+    rejects([&] {
+      (void)PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Table64);
+    });
+    require(graph.empty() &&
+                PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes).layout == LinearInput::Plain &&
+                plainKernel(graph, "verify_attention_gate"),
+            "the attention gate's table contract");
+  }
+}
+
+// A rotated projection prepares its register tile's table from the rotated
+// rows (LinearGguf.cpp), so its plan asks its producer for plain rows: on
+// Apple9 a rotated PQ2_0 projection keeps the register tile and its input
+// norm runs the plain kernel, where an unrotated one reads Table16.
+void rotatedRegisterInput(metal::MetalBackend &backend) {
+  const Linear m3 = gpu(9, 40);
+  Projection rotated = blockProjection(5120, 17408, 1, GGUF_FMT_PQ20);
+  const Projection plain = rotated;
+  rotated.rotation.signs = allocate(backend, 17408);
+  const LinearScratch scratch{.input = allocate(backend, tableBytes(17408, 32)),
+                              .sums = allocate(backend, tableSumsBytes(LinearInput::Table16, 17408, 32))};
+  const NormWeights norm{allocate(backend, 17408 * 2)};
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const LinearPlan plan = m3.decodePlan(rotated, lanes);
+    require(plan.configuration().tile == LinearTile::GgufRegister && plan.input() == LinearInput::Plain &&
+                m3.decodePlan(plain, lanes).input() == LinearInput::Table16,
+            "a rotated register plan's producer writes a table it discards");
+    metal::CommandGraph graph;
+    (void)Normalization::addRms(graph, {}, norm, {}, 17408, lanes * 8, scratch, plan.input());
+    require(graph.dispatches().back().pipelineName.find("_table") == std::string::npos,
+            "a rotated register plan's input norm wrote a table");
+  }
+}
+
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   std::array<uint64_t, 3> result{};
   const std::array buffers{projection.affine().weights, projection.affine().scales, projection.affine().biases};
@@ -1750,6 +1821,8 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     floatInstances(argv[1], plainKernels);
     ggufProjectionMatrix(backend);
+    producerTableContract(backend);
+    rotatedRegisterInput(backend);
     Linear linear(backend.capabilities());
     for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
                                       LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},

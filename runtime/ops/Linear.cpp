@@ -109,6 +109,17 @@ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexc
        : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
 }
 
+void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
+  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64 ||
+      scratch.input.sizeBytes() < tableBytes(width, rows) ||
+      scratch.sums.sizeBytes() < tableSumsBytes(layout, width, rows))
+    throw std::invalid_argument("linear table scratch is below requirement");
+}
+
+const char *tableSuffix(LinearInput layout) noexcept {
+  return layout == LinearInput::Table16 ? "_table16" : layout == LinearInput::Table64 ? "_table64" : "";
+}
+
 void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
       p.inputSize != matrix.inputSize)
@@ -157,6 +168,7 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
+  if (rotated_) return LinearInput::Plain;
   if (config_.tile == LinearTile::GgufRegister) return LinearInput::Table16;
   return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
 }
@@ -498,7 +510,9 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   w.weightLayout = p.layout();
   const std::array<const Projection *, 2> projections{&p, gate};
-  return LinearPlan(w, baseline(w, projections), p.destination);
+  LinearPlan plan(w, baseline(w, projections), p.destination);
+  plan.rotated_ = static_cast<bool>(p.rotation);
+  return plan;
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,

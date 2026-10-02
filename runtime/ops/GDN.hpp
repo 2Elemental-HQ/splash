@@ -96,7 +96,8 @@ public:
                          GdnShape shape, uint32_t tokens,
                          GdnHeadOrder order = GdnHeadOrder::Grouped);
   // Also writes the out-projection's `input` table into
-  // buffers.linearScratch when it needs one.
+  // buffers.linearScratch when it is not Plain, and throws when the scratch
+  // cannot hold it.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,

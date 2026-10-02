@@ -75,12 +75,10 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
-  const bool prepare = input != LinearInput::Plain && buffers.linearScratch.input;
-  const uint32_t outputWidth = shape.valueHeads * shape.headDimension;
-  const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
-  if (prepare && (buffers.linearScratch.input.sizeBytes() < tableBytes(outputWidth, rows) ||
-                  buffers.linearScratch.sums.sizeBytes() < tableSumsBytes(input, outputWidth, rows)))
-    throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
+  const bool prepare = input != LinearInput::Plain;
+  if (prepare)
+    requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
+                        lanes * SPLASH_TARGET_VERIFY_ROWS);
   bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
@@ -94,9 +92,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
-      : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_table16", "verify_gdn_fused_table16_vh32")
-                                      : kernelName(kernel, "verify_gdn_fused_table64", "verify_gdn_fused_table64_vh32");
+  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
   if (!prepare) return {};

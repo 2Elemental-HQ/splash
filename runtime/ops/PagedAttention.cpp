@@ -223,17 +223,12 @@ PreparedInput PagedAttention::addVerifyGate(
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
   const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
-  if (input != LinearInput::Plain && scratch.input) {
+  if (input != LinearInput::Plain) {
     const uint32_t width = queryHeads * layout.headDimension;
-    if (scratch.input.sizeBytes() < tableBytes(width, rows) ||
-        scratch.sums.sizeBytes() < tableSumsBytes(input, width, rows))
-      throw std::invalid_argument("Q4 attention gate scratch is below requirement");
-    graph.add(std::string(input == LinearInput::Table16
-                              ? pipeline(kernel, "verify_attention_gate_table16",
-                                         "verify_attention_gate_table16_kv2_g8")
-                              : pipeline(kernel, "verify_attention_gate_table64",
-                                         "verify_attention_gate_table64_kv2_g8")),
-              {packed, attention, hidden, scratch.input, scratch.sums},
+    requireTableScratch(scratch, input, width, rows);
+    std::string name = std::string("verify_attention_gate") + tableSuffix(input);
+    name += pipeline(kernel, "", "_kv2_g8");
+    graph.add(std::move(name), {packed, attention, hidden, scratch.input, scratch.sums},
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return {std::move(hidden), input};
   }

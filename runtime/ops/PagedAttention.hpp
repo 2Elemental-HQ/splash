@@ -212,7 +212,8 @@ public:
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t queryHeads,
                       kv::Layout layout, uint32_t lanes);
-  // Also writes the out-projection's `input` table when it needs one.
+  // Also writes the out-projection's `input` table into `scratch` when it is
+  // not Plain, and throws when `scratch` cannot hold it.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
                                      metal::MetalBuffer packed,
                                      metal::MetalBuffer attention,
