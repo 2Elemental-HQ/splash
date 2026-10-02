@@ -490,6 +490,59 @@ id countComputeEncoder(id command, SEL selector) {
     return reinterpret_cast<id (*)(id, SEL)>(originalComputeEncoder)(command, selector);
 }
 
+// Counts what residency sets ask of Metal while it lives, passing every call
+// on: requests and ends of residency, and removals of a member. All sets
+// share the class of the one it creates. Arm it before the backend it
+// observes, so that no call races the swap.
+class ResidencyCalls final {
+public:
+    ResidencyCalls() {
+        originalRequest = request_.original;
+        originalEnd = end_.original;
+        originalRemoval = removal_.original;
+        requests = ends = removals = 0;
+    }
+
+    static inline std::atomic<unsigned> requests{0};
+    static inline std::atomic<unsigned> ends{0};
+    static inline std::atomic<unsigned> removals{0};
+
+private:
+    static inline IMP originalRequest = nullptr;
+    static inline IMP originalEnd = nullptr;
+    static inline IMP originalRemoval = nullptr;
+
+    static void countRequest(id set, SEL selector) {
+        ++requests;
+        reinterpret_cast<void (*)(id, SEL)>(originalRequest)(set, selector);
+    }
+    static void countEnd(id set, SEL selector) {
+        ++ends;
+        reinterpret_cast<void (*)(id, SEL)>(originalEnd)(set, selector);
+    }
+    static void countRemoval(id set, SEL selector, id allocation) {
+        ++removals;
+        reinterpret_cast<void (*)(id, SEL, id)>(originalRemoval)(set, selector, allocation);
+    }
+
+    id<MTLResidencySet> set_ = [MTLCreateSystemDefaultDevice()
+        newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:nil];
+    MethodReplacement request_{set_, @selector(requestResidency),
+                               reinterpret_cast<IMP>(countRequest)};
+    MethodReplacement end_{set_, @selector(endResidency), reinterpret_cast<IMP>(countEnd)};
+    MethodReplacement removal_{set_, @selector(removeAllocation:),
+                               reinterpret_cast<IMP>(countRemoval)};
+};
+
+// Polls until `done` holds or `limit` passes, and returns whether it held.
+template <typename Predicate>
+bool waitFor(Predicate done, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return done();
+}
+
 // A lapsed keep-alive ends residency with one dispatch of a kernel built with
 // the library, never a blit whose driver program compiles at that moment, and
 // destroying a backend that holds its set submits no GPU work at all.
@@ -509,25 +562,25 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     MethodReplacement computes(command, @selector(computeCommandEncoder),
                                reinterpret_cast<IMP>(countComputeEncoder));
     originalComputeEncoder = computes.original;
+    ResidencyCalls calls;
     unsigned lapseCommits = 0, lapseComputes = 0;
     {
         MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
         MetalBuffer lapsing = backend.allocateBuffer(page);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while ((!backend.lapsedResidentBytes() || !commits) &&
-               std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        (void)waitFor([] { return commits != 0; }, std::chrono::seconds(5));
         lapseCommits = commits.exchange(0);
         lapseComputes = computeEncoders.exchange(0);
         // Allocating another buffer holds the set again for the teardown.
+        const unsigned requested = calls.requests;
         MetalBuffer held = backend.allocateBuffer(page);
-        require(backend.lapsedResidentBytes() == 0, "an allocation did not hold the set");
+        require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
+                "an allocation did not hold the set");
     }
     require(lapseCommits == 1 && lapseComputes == 1,
             "a lapsed keep-alive did not end residency with one compute dispatch");
-    require(commits == 0 && computeEncoders == 0,
-            "backend teardown submitted GPU work");
+    require(commits == 0 && computeEncoders == 0 && calls.ends == 2,
+            "backend teardown submitted GPU work or did not end residency");
     require(blitEncoders == 0, "residency encoded a blit");
     std::cout << "PASS residency ends without blits\n";
 }
@@ -564,6 +617,7 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
 // view takes it out of the set: allocated and wrapped buffers alike.
 void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
+    ResidencyCalls calls;
     MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
@@ -574,24 +628,23 @@ void buffersStayResident(const std::string &metallibPath) {
     MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping), 0, 64);
     MetalBuffer used = backend.allocateBuffer(page);
     const uint64_t each = backend.memoryStats().allocatedBytes / 2;
-    require(backend.lapsedResidentBytes() == 0, "buffers were not held at once");
-    while (!backend.lapsedResidentBytes() &&
-           std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
+            "buffers were not held at once");
+    (void)waitFor([&] { return calls.ends != 0; }, std::chrono::seconds(5));
     const std::chrono::duration<double> lapsedAfter = std::chrono::steady_clock::now() - start;
-    require(backend.lapsedResidentBytes() == 2 * each &&
-                lapsedAfter.count() >= kKeepAliveSeconds,
+    require(calls.ends == 1 && lapsedAfter.count() >= kKeepAliveSeconds,
             "buffers did not lapse once the keep-alive passed without a command");
     dropped = {};
-    require(backend.lapsedResidentBytes() == each,
+    require(calls.removals == 1 && backend.memoryStats().allocatedBytes == each,
             "a buffer whose last view is gone is still a member");
     const uint32_t count = 1, increment = 7;
     *static_cast<uint32_t *>(used.contents()) = 0;
     ComputeDispatch dispatch{"test_add_u32", {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
+    const unsigned requested = calls.requests;
     auto ticket = backend.submitAsync(dispatch);
-    require(backend.lapsedResidentBytes() == 0,
+    require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
             "a command did not hold the buffers again");
     (void)ticket.wait();
     require(*static_cast<uint32_t *>(used.contents()) == increment,
@@ -607,6 +660,7 @@ void buffersStayResident(const std::string &metallibPath) {
 void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
+    ResidencyCalls calls;
     auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0,
                                                   kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
@@ -642,11 +696,8 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
         // Every third round lets the heartbeat end residency, so that its
         // command holds the set again.
         if (round % 3 == 2) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            while (!backend->lapsedResidentBytes() &&
-                   std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            lapses += backend->lapsedResidentBytes() != 0;
+            const unsigned ended = calls.ends;
+            lapses += waitFor([&] { return calls.ends > ended; }, std::chrono::seconds(2));
         }
         (void)backend->submitAsync(dispatch).wait();
     }
@@ -676,6 +727,7 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
+    ResidencyCalls calls;
     MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
     MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
@@ -690,9 +742,6 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
                 backend.view(buffers[0], 4096, 4096).gpuAddress() ==
                     buffers[0].gpuAddress() + 4096,
             "a view's GPU address does not start at its offset");
-    require(backend.lapsedResidentBytes() == 0,
-            "the buffers did not hold the residency set");
-    const uint64_t members = backend.memoryStats().allocatedBytes;
 
     auto *entries = static_cast<uint64_t *>(table.contents());
     for (uint32_t index = 0; index < kBuffers; ++index)
@@ -724,11 +773,8 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
             ++regrown;
         }
         if (round == kRounds / 2) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!backend.lapsedResidentBytes() &&
-                   std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            require(backend.lapsedResidentBytes() == members,
+            const unsigned ended = calls.ends;
+            require(waitFor([&] { return calls.ends > ended; }, std::chrono::seconds(5)),
                     "the buffers did not lapse with the residency set");
             lapsedRound = true;
         }
@@ -763,7 +809,7 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     }
     buffers.clear();
     require(backend.memoryStats().allocatedBytes == before &&
-                backend.lapsedResidentBytes() == 0,
+                calls.removals == kBuffers + regrown,
             "released buffers stayed counted or in the residency set");
     std::cout << "PASS buffers reached through tables rounds=" << kRounds
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';

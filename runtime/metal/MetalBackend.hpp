@@ -255,10 +255,6 @@ public:
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
 
-  // The bytes whose residency the keep-alive has ended, until the next
-  // command holds them again; Metal unwires them shortly after the end.
-  [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
-
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);

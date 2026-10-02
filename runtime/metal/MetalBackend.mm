@@ -837,10 +837,6 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     return MetalBuffer(std::move(result));
 }
 
-uint64_t MetalBackend::lapsedResidentBytes() const noexcept {
-    return impl_->residency->lapsedBytes();
-}
-
 CommandTiming MetalBackend::submit(const ComputeDispatch &dispatch) {
     return submitAsync(dispatch).wait();
 }
