@@ -245,6 +245,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryGovernor.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
+	runtime/engine/KvPageTier.cpp \
 	runtime/engine/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
@@ -271,7 +272,6 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
-	runtime/model/KvPageTier.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \

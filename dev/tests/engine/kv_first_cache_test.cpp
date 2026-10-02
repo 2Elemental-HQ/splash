@@ -144,7 +144,7 @@ struct CacheFixture {
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  explicit CacheFixture(model::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+  explicit CacheFixture(engine::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
     storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)

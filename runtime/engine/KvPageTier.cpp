@@ -1,4 +1,4 @@
-#include "model/KvPageTier.hpp"
+#include "engine/KvPageTier.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -6,12 +6,12 @@
 #include <stdexcept>
 #include <utility>
 
-namespace splash::model {
+namespace splash::engine {
 
 // A demotion or a restore of one page, until the tier retires its IO.
 struct KvPageTier::Transfer final {
   bool demotion = false;
-  std::shared_ptr<SlotFile::Operation> io;
+  std::shared_ptr<model::SlotFile::Operation> io;
   bool ready = false;
   bool success = false;
 };
@@ -35,11 +35,11 @@ std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot>
 } // namespace
 
 uint64_t KvPageTier::slotBytesFor(const kv::PageStorage &pages) noexcept {
-  const uint64_t unit = SlotFile::kAlignmentBytes;
+  const uint64_t unit = model::SlotFile::kAlignmentBytes;
   return (pages.bytesPerPage() + unit - 1) / unit * unit;
 }
 
-KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<SlotFile> file,
+KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
                        uint32_t transfers)
     : pages_(pages), file_(std::move(file)), slotBytes_(slotBytesFor(pages)),
       transferLimit_(transfers) {
@@ -127,4 +127,4 @@ void KvPageTier::poll() {
   }
 }
 
-} // namespace splash::model
+} // namespace splash::engine

@@ -401,7 +401,7 @@ void testHashCollisionStillRequiresExactTokens() {
           "KV block matching trusted a colliding index hash");
 }
 
-struct FakeSlot final : model::KvDiskSlot {};
+struct FakeSlot final : engine::KvDiskSlot {};
 
 // A resident block gains a disk copy, gives up its page, and takes a page
 // back; the orders and the parent follow each step.

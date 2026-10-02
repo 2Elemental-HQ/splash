@@ -7,7 +7,7 @@
 
 namespace splash::engine {
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
+Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
       kv_(pool, cacheNamespace, recency_),
@@ -606,7 +606,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   }
   // Room in the quota or the tier that transfers in flight will free is
   // worth waiting for; room that nothing will free is not, and the leaf goes.
-  std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot();
+  std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot();
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   // Making room may have taken the states the leaf was kept for; it then
@@ -624,7 +624,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   return LeafReclaim::Started;
 }
 
-std::shared_ptr<model::KvDiskSlot> Cache::acquireDiskSlot() {
+std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot() {
   for (;;) {
     if (auto slot = tier_->acquireSlot())
       return slot;

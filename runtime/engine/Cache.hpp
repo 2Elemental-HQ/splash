@@ -2,6 +2,7 @@
 
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
+#include "engine/KvTier.hpp"
 #include "engine/StateCache.hpp"
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
@@ -137,7 +138,7 @@ class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
   // the states' file can run on it without the tier.
-  Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
+  Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
@@ -278,11 +279,11 @@ private:
   static void pagesChanged(Request &active, uint32_t first) noexcept;
   struct Demotion final {
     uint64_t block = 0;
-    std::unique_ptr<model::KvTransfer> transfer;
+    std::unique_ptr<KvTransfer> transfer;
   };
   struct Restore final {
     // Null until the tier has room for it.
-    std::unique_ptr<model::KvTransfer> transfer;
+    std::unique_ptr<KvTransfer> transfer;
     std::vector<uint64_t> waiters;
   };
 
@@ -340,7 +341,7 @@ private:
   // the poisoned block leaves with its last user.
   void dropPoisoned();
   // A slot for a new KV copy, replacing older copies while the quota is full.
-  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot();
   // Gives up one disk copy: the oldest redundant one, KV or state, else the
   // oldest that is the only copy, never the KV of a state in RAM. False when
   // the disk holds nothing to give.
@@ -352,7 +353,7 @@ private:
                       uint32_t limit = std::numeric_limits<uint32_t>::max());
 
   KvPool &pool_;
-  model::KvTier *tier_;
+  KvTier *tier_;
   std::shared_ptr<const model::DiskBudget> diskBudget_;
   CacheRecency recency_;
   KvCache kv_;

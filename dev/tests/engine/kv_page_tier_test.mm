@@ -1,4 +1,4 @@
-#include "model/KvPageTier.hpp"
+#include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
@@ -18,8 +18,8 @@
 #include <vector>
 
 using namespace splash;
-using model::KvPageTier;
-using model::KvTransfer;
+using engine::KvPageTier;
+using engine::KvTransfer;
 using model::SlotFile;
 
 namespace {
@@ -59,11 +59,11 @@ std::vector<std::byte> fill(const kv::PageStorage &pages, uint32_t page, uint32_
   return bytes;
 }
 
-std::shared_ptr<SlotFile::Slot> fileSlot(const std::shared_ptr<model::KvDiskSlot> &slot) {
+std::shared_ptr<SlotFile::Slot> fileSlot(const std::shared_ptr<engine::KvDiskSlot> &slot) {
   return static_cast<KvPageTier::DiskSlot &>(*slot).slot;
 }
 
-std::vector<std::byte> readSlot(SlotFile &file, const std::shared_ptr<model::KvDiskSlot> &slot) {
+std::vector<std::byte> readSlot(SlotFile &file, const std::shared_ptr<engine::KvDiskSlot> &slot) {
   std::vector<std::byte> bytes(file.slotBytes());
   require(file.read(fileSlot(slot), {bytes}, {})->wait(), "reading a disk slot failed");
   return bytes;
@@ -169,7 +169,7 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   auto file = std::make_shared<SlotFile>(slotBytes, 8 * slotBytes);
   KvPageTier tier(pages, file, 4);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
-  std::vector<std::shared_ptr<model::KvDiskSlot>> written;
+  std::vector<std::shared_ptr<engine::KvDiskSlot>> written;
   for (int index = 0; index < 2; ++index) {
     written.push_back(tier.acquireSlot());
     require(file->write(fileSlot(written.back()), {bytes}, {})->wait(), "seeding failed");

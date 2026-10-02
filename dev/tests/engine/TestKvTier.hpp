@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/Model.hpp"
+#include "engine/KvTier.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -12,7 +12,7 @@ namespace splash::test {
 // A KV disk tier without a disk: slots count against a quota, a bounded
 // number of transfers is in flight, and transfers finish when the test says
 // so.
-class TestKvTier final : public model::KvTier {
+class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
     bool ready = false;
@@ -23,18 +23,18 @@ public:
   uint64_t slotBytes() const noexcept override { return 100; }
   bool writable() const noexcept override { return writableFile; }
   bool canDemote() const noexcept override { return writableFile && inFlight() < transferLimit; }
-  std::shared_ptr<model::KvDiskSlot> acquireSlot() override {
+  std::shared_ptr<engine::KvDiskSlot> acquireSlot() override {
     if (slots >= capacity) return {};
     return std::make_shared<Slot>(*this);
   }
-  std::unique_ptr<model::KvTransfer>
-  demote(uint32_t, std::shared_ptr<model::KvDiskSlot>, std::function<void()>) override {
+  std::unique_ptr<engine::KvTransfer>
+  demote(uint32_t, std::shared_ptr<engine::KvDiskSlot>, std::function<void()>) override {
     if (!canDemote()) return {};
     ++demotions;
     return start();
   }
-  std::unique_ptr<model::KvTransfer>
-  restore(std::shared_ptr<model::KvDiskSlot>, uint32_t, std::function<void()>) override {
+  std::unique_ptr<engine::KvTransfer>
+  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t, std::function<void()>) override {
     if (inFlight() >= transferLimit) return {};
     ++restores;
     return start();
@@ -60,12 +60,12 @@ public:
   std::vector<std::shared_ptr<Transfer>> transfers;
 
 private:
-  struct Slot final : model::KvDiskSlot {
+  struct Slot final : engine::KvDiskSlot {
     explicit Slot(TestKvTier &owner) : tier(owner) { ++tier.slots; }
     ~Slot() override { --tier.slots; }
     TestKvTier &tier;
   };
-  class Ticket final : public model::KvTransfer {
+  class Ticket final : public engine::KvTransfer {
   public:
     Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer)
         : tier_(owner), transfer_(std::move(transfer)) {}
@@ -83,7 +83,7 @@ private:
     std::shared_ptr<Transfer> transfer_;
   };
 
-  std::unique_ptr<model::KvTransfer> start() {
+  std::unique_ptr<engine::KvTransfer> start() {
     auto transfer = std::make_shared<Transfer>();
     transfers.push_back(transfer);
     ++inFlight_;

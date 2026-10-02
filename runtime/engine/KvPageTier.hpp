@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/Model.hpp"
+#include "engine/KvTier.hpp"
 #include "model/SlotFile.hpp"
 #include "ops/PageStorage.hpp"
 
@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-namespace splash::model {
+namespace splash::engine {
 
 // Moves KV pages between their extents and a slot file. The file's IO worker
 // writes a demoted page straight from its extent and reads a restored page
@@ -21,15 +21,15 @@ namespace splash::model {
 class KvPageTier final : public KvTier {
 public:
   struct DiskSlot final : KvDiskSlot {
-    explicit DiskSlot(std::shared_ptr<SlotFile::Slot> held) : slot(std::move(held)) {}
-    std::shared_ptr<SlotFile::Slot> slot;
+    explicit DiskSlot(std::shared_ptr<model::SlotFile::Slot> held) : slot(std::move(held)) {}
+    std::shared_ptr<model::SlotFile::Slot> slot;
   };
   static constexpr uint32_t kDefaultTransfers = 128;
 
   // Disk bytes per page: the page rounded up for uncached IO.
   [[nodiscard]] static uint64_t slotBytesFor(const kv::PageStorage &pages) noexcept;
 
-  KvPageTier(kv::PageStorage &pages, std::shared_ptr<SlotFile> file,
+  KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
              uint32_t transfers = kDefaultTransfers);
   ~KvPageTier() override;
   KvPageTier(const KvPageTier &) = delete;
@@ -52,7 +52,7 @@ private:
   class Ticket;
 
   kv::PageStorage &pages_;
-  std::shared_ptr<SlotFile> file_;
+  std::shared_ptr<model::SlotFile> file_;
   uint64_t slotBytes_;
   uint32_t transferLimit_;
   uint32_t demotionLimit_;
@@ -63,4 +63,4 @@ private:
   std::vector<std::shared_ptr<Transfer>> inFlight_;
 };
 
-} // namespace splash::model
+} // namespace splash::engine

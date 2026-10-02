@@ -214,7 +214,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::StateStorage> stateStorage,
-    std::unique_ptr<model::KvPageTier> kvTier,
+    std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     uint32_t maximumImagePatches, std::optional<uint64_t> hostAvailableAtStart)
     : backend_(std::move(backend)), model_(std::move(model)),
@@ -492,11 +492,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     if (!stateStorage) {
       throw std::runtime_error("model factory returned no state storage");
     }
-    std::unique_ptr<model::KvPageTier> kvTier;
+    std::unique_ptr<KvPageTier> kvTier;
     if (diskBudget) {
       try {
-        const uint64_t slotBytes = model::KvPageTier::slotBytesFor(*kvPages);
-        kvTier = std::make_unique<model::KvPageTier>(
+        const uint64_t slotBytes = KvPageTier::slotBytesFor(*kvPages);
+        kvTier = std::make_unique<KvPageTier>(
             *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
         logStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
                    " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
