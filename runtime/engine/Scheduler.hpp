@@ -96,8 +96,12 @@ public:
   // while it lasts: the plan takes one tier, the highest among resident
   // prefill lanes and candidates, and is dropped when a higher tier decodes.
   [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
-  [[nodiscard]] std::optional<BatchPlan> next() const;
-  void commit(const BatchPlan &plan);
+  // The next command, planned without the excluded lanes: those that wait
+  // for memory on its way back and cannot run before it lands.
+  [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
+  // The excluded lanes are those the plan was made without: blocked, not
+  // passed over, so they lose nothing to it.
+  void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
                 double wallMilliseconds = 0.0,
                 bool representativePrefillTiming = true);
@@ -133,8 +137,10 @@ private:
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
   [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
                                                 const Request *b) noexcept;
-  [[nodiscard]] std::optional<BatchPlan> nextPrefill() const;
-  [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
+  [[nodiscard]] std::optional<BatchPlan>
+  nextPrefill(std::span<const uint64_t> excluded) const;
+  [[nodiscard]] std::optional<BatchPlan>
+  nextDecode(std::span<const uint64_t> excluded) const;
   [[nodiscard]] std::optional<BatchPlan>
   planPrefill(std::vector<PrefillRequestView> ready) const;
   // The rows the lane can take in one command: up to its prompt's end or its
@@ -149,6 +155,8 @@ private:
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
+  // The lanes the active command was planned without.
+  std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;

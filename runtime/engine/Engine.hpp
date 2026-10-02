@@ -268,7 +268,8 @@ private:
     // Every lane was denied and one yielded its memory or failed.
     Yielded,
     // Every lane was denied while pages are on their way back; nothing
-    // changed, the lanes retry when the pages land.
+    // changed, the lanes retry when the pages land, and other lanes run
+    // meanwhile.
     Waiting,
   };
   double nextHealthCheckMilliseconds_ = 0.0;

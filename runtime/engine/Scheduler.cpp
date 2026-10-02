@@ -15,6 +15,11 @@ constexpr uint32_t kMaximumOvertakes =
 constexpr double kContendedPrefillMilliseconds = 500.0;
 constexpr uint32_t kMinimumPrefillRows = 64;
 
+// A command excludes at most the lanes of a full batch: a linear search.
+bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
+  return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
 } // namespace
 
 void Scheduler::submit(RequestSpec request) {
@@ -209,7 +214,9 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
     ready.push_back(request);
   std::vector<uint64_t> result;
   if (const auto plan = planPrefill(std::move(ready))) {
-    const auto decode = nextDecode();
+    // Admission ranks candidates against every decoder, left out of a plan
+    // or not.
+    const auto decode = nextDecode({});
     if (decode && get(decode->items.front().requestId).spec.priority <
                       get(plan->items.front().requestId).spec.priority)
       return result;
@@ -230,11 +237,11 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
   return result;
 }
 
-std::optional<BatchPlan> Scheduler::next() const {
+std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
   if (active_)
     return std::nullopt;
-  auto decode = nextDecode();
-  auto prefill = nextPrefill();
+  auto decode = nextDecode(excluded);
+  auto prefill = nextPrefill(excluded);
   if (!decode)
     return prefill;
   if (!prefill)
@@ -259,10 +266,10 @@ std::optional<BatchPlan> Scheduler::next() const {
                                                  : std::move(decode);
 }
 
-std::optional<BatchPlan> Scheduler::nextPrefill() const {
+std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> excluded) const {
   std::vector<PrefillRequestView> ready;
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Prefill)
+  for (const auto &[id, request] : requests_) {
+    if (request.phase == Phase::Prefill && !listed(excluded, id))
       ready.push_back({&request, request.promptProcessed});
   }
   return planPrefill(std::move(ready));
@@ -341,9 +348,10 @@ uint32_t Scheduler::prefillBudget(
                (leaderFinishing || peer.request->spec.promptTokens -
                                        peer.promptProcessed <= rows);
       });
-  // Bound commands for peers decoding or waiting for a CPU mask, and for
-  // peers that can finish prefill within this slice. The first sample and
-  // minimum matrix shape remain limits.
+  // Bound commands for peers that decode or wait for a CPU mask, including
+  // decoders left out of this command (their streams resume once their
+  // memory lands), and for peers that can finish prefill within this slice.
+  // The first sample and minimum matrix shape remain limits.
   if (contended)
     return rows;
   // A leader that finishes within the full budget ends the command at its
@@ -355,10 +363,10 @@ uint32_t Scheduler::prefillBudget(
   return maximum;
 }
 
-std::optional<BatchPlan> Scheduler::nextDecode() const {
+std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
   std::vector<const Request *> ready;
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Decode)
+  for (const auto &[id, request] : requests_) {
+    if (request.phase == Phase::Decode && !listed(excluded, id))
       ready.push_back(&request);
   }
   if (ready.empty())
@@ -398,7 +406,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
   return plan;
 }
 
-void Scheduler::commit(const BatchPlan &plan) {
+void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded) {
   if (active_ || plan.empty() ||
       plan.width() > model::ExecutionLimits::maximumBatchWidth) {
     throw std::logic_error("invalid scheduler commit");
@@ -416,6 +424,7 @@ void Scheduler::commit(const BatchPlan &plan) {
       throw std::logic_error("batch no longer matches scheduler state");
     }
   }
+  excluded_.assign(excluded.begin(), excluded.end());
   active_ = plan;
   lastCommittedKind_ = plan.kind;
   if (plan.kind == WorkKind::Prefill) {
@@ -427,7 +436,8 @@ void Scheduler::commit(const BatchPlan &plan) {
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
       if (terminal(request.phase) || request.phase == Phase::Decode ||
-          request.phase == Phase::WaitingMask || request.suspendedForResources)
+          request.phase == Phase::WaitingMask || request.suspendedForResources ||
+          listed(excluded, id))
         continue;
       const bool served = std::any_of(
           plan.items.begin(), plan.items.end(),
@@ -504,7 +514,8 @@ void Scheduler::complete(const BatchPlan &plan,
   // prefill finished included, it owes decode a share of its time; decode
   // commands work the debt off with their own. A lane waiting for its mask
   // is owed nothing: it could not have decoded meanwhile, and the slice
-  // already bounds the prefill it waits behind.
+  // already bounds the prefill it waits behind. Nor is a decoder this
+  // command was planned without: it could not run either.
   if (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
     if (plan.kind == WorkKind::Decode) {
       decodeDebtMilliseconds_ =
@@ -514,14 +525,16 @@ void Scheduler::complete(const BatchPlan &plan,
           get(plan.items.front().requestId).spec.priority;
       const bool contended = std::any_of(
           requests_.begin(), requests_.end(), [&](const auto &entry) {
-            const Request &peer = entry.second;
-            return peer.phase == Phase::Decode && peer.spec.priority <= priority;
+            const auto &[id, peer] = entry;
+            return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
+                   !listed(excluded_, id);
           });
       if (contended)
         decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
   dropStaleDecodeDebt();
+  excluded_.clear();
   active_.reset();
 }
 

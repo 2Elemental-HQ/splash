@@ -6747,6 +6747,24 @@ void testGrowthWaitsForTheStateWriteInFlight() {
   }
 }
 
+// Caches `count` one-page blocks, each under a state written to disk: their
+// pages stay resident, and evicting one starts a demotion whose page comes
+// back when the copy lands.
+void cacheBlocksUnderDiskStates(engine::Cache &cache, uint32_t count) {
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 900 + count; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
+            "state was not demoted");
+  }
+}
+
 // A lane that cannot run must never leave the engine without a wakeup: the
 // transfer it waits for wakes it, and if that wake is missed the retry
 // deadline does once no command is in flight (a command's completion wakes
@@ -6763,18 +6781,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
   require(tier.demotions == 1 && executor.prefillRows == 0,
@@ -6789,6 +6796,88 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   }
   require(idle(engine) && events.outputs.contains(1) && events.failedCount == 0,
           "the lane never ran");
+}
+
+// A plan whose lanes all wait for pages on their way back leaves the tick
+// to the other lanes: a decode that needs no page runs while a prefill
+// waits, and a prefill that needs none runs while a decode waits. The
+// waiting lanes run once their pages have landed.
+void testWaitingPlanDoesNotIdleRunnableLanes() {
+  const auto runWithTransfers = [](engine::Engine &engine, test::TestKvTier &tier,
+                                   double &now, const std::function<bool()> &done) {
+    for (uint32_t step = 0; step < 200 && !done(); ++step) {
+      tier.complete();
+      static_cast<void>(engine.tick(now++));
+    }
+    require(done(), "the waiting lane did not run once its pages landed");
+  };
+  {
+    test::TestKvStorage storage(12, 4096, 4);
+    storage.budgetPages = 8;
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    cacheBlocksUnderDiskStates(cache, 6);
+    // A stream decodes within its one page, beside a prefill short of two.
+    auto stream = request(2, std::vector<uint32_t>(1, 5));
+    stream.maxNewTokens = 1000;
+    engine.submit(std::move(stream));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.outputs.contains(2); },
+              "the stream did not decode");
+    engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+    const uint64_t decodes = engine.snapshot().scheduler.decodeBatches;
+    tickUntil(engine, now, [&] { return tier.demotions > 0; },
+              "the prefill did not wait for pages");
+    require(engine.commandInFlight() && engine.snapshot().scheduler.decodeBatches == decodes + 1 &&
+                executor.prefillRows == 1,
+            "the stream idled while a prefill waited for its pages");
+    runWithTransfers(engine, tier, now, [&] { return events.outputs.contains(1); });
+    engine.cancel(2);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+    require(events.failedCount == 0 && executor.prefillRows == 98,
+            "the lanes did not finish their prompts");
+  }
+  {
+    test::TestKvStorage storage(72, 4096, 4);
+    storage.budgetPages = 68;
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    cacheBlocksUnderDiskStates(cache, 3);
+    // One command takes every page left: the short prompt's 30 rows and
+    // 2018 of the long one's, which stops inside the page that ends at its
+    // replay boundary, 2048. The short prompt's first decode needs a page;
+    // the long one's next 30 rows need none.
+    engine.submit(request(1, std::vector<uint32_t>(2060, 7)));
+    engine.submit(request(2, std::vector<uint32_t>(30, 8)));
+    double now = 1;
+    static_cast<void>(engine.tick(now++));
+    static_cast<void>(engine.tick(now++));
+    require(executor.prefillRows == 2048 && pool.freePageCount() == 0 && !engine.commandInFlight(),
+            "fixture pages are off");
+    const uint64_t prefills = engine.snapshot().scheduler.prefillBatches;
+    static_cast<void>(engine.tick(now++));
+    require(tier.demotions > 0 && engine.commandInFlight() &&
+                engine.snapshot().scheduler.prefillBatches == prefills + 1 &&
+                !events.outputs.contains(2),
+            "the long prompt idled while a decode waited for its page");
+    runWithTransfers(engine, tier, now, [&] { return idle(engine); });
+    require(events.completedCount == 2 && events.failedCount == 0 &&
+                executor.prefillRows == 2090,
+            "the lanes did not finish");
+  }
 }
 
 // Pending means a transfer is in flight. With the tier unwritable and
@@ -6838,18 +6927,7 @@ void testPageShortfallDemotesInBulk() {
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   // The cached blocks fill two extents but two of their pages: those two
   // are free, no other extent is allocated, and the budget admits nothing
   // more. The first command, 160 tokens, falls three pages short; the last
@@ -7383,18 +7461,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
   // Six cached blocks, each under a state on disk, hold six of eight pages.
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
 
   // The first prefill command ends at the replay boundary, 96 tokens: three
@@ -8496,6 +8563,7 @@ int main() {
     testGrowthWaitsForTheStateWriteInFlight();
     testPageShortfallDemotesInBulk();
     testWaitingLaneAlwaysNamesAWakeup();
+    testWaitingPlanDoesNotIdleRunnableLanes();
     testNothingInFlightIsNotPending();
     testKvGrowthProceedsThroughDemotion();
     testAsyncRestoreLifecycle();

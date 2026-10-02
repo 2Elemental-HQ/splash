@@ -291,7 +291,15 @@ bool Engine::tick(double now) {
 
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
-  if (auto plan = scheduler_.next()) {
+  // Lanes that wait for memory on its way back cannot run before it lands;
+  // the command runs the other lanes meanwhile. A plan whose lanes all wait
+  // adds them, so each attempt plans without at least one more lane.
+  std::vector<uint64_t> excluded;
+  for (const auto &[id, active] : requests_) {
+    if (active.stateCell && active.resourceWait.pending && !resourceRetryReady(active, now))
+      excluded.push_back(id);
+  }
+  while (auto plan = scheduler_.next(excluded)) {
     std::vector<ModelBatchItem> items;
     switch (prepare(*plan, items, now)) {
     case Prepared::Runnable: {
@@ -300,7 +308,7 @@ bool Engine::tick(double now) {
       if (!ticket) {
         throw std::logic_error("model returned an empty command ticket");
       }
-      scheduler_.commit(*plan);
+      scheduler_.commit(*plan, excluded);
       pending_ = Pending{std::move(*plan), std::move(ticket)};
       return true;
     }
@@ -308,7 +316,9 @@ bool Engine::tick(double now) {
       sweepTerminal();
       return true;
     case Prepared::Waiting:
-      break;
+      for (const BatchItem &item : plan->items)
+        excluded.push_back(item.requestId);
+      continue;
     }
   }
   return progressed;
