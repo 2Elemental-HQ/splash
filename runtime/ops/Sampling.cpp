@@ -141,15 +141,17 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
 }
 
 void Sampling::addInitial(metal::CommandGraph &graph,
-                          const SamplingPolicy &policy,
+                          std::span<const SamplingPolicy> policies,
                           SamplingBuffers buffers, uint32_t rowOffset,
                           uint32_t stopToken0, uint32_t stopToken1,
                           const PenaltyTable &penalties) const {
+  if (policies.empty() || policies.size() > kMaximumLanes)
+    throw std::invalid_argument("invalid sampling batch width");
   if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid initial sampling row");
-  addPenalties(graph, {&policy, 1}, buffers, penalties, rowOffset, false);
-  addSelection(graph, {&policy, 1}, buffers, {1, rowOffset, 0, 0, 0},
-               stopToken0, stopToken1);
+  addPenalties(graph, policies, buffers, penalties, rowOffset, false);
+  addSelection(graph, policies, buffers, {1, rowOffset, 0, 0, 0}, stopToken0,
+               stopToken1);
 }
 
 void Sampling::addVerify(metal::CommandGraph &graph,

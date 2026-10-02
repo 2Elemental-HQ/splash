@@ -159,12 +159,14 @@ public:
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, both among the tokens the lane
-  // admits: the first token after a prompt from one lane's row at
-  // rowOffset, and every verify row of a batch. Each row's token goes to
-  // the output tokens; acceptance reads a sampled verify row's draft token
-  // probability from the vocabulary rows. Both run the same kernels
+  // admits: the first token after a prompt from each lane's row at
+  // rowOffset, and every verify row of a batch. Each selected row's token
+  // goes to the output tokens in order, one per lane for the first token
+  // and eight for verify; acceptance reads a sampled verify row's draft
+  // token probability from the vocabulary rows. Both run the same kernels
   // (addSelection).
-  void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
+  void addInitial(metal::CommandGraph &graph,
+                  std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, uint32_t rowOffset,
                   uint32_t stopToken0, uint32_t stopToken1,
                   const PenaltyTable &penalties) const;

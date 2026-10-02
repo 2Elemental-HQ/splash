@@ -2547,6 +2547,98 @@ int main(int argc, char **argv) {
       executor.end(104 + lane);
     }
 
+    // Lanes that finish their prompts in one packed prefill share one LM
+    // head and one selection. Each finishing lane must select what it
+    // selects finishing alone and a score lane must read the same logits,
+    // and a lane whose prompt the command does not finish must end it as it
+    // does alone.
+    {
+      constexpr uint32_t kScoredRow = 0, kGreedy = 1, kOpen = 2, kSampled = 3;
+      constexpr std::array<uint32_t, 4> rows{33, 40, 64, 72};
+      constexpr uint32_t openPromptTokens = 200;
+      const auto prompt = [&](uint32_t lane) {
+        std::vector<uint32_t> tokens(lane == kOpen ? openPromptTokens
+                                                   : rows[lane]);
+        for (uint32_t row = 0; row < tokens.size(); ++row)
+          tokens[row] =
+              productionSeedTokens[(row + 3 * lane) % productionSeedTokens.size()];
+        return tokens;
+      };
+      const auto requestFor = [&](uint64_t id, uint32_t lane) {
+        EngineRequest value = makeRequest(id, prompt(lane), 1);
+        if (lane == kScoredRow) {
+          value.maxNewTokens = 0;
+          value.scoreTokens = {11, 220, 1683};
+        } else if (lane == kSampled) {
+          value.sampling = {
+              .temperature = 0.8F, .topP = 0.95F, .topK = 20, .seed = 4099};
+        }
+        return value;
+      };
+      const std::array<std::vector<uint32_t>, 4> pages{
+          pageRange(52, 2), pageRange(54, 2), pageRange(56, 7),
+          pageRange(63, 3)};
+      // The open lane's prompt ends in a command of its own.
+      const auto finishOpen = [&](uint64_t id) {
+        const std::vector<uint32_t> tokens = prompt(kOpen);
+        return prefillChunk(executor, id, rows[kOpen],
+                            std::span(tokens).subspan(rows[kOpen]),
+                            pages[kOpen]);
+      };
+      std::array<ModelStepResult, 4> alone;
+      for (uint32_t lane = 0; lane < alone.size(); ++lane) {
+        const EngineRequest request = requestFor(130 + lane, lane);
+        beginCold(executor, request, 0);
+        alone[lane] = prefillChunk(
+            executor, request.id, 0,
+            std::span(request.prompt).first(rows[lane]), pages[lane]);
+        if (lane == kOpen)
+          alone[lane] = finishOpen(request.id);
+        executor.end(request.id);
+      }
+
+      BatchPlan packedPlan{.kind = WorkKind::Prefill,
+                           .decodeStage = DecodeStage::Regular};
+      std::array<EngineRequest, 4> requests;
+      std::array<ModelBatchItem, 4> items;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        requests[lane] = requestFor(140 + lane, lane);
+        beginCold(executor, requests[lane], lane);
+        packedPlan.items.push_back({requests[lane].id, rows[lane]});
+        items[lane] = withRevision({.requestId = requests[lane].id,
+                                    .tokenCount = rows[lane],
+                                    .pageTable = pages[lane]});
+        items[lane].inputTokens =
+            std::span(requests[lane].prompt).first(rows[lane]);
+      }
+      std::vector<ModelStepResult> packed =
+          executor.prefill(packedPlan, items);
+      require(packed.size() == items.size() &&
+                  packed[kOpen].outputTokens.empty() &&
+                  !packed[kOpen].finished &&
+                  states.metadata(kOpen).lengths.targetTokens == rows[kOpen],
+              "a lane that did not finish its prompt took part in the head");
+      packed[kOpen] = finishOpen(requests[kOpen].id);
+      for (const uint32_t lane : {kGreedy, kOpen, kSampled}) {
+        require(packed[lane].outputTokens == alone[lane].outputTokens &&
+                    packed[lane].outputTokens.size() == 1,
+                "a first token selected beside other lanes differs from the "
+                "one selected alone");
+      }
+      require(packed[kScoredRow].scoreLogits.size() == 3 &&
+                  alone[kScoredRow].scoreLogits.size() == 3,
+              "the score lane of a shared head returned no logits");
+      for (uint32_t option = 0; option < 3; ++option) {
+        const float shared = packed[kScoredRow].scoreLogits[option];
+        const float single = alone[kScoredRow].scoreLogits[option];
+        require(std::fabs(shared - single) <=
+                    1e-3F * std::max(1.0F, std::fabs(single)),
+                "a score lane's logits from a shared head differ from its own");
+      }
+      for (const EngineRequest &request : requests)
+        executor.end(request.id);
+    }
+
     constexpr std::array<uint64_t, 4> productionB4Ids{71, 72, 73, 74};
     std::array<std::vector<uint32_t>, 4> productionB4Pages{
         std::vector<uint32_t>{48, 49, 50, 51, 72},

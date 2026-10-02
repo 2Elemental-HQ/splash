@@ -354,7 +354,7 @@ struct Runtime::Impl {
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
-    sampling.addInitial(graph, sampled, samplingBuffersForLane(0), 0,
+    sampling.addInitial(graph, policies, samplingBuffers(2), 0,
                         geometry.target.stopTokens[0],
                         geometry.target.stopTokens[1], penalties);
     sampling.addVerify(graph, policies, samplingBuffers(2),
@@ -744,16 +744,14 @@ struct Runtime::Impl {
         std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
   }
 
-  void captureFinalHidden(Request &entry, const MetalBuffer &rows,
-                          uint32_t row) const {
-    if (row >= kDecodeRows) {
-      throw std::out_of_range("final hidden row is out of range");
-    }
+  // A constrained lane keeps its final prompt row, which prefill leaves at
+  // row 0 of its Hidden0 block, until its first mask arrives.
+  void captureFinalHidden(Request &entry, uint32_t lane) const {
     const uint16_t *source =
-        contents<uint16_t>(rows, "target final hidden source");
-    entry.finalTargetHidden.assign(
-        source + uint64_t{row} * geometry.target.hiddenSize,
-        source + uint64_t{row + 1} * geometry.target.hiddenSize);
+        contents<uint16_t>(decodeArena->get(lane, DecodeTensor::Hidden0),
+                           "target final hidden source");
+    entry.finalTargetHidden.assign(source,
+                                   source + geometry.target.hiddenSize);
   }
 
   static DispatchDraftCapturePlan
@@ -837,8 +835,10 @@ struct Runtime::Impl {
             enabled ? entry.sampling.minP : 0.0F};
   }
 
-  template <class Get>
-  static ops::SamplingBuffers samplingBuffersWith(Get d) {
+  ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
+    auto d = [&](DecodeTensor tensor) {
+      return decodeArena->packed(tensor, lanes);
+    };
     return {d(DecodeTensor::Logits),
             d(DecodeTensor::TargetPartialMasses),
             d(DecodeTensor::TargetVocabularyRows),
@@ -852,16 +852,6 @@ struct Runtime::Impl {
             d(DecodeTensor::ProposalProbs),
             d(DecodeTensor::TargetVocabularyRanges),
             d(DecodeTensor::TargetVocabularyArrivals)};
-  }
-
-  ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
-    return samplingBuffersWith(
-        [&](DecodeTensor t) { return decodeArena->packed(t, lanes); });
-  }
-
-  ops::SamplingBuffers samplingBuffersForLane(uint32_t lane) const {
-    return samplingBuffersWith(
-        [&](DecodeTensor t) { return decodeArena->get(lane, t); });
   }
 
   std::span<uint32_t> penaltyWords(uint32_t stateLane) const {
@@ -910,13 +900,65 @@ struct Runtime::Impl {
            " from a non-finite logit row";
   }
 
-  void addInitialPolicySelection(CommandGraph &graph, Request &entry,
-                                 uint32_t lane, uint32_t rowOffset) const {
-    sampling.addInitial(graph, samplingPolicy(entry),
-                        samplingBuffersForLane(lane), rowOffset,
+  // A lane of an initial selection, whose final prompt row is at row 0 of
+  // its Hidden0 block: one that selects its first token, or a score lane,
+  // which needs only the logits.
+  struct InitialSelection final {
+    Request *entry = nullptr;
+    uint32_t lane = 0;
+    bool select = false;
+  };
+
+  // A sampled lane draws its first token with the first uniform of a fresh
+  // cycle.
+  void uploadInitialUniform(Request &entry, uint32_t lane) const {
+    entry.cycleUniforms.fill(0.0F);
+    entry.cycleUniforms[0] = nextUniform(entry);
+    uploadSamplingUniforms(entry, lane);
+  }
+
+  // One LM head over the batch's `width` lanes, then one selection of the
+  // first token of every selecting lane from its logits row 0, which
+  // initialToken() reads. The head computes, and nothing reads, the other
+  // rows of each lane and the lanes not listed; a lane that does not select
+  // takes the argmax of its row. Sampled lanes' uniforms and constrained
+  // lanes' masks are uploaded first.
+  void encodeInitialSelections(CommandGraph &graph,
+                               std::span<const InitialSelection> lanes,
+                               uint32_t width) {
+    const uint32_t storage = targetModel.decodeStorageLanes(width);
+    auto d = [&](DecodeTensor tensor) {
+      return decodeArena->packed(tensor, storage);
+    };
+    ops::LinearDispatchStats stats;
+    targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
+                             d(DecodeTensor::FinalHidden),
+                             d(DecodeTensor::Logits), width,
+                             decodeArena->linearScratch(), stats);
+    if (std::ranges::none_of(lanes, &InitialSelection::select))
+      return;
+    std::array<ops::SamplingPolicy, kLaneCount> policies;
+    policies.fill({.topK = 1, .temperature = 0.0F});
+    std::array<uint32_t, kLaneCount> stateLanes{};
+    for (const InitialSelection &lane : lanes) {
+      if (!lane.select)
+        continue;
+      policies[lane.lane] = samplingPolicy(*lane.entry);
+      stateLanes[lane.lane] = lane.entry->stateLane;
+    }
+    sampling.addInitial(graph, std::span(policies).first(width),
+                        samplingBuffers(width), 0,
                         geometry.target.stopTokens[0],
                         geometry.target.stopTokens[1],
-                        {penaltyTable, {&entry.stateLane, 1}});
+                        {penaltyTable, std::span(stateLanes).first(width)});
+  }
+
+  // The first token encodeInitialSelections() selected for a batch lane: a
+  // selection writes one output token per lane, in lane order.
+  uint32_t initialToken(uint32_t lane) const {
+    return contents<uint32_t>(
+        decodeArena->packed(DecodeTensor::OutputTokens, lane + 1),
+        "initial tokens")[lane];
   }
 
   CommandTiming selectPendingFromFinalHidden(Request &entry, uint32_t lane,
@@ -925,30 +967,19 @@ struct Runtime::Impl {
     if (entry.finalTargetHidden.size() != geometry.target.hiddenSize) {
       throw std::logic_error("request has no policy-neutral final hidden");
     }
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->get(lane, tensor);
-    };
-    auto *hidden =
-        contents<uint16_t>(d(DecodeTensor::Hidden0), "pending final hidden");
-    for (uint32_t row = 0; row < kDecodeRows; ++row) {
-      std::copy(entry.finalTargetHidden.begin(), entry.finalTargetHidden.end(),
-                hidden + uint64_t{row} * geometry.target.hiddenSize);
-    }
-    if (samplingEnabled(entry)) {
-      entry.cycleUniforms.fill(0.0F);
-      entry.cycleUniforms[0] = nextUniform(entry);
-      uploadSamplingUniforms(entry, lane);
-    }
+    std::ranges::copy(entry.finalTargetHidden,
+                      contents<uint16_t>(
+                          decodeArena->get(lane, DecodeTensor::Hidden0),
+                          "pending final hidden"));
+    if (samplingEnabled(entry))
+      uploadInitialUniform(entry, lane);
     uploadConstraintMasks(lane, masks);
 
     CommandGraph graph;
-    targetModel.addHead(graph, d(DecodeTensor::Hidden0),
-                        d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
-                        kDecodeRows, decodeArena->linearScratch());
-    addInitialPolicySelection(graph, entry, lane, 0);
+    const InitialSelection selection{&entry, lane, true};
+    encodeInitialSelections(graph, {&selection, 1}, lane + 1);
     CommandTiming timing = backend.submitCommand(graph.dispatches());
-    const uint32_t token = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
-                                               "restored prefix next token");
+    const uint32_t token = initialToken(lane);
     result.failure = invalidSelection({&token, 1});
     if (result.failure.empty())
       commitSelected(entry, {&token, 1});
@@ -1211,37 +1242,37 @@ struct Runtime::Impl {
         kvPages.layers());
     addPackedDraftContext(graph, batch);
 
+    // A lane that finishes its prompt copies the prompt's last row to row 0
+    // of its Hidden0 block. A constrained lane's completion captures that
+    // row into finalTargetHidden (captureFinalHidden), which holds it until
+    // the first mask. The others share one head: a score lane reads raw
+    // logits at the final prompt position, and a policy lane selects its
+    // first token.
+    std::array<InitialSelection, kLaneCount> selections{};
+    uint32_t selectionCount = 0;
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       Request &entry = *sequence.entry;
       const ModelBatchItem &item = *sequence.item;
       if (entry.replayingGeneration ||
           item.logicalPosition + item.tokenCount != entry.promptTokens)
         continue;
-      const bool scoring = !entry.scoreTokens.empty();
-      auto d = [&](DecodeTensor tensor) {
-        return decodeArena->get(sequence.lane, tensor);
-      };
-      const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
       ops::DraftAttention::gatherLastRows(
           graph,
-          prefillU16(finalHidden, sequence.rowBegin, item.tokenCount,
+          prefillU16(finalHidden, sequence.rowBegin + item.tokenCount - 1, 1,
                      geometry.target.hiddenSize),
-          d(DecodeTensor::Hidden0), item.tokenCount,
+          decodeArena->get(sequence.lane, DecodeTensor::Hidden0), 1,
           geometry.target.hiddenSize);
-      if (scoring) {
-        // Score-only: compute raw logits at the final prompt position; no
-        // policy selection, sampling, or anchor is produced.
-        targetModel.addHead(graph, d(DecodeTensor::Hidden0),
-                            d(DecodeTensor::FinalHidden),
-                            d(DecodeTensor::Logits), lastRows, decodeArena->linearScratch());
-      } else if (entry.constraint == ConstraintMode::None) {
-        if (samplingEnabled(entry)) {
-          entry.cycleUniforms.fill(0.0F);
-          entry.cycleUniforms[0] = nextUniform(entry);
-          uploadSamplingUniforms(entry, sequence.lane);
-        }
-        addPrefillPolicy(graph, entry, sequence.lane, lastRows - 1);
-      }
+      if (entry.constraint != ConstraintMode::None)
+        continue;
+      const bool scoring = !entry.scoreTokens.empty();
+      if (!scoring && samplingEnabled(entry))
+        uploadInitialUniform(entry, sequence.lane);
+      selections[selectionCount++] = {&entry, sequence.lane, !scoring};
+    }
+    if (selectionCount) {
+      encodeInitialSelections(
+          graph, std::span(selections).first(selectionCount),
+          static_cast<uint32_t>(batch.sequences.size()));
     }
     std::array<DispatchDraftCapturePlan, kLaneCount> captures{};
     for (const PackedPrefillSequence &sequence : batch.sequences)
@@ -1487,20 +1518,6 @@ struct Runtime::Impl {
                        samplingBuffers(lanes), geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
                        {penaltyTable, std::span(stateLanes).first(lanes)});
-  }
-
-  void addPrefillPolicy(CommandGraph &graph, Request &entry, uint32_t lane,
-                        uint32_t finalRow) const {
-    if (finalRow >= kDecodeRows || entry.constraint != ConstraintMode::None) {
-      throw std::invalid_argument("invalid prefill policy boundary");
-    }
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->get(lane, tensor);
-    };
-    targetModel.addHead(graph, d(DecodeTensor::Hidden0),
-                        d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
-                        finalRow + 1, decodeArena->linearScratch());
-    addInitialPolicySelection(graph, entry, lane, finalRow);
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -2138,9 +2155,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       std::optional<uint32_t> selected;
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
           entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
-        selected = *contents<uint32_t>(
-            impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
-            "prefill next token");
+        selected = impl->initialToken(lane);
         if (std::string failure = impl->invalidSelection({&*selected, 1});
             !failure.empty()) {
           // The chunk's state is not committed; the engine ends the
@@ -2176,14 +2191,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
         entry.pendingToken.reset();
         if (!entry.scoreTokens.empty()) {
           // Score-only: read the raw fp32 logits at the final prompt position
-          // (row lastRows-1 of the gathered head input) in requested order.
-          const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
-          const float *logits = contents<float>(
+          // (the lane's logits row 0) in requested order.
+          const float *row = contents<float>(
               impl->decodeArena->get(lane, DecodeTensor::Logits),
               "score logits");
-          const float *row =
-              logits + uint64_t{lastRows - 1} *
-                           impl->geometry.target.vocabularySize;
           result.scoreLogits.reserve(entry.scoreTokens.size());
           for (uint32_t token : entry.scoreTokens) {
             const float logit = row[token];
@@ -2202,10 +2213,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
           impl->commitSelected(entry, {&*selected, 1});
           impl->emitTerminalAnchor(entry, result);
         } else {
-          const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
-          impl->captureFinalHidden(
-              entry, impl->decodeArena->get(lane, DecodeTensor::Hidden0),
-              lastRows - 1);
+          impl->captureFinalHidden(entry, lane);
         }
       }
       if (entry.promptComplete)
