@@ -109,14 +109,14 @@ CacheNamespace cacheNamespace() {
   return result;
 }
 
-// Admits pages the way the engine does: each denial makes room with one
+// Admits pages the way the engine does: each denial makes room in one
 // reclaim step, until the pages fit, a transfer in flight holds what they
 // need, or nothing more can be reclaimed.
 TokenAdmission admitLikeEngine(engine::Cache &cache,
                                const std::function<TokenAdmission()> &attempt) {
   TokenAdmission admission = attempt();
   while (admission.failure == TokenAdmissionFailure::Denied) {
-    const CacheReclaimResult step = cache.reclaimOne(CacheReclaimMode::KeepExtents);
+    const CacheReclaimResult step = cache.reclaimForPages(admission.additionalPages);
     if (!step.madeProgress) {
       if (step.pending)
         admission.failure = TokenAdmissionFailure::Pending;
@@ -2239,6 +2239,42 @@ void testBusyTierPreservesDiskVictim() {
   }
 }
 
+// A denied admission makes room in one reclaim step: it evicts the leaves
+// that cover the shortfall and no more, and stops once an evicted state has
+// returned memory, which may let the retry grow the pool instead.
+void testReclaimForPagesCoversTheShortfall() {
+  for (bool withState : {false, true}) {
+    test::TestKvStorage storage{16, 100, 1};
+    storage.budgetPages = 8;
+    KvPool pool{storage, 0};
+    engine::Cache cache{pool, cacheNamespace()};
+    // Eight one-page leaves fill the budget; a state on the first is older
+    // than the other seven.
+    for (uint32_t leaf = 0; leaf < 8; ++leaf) {
+      cache.beginRequest(leaf + 1);
+      require(admitTokens(cache, leaf + 1, 32).granted(), "leaf KV admission failed");
+      const uint64_t block = cache.publishCommittedBlocks(
+          leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
+      cache.endRequest(leaf + 1);
+      if (withState && !leaf)
+        cache.publishCompositeState(block, std::make_shared<TestState>(100));
+    }
+    require(pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8,
+            "fixture geometry changed");
+    const CacheReclaimResult reclaimed = cache.reclaimForPages(3);
+    if (withState) {
+      require(reclaimed.madeProgress && reclaimed.reclaimedBytes > 0 &&
+                  pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8 &&
+                  cache.snapshot().stateCache.entries == 0,
+              "the reclaim step went on evicting after a state returned memory");
+    } else {
+      require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
+                  pool.freePageCount() == 3 && cache.snapshot().kvCache.blocks == 5,
+              "the reclaim step did not evict exactly the shortfall");
+    }
+  }
+}
+
 // A lookup touches the resident boundary of a chain with a disk suffix, not
 // only its tip: the boundary is a leaf, and the reclaim that makes room for
 // the restore must take an older one, not the block the restore extends.
@@ -2469,6 +2505,7 @@ void testLargeSharedDiskRestore() {
 int main() {
   try {
     testLargeSharedDiskRestore();
+    testReclaimForPagesCoversTheShortfall();
     testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();

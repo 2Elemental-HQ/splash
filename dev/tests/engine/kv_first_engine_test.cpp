@@ -2972,6 +2972,8 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
     return pool.snapshot().pagesAllocated / 4 < budgetExtents;
   };
   const KvPoolSnapshot before = pool.snapshot();
+  const uint32_t attemptsBefore = storage.allocationAttempts;
+  const uint32_t blocksBefore = cache.snapshot().kvCache.blocks;
   // The first chunk's 64 pages need 16 new extents; the budget has room for
   // 8, and evicting cached prefixes frees the other 32 pages.
   engine.submit(request(286, std::vector<uint32_t>(16 * 4 * 32 + 1, 286)));
@@ -2983,6 +2985,12 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
                   budgetExtents - cachedExtents &&
               after.extentReleases == before.extentReleases,
           "denied attempts allocated and released the same extents again");
+  // One denied attempt, one reclaim step that evicts the shortfall and no
+  // more, and a retry the free pages cover.
+  require(storage.allocationAttempts - attemptsBefore ==
+                  budgetExtents - cachedExtents + 1 &&
+              blocksBefore - cache.snapshot().kvCache.blocks == 32,
+          "the denial was retried per evicted page or evicted more than it lacked");
 }
 
 // A lone request whose chunk needs more extents than the budget holds, with
@@ -4651,11 +4659,14 @@ void testPageShortfallDemotesInBulk() {
   require(pool.freePageCount() == 2 && pool.snapshot().pagesAllocated == 8,
           "fixture storage geometry changed");
   storage.growthBlocked = true;
+  const uint32_t attemptsBefore = storage.allocationAttempts;
   engine.submit(request(1, std::vector<uint32_t>(161, 7)));
   static_cast<void>(engine.tick(1));
   require(tier.demotions == 3 && executor.prefillRows == 0 && executor.suspensions == 0 &&
               events.failedCount == 0,
           "a shortfall of three pages did not start three demotions in one pass");
+  require(storage.allocationAttempts - attemptsBefore == 2,
+          "the demotions did not start in the one reclaim step after the denial");
   static_cast<void>(engine.tick(2));
   require(tier.demotions == 3, "waiting demoted more");
   for (uint32_t step = 3; step < 40 && !engine.idle(); ++step) {

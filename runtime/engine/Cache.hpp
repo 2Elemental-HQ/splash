@@ -239,6 +239,12 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseExtents,
       bool keepResumePoint = false, bool keepRunway = false);
+  // The reclaim step for a KV admission the pool denied: evicts in
+  // reclaimOne(KeepExtents)'s order until the free pages and the pages whose
+  // demotion is in flight cover `pages` (the admission's additionalPages),
+  // until an evicted state has returned memory (the retry may then grow the
+  // pool), or until nothing more can go; one step instead of a retry per page.
+  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages);
   // Recycles exactly one unpinned state, preferring checkpoints, for a
   // required state publication; the disk tier keeps it when it admits it.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);

@@ -378,6 +378,22 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   return {false, 0, transfersInFlight()};
 }
 
+CacheReclaimResult Cache::reclaimForPages(uint32_t pages) {
+  CacheReclaimResult total;
+  while (pool_.freePageCount() + pendingPages() < pages) {
+    const CacheReclaimResult step = reclaimOne(CacheReclaimMode::KeepExtents);
+    if (!step.madeProgress) {
+      total.pending = step.pending;
+      break;
+    }
+    total.madeProgress = true;
+    total.reclaimedBytes += step.reclaimedBytes;
+    if (step.reclaimedBytes)
+      break;
+  }
+  return total;
+}
+
 bool Cache::reclaimOneState(bool checkpointsOnly) {
   const std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate();

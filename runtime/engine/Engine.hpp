@@ -217,10 +217,11 @@ private:
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
-  // What a denied allocation was for. Idle memory of that kind stays for it
-  // to reuse; idle memory of the other kind is released first.
-  enum class Growth : uint8_t { State, Kv };
-  [[nodiscard]] CacheReclaimResult reclaimForGrowth(Growth growth);
+  // The reclaim steps for a lane's state and for KV pages the governor
+  // denied. Idle memory of the kind denied stays for it to reuse; idle memory
+  // of the other kind is released first.
+  [[nodiscard]] CacheReclaimResult reclaimForState();
+  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(

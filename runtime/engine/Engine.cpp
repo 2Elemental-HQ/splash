@@ -497,7 +497,7 @@ bool Engine::admit(Request &active, double now) {
       const bool paused = growthPaused() ||
           admission.allocationFailure == metal::AllocationFailure::HostPressure;
       const CacheReclaimResult reclaimed =
-          paused ? reuseCachedStateWhilePaused() : reclaimForGrowth(Growth::State);
+          paused ? reuseCachedStateWhilePaused() : reclaimForState();
       if (reclaimed.madeProgress) {
         admission = activate();
         continue;
@@ -1105,7 +1105,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused
         ? reuseCachedPagesWhilePaused(admission)
-        : reclaimForGrowth(Growth::Kv);
+        : reclaimForKv(admission.additionalPages);
     if (!progress.madeProgress) {
       pendingReclaim = progress.pending;
       break;
@@ -1128,21 +1128,34 @@ bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();
 }
 
-// One reclaim step for an allocation the governor denied. Idle memory of the
-// kind it takes stays for it to reuse: the pooled buffers a lane starts from
-// for a lane's state, which its activation takes, and allocated extents for
-// KV. Idle memory of the other kind goes first, then one victim of the cache.
-CacheReclaimResult Engine::reclaimForGrowth(Growth growth) {
-  const bool state = growth == Growth::State;
-  if (reclaimIdleState(state))
+// The reclaim step for a lane's state the governor denied. The pooled
+// buffers a lane starts from stay for its activation to take: idle model
+// state beyond them goes first, then one empty extent, or else one victim of
+// the cache with the extent it empties.
+// While growth is paused the background pressure controller owns the shrink:
+// retrying a paused allocator here, for a state or for KV pages, would drain
+// the cache before macOS can acknowledge any reclaimed bytes.
+CacheReclaimResult Engine::reclaimForState() {
+  if (reclaimIdleState(true))
     return {true, 0};
-  // The background pressure controller owns the shrink. Retrying a paused
-  // allocator here would drain the cache before macOS can acknowledge any
-  // reclaimed bytes.
   if (growthPaused())
     return {};
-  const CacheReclaimResult reclaimed = cache_.reclaimOne(
-      state ? CacheReclaimMode::ReleaseExtents : CacheReclaimMode::KeepExtents);
+  const CacheReclaimResult reclaimed =
+      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents);
+  if (reclaimed.madeProgress)
+    signalResourceProgress();
+  return reclaimed;
+}
+
+// The reclaim step for KV pages the governor denied. Allocated extents stay
+// for the pages to reuse; idle state memory goes first, then the cache gives
+// up what covers the shortfall in one step.
+CacheReclaimResult Engine::reclaimForKv(uint32_t pages) {
+  if (reclaimIdleState(false))
+    return {true, 0};
+  if (growthPaused())
+    return {};
+  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1189,7 +1202,7 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
   if (reusable < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimOne(CacheReclaimMode::KeepExtents);
+      cache_.reclaimForPages(admission.additionalPages);
   if (reused.madeProgress) {
     // An evicted state parks its buffers in the model's pool; under pressure
     // that memory goes back to the host now rather than waiting for the
