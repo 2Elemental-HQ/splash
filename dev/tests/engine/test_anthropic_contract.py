@@ -453,7 +453,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 200, payload)
                 counted = json.loads(payload)["input_tokens"]
-                job, *_ = harness.app.prepare(translated)
+                job = harness.app.prepare(translated)
                 self.assertEqual(len(job.prompt_tokens), counted)
                 self.assertGreater(counted, 2)
                 self.assertEqual(len(job.image_spans), 1)

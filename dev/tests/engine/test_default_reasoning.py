@@ -133,11 +133,9 @@ class DefaultReasoningTests(unittest.TestCase):
                 fixtures.ServerTest.reasoning_template(default=default)
             )
             harness = self.harness(tokenizer=tokenizer)
-            job, _, _ = harness.app.prepare(fixtures.ServerTest.body())
+            job = harness.app.prepare(fixtures.ServerTest.body())
             self.assertEqual(job.thinking, default)
-            job, _, _ = harness.app.prepare_responses(
-                fixtures.ServerTest.responses_body()
-            )
+            job = harness.app.prepare_responses(fixtures.ServerTest.responses_body())
             self.assertEqual(job.thinking, default)
 
     def test_scoring_is_independent_of_generation_default(self):

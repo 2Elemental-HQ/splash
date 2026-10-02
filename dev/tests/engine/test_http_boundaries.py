@@ -213,8 +213,8 @@ class HttpBoundaryTests(unittest.TestCase):
             "server.server.secrets.token_hex",
             side_effect=("first-random-id", "second-random-id"),
         ):
-            first, _, _ = harness.app.prepare(body)
-            second, _, _ = harness.app.prepare(body)
+            first = harness.app.prepare(body)
+            second = harness.app.prepare(body)
         self.assertEqual(
             (first.public_id, second.public_id), ("first-random-id", "second-random-id")
         )

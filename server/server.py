@@ -695,7 +695,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     400, "return_progress requires stream: true and must be a boolean"
                 )
             if anthropic:
-                job, thinking, has_tools = self.app.prepare(
+                job = self.app.prepare(
                     anthropic_to_chat_body(
                         body, thinking_resolver=self.app.thinking_codec.decode
                     ),
@@ -705,7 +705,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
                 stream_options = None
             elif responses:
-                job, thinking, has_tools = self.app.prepare_responses(
+                job = self.app.prepare_responses(
                     body,
                     deadline=deadline,
                     reserve_input=self._body_reservation.grow,
@@ -726,9 +726,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 }
                 if completions:
                     job = self.app.prepare_completion(body, deadline=deadline)
-                    thinking = has_tools = False
                 else:
-                    job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+                    job = self.app.prepare(body, deadline=deadline)
             body = None
             self._body_reservation.retain_for(job)
             self._body_reservation = None
@@ -740,21 +739,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.submit(job)
             submitted = True
             if anthropic and stream:
-                self._anthropic_stream(job, thinking, has_tools)
+                self._anthropic_stream(job)
             elif anthropic:
-                self._anthropic_complete(job, thinking, has_tools)
+                self._anthropic_complete(job)
             elif responses and stream:
-                self._responses_stream(job, thinking, has_tools)
+                self._responses_stream(job)
             elif responses:
-                self._responses_complete(job, thinking, has_tools)
+                self._responses_complete(job)
             elif stream:
-                self._openai_stream(
-                    job, thinking, has_tools, stream_options, chat=not completions
-                )
+                self._openai_stream(job, stream_options, chat=not completions)
             elif completions:
                 self._text_completion(job)
             else:
-                self._complete(job, thinking, has_tools)
+                self._complete(job)
         except judgments.SystemOneError as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -907,11 +904,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except ConnectionError:
             return True
 
-    def _finalize_content(self, content, job, has_tools, incomplete, projector):
+    def _finalize_content(self, content, job, incomplete, projector):
         """The content and calls of the output, validated unless it was cut,
         and the content the stream still owes. `content` is read only without
         tools: with tools, the projector holds the content."""
-        if not has_tools:
+        if job.tool_policy is None:
             if not incomplete:
                 validate_response_content(content, job.response_validator)
             return content, [], ""
@@ -931,8 +928,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _collect(
         self,
         job,
-        thinking,
-        has_tools,
         *,
         on_start=None,
         on_text=None,
@@ -944,13 +939,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        splitter = ReasoningSplitter(thinking)
+        splitter = ReasoningSplitter(job.thinking)
         # Output with tools is parsed as it arrives whether it streams or not.
         projector = (
             StreamingToolCallProjector(
                 job.tool_policy, job.public_id, job.response_validator is not None
             )
-            if has_tools
+            if job.tool_policy is not None
             else None
         )
         reasoning, content, result = [], [], None
@@ -983,7 +978,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         for field, text in splitter.finish():
             append(field, text)
         content_text, tool_calls, unsent = self._finalize_content(
-            "".join(content), job, has_tools, result.reason == "length", projector
+            "".join(content), job, result.reason == "length", projector
         )
         if unsent and on_text is not None:
             on_text("content", unsent)
@@ -991,8 +986,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
         )
 
-    def _complete(self, job, thinking, has_tools):
-        collected = self._collect(job, thinking, has_tools)
+    def _complete(self, job):
+        collected = self._collect(job)
         message = {"role": "assistant", "content": collected.content or None}
         if collected.reasoning:
             message["reasoning_content"] = collected.reasoning
@@ -1010,7 +1005,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
 
     def _text_completion(self, job):
-        collected = self._collect(job, False, False)
+        collected = self._collect(job)
         self._json(
             200,
             text_completion_response(
@@ -1018,12 +1013,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _anthropic_complete(self, job, thinking, has_tools):
+    def _anthropic_complete(self, job):
         sequencer = BlockSequencer()
         collected = self._collect(
             job,
-            thinking,
-            has_tools,
             on_text=sequencer.text,
             on_tool_delta=sequencer.tool,
         )
@@ -1046,7 +1039,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _anthropic_stream(self, job, thinking, has_tools):
+    def _anthropic_stream(self, job):
         omitted = job.thinking_display == "omitted"
 
         def send(event, payload):
@@ -1128,8 +1121,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         def run():
             collected = self._collect(
                 job,
-                thinking,
-                has_tools,
                 on_start=start,
                 on_text=sequencer.text,
                 on_tool_delta=sequencer.tool,
@@ -1169,12 +1160,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         self._guarded_stream(job, run, send_error)
 
-    def _responses_complete(self, job, thinking, has_tools):
+    def _responses_complete(self, job):
         sequencer = BlockSequencer()
         collected = self._collect(
             job,
-            thinking,
-            has_tools,
             on_text=sequencer.text,
             on_tool_delta=sequencer.tool,
         )
@@ -1272,7 +1261,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
 
-    def _responses_stream(self, job, thinking, has_tools):
+    def _responses_stream(self, job):
         output, sequence = [], 0
 
         def send(event, **payload):
@@ -1410,8 +1399,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         def run():
             collected = self._collect(
                 job,
-                thinking,
-                has_tools,
                 on_start=begin,
                 on_text=sequencer.text,
                 on_tool_delta=sequencer.tool,
@@ -1455,7 +1442,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         self._guarded_stream(job, run, send_error)
 
-    def _openai_stream(self, job, thinking, has_tools, stream_options, *, chat):
+    def _openai_stream(self, job, stream_options, *, chat):
         """A Chat or text completion stream; text completions have no tools."""
         chunk = partial(
             stream_chunk if chat else text_completion_chunk,
@@ -1489,8 +1476,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         def run():
             collected = self._collect(
                 job,
-                thinking,
-                has_tools,
                 on_start=start,
                 on_text=lambda field, text: self._sse(chunk(payload(field, text))),
                 on_tool_delta=lambda delta: self._sse(chunk({"tool_calls": [delta]})),

@@ -411,7 +411,7 @@ class StructuredToolProjectionTest(unittest.TestCase):
         )
         events = put(projector, text, size)
         content, calls, unsent = api.FrontendHandler._finalize_content(
-            None, "", job, True, incomplete, projector
+            None, "", job, incomplete, projector
         )
         return content, calls, streamed_text(events) + unsent
 

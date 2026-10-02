@@ -146,7 +146,7 @@ class PromptToolsTests(unittest.TestCase):
             with self.subTest(effort=effort):
                 rendered = self.post("/apply-template", body)["prompt"]
                 tokens = self.post("/tokenize", {"content": rendered})["tokens"]
-                job, _, _ = self.harness.app.prepare(body)
+                job = self.harness.app.prepare(body)
                 self.assertEqual(tokens, job.prompt_tokens)
                 self.assertEqual("<think>" in rendered, effort != "none")
         self.assertFalse(self.runtime.requests)

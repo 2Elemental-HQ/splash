@@ -2240,7 +2240,7 @@ class ServerTest(unittest.TestCase):
             )
         )
         app.images = api.image_input.ImageCache()
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
+        job = app.prepare(self.body(messages=[self._image_message()]))
         native_request = app.backend._generation_request(job)
         self.assertIs(native_request.image_owner, job.image_owner)
         del job
@@ -2249,7 +2249,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(failure.exception.status, 503)
         del native_request
         self.assertEqual(app.images.stats()["request_bytes"], 0)
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
+        job = app.prepare(self.body(messages=[self._image_message()]))
         self.assertGreater(app.images.stats()["request_bytes"], 0)
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
@@ -2690,7 +2690,7 @@ class ServerTest(unittest.TestCase):
                         self.assertEqual(status, 200, payload)
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
-                job, *_ = harness.app.prepare(
+                job = harness.app.prepare(
                     api.anthropic_to_chat_body(
                         {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
                     )
@@ -2735,7 +2735,7 @@ class ServerTest(unittest.TestCase):
                 )
             )
         harness.app.max_context = 256
-        job, *_ = harness.app.prepare(
+        job = harness.app.prepare(
             api.anthropic_to_chat_body(
                 {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
             )
@@ -3526,7 +3526,7 @@ class ServerTest(unittest.TestCase):
         # No server option bounds the output of a request that names no
         # limit: it may use what the two-token prompt leaves of the window.
         app = make_frontend(tokenizer, backend, "test-model", 40000, 1, 2, vision=True)
-        self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 39998)
+        self.assertEqual(app.prepare(self.body()).max_new_tokens, 39998)
         with mock.patch("sys.stderr"):
             for option, value in (
                 ("--max-context", "0"),
@@ -3566,8 +3566,8 @@ class ServerTest(unittest.TestCase):
             second = make_frontend(
                 tokenizer, second_backend, "test-model", 128, 1, 2, vision=True
             )
-        first_job, _, _ = first.prepare(self.body(seed=1))
-        second_job, _, _ = second.prepare(self.body(seed=1))
+        first_job = first.prepare(self.body(seed=1))
+        second_job = second.prepare(self.body(seed=1))
         self.assertEqual((first_job.request_id, second_job.request_id), (1, 1))
         self.assertNotEqual(first_job.public_id, second_job.public_id)
         result = backend_api.NativeResult("stop", 2, 1, 1, 1, 1)
@@ -4252,7 +4252,7 @@ class ServerTest(unittest.TestCase):
 
         job.events = SimpleNamespace(get=next_event)
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            handler._responses_stream(job, False, False)
+            handler._responses_stream(job)
 
         raw = handler.wfile.getvalue()
         stream = io.BytesIO(raw)
@@ -4322,6 +4322,7 @@ class ServerTest(unittest.TestCase):
 
         job = SimpleNamespace(
             public_id="request",
+            thinking=False,
             tool_policy=policy,
             response_validator=None,
             deadline=100,
@@ -4330,8 +4331,6 @@ class ServerTest(unittest.TestCase):
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
             calls = handler._collect(
                 job,
-                False,
-                True,
                 on_text=lambda field, text: handler._sse({field: text}),
                 on_tool_delta=handler._sse,
                 on_idle=handler._sse_keepalive,
@@ -5380,7 +5379,7 @@ class ServerTest(unittest.TestCase):
         )
         for extra, required, parallel, start in cases:
             with self.subTest(**extra):
-                job, _, _ = app.prepare(self.body(tools=tools, **extra))
+                job = app.prepare(self.body(tools=tools, **extra))
                 rendered, kwargs = tokenizer.templates[-1]
                 self.assertEqual(rendered, [{"role": "user", "content": "hello"}])
                 self.assertEqual(kwargs["tools"], tools)
@@ -5407,7 +5406,7 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [{"type": "function", "function": {"name": "f"}}]
-        job, _, _ = app.prepare(self.body(tools=tools, tool_choice="none", stop=["x"]))
+        job = app.prepare(self.body(tools=tools, tool_choice="none", stop=["x"]))
         self.assertEqual(job.tool_policy.schemas, {})
         for choice in ("auto", "required"):
             with (
@@ -5851,8 +5850,8 @@ class ServerTest(unittest.TestCase):
                     "content": "A historical <think> must not open thinking.",
                 },
             )
-            job, thinking, _ = app.prepare(body)
-            self.assertEqual((thinking, job.thinking), (expected, expected))
+            job = app.prepare(body)
+            self.assertEqual(job.thinking, expected)
             self.assertEqual(app.count_tokens(body), len(job.prompt_tokens))
         self.assertIn("think:", factory.grammars[-1])
 
@@ -5892,8 +5891,7 @@ class ServerTest(unittest.TestCase):
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
                 with self.subTest(accepted=accepted, effort=effort):
                     tokenizer.templates.clear()
-                    job, thinking, _ = app.prepare(self.body(reasoning_effort=effort))
-                    self.assertTrue(thinking)
+                    job = app.prepare(self.body(reasoning_effort=effort))
                     self.assertTrue(job.thinking)
                     self.assertEqual(
                         [
@@ -5932,8 +5930,7 @@ class ServerTest(unittest.TestCase):
             ):
                 app.prepare(self.body(reasoning_effort=effort))
         self.assertEqual(tokenizer.templates, [])
-        job, thinking, _ = app.prepare(self.body(reasoning_effort=None))
-        self.assertTrue(thinking)
+        job = app.prepare(self.body(reasoning_effort=None))
         self.assertTrue(job.thinking)
         self.assertNotIn("enable_thinking", tokenizer.templates[-1][1])
 
@@ -5995,8 +5992,7 @@ class ServerTest(unittest.TestCase):
             chat = api.anthropic_to_chat_body(
                 body, thinking_resolver=no_signed_thinking
             )
-            job, active, _ = app.prepare(chat)
-            self.assertFalse(active)
+            job = app.prepare(chat)
             self.assertFalse(job.thinking)
             self.assertEqual(
                 app.count_tokens(
@@ -6204,8 +6200,8 @@ class ServerTest(unittest.TestCase):
         harness = self.harness(FakeRuntime())
         prompt = harness.app._prepare_prompt(self.body(reasoning_effort="minimal"))
         self.assertEqual(prompt.reasoning_effort, "minimal")
-        _, thinking, _ = harness.app.prepare(self.body(reasoning_effort="minimal"))
-        self.assertTrue(thinking)
+        job = harness.app.prepare(self.body(reasoning_effort="minimal"))
+        self.assertTrue(job.thinking)
 
     def test_chat_length_safely_finishes_partial_structured_and_tool_output(self):
         schema = {
@@ -6800,7 +6796,7 @@ class ServerTest(unittest.TestCase):
             with mock.patch.object(
                 FakeTokenizer, "__call__", return_value={"input_ids": [101] * length}
             ):
-                job, *_ = harness.app.prepare(self.body())
+                job = harness.app.prepare(self.body())
             self.assertEqual(job.max_new_tokens, expected)
             self.assertEqual(len(job.prompt_tokens), length)
         with mock.patch.object(
@@ -6829,7 +6825,7 @@ class ServerTest(unittest.TestCase):
                 ),
             ):
                 if elapsed < 1:
-                    job, *_ = app.prepare(self.body(timeout=1))
+                    job = app.prepare(self.body(timeout=1))
                     self.assertEqual(job.deadline, 101.0)
                 else:
                     with self.assertRaises(api.APIError) as error:
@@ -7534,7 +7530,7 @@ class ServerTest(unittest.TestCase):
         body = self.body()
         body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
-            job, _, _ = app.prepare(body)
+            job = app.prepare(body)
         self.assertEqual(
             (job.sampling, job.seed),
             (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
@@ -7544,7 +7540,7 @@ class ServerTest(unittest.TestCase):
         blocking = Plan([[4]], block=True)
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime, queue_size=1)
-        head, _, _ = harness.app.prepare(self.body(timeout=2))
+        head = harness.app.prepare(self.body(timeout=2))
         harness.backend.submit(head)
         self.assertTrue(blocking.started.wait(1))
 
@@ -7572,9 +7568,7 @@ class ServerTest(unittest.TestCase):
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
                 harness.app.prepare(self.body(priority=value))
-        job, _, _ = harness.app.prepare_responses(
-            self.responses_body(priority="foreground")
-        )
+        job = harness.app.prepare_responses(self.responses_body(priority="foreground"))
         self.assertEqual(job.priority, native_wire.RequestPriority.FOREGROUND)
 
     def test_active_timeout_signals_and_next_request_runs(self):

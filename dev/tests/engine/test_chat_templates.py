@@ -569,7 +569,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                         "messages": messages,
                         "reasoning_effort": effort,
                     }
-                    job, _thinking, _tools = app.prepare(body)
+                    job = app.prepare(body)
                     self.assertEqual(job.generation_prompt_tokens, expected)
                     history = app.apply_template(
                         {**body, "add_generation_prompt": False}
@@ -579,9 +579,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                         app.tokenizer(history, add_special_tokens=False)["input_ids"],
                     )
                     # Images precede it, so expanding them keeps its length.
-                    image_job, _thinking, _tools = app.prepare(
-                        {**body, "messages": with_image}
-                    )
+                    image_job = app.prepare({**body, "messages": with_image})
                     self.assertEqual(image_job.generation_prompt_tokens, expected)
                     self.assertEqual(
                         image_job.prompt_tokens[-expected:],
@@ -591,7 +589,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # without a turn-start token finds the same boundary.
         app = frontend("qwen36_gguf", "<|im_end|>")
         body = {"model": "test-model", "messages": messages}
-        job, _thinking, _tools = app.prepare(body)
+        job = app.prepare(body)
         history = app.apply_template({**body, "add_generation_prompt": False})
         self.assertGreater(job.generation_prompt_tokens, 0)
         self.assertEqual(
@@ -647,8 +645,10 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 template_tokenizer, None, "test-model", 4096, 10, 2, vision=False
             )
 
-        job, thinking, _tools = frontend(gemma_tokenizer).prepare(body)
-        self.assertEqual((job.generation_prompt_tokens, thinking), (len(ids), False))
+        job = frontend(gemma_tokenizer).prepare(body)
+        self.assertEqual(
+            (job.generation_prompt_tokens, job.thinking), (len(ids), False)
+        )
         self.assertEqual(tuple(job.prompt_tokens[-len(ids) :]), ids)
         for template in (appends_nothing, rewrites_last_turn):
             with self.subTest(template=template):
@@ -685,7 +685,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             ({}, {"reasoning_effort": "none"}, on, True, 5),
         ):
             with self.subTest(options=options, extra=extra, kwargs=kwargs):
-                job, found, _tools = frontend(qwen, **options).prepare(
+                job = frontend(qwen, **options).prepare(
                     {
                         "model": "test-model",
                         "messages": messages,
@@ -694,7 +694,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     }
                 )
                 self.assertEqual(
-                    (found, job.generation_prompt_tokens), (thinking, tokens)
+                    (job.thinking, job.generation_prompt_tokens), (thinking, tokens)
                 )
         # A switch Splash does not set, as DeepSeek's templates name it.
         switch = (
@@ -705,10 +705,8 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         app = frontend(switch)
         body = {"model": "test-model", "messages": messages}
         for kwargs, expected in ((None, False), ({"thinking": True}, True)) * 2:
-            _job, thinking, _tools = app.prepare(
-                {**body, "chat_template_kwargs": kwargs}
-            )
-            self.assertEqual(thinking, expected)
+            job = app.prepare({**body, "chat_template_kwargs": kwargs})
+            self.assertEqual(job.thinking, expected)
         self.assertEqual(app.chat_templates.select(None).probe.cache_info().misses, 1)
         for kwargs, error in (
             ("on", "must be an object"),

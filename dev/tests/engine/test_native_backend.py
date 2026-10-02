@@ -288,7 +288,7 @@ class NativeBackendContractTests(unittest.TestCase):
         app = make_frontend(
             FakeTokenizer(), transport, "test-model", 128, 10, 2, vision=True
         )
-        job, _thinking, _tools = app.prepare(
+        job = app.prepare(
             {
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -370,7 +370,7 @@ class NativeBackendContractTests(unittest.TestCase):
             FakeTokenizer(), transport, "test-model", 128, math.inf, 2, vision=True
         )
         self.assertEqual(app.request_deadline({"timeout": 5}, 10), 15)
-        job, _thinking, _tools = app.prepare(
+        job = app.prepare(
             {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
         )
         self.assertEqual(

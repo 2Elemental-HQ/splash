@@ -1065,7 +1065,7 @@ class Frontend:
         max_new = self._output_budget(
             requested, prompt_tokens, output_field, clamp_output_budget
         )
-        job = self._generation_job(
+        return self._generation_job(
             options,
             prompt_tokens,
             max_new,
@@ -1085,7 +1085,6 @@ class Frontend:
             generation_prompt_tokens=rendered.generation_prompt_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
-        return job, thinking, bool(tools)
 
     def _call_openings(self, policy, thinking):
         """The tokens that begin each callable tool's call. Its parameter
@@ -1227,7 +1226,7 @@ class Frontend:
                 previous_items = json_codec.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
-            job, thinking, has_tools = self._prepare(
+            job = self._prepare(
                 chat, namespaces, deadline, output_field="max_output_tokens"
             )
             job.response_store = store
@@ -1237,7 +1236,7 @@ class Frontend:
                     *previous_items,
                     *canonical_responses_input(body.get("input")),
                 ]
-            return job, thinking, has_tools
+            return job
 
     def persist_response(self, job, response, output):
         if not job.response_store:

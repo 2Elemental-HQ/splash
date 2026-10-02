@@ -427,7 +427,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
         reservation = api.RequestBodyReservation(harness.server.request_bodies, 100)
-        job, *_ = harness.app.prepare_responses(
+        job = harness.app.prepare_responses(
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",

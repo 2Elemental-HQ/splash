@@ -74,7 +74,7 @@ class ResponseLifecycleTests(unittest.TestCase):
         harness.app.response_store.put(
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
-        job, *_ = harness.app.prepare_responses(
+        job = harness.app.prepare_responses(
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
