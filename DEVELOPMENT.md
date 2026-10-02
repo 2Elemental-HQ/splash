@@ -496,8 +496,7 @@ Each entry records in `source` its component (such as `target/layer-0.bin`),
 the digest of the source data it was written from and the source path.
 Publishing an entry removes the complete entries it supersedes: the same
 component from the same source data under another key, which an earlier
-preparation identity wrote, and entries of earlier Splash versions prepared from
-the same source path. Entries of other sources or revisions, which
+preparation identity wrote. Entries of other sources or revisions, which
 installations may share, stay. Removal happens under the converter lock, so no
 entry being written is touched, and a running process keeps the files it has
 mapped until it unmaps them. Two builds of different preparation identities

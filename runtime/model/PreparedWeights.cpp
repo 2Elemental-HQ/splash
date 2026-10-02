@@ -232,8 +232,7 @@ std::string verifiedDigest(int fd, uint64_t from, const std::filesystem::path &p
 }
 
 // What an entry records in its source file: the component, the digest of the
-// source data it was written from and the source path. Entries of earlier
-// versions recorded only the source path and the file name.
+// source data it was written from and the source path.
 constexpr std::string_view kProvenance = "splash-prepared-weight-v1";
 
 std::string provenance(const PreparedWeight &weight) {
@@ -253,12 +252,10 @@ std::vector<std::string> sourceLines(const std::filesystem::path &directory) {
 
 // Whether an entry whose source file starts with `lines` is an earlier
 // preparation of what weight holds: the same component from the same source
-// data under another key (a new preparation identity or plan), or an entry of
-// an earlier version prepared from the same source path.
+// data under another key (a new preparation identity or plan).
 bool supersedes(const PreparedWeight &weight, std::span<const std::string> lines) {
-  if (lines.size() == 4 && lines[0] == kProvenance)
-    return lines[1] == "component " + weight.component && lines[2] == "inputs " + weight.inputs;
-  return lines.size() == 2 && lines[0] == weight.source;
+  return lines.size() == 4 && lines[0] == kProvenance && lines[1] == "component " + weight.component &&
+         lines[2] == "inputs " + weight.inputs;
 }
 
 // The proof of the file of the entry at `directory`; none when it has no

@@ -381,22 +381,16 @@ void damagedProofsAreRecomputed(Cache &cache) {
 }
 
 // Publishing an entry removes the earlier preparations of its component from
-// the same source data, and the entries earlier versions prepared from its
-// source path; others stay.
+// the same source data; others stay.
 void publishingSupersedesEarlierPreparations(Cache &cache) {
   static_cast<void>(cache.prepare(36));
   const PreparedWeight older{key(30), cache.bytes.size(), "target/layer-0.bin", key(40), "/models/a"};
   const PreparedWeight otherData{key(31), cache.bytes.size(), "target/layer-0.bin", key(41), "/models/b"};
   const PreparedWeight otherComponent{key(32), cache.bytes.size(), "target/head.bin", key(40), "/models/a"};
   for (const auto &weight : {older, otherData, otherComponent}) static_cast<void>(cache.prepare(weight));
-  std::filesystem::create_directory(cache.root / key(33));
-  splash::test::writeFile(cache.root / key(33) / "source", "/models/a\nhead.bin\n");
-  std::filesystem::create_directory(cache.root / key(34));
-  splash::test::writeFile(cache.root / key(34) / "source", "/models/c\nhead.bin\n");
   static_cast<void>(cache.prepare({key(35), cache.bytes.size(), "target/layer-0.bin", key(40), "/models/a"}));
   const auto kept = [&](uint8_t value) { return std::filesystem::exists(cache.root / key(value)); };
-  require(!kept(30) && !kept(33) && kept(31) && kept(32) && kept(34) && kept(35) && kept(36),
-          "superseded entries were kept or others removed");
+  require(!kept(30) && kept(31) && kept(32) && kept(35) && kept(36), "superseded entries were kept or others removed");
 }
 
 } // namespace
