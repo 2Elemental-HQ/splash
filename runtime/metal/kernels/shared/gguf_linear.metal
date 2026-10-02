@@ -6,7 +6,6 @@
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
-#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -31,69 +30,20 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 // ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
 // a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather than
-// to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Every simdgroup still
-// stages and meets the same barrier at each step: in MSL a barrier inside a conditional must be reached by every
-// thread of the threadgroup. Full tiles run this loop too: a separate branch-free copy for them, selected per
-// threadgroup, measured up to 4% slower on an M5 Max and no faster on an M3 Max.
+// to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Full tiles run this
+// loop too: a separate branch-free copy for them, selected per threadgroup, measured up to 4% slower on an M5 Max and
+// no faster on an M3 Max.
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
-  // Prefetch: the steps whose weights are loaded ahead of the one being staged.
-  constexpr ushort Prefetch = 1, Threads = Simdgroups * 32, GPS = KS / 32, Items = TileN * GPS,
-                   IPT = (Items + Threads - 1) / Threads;
-  auto a = tensor(input + ulong(simd_group) * RowsPerSG * input_size, dextents<int, 2>{int(input_size), RowsPerSG}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(RowsPerSG, TileN, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
-  const uint groups = input_size / 32, steps = groups / GPS, units = groups / F::MetaGroups;
-  const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
-  device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
-  device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
-  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
-  auto a0 = a.template slice<KS, RowsPerSG>(0, 0);
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * TileN, dextents<int, 2>{KS, TileN}, array<int, 2>{1, KS});
-  auto b0 = bt0.slice<KS, TileN>(0, 0), b1 = bt1.slice<KS, TileN>(0, 0);
-  auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
-  const uint thread_index = simd_group * 32 + simd_lane;
-  typename F::Payload packed[Prefetch][IPT]; typename F::Meta hdr[IPT]; uint hdr_unit[IPT];
-#pragma unroll
-  for (ushort it = 0; it < IPT; ++it) {
-    const uint item = thread_index + it * Threads; const bool live = item < Items;
-    const uint col = live ? item % TileN : 0, gi = live ? item / TileN : 0;
-#pragma unroll
-    for (ushort pf = 0; pf < Prefetch; ++pf) {
-      const ulong g = ulong(pf) * GPS + gi;
-      if (live && pf < steps) packed[pf][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
-    }
-    hdr[it] = F::loadMeta(tmeta + col * F::MetaBytes); hdr_unit[it] = 0;
-  }
-  for (uint step = 0; step < steps; ++step) {
-    threadgroup half *buf = stage + (step & 1) * (KS * TileN);
-#pragma unroll
-    for (ushort it = 0; it < IPT; ++it) {
-      const uint item = thread_index + it * Threads; if (item >= Items) break;
-      const uint col = item % TileN, gi = item / TileN, g = step * GPS + gi, unit = g / F::MetaGroups; const ushort j = g % F::MetaGroups;
-      if (unit != hdr_unit[it]) { hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes); hdr_unit[it] = unit; }
-      dequant32<F>(packed[0][it], hdr[it], j, tl, buf + col * KS + gi * 32);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (step + Prefetch < steps) {
-#pragma unroll
-      for (ushort it = 0; it < IPT; ++it) {
-        const uint item = thread_index + it * Threads; if (item >= Items) break;
-        const uint col = item % TileN, gi = item / TileN; const ulong g = ulong(step + Prefetch) * GPS + gi;
-        packed[Prefetch - 1][it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
-      }
-    }
-    if (owns_rows) {
-      auto a_slice = a.template slice<KS, RowsPerSG>(step * KS, 0);
-      if (step & 1) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
-    }
-  }
+  device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
+  auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
+  gguf_zero(acc);
+  gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
+                                                              simd_group * 32 + simd_lane, 0, input_size / KS, owns_rows,
+                                                              acc);
   if (!owns_rows) return;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
@@ -132,11 +82,8 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
                                           (group.y + 1) * per, acc);
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0,
                         simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
-    // gguf_epilogue inline: calling it here reorders the lambda's captures.
     const ulong o = ulong(row) * p.out_stride + column0 + column;
-    if constexpr (Ep == EpResidual) v += float(aux[o]);
-    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
-    output[o] = Out(v);
+    output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
   });
 }
 // The staged decode kernels: grid (column tiles, K partitions), two simdgroups.
