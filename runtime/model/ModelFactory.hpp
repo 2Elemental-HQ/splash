@@ -92,9 +92,6 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 // is one shared engine and DFlash controller; only model execution differs.
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
-                 const std::filesystem::path &root);
-[[nodiscard]] ModelPackage
-loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
 

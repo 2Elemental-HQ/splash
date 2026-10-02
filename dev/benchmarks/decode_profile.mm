@@ -221,8 +221,9 @@ int main(int argc, char **argv) {
       }
 
       metal::MetalBackend backend(argv[1]);
-      model::ModelPackage model = model::loadModelPackage(
-          backend, std::filesystem::path(argv[2]));
+      const std::filesystem::path root(argv[2]);
+      model::ModelPackage model =
+          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
       ops::ExecutionPlans operators(backend.capabilities());
       model::ModelMemoryPlan executorPlan =
           model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
