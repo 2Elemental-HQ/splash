@@ -325,10 +325,10 @@ float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES,
-                                       logicalPage)[keyScaleIndex(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[keyDataIndex(
-             head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES, logicalPage)[
+      splash_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[
+             splash_kv_key_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -336,10 +336,10 @@ float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES,
-                                       logicalPage)[valueScaleIndex(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[valueDataIndex(
-             head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES, logicalPage)[
+      splash_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[
+             splash_kv_value_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -511,15 +511,14 @@ void validateStoredRow(const Case &data, bool valueTensor,
   uint32_t pageToken = logical % kPageTokens;
   const auto *scales = data.slab<const float>(
       valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, logicalPage);
-  float observedScale = scales[valueTensor ? valueScaleIndex(0, pageToken)
-                                           : keyScaleIndex(0, pageToken)];
+  float observedScale = scales[splash_kv_scale_element(0, pageToken)];
   require(std::abs(observedScale - expectedScale) <= 2e-7f,
           "stored Q8 row scale differs");
   const auto *stored = data.slab<const int8_t>(
       valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, logicalPage);
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-    uint64_t index = valueTensor ? valueDataIndex(0, pageToken, dimension)
-                                 : keyDataIndex(0, pageToken, dimension);
+    uint64_t index = valueTensor ? splash_kv_value_element(0, pageToken, dimension)
+                                 : splash_kv_key_element(0, pageToken, dimension);
     require(stored[index] == expected[dimension],
             "stored Q8 row payload differs");
   }
@@ -847,7 +846,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
         const float expectedScale = maximum / 127.0f;
         const float observedScale = reinterpret_cast<const float *>(
             slab(valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES))[
-            valueTensor ? valueScaleIndex(0, pageToken) : keyScaleIndex(0, pageToken)];
+            splash_kv_scale_element(0, pageToken)];
         require(std::abs(expectedScale - observedScale) <= 2e-7f,
                 "batched verify store scale differs");
         for (uint32_t dimension = 0; dimension < kHeadDimension;
@@ -855,8 +854,9 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
           const int8_t expected = static_cast<int8_t>(std::clamp(
               int(std::nearbyint(source[dimension] * 127.0f / maximum)),
               -127, 127));
-          const uint64_t index = valueTensor ? valueDataIndex(0, pageToken, dimension)
-                                             : keyDataIndex(0, pageToken, dimension);
+          const uint64_t index =
+              valueTensor ? splash_kv_value_element(0, pageToken, dimension)
+                          : splash_kv_key_element(0, pageToken, dimension);
           require(reinterpret_cast<const int8_t *>(
                       slab(valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS))[index] ==
                       expected,

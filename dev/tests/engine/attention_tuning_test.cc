@@ -329,7 +329,7 @@ uint64_t expectedBytes(AttentionShape shape, uint32_t rows, uint32_t lanes,
                              shape.queryHeads * 256 * 4;
   const uint64_t statistics = uint64_t{lanes} * slots * 8 *
                                shape.queryHeads * 2 * 4;
-  return align(extents) + 2 * align(chunks) + 3 * align(queries) + align(partials) +
+  return align(extents) + 2 * align(chunks) + 2 * align(queries) + align(partials) +
          align(statistics) + tables;
 }
 

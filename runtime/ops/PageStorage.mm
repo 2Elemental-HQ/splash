@@ -35,11 +35,8 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     }
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        layers_.push_back({extentPages_,
-                           static_cast<uint32_t>(splash_kv_offset(
-                               extentPages_, data, scale, layer, SPLASH_KV_KEYS, 0))});
-    }
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
     extents_.resize(pageCount_ / extentPages_);
     extentAddresses_.resize(extents_.size());
 }
@@ -105,7 +102,8 @@ SplashKvPage PageStorage::entry(uint32_t page) const {
         throw std::logic_error("KV page " + std::to_string(page) +
                                " is in an extent that is not allocated");
     }
-    return address | (page - extent * extentPages_);
+    return splash_kv_page_entry(
+        address, page - static_cast<uint32_t>(extent) * extentPages_);
 }
 
 void PageStorage::writeEntries(std::span<const uint32_t> pages,

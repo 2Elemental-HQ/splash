@@ -1,5 +1,6 @@
 #include "tuning/AttentionTuning.hpp"
 
+#include "tuning/AttentionFixture.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -7,7 +8,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -17,119 +17,41 @@ namespace splash::ops::tuning {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr uint64_t kAlignment = 16 * 1024;
+using Tensor = AttentionFixture::Tensor;
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDimension = 256;
-constexpr uint32_t kPageRows = kv::kPageTokens;
+constexpr uint32_t kDimension = AttentionFixturePlan::kHeadDimension;
 constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
 
-enum class Tensor : uint32_t {
-  Extents, ChunkKeys, ChunkValues,
-  Queries, Output, Reference, Partials, Statistics, Table0, Table1, Table2,
-  Table3, Count
-};
-constexpr size_t tensorIndex(Tensor tensor) { return static_cast<size_t>(tensor); }
-constexpr size_t kTensorCount = tensorIndex(Tensor::Count);
-
-uint64_t aligned(uint64_t bytes) {
-  if (bytes > std::numeric_limits<uint64_t>::max() - kAlignment + 1)
-    throw std::invalid_argument("attention tuning fixture size overflow");
-  return (bytes + kAlignment - 1) & ~(kAlignment - 1);
-}
-
-struct FixturePlan final {
-  AttentionShape shape;
-  uint32_t lanes = 0;
-  uint32_t rows = 0;
-  uint32_t stride = 0;
-  // Pages the history may use and the extents that hold them.
-  uint32_t poolPages = 0;
-  HostKvExtents::Geometry pool;
-  std::array<uint32_t, kMaximumLanes> histories{};
-  std::array<uint32_t, kMaximumLanes> pages{};
-  std::array<uint64_t, kTensorCount> sizes{};
-  uint64_t bytes = 0;
-
-  kv::Layout layout() const { return {1, shape.kvHeads, shape.headDimension, shape.format}; }
-  void size(Tensor tensor, uint64_t bytes) { sizes[tensorIndex(tensor)] = bytes; }
-  uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
-                      uint32_t dimension) const {
-    const uint32_t group = shape.queryHeads / shape.kvHeads;
-    return (((uint64_t{lane} * shape.kvHeads + head / group) * stride + row) *
-                group + head % group) * kDimension + dimension;
-  }
-};
-
-template <typename Workload> FixturePlan fixturePlan(Workload workload) {
-  FixturePlan plan;
-  plan.shape = workload.shape;
+// A workload's fixture: its one attention layer in as few extents as the
+// page index allows, with scratch for every candidate's plan.
+template <typename Workload> AttentionFixturePlan fixturePlan(Workload workload) {
+  const kv::Layout layout{1, workload.shape.kvHeads, workload.shape.headDimension,
+                          workload.shape.format};
+  uint32_t lanes = 1, rows = 0;
+  AttentionFixturePlan::Histories histories{};
   AttentionWorkspace scratch;
+  const auto cover = [&](AttentionWorkspace workspace) {
+    scratch.partialsBytes = std::max(scratch.partialsBytes, workspace.partialsBytes);
+    scratch.statisticsBytes = std::max(scratch.statisticsBytes, workspace.statisticsBytes);
+  };
   if constexpr (std::is_same_v<Workload, PrefillAttentionWorkload>) {
-    plan.lanes = 1;
-    plan.rows = workload.rows;
-    plan.histories[0] = workload.historyTokens;
-    for (auto config : PagedAttention::prefillCandidates()) {
-      const auto candidate = PagedAttention::prefillPlan(
-          plan.rows, plan.shape.queryHeads, plan.layout(), workload.historyTokens, config);
-      scratch.partialsBytes = std::max(scratch.partialsBytes,
-                                       candidate.workspace.partialsBytes);
-      scratch.statisticsBytes = std::max(scratch.statisticsBytes,
-                                         candidate.workspace.statisticsBytes);
-    }
+    rows = workload.rows;
+    histories[0] = workload.historyTokens;
+    for (auto config : PagedAttention::prefillCandidates())
+      cover(PagedAttention::prefillPlan(rows, workload.shape.queryHeads, layout,
+                                        workload.historyTokens, config).workspace);
   } else {
-    plan.lanes = workload.lanes;
-    plan.rows = kVerifyRows;
-    plan.histories = workload.historyTokens;
-    for (auto config : PagedAttention::verifyCandidates()) {
-      const auto candidate = PagedAttention::verifyPlan(
-          plan.lanes, plan.shape.queryHeads, plan.layout(), plan.histories, config);
-      scratch.partialsBytes = std::max(scratch.partialsBytes,
-                                       candidate.workspace.partialsBytes);
-      scratch.statisticsBytes = std::max(scratch.statisticsBytes,
-                                         candidate.workspace.statisticsBytes);
-    }
+    lanes = workload.lanes;
+    rows = kVerifyRows;
+    histories = workload.historyTokens;
+    for (auto config : PagedAttention::verifyCandidates())
+      cover(PagedAttention::verifyPlan(lanes, workload.shape.queryHeads, layout, histories,
+                                       config).workspace);
   }
-  plan.stride = (plan.rows + kPageRows - 1) / kPageRows * kPageRows;
-  uint32_t pages = 0;
-  for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
-    if (lane >= plan.lanes) {
-      if (plan.histories[lane])
-        throw std::invalid_argument("inactive tuning history must be zero");
-      continue;
-    }
-    const uint64_t tokens = uint64_t{plan.histories[lane]} + plan.rows;
-    if (tokens > kv::kMaximumPhysicalTokens)
-      throw std::invalid_argument("attention tuning history exceeds context");
-    plan.pages[lane] = uint32_t((tokens + kPageRows - 1) / kPageRows);
-    pages += plan.pages[lane];
-    plan.size(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane),
-              uint64_t{plan.pages[lane]} * sizeof(SplashKvPage));
-  }
-  // An odd pool permits an injective stride-two page permutation. Only
-  // one/two spare pages are needed, even for long exact histories.
-  plan.poolPages = pages + 1 + (pages % 2);
-  plan.pool = HostKvExtents::aligned(plan.layout(), plan.poolPages);
-  plan.size(Tensor::Extents,
-            uint64_t{plan.pool.extents} *
-                HostKvExtents::extentStride(plan.layout(), plan.pool.extentPages));
-  const uint64_t chunks = uint64_t{plan.lanes} * plan.shape.kvHeads *
-                           plan.stride * kDimension * sizeof(uint16_t);
-  const uint64_t queries = uint64_t{plan.lanes} * plan.shape.queryHeads *
-                            plan.stride * kDimension * sizeof(uint16_t);
-  plan.size(Tensor::ChunkKeys, chunks);
-  plan.size(Tensor::ChunkValues, chunks);
-  plan.size(Tensor::Queries, queries);
-  plan.size(Tensor::Output, queries);
-  plan.size(Tensor::Reference, queries);
-  plan.size(Tensor::Partials, scratch.partialsBytes);
-  plan.size(Tensor::Statistics, scratch.statisticsBytes);
-  for (uint64_t size : plan.sizes) {
-    const uint64_t allocation = aligned(size);
-    if (allocation > std::numeric_limits<uint64_t>::max() - plan.bytes)
-      throw std::invalid_argument("attention tuning fixture size overflow");
-    plan.bytes += allocation;
-  }
-  return plan;
+  const uint32_t poolPages =
+      AttentionFixturePlan::poolPagesFor(AttentionFixturePlan::pagesOf(lanes, rows, histories));
+  return AttentionFixturePlan::make(workload.shape, lanes, rows, histories, scratch,
+                                    {1, 0, HostKvExtents::aligned(layout, poolPages).extentPages});
 }
 
 struct NumericalMismatch final : std::runtime_error {
@@ -140,193 +62,92 @@ struct Interrupted final {
   MeasurementStatus status;
 };
 
-// The fixture's extents are views of its one buffer, resident for every
-// command like every backend buffer: the kernels reach them only through
-// page entries.
-class Fixture final {
+// The trials of one workload on its fixture: graphs of repeated production
+// attention, the reset before each run, and output qualification against the
+// baseline's output, which the host keeps.
+class TuningFixture final {
 public:
-  Fixture(metal::MetalBackend &backend, FixturePlan plan)
-      : plan_(std::move(plan)), base_(backend.allocateBuffer(
-            plan_.bytes, metal::BufferStorage::Shared, "attention-tuning-fixture")) {
-    uint64_t offset = 0;
-    for (size_t i = 0; i < plan_.sizes.size(); ++i) {
-      if (plan_.sizes[i]) buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
-      offset += aligned(plan_.sizes[i]);
-    }
-    const uint64_t stride =
-        HostKvExtents::extentStride(plan_.layout(), plan_.pool.extentPages);
-    std::vector<HostKvExtents::Extent> extents;
-    for (uint32_t extent = 0; extent < plan_.pool.extents; ++extent)
-      extents.push_back({data<std::byte>(Tensor::Extents) + extent * stride,
-                         get(Tensor::Extents).gpuAddress() + extent * stride});
-    pages_ = std::make_unique<HostKvExtents>(plan_.layout(), plan_.pool.extentPages,
-                                                   std::move(extents));
-    layer_ = pages_->layer(0);
-    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
-      tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
-      stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride,
-                        plan_.pages[lane], {}};
-      attention_[lane] = kv::q8VerifyAttentionParams(
-          plan_.histories[lane], kVerifyRows, plan_.stride, plan_.pages[lane]);
-    }
-    for (uint32_t lane = plan_.lanes; lane < kMaximumLanes; ++lane) {
-      tables_[lane] = tables_[0];
-      stores_[lane] = stores_[0];
-      attention_[lane] = attention_[0];
-    }
-  }
+  TuningFixture(metal::MetalBackend &backend, AttentionFixturePlan plan)
+      : fixture_(backend, std::move(plan), "attention-tuning-fixture") {}
 
   // Called once after admission. Long histories periodically consult the same
   // sweep control callback; no GPU command has been submitted at this point.
-  bool initialize(const MeasurementStop &stop) {
-    std::memset(base_.contents(), 0, plan_.bytes);
-    auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
-    auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
-    auto *queries = data<uint16_t>(Tensor::Queries);
-    uint32_t firstPage = 0;
-    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
-      pageIds_[lane].resize(plan_.pages[lane]);
-      for (uint32_t page = 0; page < plan_.pages[lane]; ++page)
-        pageIds_[lane][page] = (2 * (firstPage + page) + 1) % plan_.poolPages;
-      pages_->writeTable(pageIds_[lane], tables_[lane].contents());
-      firstPage += plan_.pages[lane];
-      for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
-        if (token % 256 == 0 && stop && stop()) return false;
-        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          if (plan_.shape.format == kv::Format::Int8) {
-            *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0.006f;
-            *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0.007f;
-          }
-          const auto key = [&](uint32_t d) {
-            return int((uint64_t{token} * 37 + head * 101 + d * 17 +
-                        uint64_t{token} * d * 3 + lane * 7) % 255) - 127;
-          };
-          const auto value = [&](uint32_t d) {
-            return int((uint64_t{token} * 53 + head * 79 + d * 29 +
-                        uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
-          };
-          // A key row is contiguous; a value column steps over the page's
-          // tokens.
-          if (plan_.shape.format == kv::Format::Int8) {
-            auto *keys = element<int8_t>(lane, SPLASH_KV_KEYS, head, token, 0);
-            auto *values = element<int8_t>(lane, SPLASH_KV_VALUES, head, token, 0);
-            for (uint32_t d = 0; d < kDimension; ++d) {
-              keys[d] = key(d);
-              values[d * kPageRows] = value(d);
-            }
-          } else {
-            auto *keys = element<uint16_t>(lane, SPLASH_KV_KEYS, head, token, 0);
-            auto *values = element<uint16_t>(lane, SPLASH_KV_VALUES, head, token, 0);
-            for (uint32_t d = 0; d < kDimension; ++d) {
-              keys[d] = floatToBf16(key(d) * 0.006f);
-              values[d * kPageRows] = floatToBf16(value(d) * 0.007f);
-            }
-          }
-        }
-      }
-      for (uint32_t row = 0; row < plan_.rows; ++row) {
-        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const uint64_t base = (uint64_t{lane} * plan_.shape.kvHeads + head) *
-                                 plan_.stride * kDimension;
-          for (uint32_t d = 0; d < kDimension; ++d) {
-            chunkKeys[base + row * kDimension + d] =
-                floatToBf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
-            chunkValues[base + uint64_t{d} * plan_.stride + row] =
-                floatToBf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
-          }
-        }
-        for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
-          for (uint32_t d = 0; d < kDimension; ++d)
-            queries[plan_.queryIndex(lane, head, row, d)] =
-                floatToBf16(float(int((row * 43 + head * 67 + d * 11 + head * d * 7 +
-                                lane * 29) % 1019) - 509) / 1018.0f);
-      }
-    }
-    return true;
-  }
+  bool initialize(const MeasurementStop &stop) { return fixture_.fill(stop); }
 
   template <typename Config> metal::CommandGraph graph(Config config,
                                                        uint32_t repetitions = 1) const {
+    const auto &plan = fixture_.plan();
     metal::CommandGraph result;
     const auto attentionPlan = [&] {
       if constexpr (std::is_same_v<Config, PrefillAttentionConfig>)
-        return PagedAttention::prefillPlan(plan_.rows, plan_.shape.queryHeads,
-                                           plan_.layout(), plan_.histories[0], config);
+        return PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads,
+                                           plan.layout(), plan.histories[0], config);
       else
-        return PagedAttention::verifyPlan(plan_.lanes, plan_.shape.queryHeads,
-                                          plan_.layout(), plan_.histories, config);
+        return PagedAttention::verifyPlan(plan.lanes, plan.shape.queryHeads,
+                                          plan.layout(), plan.histories, config);
     }();
     // Each repeated subgraph begins with the deterministic KV store and ends
     // with split reduction. It never consumes the previous attention output:
     // queries/chunk K/V/history remain unchanged and current KV slots are
     // overwritten with identical values. Do not repeat individual dispatches.
-    for (uint32_t repetition = 0; repetition < repetitions; ++repetition) {
-      if constexpr (std::is_same_v<Config, PrefillAttentionConfig>) {
-        PagedAttention::addPrefillStore(result, layer_, get(Tensor::ChunkKeys),
-                                        get(Tensor::ChunkValues), tables_[0], stores_[0],
-                                        plan_.layout());
-        PagedAttention::addPrefill(result, layer_, get(Tensor::Queries), get(Tensor::Output),
-                                   get(Tensor::Partials), get(Tensor::Statistics), tables_[0],
-                                   stores_[0], attentionPlan);
-      } else {
-        PagedAttention::addVerify(
-            result, layer_, {get(Tensor::ChunkKeys), get(Tensor::ChunkValues),
-                             get(Tensor::Queries), get(Tensor::Partials),
-                             get(Tensor::Statistics), get(Tensor::Output), tables_},
-            stores_, attention_, attentionPlan);
-      }
-    }
+    for (uint32_t repetition = 0; repetition < repetitions; ++repetition)
+      fixture_.addGraph(result, attentionPlan);
     return result;
   }
 
   void reset() {
-    for (Tensor tensor : {Tensor::Output, Tensor::Partials, Tensor::Statistics})
-      std::memset(get(tensor).contents(), 0, get(tensor).sizeBytes());
+    for (Tensor tensor : {Tensor::Output, Tensor::Partials, Tensor::Statistics}) {
+      const metal::MetalBuffer buffer = fixture_.buffer(tensor);
+      std::memset(buffer.contents(), 0, buffer.sizeBytes());
+    }
     // Only current-row cache slots are mutated by the production store.
     // Restore those exact slots; immutable history, input and tables remain.
-    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
-      for (uint32_t row = 0; row < plan_.rows; ++row)
-        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const uint32_t token = plan_.histories[lane] + row;
-          if (plan_.shape.format == kv::Format::Int8) {
-            *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0;
-            *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0;
-            for (uint32_t d = 0; d < kDimension; ++d) {
-              *element<int8_t>(lane, SPLASH_KV_KEYS, head, token, d) = 0;
-              *element<int8_t>(lane, SPLASH_KV_VALUES, head, token, d) = 0;
-            }
+    const auto clear = [](auto *keys, auto *values) {
+      for (uint32_t d = 0; d < kDimension; ++d) {
+        keys[d] = 0;
+        values[d * kv::kPageTokens] = 0;
+      }
+    };
+    const auto &plan = fixture_.plan();
+    for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+      for (uint32_t row = 0; row < plan.rows; ++row)
+        for (uint32_t head = 0; head < plan.shape.kvHeads; ++head) {
+          const uint32_t token = plan.histories[lane] + row;
+          if (plan.shape.format == kv::Format::Int8) {
+            *fixture_.scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0;
+            *fixture_.scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0;
+            clear(fixture_.keyRow<int8_t>(lane, head, token),
+                  fixture_.valueColumn<int8_t>(lane, head, token));
           } else {
-            for (uint32_t d = 0; d < kDimension; ++d) {
-              *element<uint16_t>(lane, SPLASH_KV_KEYS, head, token, d) = 0;
-              *element<uint16_t>(lane, SPLASH_KV_VALUES, head, token, d) = 0;
-            }
+            clear(fixture_.keyRow<uint16_t>(lane, head, token),
+                  fixture_.valueColumn<uint16_t>(lane, head, token));
           }
         }
   }
 
   void qualify(bool baseline) {
-    auto *reference = data<uint16_t>(Tensor::Reference);
-    const auto *output = data<uint16_t>(Tensor::Output);
+    const auto &plan = fixture_.plan();
+    const metal::MetalBuffer output = fixture_.buffer(Tensor::Output);
+    const auto *values = static_cast<const uint16_t *>(output.contents());
     double dot = 0, refSquared = 0, outSquared = 0;
     float maximumError = 0;
-    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
-      for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
-        for (uint32_t row = 0; row < plan_.rows; ++row)
+    for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+      for (uint32_t head = 0; head < plan.shape.queryHeads; ++head)
+        for (uint32_t row = 0; row < plan.rows; ++row)
           for (uint32_t d = 0; d < kDimension; ++d) {
-            const uint64_t index = plan_.queryIndex(lane, head, row, d);
-            const float right = bf16ToFloat(output[index]);
+            const uint64_t index = plan.queryIndex(lane, head, row, d);
+            const float right = bf16ToFloat(values[index]);
             if (!std::isfinite(right)) throw NumericalMismatch();
-            if (!haveReference_) continue;
-            const float left = bf16ToFloat(reference[index]);
+            if (reference_.empty()) continue;
+            const float left = bf16ToFloat(reference_[index]);
             maximumError = std::max(maximumError, std::abs(left - right));
             dot += double(left) * right;
             refSquared += double(left) * left;
             outSquared += double(right) * right;
           }
-    if (!haveReference_) {
+    if (reference_.empty()) {
       if (!baseline) throw std::logic_error("attention baseline was not measured first");
-      std::memcpy(reference, output, get(Tensor::Output).sizeBytes());
-      haveReference_ = true;
+      reference_.assign(values, values + output.sizeBytes() / sizeof(uint16_t));
     } else if (!(maximumError < 0.02f) || !(refSquared > 0) || !(outSquared > 0) ||
                !(dot / std::sqrt(refSquared * outSquared) > 0.9995)) {
       throw NumericalMismatch();
@@ -334,34 +155,9 @@ public:
   }
 
 private:
-  metal::MetalBuffer get(Tensor tensor) const { return buffers_[tensorIndex(tensor)]; }
-  template <typename T> T *data(Tensor tensor) const {
-    return static_cast<T *>(get(tensor).contents());
-  }
-  // A lane's slot of a token in its page: keys token-major, values
-  // dimension-major, one scale per (head, token) (q8_paging.h).
-  template <typename T>
-  T *element(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token,
-             uint32_t dimension) const {
-    const uint64_t index = tensor == SPLASH_KV_KEYS
-        ? (uint64_t{head} * kPageRows + token % kPageRows) * kDimension + dimension
-        : (uint64_t{head} * kDimension + dimension) * kPageRows + token % kPageRows;
-    return pages_->slab<T>(0, tensor, pageIds_[lane][token / kPageRows]) + index;
-  }
-  float *scale(uint32_t lane, uint32_t tensor, uint32_t head, uint32_t token) const {
-    return pages_->slab<float>(0, tensor, pageIds_[lane][token / kPageRows]) +
-           head * kPageRows + token % kPageRows;
-  }
-  FixturePlan plan_;
-  metal::MetalBuffer base_;
-  std::array<metal::MetalBuffer, kTensorCount> buffers_{};
-  std::unique_ptr<HostKvExtents> pages_;
-  std::array<std::vector<uint32_t>, kMaximumLanes> pageIds_;
-  SplashKvLayer layer_{};
-  std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
-  std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};
-  std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};
-  bool haveReference_ = false;
+  AttentionFixture fixture_;
+  // The baseline's output, once it ran.
+  std::vector<uint16_t> reference_;
 };
 
 template <typename Workload, typename Config>
@@ -399,12 +195,12 @@ Result tune(metal::MetalBackend &backend, const metal::AllocationAdmission &admi
     if (!admit || !validMeasurementOptions(options) || interrupted() ||
         plan.bytes > backend.capabilities().maxBufferLengthBytes)
       return result;
-    std::unique_ptr<Fixture> fixture;
+    std::unique_ptr<TuningFixture> fixture;
     bool invoked = false;
     const auto admitted = admit(plan.bytes, [&] {
       if (invoked) throw std::logic_error("attention fixture admission invoked twice");
       invoked = true;
-      fixture = std::make_unique<Fixture>(backend, plan);
+      fixture = std::make_unique<TuningFixture>(backend, plan);
     });
     if (!admitted) {
       if (fixture) throw std::logic_error("attention admission denied after retaining allocation");

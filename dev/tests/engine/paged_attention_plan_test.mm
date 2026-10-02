@@ -242,32 +242,28 @@ struct Case final {
            dimension;
   }
 
-  // A head's slot of a token in its page: keys token-major, values
-  // dimension-major, one scale per (head, token) (q8_paging.h).
   uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / 32]; }
-  static uint32_t slot(uint32_t head, uint32_t token) { return head * 32 + token % 32; }
-  static uint64_t valueIndex(uint32_t head, uint32_t token, uint32_t dimension) {
-    return (uint64_t{head} * 256 + dimension) * 32 + token % 32;
-  }
 
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = uint64_t{slot(head, token)} * 256 + dimension;
+    const uint64_t index = splash_kv_key_element(head, token % 32, dimension);
+    const uint64_t scale = splash_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
     return pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index] *
-           pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot(head, token)];
+           pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[scale];
   }
 
   float value(uint32_t lane, uint32_t head, uint32_t token,
                uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = valueIndex(head, token, dimension);
+    const uint64_t index = splash_kv_value_element(head, token % 32, dimension);
+    const uint64_t scale = splash_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
     return pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index] *
-           pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot(head, token)];
+           pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[scale];
   }
 };
 
@@ -325,7 +321,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
       const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
-        const uint32_t slot = Case::slot(head, token);
+        const uint64_t slot = splash_kv_scale_element(head, token % 32);
         if (layout.format == kv::Format::Int8) {
           data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.006f;
           data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.007f;
@@ -335,8 +331,8 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                                token * dimension * 3 + lane * 7) % 255) - 127;
           const int value = int((token * 53 + head * 79 + dimension * 29 +
                                  token * dimension * 5 + lane * 19) % 255) - 127;
-          const uint64_t keyIndex = uint64_t{slot} * 256 + dimension;
-          const uint64_t valueIndex = Case::valueIndex(head, token, dimension);
+          const uint64_t keyIndex = splash_kv_key_element(head, token % 32, dimension);
+          const uint64_t valueIndex = splash_kv_value_element(head, token % 32, dimension);
           if (layout.format == kv::Format::Int8) {
             data.pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = key;
             data.pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = value;
@@ -479,8 +475,8 @@ std::vector<std::vector<std::byte>> expectedBf16Store(const Case &data) {
         const uint32_t extent = id / data.pool.extentPages();
         for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
           for (uint32_t d = 0; d < 256; ++d) {
-            const uint64_t element = tensor ? Case::valueIndex(head, token, d)
-                                            : uint64_t{Case::slot(head, token)} * 256 + d;
+            const uint64_t element = tensor ? splash_kv_value_element(head, token % 32, d)
+                                            : splash_kv_key_element(head, token % 32, d);
             const auto offset = reinterpret_cast<const std::byte *>(page + element) -
                                 data.pool.bytes(extent).data();
             const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) * data.stride * 256;

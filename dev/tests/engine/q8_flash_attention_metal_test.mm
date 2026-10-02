@@ -283,10 +283,10 @@ float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES,
-                                       logicalPage)[keyScaleIndex(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[keyDataIndex(
-             head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES, logicalPage)[
+      splash_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[
+             splash_kv_key_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -294,10 +294,10 @@ float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES,
-                                       logicalPage)[valueScaleIndex(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[valueDataIndex(
-             head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES, logicalPage)[
+      splash_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[
+             splash_kv_value_element(head, pageToken, dimension)]) *
          scale;
 }
 

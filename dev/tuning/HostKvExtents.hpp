@@ -20,8 +20,10 @@ namespace splash::ops::tuning {
 // kernel tests and benchmarks that fill and read pages on the host. Page p
 // sits in extent p / extentPages at index p % extentPages, and every
 // layer's region where splash_kv_offset places it, as in production
-// extents; kernels reach a page only through its entry. Extents are sized
-// exactly, so an access past one fails under shader validation.
+// extents; kernels reach a page only through its entry. The constructors
+// size each extent exactly, so an access past one fails under shader
+// validation; contiguous() extents lie extentStride() apart in one region,
+// and an access past one runs into its neighbour unchecked.
 class HostKvExtents final {
 public:
   struct Extent final {
@@ -88,7 +90,18 @@ public:
     validate();
   }
 
-  [[nodiscard]] kv::Layout layout() const noexcept { return layout_; }
+  // `extents` extents one after another in a region the caller allocated,
+  // extentStride() bytes each, and keeps resident for its commands.
+  [[nodiscard]] static HostKvExtents contiguous(kv::Layout layout, uint32_t extentPages,
+                                                uint32_t extents, std::byte *contents,
+                                                uint64_t gpuAddress) {
+    const uint64_t stride = extentStride(layout, extentPages);
+    std::vector<Extent> placed;
+    for (uint32_t index = 0; index < extents; ++index)
+      placed.push_back({contents + index * stride, gpuAddress + index * stride});
+    return {layout, extentPages, std::move(placed)};
+  }
+
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
   [[nodiscard]] uint32_t extentCount() const noexcept {
     return static_cast<uint32_t>(extents_.size());
@@ -103,10 +116,7 @@ public:
   [[nodiscard]] SplashKvLayer layer(uint32_t index) const {
     if (index >= layout_.attentionLayers)
       throw std::out_of_range("host KV layer is outside the layout");
-    return {extentPages_, static_cast<uint32_t>(offset(index, SPLASH_KV_KEYS, 0))};
-  }
-  [[nodiscard]] SplashKvPage entry(uint32_t page) const {
-    return extent(page).gpuAddress | (page % extentPages_);
+    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), index);
   }
   // Writes the entries of `pages` to the start of a CPU-visible table.
   void writeTable(std::span<const uint32_t> pages, void *table) const {
@@ -156,11 +166,17 @@ private:
       throw std::out_of_range("host KV page is outside the extents");
     return extents_[page / extentPages_];
   }
+  [[nodiscard]] SplashKvPage entry(uint32_t page) const {
+    return splash_kv_page_entry(extent(page).gpuAddress, page % extentPages_);
+  }
+  [[nodiscard]] uint32_t dataBytes() const noexcept {
+    return static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+  }
+  [[nodiscard]] uint32_t scaleBytes() const noexcept {
+    return static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+  }
   [[nodiscard]] uint64_t offset(uint32_t layer, uint32_t tensor, uint32_t index) const {
-    return splash_kv_offset(extentPages_,
-                            static_cast<uint32_t>(layout_.dataBytesPerLayerPage()),
-                            static_cast<uint32_t>(layout_.scaleBytesPerLayerPage()),
-                            layer, tensor, index);
+    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layer, tensor, index);
   }
 
   kv::Layout layout_;

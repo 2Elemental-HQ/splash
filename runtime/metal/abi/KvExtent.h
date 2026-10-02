@@ -11,11 +11,16 @@
 #include <stdint.h>
 #endif
 
+#include "metal/abi/ExecutionGeometry.h"
+
 // One KV page as kernels address it: the GPU address of the extent that holds
 // it, 16 KiB-aligned, with the page's index in the extent in the low bits.
 typedef uint64_t SplashKvPage;
 #define SPLASH_KV_PAGE_INDEX_BITS 14u
 #define SPLASH_KV_PAGE_INDEX_MASK ((1u << SPLASH_KV_PAGE_INDEX_BITS) - 1u)
+
+// The dimension of every KV head a page holds.
+#define SPLASH_KV_HEAD_DIMENSION 256u
 
 // The tensors of a layer, in the order they sit in its region of an extent.
 // BF16 has no scales: their bytes are zero.
@@ -29,6 +34,28 @@ typedef uint64_t SplashKvPage;
 inline uint32_t splash_kv_page_bytes(uint32_t data_bytes, uint32_t scale_bytes,
                                      uint32_t tensor) {
   return tensor % 2 ? scale_bytes : data_bytes;
+}
+
+// Where one element of one KV head sits in a page's slab of a tensor, in
+// elements, for `token` of the page's SPLASH_TARGET_KV_BLOCK_TOKENS: keys
+// token-major, values dimension-major, and one scale per (head, token) for
+// either of them.
+inline uint64_t splash_kv_key_element(uint32_t head, uint32_t token,
+                                      uint32_t dimension) {
+  return (uint64_t(head) * SPLASH_TARGET_KV_BLOCK_TOKENS + token) *
+             SPLASH_KV_HEAD_DIMENSION +
+         dimension;
+}
+
+inline uint64_t splash_kv_value_element(uint32_t head, uint32_t token,
+                                        uint32_t dimension) {
+  return (uint64_t(head) * SPLASH_KV_HEAD_DIMENSION + dimension) *
+             SPLASH_TARGET_KV_BLOCK_TOKENS +
+         token;
+}
+
+inline uint64_t splash_kv_scale_element(uint32_t head, uint32_t token) {
+  return uint64_t(head) * SPLASH_TARGET_KV_BLOCK_TOKENS + token;
 }
 
 // Where one tensor of one page of one layer sits in its extent, in bytes.
@@ -54,3 +81,16 @@ struct SplashKvLayer {
 };
 
 static_assert(sizeof(SplashKvLayer) == 8, "KV layer placement is 8 bytes on both sides");
+
+// The placement of `layer` in a pool of extents of extent_pages pages.
+inline SplashKvLayer splash_kv_layer(uint32_t extent_pages, uint32_t data_bytes,
+                                     uint32_t scale_bytes, uint32_t layer) {
+  return {extent_pages, uint32_t(splash_kv_offset(extent_pages, data_bytes, scale_bytes,
+                                                  layer, SPLASH_KV_KEYS, 0))};
+}
+
+// The entry of the page at `index` of the extent whose GPU address is
+// extent_address.
+inline SplashKvPage splash_kv_page_entry(uint64_t extent_address, uint32_t index) {
+  return extent_address | index;
+}
