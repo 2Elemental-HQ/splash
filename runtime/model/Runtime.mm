@@ -335,8 +335,8 @@ struct Runtime::Impl {
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return QwenTarget(weights, value.backend, operators,
-                                            value.kvPages.layout().format);
+                          return QwenTarget(weights, geometry.target,
+                                            value.backend, operators);
                         },
                         value.package.target)),
         draftModel(value.package.draft, value.backend, operators) {

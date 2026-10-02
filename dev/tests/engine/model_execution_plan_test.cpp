@@ -70,7 +70,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
   ops::ExecutionPlans baseline(device);
-  const auto before = model::plannedRuntimeMemory(device, package, baseline);
+  const auto before = model::plannedRuntimeMemory(device, package, baseline, kv::Format::Int8);
   const auto geometry = std::visit([](const auto &weights) {
     return model::qwenTargetGeometry(weights);
   }, package.target);
@@ -87,7 +87,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
                            {ops::MoeExpertTile::M32}});
   ops::ExecutionPlans selected(device);
   selected.install(choices);
-  const auto after = model::plannedRuntimeMemory(device, package, selected);
+  const auto after = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
   const auto prefillBefore = baseline.prefillAttentionWorkspace(
       2048, attention.queryHeads, geometry.kvLayout);
   const auto prefillAfter = selected.prefillAttentionWorkspace(
@@ -131,7 +131,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
                   .configuration().groups == 80,
           "paired draft did not use the same selection owner");
   selected.install({});
-  const auto reset = model::plannedRuntimeMemory(device, package, selected);
+  const auto reset = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
   require(reset.sharedPrefillPlannedAllocatedBytes ==
               before.sharedPrefillPlannedAllocatedBytes &&
               reset.sharedDecodePlannedAllocatedBytes ==
@@ -158,7 +158,7 @@ void checkMixedLayouts() {
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
     ops::ExecutionPlans plans(device);
-    const auto geometry = model::RuntimeGeometry::from(mixed);
+    const auto geometry = model::RuntimeGeometry::from(mixed, kv::Format::Int8);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
       return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
@@ -208,7 +208,7 @@ void checkMixedLayouts() {
 // lane's plan of every affine target and draft projection, including an
 // installed choice at eight splits, at the measured core counts.
 void checkLaneScratch(const model::ModelPackage &package) {
-  const auto geometry = model::RuntimeGeometry::from(package);
+  const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
   std::vector<ops::LinearMatrix> matrices{
       {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
@@ -250,14 +250,15 @@ void checkUnsizedProjection() {
   auto broken = package<model::Qwen3_8Weights>();
   std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
   bool rejected = false;
-  try { static_cast<void>(model::RuntimeGeometry::from(broken)); }
+  try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
   catch (const std::invalid_argument &) { rejected = true; }
   require(rejected, "a target projection without sizes reached arena sizing");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
-// heads span another width is refused before loading and at arena sizing.
-// The packed GDN rows must also hold the two gates of every value head.
+// heads span another width is refused before loading. Arena sizing checks
+// the GDN shape, whose packed rows must also hold the two gates of every
+// value head.
 void checkGdnWidths() {
   const auto sparse = package<model::Qwen3_6MoeWeights>();
   const auto layoutRejected = [](const model::Qwen3_6MoeLayout &layout) {
@@ -268,7 +269,7 @@ void checkGdnWidths() {
   const auto geometryRejected = [&](const model::Qwen3_6MoeLayout &layout) {
     auto broken = sparse;
     std::get<model::Qwen3_6MoeWeights>(broken.target).layout = layout;
-    try { static_cast<void>(model::RuntimeGeometry::from(broken)); }
+    try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
     catch (const std::invalid_argument &) { return true; }
     return false;
   };
@@ -278,7 +279,7 @@ void checkGdnWidths() {
   auto narrowValues = shipped;
   narrowValues.gdnValueHeads = narrowValues.gdnKeyHeads;
   narrowValues.convolutionDimension = 3 * narrowValues.gdnKeyHeads * narrowValues.gdnHeadDimension;
-  require(layoutRejected(narrowValues) && geometryRejected(narrowValues),
+  require(layoutRejected(narrowValues),
           "a GDN value width other than attentionWidth was accepted");
   auto withoutGates = shipped;
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;

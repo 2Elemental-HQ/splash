@@ -807,9 +807,9 @@ int main(int argc, char **argv) {
     const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
     bootstrapConfig.nativeLoop.maskWordsPerToken = maskWordsPerToken;
     bootstrapConfig.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-    bootstrapConfig.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
+    bootstrapConfig.protocolLimits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
     bootstrapConfig.protocolLimits.maxMaskWords =
-        maskWordsPerToken * (capabilities.draftQueryRows + 1);
+        maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;

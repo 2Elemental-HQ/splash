@@ -398,16 +398,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.vision = vision;
   std::visit(
       [&](const auto &layout) {
-        result.capabilities = {
-            layout.vocabularySize,
-            layout.maximumContextTokens,
-            ExecutionLimits::maximumBatchWidth,
-            ExecutionLimits::prefillTokenBudget,
-            ExecutionLimits::draftQueryRows,
-            ExecutionLimits::draftProposalTokens,
-            ExecutionLimits::targetVerifyRows,
-            ExecutionLimits::draftContextTokens,
-        };
+        result.capabilities = {layout.vocabularySize,
+                               layout.maximumContextTokens};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -419,12 +411,6 @@ bool ModelDescriptor::valid() const noexcept {
   if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf) ||
       name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
-      capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||
-      capabilities.prefillTokenBudget != ExecutionLimits::prefillTokenBudget ||
-      capabilities.draftQueryRows != ExecutionLimits::draftQueryRows ||
-      capabilities.draftProposalTokens != ExecutionLimits::draftProposalTokens ||
-      capabilities.targetVerifyRows != ExecutionLimits::targetVerifyRows ||
-      capabilities.draftContextTokens != ExecutionLimits::draftContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
       vision.outputHiddenSize != draft.hiddenSize) {

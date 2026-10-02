@@ -21,7 +21,6 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
                 QwenTargetGeometry::maximumCaptureLayers);
   QwenTargetGeometry result;
-  result.maximumContextTokens = layout.maximumContextTokens;
   result.layers = layout.layers;
   result.hiddenSize = layout.hiddenSize;
   result.vocabularySize = layout.vocabularySize;
@@ -82,18 +81,18 @@ void requireWeights(const Weights &weights,
 
 template <class Layout, class Layer>
 QwenTarget::QwenTarget(const QwenTargetWeights<Layout, Layer> &weights,
+                       const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators, kv::Format format)
-    : weights_(&weights), weightsBase_(weights), geometry_(qwenTargetGeometry(weights)),
+                       const ops::ExecutionPlans &operators)
+    : weights_(&weights), weightsBase_(weights), geometry_(geometry),
       backend_(backend), operators_(operators) {
-  geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
-template QwenTarget::QwenTarget(const Qwen3_8Weights &, metal::MetalBackend &, const ops::ExecutionPlans &,
-                                kv::Format);
-template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &, kv::Format);
+template QwenTarget::QwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &);
+template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &);
 
 namespace {
 

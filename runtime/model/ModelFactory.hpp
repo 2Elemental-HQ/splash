@@ -29,8 +29,7 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Layout targetKvLayout(
-      kv::Format format = kv::Format::Int8) const noexcept {
+  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;
     return layout;
@@ -109,7 +108,7 @@ inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format = kv::Format::Int8);
+                     kv::Format format);
 // The file, when given, holds one state per slot and shares the cache's
 // disk budget.
 [[nodiscard]] std::unique_ptr<StateStorage>

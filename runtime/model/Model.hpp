@@ -295,16 +295,10 @@ namespace model {
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
-  uint32_t maximumBatchWidth = 0;
-  uint32_t prefillTokenBudget = 0;
-  uint32_t draftQueryRows = 0;
-  uint32_t draftProposalTokens = 0;
-  uint32_t targetVerifyRows = 0;
-  uint32_t draftContextTokens = 0;
 };
 
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
-// target/draft manifests are validated against these capabilities at startup;
+// target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;

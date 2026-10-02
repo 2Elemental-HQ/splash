@@ -88,7 +88,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
-      bytesFor<float>(geometry.draftState.headDimension / 2));
+      bytesFor<float>(geometry.draftRotaryPairs()));
   put(PrefillTensor::RopeCos,
       bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
   put(PrefillTensor::RopeSin,
@@ -101,10 +101,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.qkvSize));
   put(PrefillTensor::DraftRopeCos,
       bytesFor<float>(uint64_t{kPrefillRows} *
-                      (geometry.draftState.headDimension / 2)));
+                      geometry.draftRotaryPairs()));
   put(PrefillTensor::DraftRopeSin,
       bytesFor<float>(uint64_t{kPrefillRows} *
-                      (geometry.draftState.headDimension / 2)));
+                      geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kPackedAttentionRows *
@@ -228,9 +228,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // Proposal attention and accepted target-hidden injection use the same
   // eight absolute positions, so one RoPE table per lane is sufficient.
   put(DecodeTensor::DraftRopeCos,
-      bytesFor<float>(r * (geometry.draftState.headDimension / 2)));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::DraftRopeSin,
-      bytesFor<float>(r * (geometry.draftState.headDimension / 2)));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::FinalHidden,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Logits,

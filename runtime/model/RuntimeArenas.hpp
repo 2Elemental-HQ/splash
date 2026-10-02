@@ -39,18 +39,16 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
-  DraftStateLayout draftState;
 
-  [[nodiscard]] static RuntimeGeometry from(
-      const ModelPackage &package, kv::Format format = kv::Format::Int8) {
+  [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package,
+                                            kv::Format format) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = package.draft.layout;
-    result.draftState = result.draft.stateLayout();
-    if (!result.target.valid() || !result.draftState.valid() ||
+    if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
         result.target.capturedHiddenSize() != result.draft.targetHiddenSize) {
@@ -59,6 +57,9 @@ struct RuntimeGeometry final {
     return result;
   }
 
+  [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
+    return draft.attentionHeadDimension / 2;
+  }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return (target.vocabularySize + 31) / 32;
   }
@@ -189,10 +190,9 @@ public:
           std::pow(geometry.target.rotaryTheta,
                    -static_cast<float>(dim) / geometry.target.rotaryPairs);
     }
-    const uint32_t draftRotaryPairs = geometry.draftState.headDimension / 2;
-    for (uint32_t dim = 0; dim < draftRotaryPairs; ++dim) {
+    for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
-                            -static_cast<float>(dim) / draftRotaryPairs);
+                            -static_cast<float>(dim) / geometry.draftRotaryPairs());
     }
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
