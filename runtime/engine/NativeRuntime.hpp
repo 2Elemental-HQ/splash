@@ -28,6 +28,13 @@ struct NativeLoopClocks {
 };
 
 // Translates native protocol messages and events at the Engine boundary.
+//
+// The engine's failure boundary. Every received frame, tick() and
+// runControl() run inside it: an exception is reported once as an
+// EngineUnhealthy ErrorEvent (metal_execution_failed for MetalBackendError,
+// else engine_execution_failed), the connection closes and the process exits.
+// Request-scoped problems never arrive as exceptions here except
+// std::invalid_argument from Engine::submit.
 class NativeRuntime final : private EngineEventSink {
 public:
   using ByteSink = std::function<void(std::span<const uint8_t>)>;

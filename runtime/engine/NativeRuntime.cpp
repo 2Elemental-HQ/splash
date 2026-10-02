@@ -106,13 +106,15 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
 bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
   if (closeConnection_)
     return false;
-  size_t offset = 0;
-  while (offset < bytes.size() && !closeConnection_) {
-    protocol::ParseStep step = parser_.consume(bytes.subspan(offset));
-    offset += step.consumedBytes;
-    if (step.issue)
-      return handleIssue(std::move(*step.issue));
-    if (step.frame) {
+  try {
+    size_t offset = 0;
+    while (offset < bytes.size() && !closeConnection_) {
+      protocol::ParseStep step = parser_.consume(bytes.subspan(offset));
+      offset += step.consumedBytes;
+      if (step.issue)
+        return handleIssue(std::move(*step.issue));
+      if (!step.frame)
+        continue;
       // The parser is already past a frame it yielded, so a request-scoped
       // decode failure leaves the frames behind it to be processed.
       auto decoded = protocol::decodeFrame(*step.frame, limits_);
@@ -132,10 +134,10 @@ bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
         if (!handleIssue(std::move(*decoded.issue)))
           return false;
       }
-    } else if (!step.consumedBytes) {
-      engineError("protocol_stalled", "protocol parser made no input progress");
-      return false;
     }
+  } catch (...) {
+    executionFailed(std::current_exception());
+    return false;
   }
   return !closeConnection_;
 }
@@ -241,11 +243,6 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
                         protocol::IssueCode::InvalidRequestId,
                         request.requestId, "request id is already active"});
   }
-  if (!ready_) {
-    requestError(request.requestId, "engine_not_ready",
-                 "engine warmup has not completed", true);
-    return true;
-  }
   const uint64_t nowUnix = clocks_.unixMicros();
   const double nowMonotonic = clocks_.monotonicMilliseconds();
   const uint64_t remaining =
@@ -298,52 +295,16 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   } catch (const std::invalid_argument &error) {
     requestError(request.requestId, "invalid_request", error.what());
     return true;
-  } catch (const std::exception &error) {
-    engineError("request_admission_failed", error.what());
-    return false;
-  } catch (...) {
-    engineError("request_admission_failed",
-                "unknown request admission exception");
-    return false;
   }
-  try {
-    auto [_, inserted] = telemetry_.emplace(
-        request.requestId,
-        RequestTelemetry{.arrivedMilliseconds = nowMonotonic});
-    if (!inserted) {
-      throw std::logic_error("accepted request already has native telemetry");
-    }
-  } catch (const std::exception &error) {
-    // Core admission has already committed. Any failure in the matching
-    // native registry is an engine invariant failure; treating
-    // it as a bad client request would continue with split ownership.
-    engineError("request_admission_failed", error.what());
-    return false;
-  } catch (...) {
-    engineError("request_admission_failed",
-                "unknown request telemetry exception");
-    return false;
-  }
+  telemetry_.emplace(request.requestId,
+                     RequestTelemetry{.arrivedMilliseconds = nowMonotonic});
   return true;
 }
 
 bool NativeRuntime::handleCancel(const protocol::CancelFrame &cancel) {
-  if (!telemetry_.contains(cancel.requestId)) {
-    // Cancel can arrive after the terminal event; treat it as a no-op.
-    return true;
-  }
-  try {
+  // Cancel can arrive after the terminal event; it is then a no-op.
+  if (telemetry_.contains(cancel.requestId))
     core_.cancel(cancel.requestId);
-  } catch (const std::exception &error) {
-    // A decoded cancel for live telemetry has no remaining client-side
-    // semantic failure. Core cancellation/release exceptions indicate
-    // inconsistent engine ownership and must stop this process.
-    engineError("cancel_failed", error.what());
-    return false;
-  } catch (...) {
-    engineError("cancel_failed", "unknown cancellation exception");
-    return false;
-  }
   return true;
 }
 
@@ -352,40 +313,27 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
     // A CPU mask calculation can finish after the request ends.
     return true;
   }
-  try {
-    auto found = pendingMasks_.find(mask.requestId);
-    if (found == pendingMasks_.end() ||
-        found->second.maskRequestId != mask.maskRequestId ||
-        found->second.expectedWords != mask.maskWords.size()) {
-      core_.failRequest(mask.requestId, LaneOutcome::InvalidMask,
-                        "mask response does not match the pending request");
-      return true;
-    }
-    // Erased before the engine reads the mask: unusable contents fail the
-    // request there, and its failure event erases the same entry.
-    pendingMasks_.erase(found);
-    core_.provideMask(mask.requestId, mask.maskWords);
-  } catch (const std::exception &error) {
-    engineError("mask_response_failure", error.what());
-    return false;
-  } catch (...) {
-    engineError("mask_response_failure", "unknown token-mask exception");
-    return false;
+  auto found = pendingMasks_.find(mask.requestId);
+  if (found == pendingMasks_.end() ||
+      found->second.maskRequestId != mask.maskRequestId ||
+      found->second.expectedWords != mask.maskWords.size()) {
+    core_.failRequest(mask.requestId, LaneOutcome::InvalidMask,
+                      "mask response does not match the pending request");
+    return true;
   }
+  // Erased before the engine reads the mask: unusable contents fail the
+  // request there, and its failure event erases the same entry.
+  pendingMasks_.erase(found);
+  core_.provideMask(mask.requestId, mask.maskWords);
   return true;
 }
 
 bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
-  try {
-    std::string json = statusProvider_();
-    if (json.empty())
-      throw std::runtime_error("empty status document");
-    return send(protocol::StatusJsonEvent{
-        status.correlationId, protocol::kStatusSchemaVersion, std::move(json)});
-  } catch (const std::exception &error) {
-    engineError("status_failed", error.what());
-    return false;
-  }
+  std::string json = statusProvider_();
+  if (json.empty())
+    throw std::runtime_error("empty status document");
+  return send(protocol::StatusJsonEvent{
+      status.correlationId, protocol::kStatusSchemaVersion, std::move(json)});
 }
 
 bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
@@ -396,18 +344,9 @@ bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
     // for requests that have already ended, including invalid mask contents.
     return true;
   }
-  try {
-    core_.failRequest(issue.requestId, LaneOutcome::InvalidMask,
-                      std::string(protocol::issueCodeName(issue.code)) + ": " +
-                          issue.message);
-  } catch (const std::exception &error) {
-    engineError("mask_response_failure", error.what());
-    return false;
-  } catch (...) {
-    engineError("mask_response_failure",
-                "unknown malformed mask response failure");
-    return false;
-  }
+  core_.failRequest(issue.requestId, LaneOutcome::InvalidMask,
+                    std::string(protocol::issueCodeName(issue.code)) + ": " +
+                        issue.message);
   return !closeConnection_;
 }
 

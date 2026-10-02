@@ -846,6 +846,56 @@ void testControlFailureUsesExecutionBoundary() {
   }
 }
 
+// A frame whose handling throws stops the engine through the same boundary
+// as tick(): one EngineUnhealthy event, whatever was thrown, with a Metal
+// failure named and counted.
+void testFrameFailureUsesExecutionBoundary() {
+  enum class Thrown { Standard, Metal, Foreign };
+  for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    RuntimeMetrics metrics;
+    engine::NativeLoopConfig config;
+    config.metrics = &metrics;
+    std::vector<uint8_t> output;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [thrown]() -> std::string {
+          if (thrown == Thrown::Standard)
+            throw std::runtime_error("status test");
+          if (thrown == Thrown::Metal)
+            throw metal::MetalBackendError("status test");
+          throw 42;
+        });
+    loop.announceReady();
+    const auto status = protocol::serializeMessage(
+        protocol::Message{protocol::StatusRequestFrame{77}});
+    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "a failed status frame did not stop the engine");
+    uint32_t errors = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 0 &&
+                    error->failureClass == protocol::FailureClass::EngineUnhealthy &&
+                    error->code == (thrown == Thrown::Metal
+                                        ? "metal_execution_failed"
+                                        : "engine_execution_failed"),
+                "a frame exception lost its engine failure classification");
+        ++errors;
+      }
+    }
+    require(errors == 1 && metrics.snapshot().metalFailures ==
+                               (thrown == Thrown::Metal ? 1U : 0U),
+            "a frame exception was reported or counted more than once");
+  }
+}
+
 // An exception while the engine admits a request is engine-fatal: nothing
 // below the engine rolls back, and the loop reports it once.
 void testAdmissionExceptionStopsTheEngineOnce() {
@@ -1474,6 +1524,7 @@ int main() {
     testCancelledIdIsReusableInTheSameInput();
     testControlFailureUsesExecutionBoundary();
     testAdmissionExceptionStopsTheEngineOnce();
+    testFrameFailureUsesExecutionBoundary();
     testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
