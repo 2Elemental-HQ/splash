@@ -268,11 +268,14 @@ class RenderedPrompt:
 
 @dataclass(frozen=True)
 class GenerationOptions:
-    """Sampling and stop options, validated alike by every generation API."""
+    """Sampling, stop and scheduling options, validated alike by every
+    generation API."""
 
     sampling: wire.SamplingParameters
     stop_sequences: tuple[str, ...]
     ignore_eos: bool
+    seed: int
+    priority: wire.RequestPriority
 
 
 def validate_served_model_name(value):
@@ -580,7 +583,7 @@ class Frontend:
                 "max_tokens",
                 clamp=requested is None,
             )
-            return self._generation_job(body, options, prompt_tokens, max_new, deadline)
+            return self._generation_job(options, prompt_tokens, max_new, deadline)
 
     def _completion_prompt(self, prompt):
         """A string encodes as a raw prompt, with the tokenizer's own special
@@ -987,7 +990,8 @@ class Frontend:
                 "parallel_tool_calls",
             ),
         )
-        prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
+        # Fields checked without the prompt fail before it is prepared, which
+        # can render documents and build validators.
         options = self._generation_options(body)
         n = body.get("n", 1)
         logprobs = body.get("logprobs")
@@ -998,6 +1002,7 @@ class Frontend:
             or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
         ):
             raise APIError(400, "n and logprobs are not currently supported")
+        prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
         tools, tool_policy = prompt.tools, prompt.tool_policy
         response_schema, response_validator = (
             prompt.response_schema,
@@ -1061,7 +1066,6 @@ class Frontend:
             requested, prompt_tokens, output_field, clamp_output_budget
         )
         job = self._generation_job(
-            body,
             options,
             prompt_tokens,
             max_new,
@@ -1137,8 +1141,17 @@ class Frontend:
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
+        seed = body.get("seed")
+        if seed is None:
+            seed = secrets.randbits(64)
+        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
+            raise APIError(400, "seed must be an unsigned 64-bit integer")
         return GenerationOptions(
-            wire.SamplingParameters(top_k=top_k, **numbers), stop_sequences, ignore_eos
+            wire.SamplingParameters(top_k=top_k, **numbers),
+            stop_sequences,
+            ignore_eos,
+            seed,
+            self._priority(body),
         )
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
@@ -1164,24 +1177,16 @@ class Frontend:
             max_new = remaining
         return max_new
 
-    def _generation_job(
-        self, body, options, prompt_tokens, max_new, deadline, **fields
-    ):
+    def _generation_job(self, options, prompt_tokens, max_new, deadline, **fields):
         """The job for a prepared prompt, with the endpoint's own fields."""
-        seed = body.get("seed")
-        if seed is None:
-            seed = secrets.randbits(64)
-        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
-            raise APIError(400, "seed must be an unsigned 64-bit integer")
-        priority = self._priority(body)
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
             max_new_tokens=max_new,
-            seed=seed,
+            seed=options.seed,
             sampling=options.sampling,
             deadline=deadline,
-            priority=priority,
+            priority=options.priority,
             stop_sequences=options.stop_sequences,
             flags=(
                 wire.RequestFlag.IGNORE_END_OF_SEQUENCE

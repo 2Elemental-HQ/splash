@@ -1,4 +1,5 @@
 import array
+import base64
 import errno
 import http.client
 import json
@@ -10,13 +11,20 @@ import unittest
 from unittest import mock
 
 from dev.tests.engine import native_peer
+from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.engine.test_runtime import FakeFactory, request
-from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
+from dev.tests.test_server import (
+    FakeConstraintFactory,
+    FakeRuntime,
+    Harness,
+    no_signed_thinking,
+)
+from server import documents, runtime, schema_validation, tool_schema
 from server import frontend as request_frontend
 from server import protocol as wire
-from server import runtime, schema_validation, tool_schema
 from server import server as api
 from server.api_shapes import anthropic_to_chat_prompt, normalize_messages
+from server.errors import APIError
 
 
 class RequestContractTests(unittest.TestCase):
@@ -40,6 +48,63 @@ class RequestContractTests(unittest.TestCase):
         with mock.patch.object(api.time, "monotonic", return_value=10):
             deadline = harness.app.request_deadline({"timeout": 1e6})
         self.assertEqual(deadline, 10 + harness.app.request_timeout)
+
+    def test_invalid_generation_fields_fail_before_document_rendering(self):
+        constraints = FakeConstraintFactory()
+        harness = Harness(FakeRuntime(), constraint_factory=constraints)
+        self.addCleanup(harness.close)
+        pdf = base64.b64encode(pdf_bytes(pages=1)).decode()
+        document = {
+            "type": "file",
+            "file": {"file_data": "data:application/pdf;base64," + pdf},
+        }
+        tool = {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+        rendering = "the PDF reached rendering"
+        invalid = (
+            ({"temperature": 5}, "temperature must be"),
+            ({"seed": -1}, "seed must be"),
+            ({"priority": "urgent"}, "priority must be"),
+            ({"n": 2}, "n and logprobs"),
+        )
+        # The valid request shows that the PDF otherwise reaches the renderer.
+        for fields, message in (*invalid, ({}, rendering)):
+            with (
+                self.subTest(fields=fields),
+                mock.patch.dict(documents._cache, clear=True),
+                mock.patch.object(
+                    documents, "_render", side_effect=APIError(400, rendering)
+                ) as render,
+            ):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    {
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": [document]}],
+                        **fields,
+                    },
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(render.called, not fields)
+        for fields, message in invalid:
+            with self.subTest(fields=fields, tools=True):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    {
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Look it up."}],
+                        "tools": [tool],
+                        **fields,
+                    },
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(constraints.grammars, [])
 
     def test_enabled_thinking_honors_effort(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
