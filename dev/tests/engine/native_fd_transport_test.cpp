@@ -29,9 +29,21 @@ namespace {
 
 class Executor final : public model::Model {
 public:
-  // No request gets a lane: one waits for it until its deadline.
-  StateAdmission begin(const ModelRequest &) override {
-    return {{}, StateFailure::ConcurrencyLimit};
+  // Unless admit is set, no request gets a lane: one waits for it until its
+  // deadline. An admitted request takes lane 0, and each of its commands
+  // stays in flight until the test sets ticketReady and calls
+  // heldCompletion, as Metal's completion handler would.
+  bool admit = false;
+  std::shared_ptr<std::atomic<bool>> ticketReady =
+      std::make_shared<std::atomic<bool>>(false);
+  std::function<void()> heldCompletion;
+  std::function<void()> onSubmit;
+
+  StateAdmission begin(const ModelRequest &request) override {
+    if (!admit)
+      return {{}, StateFailure::ConcurrencyLimit};
+    promptTokens_ = request.prompt.size();
+    return {0, StateFailure::None};
   }
   void suspend(uint64_t) override {}
   StateAdmission resume(const ModelRequest &) override {
@@ -40,21 +52,26 @@ public:
   void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
                      bool) override {}
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
-  std::vector<ModelStepResult> prefill(const BatchPlan &,
-                                          std::span<const ModelBatchItem>) {
-    return {};
-  }
-  std::vector<ModelStepResult> decode(const BatchPlan &,
-                                         std::span<const ModelBatchItem>) {
-    return {};
-  }
+  // Prefill consumes its rows; the final chunk selects token 42, which ends
+  // the request.
   std::unique_ptr<ModelBatchTicket>
-  submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-              std::function<void()> completion) override {
-    return test::immediateTicket(plan.kind == WorkKind::Prefill
-                                     ? prefill(plan, items)
-                                     : decode(plan, items),
-                                 completion);
+  submit(const BatchPlan &, std::span<const ModelBatchItem> items,
+         std::function<void()> completion) override {
+    std::vector<ModelStepResult> results;
+    for (const ModelBatchItem &item : items) {
+      ModelStepResult step{item.requestId, item.tokenCount, {}};
+      if (item.logicalPosition + item.tokenCount == promptTokens_) {
+        step.outputTokens = {42};
+        step.outputTokensWithoutKv = 1;
+        step.finished = true;
+      }
+      results.push_back(std::move(step));
+    }
+    heldCompletion = std::move(completion);
+    if (onSubmit)
+      onSubmit();
+    return std::make_unique<test::HeldTicket>(std::move(results), ticketReady,
+                                              0.0);
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return {};
@@ -62,6 +79,9 @@ public:
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
   void provideMask(uint64_t, std::span<const uint32_t>) override {}
   void end(uint64_t) override {}
+
+private:
+  uint64_t promptTokens_ = 0;
 };
 
 struct Pipes final {
@@ -101,7 +121,9 @@ struct Harness final {
   explicit Harness(size_t inputQueueBytes = engine::FdTransport::kInputQueueBytes,
                    int inputFd = -1)
       : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
-                  inputQueueBytes) {}
+                  inputQueueBytes) {
+    storage.commandInFlight = [this] { return loop.commandInFlight(); };
+  }
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
@@ -117,6 +139,22 @@ std::vector<uint8_t> wire(const protocol::Message &message) {
   auto bytes = protocol::serializeMessage(message);
   require(static_cast<bool>(bytes), "message encoding failed");
   return *bytes.value;
+}
+
+// A request for three prompt tokens and one output token: its wall-clock
+// deadline is a minute away, its remaining budget `remainingMicros`.
+protocol::RequestFrame requestFrame(uint64_t id, uint64_t remainingMicros) {
+  protocol::RequestFrame request;
+  request.requestId = id;
+  request.promptTokens = {1, 2, 3};
+  request.logicalMaxOutputTokens = 1;
+  request.absoluteDeadlineUnixMicros =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count() +
+      60'000'000;
+  request.remainingDeadlineMicros = remainingMicros;
+  return request;
 }
 
 // Writes every byte, waiting for room in the pipe.
@@ -258,6 +296,42 @@ void testShutdownRequestAndControlContinuation() {
   }
 }
 
+// A control notification that arrives while a command is in flight runs
+// only once the loop has consumed the command.
+void testControlWaitsForTheCommandInFlight() {
+  Harness harness;
+  std::promise<void> submitted;
+  harness.executor.admit = true;
+  harness.executor.onSubmit = [&submitted] { submitted.set_value(); };
+  std::atomic<int> passes{0};
+  std::atomic<bool> passedInFlight{false};
+  harness.transport.setControlHandler([&harness, &passes, &passedInFlight] {
+    if (harness.loop.commandInFlight())
+      passedInFlight = true;
+    ++passes;
+    harness.transport.requestShutdown();
+    return false;
+  });
+  harness.loop.announceReady();
+  writeAll(harness.pipes.input[1],
+           wire(protocol::Message{requestFrame(7, 30'000'000)}));
+  auto loop = start(harness);
+  if (submitted.get_future().wait_for(std::chrono::seconds(10)) !=
+      std::future_status::ready)
+    abandon("the loop did not submit the request's prefill");
+  harness.transport.controlNotifier()();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const int passesInFlight = passes;
+  *harness.executor.ticketReady = true;
+  harness.executor.heldCompletion();
+  require(finish(loop) == engine::NativeProcessExit::CleanEof,
+          "the control pass after the command did not end the loop cleanly");
+  require(passesInFlight == 0,
+          "a control pass ran while the command was in flight");
+  require(passes == 1 && !passedInFlight,
+          "the deferred control pass did not run once after the command");
+}
+
 // The loop records its longest control pass and tick, and keeps it as later
 // ones are shorter.
 void testLoopRecordsItsLongestTick() {
@@ -309,18 +383,10 @@ void testLoopWakesForAnEngineDeadline() {
         }
       },
       [] { return std::string("{\"schema_version\":5}"); }};
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  protocol::RequestFrame request;
-  request.requestId = 5;
-  request.promptTokens = {1, 2, 3};
-  request.logicalMaxOutputTokens = 1;
-  request.absoluteDeadlineUnixMicros =
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count() +
-      60'000'000;
-  request.remainingDeadlineMicros = 20'000;
-  auto wire = protocol::serializeMessage(protocol::Message{request});
+  auto wire = protocol::serializeMessage(
+      protocol::Message{requestFrame(5, 20'000)});
   require(static_cast<bool>(wire), "request encoding failed");
   require(write(pipes.input[1], wire.value->data(), wire.value->size()) ==
               static_cast<ssize_t>(wire.value->size()),
@@ -519,6 +585,7 @@ int main() {
   try {
     testCleanEofAndProtocolFailure();
     testShutdownRequestAndControlContinuation();
+    testControlWaitsForTheCommandInFlight();
     testLoopRecordsItsLongestTick();
     testLoopWakesForAnEngineDeadline();
     testReaderReadsWhileTheLoopIsBusy();

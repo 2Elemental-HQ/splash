@@ -471,6 +471,12 @@ EngineRequest request(uint64_t id, const std::vector<uint32_t> &prompt) {
   return result;
 }
 
+// Every engine test holds the engine to PageStorage's rule: no extent is
+// released while a command is in flight.
+void guardReleases(test::TestKvStorage &storage, const engine::Engine &engine) {
+  storage.commandInFlight = [&engine] { return engine.commandInFlight(); };
+}
+
 // Ticks until every prompt (65 tokens of its request id) has published a
 // state, then holds a lookup on each, which keeps its state resident.
 std::vector<CacheLookup> runUntilStatesHeld(engine::Engine &engine, engine::Cache &cache,
@@ -498,6 +504,7 @@ void testConcurrentColdPrefixesComputeOnce() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   for (uint32_t id = 1; id <= 4; ++id) {
     std::vector<uint32_t> prompt(193, 7);
     std::fill(prompt.begin() + 160, prompt.end(), id + 10);
@@ -521,6 +528,7 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(6530, 7)));
   runUntilIdle(engine);
   std::vector<uint32_t> branch(6575, 7);
@@ -548,6 +556,7 @@ void testSharedPrefillReleasesDifferentJunctionsIndependently() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(193, 7)));
   for (uint32_t id = 2; id <= 3; ++id) {
     std::vector<uint32_t> branch(193, 7);
@@ -571,6 +580,7 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(193, 7)));
   engine.submit(request(2, std::vector<uint32_t>(193, 7)));
   static_cast<void>(engine.tick(0));
@@ -591,6 +601,7 @@ void testSharedPrefillProducerFailureReleasesWaiters() {
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
     engine.submit(request(1, std::vector<uint32_t>(193, 7)));
     engine.submit(request(2, std::vector<uint32_t>(193, 7)));
     static_cast<void>(engine.tick(0));
@@ -617,6 +628,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
     engine.submit(request(1, std::vector<uint32_t>(193, 7)));
     auto waiter = request(2, std::vector<uint32_t>(193, 7));
     waiter.deadlineMilliseconds = 1;
@@ -640,6 +652,7 @@ void testSharedPrefillFailedPublicationFallsBack() {
   model.deniedSnapshots = 100;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   for (uint32_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(193, 7)));
   runUntilIdle(engine);
@@ -656,6 +669,7 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
     for (uint32_t id = 1; id <= 4; ++id) {
       auto value = request(id, std::vector<uint32_t>(193, images ? 7 : id));
       if (images) {
@@ -682,6 +696,7 @@ void testSharedPrefillHonorsPriorityAndLateArrival() {
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
     auto producer = request(1, std::vector<uint32_t>(5001, 7));
     producer.priority = RequestPriority::Background;
     engine.submit(std::move(producer));
@@ -713,6 +728,7 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
       model.denySnapshotAtBoundary = 4096;
     Events events;
     engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
     engine.submit(request(1, std::vector<uint32_t>(6601, 7)));
     static_cast<void>(engine.tick(0));
     for (uint32_t id = 2; id <= 4; ++id) {
@@ -736,6 +752,7 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
   for (uint32_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(193, 7)));
   for (uint32_t step = 0; step < 64 && !engine.idle(); ++step)
@@ -756,6 +773,7 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, resources, executor, events);
+  guardReleases(storage, engine);
   require(engine.snapshot().maximumContextTokens == 102400,
           "snapshot lost the configured context limit");
   std::vector<uint32_t> prompt(65);
@@ -804,6 +822,7 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65);
   for (uint32_t index = 0; index < prompt.size(); ++index)
     prompt[index] = index + 1;
@@ -834,6 +853,7 @@ void testReplayStateEndsBeforeTheGenerationPrompt() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   struct Case {
     uint32_t tokens;
     uint32_t generationPromptTokens;
@@ -876,6 +896,7 @@ void testFollowUpResumesBeforeTheGenerationPrompt() {
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     std::vector<uint32_t> prompt(97);
     std::iota(prompt.begin(), prompt.end(), 1);
     EngineRequest turn = request(1, prompt);
@@ -910,6 +931,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     std::vector<uint32_t> prompt(97);
     std::iota(prompt.begin(), prompt.end(), 1);
     for (uint64_t id : {1, 2}) {
@@ -939,6 +961,7 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(200);
   std::iota(prompt.begin(), prompt.end(), 1);
   EngineRequest producer = request(1, prompt);
@@ -969,6 +992,7 @@ void testImageSpansKeyPrefixIdentity() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   // Image runs render as one placeholder id, so two prompts with different
   // images are token-identical; only the span digests differ.
   std::vector<uint32_t> prompt(65, 248056);
@@ -1027,6 +1051,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   std::vector<uint32_t> prompt(97);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -1064,6 +1089,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   std::vector<uint32_t> prompt(97);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -1129,6 +1155,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   std::vector<uint32_t> prompt(97);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -1175,6 +1202,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
   executor.deniedSnapshots = 100;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 7);
 
   engine.submit(request(3, prompt));
@@ -1225,6 +1253,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> older(65, 1);
   const std::vector<uint32_t> newer(65, 2);
   engine.submit(request(1, older));
@@ -1276,6 +1305,7 @@ void testPersistentSnapshotDenialRecyclesAtMostOneState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   for (uint64_t id : {1, 2, 3}) {
     engine.submit(request(id, std::vector<uint32_t>(65, id)));
     runUntilIdle(engine);
@@ -1305,6 +1335,7 @@ void testLongSuffixSkipsDraftRestore() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prefix(65);
   for (uint32_t index = 0; index < prefix.size(); ++index) {
     prefix[index] = index + 1;
@@ -1331,6 +1362,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(4097, 11);
 
   engine.submit(request(4, prompt));
@@ -1370,6 +1402,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
     EngineConfig config;
     config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
 
     engine.submit(request(20, std::vector<uint32_t>(65, 7)));
     runUntilIdle(engine);
@@ -1417,6 +1450,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
     EngineConfig config;
     config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
 
     engine.submit(request(25, std::vector<uint32_t>(65, 25)));
     runUntilIdle(engine);
@@ -1458,6 +1492,7 @@ void testKvGrowthDenialKeepsEveryLaneReplayState() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   storage.growthBlocked = true;
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.reclaimableIdleStateBytes = 1U << 20;
@@ -1488,6 +1523,7 @@ void testPressureReclaimRespectsStateLifetimes() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(request(27, std::vector<uint32_t>(65, 27)));
   runUntilIdle(engine);
@@ -1552,6 +1588,7 @@ void testWarningReclaimKeepsTheServingFootprint() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(request(28, std::vector<uint32_t>(65, 28)));
   runUntilIdle(engine);
@@ -1590,6 +1627,7 @@ void testPressureReclaimFollowsTheChain() {
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(129);
   std::iota(prompt.begin(), prompt.end(), 1000);
   cache.beginRequest(1);
@@ -1641,6 +1679,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
                         resources, executor, events);
+  guardReleases(storage, engine);
   const auto submit = [&](uint64_t id, uint32_t promptTokens) {
     auto value = request(id, std::vector<uint32_t>(promptTokens, id));
     value.maxNewTokens = 100'000;
@@ -1682,6 +1721,7 @@ void testConcurrencyLimitDoesNotEvictCache() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(request(22, std::vector<uint32_t>(65, 22)));
   runUntilIdle(engine);
@@ -1719,6 +1759,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   EngineConfig config;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(200, std::vector<uint32_t>(65, 200)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
@@ -1763,6 +1804,7 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   EngineConfig config;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(210, std::vector<uint32_t>(65, 210)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
@@ -1800,6 +1842,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   EngineConfig config;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
@@ -1837,6 +1880,7 @@ void testAdmissionWaitsOutEarlierLanes() {
     EngineConfig config;
     config.resourceWaitTimeoutMilliseconds = 100;
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     auto running = request(310, {310});
     running.maxNewTokens = 1000;
     engine.submit(std::move(running));
@@ -1883,6 +1927,7 @@ void testLaterLanesDoNotExtendAResourceWait() {
   EngineConfig config;
   config.resourceWaitTimeoutMilliseconds = 300;
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(320, {320}));
   static_cast<void>(engine.tick(1));
   auto later = request(321, {321});
@@ -1917,6 +1962,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
     config.resourceWaitTimeoutMilliseconds = outcome == 3 ? 100.0 : 30000.0;
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     engine.submit(request(220, std::vector<uint32_t>(65, 220)));
     runUntilIdle(engine);
     const auto cached = resources.snapshot();
@@ -1999,6 +2045,7 @@ void testKvPressureNarrowsTheRealBatch() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(request(30, std::vector<uint32_t>(33, 30)));
   engine.submit(request(31, std::vector<uint32_t>(33, 31)));
@@ -2027,6 +2074,7 @@ void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
   };
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
@@ -2060,6 +2108,7 @@ void testRequiredWorkDoesNotReserveAnExtraPage() {
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     engine.submit(request(231, std::vector<uint32_t>(promptTokens, 231)));
     runUntilIdle(engine);
     require(events.completedCount == 1 && events.emitted == 1 &&
@@ -2076,6 +2125,7 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> desired(65, 240);
   engine.submit(request(240, desired));
   runUntilIdle(engine);
@@ -2109,6 +2159,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(65, 245);
   engine.submit(request(245, prompt));
   runUntilIdle(engine);
@@ -2140,6 +2191,7 @@ void testFailedAdmissionReturnsWhatItTook() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(65, 7);
   engine.submit(request(1, prompt));
   runUntilIdle(engine);
@@ -2165,6 +2217,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(request(40, std::vector<uint32_t>(33, 40)));
   runUntilIdle(engine);
@@ -2182,6 +2235,7 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   for (uint64_t id = 1; id <= 4; ++id)
     engine.submit(request(id, std::vector<uint32_t>(8193, id)));
   require(engine.tick(1) && engine.tick(2) &&
@@ -2206,6 +2260,7 @@ void testAdmissionUsesCachedRemainingWork() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> warm(4097, 47);
   engine.submit(request(1, warm));
   runUntilIdle(engine);
@@ -2227,6 +2282,7 @@ void testFailedAdmissionDoesNotBlockOtherWork() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
   engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
@@ -2246,6 +2302,7 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
                         resources, executor, events);
+  guardReleases(storage, engine);
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
   engine.submit(request(1, std::vector<uint32_t>(8193, 47)));
@@ -2268,6 +2325,7 @@ void testUnadmittedRequestsHonorCancellationAndDeadline() {
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(1, std::vector<uint32_t>(8193, 1)));
   engine.submit(request(2, std::vector<uint32_t>(8193, 2)));
   auto expiring = request(3, std::vector<uint32_t>(8193, 3));
@@ -2291,6 +2349,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     Executor executor(2);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     storage.growthAllowed = [&](uint32_t) {
       const auto started = executor.requests.find(48);
       return started == executor.requests.end() ||
@@ -2331,6 +2390,7 @@ void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   storage.growthAllowed = [&](uint32_t) {
     return std::count_if(executor.requests.begin(), executor.requests.end(),
                          [](const auto &entry) { return entry.second.resident; }) < 2;
@@ -2360,6 +2420,7 @@ void testPrefillGrowthPreservesAnActiveDecodePeer() {
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(48, std::vector<uint32_t>(8192, 48)));
   require(engine.tick(1) && engine.tick(2), "prefill setup did not progress");
   auto decoding = request(49, {49});
@@ -2390,6 +2451,7 @@ void testKvPressureSuspendsInsteadOfKillingActiveWork() {
   executor.kvGrowthBlocked = &storage.growthBlocked;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   storage.growthBlocked = true;
   engine.submit(request(50, {50}));
@@ -2417,6 +2479,7 @@ void testPressureRetryIsBackedOffWithoutProgress() {
   EngineConfig config;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
 
   storage.growthBlocked = true;
   engine.submit(request(52, {52}));
@@ -2453,6 +2516,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
     executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     engine.submit(request(1, {1}));
     require(engine.tick(1) && engine.tick(2), "resident request did not prefill");
     engine.submit(request(2, {2}));
@@ -2478,6 +2542,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
     EngineConfig config;
     config.growthPaused = [&] { return paused; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     storage.growthBlocked = true;
     engine.submit(request(1, {1}));
     engine.submit(request(2, {2}));
@@ -2506,6 +2571,7 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
     executor.decodeFinishes = false;
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     // The resident's held command is its last one.
     for (uint64_t id : {250, 251}) {
       auto value = request(id, std::vector<uint32_t>(24, id));
@@ -2564,6 +2630,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   executor.replayDecodeStage = DecodeStage::ApplyInitialMask;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   for (uint64_t id : {250, 251}) {
     auto value = request(id, std::vector<uint32_t>(24, id));
     value.maxNewTokens = 4;
@@ -2638,6 +2705,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   config.prefillCheckpointTokens = 8192;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
 
   constexpr uint64_t id = 255;
   const std::vector<uint32_t> prompt(4097, 5);
@@ -2719,6 +2787,7 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   for (uint64_t id : {260, 261}) {
     auto value = request(id, std::vector<uint32_t>(65, id));
     value.maxNewTokens = 30;
@@ -2758,6 +2827,7 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   for (uint64_t id : {262, 263}) {
     auto value = request(id, std::vector<uint32_t>(65, id));
     // Long enough to move the boundary if it applied to the 89-token history
@@ -2794,6 +2864,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
     EngineConfig config;
     config.growthPaused = [] { return true; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     storage.growthBlocked = true;
     auto value = request(270, {270});
     value.deadlineMilliseconds = 350;
@@ -2850,6 +2921,7 @@ void testBudgetDenialRetriesAfterRelease() {
     EngineConfig config;
     config.resourceWaitTimeoutMilliseconds = 500;
     engine::Engine engine(config, cache, executor, events);
+    guardReleases(storage, engine);
     engine.submit(request(284, {284}));
     static_cast<void>(engine.tick(1));
     // The denial released one empty extent per step, retrying after each:
@@ -2891,6 +2963,7 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
     executor.pooledLaneBytes = 4096;
     Events events;
     engine::Engine engine({}, cache, executor, events);
+    guardReleases(storage, engine);
     if (state) {
       executor.beginGrowthBlocked = [] { return true; };
       executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
@@ -2921,6 +2994,7 @@ void testPausedStateAdmissionReusesCachedStates() {
     EngineConfig config;
     config.growthPaused = [&] { return paused; };
     engine::Engine engine(config, cache, executor, events);
+    guardReleases(storage, engine);
     engine.submit(request(287, std::vector<uint32_t>(65, 287)));
     runUntilIdle(engine);
     const auto cached = cache.snapshot().stateCache;
@@ -2960,6 +3034,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   for (uint32_t chain = 0; chain < cachedExtents; ++chain) {
     const uint64_t id = 5000 + chain;
     cache.beginRequest(id);
@@ -3004,6 +3079,7 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   storage.growthAllowed = [&](uint32_t) { return pool.snapshot().pagesAllocated / 4 < 8; };
   engine.submit(request(287, std::vector<uint32_t>(16 * 4 * 32 + 1, 287)));
   static_cast<void>(engine.tick(1));
@@ -3031,6 +3107,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
     Executor executor(1);
     Events events;
     engine::Engine engine({}, cache, executor, events);
+    guardReleases(storage, engine);
     MemoryReclaimDirective directive{.reclaim = true};
     if (targeted) {
       directive.evictAllUnpinnedPrefixes = true;
@@ -3046,6 +3123,54 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   }
 }
 
+// A reclaim runs only between commands: while a prefill is in flight it
+// throws and reclaims nothing, neither idle model state nor an extent
+// nothing holds. Once the command has completed, the same reclaim takes
+// both.
+void testReclaimRefusesACommandInFlight() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  auto pages = pool.acquirePages(8, false);
+  require(pages.granted(), "could not seed the KV extents");
+  for (uint32_t page : pages.pages)
+    pool.releasePage(page, false);
+  Executor executor(1);
+  executor.prefillAnchor = true;
+  executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  executor.reclaimableIdleStateBytes = 64;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(289, {289}));
+  require(engine.tick(1) && engine.commandInFlight() &&
+              pool.snapshot().reclaimableExtents == 1,
+          "the prefill did not stay in flight beside an empty extent");
+
+  const MemoryReclaimDirective directive{.reclaim = true,
+                                         .evictAllUnpinnedPrefixes = true};
+  bool refused = false;
+  try {
+    static_cast<void>(engine.reclaimMemory(directive));
+  } catch (const std::logic_error &) {
+    refused = true;
+  }
+  require(refused && executor.reclaimableIdleStateBytes == 64 &&
+              pool.snapshot().extentReleases == 0 &&
+              pool.snapshot().reclaimableExtents == 1,
+          "a reclaim ran while a command was in flight");
+
+  *executor.holdPrefillUntil = true;
+  require(engine.tick(2) && !engine.commandInFlight() &&
+              events.completedCount == 1,
+          "the held prefill did not complete");
+  static_cast<void>(engine.reclaimMemory(directive));
+  require(executor.reclaimedIdleStateBytes == 64 &&
+              pool.snapshot().extentReleases == 2 &&
+              pool.snapshot().pagesAllocated == 0,
+          "the reclaim after the command did not take the idle memory");
+}
+
 void testAllocationCausesRemainDistinct() {
   for (bool stateAllocation : {false, true}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
@@ -3057,6 +3182,7 @@ void testAllocationCausesRemainDistinct() {
       Executor executor(1);
       Events events;
       engine::Engine engine({}, cache, executor, events);
+      guardReleases(storage, engine);
       storage.growthBlocked = !stateAllocation;
       storage.allocationFailure = reason;
       executor.beginGrowthBlocked = [stateAllocation] { return stateAllocation; };
@@ -3098,6 +3224,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     // Models the request-sized headroom denial while global pressure is Normal.
     config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(129, 280);
     if (sharePrefix) {
       engine.submit(request(279, std::vector<uint32_t>(65, 280)));
@@ -3169,6 +3296,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   executor.stateTier->ready = true;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   storage.allocationFailure = metal::AllocationFailure::HostPressure;
   const std::vector<uint32_t> prompt(129, 290);
   engine.submit(request(290, prompt));
@@ -3228,6 +3356,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   EngineConfig config;
   config.growthPaused = [&] { return pressure != MemoryPressure::Normal; };
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
 
   storage.growthBlocked = true;
   auto longRequest = request(271, {271});
@@ -3262,6 +3391,7 @@ void testAdmissionRespectsPriorityBeforeHashOrder() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   EngineRequest background = request(100, {1});
   background.priority = RequestPriority::Background;
@@ -3331,6 +3461,7 @@ void testRecoveryDrainEndsWithItsCause() {
     config.resourceWaitTimeoutMilliseconds = 1000;
     config.growthPaused = [&] { return paused; };
     engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
     // A resident lane waits for its initial mask without a command in
     // flight; the other fills the first extent and must map another.
     auto resident = constrainedRequest(1, 100'000);
@@ -3412,6 +3543,7 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(constrainedRequest(200));
   advanceToOverlappedVerify(engine, executor, events, 200);
@@ -3430,6 +3562,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     engine.submit(constrainedRequest(201));
     advanceToOverlappedVerify(engine, executor, events, 201);
     engine.cancel(201);
@@ -3449,6 +3582,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     engine.submit(constrainedRequest(202, 100.0));
     advanceToOverlappedVerify(engine, executor, events, 202);
     require(engine.tick(100.0) && executor.overlap->abandoned &&
@@ -3467,6 +3601,7 @@ void testDecodeNearContextCeilingCoversVerifyRows() {
   EngineConfig config;
   config.maxContext = 64;
   engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
 
   // prompt + max_tokens fill a context that is a whole number of pages; the
   // last decode cycles store verify rows past the logical ceiling.
@@ -3486,6 +3621,7 @@ void testExpiredMaskWaitFinalizesWhileAnotherCommandRuns() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   engine.submit(constrainedRequest(300, 100.0));
   require(engine.tick(1) && engine.tick(2) && engine.tick(3) && engine.tick(4),
@@ -3519,6 +3655,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
     auto released = std::make_shared<std::atomic<bool>>(false);
     if (heldKind == WorkKind::Prefill)
       executor.holdPrefillUntil = released;
@@ -3566,6 +3703,7 @@ void testStalledSuspensionFailsWithCapacity() {
   executor.unblockGrowthOnSuspend = false;
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
 
   storage.growthBlocked = true;
   engine.submit(request(60, {60}));
@@ -3593,6 +3731,7 @@ void testTerminalAnchorWithoutKvIsNotCached() {
     executor.decodeTokensWithoutKv = withoutKv;
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
 
     // 31 prompt tokens plus the emitted token complete one Page32 block only
     // when that token has a stored KV row.
@@ -3614,6 +3753,7 @@ void testPrefillCanCompleteTheRequest() {
     executor.prefillAnchor = stop;
     Events events;
     engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
 
     EngineRequest value = request(90, std::vector<uint32_t>(40, 90));
     value.maxNewTokens = stop ? 8 : 1;
@@ -3636,6 +3776,7 @@ void testOutOfVocabularyOutputFailsLaneOnly() {
   EngineConfig config;
   config.vocabularySize = 1000;
   engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
   // The sampling kernels leave 0xffffffff when a logit row is entirely
   // non-finite; the engine must fail that lane before the sentinel reaches
   // the token history while the peer request completes normally.
@@ -3675,6 +3816,7 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(30001, 19);
   engine.submit(request(400, prompt));
   runUntilCheckpoint(engine, 2);
@@ -3703,6 +3845,7 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(25001, 20);
   engine.submit(request(410, prompt));
   engine.submit(request(411, prompt));
@@ -3730,6 +3873,7 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> original(25001, 20);
   auto background = request(412, original);
   background.priority = RequestPriority::Background;
@@ -3756,6 +3900,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(40001, 31);
   for (uint32_t attempt = 0; attempt < 3; ++attempt) {
     engine.submit(request(500 + attempt, prompt));
@@ -3783,6 +3928,7 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(25001, 32);
   engine.submit(request(510, prompt));
   runUntilCheckpoint(engine, 1);
@@ -3820,6 +3966,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       }
       Events events;
       engine::Engine engine({}, resources, executor, events);
+      guardReleases(storage, engine);
       const std::vector<uint32_t> prompt(25001, 33);
       engine.submit(request(520, prompt));
       runUntilCheckpoint(engine, 1);
@@ -3858,6 +4005,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
                         events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(30001, 34);
   engine.submit(request(530, prompt));
   runUntilCheckpoint(engine, 2);
@@ -3886,6 +4034,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(18001, 35);
   engine.submit(request(540, prompt));
   runUntilCheckpoint(engine, 1);
@@ -3915,6 +4064,7 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(25001, 36);
   engine.submit(request(550, prompt));
   runUntilCheckpoint(engine, 1);
@@ -3940,6 +4090,7 @@ void testRollingHandleCannotRetirePromotedState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(25001, 37);
   engine.submit(request(560, prompt));
   runUntilCheckpoint(engine, 1);
@@ -3965,6 +4116,7 @@ void testCheckpointDenialPreservesUnrelatedHotState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> hot(65, 21);
   engine.submit(request(420, hot));
   runUntilIdle(engine);
@@ -3988,6 +4140,7 @@ void testCheckpointRecyclesItsBufferBeforeReplacement() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(430, std::vector<uint32_t>(25001, 23)));
   runUntilCheckpoint(engine, 1);
   executor.snapshotObserver = [&] {
@@ -4012,6 +4165,7 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
                         events);
+  guardReleases(storage, engine);
   engine.submit(request(440, std::vector<uint32_t>(18001, 24)));
   for (uint32_t step = 0; step < 32; ++step) {
     static_cast<void>(engine.tick(step + 1));
@@ -4038,6 +4192,7 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> hot(65, 27);
   engine.submit(request(460, hot));
   runUntilIdle(engine);
@@ -4062,6 +4217,7 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(20001, 29);
   resources.beginRequest(470);
   require(resources.ensureTokens(470, 20000).granted(),
@@ -4084,6 +4240,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(18001, 30);
   engine.submit(request(480, prompt));
   runUntilCheckpoint(engine, 1);
@@ -4107,6 +4264,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> donor(32769, 61);
   engine.submit(request(600, donor));
   for (uint32_t step = 0; step < 128; ++step) {
@@ -4174,6 +4332,7 @@ void testCheckpointIntervalValidationAndDisable() {
     require(rejected, "invalid checkpoint interval was accepted");
   }
   engine::Engine engine({.prefillCheckpointTokens = 0}, resources, executor, events);
+  guardReleases(storage, engine);
   engine.submit(request(450, std::vector<uint32_t>(18001, 25)));
   runUntilIdle(engine);
   require(engine.snapshot().checkpointPublications == 0 && executor.snapshots == 1 &&
@@ -4215,6 +4374,7 @@ void testStateWithoutACacheSlotGoesToDisk() {
   executor.stateTier = std::make_shared<OffloadControl>();
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> first(65, 1);
   engine.submit(request(1, first));
   runUntilIdle(engine);
@@ -4281,6 +4441,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
   executor.stateTier->ready = true;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(5001, 7);
   auto producer = request(1, prompt);
   producer.priority = RequestPriority::Background;
@@ -4315,6 +4476,7 @@ void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
   executor.stateTier->ready = true;
   Events events;
   engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> donor(2 * defaultCheckpointTokens + 1, 61);
   engine.submit(request(600, donor));
   for (uint32_t step = 0; step < 128; ++step) {
@@ -4366,6 +4528,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     executor.stateTier->ready = true;
     Events events;
     engine::Engine engine({}, cache, executor, events);
+    guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 1, 65);
     EngineRequest decoding = request(610, prompt);
     decoding.maxNewTokens = 64;
@@ -4429,6 +4592,7 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
       executor.stateTier->ready = true;
       Events events;
       engine::Engine engine({}, cache, executor, events);
+      guardReleases(storage, engine);
       const std::vector<uint32_t> prompt(defaultCheckpointTokens + remaining + 1, 71);
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
@@ -4468,6 +4632,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     executor.restoreControl->ready = true;
     Events events;
     engine::Engine engine({}, cache, executor, events);
+    guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 33, 73);
     engine.submit(request(1, prompt));
     for (uint32_t step = 0; step < 128; ++step) {
@@ -4515,6 +4680,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     Events events;
     engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
                           cache, executor, events);
+    guardReleases(storage, engine);
     // A write in flight from a lane still running: its block is no leaf to evict.
     auto writing = std::make_shared<OffloadControl>();
     cache.beginRequest(999);
@@ -4573,6 +4739,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   for (uint64_t id = 900; id < 906; ++id) {
@@ -4612,6 +4779,7 @@ void testNothingInFlightIsNotPending() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   for (uint64_t id = 900; id < 908; ++id) {
@@ -4641,6 +4809,7 @@ void testPageShortfallDemotesInBulk() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   for (uint64_t id = 900; id < 906; ++id) {
@@ -4686,6 +4855,7 @@ void testKvGrowthProceedsThroughDemotion() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   auto transfer = std::make_shared<OffloadControl>();
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
@@ -4737,6 +4907,7 @@ void testAsyncRestoreLifecycle() {
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
     std::vector<uint32_t> prompt(65, 17);
     publishDiskState(cache, prompt);
     engine.submit(request(1, prompt));
@@ -4775,6 +4946,7 @@ void testDiskHitWithNoActiveMemory() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 17);
   publishDiskState(cache, prompt);
   executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
@@ -4792,6 +4964,7 @@ void testRepeatedDiskHitPromotesToMemory() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 17);
   publishDiskState(cache, prompt);
   executor.restoreControl->ready = true;
@@ -4813,6 +4986,7 @@ void testFailedDiskRestoreKeepsShallowerState() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
@@ -4841,6 +5015,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 17);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
@@ -4892,6 +5067,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(129, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
@@ -4947,6 +5123,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   // Six cached blocks, each under a state on disk, hold six of eight pages.
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
@@ -5002,6 +5179,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   // A three-block prefix and its state move to disk entirely.
   std::vector<uint32_t> prompt(97, 17);
   cache.beginRequest(999);
@@ -5067,6 +5245,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   // An eight-block prefix and its state move to disk entirely.
   std::vector<uint32_t> prompt(257, 17);
   cache.beginRequest(999);
@@ -5149,6 +5328,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   // A two-block prefix and its state move to disk.
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
@@ -5200,6 +5380,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   executor.decodeFinishes = false;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
   // A two-block prefix and its state move to disk.
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
@@ -5359,6 +5540,7 @@ int main() {
     testDeniedGrowthAllocatesEachExtentOnce();
     testGrowthBeyondTheBudgetFailsAtOnce();
     testReclaimPassReleasesEveryEmptyExtent();
+    testReclaimRefusesACommandInFlight();
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();

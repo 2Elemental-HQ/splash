@@ -227,6 +227,7 @@ void testPromptProgress() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto submit = [&](uint64_t id, bool enabled) {
     auto input = request(id);
@@ -331,6 +332,7 @@ void testWireLifecycleAndCacheHit() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   auto first = protocol::serializeMessage(protocol::Message{request(1)});
@@ -406,6 +408,7 @@ void testGenerationPromptBoundsTheReplayState() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -437,6 +440,7 @@ void testRequestFlagsReachTheModel() {
       config, resources, executor, [](std::span<const uint8_t>) {},
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -463,6 +467,7 @@ void testFatalFramingClosesConnection() {
         output.insert(output.end(), bytes.begin(), bytes.end());
       },
       [] { return std::string("{}"); });
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   const std::array<uint8_t, 24> invalid{};
   require(!loop.receive(invalid), "bad frame did not close connection");
   require(loop.connectionMustClose() && loop.engineHealthy(),
@@ -489,6 +494,7 @@ void testRequestErrorKeepsFraming() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   const auto wire = [](protocol::Message message) {
@@ -552,6 +558,7 @@ void testCapacityFailureHasOneTerminalFrame() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   auto encoded = protocol::serializeMessage(protocol::Message{request(3)});
@@ -611,6 +618,7 @@ void testCommandWatchdogAndPendingHealthWake() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     auto input = request(1);
     input.absoluteDeadlineUnixMicros = 601'000'000;
@@ -659,6 +667,7 @@ void testCommandWatchdogAndPendingHealthWake() {
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   require(!loop.tick() && loop.idle() && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
@@ -679,6 +688,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto first = protocol::serializeMessage(protocol::Message{request(1)});
     require(first && loop.receive(*first.value) && loop.tick(),
@@ -714,6 +724,7 @@ void testControlFailureUsesExecutionBoundary() {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     require(loop.runControl([] { return true; }) && loop.engineHealthy(),
             "ordinary deferred control work failed");
@@ -756,6 +767,7 @@ void testEngineFailureNamesItsReason() {
             throw closed;
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     outputClosed = true;
     auto status = protocol::serializeMessage(
@@ -779,6 +791,7 @@ void testEngineFailureNamesItsReason() {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     auto frame = protocol::serializeMessage(protocol::Message{request(1)});
     require(static_cast<bool>(frame), "request wire failed");
@@ -824,6 +837,7 @@ void testInvalidPromptTokensStayRequestScoped() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
     auto invalid = request(9);
@@ -871,6 +885,7 @@ uint64_t announcedFeatures(uint32_t maxImagePatches) {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   const auto announced = decodeMessages(output);
   const auto *ready = announced.size() == 1
@@ -906,6 +921,7 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto image = request(9);
   image.imageSpans = {{8, 16, 8, 8, 1, 2}};
@@ -951,6 +967,7 @@ void testStepTokensFitTheWire() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
     loop.announceReady();
     auto encoded = protocol::serializeMessage(
@@ -1010,6 +1027,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto encoded = protocol::serializeMessage(
       protocol::Message{scoreRequest(9, 3000)});
@@ -1055,6 +1073,7 @@ void testCancelledScoreReturnsEmptyLogits() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto encoded = protocol::serializeMessage(
       protocol::Message{scoreRequest(11, 65)});
@@ -1116,6 +1135,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
 
   // Whole KV pages, so the last prompt chunk is the one that publishes the
@@ -1220,6 +1240,7 @@ void testConstrainedMaskExchange() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto send = [&](protocol::Message message) {
       auto wire = protocol::serializeMessage(message);

@@ -351,7 +351,9 @@ public:
               }
               output_.insert(output_.end(), bytes.begin(), bytes.end());
             },
-            [] { return std::string("{\"schema_version\":5}"); }) {}
+            [] { return std::string("{\"schema_version\":5}"); }) {
+    backing_.commandInFlight = [this] { return loop_.commandInFlight(); };
+  }
 
   Executor &executor() noexcept { return executor_; }
   engine::NativeRuntime &loop() noexcept { return loop_; }

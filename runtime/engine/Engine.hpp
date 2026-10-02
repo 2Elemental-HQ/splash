@@ -98,10 +98,10 @@ public:
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
-  // Runs only at a command-completion safe point. Reclaim order follows
-  // ownership and preserves reusable prefixes for as long as possible: idle
-  // model state, empty KV extents, disposable checkpoints, then ordinary
-  // state/KV in LRU order.
+  // Runs only between commands: throws std::logic_error while a command is
+  // in flight. Reclaim order follows ownership and preserves reusable
+  // prefixes for as long as possible: idle model state, empty KV extents,
+  // disposable checkpoints, then ordinary state/KV in LRU order.
   // Live command buffers are never eviction candidates. The result says
   // whether the directive's target is met, waits for transfers in flight, or
   // finds nothing left to reclaim.
