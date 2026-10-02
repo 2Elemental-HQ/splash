@@ -51,7 +51,7 @@ bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRow
 
 // A copy of the tensor's rows as the GGUF stores them.
 bool asStored(const model::gguf::Copy *copy, const test_gguf::Bytes &data) {
-  return copy && !copy->bfloat16 && copy->source.order.from == UINT64_MAX &&
+  return copy && copy->conversion == model::gguf::Conversion::None && copy->source.order.from == UINT64_MAX &&
          copy->source.rows * copy->source.rowBytes == data.size();
 }
 
@@ -71,14 +71,15 @@ void checkDense(const std::filesystem::path &directory) {
 
   const uint32_t keyRows = g.convolutionDimension - g.gdnValueHeads * g.gdnHeadDimension;
   const auto *convolution = copyOf(gdn, "blk.0.ssm_conv1d.weight");
-  check(convolution && convolution->bfloat16 && convolution->source.rows == g.convolutionDimension &&
+  check(convolution && convolution->conversion == model::gguf::Conversion::NarrowToBfloat16 &&
+            convolution->source.rows == g.convolutionDimension &&
             grouped(convolution->source.order, keyRows, g.gdnHeadDimension, g),
         "planner narrows the convolution to bf16 and groups its value heads");
   const auto *decay = copyOf(gdn, "blk.0.ssm_a");
-  check(decay && !decay->bfloat16 && grouped(decay->source.order, 0, 1, g),
+  check(decay && decay->conversion == model::gguf::Conversion::None && grouped(decay->source.order, 0, 1, g),
         "planner keeps the decay F32 and groups its value heads");
   const auto *bias = copyOf(gdn, "blk.0.ssm_dt.bias");
-  check(bias && bias->bfloat16 && grouped(bias->source.order, 0, 1, g),
+  check(bias && bias->conversion == model::gguf::Conversion::NarrowToBfloat16 && grouped(bias->source.order, 0, 1, g),
         "planner narrows the time bias to bf16 and groups its value heads");
 
   // A key or value projection of other than attentionKvHeads heads.
@@ -161,8 +162,8 @@ void checkMoe(const std::filesystem::path &directory) {
   const model::gguf::Image &layer = moe.images[0];
   const auto *beta = copyOf(layer, "blk.0.ssm_beta.weight"), *alpha = copyOf(layer, "blk.0.ssm_alpha.weight");
   check(beta && alpha && alpha->destination == beta->destination + target.data(beta->source.name).size() &&
-            grouped(beta->source.order, 0, 1, g) && grouped(alpha->source.order, 0, 1, g) && !beta->bfloat16 &&
-            !alpha->bfloat16,
+            grouped(beta->source.order, 0, 1, g) && grouped(alpha->source.order, 0, 1, g) &&
+            beta->conversion == model::gguf::Conversion::None && alpha->conversion == model::gguf::Conversion::None,
         "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
   for (const std::string name : {"blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_inp_shexp.weight"})
     check(asStored(copyOf(layer, name), target.data(name)), "planner copies the F32 tensor as stored: " + name);

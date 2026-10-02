@@ -128,17 +128,20 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
         check(slice(prepared[index], copy.destination, values.size()) == values,
               "prepared norm is the GGUF's F32 values as stored: " + copy.source.name);
       }
-  const auto prepares = [&](const char *name, bool bfloat16) {
+  const auto prepares = [&](const char *name, model::gguf::Conversion conversion) {
     const model::gguf::Copy *copy = copyOf(images[0], name);
-    if (!copy) return false;
+    if (!copy || copy->conversion != conversion) return false;
     const auto &values = target.data(name);
     const auto ordered = orderedRows(values, values.size() / copy->source.rows, copy->source.order);
-    const auto expected = bfloat16 ? bfloat16Halves(ordered) : ordered;
+    const auto expected =
+        conversion == model::gguf::Conversion::NarrowToBfloat16 ? bfloat16Halves(ordered) : ordered;
     return slice(prepared[0], copy->destination, expected.size()) == expected;
   };
-  check(prepares("blk.0.ssm_conv1d.weight", true), "prepared convolution: exact bf16 in grouped head order");
-  check(prepares("blk.0.ssm_a", false), "prepared decay: F32 in grouped head order");
-  check(prepares("blk.0.ssm_dt.bias", true), "prepared time bias: exact bf16 in grouped head order");
+  check(prepares("blk.0.ssm_conv1d.weight", model::gguf::Conversion::NarrowToBfloat16),
+        "prepared convolution: exact bf16 in grouped head order");
+  check(prepares("blk.0.ssm_a", model::gguf::Conversion::None), "prepared decay: F32 in grouped head order");
+  check(prepares("blk.0.ssm_dt.bias", model::gguf::Conversion::NarrowToBfloat16),
+        "prepared time bias: exact bf16 in grouped head order");
 
   for (const std::string name : {"blk.0.ssm_conv1d.weight", "blk.0.ssm_dt.bias"}) {
     std::vector<Tensor> inexact = target.tensors;
@@ -299,7 +302,8 @@ void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &d
   const std::vector<model::gguf::Image> images = planned(path, g);
   const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
   if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
-  check(beta->float32 && alpha->float32 && !beta->bfloat16 && !alpha->bfloat16 &&
+  check(beta->conversion == model::gguf::Conversion::WidenToFloat32 &&
+            alpha->conversion == model::gguf::Conversion::WidenToFloat32 &&
             alpha->destination == beta->destination + 2 * target.data(beta->source.name).size(),
         "planner widens BF16 alpha/beta into one F32 tensor");
   model::GgufTargetLoader loader(backend, path, g);
