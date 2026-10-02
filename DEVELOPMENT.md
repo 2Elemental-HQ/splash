@@ -774,8 +774,10 @@ a time, down to one lane's state buffers and one KV extent. A request in service
 keeps growing within `--max-memory`, first into cached pages no request holds.
 A new request waits while another is in service unless it can start from what
 the engine already holds, and with none in service it starts. Critical pressure
-evicts every unpinned cache entry and stops all growth. `/ready` remains healthy
-throughout.
+evicts every unpinned cache entry and stops all growth. `/ready` stays healthy
+under warning pressure, and reports 503 while macOS reports critical pressure;
+requests already running continue, and one that needs more memory is suspended
+until the pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and
