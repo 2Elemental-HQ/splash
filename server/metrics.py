@@ -181,6 +181,7 @@ def prometheus_metrics(status):
         ),
         "splash_decode_output_tokens_total": ("metrics", "decode_output_tokens"),
         "splash_decode_wall_milliseconds_total": ("metrics", "decode_wall_ms"),
+        "splash_decode_cycle_milliseconds_total": ("metrics", "decode_cycle_ms"),
         "splash_decode_tokens_per_second": (
             "metrics",
             "decode_tokens_per_second",

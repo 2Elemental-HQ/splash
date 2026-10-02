@@ -122,8 +122,8 @@ private:
                uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
-                      uint32_t acceptedDraftTokens,
-                      double wallMilliseconds) override;
+                      uint32_t acceptedDraftTokens, double wallMilliseconds,
+                      double cycleMilliseconds) override;
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,

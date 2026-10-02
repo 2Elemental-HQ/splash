@@ -561,8 +561,10 @@ private:
 
 class Events final : public EngineEventSink {
 public:
-  void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t, uint32_t,
-                      uint32_t, double) override {}
+  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t, uint32_t,
+                      uint32_t, double, double cycleMilliseconds) override {
+    cycles.emplace_back(kind, cycleMilliseconds);
+  }
   void started(uint64_t requestId, uint32_t matched, uint32_t) override {
     startIds.push_back(requestId);
     starts.push_back(matched);
@@ -607,6 +609,8 @@ public:
   uint32_t failedCount = 0;
   uint32_t capacityExhaustedCount = 0;
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> maskRequests;
+  // Each completed command's kind and engine cycle.
+  std::vector<std::pair<WorkKind, double>> cycles;
 };
 
 void require(bool value, const char *message) {
@@ -5570,6 +5574,50 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
           "overlapped verify mask did not complete the owning batch");
 }
 
+// A command's engine cycle runs from the previous command's retirement while
+// the engine stays busy, so it covers the host work between commands, and
+// from the command's plan after a tick that found nothing to do.
+void testDecodeCycleCoversHostWork() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool);
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+
+  EngineRequest greedy = request(1, {1});
+  greedy.maxNewTokens = 2;
+  engine.submit(std::move(greedy));
+  // Each command is planned 5 ms after the previous one retires and
+  // retires 10 ms after its plan.
+  for (double now : {10.0, 20.0, 25.0, 35.0, 40.0, 50.0})
+    require(engine.tick(now), "the greedy request stalled");
+  using Cycles = std::vector<std::pair<WorkKind, double>>;
+  require(events.completedCount == 1 &&
+              events.cycles == Cycles{{WorkKind::Prefill, 10.0},
+                                      {WorkKind::Decode, 15.0},
+                                      {WorkKind::Decode, 15.0}},
+          "back-to-back commands were not timed from retirement to retirement");
+  require(!engine.tick(60.0), "a finished request kept the engine busy");
+
+  engine.submit(constrainedRequest(2));
+  for (double now : {100.0, 110.0, 115.0, 125.0})
+    require(engine.tick(now), "the constrained request stalled");
+  require(events.maskRequests.size() == 1 && !engine.tick(130.0),
+          "a lane waiting for its first mask kept the engine busy");
+  const std::array<uint32_t, 1> mask{1};
+  engine.provideMask(2, mask);
+  require(engine.tick(140.0) && engine.tick(145.0) &&
+              events.maskRequests.size() == 2,
+          "the masked decode did not start");
+  engine.provideMask(2, mask);
+  require(engine.tick(150.0) &&
+              events.cycles.back() == std::pair{WorkKind::Decode, 10.0},
+          "a decode planned after an idle tick was not timed from its plan");
+}
+
 void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
@@ -8979,6 +9027,7 @@ int main() {
     testConstraintMaskWaitHonorsCancelAndDeadline();
     testUnansweredVerifyMaskFailsOnlyItsRequest();
     testUnansweredInitialMaskFails();
+    testDecodeCycleCoversHostWork();
     testDecodeNearContextCeilingCoversVerifyRows();
     testExpiredMaskWaitFinalizesWhileAnotherCommandRuns();
     testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput();

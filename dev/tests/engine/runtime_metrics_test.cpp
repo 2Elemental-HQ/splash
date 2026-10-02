@@ -26,8 +26,8 @@ void testLatencyWindowAndThroughput() {
     metrics.tokens(submitted, first, 2, first + 8.0);
   }
 
-  metrics.batchCompleted(WorkKind::Prefill, 1, 1000, 0, 0, 0, 100.0);
-  metrics.batchCompleted(WorkKind::Decode, 4, 0, 8, 28, 4, 40.0);
+  metrics.batchCompleted(WorkKind::Prefill, 1, 1000, 0, 0, 0, 100.0, 110.0);
+  metrics.batchCompleted(WorkKind::Decode, 4, 0, 8, 28, 4, 40.0, 45.0);
   metrics.capacityFailed();
   metrics.metalFailed();
 
@@ -47,6 +47,8 @@ void testLatencyWindowAndThroughput() {
               snapshot.decodeOutputTokens == 8 &&
               close(snapshot.decodeWallMilliseconds, 40.0),
           "batch throughput metrics are incorrect");
+  require(close(snapshot.decodeCycleMilliseconds, 45.0),
+          "the decode cycle did not count decode commands alone");
   require(snapshot.draftedTokens == 28 && snapshot.acceptedDraftTokens == 4 &&
               close(snapshot.draftAcceptanceRate, 1.0 / 7.0) &&
               snapshot.capacityFailures == 1 && snapshot.metalFailures == 1,

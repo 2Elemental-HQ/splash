@@ -254,6 +254,7 @@ std::string runtimeStatusJson(
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
       << ",\"decode_wall_ms\":" << metrics.decodeWallMilliseconds
+      << ",\"decode_cycle_ms\":" << metrics.decodeCycleMilliseconds
       << ",\"decode_tokens_per_second\":" << metrics.decodeTokensPerSecond
       << ",\"drafted_tokens\":" << metrics.draftedTokens
       << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens

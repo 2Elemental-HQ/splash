@@ -115,6 +115,8 @@ void testCleanRuntimeStatus() {
   RuntimeMetricsSnapshot metrics;
   metrics.prefillInputTokens = 4096;
   metrics.decodeOutputTokens = 32;
+  metrics.decodeWallMilliseconds = 10.0;
+  metrics.decodeCycleMilliseconds = 12.5;
   metrics.draftedTokens = 28;
   metrics.acceptedDraftTokens = 20;
   metrics.draftAcceptanceRate = 20.0 / 28.0;
@@ -218,6 +220,9 @@ void testCleanRuntimeStatus() {
                     "\"rows_bytes\":8}") !=
               std::string::npos,
           "image telemetry is missing from status");
+  require(json.find("\"decode_wall_ms\":10,\"decode_cycle_ms\":12.5,") !=
+              std::string::npos,
+          "status lost the decode command wall or the engine's decode cycle");
   require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                     "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"
                     "\"total_gpu_ms\":500500,\"total_wall_ms\":700250},"

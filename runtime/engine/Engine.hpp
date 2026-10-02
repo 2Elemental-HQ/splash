@@ -266,6 +266,9 @@ private:
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;
+    // Where the engine's time for this command starts: the previous
+    // command's retirement when the engine stayed busy, else its plan.
+    double startedMilliseconds = 0.0;
   };
   enum class Prepared : uint8_t {
     // Some lanes were admitted and the plan runs with them.
@@ -420,8 +423,8 @@ private:
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
-             double wallMilliseconds, bool representativePrefillTiming,
-             double nowMilliseconds);
+             double wallMilliseconds, double cycleMilliseconds,
+             bool representativePrefillTiming, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end
@@ -472,6 +475,8 @@ private:
                                     bool draining) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  // When the latest command retired, until a tick finds nothing to do.
+  std::optional<double> busySinceMilliseconds_;
   // The lanes admit() has obtained so far, including those it gave back when
   // the attempt's pages were refused (Request::admission).
   uint64_t admissions_ = 0;

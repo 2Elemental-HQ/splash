@@ -103,17 +103,18 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
         after["state"]["active_lanes"] == 0 and after["kv"]["pages_active"] == 0,
         "active resources leaked",
     )
-    delta = {
-        key: after["metrics"][key] - before["metrics"][key]
-        for key in (
-            "prefill_wall_ms",
-            "decode_wall_ms",
-            "prefill_input_tokens",
-            "decode_output_tokens",
-            "drafted_tokens",
-            "accepted_draft_tokens",
-        )
-    }
+    keys = [
+        "prefill_wall_ms",
+        "decode_wall_ms",
+        "prefill_input_tokens",
+        "decode_output_tokens",
+        "drafted_tokens",
+        "accepted_draft_tokens",
+    ]
+    # A build older than the engine's decode cycle timing does not report it.
+    if "decode_cycle_ms" in after["metrics"]:
+        keys.append("decode_cycle_ms")
+    delta = {key: after["metrics"][key] - before["metrics"][key] for key in keys}
     return {
         "scenario": scenario,
         "context": context,
@@ -212,6 +213,18 @@ def summarize(records: list[dict]) -> list[dict]:
     both versions must be identical."""
     groups = defaultdict(lambda: defaultdict(list))
     outputs = {}
+    # Decode is judged by the engine's cycle, so host work between commands
+    # counts, unless a version does not report it: then both versions are
+    # judged by the GPU command's wall, never one metric against the other.
+    decode_metric = (
+        "decode_cycle_ms"
+        if all(
+            "decode_cycle_ms" in row["native_delta"]
+            for row in records
+            if row["scenario"] == "decode"
+        )
+        else "decode_wall_ms"
+    )
     for row in records:
         key = row["sample"], row["context"], row["scenario"]
         output = (
@@ -226,7 +239,7 @@ def summarize(records: list[dict]) -> list[dict]:
             raise ValueError(f"baseline/candidate transcript differs: {key}")
         paired[row["version"]] = output
         if row["scenario"] == "decode":
-            latency = row["native_delta"]["decode_wall_ms"] / max(
+            latency = row["native_delta"][decode_metric] / max(
                 1, row["native_delta"]["decode_output_tokens"]
             )
         else:
@@ -243,7 +256,9 @@ def summarize(records: list[dict]) -> list[dict]:
             {
                 "context": context,
                 "scenario": scenario,
-                "metric": "decode_ms_per_token" if scenario == "decode" else "ttft_ms",
+                "metric": (
+                    f"{decode_metric}_per_token" if scenario == "decode" else "ttft_ms"
+                ),
                 "samples_per_round": [
                     len(rounds[index]) for index in range(len(ROUNDS))
                 ],

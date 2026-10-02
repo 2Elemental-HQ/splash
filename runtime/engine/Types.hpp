@@ -107,8 +107,12 @@ inline constexpr std::string_view kDeadlineExceededMessage =
 class EngineEventSink {
 public:
   virtual ~EngineEventSink() = default;
+  // Kind, width, input, output, drafted and accepted tokens, then the
+  // command's wall time and the engine's cycle for it: from the previous
+  // command's retirement, or from its plan when the engine was idle, to its
+  // own retirement.
   virtual void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t,
-                              uint32_t, uint32_t, double) = 0;
+                              uint32_t, uint32_t, double, double) = 0;
   virtual void started(uint64_t requestId, uint32_t matchedTokens,
                        uint32_t lane) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
