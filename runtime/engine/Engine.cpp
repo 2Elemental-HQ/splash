@@ -11,6 +11,9 @@ namespace {
 
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
+// A mask request the server leaves unanswered this long fails its request;
+// the batch's command slot is not held longer.
+constexpr int kMaskWaitLimitMilliseconds = 5000;
 
 // While an active one lives, allocations are memory a request in service
 // needs (EngineConfig::serving).
@@ -181,6 +184,7 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
     settle(active, {LaneOutcome::InvalidMask, std::move(*rejected)});
     return;
   }
+  active.maskRequestedMilliseconds.reset();
   if (!ownedByActiveBatch)
     scheduler_.maskReady(id);
 }
@@ -215,6 +219,15 @@ bool Engine::tick(double now) {
   }
   const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
+    // A mask request left unanswered past the limit ends its request: a lane
+    // in flight commits without the mask, any other fails now.
+    if (!active.pendingEnd && active.maskRequestedMilliseconds &&
+        now >= *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds) {
+      settle(active, {LaneOutcome::MaskTimeout,
+                      "the server did not answer a token-mask request within " +
+                          std::to_string(kMaskWaitLimitMilliseconds) + " ms"});
+      progressed = true;
+    }
     // Admission is deliberately paused while resident peers finish. Start a
     // fresh resource wait only if admission still fails after that drain.
     if (draining) {
@@ -245,8 +258,9 @@ bool Engine::tick(double now) {
     sweepTerminal();
   if (pending_) {
     auto forwardMaskRequests = [&] {
-      for (ModelMaskRequest &request : pending_->ticket->takeMaskRequests()) {
-        events_.maskRequested(request.requestId, request.simulationTokens);
+      for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
+        events_.maskRequested(asked.requestId, asked.simulationTokens);
+        request(asked.requestId).maskRequestedMilliseconds = now;
         progressed = true;
       }
     };
@@ -267,7 +281,7 @@ bool Engine::tick(double now) {
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command.plan, results, command.ticket->wallMilliseconds(),
-          command.ticket->prefillTimingIsRepresentative());
+          command.ticket->prefillTimingIsRepresentative(), now);
     sweepTerminal();
     return true;
   }
@@ -328,6 +342,12 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       continue;
     if (!result || active.request.deadlineMilliseconds < *result)
       result = active.request.deadlineMilliseconds;
+    if (active.maskRequestedMilliseconds) {
+      const double limit =
+          *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds;
+      if (!result || limit < *result)
+        result = limit;
+    }
     const double deadline = resourceDeadline(active);
     if (!draining && deadline > 0.0 && (!result || deadline < *result))
       result = deadline;
@@ -1399,7 +1419,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
 void Engine::apply(const BatchPlan &plan,
                    std::span<const ModelStepResult> results,
-                   double wallMilliseconds, bool representativePrefillTiming) {
+                   double wallMilliseconds, bool representativePrefillTiming,
+                   double now) {
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
@@ -1518,6 +1539,7 @@ void Engine::apply(const BatchPlan &plan,
                                 complete, result.nextDecodeStage});
     if (plan.kind == WorkKind::Decode && waitsForMask(result.nextDecodeStage)) {
       events_.maskRequested(active.request.id, {});
+      active.maskRequestedMilliseconds = now;
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
@@ -1607,6 +1629,7 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::release(Request &active) {
   active.resourceWait = {};
+  active.maskRequestedMilliseconds.reset();
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);

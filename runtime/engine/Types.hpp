@@ -68,6 +68,8 @@ enum class LaneOutcome : uint8_t {
   CapacityExhausted,
   ModelResultInvalid,
   InvalidMask,
+  // The server left a token-mask request unanswered (Engine.cpp's limit).
+  MaskTimeout,
 };
 
 struct LaneOutcomeWire final {
@@ -90,6 +92,8 @@ laneOutcomeWire(LaneOutcome outcome) noexcept {
     return {"model_result_invalid", false};
   case LaneOutcome::InvalidMask:
     return {"invalid_mask_response", false};
+  case LaneOutcome::MaskTimeout:
+    return {"mask_timeout", true};
   }
 }
 

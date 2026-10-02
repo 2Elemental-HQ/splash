@@ -998,6 +998,9 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
+A mask request the server leaves unanswered for 5 s fails that request with
+the retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
+batch's command.
 A lane's arithmetic can depend on the batch it decodes in and on how its
 prompt is chunked. Concurrent requests change both, and chunk boundaries also
 come from the cached boundary a request resumes from and from the junctions

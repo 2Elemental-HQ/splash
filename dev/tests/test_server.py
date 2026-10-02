@@ -519,7 +519,7 @@ class FakeConstraintFactory:
 
     def create(self, grammar, *, timeout=None, prefixes=None):
         self.grammars.append(grammar)
-        return SimpleNamespace(consume=lambda _tokens: None)
+        return SimpleNamespace(commit=lambda _tokens: None, finish=lambda: None)
 
     def stats(self):
         return {}

@@ -203,6 +203,9 @@ private:
     // The outcome that ends this lane once the command or restore it is in
     // drains; the first one stands.
     std::optional<LaneEnd> pendingEnd;
+    // When the engine asked the server for this lane's token mask, until the
+    // model takes one.
+    std::optional<double> maskRequestedMilliseconds;
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
@@ -336,7 +339,8 @@ private:
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
-             double wallMilliseconds, bool representativePrefillTiming);
+             double wallMilliseconds, bool representativePrefillTiming,
+             double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end

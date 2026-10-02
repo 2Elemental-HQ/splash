@@ -93,6 +93,8 @@ struct MaskOverlapState final {
   bool emitted = false;
   bool provided = false;
   bool abandoned = false;
+  // Keeps the command running after its mask wait ended.
+  bool held = false;
 };
 
 class MaskOverlapTicket final : public ModelBatchTicket {
@@ -114,7 +116,7 @@ public:
       state_->abandoned = true;
   }
   bool ready() const noexcept override {
-    return state_->provided || state_->abandoned;
+    return !state_->held && (state_->provided || state_->abandoned);
   }
   std::vector<ModelStepResult> wait() override {
     if (!ready())
@@ -4739,6 +4741,85 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
   }
 }
 
+// A verify mask the server leaves unanswered fails its request alone once
+// the limit passes: the command commits without the mask, a mask that comes
+// after the limit is ignored, and the lane goes to the request waiting for
+// it.
+void testUnansweredVerifyMaskFailsOnlyItsRequest() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(constrainedRequest(203, 100'000.0));
+  // The verify mask is requested at tick 6.
+  advanceToOverlappedVerify(engine, executor, events, 203);
+  engine.submit(request(204, {2}));
+  static_cast<void>(engine.tick(5005.0));
+  require(engine.commandInFlight() && !executor.overlap->abandoned &&
+              events.failedCount == 0,
+          "a verify mask wait ended before its limit");
+  // The command still runs after the limit, so a late mask finds the
+  // request in flight.
+  executor.overlap->held = true;
+  require(engine.tick(5006.0) && engine.commandInFlight() &&
+              executor.overlap->abandoned && events.failedCount == 0,
+          "an unanswered verify mask wait did not end at its limit");
+  const std::array<uint32_t, 1> lateMask{1};
+  engine.provideMask(203, lateMask);
+  require(!executor.overlap->provided,
+          "a verify mask that came after the limit reached the model");
+  executor.overlap->held = false;
+  require(engine.tick(5007.0) && !engine.commandInFlight() &&
+              events.failures == std::vector<std::string>{"mask_timeout"} &&
+              events.failureDetails.front().second && events.emitted == 0 &&
+              events.completedCount == 0,
+          "an unanswered verify mask did not fail its request as retryable");
+  require(engine.tick(5008.0) && events.startIds.back() == 204,
+          "the timed-out request's lane did not go to the waiting request");
+  runUntilIdle(engine);
+  require(events.completedCount == 1 && events.failedCount == 1,
+          "the waiting request did not complete after the mask timeout");
+}
+
+// An initial mask the server leaves unanswered fails its request when the
+// limit passes, which the engine's next wakeup names; an answered mask
+// clears the limit.
+void testUnansweredInitialMaskFails() {
+  for (const bool answered : {false, true}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor(1);
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
+    engine.submit(constrainedRequest(205, 100'000.0));
+    require(engine.tick(1) && engine.tick(2) && engine.tick(3) &&
+                engine.tick(4) && events.maskRequests.size() == 1,
+            "constrained request did not reach its initial mask");
+    require(engine.nextWakeupMilliseconds() == 5004.0,
+            "the initial mask wait did not schedule its limit");
+    if (answered) {
+      const std::array<uint32_t, 1> initialMask{1};
+      engine.provideMask(205, initialMask);
+      require(engine.nextWakeupMilliseconds() == 100'000.0 &&
+                  engine.tick(5004.0) && events.failedCount == 0,
+              "an answered initial mask kept its limit");
+      continue;
+    }
+    static_cast<void>(engine.tick(5003.0));
+    require(events.failedCount == 0, "an initial mask wait ended early");
+    require(engine.tick(5004.0) &&
+                events.failures == std::vector<std::string>{"mask_timeout"} &&
+                events.failureDetails.front().second &&
+                executor.requests.empty() && idle(engine),
+            "an unanswered initial mask did not fail its request");
+  }
+}
+
 void testDecodeNearContextCeilingCoversVerifyRows() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -7427,6 +7508,8 @@ int main() {
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
     testConstraintMaskWaitHonorsCancelAndDeadline();
+    testUnansweredVerifyMaskFailsOnlyItsRequest();
+    testUnansweredInitialMaskFails();
     testDecodeNearContextCeilingCoversVerifyRows();
     testExpiredMaskWaitFinalizesWhileAnotherCommandRuns();
     testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput();

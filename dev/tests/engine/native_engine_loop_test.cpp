@@ -1423,7 +1423,8 @@ void testInvalidScoreFailsOneRequestAndKeepsTheBatch() {
 // A constrained request's initial token mask crosses the native protocol.
 // Only the response to the pending mask request, with one row of the
 // configured width, reaches the model. Any other response fails that
-// request alone, and one that arrives after the request ended is ignored.
+// request alone, and one that arrives after the request ended, cancelled or
+// timed out waiting for it, is ignored.
 void testConstrainedMaskExchange() {
   enum class Reply {
     Valid,
@@ -1431,10 +1432,13 @@ void testConstrainedMaskExchange() {
     WrongWordCount,
     EmptyRow,
     Malformed,
-    AfterCancel
+    AfterCancel,
+    AfterTimeout
   };
-  for (Reply reply : {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
-                      Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel}) {
+  for (Reply reply :
+       {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
+        Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel,
+        Reply::AfterTimeout}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
@@ -1443,13 +1447,14 @@ void testConstrainedMaskExchange() {
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
     config.maskWordsPerToken = 2;
+    double now = 100.0;
     engine::NativeRuntime loop(
         config, resources, executor,
         [&](std::span<const uint8_t> bytes) {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+        {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto send = [&](protocol::Message message) {
@@ -1461,6 +1466,8 @@ void testConstrainedMaskExchange() {
     constrained.priority = protocol::RequestPriority::Background;
     constrained.cohort = protocol::Cohort::Constrained;
     constrained.constraint = protocol::ConstraintMode::TokenMask;
+    constrained.absoluteDeadlineUnixMicros = 601'000'000;
+    constrained.remainingDeadlineMicros = 600'000'000;
     send(constrained);
     while (loop.tick()) {
     }
@@ -1482,6 +1489,10 @@ void testConstrainedMaskExchange() {
       response.maskWords = {0, 0};
     if (reply == Reply::AfterCancel) {
       send(protocol::CancelFrame{7});
+      runUntilIdle(loop);
+    }
+    if (reply == Reply::AfterTimeout) {
+      now += 5000.0;
       runUntilIdle(loop);
     }
     if (reply == Reply::Malformed) {
@@ -1523,6 +1534,10 @@ void testConstrainedMaskExchange() {
       require(done == protocol::FinishReason::Cancelled && errors.empty() &&
                   executor.providedMasks == 0,
               "mask response after cancellation was not ignored");
+    } else if (reply == Reply::AfterTimeout) {
+      require(!done && errors == std::vector<std::string>{"mask_timeout"} &&
+                  executor.providedMasks == 0,
+              "mask response after its timeout was not ignored");
     } else {
       require(!done &&
                   errors == std::vector<std::string>{"invalid_mask_response"} &&
