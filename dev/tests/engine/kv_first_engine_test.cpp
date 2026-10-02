@@ -2787,6 +2787,160 @@ void testClosedAdmissionReopensWhenTheWaitEnds() {
           "a cancelled wait left work behind");
 }
 
+// A request refused memory waits next for a prefix that a lane admitted in
+// the same pass is about to compute. A prefix wait is not an attempt: the
+// refusal stands, and a short request that arrived after it stays queued
+// until the refused request starts from the producer's junction.
+void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  // Two lanes: the first two requests take both, so the producer waits for
+  // a lane while the host refuses request 4.
+  Executor executor(2);
+  bool hostRefuses = true;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return hostRefuses && executor.lastBeginId == 4; };
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  // The producer and request 4 share 960 tokens.
+  std::vector<uint32_t> producer(1000, 7);
+  std::vector<uint32_t> refused(1100, 7);
+  std::fill(producer.begin() + 960, producer.end(), 8);
+  std::fill(refused.begin() + 960, refused.end(), 9);
+  engine.submit(request(1, {1}));
+  engine.submit(request(2, {2}));
+  engine.submit(request(3, producer));
+  engine.submit(request(4, refused));
+  static_cast<void>(engine.tick(1));
+  const auto waits = engine.resourceWaitSnapshot(1);
+  require(executor.requests.size() == 2 && waits.memory == 1 && waits.concurrency == 1,
+          "the producer did not wait for a lane beside a refused request");
+  hostRefuses = false;
+  require(engine.tick(2), "the first requests did not prefill");
+  engine.cancel(2);
+  engine.submit(request(5, {5}));
+  // The producer starts in the freed lane with a junction for request 4,
+  // which then waits for it; a decode runs before the producer's prefill.
+  require(engine.tick(3) && executor.requests.contains(3) &&
+              engine.snapshot().scheduler.waitingPrefix == 1,
+          "the refused request did not wait for the producer's prefix");
+  double now = 4;
+  while (!executor.requests.contains(4) && now < 100) {
+    require(!executor.requests.contains(5) && !events.usage.contains(5),
+            "a later arrival started while a refused request waited for a prefix");
+    static_cast<void>(engine.tick(now++));
+  }
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  const auto started = [&](uint64_t id) {
+    return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
+  };
+  require(events.completedCount == 5 && events.failedCount == 0 && started(4) < started(5) &&
+              executor.restored == 960,
+          "the refused request did not start first from the producer's junction");
+}
+
+// After a suspension, suspended requests resume one at a time in admission
+// order. The first one's resume is refused memory: the one after it, whose
+// pages would fit, stays suspended, and once the resident lane finishes the
+// first resumes first.
+void testRefusedResumeHoldsBackLaterSuspendedLanes() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0}, resources, executor,
+                        events);
+  guardReleases(storage, engine);
+  // The resident lane fills the first extent and decodes within it.
+  auto resident = request(1, std::vector<uint32_t>(97, 1));
+  resident.maxNewTokens = 1000;
+  engine.submit(std::move(resident));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.emitted != 0; }, "the resident lane did not decode");
+  // The host refuses growth: both later requests are suspended at their
+  // first prefill, request 2 to resume with five pages, request 3 with one.
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  const std::vector<uint32_t> first(161, 2);
+  const std::vector<uint32_t> second(33, 3);
+  engine.submit(request(2, first));
+  engine.submit(request(3, second));
+  tickUntil(engine, now, [&] { return executor.suspensions == 2; },
+            "the later requests were not suspended");
+  // One more extent: room for request 3's page, not for request 2's. The
+  // refusal of request 2's resume drains the resident lane for the wait
+  // limit; its retries after the drain are refused too.
+  storage.growthBlocked = false;
+  storage.allocationFailure = metal::AllocationFailure::EngineBudget;
+  storage.budgetPages = 8;
+  for (const double end = now + 1500; now < end; now += 101) {
+    static_cast<void>(engine.tick(now));
+    require(engine.snapshot().resourceResumptions == 0 && !executor.requests.at(3).resident &&
+                events.failedCount == 0,
+            "a suspended request resumed ahead of an earlier one refused memory");
+  }
+  require(executor.resumeAttempts >= 3 && executor.requests.at(1).resident,
+          "the refused resume was not retried beside the resident lane");
+  executor.decodeFinishes = true;
+  for (const double end = now + 2000; now < end && !engine.idle(); now += 101)
+    static_cast<void>(engine.tick(now));
+  // The executor records every state it grants, request 2's refused
+  // resumes included: request 3's is the last.
+  const auto &resumed = executor.resumedPrompts;
+  require(engine.idle() && events.completedCount == 3 && events.failedCount == 0 &&
+              engine.snapshot().resourceResumptions == 2 &&
+              std::find(resumed.begin(), resumed.end(), second) == resumed.end() - 1,
+          "the suspended requests did not resume in admission order");
+}
+
+// A suspended request held behind one whose resume is refused memory is not
+// tried, so it neither keeps a retry time nor runs out its wait. With
+// nothing resident, the native loop sleeps until the refused request's next
+// retry; when the wait limit ends that request, the held one resumes.
+void testHeldSuspendedRequestNeitherWakesNorExpires() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.kvGrowthBlocked = &storage.growthBlocked;
+  executor.unblockGrowthOnSuspend = false;
+  Events events;
+  engine::Engine engine({.resourceWaitTimeoutMilliseconds = 300.0}, resources, executor,
+                        events);
+  guardReleases(storage, engine);
+  // The host refuses growth, so both requests are suspended at their first
+  // prefill, and then it refuses every resume.
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  engine.submit(request(1, {1}));
+  engine.submit(request(2, {2}));
+  require(engine.tick(1) && engine.tick(2) && executor.suspensions == 2 &&
+              !engine.commandInFlight(),
+          "the requests were not suspended");
+  storage.growthBlocked = false;
+  executor.resumeDenied = true;
+  // As the native loop does, sleep until the next wake-up.
+  double now = 2;
+  while (!events.failedCount) {
+    const std::optional<double> wakeup = engine.nextWakeupMilliseconds();
+    require(wakeup && *wakeup > now,
+            "a request held behind a refused resume woke the loop with nothing to do");
+    now = *wakeup;
+    static_cast<void>(engine.tick(now));
+  }
+  require(events.failures == std::vector<std::string>{"resource_timeout"},
+          "the refused resume did not end at its wait limit alone");
+  executor.resumeDenied = false;
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  require(events.completedCount == 1 && events.failedCount == 1 &&
+              engine.snapshot().resourceResumptions == 1,
+          "a request held behind a refused resume ran out its wait meanwhile");
+}
+
 void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -6842,6 +6996,9 @@ int main() {
     testMemoryWaitHoldsBackLaterArrivals();
     testMemoryWaitClosesAdmissionBesideAResidentLane();
     testClosedAdmissionReopensWhenTheWaitEnds();
+    testPrefixWaitKeepsAdmissionClosedBehindARefusal();
+    testRefusedResumeHoldsBackLaterSuspendedLanes();
+    testHeldSuspendedRequestNeitherWakesNorExpires();
     testSchedulingWaitDoesNotConsumeMemoryTimeout();
     testUnadmittedRequestsHonorCancellationAndDeadline();
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();

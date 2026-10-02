@@ -158,8 +158,10 @@ private:
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
     // The latest attempt to start it was refused memory. Until it starts,
-    // nothing that arrived after it is admitted (admitQueued); a pass that
-    // does not schedule it leaves that in place.
+    // nothing that comes after it in admission order is admitted, in
+    // ordinary admission or among suspended requests during recovery
+    // (admitQueued); a pass that does not schedule it or a prefix wait
+    // leaves it in place.
     bool refusedMemory = false;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;

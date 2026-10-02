@@ -325,7 +325,8 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   if (draining && (!result || drainEndMilliseconds_ < *result))
     result = drainEndMilliseconds_;
   // Admission retries run only between commands, and after a suspension only
-  // for suspended requests. Other retry times would wake the loop with
+  // for suspended requests; those held behind one refused memory have no
+  // retry time (admitQueued). Other retry times would wake the loop with
   // nothing to do; the command completion or resumption wakes it instead.
   const bool recovering = std::any_of(
       requests_.begin(), requests_.end(),
@@ -393,10 +394,23 @@ bool Engine::admitQueued(double now) {
     return false;
   const std::vector<uint64_t> order = scheduler_.admissionOrder();
   if (recovering) {
+    // Suspended requests come first, one at a time, in admission order; as
+    // in ordinary admission, the first one refused memory holds back the
+    // ones after it. Those are not tried, so they keep no retry time, and
+    // their wait limit starts again at their next attempt.
+    bool held = false;
     for (uint64_t id : order) {
       Request &active = request(id);
-      if (active.suspended && !active.restore && resourceRetryReady(active, now) && admit(active, now))
+      if (!active.suspended || active.restore)
+        continue;
+      if (held) {
+        active.resourceWait.retryMilliseconds = 0.0;
+        active.resourceWait.deadlineMilliseconds = 0.0;
+        continue;
+      }
+      if (resourceRetryReady(active, now) && admit(active, now))
         return true;
+      held = active.refusedMemory;
     }
     return false;
   }
@@ -543,7 +557,6 @@ bool Engine::pendingSharedPrefill(const Request &active,
 
 bool Engine::admit(Request &active, double now) {
   const bool resuming = active.suspended;
-  active.refusedMemory = false;
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
@@ -561,6 +574,8 @@ bool Engine::admit(Request &active, double now) {
     scheduler_.waitForPrefix(active.request.id);
     return false;
   }
+  // A prefix wait is not an attempt: a refusal stands until the next one.
+  active.refusedMemory = false;
   bool executorStarted = false;
   bool resourcesStarted = false;
   try {

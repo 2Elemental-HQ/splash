@@ -779,10 +779,14 @@ the engine already holds, and with none in service it starts. A request whose
 start was refused memory, under host pressure or at `--max-memory`, holds back
 the requests that arrived after it until it starts, fails or is cancelled, so
 the lanes that finish leave their memory to it; a higher priority is not held
-back. Critical pressure evicts every unpinned cache entry and stops all growth.
-`/ready` stays healthy under warning pressure, and reports 503 while macOS
-reports critical pressure; requests already running continue, and one that
-needs more memory is suspended until the pressure lifts.
+back. It keeps holding them back while it waits for a prefix another lane is
+computing. After a suspension, suspended requests resume first, one at a time,
+higher priority first and then in the order they arrived; one refused memory
+holds back the suspended requests after it, and their resource waits do not
+run out while it does. Critical pressure evicts every unpinned cache entry and
+stops all growth. `/ready` stays healthy under warning pressure, and reports
+503 while macOS reports critical pressure; requests already running continue,
+and one that needs more memory is suspended until the pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and
