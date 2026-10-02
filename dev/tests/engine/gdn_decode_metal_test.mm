@@ -497,7 +497,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
       "lanes " + std::to_string(lanes) + (float32 ? " f32 norm" : "");
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     require(GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes,
-                           layer, fixture.cell.strides())
+                           layer, fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain)
                     .layout == LinearInput::Plain,
             where + ": plain GDN claimed a table");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -616,7 +616,8 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
     GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
                    GdnHeadOrder::Grouped, layout);
   });
-  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " plain kernel claimed a table");
   tables.addReference(reference, fixture.hidden);
@@ -654,7 +655,8 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
   const std::string what = caseName("tiled GDN", shape, lanes, layout);
   CommandGraph grouped;
-  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " grouped reference claimed a table");
   (void)backend.submitCommand(grouped.dispatches());
@@ -670,7 +672,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   CommandGraph tiled;
   if (layout == LinearInput::Plain) {
     require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
-                           GdnHeadOrder::Tiled).layout == LinearInput::Plain,
+                           GdnHeadOrder::Tiled, LinearInput::Plain).layout == LinearInput::Plain,
             what + " claimed a table");
     (void)backend.submitCommand(tiled.dispatches());
   } else {
@@ -693,16 +695,16 @@ void rejectsInvalid(MetalBackend &backend) {
   CommandGraph graph;
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, 0, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, kMaxLanes + 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0),
                    GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
@@ -728,7 +730,8 @@ void rejectsInvalid(MetalBackend &backend) {
     // F32 weights need twice the bytes of bf16 ones.
     auto buffers = fixture.decodeBuffers(0);
     buffers.mixerNorm.float32 = true;
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides());
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Plain);
   });
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }

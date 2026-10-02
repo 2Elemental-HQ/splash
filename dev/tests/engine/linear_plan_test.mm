@@ -567,13 +567,26 @@ void planContracts(uint32_t family, uint32_t cores) {
            LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
     rejects([&] { (void)linear.plan(invalid); });
   for (const LinearConfig invalid : {LinearConfig{LinearTile::N128, 0}, LinearConfig{LinearTile::N128, 5}})
-    rejects([&] { (void)Linear::plan(valid, invalid); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::Paired128, 0}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
-  rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0}); });
+    rejects([&] { (void)Linear::plan(valid, invalid, FloatOutput::BFloat16); });
+  rejects([&] { (void)Linear::plan({{512, 256}, 16}, {LinearTile::Paired128, 1}, FloatOutput::BFloat16); });
+  rejects([&] {
+    (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::N128, 1}, FloatOutput::BFloat16);
+  });
+  rejects([&] {
+    (void)Linear::plan({{512, 256}, 32, LinearPhase::Prefill}, {LinearTile::Paired128, 0}, FloatOutput::BFloat16);
+  });
+  rejects([&] {
+    (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1},
+                       FloatOutput::BFloat16);
+  });
+  rejects([&] {
+    (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1},
+                       FloatOutput::BFloat16);
+  });
+  rejects([&] {
+    (void)Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0},
+                       FloatOutput::BFloat16);
+  });
   // Split128: eight simdgroups and two to eight K partitions of at least one
   // 256-input block, at every lane count and epilogue. Paired256: one lane,
   // plain epilogue, four simdgroups. Neither exists in prefill.
@@ -584,81 +597,89 @@ void planContracts(uint32_t family, uint32_t cores) {
   for (const uint32_t splits : {0U, 3U, 16U}) {
     auto invalid = matrixTile;
     invalid.splits = splits;
-    rejects([&] { (void)Linear::plan(splitWorkload, invalid); });
+    rejects([&] { (void)Linear::plan(splitWorkload, invalid, FloatOutput::BFloat16); });
   }
   rejects([&] { (void)Linear::plan({{512, 768}, 8},
-      {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 8}); });
+      {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 8}, FloatOutput::BFloat16); });
   for (uint32_t rows : {8U, 16U, 24U, 32U}) {
     const LinearWorkload workload{{512, 1024}, rows};
-    const LinearPlan plan = Linear::plan(workload, matrixTile);
+    const LinearPlan plan = Linear::plan(workload, matrixTile, FloatOutput::BFloat16);
     require(sameScratch(plan.scratchSize(), expectedScratch(matrixTile, workload, plan.tileColumns())),
             "matrix row tiles must own disjoint input, sums, both fragment streams' partials and counters");
   }
   rejects([&] { (void)Linear::plan(splitWorkload,
-      {LinearTile::Simdgroup, 0, LinearSimdgroups::Eight, 4}); });
+      {LinearTile::Simdgroup, 0, LinearSimdgroups::Eight, 4}, FloatOutput::BFloat16); });
   const LinearConfig split128{LinearTile::Split128, 0, LinearSimdgroups::Eight, 4};
   const LinearConfig paired256{LinearTile::Paired256, 2, LinearSimdgroups::Four};
   // A tile whose grid covers the matrix takes no group count, not even its
   // grid's: the plan derives it.
   for (LinearConfig fullGrid : {matrixTile, split128}) {
-    fullGrid.groups = 512 / Linear::plan(splitWorkload, fullGrid).tileColumns();
-    rejects([&] { (void)Linear::plan(splitWorkload, fullGrid); });
+    fullGrid.groups = 512 / Linear::plan(splitWorkload, fullGrid, FloatOutput::BFloat16).tileColumns();
+    rejects([&] { (void)Linear::plan(splitWorkload, fullGrid, FloatOutput::BFloat16); });
   }
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::string rows = rowsSuffix(lanes);
     const LinearWorkload plain{{512, 1024}, lanes * 8, LinearPhase::Decode, LinearEpilogue::None};
-    const auto plan = Linear::plan(plain, split128);
+    const auto plan = Linear::plan(plain, split128, FloatOutput::BFloat16);
     require(plan.pipeline() == "decode_linear_q4_n128_split" + rows && plan.threadsPerThreadgroup() == 256 &&
                 plan.tileColumns() == 128 && plan.secondPipeline().empty() &&
                 plan.storageRows() == lanes * 8 && plan.input() == LinearInput::Plain &&
                 sameScratch(plan.scratchSize(), expectedScratch(split128, plain, 128)),
             "Split128 plan geometry, pipeline or scratch is wrong");
-    require(Linear::plan({plain.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual}, split128)
+    require(Linear::plan({plain.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual}, split128,
+                         FloatOutput::BFloat16)
                     .pipeline() == "decode_linear_q4_n128_split_residual" + rows,
             "Split128 residual pipeline is wrong");
     const auto gateUpPlan = Linear::plan({plain.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::GateUp},
-                                         split128);
+                                         split128, FloatOutput::BFloat16);
     require(gateUpPlan.pipeline() == "decode_linear_q4_n128_split" + rows &&
                 gateUpPlan.secondPipeline() == "decode_linear_q4_n128_split_up_silu" + rows &&
                 gateUpPlan.gateScratchBytes() == uint64_t{lanes} * 8 * 512 * 2,
             "Split128 gate/up runs a gate pass into the gate scratch and an up pass");
   }
-  const auto wide = Linear::plan(splitWorkload, paired256);
+  const auto wide = Linear::plan(splitWorkload, paired256, FloatOutput::BFloat16);
   require(wide.pipeline() == "decode_linear_q4_n256_paired_sg4" && wide.threadsPerThreadgroup() == 128 &&
               wide.tileColumns() == 256,
           "Paired256 plan geometry or pipeline is wrong");
   // Split128 takes eight simdgroups and 2, 4 or 8 partitions of at least one
   // block: 1024 inputs hold four.
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Four, 4}); });
+  rejects([&] {
+    (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Four, 4}, FloatOutput::BFloat16);
+  });
   for (const uint32_t splits : {0U, 1U, 3U, 8U, 16U})
-    rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits}); });
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Linear::plan(splitResidual, paired256); });
-  rejects([&] { (void)Linear::plan(splitGateUp, paired256); });
+    rejects([&] {
+      (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits},
+                         FloatOutput::BFloat16);
+    });
+  rejects([&] {
+    (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}, FloatOutput::BFloat16);
+  });
+  rejects([&] { (void)Linear::plan(splitResidual, paired256, FloatOutput::BFloat16); });
+  rejects([&] { (void)Linear::plan(splitGateUp, paired256, FloatOutput::BFloat16); });
   for (uint32_t rows : {16U, 24U, 32U})
-    rejects([&] { (void)Linear::plan({{512, 1024}, rows}, paired256); });
+    rejects([&] { (void)Linear::plan({{512, 1024}, rows}, paired256, FloatOutput::BFloat16); });
   rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
-                                   {LinearTile::Paired256, 0, LinearSimdgroups::Four}); });
+                                   {LinearTile::Paired256, 0, LinearSimdgroups::Four}, FloatOutput::BFloat16); });
   rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
-                                   {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}); });
+                                   {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}, FloatOutput::BFloat16); });
   const LinearWorkload fourWorkload{{512, 256}, 24, LinearPhase::Decode, LinearEpilogue::None};
   const LinearConfig fourConfig{LinearTile::N128, 1, LinearSimdgroups::Four};
   for (uint32_t rows : {8U, 16U, 32U})
-    rejects([&] { (void)Linear::plan({{512, 256}, rows}, fourConfig); });
+    rejects([&] { (void)Linear::plan({{512, 256}, rows}, fourConfig, FloatOutput::BFloat16); });
   for (const auto tile : {LinearTile::N256, LinearTile::Paired128})
     rejects([&] { (void)Linear::plan(fourWorkload,
-        {tile, 1, LinearSimdgroups::Four}); });
+        {tile, 1, LinearSimdgroups::Four}, FloatOutput::BFloat16); });
   for (const auto epilogue : {LinearEpilogue::GateUp, LinearEpilogue::UpWithGate})
     rejects([&] { (void)Linear::plan({{512, 256}, 24, LinearPhase::Decode, epilogue},
-                                      fourConfig); });
+                                      fourConfig, FloatOutput::BFloat16); });
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                              LinearEpilogue::UpWithGate}) {
     const LinearWorkload prefill{{512, 256}, 24, LinearPhase::Prefill, epilogue};
-    require(Linear::plan(prefill, {LinearTile::N128, 0, LinearSimdgroups::Four})
+    require(Linear::plan(prefill, {LinearTile::N128, 0, LinearSimdgroups::Four}, FloatOutput::BFloat16)
                     .threadsPerThreadgroup() == 128,
             "four-SIMDgroup prefill plan was rejected");
-    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}); });
-    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
+    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}, FloatOutput::BFloat16); });
+    rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}, FloatOutput::BFloat16); });
   }
 }
 
@@ -874,14 +895,16 @@ void ggufPlans() {
   }
   // The decode tiles hold at most a decode batch.
   LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
-  rejects([&] { (void)Linear::plan(longPrefill, {.tile = LinearTile::GgufStaged}); });
+  rejects([&] { (void)Linear::plan(longPrefill, {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16); });
   // Affine and GGUF plans do not mix.
-  rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 8}); });
+  rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 8}, FloatOutput::BFloat16); });
   LinearWorkload gguf = down;
   gguf.weightLayout = WeightLayout::Block32;
-  rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}); });
-  rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .groups = 80, .splits = 8}); });
-  rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .splits = 3}); });
+  rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}, FloatOutput::BFloat16); });
+  rejects([&] {
+    (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .groups = 80, .splits = 8}, FloatOutput::BFloat16);
+  });
+  rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .splits = 3}, FloatOutput::BFloat16); });
   // The arena bound is the single-tensor plan of the 32-row tile, which fused
   // and gate/up plans share.
   const ProjectionShape downShape{5120, 17408, WeightLayout::Block32};
@@ -998,29 +1021,29 @@ void ggufPlans() {
   for (const LinearConfig config : {LinearConfig{.tile = LinearTile::GgufRegister, .splits = 3},
                                     LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16},
                                     LinearConfig{.tile = LinearTile::GgufRegister, .groups = 80, .splits = 8}})
-    rejects([&] { (void)Linear::plan(registerDown, config); });
+    rejects([&] { (void)Linear::plan(registerDown, config, FloatOutput::BFloat16); });
   // Split boundaries fall on 256-input units, and prefill has no register tile.
   const LinearWorkload chunk{{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
   rejects([&] {
     (void)Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
-                         {.tile = LinearTile::GgufRegister, .splits = 4});
+                         {.tile = LinearTile::GgufRegister, .splits = 4}, FloatOutput::BFloat16);
   });
-  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufRegister}); });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufRegister}, FloatOutput::BFloat16); });
   // The GGUF kernels fix their threadgroups (GGUF_*_THREADS): every GGUF tile
   // takes the default simdgroups.
   const auto fixedThreadgroup = [](LinearWorkload workload, LinearConfig config, uint32_t threads) {
-    require(Linear::plan(workload, config).threadsPerThreadgroup() == threads,
+    require(Linear::plan(workload, config, FloatOutput::BFloat16).threadsPerThreadgroup() == threads,
             "a GGUF plan's threadgroup is not its kernel's");
     config.simdgroups = LinearSimdgroups::Four;
-    rejects([&] { (void)Linear::plan(workload, config); });
+    rejects([&] { (void)Linear::plan(workload, config, FloatOutput::BFloat16); });
   };
   fixedThreadgroup(registerDown, {.tile = LinearTile::GgufRegister, .splits = 8}, GGUF_REGISTER_THREADS);
   fixedThreadgroup(registerDown, {.tile = LinearTile::GgufStaged, .splits = 2}, GGUF_STAGED_THREADS);
   fixedThreadgroup(chunk, {.tile = LinearTile::GgufPrefill}, GGUF_PREFILL_THREADS);
   // The prefill tile runs prefill chunks on their matrix grid, unsplit.
-  rejects([&] { (void)Linear::plan(registerDown, {.tile = LinearTile::GgufPrefill}); });
-  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .groups = 80}); });
-  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 2}); });
+  rejects([&] { (void)Linear::plan(registerDown, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16); });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .groups = 80}, FloatOutput::BFloat16); });
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 2}, FloatOutput::BFloat16); });
 }
 
 // A rotated projection's scratch holds the bf16 rotated rows of a full decode
@@ -1284,7 +1307,9 @@ void producerTableContract(metal::MetalBackend &backend) {
     rejects([&] {
       (void)GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}, GdnHeadOrder::Grouped, LinearInput::Table16);
     });
-    require(graph.empty() && GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}).layout == LinearInput::Plain &&
+    require(graph.empty() &&
+                GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}, GdnHeadOrder::Grouped, LinearInput::Plain)
+                        .layout == LinearInput::Plain &&
                 plainKernel(graph, "verify_gdn_fused_vh32"),
             "the GDN decode's table contract");
   }
@@ -1295,7 +1320,8 @@ void producerTableContract(metal::MetalBackend &backend) {
       (void)PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Table64);
     });
     require(graph.empty() &&
-                PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes).layout == LinearInput::Plain &&
+                PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Plain).layout ==
+                    LinearInput::Plain &&
                 plainKernel(graph, "verify_attention_gate"),
             "the attention gate's table contract");
   }
@@ -1669,7 +1695,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
   if (workload.epilogue == LinearEpilogue::GateUp) {
     const auto plain = Linear::plan({workload.matrix, workload.rows, LinearPhase::Decode,
                                        LinearEpilogue::None},
-                                      {LinearTile::N128, p.outputSize / 128});
+                                      {LinearTile::N128, p.outputSize / 128}, FloatOutput::BFloat16);
     auto gateOutput = allocate(backend, uint64_t{storageRows} * p.outputSize * 2);
     auto upOutput = allocate(backend, uint64_t{storageRows} * p.outputSize * 2);
     metal::CommandGraph graph;

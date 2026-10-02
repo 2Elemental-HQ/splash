@@ -175,7 +175,7 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
     if (std::none_of(result.begin(), result.end(), [&](const LinearPlan &plan) {
           return plan.configuration() == config;
         }))
-      result.push_back(Linear::plan(w, config));
+      result.push_back(Linear::plan(w, config, ops::FloatOutput::BFloat16));
   };
   const uint32_t columns = w.matrix.outputSize;
   if (w.phase == LinearPhase::Prefill) {
@@ -303,7 +303,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
         ? std::optional{Linear::plan(
               {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
-              {LinearTile::N128, workload.matrix.outputSize / 128})}
+              {LinearTile::N128, workload.matrix.outputSize / 128}, ops::FloatOutput::BFloat16)}
         : std::nullopt;
     float operandSlack = 0;
     auto referenceGateUp = [&](uint32_t representative) {

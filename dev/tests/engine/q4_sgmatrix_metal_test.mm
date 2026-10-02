@@ -113,7 +113,8 @@ bool within(const Reference &ref, uint16_t actual) {
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
-  const auto plan = Linear::plan(workload, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
+  const auto plan =
+      Linear::plan(workload, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
@@ -239,7 +240,7 @@ void splitVisibility(metal::MetalBackend &backend,
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Linear::plan(w, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
+    return Linear::plan(w, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits}, FloatOutput::BFloat16);
   };
   LinearScratchSize size;
   const auto grow = [&](const LinearPlan &p) {
@@ -369,8 +370,9 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
   Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
   Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
-  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view,
-                                        heads, {1, kvHeads, 256}, lanes).layout == LinearInput::Plain,
+  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view, heads, {1, kvHeads, 256}, lanes, {},
+                                        LinearInput::Plain)
+                  .layout == LinearInput::Plain,
           "plain attention gate claimed a table");
   addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, lanes);
   const PreparedInput prepared =

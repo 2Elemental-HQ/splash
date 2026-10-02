@@ -426,14 +426,14 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
             const std::vector<float> aux(residual.begin() + uint64_t{lane} * kLaneRows * columns,
                                          residual.begin() + uint64_t{lane + 1} * kLaneRows * columns);
             const LinearWorkload one = decode({columns, K}, 1, epilogue);
-            const LinearPlan plan = Linear::plan(one, config(tile, one, splits));
+            const LinearPlan plan = Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16);
             lanesAlone.push_back(run(backend, linear, plan, up, gated, storageRows(rows, K, kLaneRows, kLaneRows),
                                      storageRows(aux, columns, kLaneRows, kLaneRows), kPoisonNaN, N,
                                      what + " lane " + std::to_string(lane) + " alone"));
           }
           for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
             const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
-            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits));
+            const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
             const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
@@ -470,7 +470,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     for (const uint32_t splits : kSplits)
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
         const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
-        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits));
+        const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
         const uint32_t storage = plan.storageRows(), rows = wl.rows;
         const std::string label = formats + " S=" + std::to_string(splits) + " L=" + std::to_string(lanes);
         const Outcome out = run(backend, linear, plan, fused, nullptr, storageRows(x, K, rows, storage), {},
@@ -480,8 +480,9 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         for (const Tensor *part : parts) {
           const Projection alone = projection({part}, part->N);
           const LinearWorkload one = decode({part->N, K}, lanes, LinearEpilogue::None);
-          const Outcome single = run(backend, linear, Linear::plan(one, config(tile, one, splits)), alone, nullptr,
-                                     storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
+          const Outcome single =
+              run(backend, linear, Linear::plan(one, config(tile, one, splits), FloatOutput::BFloat16), alone, nullptr,
+                  storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
           for (uint32_t r = 0; r < rows; ++r)
             if (!std::equal(single.output.begin() + uint64_t{r} * part->N, single.output.begin() + (r + 1) * part->N,
                             out.output.begin() + uint64_t{r} * columns + offset)) {
@@ -506,7 +507,7 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     const Tensor g = tensor(backend, gf, N, K), u = tensor(backend, uf, N, K);
     const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
     const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::GateUp);
-    const LinearPlan plan = Linear::plan(wl, config(tile, wl, kSplitsByLanes[lanes - 1]));
+    const LinearPlan plan = Linear::plan(wl, config(tile, wl, kSplitsByLanes[lanes - 1]), FloatOutput::BFloat16);
     const std::vector<float> x = activations(Inputs::Dense, wl.rows, K);
     const std::string label = std::string(fmtName(gf)) + " gate " + fmtName(uf) + " up N=" + std::to_string(N) +
                               " L=" + std::to_string(lanes);
@@ -540,7 +541,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
       return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
     };
     // Both chunks take two tiles.
-    const uint32_t storage = Linear::plan(workload(kChunks[0]), kTiles).storageRows();
+    const uint32_t storage = Linear::plan(workload(kChunks[0]), kTiles, FloatOutput::BFloat16).storageRows();
     const std::vector<float> x = activations(Inputs::Dense, storage, K);
     // The residual, or the gate of the up-with-gate epilogue.
     const std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
@@ -552,7 +553,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
     for (const uint32_t chunk : kChunks) {
       const LinearWorkload w = workload(chunk);
       const std::string name = label + " " + std::to_string(chunk) + " rows";
-      const Outcome whole = run(backend, linear, Linear::plan(w, kTiles), p, nullptr,
+      const Outcome whole = run(backend, linear, Linear::plan(w, kTiles, FloatOutput::BFloat16), p, nullptr,
                                 storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
       checkValues(whole, dots, {}, aux, w, chunk, covered, true, name);
       const uint32_t written = (chunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
@@ -564,7 +565,8 @@ void prefill(MetalBackend &backend, const Linear &linear) {
     for (const uint32_t rows : {8u, 16u, 24u, 32u})
       for (const uint32_t splits : {1u, kSplitChunk}) {
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
-        const LinearPlan plan = Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits));
+        const LinearPlan plan =
+            Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits), FloatOutput::BFloat16);
         const std::string name = label + " chunk of " + std::to_string(rows) + " rows S=" + std::to_string(splits);
         const std::vector<uint16_t> chunkAux(aux.begin(), aux.begin() + uint64_t{plan.storageRows()} * columns);
         const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, plan.storageRows()),
@@ -641,7 +643,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   for (const auto &splits : splitPairs) pairs += " " + std::to_string(splits[0]) + "/" + std::to_string(splits[1]);
   std::cout << "  " << shape << ": splits" << pairs << '\n';
   const auto plan = [&](uint32_t i, uint32_t splits) {
-    return Linear::plan(workloads[i], config(tile, workloads[i], splits));
+    return Linear::plan(workloads[i], config(tile, workloads[i], splits), FloatOutput::BFloat16);
   };
   LinearScratchSize size = plan(0, 1).scratchSize();
   size.include(plan(1, 1).scratchSize());

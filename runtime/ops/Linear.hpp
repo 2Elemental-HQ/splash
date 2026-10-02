@@ -257,7 +257,7 @@ public:
   // The plan of `config` for `workload`, whether or not the device's policy
   // picks it.
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config,
-                                       FloatOutput destination = FloatOutput::BFloat16);
+                                       FloatOutput destination);
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
                     const Projection &projection, const LinearPlan &plan,
@@ -274,10 +274,10 @@ public:
                   LinearScratch scratch = {}) const;
   void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                             metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
-                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch = {}) const;
+                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
-                          uint32_t rows, LinearScratch scratch = {}) const;
+                          uint32_t rows, LinearScratch scratch) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it

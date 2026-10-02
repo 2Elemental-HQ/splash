@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
-        cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config),
+        cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == linear.plan(w, ring.front()).configuration(), {}});
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
@@ -140,7 +140,7 @@ int main(int argc, char **argv) {
             const LinearConfig config{.tile = tile, .splits = splits};
             cases.push_back({"L" + std::to_string(lanes),
                              std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
-                             Linear::plan(w, config), config == policy, {}});
+                             Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
           }
       }
       // Buffers of the widest plan; the scratch of the plan that needs the most.
