@@ -57,7 +57,6 @@ if __package__:
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
-        metrics_dict,
         prometheus_metrics,
         timings_dict,
         usage_dict,
@@ -106,7 +105,6 @@ else:
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
-        metrics_dict,
         prometheus_metrics,
         timings_dict,
         usage_dict,
@@ -207,10 +205,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._unread_body = 0
         self._last_sse_write = time.monotonic()
         super().setup()
-        self.connection.settimeout(self.server.io_timeout)
-        self._header_timer = threading.Timer(
-            self.server.io_timeout, self._expire_headers
-        )
+        self.connection.settimeout(HTTP_IO_TIMEOUT)
+        self._header_timer = threading.Timer(HTTP_IO_TIMEOUT, self._expire_headers)
         self._header_timer.daemon = True
         self._header_timer.start()
 
@@ -236,7 +232,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 remaining = self._upload_deadline - time.monotonic()
                 if remaining <= 0:
                     return
-                self.connection.settimeout(min(remaining, self.server.io_timeout))
+                self.connection.settimeout(min(remaining, HTTP_IO_TIMEOUT))
                 chunk = self.rfile.read1(min(65536, self._unread_body))
                 if not chunk:
                     return
@@ -281,10 +277,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
-            path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
+                and self.route
+                in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -292,9 +288,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if isinstance(error, OriginRefused):
                 self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(
-                error, self.path.partition("?")[0].startswith("/v1/messages"), log=False
-            )
+            self._safe_error(error, self.route.startswith("/v1/messages"), log=False)
             return False
         return True
 
@@ -305,16 +299,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # and it writes that page with no status line or headers. Answer as
         # any other error, over HTTP/1.1.
         self.request_version = self.protocol_version
-        path = getattr(self, "path", "").partition("?")[0]
         self._safe_error(
             APIError(code, message or self.responses[code][0]),
-            path.startswith("/v1/messages"),
+            self.route.startswith("/v1/messages"),
             log=False,
         )
 
     @property
     def app(self):
         return self.server.app
+
+    @property
+    def route(self):
+        """The request's path as routing, authentication and error dialects
+        all read it; empty before a request line parses."""
+        return _normalize_path(getattr(self, "path", ""))
 
     def end_headers(self):
         # A browser hands a page the response from another origin only when
@@ -339,11 +338,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
-        path = _normalize_path(getattr(self, "path", ""))
+        route = self.route
         if (
-            path == "/v1/systemone"
-            or path == "/v1/models"
-            or path.startswith("/v1/models/")
+            route == "/v1/systemone"
+            or route == "/v1/models"
+            or route.startswith("/v1/models/")
         ):
             self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
         self._response_started = True
@@ -358,7 +357,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             log_unexpected(error)
             self._error(
                 APIError(500, "internal server error", "internal_server_error"),
-                self.path.partition("?")[0].startswith("/v1/messages"),
+                self.route.startswith("/v1/messages"),
             )
             return
         self._send(status, data, "application/json")
@@ -387,8 +386,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
 
     def _log_api_error(self, error):
-        path = self.path.partition("?")[0].partition("#")[0]
-        path = "".join(char if char.isprintable() else "?" for char in path)
+        path = "".join(char if char.isprintable() else "?" for char in self.route)
         print_status(f"Error · {error.code} · {self.command} {path[:256]}", error=True)
 
     def _safe_error(self, error, anthropic=False, *, log=True):
@@ -403,7 +401,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _upload_seconds(self, length):
         # Inactivity allowed at any point, plus the body at the upload rate.
-        return self.server.io_timeout + length / HTTP_UPLOAD_BYTES_PER_SECOND
+        return HTTP_IO_TIMEOUT + length / HTTP_UPLOAD_BYTES_PER_SECOND
 
     def _read_json_body(self, deadline):
         if self.headers.get_all("Transfer-Encoding"):
@@ -449,14 +447,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError
-                self.connection.settimeout(min(remaining, self.server.io_timeout))
+                self.connection.settimeout(min(remaining, HTTP_IO_TIMEOUT))
                 chunk = self.rfile.read1(min(65536, length - len(payload)))
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
         finally:
             self._unread_body = length - len(payload)
-            self.connection.settimeout(self.server.io_timeout)
+            self.connection.settimeout(HTTP_IO_TIMEOUT)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
         payload.clear()
         return json_codec.loads(text)
@@ -486,7 +484,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return "Splash"
 
     def do_GET(self):
-        path = self.path.partition("?")[0]
+        path = self.route
         if path in ("/", "/index.html", "/favicon.ico"):
             if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
@@ -523,8 +521,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else:
                 self._json(200, stored.response)
             return
-        model_path = _normalize_path(self.path)
-        if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
+        if path == "/v1/models" or path.startswith("/v1/models/"):
             models = [
                 {
                     "id": name,
@@ -543,7 +540,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 }
                 for name in self.app.model_names
             ]
-            if model_path == "/v1/models":
+            if path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
                 typed = [
                     {
@@ -555,7 +552,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 ]
                 self._json(200, {"object": "list", "data": models, "models": typed})
             else:
-                name = model_path.removeprefix("/v1/models/")
+                name = path.removeprefix("/v1/models/")
                 model = next((item for item in models if item["id"] == name), None)
                 if model is None:
                     self._safe_error(
@@ -567,7 +564,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._safe_error(APIError(404, "not found", "not_found"))
 
     def do_DELETE(self):
-        path = self.path.partition("?")[0]
+        path = self.route
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match is None:
             self._safe_error(APIError(404, "not found", "not_found"))
@@ -587,9 +584,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         body = None
         self._body_reservation = None
         submitted = False
-        # Route on the URL path so standard protocol query parameters do not
-        # turn a supported endpoint into an unknown one.
-        path = self.path.partition("?")[0]
+        path = self.route
         count_tokens = path == "/v1/messages/count_tokens"
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
@@ -1746,7 +1741,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         created,
                         {},
                         usage=usage_dict(result, job),
-                        metrics=metrics_dict(result),
+                        metrics=result.metrics,
                     )
                 )
             self._sse("[DONE]")
@@ -1814,7 +1809,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         created,
                         "",
                         usage=usage_dict(result, job),
-                        metrics=metrics_dict(result),
+                        metrics=result.metrics,
                     )
                 )
             self._sse("[DONE]")
@@ -1832,15 +1827,12 @@ class HttpAdmission:
         self.active = 0
         # Input finalizers can run during a stats snapshot on this thread.
         self.lock = threading.RLock()
-        self.idle = threading.Event()
-        self.idle.set()
 
     def acquire(self, amount=1):
         with self.lock:
             if self.active + amount > self.capacity:
                 return False
             self.active += amount
-            self.idle.clear()
             return True
 
     def release(self, amount=1):
@@ -1848,8 +1840,6 @@ class HttpAdmission:
             if amount > self.active:
                 raise RuntimeError("HTTP admission slot released without acquisition")
             self.active -= amount
-            if self.active == 0:
-                self.idle.set()
 
     def stats(self):
         with self.lock:
@@ -2160,7 +2150,6 @@ class FrontendServer(ThreadingHTTPServer):
         self,
         address,
         app,
-        io_timeout=HTTP_IO_TIMEOUT,
         bind_and_activate=True,
         request_capacity=32,
         allowed_hosts=(),
@@ -2169,8 +2158,6 @@ class FrontendServer(ThreadingHTTPServer):
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
     ):
-        if not is_finite_number(io_timeout) or io_timeout <= 0:
-            raise ValueError("io_timeout must be positive and finite")
         if (
             isinstance(max_request_bytes, bool)
             or not isinstance(max_request_bytes, int)
@@ -2181,7 +2168,6 @@ class FrontendServer(ThreadingHTTPServer):
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
-        self.io_timeout = io_timeout
         self.api_key = validate_api_key(api_key) if api_key is not None else None
         self.webui = webui
         self.allowed_hosts = {
@@ -2240,7 +2226,7 @@ class FrontendServer(ThreadingHTTPServer):
     def server_close(self):
         super().server_close()
         self.refused.stop()
-        self.connections.idle.wait(min(2.0, self.io_timeout))
+        self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]

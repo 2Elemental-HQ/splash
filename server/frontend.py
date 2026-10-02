@@ -23,7 +23,7 @@ if __package__:
         responses_to_chat_body,
         template_messages,
     )
-    from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
+    from .backend import Job, remaining_request_time
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
@@ -59,7 +59,7 @@ else:
         responses_to_chat_body,
         template_messages,
     )
-    from backend import REQUEST_PRIORITIES, Job, remaining_request_time
+    from backend import Job, remaining_request_time
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
         REASONING_EFFORTS,
@@ -86,6 +86,9 @@ else:
 
 
 PREPARATION_WAIT_SECONDS = 30.0
+
+# The priority a request names, by its lowercase wire name.
+_PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
 
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
@@ -136,9 +139,6 @@ def _drop_nulls(body, extras):
     }
 
 
-RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
-
-
 # Text completions' output budget when max_tokens is omitted: OpenAI's
 # default for the endpoint, which vLLM and SGLang also use.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
@@ -183,14 +183,9 @@ class StoredResponse:
 class ResponseStore:
     """Process-local Responses state with one strict byte-budgeted LRU."""
 
-    def __init__(self, budget_bytes=RESPONSE_STORE_BUDGET_BYTES):
-        if (
-            not isinstance(budget_bytes, int)
-            or isinstance(budget_bytes, bool)
-            or budget_bytes <= 0
-        ):
-            raise ValueError("response store budget must be positive")
-        self.budget_bytes = budget_bytes
+    BUDGET_BYTES = 64 * 1024 * 1024
+
+    def __init__(self):
         self.records = OrderedDict()
         self.bytes = 0
         self.evictions = 0
@@ -212,7 +207,7 @@ class ResponseStore:
         record = StoredResponse(
             json_codec.encode(response), json_codec.encode(history_items)
         )
-        if record.size > self.budget_bytes:
+        if record.size > self.BUDGET_BYTES:
             return False
         response_id = response["id"]
         with self.lock:
@@ -221,7 +216,7 @@ class ResponseStore:
                 self.bytes -= previous.size
             self.records[response_id] = record
             self.bytes += record.size
-            while self.bytes > self.budget_bytes:
+            while self.bytes > self.BUDGET_BYTES:
                 _, evicted = self.records.popitem(last=False)
                 self.bytes -= evicted.size
                 self.evictions += 1
@@ -240,7 +235,7 @@ class ResponseStore:
             return {
                 "entries": len(self.records),
                 "bytes": self.bytes,
-                "budget_bytes": self.budget_bytes,
+                "budget_bytes": self.BUDGET_BYTES,
                 "evictions": self.evictions,
                 "hits": self.hits,
                 "misses": self.misses,
@@ -642,12 +637,9 @@ class Frontend:
 
     def _priority(self, body):
         priority_name = body.get("priority", "normal")
-        if (
-            not isinstance(priority_name, str)
-            or priority_name not in REQUEST_PRIORITIES
-        ):
+        if not isinstance(priority_name, str) or priority_name not in _PRIORITIES:
             raise APIError(400, "priority must be foreground, normal, or background")
-        return REQUEST_PRIORITIES[priority_name]
+        return _PRIORITIES[priority_name]
 
     def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
         return Job(
@@ -728,10 +720,7 @@ class Frontend:
         state, specs, question_details = judgments.validate_systemone(body)
         details.extend(question_details)
         priority_name = body.get("priority", "normal")
-        if (
-            not isinstance(priority_name, str)
-            or priority_name not in REQUEST_PRIORITIES
-        ):
+        if not isinstance(priority_name, str) or priority_name not in _PRIORITIES:
             details.append(
                 judgments.detail(
                     ["priority"],
@@ -742,7 +731,7 @@ class Frontend:
             raise judgments.SystemOneError(details)
         if deadline is None:
             deadline = self.request_deadline(body)
-        priority = REQUEST_PRIORITIES[priority_name]
+        priority = _PRIORITIES[priority_name]
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):

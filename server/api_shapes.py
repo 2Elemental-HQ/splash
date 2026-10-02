@@ -12,13 +12,13 @@ if __package__:
     from . import protocol as wire
     from .documents import DocumentBudget, document_parts, file_content
     from .errors import APIError
-    from .metrics import metrics_dict, timings_dict, usage_dict
+    from .metrics import timings_dict, usage_dict
 else:  # ``python server/server.py`` from the repo root.
     import json_codec
     import protocol as wire
     from documents import DocumentBudget, document_parts, file_content
     from errors import APIError
-    from metrics import metrics_dict, timings_dict, usage_dict
+    from metrics import timings_dict, usage_dict
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (
@@ -1030,7 +1030,7 @@ def completion_response(model, job, result, message, tool_calls):
             }
         ],
         "usage": usage_dict(result, job),
-        "metrics": metrics_dict(result),
+        "metrics": result.metrics,
         "timings": timings_dict(result),
     }
 
@@ -1050,7 +1050,7 @@ def text_completion_response(model, job, result, text):
             }
         ],
         "usage": usage_dict(result, job),
-        "metrics": metrics_dict(result),
+        "metrics": result.metrics,
         "timings": timings_dict(result),
     }
 

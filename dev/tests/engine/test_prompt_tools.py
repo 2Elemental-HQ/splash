@@ -62,7 +62,13 @@ class PromptToolsTests(unittest.TestCase):
                     release.set()
                 for response in pending:
                     self.assertEqual(response.result()[0], 200)
-        self.assertTrue(self.harness.server.token_counts.idle.wait(2))
+        deadline = time.monotonic() + 2
+        while (
+            self.harness.server.token_counts.stats()["active"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertEqual(self.harness.server.token_counts.stats()["active"], 0)
         self.post("/tokenize", {"content": "hello"})
         self.post("/apply-template", body)
 

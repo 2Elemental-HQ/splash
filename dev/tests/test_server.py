@@ -33,6 +33,7 @@ from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
+from server.metrics import metrics_dict
 from server.origins import ANY_ORIGIN, parse_allowed_origin
 from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
@@ -562,9 +563,9 @@ class Harness:
         timeout=2,
         max_context=128,
         model="test-model",
-        request_logger=None,
+        request_logger=lambda _record: None,
         constraint_factory=None,
-        io_timeout=api.HTTP_IO_TIMEOUT,
+        io_timeout=None,
         thinking_codec=None,
         api_key=None,
         webui=True,
@@ -599,7 +600,6 @@ class Harness:
         self.server = api.FrontendServer(
             (host, 0),
             self.app,
-            io_timeout,
             request_capacity=queue_size,
             api_key=api_key,
             webui=webui,
@@ -607,6 +607,13 @@ class Harness:
             allowed_hosts=allowed_hosts,
             allowed_origins=map(parse_allowed_origin, allowed_origins),
         )
+        # The server reads HTTP_IO_TIMEOUT per connection. A harness given its
+        # own holds it until close(); patching only once setup has succeeded
+        # never leaves it patched.
+        self._io_timeout = None
+        if io_timeout is not None:
+            self._io_timeout = mock.patch.object(api, "HTTP_IO_TIMEOUT", io_timeout)
+            self._io_timeout.start()
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -648,6 +655,8 @@ class Harness:
         self.thread.join()
         self.server.server_close()
         self.backend.close()
+        if self._io_timeout is not None:
+            self._io_timeout.stop()
 
 
 class ServerTest(unittest.TestCase):
@@ -705,6 +714,9 @@ class ServerTest(unittest.TestCase):
             def deep_copy(self):
                 return SimpleNamespace(grammar=self.grammar, copy=True)
 
+        self.enterContext(
+            mock.patch.object(generation_constraints.ConstraintFactory, "CACHE_SIZE", 2)
+        )
         with (
             mock.patch(
                 "server.constraints.guidance_tokenizer",
@@ -717,7 +729,7 @@ class ServerTest(unittest.TestCase):
                 side_effect=lambda matcher, executor: (matcher, executor),
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object(), cache_size=2)
+            factory = generation_constraints.ConstraintFactory(object())
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -734,7 +746,7 @@ class ServerTest(unittest.TestCase):
                 "entries": 2,
                 "capacity": 2,
                 "source_bytes": 8,
-                "source_budget_bytes": factory.DEFAULT_CACHE_SOURCE_BYTES,
+                "source_budget_bytes": factory.CACHE_SOURCE_BYTES,
                 "hits": 1,
                 "misses": 4,
             },
@@ -1639,13 +1651,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertTrue((request_id or "").startswith("req_"))
 
-        # Paths that normalize away from the catalog get no request id.
-        status, request_id, _ = get("/health")
-        self.assertEqual(status, 200)
-        self.assertIsNone(request_id)
-        status, request_id, _ = get("/v1/models/%2e%2e/%2e%2e/health")
-        self.assertEqual(status, 404)
-        self.assertIsNone(request_id)
+        # Paths that normalize away from the catalog are routed where they
+        # lead, without a request id.
+        for path in ("/health", "/v1/models/%2e%2e/%2e%2e/health"):
+            with self.subTest(path=path):
+                status, request_id, _ = get(path)
+                self.assertEqual(status, 200)
+                self.assertIsNone(request_id)
 
     def test_systemone_question_count_budget_rejects_before_inference(self):
         runtime = FakeRuntime()
@@ -2232,7 +2244,12 @@ class ServerTest(unittest.TestCase):
         app = self.harness(
             FakeRuntime(), tokenizer=self.ImagePadTokenizer(), max_context=1024
         ).app
-        app.images = api.image_input.ImageCache(request_budget_bytes=256 * 256 * 3)
+        self.enterContext(
+            mock.patch.object(
+                api.image_input.ImageCache, "REQUEST_BUDGET_BYTES", 256 * 256 * 3
+            )
+        )
+        app.images = api.image_input.ImageCache()
         job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
         native_request = app.backend._generation_request(job)
         self.assertIs(native_request.image_owner, job.image_owner)
@@ -3107,7 +3124,11 @@ class ServerTest(unittest.TestCase):
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
         harness = self.harness(FakeRuntime(Plan([[1], [26], [27]])))
-        with self.openai_client(harness) as client:
+        with (
+            # The fake vocabulary's </think> is token 26.
+            mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26),
+            self.openai_client(harness) as client,
+        ):
             response = client.chat.completions.create(
                 model="test-model",
                 messages=[{"role": "user", "content": "hello"}],
@@ -3238,14 +3259,14 @@ class ServerTest(unittest.TestCase):
         result = backend_api.NativeResult(
             "stop", 1, 1, 1.0, 2.0, 3.0, 1, first_token_batch_tokens=1
         )
-        metrics = api.metrics_dict(result)
+        metrics = metrics_dict(result)
         self.assertNotIn("stream_tokens_per_second", metrics["request_latency"])
         self.assertEqual(metrics["prefill"]["tokens"], 1)
         result.completion_tokens = 3
         for interval in (0.0, math.inf, 5e-324):
             result.first_token_to_done_ms = interval
             self.assertNotIn(
-                "stream_tokens_per_second", api.metrics_dict(result)["request_latency"]
+                "stream_tokens_per_second", metrics_dict(result)["request_latency"]
             )
 
     def test_stream_rate_excludes_the_whole_first_speculative_batch(self):
@@ -3273,7 +3294,6 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(records), 1)
         record = records[0]
-        self.assertEqual(record["event"], "request")
         self.assertEqual(record["outcome"], "stop")
         self.assertNotIn("queue_ms", record)
         self.assertNotIn("queue_ms", record["metrics"])
@@ -3505,7 +3525,9 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         # No server option bounds the output of a request that names no
         # limit: it may use what the two-token prompt leaves of the window.
@@ -3533,8 +3555,12 @@ class ServerTest(unittest.TestCase):
 
     def test_public_ids_are_stable_and_unique_across_app_instances(self):
         tokenizer = FakeTokenizer()
-        first_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
-        second_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        first_backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
+        second_backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(first_backend.close)
         self.addCleanup(second_backend.close)
         with mock.patch.object(
@@ -4161,7 +4187,7 @@ class ServerTest(unittest.TestCase):
         clock = [0.0]
         events = iter(
             [
-                ("start", "miss"),
+                ("start", None),
                 None,
                 None,
                 ("text", "answer"),
@@ -5298,7 +5324,9 @@ class ServerTest(unittest.TestCase):
 
     def test_tool_choice_shapes_the_grammar_policy_not_the_prompt(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [
@@ -5335,7 +5363,9 @@ class ServerTest(unittest.TestCase):
 
     def test_stop_is_refused_only_while_a_tool_can_be_called(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [{"type": "function", "function": {"name": "f"}}]
@@ -5681,7 +5711,9 @@ class ServerTest(unittest.TestCase):
 
     def test_qwen_reasoning_efforts(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         for effort in ("xhigh", "medium", "low"):
@@ -7455,7 +7487,9 @@ class ServerTest(unittest.TestCase):
 
     def test_official_sampling_defaults_and_random_seed(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         body = self.body()
@@ -7502,7 +7536,7 @@ class ServerTest(unittest.TestCase):
         job, _, _ = harness.app.prepare_responses(
             self.responses_body(priority="foreground")
         )
-        self.assertEqual(job.priority, backend_api.REQUEST_PRIORITIES["foreground"])
+        self.assertEqual(job.priority, native_wire.RequestPriority.FOREGROUND)
 
     def test_active_timeout_signals_and_next_request_runs(self):
         blocking = Plan([[4]], block=True)
@@ -8950,7 +8984,10 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_response_store_is_strictly_byte_bounded_lru(self):
-        store = request_frontend.ResponseStore(2048)
+        self.enterContext(
+            mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 2048)
+        )
+        store = request_frontend.ResponseStore()
         for index in range(10):
             response = {
                 "id": f"resp_{index}",
@@ -8963,14 +9000,18 @@ class ServerTest(unittest.TestCase):
         self.assertGreater(stats["evictions"], 0)
         self.assertIsNone(store.get("resp_0"))
         self.assertIsNotNone(store.get("resp_9"))
-        self.assertFalse(
-            request_frontend.ResponseStore(64).put(
-                {"id": "resp_large", "text": "x" * 128}, []
+        with mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 64):
+            self.assertFalse(
+                request_frontend.ResponseStore().put(
+                    {"id": "resp_large", "text": "x" * 128}, []
+                )
             )
-        )
 
     def test_response_store_concurrent_churn_remains_bounded(self):
-        store = request_frontend.ResponseStore(8192)
+        self.enterContext(
+            mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 8192)
+        )
+        store = request_frontend.ResponseStore()
         errors = []
 
         def churn(shard):

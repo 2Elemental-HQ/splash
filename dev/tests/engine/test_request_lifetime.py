@@ -25,12 +25,17 @@ class RequestLifetimeTests(unittest.TestCase):
     def backend(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        backend = backend_api.NativeBackend(runtime, FakeTokenizer())
+        backend = backend_api.NativeBackend(
+            runtime, FakeTokenizer(), lambda _record: None
+        )
         self.addCleanup(backend.close)
         return backend, factory.processes[0]
 
     def job(self):
-        cache = images.ImageCache(request_budget_bytes=1024)
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 1024)
+        )
+        cache = images.ImageCache()
         owner = cache.request_batch()
         owner.append(images.PreparedImage(2, 2, b"pixels", 0, 0))
         job = backend_api.Job(

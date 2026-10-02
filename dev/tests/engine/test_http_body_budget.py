@@ -100,7 +100,6 @@ class HttpBodyBudgetTests(unittest.TestCase):
             handler.server = SimpleNamespace(
                 max_request_bytes=4096,
                 request_bodies=api.HttpAdmission(4096),
-                io_timeout=1,
             )
             handler.connection = SimpleNamespace(settimeout=lambda _: None)
             handler.rfile = io.BytesIO(payload)
@@ -484,7 +483,6 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 handler.server = SimpleNamespace(
                     max_request_bytes=length,
                     request_bodies=api.HttpAdmission(length),
-                    io_timeout=30,
                 )
                 handler.connection = SimpleNamespace(settimeout=settimeout)
                 handler.rfile = SimpleNamespace(read1=drip)

@@ -1,6 +1,7 @@
 """Native request submission, cancellation, recovery and completion ownership."""
 
 import copy
+import functools
 import queue
 import threading
 import time
@@ -18,7 +19,7 @@ if __package__:
     from .latency import RequestLatency
     from .metrics import metrics_dict
     from .output import hold_partial
-    from .tool_schema import THINK_END, ToolPolicy
+    from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
 else:
     import json_codec
     import protocol as wire
@@ -28,7 +29,7 @@ else:
     from latency import RequestLatency
     from metrics import metrics_dict
     from output import hold_partial
-    from tool_schema import THINK_END, ToolPolicy
+    from tool_schema import THINK_END_TOKEN_ID, ToolPolicy
 
     import runtime as engine_runtime
 
@@ -45,10 +46,6 @@ RESTART_BACKOFF_SECONDS = 5.0
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
-
-
-REQUEST_PRIORITIES = {"foreground": 0, "normal": 1, "background": 2}
-REQUEST_PRIORITY_NAMES = {value: name for name, value in REQUEST_PRIORITIES.items()}
 
 
 def remaining_request_time(deadline):
@@ -82,6 +79,11 @@ class NativeResult:
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
 
+    @functools.cached_property
+    def metrics(self):
+        """The per-request metrics every response and log record reports."""
+        return metrics_dict(self)
+
 
 @dataclass
 class Job:
@@ -91,7 +93,7 @@ class Job:
     seed: int
     sampling: wire.SamplingParameters
     deadline: float
-    priority: int = REQUEST_PRIORITIES["normal"]
+    priority: wire.RequestPriority = wire.RequestPriority.NORMAL
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
     thinking_display: str = "summarized"
@@ -138,16 +140,12 @@ class CallbackStreamer:
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
         self.on_stop = on_stop
-        self.backend = getattr(tokenizer, "backend_tokenizer", None)
-        self.decode_stream = (
-            DecodeStream(skip_special_tokens=True) if self.backend is not None else None
-        )
+        self.backend = tokenizer.backend_tokenizer
+        self.decode_stream = DecodeStream(skip_special_tokens=True)
         self.token_ids = []
         self.emitted = []
         self.pending_text = ""
         self.stop_sequence = None
-        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-        self.think_end_token = convert(THINK_END) if callable(convert) else None
 
     def _send(self, text):
         if text:
@@ -225,10 +223,10 @@ class CallbackStreamer:
             self.pending_text = ""
 
     def count_reasoning_tokens(self, enabled):
-        if not enabled or not isinstance(self.think_end_token, int):
+        if not enabled:
             return 0
         try:
-            return self.token_ids.index(self.think_end_token)
+            return self.token_ids.index(THINK_END_TOKEN_ID)
         except ValueError:
             return len(self.token_ids)
 
@@ -262,7 +260,7 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger=None):
+    def __init__(self, runtime, tokenizer, request_logger):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
@@ -570,7 +568,7 @@ class NativeBackend:
         )
         frame = wire.RequestFrame(
             request_id=0,
-            priority=wire.RequestPriority(job.priority),
+            priority=job.priority,
             absolute_deadline_unix_micros=0,
             remaining_deadline_micros=0,
             logical_max_output_tokens=job.max_new_tokens,
@@ -687,7 +685,7 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
-            job.events.put(("start", cache.status))
+            job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
                 (
@@ -773,7 +771,7 @@ class NativeBackend:
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )
             if job.latency is not None:
-                latency = metrics_dict(result)["request_latency"]
+                latency = result.metrics["request_latency"]
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
@@ -861,18 +859,13 @@ class NativeBackend:
         return APIError(500, str(error), "runtime_error")
 
     def _record(self, job, result=None, error=None):
-        if self.request_logger is None:
-            return
         record = {
-            "event": "request",
-            "request_id": job.request_id,
             "outcome": result.reason if result else "error",
             "prompt_tokens": len(job.prompt_tokens),
-            "priority": REQUEST_PRIORITY_NAMES[job.priority],
         }
         if result:
             record["completion_tokens"] = result.completion_tokens
-            record["metrics"] = metrics_dict(result)
+            record["metrics"] = result.metrics
         if job.tools_signature:
             record["tools"] = {
                 "count": job.tools_signature[0],

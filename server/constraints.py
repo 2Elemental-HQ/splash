@@ -143,27 +143,10 @@ def _grammar_error(error):
 
 
 class ConstraintFactory:
-    DEFAULT_CACHE_SIZE = 32
-    DEFAULT_CACHE_SOURCE_BYTES = 8 * 1024 * 1024
+    CACHE_SIZE = 32
+    CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(
-        self,
-        tokenizer,
-        cache_size=DEFAULT_CACHE_SIZE,
-        cache_source_bytes=DEFAULT_CACHE_SOURCE_BYTES,
-    ):
-        if (
-            not isinstance(cache_size, int)
-            or isinstance(cache_size, bool)
-            or cache_size <= 0
-        ):
-            raise ValueError("constraint cache size must be positive")
-        if (
-            not isinstance(cache_source_bytes, int)
-            or isinstance(cache_source_bytes, bool)
-            or cache_source_bytes <= 0
-        ):
-            raise ValueError("constraint cache byte budget must be positive")
+    def __init__(self, tokenizer):
         self.tokenizer = guidance_tokenizer(
             tokenizer,
             n_vocab=TokenConstraint.VOCABULARY,
@@ -171,8 +154,6 @@ class ConstraintFactory:
             slices=LLTokenizer.json_slices(),
         )
         self.executor = LLExecutor()
-        self.cache_size = cache_size
-        self.cache_source_bytes = cache_source_bytes
         self.source_bytes = 0
         self.cache = OrderedDict()
         self.lock = threading.Lock()
@@ -226,12 +207,12 @@ class ConstraintFactory:
             # This bounds source bytes; LLGuidance bounds compiler complexity.
             with self.lock:
                 self.misses += 1
-                if size <= self.cache_source_bytes:
+                if size <= self.CACHE_SOURCE_BYTES:
                     self.cache[grammar] = (matcher, size)
                     self.source_bytes += size
                     while (
-                        len(self.cache) > self.cache_size
-                        or self.source_bytes > self.cache_source_bytes
+                        len(self.cache) > self.CACHE_SIZE
+                        or self.source_bytes > self.CACHE_SOURCE_BYTES
                     ):
                         _, (_, evicted_size) = self.cache.popitem(last=False)
                         self.source_bytes -= evicted_size
@@ -248,9 +229,9 @@ class ConstraintFactory:
         with self.lock:
             return {
                 "entries": len(self.cache),
-                "capacity": self.cache_size,
+                "capacity": self.CACHE_SIZE,
                 "source_bytes": self.source_bytes,
-                "source_budget_bytes": self.cache_source_bytes,
+                "source_budget_bytes": self.CACHE_SOURCE_BYTES,
                 "hits": self.hits,
                 "misses": self.misses,
             }

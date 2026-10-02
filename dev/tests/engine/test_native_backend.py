@@ -11,7 +11,7 @@ from unittest import mock
 
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory
-from dev.tests.test_server import make_frontend
+from dev.tests.test_server import _byte_backend, make_frontend
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -20,13 +20,14 @@ from server import protocol as wire
 
 
 class FakeTokenizer:
-    backend_tokenizer = None
+    # Token ids up to 15 decode to their digits.
+    backend_tokenizer = _byte_backend({token: str(token) for token in range(16)})
     # Rendering ignores it; only the startup probe reads it.
     chat_template = "{%- for message in messages %}{{- message.content }}{%- endfor %}"
 
-    @staticmethod
-    def decode(token_ids, **_kwargs):
-        return "|".join(str(token) for token in token_ids)
+    @classmethod
+    def decode(cls, token_ids, **_kwargs):
+        return cls.backend_tokenizer.decode(list(token_ids))
 
     @staticmethod
     def convert_tokens_to_ids(_token):
@@ -212,7 +213,7 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
             min_p=0.125,
         ),
         deadline=time.monotonic() + 10.0,
-        priority=backend_api.REQUEST_PRIORITIES["foreground"],
+        priority=wire.RequestPriority.FOREGROUND,
         constraint=constraint,
     )
 
@@ -226,7 +227,9 @@ def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
 class NativeBackendContractTests(unittest.TestCase):
     def make_transport(self, runtime=None):
         runtime = runtime or FakeRuntime()
-        transport = backend_api.NativeBackend(runtime, FakeTokenizer())
+        transport = backend_api.NativeBackend(
+            runtime, FakeTokenizer(), lambda _record: None
+        )
         self.addCleanup(transport.close)
         return transport, runtime
 
@@ -462,11 +465,13 @@ class NativeBackendContractTests(unittest.TestCase):
         call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
         call.complete(result=success_result(call, tokens=(7, 8)))
 
-        self.assertEqual(job.events.get(timeout=1.0), ("start", "hit"))
-        self.assertEqual(job.events.get(timeout=1.0), ("text", "7|8"))
+        self.assertEqual(job.events.get(timeout=1.0), ("start", None))
+        self.assertEqual(job.events.get(timeout=1.0), ("text", "7"))
+        self.assertEqual(job.events.get(timeout=1.0), ("text", "8"))
         kind, result = job.events.get(timeout=1.0)
         self.assertEqual(kind, "done")
         self.assertEqual(result.reason, "stop")
+        self.assertEqual(result.cache.status, "hit")
         self.assertEqual(result.prefill_tokens, 2)
         self.assertEqual(result.start_to_first_token_ms, 1.25)
         self.assertEqual(result.first_token_to_done_ms, 2.5)
@@ -480,7 +485,11 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(
             runtime.MultiplexedRuntime(process_factory=factory, pending_limit=4)
         )
-        cache = images.ImageCache(budget_bytes=0, request_budget_bytes=4)
+        self.enterContext(mock.patch.object(images.ImageCache, "BUDGET_BYTES", 0))
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 4)
+        )
+        cache = images.ImageCache()
         job = make_job()
         job.image_owner = cache.request_batch()
         job.image_owner.append(images.PreparedImage(2, 2, b"abcd", 0, 0))

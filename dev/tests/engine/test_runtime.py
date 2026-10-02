@@ -758,10 +758,10 @@ class RuntimeTests(unittest.TestCase):
             ).tobytes()
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory,
-            mask_workers=1,
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
         )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -921,10 +921,10 @@ class RuntimeTests(unittest.TestCase):
             return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory,
-            mask_workers=1,
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
         )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -963,8 +963,11 @@ class RuntimeTests(unittest.TestCase):
             return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
+        )
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, mask_workers=1, pending_limit=2
+            process_factory=factory, pending_limit=2
         )
         self.addCleanup(runtime.close)
         self.addCleanup(release.set)
@@ -1741,10 +1744,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancel_write_timeout_fails_generation(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, io_timeout=0.02
-        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
+        runtime._io_timeout_seconds = 0.02
         call = runtime.submit(request(1))
         with runtime._write_lock:
             self.assertTrue(call.cancel())
@@ -1791,10 +1793,9 @@ class RuntimeTests(unittest.TestCase):
         def factory():
             return processes.pop() if processes else replacement_factory()
 
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, io_timeout=0.15
-        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
+        runtime._io_timeout_seconds = 0.15
         failure_state = []
 
         def completed(_call):

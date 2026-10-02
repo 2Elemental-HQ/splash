@@ -419,6 +419,10 @@ class MultiplexedRuntime:
     """One-reader, direct-admission client for the native protocol."""
 
     _shutdown_grace_seconds = 15.0
+    # How long a started frame write may make no progress.
+    _io_timeout_seconds = 5.0
+    # CPU token-mask workers; None lets the executor choose.
+    _mask_workers = None
     # Allow the native 120-second command watchdog to finish before fencing it.
     _cancel_grace_seconds = 150.0
     # While calls are pending, how often the loop must answer a status request.
@@ -433,33 +437,26 @@ class MultiplexedRuntime:
         *,
         process_factory: Callable[[], ProcessLike] | None = None,
         startup_timeout: float = 30.0,
-        io_timeout: float = 5.0,
         pending_limit: int = 64,
-        mask_workers: int | None = None,
         eager_start: bool = True,
     ):
         if process_factory is None and not command:
             raise ValueError("command or process_factory is required")
         if not math.isfinite(startup_timeout) or startup_timeout <= 0:
             raise ValueError("startup_timeout must be positive")
-        if not math.isfinite(io_timeout) or io_timeout <= 0:
-            raise ValueError("io_timeout must be positive")
         if pending_limit <= 0:
             raise ValueError("pending_limit must be positive")
-        if mask_workers is not None and mask_workers <= 0:
-            raise ValueError("mask_workers must be positive")
 
         self._command = tuple(command) if command else None
         self._process_factory = process_factory or self._default_process_factory
         self._startup_timeout = startup_timeout
-        self._io_timeout = io_timeout
         self._pending_limit = pending_limit
         self._admission_slots = threading.BoundedSemaphore(pending_limit)
         # Native cancellation frees a request slot before its CPU mask job
         # necessarily finishes. Bound queued + running jobs independently.
         self._mask_slots = threading.BoundedSemaphore(pending_limit)
         self._mask_executor = ThreadPoolExecutor(
-            max_workers=mask_workers,
+            max_workers=self._mask_workers,
             thread_name_prefix="splash-mask",
         )
 
@@ -906,7 +903,7 @@ class MultiplexedRuntime:
         # The caller's deadline bounds only the start of a frame. A started
         # frame must be finished: then only the I/O timeout, counted from the
         # last write that made progress, bounds it.
-        limit = time.monotonic() + self._io_timeout
+        limit = time.monotonic() + self._io_timeout_seconds
         if deadline is not None:
             limit = min(deadline, limit)
         if not self._write_lock.acquire(timeout=_remaining(limit)):
@@ -947,7 +944,7 @@ class MultiplexedRuntime:
                     if written <= 0:
                         raise BrokenPipeError("native stdin accepted zero bytes")
                     offset += written
-                    limit = time.monotonic() + self._io_timeout
+                    limit = time.monotonic() + self._io_timeout_seconds
                 self._crash_trace.record_bytes(generation, "client_to_engine", encoded)
             except TimeoutError:
                 if offset == 0:

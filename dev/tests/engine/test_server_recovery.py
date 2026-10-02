@@ -77,7 +77,9 @@ class ServerRecoveryTests(unittest.TestCase):
         return harness
 
     def backend(self, runtime):
-        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
+        backend = backend_api.NativeBackend(
+            runtime, NativeTokenizer(), lambda _record: None
+        )
         self.addCleanup(backend.close)
         return backend
 
@@ -497,8 +499,7 @@ class ServerRecoveryTests(unittest.TestCase):
     def test_idle_engine_death_restarts_before_traffic_arrives(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
-        self.addCleanup(backend.close)
+        backend = self.backend(runtime)
         factory.processes[0].kill()
         self.wait_until(lambda: len(factory.processes) == 2 and runtime.ready, 2)
         self.assertEqual(runtime.restart_count, 1)
@@ -536,8 +537,7 @@ class ServerRecoveryTests(unittest.TestCase):
             return factory()
 
         runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
-        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
-        self.addCleanup(backend.close)
+        backend = self.backend(runtime)
         with mock.patch.object(backend_api, "print_status") as console:
             factory.processes[0].kill()
             self.wait_until(lambda: console.call_count >= 2)
@@ -581,8 +581,7 @@ class ServerRecoveryTests(unittest.TestCase):
     def test_engine_failure_under_a_request_asks_its_client_to_retry(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
-        backend = backend_api.NativeBackend(runtime, NativeTokenizer())
-        self.addCleanup(backend.close)
+        backend = self.backend(runtime)
         job = make_job()
         with mock.patch.object(backend_api, "print_status") as console:
             backend.submit(job)
