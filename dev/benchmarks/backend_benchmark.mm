@@ -480,15 +480,11 @@ void evictAllCache(engine::Cache &resources) {
     throw std::logic_error("native benchmark cache did not drain");
 }
 
+// Evicts every cached state, one at a time, and leaves the KV graph intact.
 void evictAllCompositeState(engine::Cache &resources) {
   while (resources.snapshot().stateCache.entries) {
-    const engine::CacheSnapshot before = resources.snapshot();
-    static_cast<void>(resources.reclaimCache(1, false, false));
-    const engine::CacheSnapshot after = resources.snapshot();
-    if (after.stateCache.entries >= before.stateCache.entries &&
-        after.pool.allocatedBytes >= before.pool.allocatedBytes) {
+    if (!resources.reclaimStateForLane(engine::ReclaimClass::InUse).madeProgress)
       throw std::logic_error("native benchmark state cache made no progress");
-    }
   }
 }
 

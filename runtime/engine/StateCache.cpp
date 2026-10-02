@@ -309,7 +309,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   // One write at a time.
   const bool writable = !entry.disk && entry.ram->canOffload();
   if (writable && pending_ && unwritten != Unwritten::Drop)
-    return {false, 0, true};
+    return {false, true};
   if (writable) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
           return state->offload(std::move(done));
@@ -324,7 +324,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     checkpointBytes_ -= reclaimed;
   entry.ram.reset();
   reindex(kvBlock, entry);
-  return {true, reclaimed};
+  return {true};
 }
 
 void StateCache::evict(uint64_t kvBlock) noexcept {
@@ -445,7 +445,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
     ++checkpointRetirements_;
   else
     ++evictions_;
-  return {true, reclaimed};
+  return {true};
 }
 
 StateCacheSnapshot StateCache::snapshot() const noexcept {

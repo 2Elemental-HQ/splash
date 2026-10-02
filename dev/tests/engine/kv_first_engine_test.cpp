@@ -19,7 +19,18 @@ namespace {
 
 class State final : public CompositeState {
 public:
+  State() = default;
+  // A lane's snapshot: once the cache lets go of it, its buffers return to
+  // the model's pool, as QwenStateStorage's do.
+  explicit State(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
+  ~State() override {
+    if (pool_)
+      *pool_ += bytes();
+  }
   uint64_t bytes() const noexcept override { return 64; }
+
+private:
+  std::shared_ptr<uint64_t> pool_;
 };
 
 class DiskState final : public CompositeState {
@@ -48,10 +59,18 @@ private:
   std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
 };
 
+// With a pool, it is a lane's snapshot whose buffers return to the model's
+// pool once the cache lets go of them, like State's.
 class OffloadState final : public CompositeState {
 public:
-  explicit OffloadState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
-  ~OffloadState() override { control_->released = true; }
+  explicit OffloadState(std::shared_ptr<OffloadControl> control,
+                        std::shared_ptr<uint64_t> pool = nullptr)
+      : control_(std::move(control)), pool_(std::move(pool)) {}
+  ~OffloadState() override {
+    control_->released = true;
+    if (pool_)
+      *pool_ += bytes();
+  }
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload() const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
@@ -59,6 +78,7 @@ public:
   }
 private:
   std::shared_ptr<OffloadControl> control_;
+  std::shared_ptr<uint64_t> pool_;
 };
 
 struct RestoreControl {
@@ -359,7 +379,7 @@ public:
     if (snapshotRoom && !snapshotRoom())
       return nullptr;
     ++snapshots;
-    return std::make_shared<State>();
+    return std::make_shared<State>(evictedStateBytes);
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
@@ -374,6 +394,13 @@ public:
   }
   uint64_t reclaimIdleState(bool keepLane) noexcept override {
     keptLane = keepLane;
+    // The buffers of states the cache let go of refill the lane's footprint;
+    // the rest is idle.
+    const uint64_t refill = std::min(
+        *evictedStateBytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    pooledLaneBytes += refill;
+    reclaimableIdleStateBytes += *evictedStateBytes - refill;
+    *evictedStateBytes = 0;
     if (!keepLane && pooledLaneBytes)
       return std::exchange(pooledLaneBytes, 0);
     const uint64_t released = reclaimableIdleStateBytes;
@@ -466,8 +493,13 @@ public:
       metal::AllocationFailure::EngineBudget;
   uint64_t reclaimableIdleStateBytes = 0;
   // The pooled buffers a lane starts from; only a reclaim that does not keep
-  // the lane releases them.
+  // the lane releases them. A reclaim first refills them, up to
+  // laneFootprintBytes, from the buffers of evicted states.
   uint64_t pooledLaneBytes = 0;
+  uint64_t laneFootprintBytes = 0;
+  // The buffers of snapshots the cache has let go of, until reclaimIdleState
+  // takes them into the pool.
+  std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
   // The cached states whose buffers the pool lacks for one activation.
   std::function<uint32_t()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
@@ -923,7 +955,7 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
               events.starts[0].first == EngineCacheStatus::Miss,
           "cold request reported a cache hit");
 
-  require(resources.reclaimCache(1, false, false) != 0,
+  require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
@@ -1193,7 +1225,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
+    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
             "test could not leave a KV-only shared prefix");
   }
 
@@ -1231,7 +1263,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(7, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
+    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
             "test could not remove the old composite state");
   }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
@@ -1297,7 +1329,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine.submit(request(9, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
+    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
             "test could not remove the old composite state");
   }
 
@@ -1774,6 +1806,72 @@ void testWarningReclaimKeepsTheServingFootprint() {
           "critical pressure kept the serving footprint");
 }
 
+// A pass counts only memory that leaves the engine. A warning pass that
+// evicts a cached state while the lane's pooled buffers are short gains the
+// host nothing: the state's buffers refill them. The pass goes on to the
+// cached KV and releases the extent that empties, keeping the empty one the
+// next request starts from.
+void testWarningReclaimCountsOnlyWhatReachesTheHost() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(129, 1)));
+  runUntilIdle(engine);
+  constexpr uint64_t extentBytes = 4 * 4096;
+  require(resources.snapshot().stateCache.bytes == 64 &&
+              resources.snapshot().pool.allocatedBytes == 2 * extentBytes &&
+              resources.snapshot().pool.reclaimableExtents == 1,
+          "fixture did not cache a state and an extent of KV beside the runway");
+  // The lane's pooled buffers went back to the host earlier.
+  executor.laneFootprintBytes = 64;
+  const MemoryReclaimResult result = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  require(result.releasedBytes == extentBytes && result.outcome == ReclaimOutcome::Met &&
+              executor.pooledLaneBytes == 64 &&
+              resources.snapshot().stateCache.entries == 0 &&
+              resources.snapshot().pool.allocatedBytes == extentBytes,
+          "a warning pass counted a state whose buffers stayed in the engine");
+}
+
+// Memory a pass frees but keeps still wakes the requests waiting for memory.
+// A start the host refused can start from the lane's pooled buffers; a
+// warning pass that refills them from an evicted state releases nothing,
+// and the start retries at once rather than after its backoff.
+void testWarningReclaimWakesARefusedStart() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.bytes == 64, "fixture did not cache a state");
+  executor.laneFootprintBytes = 64;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.pooledLaneBytes == 0; };
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  static_cast<void>(engine.tick(100));
+  require(engine.resourceWaitSnapshot(100).memory == 1 &&
+              engine.nextWakeupMilliseconds() == 200.0,
+          "the host did not refuse the start");
+  const MemoryReclaimResult result = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  require(!result.releasedBytes && executor.pooledLaneBytes == 64 &&
+              resources.snapshot().stateCache.entries == 0 &&
+              engine.nextWakeupMilliseconds() == 0.0,
+          "a pass that refilled the lane's buffers did not wake the refused start");
+  for (double now = 101; now < 120 && !idle(engine); ++now)
+    static_cast<void>(engine.tick(now));
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0,
+          "the start did not run from the refilled buffers");
+}
+
 // A KV chain gives up one leaf at a time, each after its copy is written. A
 // pass reports that transfers hold back the rest of its target, and passes
 // with that rest (MemoryPressurePolicy continues it) take the chain as the
@@ -1795,13 +1893,15 @@ void testPressureReclaimFollowsTheChain() {
   const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer));
+  cache.publishCompositeState(
+      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes));
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
     return engine.reclaimMemory({.reclaim = true, .targetBytes = target});
   };
-  // The state's RAM, then the chain's leaf, whose parent waits for its copy.
+  // The state's buffers, which the model returns once the cache has written
+  // the state, then the chain's leaf, whose parent waits for its copy.
   MemoryReclaimResult result = reclaim(364);
   require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
               tier.demotions == 1,
@@ -6459,8 +6559,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   const auto block = cache.publishCommittedBlocks(999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 64 &&
-              cache.pollTransfers(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -7673,6 +7772,8 @@ int main() {
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
     testWarningReclaimKeepsTheServingFootprint();
+    testWarningReclaimCountsOnlyWhatReachesTheHost();
+    testWarningReclaimWakesARefusedStart();
     testPressureReclaimFollowsTheChain();
     testFullStateCellsSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();

@@ -107,7 +107,6 @@ struct StateCacheSnapshot {
 
 struct StateEviction final {
   bool evicted = false;
-  uint64_t reclaimedBytes = 0;
   // Not evicted because the one write in flight holds the staging buffer;
   // the copy is written on a later call.
   bool pending = false;
@@ -221,7 +220,8 @@ public:
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf),
-  // otherwise as `unwritten` says. The RAM is free when the call returns.
+  // otherwise as `unwritten` says. Its buffers return to the model's pool,
+  // which reclaimIdleState gives back to the host.
   [[nodiscard]] StateEviction reclaim(uint64_t kvBlock, Unwritten unwritten);
   // Removes an unpinned state from both tiers.
   void evict(uint64_t kvBlock) noexcept;

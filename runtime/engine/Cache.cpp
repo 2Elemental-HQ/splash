@@ -296,33 +296,20 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
 // one; then one victim at a time: KV no state restores through, then the
 // shared recency order, states and resident KV leaves alike.
 
-uint64_t Cache::reclaimCache(uint64_t targetBytes, bool keepResumePoint,
-                             bool keepRunway) {
-  uint64_t released =
-      pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
-  // Pages whose copies are being written count toward the target.
-  while (!reclaimMet(released, targetBytes)) {
-    const CacheReclaimResult result =
-        reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
-                   keepResumePoint, keepRunway);
-    if (!result.madeProgress)
-      break;
-    released += result.reclaimedBytes;
-  }
-  return released;
+uint64_t Cache::releaseEmptyExtents(bool keepRunway) {
+  return pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
-uint64_t Cache::evictAll() {
-  constexpr uint32_t every = std::numeric_limits<uint32_t>::max();
-  uint64_t released = pool_.reclaimEmptyExtents(false, every);
+CacheReclaimResult Cache::evictAll() {
+  uint64_t released = releaseEmptyExtents(false);
+  bool evicted = false;
   // Everything unpinned goes before anything moves.
-  for (CacheReclaimResult evicted = evictOne(ReclaimClass::InUse, false, false);
-       evicted.madeProgress; evicted = evictOne(ReclaimClass::InUse, false, false))
-    released += evicted.reclaimedBytes;
+  while (evictOne(ReclaimClass::InUse, false, false).madeProgress)
+    evicted = true;
   do {
-    released += pool_.reclaimEmptyExtents(false, every);
+    released += releaseEmptyExtents(false);
   } while (compactExtent());
-  return released;
+  return {.madeProgress = evicted || released != 0, .reclaimedBytes = released};
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
@@ -345,9 +332,8 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
   // buffers give no page; one whose write must wait for the one in flight
   // stays and holds back nothing else.
   if (const auto oldest = states_.checkpointCandidate(keepResumePoint); oldest && !pagesOnly) {
-    if (const StateEviction eviction = states_.reclaim(oldest->id, StateCache::Unwritten::Wait);
-        eviction.evicted)
-      return {true, eviction.reclaimedBytes};
+    if (states_.reclaim(oldest->id, StateCache::Unwritten::Wait).evicted)
+      return {.madeProgress = true, .evictedState = true};
   }
 
   // Then oldest first across ordinary states and KV, or the leaves alone
@@ -358,17 +344,17 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
     if (inUse && upTo == ReclaimClass::Ordinary)
       break;
     if (inUse && transfersInFlight())
-      return {false, 0, true};
+      return {.pending = true};
     if (const auto victim = reclaimOldest({.inUse = inUse,
                                            .keepResumePoint = keepResumePoint,
                                            .unwritten = StateCache::Unwritten::Wait,
                                            .timing = ReclaimTiming::CanWait,
                                            .pagesOnly = pagesOnly}))
-      return {true, victim->reclaimedBytes};
+      return {.madeProgress = true, .evictedState = !victim->kv};
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
   // was in flight during the pass still is, and comes back.
-  return {false, 0, transfersInFlight()};
+  return {.pending = transfersInFlight()};
 }
 
 CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
@@ -381,11 +367,10 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
       break;
     }
     total.madeProgress = true;
-    total.reclaimedBytes += step.reclaimedBytes;
-    // A state's memory may let the retry grow the pool. While the host
-    // refuses growth it gives no page, and the leaf the state sat on goes
-    // next.
-    if (step.reclaimedBytes && mode == CacheReclaimMode::KeepExtents)
+    // A state's buffers, once the model's pool returns them, may let the
+    // retry grow the pool. While the host refuses growth they give no page,
+    // and the leaf the state sat on goes next.
+    if (step.evictedState && mode == CacheReclaimMode::KeepExtents)
       break;
   }
   return total;
@@ -404,7 +389,7 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
   if (!scan.inUse) {
     for (auto leaf = oldestDeadKvLeaf(0); leaf; leaf = oldestDeadKvLeaf(leaf->id))
       if (reclaimKvLeaf(leaf->id, scan.timing) == LeafReclaim::Started)
-        return Victim{true, 0};
+        return Victim{true};
   }
   std::optional<CacheEvictionCandidate> state;
   if (!scan.pagesOnly)
@@ -413,26 +398,23 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
   ReclaimTiming timing = scan.timing;
   while (state || kv) {
     if (state && (!kv || state->lastUsed <= kv->lastUsed)) {
-      if (const StateEviction eviction = states_.reclaim(state->id, scan.unwritten);
-          eviction.evicted)
-        return Victim{false, eviction.reclaimedBytes};
+      if (states_.reclaim(state->id, scan.unwritten).evicted)
+        return Victim{false};
       state.reset();
       continue;
     }
     // A page scan's leaf gives up its state in RAM first. The resume point
     // the scan keeps stays, and the leaf under it.
     if (states_.stateResident(kv->id)) {
-      if (!scan.keepResumePoint || kv->id != states_.resumePoint()) {
-        if (const StateEviction eviction = states_.reclaim(kv->id, scan.unwritten);
-            eviction.evicted)
-          return Victim{false, eviction.reclaimedBytes};
-      }
-      kv = oldestKvLeaf(kv->id, scan.inUse, true);
+      if ((!scan.keepResumePoint || kv->id != states_.resumePoint()) &&
+          states_.reclaim(kv->id, scan.unwritten).evicted)
+        return Victim{false};
+      kv = oldestKvLeaf(kv->id, scan.inUse, scan.pagesOnly);
       continue;
     }
     switch (reclaimKvLeaf(kv->id, timing)) {
     case LeafReclaim::Started:
-      return Victim{true, 0};
+      return Victim{true};
     case LeafReclaim::Pending:
       // The tier takes no demotion until a transfer lands: the leaves that
       // need one wait with this one, and those whose page frees now go.
@@ -496,9 +478,11 @@ CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {
   if (!state && upTo == ReclaimClass::InUse && !transfersInFlight())
     state = states_.inUseCandidate();
   if (!state)
-    return {false, 0, transfersInFlight()};
+    return {.pending = transfersInFlight()};
   const StateEviction eviction = states_.reclaim(state->id, StateCache::Unwritten::Wait);
-  return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
+  return {.madeProgress = eviction.evicted,
+          .pending = eviction.pending,
+          .evictedState = eviction.evicted};
 }
 
 std::optional<CacheEvictionCandidate> Cache::oldestDeadKvLeaf(uint64_t after) const {
@@ -632,11 +616,6 @@ bool Cache::transfersInFlight() const noexcept {
 
 uint64_t Cache::pendingBytes() const noexcept {
   return uint64_t{pendingPages()} * pool_.bytesPerPage();
-}
-
-bool Cache::reclaimMet(uint64_t releasedBytes,
-                       uint64_t targetBytes) const noexcept {
-  return releasedBytes + pendingBytes() >= targetBytes;
 }
 
 

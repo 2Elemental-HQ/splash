@@ -1425,26 +1425,43 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
   const bool keep = directive.keepServingFootprint;
   uint64_t released = 0;
-  while (const uint64_t idle = model_.reclaimIdleState(keep))
-    released += idle;
-  const uint64_t remaining =
-      released >= directive.targetBytes ? 0 : directive.targetBytes - released;
-  // Even a zero-byte directive may release completely empty KV extents.
-  const uint64_t fromCache =
-      directive.evictAllUnpinnedPrefixes
-          ? cache_.evictAll()
-          : cache_.reclaimCache(remaining, directive.keepResumePoint, keep);
-  released += fromCache;
-  // Evicted states park their buffers in the model's pool; a pressure pass
-  // returns that memory to the host now rather than keeping it warm.
-  while (model_.reclaimIdleState(keep)) {
+  // A reclaim step may free memory that stays in the engine, pages of an
+  // extent that stays or buffers that refill the lane's footprint, and a
+  // waiting request may fit in it all the same.
+  bool reclaimed = false;
+  // Evicted states park their buffers in the model's pool, which a pass
+  // returns to the host at once, or uses to refill the buffers it keeps.
+  const auto releaseIdle = [&] {
+    while (const uint64_t idle = model_.reclaimIdleState(keep))
+      released += idle;
+  };
+  releaseIdle();
+  if (directive.evictAllUnpinnedPrefixes) {
+    const CacheReclaimResult evicted = cache_.evictAll();
+    reclaimed = evicted.madeProgress;
+    released += evicted.reclaimedBytes;
+    releaseIdle();
+  } else {
+    // Even a zero-byte directive releases completely empty KV extents.
+    released += cache_.releaseEmptyExtents(keep);
+    // Pages whose copies are being written count toward the target.
+    while (released + cache_.pendingBytes() < directive.targetBytes) {
+      const CacheReclaimResult step =
+          cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
+                            directive.keepResumePoint, keep);
+      if (!step.madeProgress)
+        break;
+      reclaimed = true;
+      released += step.reclaimedBytes;
+      releaseIdle();
+    }
   }
-  if (released)
+  if (released || reclaimed)
     signalResourceProgress();
   if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)
     return {released, ReclaimOutcome::Untargeted};
   if (!directive.evictAllUnpinnedPrefixes &&
-      cache_.reclaimMet(fromCache, remaining))
+      released + cache_.pendingBytes() >= directive.targetBytes)
     return {released, ReclaimOutcome::Met};
   return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
                                                : ReclaimOutcome::Exhausted};
