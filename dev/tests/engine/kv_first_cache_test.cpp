@@ -1,3 +1,4 @@
+#include "TestCache.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "engine/Cache.hpp"
@@ -174,7 +175,7 @@ struct CacheFixture {
     cache.beginRequest(1);
     require(admitTokens(cache, 1, 128).granted(),
             "fixture KV pages were not acquired");
-    static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
+    cache.publishCommittedBlocks(1, prompt, 128);
     for (uint32_t boundary = 32; boundary <= 128; boundary += 32)
       blocks.push_back(cache.blockAt(1, boundary));
     if (!running)
@@ -208,7 +209,7 @@ struct Prefixes {
       prompts[i].assign(KvCache::pageTokens, 1000 + i);
       cache.beginRequest(i + 1);
       require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
-      blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
+      blocks[i] = test::publishBlocks(cache, i + 1, prompts[i], KvCache::pageTokens);
       cache.endRequest(i + 1);
       if (continued)
         prompts[i].push_back(9999);
@@ -308,7 +309,7 @@ void testProbeRefreshFollowsTheGraph() {
     require(admitRestore(cache, 2, probed).granted() && admitTokens(cache, 2, 128).granted(),
             "the tail's page was not acquired");
     probed = {};
-    static_cast<void>(cache.publishCommittedBlocks(2, fixture.prompt, 128));
+    cache.publishCommittedBlocks(2, fixture.prompt, 128);
     cache.endRequest(2);
     cache.refresh(probe, fixture.prompt);
     require(hashed() == 6 && cache.lookup(fixture.prompt, {}, &probe).kvBoundary == 128,
@@ -390,7 +391,7 @@ void testProbeFallsBackWhenKvChanges() {
   require(cold.cachedTokens() == 0, "cold admission probe found cached work");
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "new KV page was not acquired");
-  const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
+  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32);
   cache.publishCompositeState(block, std::make_shared<TestState>(100));
   cache.endRequest(1);
   auto newlyCached = cache.lookup(prompt, {}, &cold);
@@ -408,7 +409,7 @@ void testProbeBindsImageIdentity() {
   const std::span<const ImageSpan> images(&image, 1);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "image KV page was not acquired");
-  const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32, images);
+  const uint64_t block = test::publishBlocks(cache, 1, prompt, 32, images);
   cache.publishCompositeState(block, std::make_shared<TestState>(100));
   cache.endRequest(1);
   const CacheProbe probe = cache.probe(prompt, images);
@@ -430,7 +431,7 @@ void testProbeCannotCrossCaches() {
                            const std::vector<uint32_t> &prompt) {
     cache.beginRequest(1);
     require(admitTokens(cache, 1, 32).granted(), "KV page was not acquired");
-    const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
+    const uint64_t block = test::publishBlocks(cache, 1, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<TestState>(100));
     cache.endRequest(1);
   };
@@ -470,7 +471,7 @@ void testPageTableReportsWhatChanged() {
               cache.pageTable(1).firstChanged == 1 && cache.pageTable(1).pages.size() == 2,
           "an append did not report the length it grew from");
   require(admitTokens(cache, 1, page + 1).granted(), "held pages were denied");
-  static_cast<void>(cache.publishCommittedBlocks(1, prompt, 2 * page));
+  cache.publishCommittedBlocks(1, prompt, 2 * page);
   require(cache.pageTable(1).revision == 2,
           "tokens on held pages or a request's own blocks moved its revision");
   cache.publishCompositeState(cache.blockAt(1, 2 * page), std::make_shared<TestState>(100));
@@ -480,11 +481,11 @@ void testPageTableReportsWhatChanged() {
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 2 * page).granted() && cache.pageTable(2).revision == 1,
           "a second request's pages were denied");
-  static_cast<void>(cache.publishCommittedBlocks(2, prompt, page));
+  cache.publishCommittedBlocks(2, prompt, page);
   require(cache.pageTable(2).revision == 2 && cache.pageTable(2).firstChanged == 0 &&
               cache.pageTable(2).pages[0] == cache.pageTable(1).pages[0],
           "the first swapped block did not report its index");
-  static_cast<void>(cache.publishCommittedBlocks(2, prompt, 2 * page));
+  cache.publishCommittedBlocks(2, prompt, 2 * page);
   require(cache.pageTable(2).revision == 3 && cache.pageTable(2).firstChanged == 1 &&
               cache.pageTable(2).pages[1] == cache.pageTable(1).pages[1] &&
               cache.pageTable(1).revision == 2,
@@ -749,11 +750,11 @@ void testFinishedRequestLeavesTailKvBeforeItsState() {
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 64).granted(),
           "prefix pages were not acquired");
-  static_cast<void>(cache.publishCommittedBlocks(1, prompt, 64));
+  cache.publishCommittedBlocks(1, prompt, 64);
   const uint64_t stateBlock = cache.blockAt(1, 64);
   cache.publishCompositeState(stateBlock, std::make_shared<TestState>(100));
   require(admitTokens(cache, 1, 128).granted(), "tail pages were not acquired");
-  static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
+  cache.publishCommittedBlocks(1, prompt, 128);
   cache.endRequest(1);
   require(cache.snapshot().kvCache.blocks == 4 &&
               cache.snapshot().stateCache.entries == 1,
@@ -952,7 +953,7 @@ void testCheckpointPressurePreservesHotPrefix() {
   const std::vector<uint32_t> cold(65, 22);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "hot KV admission failed");
-  const uint64_t hotBlock = cache.publishCommittedBlocks(1, hot, 32);
+  const uint64_t hotBlock = test::publishBlocks(cache, 1, hot, 32);
   cache.publishCompositeState(hotBlock, std::make_shared<BudgetState>(budget));
   cache.endRequest(1);
   {
@@ -965,7 +966,7 @@ void testCheckpointPressurePreservesHotPrefix() {
 
   cache.beginRequest(3);
   require(admitTokens(cache, 3, 32).granted(), "cold KV admission failed");
-  const uint64_t coldBlock = cache.publishCommittedBlocks(3, cold, 32);
+  const uint64_t coldBlock = test::publishBlocks(cache, 3, cold, 32);
   cache.publishCompositeState(coldBlock, std::make_shared<BudgetState>(budget),
                               true);
   require(budget.used == SharedBudget::capacity,
@@ -2363,7 +2364,7 @@ void testFailedRestoreDropsTheBlocksBelow() {
     cache.beginRequest(request);
     require(admitTokens(cache, request, 128).granted(), "prefix KV failed");
     const uint64_t last =
-        cache.publishCommittedBlocks(request, request == 1 ? prompt : sibling, 128);
+        test::publishBlocks(cache, request, request == 1 ? prompt : sibling, 128);
     cache.endRequest(request);
     cache.publishCompositeState(last, std::make_shared<TieredState>(control));
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -2438,7 +2439,7 @@ void testBusyTierPreservesDiskVictim() {
       prompts[i].assign(KvCache::pageTokens, 1000 + i);
       cache.beginRequest(i + 1);
       require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
-      auto block = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
+      auto block = test::publishBlocks(cache, i + 1, prompts[i], KvCache::pageTokens);
       cache.endRequest(i + 1);
       cache.publishCompositeState(block, std::make_shared<TieredState>(control));
       require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -2492,8 +2493,8 @@ void testReclaimForPagesCoversTheShortfall() {
     for (uint32_t leaf = 0; leaf < 8; ++leaf) {
       cache.beginRequest(leaf + 1);
       require(admitTokens(cache, leaf + 1, 32).granted(), "leaf KV admission failed");
-      const uint64_t block = cache.publishCommittedBlocks(
-          leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
+      const uint64_t block = test::publishBlocks(
+          cache, leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
       cache.endRequest(leaf + 1);
       if (withState)
         cache.publishCompositeState(block, std::make_shared<TestState>(100));
@@ -2531,7 +2532,7 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
     chain[i] = 1000 + i;
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 64).granted(), "chain KV admission failed");
-  const uint64_t leaf = cache.publishCommittedBlocks(1, chain, 64);
+  const uint64_t leaf = test::publishBlocks(cache, 1, chain, 64);
   cache.endRequest(1);
   cache.publishCompositeState(leaf, std::make_shared<TieredState>(control));
   require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && cache.pollTransfers(),
@@ -2542,7 +2543,7 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
   const std::vector<uint32_t> newer(33, 7);
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 32).granted(), "newer KV admission failed");
-  static_cast<void>(cache.publishCommittedBlocks(2, newer, 32));
+  cache.publishCommittedBlocks(2, newer, 32);
   cache.endRequest(2);
   require(pool.freePageCount() == 2 && tier.demotions == 1,
           "fixture geometry changed");
@@ -2664,7 +2665,7 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
     prompt[i] = 1000 + i;
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 128).granted(), "prefix KV failed");
-  const uint64_t last = cache.publishCommittedBlocks(1, prompt, 128);
+  const uint64_t last = test::publishBlocks(cache, 1, prompt, 128);
   const uint64_t third = cache.blockAt(1, 96);
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
@@ -2678,7 +2679,7 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
           "restore was denied");
   cache.beginRequest(3);
   require(admitTokens(cache, 3, 97).granted() &&
-              cache.publishCommittedBlocks(3, prompt, 96) == third,
+              test::publishBlocks(cache, 3, prompt, 96) == third,
           "the prefill did not reach the block being restored");
   cache.publishCompositeState(third, std::make_shared<TieredState>(control));
   cache.endRequest(3);
@@ -2712,7 +2713,7 @@ void testLargeSharedDiskRestore() {
   std::vector<uint32_t> prompt(tokens, 17);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, tokens).granted(), "large prefix admission failed");
-  const auto boundary = cache.publishCommittedBlocks(1, prompt, tokens);
+  const auto boundary = test::publishBlocks(cache, 1, prompt, tokens);
   cache.endRequest(1);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
@@ -2762,7 +2763,7 @@ void testRefusedRestoresStopAtTheFirstRefusal() {
   std::vector<uint32_t> prompt(tokens, 19);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, tokens).granted(), "the disk chain's admission failed");
-  const auto boundary = cache.publishCommittedBlocks(1, prompt, tokens);
+  const auto boundary = test::publishBlocks(cache, 1, prompt, tokens);
   cache.endRequest(1);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
@@ -2824,7 +2825,7 @@ struct ExtentFixture {
                 "extent fixture pages are not laid out in order");
         storage.content[table.pages[block]] = content(prompt, block);
       }
-      lastBlocks[prompt] = cache.publishCommittedBlocks(request, prompts[prompt], 96);
+      lastBlocks[prompt] = test::publishBlocks(cache, request, prompts[prompt], 96);
       if (prompt)
         cache.publishCompositeState(lastBlocks[prompt], std::make_shared<TestState>(100));
       cache.endRequest(request);
@@ -3056,7 +3057,7 @@ void testCompactionLeavesAPageBeingRestored() {
   const std::vector<uint32_t> onDisk = prompt(1000, 1);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "disk prompt KV failed");
-  uint64_t last = cache.publishCommittedBlocks(1, onDisk, 32);
+  uint64_t last = test::publishBlocks(cache, 1, onDisk, 32);
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
   require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(), "state was not demoted");
@@ -3065,7 +3066,7 @@ void testCompactionLeavesAPageBeingRestored() {
   const std::vector<uint32_t> plain = prompt(2000, 3);
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 96).granted(), "plain prompt KV failed");
-  static_cast<void>(cache.publishCommittedBlocks(2, plain, 96));
+  cache.publishCommittedBlocks(2, plain, 96);
   cache.endRequest(2);
   // The restore takes extent 0's last page and stays in flight.
   auto lookup = cache.lookup(onDisk);
@@ -3081,7 +3082,7 @@ void testCompactionLeavesAPageBeingRestored() {
           "kept prompt KV failed");
   for (uint32_t block = 0; block < 3; ++block)
     storage.content[4 + block] = 40 + block;
-  last = cache.publishCommittedBlocks(4, kept, 96);
+  last = test::publishBlocks(cache, 4, kept, 96);
   cache.publishCompositeState(last, std::make_shared<TestState>(100));
   cache.endRequest(4);
   // The plain leaves go: extent 0 keeps only the page being read into.
@@ -3138,14 +3139,14 @@ void testCompactionLeavesAPageBeingDemoted() {
   }
   cache.beginRequest(1);
   require(admitTokens(cache, 1, 32).granted(), "plain block KV failed");
-  static_cast<void>(cache.publishCommittedBlocks(1, plain, 32));
+  cache.publishCommittedBlocks(1, plain, 32);
   cache.endRequest(1);
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 128).granted() && cache.pageTable(2).pages[3] == 4,
           "chain KV failed");
   for (uint32_t block = 0; block < 4; ++block)
     storage.content[1 + block] = 20 + block;
-  const uint64_t last = cache.publishCommittedBlocks(2, chained, 128);
+  const uint64_t last = test::publishBlocks(cache, 2, chained, 128);
   cache.endRequest(2);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
   require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(), "state was not demoted");
@@ -3193,7 +3194,7 @@ cacheChain(engine::Cache &cache, uint64_t id, uint32_t pages, bool running = fal
   cache.beginRequest(id);
   require(admitTokens(cache, id, pages * KvCache::pageTokens).granted(),
           "fixture pages were not acquired");
-  static_cast<void>(cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens));
+  cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens);
   std::vector<uint64_t> blocks;
   for (uint32_t page = 1; page <= pages; ++page)
     blocks.push_back(cache.blockAt(id, page * KvCache::pageTokens));

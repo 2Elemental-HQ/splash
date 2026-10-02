@@ -178,10 +178,10 @@ void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
   active.firstChangedPage = first;
 }
 
-uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
-                                       std::span<const uint32_t> exactTokens,
-                                       uint32_t committedTokens,
-                                       std::span<const ImageSpan> images) {
+void Cache::publishCommittedBlocks(uint64_t requestId,
+                                   std::span<const uint32_t> exactTokens,
+                                   uint32_t committedTokens,
+                                   std::span<const ImageSpan> images) {
   Request &active = request(requestId);
   if (committedTokens > exactTokens.size()) {
     throw std::invalid_argument("committed KV exceeds exact token history");
@@ -217,7 +217,6 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     if (parent)
       kv_.releaseActive(parent);
   }
-  return active.cachedBlocks.empty() ? 0 : active.cachedBlocks.back();
 }
 
 uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {

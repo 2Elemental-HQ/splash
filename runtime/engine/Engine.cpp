@@ -1638,9 +1638,8 @@ void Engine::apply(const BatchPlan &plan,
         counters_.resourceReplayTokens += result.consumedPromptTokens;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
-      static_cast<void>(cache_.publishCommittedBlocks(
-          active.request.id, active.exactTokens, promptProcessed,
-          active.request.images));
+      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
+                                    promptProcessed, active.request.images);
       publishReachedStateBoundaries(active, promptProcessed);
       // Recovery may replay an already reported prefix, including generated
       // history.
@@ -1666,9 +1665,8 @@ void Engine::apply(const BatchPlan &plan,
       const uint32_t storedTokens =
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
-      static_cast<void>(cache_.publishCommittedBlocks(
-          active.request.id, active.exactTokens, storedTokens,
-          active.request.images));
+      cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
+                                    storedTokens, active.request.images);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;

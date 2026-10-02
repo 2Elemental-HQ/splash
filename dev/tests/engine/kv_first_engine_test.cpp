@@ -1,3 +1,4 @@
+#include "TestCache.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
@@ -2144,7 +2145,7 @@ void testPressureReclaimFollowsTheChain() {
   std::iota(prompt.begin(), prompt.end(), 1000);
   cache.beginRequest(1);
   require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
-  const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
+  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   cache.publishCompositeState(
@@ -2660,7 +2661,7 @@ void testPausedPageShortageKeepsCachedStates() {
   // Cached: a checkpoint, an ordinary state below it, and KV below both.
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
-  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128));
+  resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128);
   resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
   resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>());
   resources.endRequest(900);
@@ -3190,7 +3191,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   resources.beginRequest(999);
   require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(999, std::vector<uint32_t>(64, 9), 64),
+      test::publishBlocks(resources, 999, std::vector<uint32_t>(64, 9), 64),
       std::make_shared<OffloadState>(write));
   resources.endRequest(999);
   require(resources.reclaimOneState(false, 0, false) &&
@@ -3231,7 +3232,7 @@ void testDroppedLeaseLooksUpAgain() {
   write->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  cache.publishCompositeState(cache.publishCommittedBlocks(999, prompt, 64),
+  cache.publishCompositeState(test::publishBlocks(cache, 999, prompt, 64),
                               std::make_shared<OffloadState>(write));
   cache.endRequest(999);
   executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.bytes != 0; };
@@ -4344,7 +4345,7 @@ struct LostReplayPoint {
     // Another conversation's KV, with no state, fills two whole extents.
     resources.beginRequest(900);
     require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-    static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+    resources.publishCommittedBlocks(900, other, 256);
     resources.endRequest(900);
     releases = storage.releasedExtents;
   }
@@ -4453,7 +4454,7 @@ void testSharedJunctionPublishesFromCachedKv() {
   // Another conversation's KV, with no state, fills two whole extents.
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256));
+  resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256);
   resources.endRequest(900);
   // A snapshot needs memory that only a released extent gives.
   const uint32_t releases = storage.releasedExtents;
@@ -4488,7 +4489,7 @@ void testPausedPublicationInUseTakesNoKv() {
   const std::vector<uint32_t> other(257, 6);
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+  resources.publishCommittedBlocks(900, other, 256);
   resources.endRequest(900);
 
   executor.snapshotRoom = [] { return false; };
@@ -4767,8 +4768,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
     const uint64_t id = 5000 + chain;
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 128).granted(), "could not seed a cached prefix");
-    static_cast<void>(cache.publishCommittedBlocks(
-        id, std::vector<uint32_t>(129, 7000 + chain), 128));
+    cache.publishCommittedBlocks(id, std::vector<uint32_t>(129, 7000 + chain), 128);
     cache.endRequest(id);
   }
   storage.growthAllowed = [&](uint32_t) {
@@ -6232,7 +6232,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   resources.beginRequest(999);
   require(resources.ensureTokens(999, branch.size()).granted(), "branch fixture KV failed");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(999, branch, static_cast<uint32_t>(branch.size())),
+      test::publishBlocks(resources, 999, branch, static_cast<uint32_t>(branch.size())),
       std::make_shared<State>());
   resources.endRequest(999);
   engine.submit(request(531, prompt));
@@ -6454,7 +6454,7 @@ void testJunctionRetiresEarlierProgressPoint() {
   require(resources.ensureTokens(470, branch.size()).granted(),
           "junction fixture could not allocate its KV prefix");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(470, branch, static_cast<uint32_t>(branch.size())),
+      test::publishBlocks(resources, 470, branch, static_cast<uint32_t>(branch.size())),
       std::make_shared<State>());
   resources.endRequest(470);
   engine.submit(request(471, prompt));
@@ -6994,7 +6994,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     auto writing = std::make_shared<OffloadControl>();
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-    const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
+    const auto held = test::publishBlocks(cache, 999, std::vector<uint32_t>(64, 12), 64);
     require(cache.publishStateToDisk(held, [&](std::function<void()>) {
               return std::make_unique<OffloadTicket>(writing);
             }),
@@ -7003,8 +7003,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     auto cached = std::make_shared<OffloadControl>();
     cache.beginRequest(998);
     require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
-    const auto cachedBlock =
-        cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
+    const auto cachedBlock = test::publishBlocks(cache, 998, std::vector<uint32_t>(64, 13), 64);
     cache.publishCompositeState(cachedBlock, std::make_shared<OffloadState>(cached));
     cache.endRequest(998);
     // Every further page needs an extent the budget, or the host, refuses.
@@ -7040,7 +7039,7 @@ void cacheBlocksUnderDiskStates(engine::Cache &cache, uint32_t count) {
     std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    const auto block = test::publishBlocks(cache, id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -7185,7 +7184,7 @@ void testNothingInFlightIsNotPending() {
       cache.endRequest(id);
       break;
     }
-    static_cast<void>(cache.publishCommittedBlocks(id, prompt, 32));
+    cache.publishCommittedBlocks(id, prompt, 32);
     cache.endRequest(id);
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
@@ -7249,7 +7248,7 @@ void testKvGrowthProceedsThroughDemotion() {
   auto transfer = std::make_shared<OffloadControl>();
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, std::vector<uint32_t>(32, 12), 32);
+  const auto block = test::publishBlocks(cache, 999, std::vector<uint32_t>(32, 12), 32);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   {
@@ -7285,7 +7284,7 @@ void demoteState(engine::Cache &cache, uint64_t block) {
 void publishDiskState(engine::Cache &cache, const std::vector<uint32_t> &prompt) {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "disk fixture KV allocation failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
 }
 
@@ -7384,7 +7383,7 @@ void testFailedDiskRestoreKeepsShallowerState() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  static_cast<void>(cache.publishCommittedBlocks(999, prompt, 64));
+  cache.publishCommittedBlocks(999, prompt, 64);
   demoteState(cache, cache.blockAt(999, 64));
   cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>());
   cache.endRequest(999);
@@ -7415,7 +7414,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   transfer->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
@@ -7541,7 +7540,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   transfer->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
@@ -7618,7 +7617,7 @@ void testSkipCacheCandidateIsNotProbed() {
   const std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "KV block was not written");
@@ -7669,7 +7668,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
     if (written) {
       cache.beginRequest(998);
       require(cache.ensureTokens(998, 32).granted(), "fixture KV failed");
-      demoteState(cache, cache.publishCommittedBlocks(998, std::vector<uint32_t>(33, 5), 32));
+      demoteState(cache, test::publishBlocks(cache, 998, std::vector<uint32_t>(33, 5), 32));
       cache.endRequest(998);
     }
     // The Background lane's three pages fill the engine's limit.
@@ -7755,7 +7754,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   const std::vector<uint32_t> prompt(129, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 128);
+  const auto block = test::publishBlocks(cache, 999, prompt, 128);
   demoteState(cache, block);
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
@@ -7863,7 +7862,7 @@ void testRefusedRestoreClosesAdmission() {
     const std::vector<uint32_t> prompt(65, 17);
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-    demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+    demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
     cache.endRequest(999);
     for (uint32_t written = 1; written <= 2; ++written) {
       require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
@@ -7877,8 +7876,8 @@ void testRefusedRestoreClosesAdmission() {
       for (uint64_t id = 900; id < 904; ++id) {
         cache.beginRequest(id);
         require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-        demoteState(cache, cache.publishCommittedBlocks(
-                               id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+        demoteState(cache, test::publishBlocks(
+                               cache, id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
         cache.endRequest(id);
       }
     }
@@ -7946,7 +7945,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   std::vector<uint32_t> prompt(97, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 96).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 96));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 3; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -7961,7 +7960,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -8013,7 +8012,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   std::vector<uint32_t> prompt(257, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 256).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 256));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 256));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 8; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8028,7 +8027,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -8102,8 +8101,8 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   for (uint64_t id = 900; id < 904; ++id) {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    demoteState(cache, cache.publishCommittedBlocks(
-                           id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+    demoteState(cache, test::publishBlocks(
+                           cache, id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
     cache.endRequest(id);
   }
   // Request 1's first command needs seven of the eight pages; its last needs
@@ -8157,7 +8156,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8210,7 +8209,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8657,7 +8656,7 @@ void testHeldBackStartTakesNothingInUse() {
       // budget holds no extent beyond the one the running lane fills.
       resources.beginRequest(999);
       require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
-      demoteState(resources, resources.publishCommittedBlocks(999, held, 64));
+      demoteState(resources, test::publishBlocks(resources, 999, held, 64));
       resources.endRequest(999);
       for (uint32_t written = 1; written <= 2; ++written) {
         require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)

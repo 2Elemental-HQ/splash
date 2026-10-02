@@ -241,9 +241,10 @@ public:
   // Canonicalizes every newly complete Page32 block. Duplicate content swaps
   // the request to the existing immutable page after the writer command has
   // completed; no active command ever aliases a writable page.
-  [[nodiscard]] uint64_t publishCommittedBlocks(
-      uint64_t requestId, std::span<const uint32_t> exactTokens,
-      uint32_t committedTokens, std::span<const ImageSpan> images = {});
+  void publishCommittedBlocks(uint64_t requestId,
+                              std::span<const uint32_t> exactTokens,
+                              uint32_t committedTokens,
+                              std::span<const ImageSpan> images = {});
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
   // Reuses the state at this block in either tier, as reuseCompositeState()

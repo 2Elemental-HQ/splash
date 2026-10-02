@@ -1,3 +1,4 @@
+#include "TestCache.hpp"
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
@@ -52,7 +53,7 @@ void testCanonicalPagesAndSparseState() {
   resources.beginRequest(1);
   require(resources.ensureTokens(1, prompt.size()).granted(),
           "request pages were not admitted");
-  uint64_t deepest = resources.publishCommittedBlocks(1, prompt, 64);
+  uint64_t deepest = test::publishBlocks(resources, 1, prompt, 64);
   require(deepest && resources.blockAt(1, 64) == deepest,
           "complete Page32 chain was not published");
   publish(resources, deepest, 100);
@@ -76,7 +77,7 @@ void testKvDeeperThanStateAndDependencyEviction() {
   auto prompt = tokens(97);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 96).granted(), "KV allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 96));
+  resources.publishCommittedBlocks(1, prompt, 96);
   const uint64_t middle = resources.blockAt(1, 64);
   publish(resources, middle, 100);
   resources.endRequest(1);
@@ -110,7 +111,7 @@ void testActiveTipProtectsTheContentChain() {
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 64).granted(),
           "active request KV allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 64));
+  resources.publishCommittedBlocks(1, prompt, 64);
   resources.beginRequest(2);
 
   engine::TokenAdmission blocked = resources.ensureTokens(2, 96);
@@ -136,7 +137,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(),
           "initial KV extent allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 128));
+  resources.publishCommittedBlocks(1, prompt, 128);
   resources.endRequest(1);
   require(resources.snapshot().kvCache.blocks == 4 &&
               resources.snapshot().pool.pagesAllocated == 4,
@@ -166,7 +167,7 @@ void testFragmentedColdKvPrecedesNewerState() {
   const auto prompt = tokens(129);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(), "fixture allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 128));
+  resources.publishCommittedBlocks(1, prompt, 128);
   const uint64_t stateBlock = resources.blockAt(1, 32);
   resources.endRequest(1);
   publish(resources, stateBlock, 100);
@@ -188,7 +189,7 @@ void testReplacementKeepsTheExtentItEmpties() {
   resources.beginRequest(1);
   const auto prompt = tokens(33);
   require(resources.ensureTokens(1, 32).granted(), "fixture allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
+  resources.publishCommittedBlocks(1, prompt, 32);
   resources.endRequest(1);
 
   const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
@@ -217,7 +218,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   const auto prompt = tokens(33);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 32).granted(), "cached page allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
+  resources.publishCommittedBlocks(1, prompt, 32);
   resources.endRequest(1);
   // Request 2 fills the cached block's extent and every other one, then
   // ends: every extent but the cached block's is empty.
@@ -257,8 +258,7 @@ void testReleaseTimeCoversOneExtent() {
     resources.beginRequest(id);
     require(resources.ensureTokens(id, 128).granted(),
             "cached chain allocation failed");
-    static_cast<void>(
-        resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128));
+    resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128);
     resources.endRequest(id);
   }
   require(resources.snapshot().pool.reclaimableExtents == 0 &&
@@ -286,14 +286,14 @@ void testPublicationReleasesTheExtentItEmpties() {
   const auto running = tokens(129);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(), "the running request got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(1, running, 128));
+  resources.publishCommittedBlocks(1, running, 128);
   const uint64_t point = resources.blockAt(1, 128);
   StateUse use = resources.useState(point);
   // Another conversation's chain fills the second extent and half the third.
   const auto other = tokens(193, 1000);
   resources.beginRequest(2);
   require(resources.ensureTokens(2, 192).granted(), "the other chain got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(2, other, 192));
+  resources.publishCommittedBlocks(2, other, 192);
   resources.endRequest(2);
   // A request that cached nothing leaves the fourth extent empty.
   resources.beginRequest(3);
