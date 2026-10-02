@@ -126,6 +126,10 @@ class MaskComputationFailed(EngineRuntimeError):
         return MaskComputationFailed(*self.args, retryable=self.retryable)
 
 
+class StatusUnanswered(TimeoutError):
+    """The native loop accepted a status request but did not answer it in time."""
+
+
 @dataclass(slots=True, frozen=True)
 class Deadline:
     absolute_unix_micros: int
@@ -454,6 +458,11 @@ class MultiplexedRuntime:
     _shutdown_grace_seconds = 15.0
     # Allow the native 120-second command watchdog to finish before fencing it.
     _cancel_grace_seconds = 150.0
+    # While calls are pending, how often the loop must answer a status request.
+    _liveness_interval_seconds = 10.0
+    # Far above any legitimate tick: release passes take <= 0.5 s, pipeline
+    # compiles < 1 s.
+    _liveness_timeout_seconds = 30.0
 
     def __init__(
         self,
@@ -507,6 +516,7 @@ class MultiplexedRuntime:
         self._terminal_error: EngineRuntimeError | None = None
         self._pending: dict[int, RuntimeCall] = {}
         self._status_waiters: dict[int, _StatusWaiter] = {}
+        self._liveness_timer: threading.Timer | None = None
         self._last_status_id = 0
         self._last_status: wire.StatusJsonEvent | None = None
         self._request_ids = itertools.count(1)
@@ -648,6 +658,7 @@ class MultiplexedRuntime:
                     on_complete,
                 )
                 self._pending[request_id] = call
+                self._arm_liveness_probe_locked(generation)
             self._write_bytes(encoded, generation, call=call, deadline=deadline)
             return call
         except BaseException:
@@ -662,13 +673,19 @@ class MultiplexedRuntime:
             raise
 
     def status(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
+        return self._status(timeout, None)
+
+    def _status(self, timeout: float, generation: int | None) -> wire.StatusJsonEvent:
+        """Asks the engine of ``generation``, or the current one when None, so
+        that a probe never measures a newer engine."""
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("status timeout must be positive")
         deadline = time.monotonic() + timeout
         with self._state_lock:
             if self._closed:
                 raise RuntimeClosed("runtime is closed")
-            generation = self._generation
+            if generation is None:
+                generation = self._generation
             self._require_generation_ready_locked(generation)
             correlation_id = next(self._status_ids)
             self._last_status_id = correlation_id
@@ -687,7 +704,7 @@ class MultiplexedRuntime:
                 if self._status_waiters.pop(correlation_id, None) is waiter:
                     expired = True
             if expired:
-                raise TimeoutError("native status response timed out")
+                raise StatusUnanswered("native status response timed out")
         if waiter.error:
             raise waiter.error.restate()
         assert waiter.result is not None
@@ -1038,6 +1055,55 @@ class MultiplexedRuntime:
         if finish:
             finish()
 
+    def _arm_liveness_probe_locked(self, generation: int) -> None:
+        if self._liveness_timer is None:
+            timer = threading.Timer(
+                self._liveness_interval_seconds, self._probe_liveness, (generation,)
+            )
+            timer.daemon = True
+            self._liveness_timer = timer
+            timer.start()
+
+    def _liveness_wanted_locked(self, generation: int) -> bool:
+        return (
+            not self._closed
+            and generation == self._generation
+            and self._terminal_error is None
+            and bool(self._pending)
+        )
+
+    def _probe_liveness(self, generation: int) -> None:
+        """The engine's reader thread drains stdin even while its loop is
+        stuck, so writes keep progressing; only an answer from the loop shows
+        it runs."""
+        try:
+            with self._state_lock:
+                if not self._liveness_wanted_locked(generation):
+                    return
+            timeout = self._liveness_timeout_seconds
+            try:
+                self._status(timeout, generation)
+            except StatusUnanswered:
+                self._fail_generation(
+                    generation,
+                    EngineUnhealthy(
+                        f"native loop did not answer status within {timeout:g} s "
+                        "while requests were pending"
+                    ),
+                )
+            except (EngineRuntimeError, TimeoutError):
+                # The generation failed meanwhile, or the write lock stayed
+                # taken; _write_bytes fences a started write that stalls.
+                pass
+        finally:
+            with self._state_lock:
+                # A failure cancels this timer, and the next generation may
+                # then arm its own: only the armed timer arms the next one.
+                if self._liveness_timer is threading.current_thread():
+                    self._liveness_timer = None
+                    if self._liveness_wanted_locked(generation):
+                        self._arm_liveness_probe_locked(generation)
+
     def _reader_loop(self, process: ProcessLike, generation: int) -> None:
         parser = wire.FrameParser()
         try:
@@ -1329,6 +1395,9 @@ class MultiplexedRuntime:
             process = self._process
             calls = tuple(self._pending.values())
             self._pending.clear()
+            if self._liveness_timer is not None:
+                self._liveness_timer.cancel()
+                self._liveness_timer = None
             waiters = tuple(self._status_waiters.values())
             self._status_waiters.clear()
             for waiter in waiters:

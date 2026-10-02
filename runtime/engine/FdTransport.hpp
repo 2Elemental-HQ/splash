@@ -54,9 +54,10 @@ public:
   void requestShutdown() noexcept;
   [[nodiscard]] bool shutdownRequested() const noexcept;
   // The longest one control pass and one tick of run() have taken. Read on
-  // the loop thread (status). The reader keeps reading input meanwhile, so
-  // the server's limit on a write that makes no progress for 5 s judges only
-  // whether the process reads.
+  // the loop thread (status). The reader keeps reading input meanwhile, so a
+  // stalled request write shows only that the process stopped reading; a
+  // stuck loop is detected by the server's status round trip
+  // (server/runtime.py `_probe_liveness`).
   [[nodiscard]] double maxTickMilliseconds() const noexcept;
   // Why run() ended with IoFailure, or with EngineFailure when the input
   // reader ran out of memory; empty when the loop chose the exit.
