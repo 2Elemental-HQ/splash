@@ -73,7 +73,8 @@ public:
                       bool retryable) = 0;
 };
 
-// The code of a request the engine could not give memory to.
+// The code of a request the engine could not give memory to even alone: not
+// retryable.
 inline constexpr std::string_view kCapacityExhausted = "capacity_exhausted";
 
 } // namespace splash::engine

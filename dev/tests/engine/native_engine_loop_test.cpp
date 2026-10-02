@@ -566,7 +566,7 @@ void testCapacityFailureHasOneTerminalFrame() {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++errors;
       capacity += error->failureClass == protocol::FailureClass::RequestError &&
-                  error->retryable && error->code == engine::kCapacityExhausted;
+                  !error->retryable && error->code == engine::kCapacityExhausted;
     }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }

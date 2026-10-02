@@ -905,7 +905,10 @@ requests then resume first, each within its own resource wait. A resource
 wait's limit restarts whenever a lane submitted before the waiting request has
 work in flight, since that lane holds memory the request waits for until it
 finishes; lanes submitted after the request do not extend it. Readiness does
-not guarantee that a request-sized allocation fits.
+not guarantee that a request-sized allocation fits. A request that cannot fit
+even alone, after every cached prefix was evicted, fails with 400
+`capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
+fails the same way.
 
 ### Disk cache
 

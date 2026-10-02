@@ -3046,7 +3046,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   }
 }
 
-void testAllocationCausesRemainRetryableAndDistinct() {
+void testAllocationCausesRemainDistinct() {
   for (bool stateAllocation : {false, true}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
                         metal::AllocationFailure::EngineBudget,
@@ -3073,10 +3073,10 @@ void testAllocationCausesRemainRetryableAndDistinct() {
         require(engine.idle() && events.failures ==
                     std::vector<std::string>{"capacity_exhausted"} &&
                     events.failureDetails.size() == 1 &&
-                    events.failureDetails[0].second &&
+                    !events.failureDetails[0].second &&
                     events.failureDetails[0].first.find(
                         metal::allocationFailureName(reason)) != std::string::npos,
-                "allocation failure lost its cause or became nonretryable");
+                "allocation failure lost its cause or became retryable");
       }
       require(engine.idle() && executor.requests.empty() &&
                   cache.snapshot().activeRequests == 0,
@@ -5359,7 +5359,7 @@ int main() {
     testDeniedGrowthAllocatesEachExtentOnce();
     testGrowthBeyondTheBudgetFailsAtOnce();
     testReclaimPassReleasesEveryEmptyExtent();
-    testAllocationCausesRemainRetryableAndDistinct();
+    testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
     testConstraintMaskWaitHonorsCancelAndDeadline();

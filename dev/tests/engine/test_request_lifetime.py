@@ -92,7 +92,7 @@ class RequestLifetimeTests(unittest.TestCase):
                         wire.ErrorEvent(
                             wire.FailureClass.REQUEST_ERROR,
                             call.request_id,
-                            True,
+                            False,
                             b"capacity_exhausted",
                             b"could not allocate KV target: engine budget",
                         )

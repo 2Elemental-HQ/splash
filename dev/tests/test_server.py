@@ -7427,24 +7427,41 @@ class ServerTest(unittest.TestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 
-    def test_retryable_capacity_failure_maps_to_503(self):
-        runtime = FakeRuntime(
+    def test_capacity_failure_is_a_bad_request_naming_the_limits(self):
+        native = (
+            "could not allocate KV target: engine memory budget exceeded "
+            "(additional_pages=12, free_pages=0)"
+        )
+        capacity = [
             Plan(
                 exception=api.engine_runtime.RequestFailed(
-                    1,
-                    b"capacity_exhausted",
-                    b"system memory pressure is critical",
-                    retryable=True,
+                    1, b"capacity_exhausted", native.encode(), retryable=False
                 )
-            ),
-            Plan([[4]]),
-        )
-        harness = self.harness(runtime)
-        status, _, payload = harness.request(
-            "POST", "/v1/chat/completions", self.body()
-        )
-        self.assertEqual(status, 503)
-        self.assertEqual(json.loads(payload)["error"]["code"], "capacity_exhausted")
+            )
+            for _ in range(2)
+        ]
+        harness = self.harness(FakeRuntime(*capacity, Plan([[4]])))
+        # Retrying fails the same way, so no response invites a retry.
+        for path, body in (
+            ("/v1/chat/completions", self.body()),
+            ("/v1/messages", self.anthropic_body()),
+        ):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            self.addCleanup(connection.close)
+            connection.request(
+                "POST", path, json.dumps(body), {"Content-Type": "application/json"}
+            )
+            response = connection.getresponse()
+            error = json.loads(response.read())["error"]
+            self.assertEqual(response.status, 400)
+            self.assertIsNone(response.getheader("Retry-After"))
+            self.assertEqual(error["type"], "invalid_request_error")
+            for text in ("--max-memory", "--max-context", native):
+                self.assertIn(text, error["message"])
+            if path == "/v1/chat/completions":
+                self.assertEqual(error["code"], "capacity_exhausted")
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 

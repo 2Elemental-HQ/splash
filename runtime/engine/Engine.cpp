@@ -523,12 +523,13 @@ bool Engine::admit(Request &active, double now) {
       // not get may fail it.
       if (admission.failure == StateFailure::MemoryPressure &&
           judge(denial, active.request.id) == Verdict::Fail) {
+        // A lone lane that cannot fit even after every cached prefix went:
+        // retrying the same request fails the same way.
         finishFailure(active,
                       {std::string(kCapacityExhausted),
                        std::string("could not allocate request state: ") +
                            metal::allocationFailureName(
-                               admission.allocationFailure),
-                       true});
+                               admission.allocationFailure)});
         return true;
       }
       scheduler_.waitForResources(active.request.id);
@@ -1460,6 +1461,8 @@ void Engine::finishFailure(Request &active, Failure failure) {
   release(active);
 }
 
+// A lone lane that cannot fit even after every cached prefix went: retrying
+// the same request fails the same way.
 void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
   finishFailure(active,
                 {std::string(kCapacityExhausted),
@@ -1468,8 +1471,7 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
                      " (additional_pages=" +
                      std::to_string(admission.additionalPages) +
                      ", free_pages=" + std::to_string(admission.availablePages) +
-                     ")",
-                 true});
+                     ")"});
 }
 
 void Engine::release(Request &active) {

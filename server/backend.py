@@ -779,6 +779,14 @@ class NativeBackend:
             message = error.message_bytes.decode("utf-8", "replace")
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
+            if code == "capacity_exhausted":
+                return APIError(
+                    400,
+                    "the request does not fit in the memory this server may use, even "
+                    "after every cached prefix was evicted; restart the server with a "
+                    f"larger --max-memory or a smaller --max-context ({message})",
+                    code,
+                )
             request_codes = {
                 "integer_overflow",
                 "invalid_cohort_constraint",
