@@ -9,8 +9,6 @@ import sys
 import unittest
 from unittest import mock
 
-from referencing import Registry
-
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory, request
 from dev.tests.test_server import FakeRuntime, Harness, no_signed_thinking
@@ -242,7 +240,7 @@ class RequestContractTests(unittest.TestCase):
             "patternProperties": {"^key": {"type": "integer"}},
             "additionalProperties": False,
         }
-        validator = schema_validation.build_validator(schema, lambda s: [s], Registry())
+        validator = schema_validation.build_validator(schema)
         self.assertTrue(validator.is_valid({"key_one": 1}))
         self.assertFalse(validator.is_valid({"other": 1}))
         self.assertFalse(validator.is_valid({"key_one": "1"}))
@@ -254,12 +252,11 @@ class RequestContractTests(unittest.TestCase):
                 validator.is_valid({"key_one": 1})
 
     def test_build_validator_reuses_a_cached_instance_for_the_same_schema(self):
-        nodes, registry = lambda s: [s], Registry()
         schema_a = {"type": "object", "properties": {"x": {"type": "integer"}}}
         schema_b = {"type": "object", "properties": {"x": {"type": "string"}}}
-        first = schema_validation.build_validator(schema_a, nodes, registry)
-        second = schema_validation.build_validator(dict(schema_a), nodes, registry)
-        third = schema_validation.build_validator(schema_b, nodes, registry)
+        first = schema_validation.build_validator(schema_a)
+        second = schema_validation.build_validator(dict(schema_a))
+        third = schema_validation.build_validator(schema_b)
         self.assertIs(first, second)
         self.assertIsNot(first, third)
 

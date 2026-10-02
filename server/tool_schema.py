@@ -11,14 +11,13 @@ from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
-from referencing import Registry
 
 if __package__:
     from .errors import APIError
-    from .schema_validation import build_validator, json_objects
+    from .schema_validation import build_validator, json_objects, subschemas
 else:  # ``python server/server.py`` from the repo root.
     from errors import APIError
-    from schema_validation import build_validator, json_objects
+    from schema_validation import build_validator, json_objects, subschemas
 
 MAX_JSON_NESTING = 256
 
@@ -38,8 +37,6 @@ def function_opening(name):
     arguments."""
     return f"{FUNCTION_OPEN}{name}>\n"
 
-
-LOCAL_REGISTRY = Registry()
 
 # Framing projects each tool's fields through schema composition and copies
 # the root schema into every field that refers to it. Pathological schemas
@@ -88,64 +85,8 @@ def json_value(value):
         return value
 
 
-# JSON Schema keywords whose values are schemas: maps from names to schemas,
-# then single schemas or lists of schemas. ``dependencies`` holds a schema or
-# a list of property names per entry and is told apart by shape. Draft 3's
-# ``type`` and ``disallow`` lists may hold schemas beside type names.
-SCHEMA_MAP_KEYWORDS = {
-    "properties",
-    "patternProperties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-}
-SUBSCHEMA_KEYWORDS = {
-    "items",
-    "prefixItems",
-    "additionalItems",
-    "contains",
-    "additionalProperties",
-    "unevaluatedItems",
-    "unevaluatedProperties",
-    "propertyNames",
-    "allOf",
-    "anyOf",
-    "oneOf",
-    "not",
-    "if",
-    "then",
-    "else",
-    "contentSchema",
-    "extends",
-}
-
-
-def _schemas(schema):
-    """Yield ``schema`` and, depth first, every schema nested under it.
-
-    Only schema positions are visited, so property names and literal const,
-    enum, default and examples data are never mistaken for schemas.
-    """
-    yield schema
-    if not isinstance(schema, dict):
-        return
-    for key, item in schema.items():
-        if key in SCHEMA_MAP_KEYWORDS and isinstance(item, dict):
-            children = item.values()
-        elif key == "dependencies" and isinstance(item, dict):
-            children = (child for child in item.values() if not isinstance(child, list))
-        elif key in SUBSCHEMA_KEYWORDS:
-            children = item if isinstance(item, list) else (item,)
-        elif key in ("type", "disallow") and isinstance(item, list):
-            children = (child for child in item if isinstance(child, dict))
-        else:
-            continue
-        for child in children:
-            yield from _schemas(child)
-
-
 def _remote_ref(schema):
-    for node in _schemas(schema):
+    for node in subschemas(schema):
         if isinstance(node, dict):
             if "$schema" in node and not isinstance(node["$schema"], str):
                 raise APIError(400, "$schema must be a string")
@@ -225,7 +166,7 @@ def _grammar_takes_pattern(pattern):
 def _grammar_compatible_schema(schema):
     """Guide generation with supported constraints; validate the original."""
     output = copy.deepcopy(schema)
-    for node in _schemas(output):
+    for node in subschemas(output):
         if isinstance(node, dict):
             node.pop("propertyNames", None)
             pattern = node.pop("pattern", None)
@@ -292,10 +233,10 @@ def _strict_schema(schema):
     A schema that other schemas of the same instance extend, as an allOf
     does, may declare only some of its properties, and closing it would
     refuse the others; a schema composed that way is left as declared."""
-    if any(_extended(node) for node in _schemas(schema) if isinstance(node, dict)):
+    if any(_extended(node) for node in subschemas(schema) if isinstance(node, dict)):
         return schema
     output = copy.deepcopy(schema)
-    for node in _schemas(output):
+    for node in subschemas(output):
         if not isinstance(node, dict):
             continue
         keys = set(node)
@@ -337,7 +278,7 @@ def _lookup_tool_reference(ref, root):
                 continue
             raise APIError(400, f"unresolved tool parameter reference: {ref}")
         return current
-    for node in _schemas(root):
+    for node in subschemas(root):
         if isinstance(node, dict) and fragment in (
             node.get("$anchor"),
             node.get("$dynamicAnchor"),
@@ -367,7 +308,7 @@ def _resolve_tool_schema(schema, root):
 
 def _schema_with_root(schema, root):
     def local_refs(value):
-        for node in _schemas(value):
+        for node in subschemas(value):
             ref = node.get("$ref") if isinstance(node, dict) else None
             if isinstance(ref, str) and ref.startswith("#"):
                 yield node
@@ -794,7 +735,7 @@ def normalize_response_format(value):
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote schema reference is not allowed: {ref}")
     try:
-        validator = build_validator(schema, _schemas, LOCAL_REGISTRY)
+        validator = build_validator(schema)
     except SchemaError as error:
         raise APIError(400, f"invalid response schema: {error.message}") from error
     return schema, validator
@@ -836,7 +777,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            validators[name] = build_validator(schema, _schemas, LOCAL_REGISTRY)
+            validators[name] = build_validator(schema)
             schemas[name] = _strict_schema(schema) if strict else schema
         except SchemaError as error:
             raise APIError(
