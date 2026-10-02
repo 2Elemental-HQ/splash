@@ -1,6 +1,5 @@
 """Prepare API requests for generation and manage Responses history."""
 
-import copy
 import hashlib
 import json
 import secrets
@@ -1207,7 +1206,8 @@ class Frontend:
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
-            chat = responses_to_chat_body(body, previous_items)
+            items = [*previous_items, *canonical_responses_input(body.get("input"))]
+            chat = responses_to_chat_body(body, items)
             namespaces = chat.pop("_tool_namespaces")
             job = self._prepare(
                 chat, namespaces, deadline, output_field="max_output_tokens"
@@ -1215,16 +1215,15 @@ class Frontend:
             job.response_store = store
             job.response_previous_id = previous_id
             if store:
-                job.response_history_items = [
-                    *previous_items,
-                    *canonical_responses_input(body.get("input")),
-                ]
+                job.response_history_items = items
             return job
 
     def persist_response(self, job, response, output):
         if not job.response_store:
             return
-        history = [*job.response_history_items, *copy.deepcopy(output)]
+        # The store encodes the history at once, so later changes to the
+        # request's items or the output cannot reach it.
+        history = [*job.response_history_items, *output]
         if not self.response_store.put(response, history):
             response["store"] = False
             job.response_store = False

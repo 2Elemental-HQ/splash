@@ -38,18 +38,17 @@ class PdfProtocolTests(unittest.TestCase):
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
         response = api_shapes.responses_to_chat_body(
-            {
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "before"},
-                            {"type": "input_file", **self.file},
-                            {"type": "input_text", "text": "after"},
-                        ],
-                    }
-                ],
-            }
+            {},
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "before"},
+                        {"type": "input_file", **self.file},
+                        {"type": "input_text", "text": "after"},
+                    ],
+                }
+            ],
         )
         actual = api_shapes.normalize_messages(response["messages"], vision=True)[0][
             "content"
@@ -204,14 +203,13 @@ class PdfProtocolTests(unittest.TestCase):
             documents, "_render", side_effect=AssertionError("early render")
         ):
             response = api_shapes.responses_to_chat_body(
-                {
-                    "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_file", **self.file}],
-                        }
-                    ]
-                }
+                {},
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", **self.file}],
+                    }
+                ],
             )
         self.assertEqual(
             response["messages"][0]["content"], [{"type": "file", "file": self.file}]
@@ -244,20 +242,18 @@ class PdfProtocolTests(unittest.TestCase):
                         },
                     ]
                 else:
-                    body = {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [{"type": "input_file", **self.file}],
-                            },
-                            {
-                                "type": "function_call_output",
-                                "call_id": "read",
-                                "output": [{"type": "input_file", **self.file}],
-                            },
-                        ]
-                    }
-                    messages = api_shapes.responses_to_chat_body(body)["messages"]
+                    items = [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_file", **self.file}],
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "read",
+                            "output": [{"type": "input_file", **self.file}],
+                        },
+                    ]
+                    messages = api_shapes.responses_to_chat_body({}, items)["messages"]
                 normalize(messages, 2 * one_file)
                 with self.assertRaisesRegex(APIError, "request size limit"):
                     normalize(messages, 2 * one_file - 1)

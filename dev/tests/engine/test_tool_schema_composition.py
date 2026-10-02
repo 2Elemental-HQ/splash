@@ -105,10 +105,8 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         function = {"name": "test", "parameters": schema}
         chat = {"tools": [{"type": "function", "function": function}]}
         responses = api_shapes.responses_to_chat_body(
-            {
-                "input": "Create a note",
-                "tools": [{"type": "function", **function}],
-            }
+            {"tools": [{"type": "function", **function}]},
+            [{"role": "user", "content": "Create a note"}],
         )
         messages = api_shapes.anthropic_to_chat_body(
             {

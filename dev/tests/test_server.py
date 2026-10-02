@@ -2120,17 +2120,16 @@ class ServerTest(unittest.TestCase):
         ):
             converted = {
                 "responses": responses(
-                    {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_image", "image_url": image},
-                                    {"type": "input_file", "file_data": image},
-                                ],
-                            }
-                        ]
-                    }
+                    {},
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": image},
+                                {"type": "input_file", "file_data": image},
+                            ],
+                        }
+                    ],
                 )["messages"],
                 "anthropic": anthropic(
                     {
@@ -8724,16 +8723,15 @@ class ServerTest(unittest.TestCase):
                 ],
             }
         ]
-        translated = api_shapes.responses_to_chat_body(
-            self.responses_body(
-                tools=tools,
-                tool_choice={
-                    "type": "function",
-                    "namespace": namespace,
-                    "name": first_name,
-                },
-            )
+        body = self.responses_body(
+            tools=tools,
+            tool_choice={
+                "type": "function",
+                "namespace": namespace,
+                "name": first_name,
+            },
         )
+        translated = api_shapes.responses_to_chat_body(body, body["input"])
         aliases = [tool["function"]["name"] for tool in translated["tools"]]
         self.assertEqual([len(alias) for alias in aliases], [64, 64])
         self.assertNotEqual(aliases[0], aliases[1])

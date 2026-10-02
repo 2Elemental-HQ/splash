@@ -748,7 +748,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "Continue"},
             ],
         }
-        chat = api_shapes.responses_to_chat_body(body)
+        chat = api_shapes.responses_to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
             harness.app._prepare_prompt(chat), float("inf"), check_context=False
         ).text
@@ -845,13 +845,11 @@ class LeadingSystemMergeTests(unittest.TestCase):
 
     def test_every_api_shape_leads_with_one_system_message(self):
         responses = api_shapes.responses_to_chat_body(
-            {
-                "instructions": "Base",
-                "input": [
-                    {"role": "developer", "content": "Developer"},
-                    {"role": "user", "content": "Ask"},
-                ],
-            }
+            {"instructions": "Base"},
+            [
+                {"role": "developer", "content": "Developer"},
+                {"role": "user", "content": "Ask"},
+            ],
         )["messages"]
         anthropic = api_shapes.anthropic_to_chat_prompt(
             {

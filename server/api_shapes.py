@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -465,11 +464,12 @@ def normalize_responses_input(instructions, items):
 
 
 def canonical_responses_input(items):
+    """A Responses input as its list of items, a string as one user message."""
     if isinstance(items, str):
         return [{"type": "message", "role": "user", "content": items}]
     if not isinstance(items, list):
         raise APIError(400, "input must be a non-empty string or array")
-    return copy.deepcopy(items)
+    return items
 
 
 def _namespace_alias(namespace, name):
@@ -550,7 +550,9 @@ def _responses_format(text):
     }
 
 
-def responses_to_chat_body(body, previous_items=()):
+def responses_to_chat_body(body, items):
+    """A Responses request as a Chat body; `items` are its canonical input
+    items after those of the response it continues."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
@@ -561,11 +563,8 @@ def responses_to_chat_body(body, previous_items=()):
         raise APIError(400, "Responses context_management edits are not supported")
     if body.get("stream") is not None and not isinstance(body["stream"], bool):
         raise APIError(400, "stream must be a boolean")
-    current_items = canonical_responses_input(body.get("input"))
     chat = {
-        "messages": normalize_responses_input(
-            body.get("instructions"), [*previous_items, *current_items]
-        ),
+        "messages": normalize_responses_input(body.get("instructions"), items),
         "parallel_tool_calls": body.get("parallel_tool_calls"),
     }
     namespaces = {}
