@@ -54,8 +54,6 @@ struct ModelMemoryProfile final {
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
 };
 
-[[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);
-
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe
   // working set. Keep only a small runtime/measurement margin below it; the
@@ -202,10 +200,5 @@ struct EngineMemoryPlanResult {
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
                          uint64_t maximumMemoryBytes = 0);
-
-[[nodiscard]] EngineMemoryPlan
-requireEngineMemoryPlan(const DeviceCapabilities &device,
-                        const ModelMemoryProfile &model,
-                        uint64_t maximumMemoryBytes = 0);
 
 } // namespace splash::engine

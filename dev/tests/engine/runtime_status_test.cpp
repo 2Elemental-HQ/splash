@@ -36,7 +36,7 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  return requireEngineMemoryPlan(
+  return test::requireMemoryPlan(
       device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 

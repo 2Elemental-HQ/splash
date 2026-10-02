@@ -2,6 +2,9 @@
 
 #include "engine/MemoryPlan.hpp"
 
+#include <stdexcept>
+#include <utility>
+
 namespace splash::test {
 
 // Synthetic nonzero allocations for planner/status tests. Production obtains
@@ -23,6 +26,19 @@ modelMemoryProfile(uint64_t targetWeightsBytes,
           kv::Layout{16, 4, 256},
           modelMemoryFootprint(targetWeightsBytes, draftWeightsBytes,
                                visionWeightsBytes)};
+}
+
+// The plan for a profile the test expects to fit; throws with the planner's
+// verdict otherwise.
+[[nodiscard]] inline engine::EngineMemoryPlan
+requireMemoryPlan(const DeviceCapabilities &device,
+                  const engine::ModelMemoryProfile &model,
+                  uint64_t maximumMemoryBytes = 0) {
+  engine::EngineMemoryPlanResult result =
+      engine::evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
+  if (!result.plan)
+    throw std::runtime_error(result.status.describe());
+  return std::move(*result.plan);
 }
 
 } // namespace splash::test

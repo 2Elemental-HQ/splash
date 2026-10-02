@@ -1,3 +1,4 @@
+#include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
@@ -1486,7 +1487,7 @@ int main(int argc, char **argv) {
         model.name(), model.maximumContextTokens(),
         model.targetKvLayout(format), footprint};
     EngineMemoryPlan memoryPlan =
-        requireEngineMemoryPlan(backend.capabilities(), profile);
+        test::requireMemoryPlan(backend.capabilities(), profile);
 
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.

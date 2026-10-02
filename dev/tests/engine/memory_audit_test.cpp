@@ -32,7 +32,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
   model.footprint.stateStagingBytes = stateStagingBytes;
-  return requireEngineMemoryPlan(device, model);
+  return test::requireMemoryPlan(device, model);
 }
 
 // A consistent warmup report; `unclassifiedBytes` are backend buffers no
@@ -177,7 +177,7 @@ void testWarmupDeviationExcludesReserves() {
   device.hasUnifiedMemory = true;
   for (const uint64_t weightsMiB : {16'589, 12'288, 9'216, 6'144}) {
     for (const uint64_t untrackedMiB : {100, 300}) {
-      const auto memoryPlan = requireEngineMemoryPlan(
+      const auto memoryPlan = test::requireMemoryPlan(
           device, test::modelMemoryProfile(weightsMiB * kMiB, 1, 0));
       const auto &b = memoryPlan.breakdown();
       ActualMemoryReport actual;

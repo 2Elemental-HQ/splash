@@ -42,7 +42,7 @@ uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
 }
 
 void testUnifiedElasticBudget() {
-  EngineMemoryPlan plan = requireEngineMemoryPlan(device(), model());
+  EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
   require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 4 &&
               budget.kvExtentPages == 128,
@@ -77,8 +77,8 @@ void testUnifiedElasticBudget() {
 void testBf16BudgetAndStatus() {
   auto profile = model();
   profile.targetKvLayout.format = kv::Format::BFloat16;
-  const auto bf16 = requireEngineMemoryPlan(device(), profile);
-  const auto int8 = requireEngineMemoryPlan(device(), model());
+  const auto bf16 = test::requireMemoryPlan(device(), profile);
+  const auto int8 = test::requireMemoryPlan(device(), model());
   const auto &budget = bf16.breakdown();
   require(budget.kvPageBytes == profile.targetKvLayout.bytesPerModelPage() &&
               budget.kvPageBytes > int8.breakdown().kvPageBytes &&
@@ -106,7 +106,7 @@ void testMinimumHoldsTheWarmupRunway() {
   profile.targetKvLayout.format = kv::Format::BFloat16;
   require(profile.targetKvLayout.minimumExtentPages() == 32,
           "the BF16 fixture's smallest extent changed");
-  const EngineMemoryPlan plan = requireEngineMemoryPlan(device(), profile);
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
   const auto &budget = plan.breakdown();
   require(budget.minimumDynamicBytes ==
               budget.activeStateCellBytes + 64 * budget.kvPageBytes,
@@ -118,14 +118,14 @@ void testMinimumHoldsTheWarmupRunway() {
 }
 
 void testUserCeilingAndFailure() {
-  EngineMemoryPlan automatic = requireEngineMemoryPlan(device(), model());
+  EngineMemoryPlan automatic = test::requireMemoryPlan(device(), model());
   const uint64_t ceiling =
       automatic.breakdown().minimumRequiredBytes + 64 * kMiB;
   EngineMemoryPlan limited =
-      requireEngineMemoryPlan(device(), model(), ceiling);
+      test::requireMemoryPlan(device(), model(), ceiling);
   require(limited.breakdown().hardBudgetBytes == ceiling,
           "explicit memory ceiling was ignored");
-  require(requireEngineMemoryPlan(device(), model(), 16 * kGiB)
+  require(test::requireMemoryPlan(device(), model(), 16 * kGiB)
                   .breakdown().hardBudgetBytes ==
               automatic.breakdown().hardBudgetBytes,
           "explicit memory ceiling overrode the safe working set");
@@ -141,12 +141,12 @@ void testUserCeilingAndFailure() {
 // plan sets aside beside the weights, so one lone request still reaches the
 // advertised context.
 void testDiskTierStateStagingIsBudgeted() {
-  const EngineMemoryPlan without = requireEngineMemoryPlan(device(), model());
+  const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
   ModelMemoryProfile tiered = model();
   // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
   const uint64_t staging = 187 * kMiB;
   tiered.footprint.stateStagingBytes = staging;
-  const EngineMemoryPlan with = requireEngineMemoryPlan(device(), tiered);
+  const EngineMemoryPlan with = test::requireMemoryPlan(device(), tiered);
   const auto &budget = with.breakdown();
   require(without.breakdown().fixedRuntimeBytes + staging +
                   budget.activeStateCellBytes + budget.kvCapacityBytes <=
@@ -198,10 +198,10 @@ void testHardBudgetBoundaries() {
 // plan made there, within the configured limit, and nothing where one request
 // does not fit.
 void testContextTokensWithin() {
-  const EngineMemoryPlan plan = requireEngineMemoryPlan(device(), model());
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
   const uint64_t ceiling = budget.minimumRequiredBytes + 64 * kMiB;
-  const EngineMemoryPlan limited = requireEngineMemoryPlan(device(), model(), ceiling);
+  const EngineMemoryPlan limited = test::requireMemoryPlan(device(), model(), ceiling);
   require(plan.contextTokensWithin(16 * kGiB) == plan.maximumContextTokens() &&
               plan.contextTokensWithin(ceiling) == limited.maximumContextTokens() &&
               limited.maximumContextTokens() < plan.maximumContextTokens() &&
@@ -215,7 +215,7 @@ void testModelProvidedKvGeometry() {
   ModelMemoryProfile compact = model();
   compact.name = "compact-test-model";
   compact.targetKvLayout = {10, 2, 256};
-  EngineMemoryPlan plan = requireEngineMemoryPlan(device(), compact);
+  EngineMemoryPlan plan = test::requireMemoryPlan(device(), compact);
   const auto &budget = plan.breakdown();
   require(budget.kvPageTokens == 32 && budget.kvPageBytes == 332'800 &&
               budget.kvExtentPages ==
@@ -235,7 +235,8 @@ void testModelProvidedKvGeometry() {
 void testExtentSizeFollowsThePool() {
   ModelMemoryProfile compact = model();
   compact.targetKvLayout = {10, 2, 256};
-  const auto &reference = requireEngineMemoryPlan(device(), compact).breakdown();
+  const EngineMemoryBreakdown reference =
+      test::requireMemoryPlan(device(), compact).breakdown();
   const auto planFor = [&](uint64_t pages) {
     return evaluateEngineMemoryPlan(
         device(), compact,

@@ -171,7 +171,7 @@ void testAdvertisedContextIsGrantable() {
     ModelMemoryProfile model =
         test::modelMemoryProfile(15 * kGiB, kGiB / 2, 7 * kGiB / 10);
     model.targetKvLayout.format = machine.format;
-    const EngineMemoryPlan plan = requireEngineMemoryPlan(
+    const EngineMemoryPlan plan = test::requireMemoryPlan(
         mac(machine.physicalGiB, machine.numerator, machine.denominator),
         model);
     const EngineMemoryBreakdown &budget = plan.breakdown();

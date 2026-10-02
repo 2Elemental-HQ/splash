@@ -208,7 +208,7 @@ DeviceCapabilities device() {
 }
 
 EngineMemoryPlan memoryPlan() {
-  return requireEngineMemoryPlan(
+  return test::requireMemoryPlan(
       device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 
@@ -435,7 +435,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     const uint64_t ceiling = complete.minimumRequiredBytes +
                             (width - 1) * complete.activeStateCellBytes +
                             complete.activeStateCellBytes / 2;
-    const EngineMemoryPlan plan = requireEngineMemoryPlan(
+    const EngineMemoryPlan plan = test::requireMemoryPlan(
         device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB),
         ceiling);
     Harness harness(plan);
