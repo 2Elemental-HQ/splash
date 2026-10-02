@@ -46,7 +46,7 @@ class PreparedBytesTests(unittest.TestCase):
                 baseline, "9" * 64, e, "target/layer-0.bin", "r" * 64, f"{PACKAGE}-old"
             )
             (baseline / ("4" * 64)).mkdir()  # an incomplete entry
-            (baseline / "verified").mkdir()
+            (baseline / "verified-v3").mkdir()
             self.assertEqual(len(prepared.entries(baseline)), 2)
             self.assertEqual(prepared.entries(root / "missing"), [])
             result = self.compare(baseline, candidate)

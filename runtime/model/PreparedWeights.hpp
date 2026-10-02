@@ -175,7 +175,9 @@ public:
   // files add beyond the entries they supersede, which publishing them
   // evicts, and its largest file, written while the entries it replaces
   // remain. Completed layers remain reusable after an interruption; they are
-  // not partial files.
+  // not partial files, which this removes under the converter lock first. A
+  // complete model takes the lock only when it is free, never waiting for it,
+  // and a cache it cannot lock or clean does not fail it.
   void requireSpace(std::span<const PreparedWeight> weights,
                     const PreparationCheck &check = {}) const;
   // The complete file of weight: reused, or written now under the converter

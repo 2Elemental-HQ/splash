@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -101,6 +102,22 @@ struct Cache {
 
 const PreparationCheck noWorkspace = [] { throw std::runtime_error("no conversion workspace"); };
 
+// A staging entry an interrupted writer left.
+void abandonStaging(const Cache &cache, uint8_t value) {
+  const auto staging = cache.root / (key(value) + ".partial");
+  std::filesystem::create_directory(staging);
+  splash::test::writeFile(staging / "weights", "x");
+}
+
+bool staged(const Cache &cache, uint8_t value) {
+  return std::filesystem::exists(cache.root / (key(value) + ".partial"));
+}
+
+long proofCount(const Cache &cache) {
+  const std::filesystem::directory_iterator proofs(cache.root / "verified-v3");
+  return std::distance(begin(proofs), end(proofs));
+}
+
 void coldPreparationWritesOnceAndWarmReuses(Cache &cache) {
   require(cache.buildsOf(1) == 1, "cold preparation did not write once");
   const auto path = cache.prepare(1);
@@ -125,10 +142,12 @@ void warmHitsAreCancellable(Cache &cache) {
           "cancelled", "warm hit ignored cancellation");
 }
 
-// A warm load must finish while an unrelated converter holds the lock. Pipes
-// order the two processes; the holder's alarm turns a deadlock into a failure.
+// A warm load must finish while an unrelated converter holds the lock, and
+// leaves the staging that converter may own. Pipes order the two processes;
+// the holder's alarm turns a deadlock into a failure.
 void warmLoadDoesNotWaitForTheConverterLock(Cache &cache) {
   static_cast<void>(cache.prepare(1));
+  abandonStaging(cache, 62);
   int ready[2], release[2];
   require(pipe(ready) == 0 && pipe(release) == 0, "lock fixture pipes");
   const pid_t holder = spawn([&] {
@@ -151,6 +170,7 @@ void warmLoadDoesNotWaitForTheConverterLock(Cache &cache) {
   require(write(release[1], &signal, 1) == 1, "release the lock holder");
   for (int end : {ready[0], release[0], release[1]}) close(end);
   require(exitStatus(holder) == 0, "warm load waited for the converter lock");
+  require(staged(cache, 62), "a warm load removed staging while the converter lock was held");
 }
 
 void diskChecksKeepTheReserveAndCoverTheModel(Cache &cache) {
@@ -237,6 +257,53 @@ void crashedWriteIsReclaimed(Cache &cache) {
   require(cache.buildsOf(4) == 1, "retry after a crash did not write");
 }
 
+// Every converter-lock acquisition removes abandoned staging, as does a warm
+// start that finds the lock free (warmLoadDoesNotWaitForTheConverterLock
+// holds it).
+void everyLockReclaimsAbandonedStaging(Cache &cache) {
+  abandonStaging(cache, 60);
+  static_cast<void>(cache.prepare(61));
+  require(!staged(cache, 60), "a cold preparation left abandoned staging");
+  abandonStaging(cache, 60);
+  const std::array<PreparedWeight, 1> warm{{cache.entry(61)}};
+  cache.store.requireSpace(warm);
+  require(!staged(cache, 60), "a warm start with the lock free left abandoned staging");
+}
+
+// A warm start's reclaim never fails the load: a lock it cannot open and
+// staging it cannot remove stay for a converter.
+void warmLoadSkipsAReclaimItCannotRun(Cache &cache) {
+  const std::array<PreparedWeight, 1> warm{{cache.entry(61)}};
+  const auto lock = cache.root / "prepare.lock";
+  require(chmod(lock.c_str(), 0400) == 0, "chmod the converter lock");
+  cache.store.requireSpace(warm);
+  require(chmod(lock.c_str(), 0600) == 0, "chmod the converter lock");
+  abandonStaging(cache, 60);
+  const auto staging = cache.root / (key(60) + ".partial");
+  require(chmod(staging.c_str(), 0500) == 0, "chmod abandoned staging");
+  cache.store.requireSpace(warm);
+  require(chmod(staging.c_str(), 0700) == 0, "chmod abandoned staging");
+}
+
+// The device-keyed proofs Splash 1.1 wrote go at a lock acquisition.
+void legacyProofsAreRemovedUnderTheLock(Cache &cache) {
+  std::filesystem::create_directory(cache.root / "verified");
+  splash::test::writeFile(cache.root / "verified" / "proof", "x");
+  static_cast<void>(cache.prepare(63));
+  require(!std::filesystem::exists(cache.root / "verified"), "legacy proofs were kept");
+}
+
+// An invalid entry is replaced together with its file's proof.
+void replacingAnInvalidEntryDropsItsProof(Cache &cache) {
+  static_cast<void>(cache.prepare(64));
+  const long proofs = proofCount(cache);
+  const auto record = cache.root / key(64) / "sha256";
+  std::filesystem::permissions(record, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+  splash::test::writeFile(record, key(65));
+  require(cache.buildsOf(64) == 1, "an entry recording another digest was reused");
+  require(proofCount(cache) == proofs, "replacing an invalid entry kept its proof");
+}
+
 // Two processes requesting the same identity must run its writer only once.
 void concurrentMissesWriteOnce(Cache &cache) {
   const auto counter = cache.root / "builds";
@@ -301,7 +368,7 @@ void onlyVerifiedFilesAreMapped(Cache &cache) {
 void damagedProofsAreRecomputed(Cache &cache) {
   static_cast<void>(cache.prepare(9));
   int damaged = 0;
-  for (const auto &entry : std::filesystem::directory_iterator(cache.root / "verified")) {
+  for (const auto &entry : std::filesystem::directory_iterator(cache.root / "verified-v3")) {
     const int proof = open(entry.path().c_str(), O_WRONLY | O_TRUNC);
     require(proof >= 0, "open proof fixture");
     const uint8_t bad = 9;
@@ -348,13 +415,17 @@ int main() {
     corruptionIsRepaired(cache);
     failedWritesPublishNothing(cache);
     crashedWriteIsReclaimed(cache);
+    everyLockReclaimsAbandonedStaging(cache);
+    warmLoadSkipsAReclaimItCannotRun(cache);
+    legacyProofsAreRemovedUnderTheLock(cache);
+    replacingAnInvalidEntryDropsItsProof(cache);
     concurrentMissesWriteOnce(cache);
     changedSourcesAreRejected(cache);
     onlyVerifiedFilesAreMapped(cache);
     damagedProofsAreRecomputed(cache);
     publishingSupersedesEarlierPreparations(cache);
-    std::cout << "prepared weights: content, reuse, corruption, interruption, pressure, concurrency and "
-                 "superseded entries PASS\n";
+    std::cout << "prepared weights: content, reuse, corruption, interruption, reclaimed staging and proofs, "
+                 "pressure, concurrency and superseded entries PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

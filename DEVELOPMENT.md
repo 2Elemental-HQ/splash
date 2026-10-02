@@ -504,20 +504,24 @@ mapped until it unmaps them. Two builds of different preparation identities
 sharing one cache supersede each other's entries at every start; give a
 development build its own `SPLASH_WEIGHT_CACHE`.
 
-One writer per cache serializes conversion; complete cache hits bypass this
-lock. Each output's disk space is preallocated before writing. Interruption,
-disk-full errors and memory-pressure rejection cannot publish partial files;
-concurrent external disk activity can still exhaust the volume. Retrying removes
-abandoned writes under the converter lock and reuses previously completed
+One writer per cache serializes conversion; complete cache hits never wait for
+this lock. Each output's disk space is preallocated before writing.
+Interruption, disk-full errors and memory-pressure rejection cannot publish
+partial files; concurrent external disk activity can still exhaust the volume.
+Every converter-lock acquisition removes abandoned writes, and so does a warm
+start that finds the lock free; a warm start that cannot lock or clean the cache
+(read-only, or without `flock`) leaves them and still loads. Replacing an
+invalid entry also drops its digest proof. Retrying reuses previously completed
 files, which are read-only. Cold preparation reports each artifact's progress.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to device, inode, size, birth time, mtime and
-ctime; a write or replacement invalidates it. This is not a full disk scrub on
-every startup. Preparation uses uncached destination I/O. Every adapter sizes
-its conversion steps to one staging bound, input and output together, of
-32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
-count, inside a 64 MiB admission reserve that also covers source metadata.
+files reuse a digest proof tied to inode, size, birth time, mtime and ctime, so
+a remounted volume keeps its proofs; a write or replacement invalidates it.
+This is not a full disk scrub on every startup. Preparation uses uncached
+destination I/O. Every adapter sizes its conversion steps to one staging bound,
+input and output together, of 32 MiB (`kWeightPreparationStagingBytes`),
+whatever the tensor, layer or expert count, inside a 64 MiB admission reserve
+that also covers source metadata.
 Complete rows and multiple row tiles are processed together where possible,
 avoiding per-row I/O and small GPU waits. Startup runs two checks
 (`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,
