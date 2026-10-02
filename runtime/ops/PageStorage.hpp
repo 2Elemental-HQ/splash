@@ -47,12 +47,9 @@ public:
   [[nodiscard]] uint64_t extentBytes() const noexcept {
     return uint64_t{extentPages_} * layout_.bytesPerModelPage();
   }
-  // The extents that hold memory now, and their bytes: a measurement of the
+  // The bytes of the extents that hold memory now: a measurement of the
   // buffers, which KvPool's record of its extents must match.
-  [[nodiscard]] uint32_t allocatedExtents() const noexcept;
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return uint64_t{allocatedExtents()} * extentBytes();
-  }
+  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept;
   [[nodiscard]] bool isAllocated(uint32_t page) const;
   // std::out_of_range for an extent past the pool.
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent) override;
@@ -67,15 +64,12 @@ public:
     return layers_;
   }
 
-  // The entry kernels reach a page by. Throws std::logic_error for a page
-  // whose extent is not allocated: a GPU table holds only pages of allocated
-  // extents.
-  [[nodiscard]] SplashKvPage entry(uint32_t page) const;
-  // Writes the entries of `pages` from index `first` on to a CPU-visible
-  // GPU page table, which must hold all of them; entries before `first` are
-  // left as they are. Throws std::logic_error for a table that is not
-  // CPU-visible or too small, std::invalid_argument for `first` past the
-  // pages.
+  // Writes the entries kernels reach `pages` by, from index `first` on, to a
+  // CPU-visible GPU page table, which must hold all of them; entries before
+  // `first` are left as they are. Throws std::logic_error for a table that is
+  // not CPU-visible or too small and for a page whose extent is not allocated
+  // (a GPU table holds only pages of allocated extents), std::invalid_argument
+  // for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
@@ -87,6 +81,7 @@ public:
 
 private:
   [[nodiscard]] size_t extentIndex(uint32_t page) const;
+  [[nodiscard]] SplashKvPage entry(uint32_t page) const;
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;

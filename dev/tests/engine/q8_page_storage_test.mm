@@ -1,5 +1,6 @@
 #include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/TestPageEntries.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using splash::test::entryOf;
 
 namespace {
 
@@ -106,14 +108,16 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
 // Writing a table from an index on leaves the entries before it as they
 // are, and refuses an index past the pages.
 void entriesFromFirst(const kv::PageStorage &storage, const metal::MetalBuffer &table) {
+    constexpr std::array<uint32_t, 3> pages{5, 200, 255};
     auto *entries = static_cast<SplashKvPage *>(table.contents());
+    storage.writeEntries(pages, 0, table);
+    const std::array<SplashKvPage, 3> written{entries[0], entries[1], entries[2]};
     constexpr SplashKvPage kSentinel = ~SplashKvPage{0};
     std::fill_n(entries, 3, kSentinel);
-    storage.writeEntries(std::array<uint32_t, 3>{5, 200, 255}, 1, table);
-    require(entries[0] == kSentinel && entries[1] == storage.entry(200) &&
-                entries[2] == storage.entry(255),
+    storage.writeEntries(pages, 1, table);
+    require(entries[0] == kSentinel && entries[1] == written[1] && entries[2] == written[2],
             "a table written from an index did not keep the entries before it");
-    storage.writeEntries(std::array<uint32_t, 3>{5, 200, 255}, 3, table);
+    storage.writeEntries(pages, 3, table);
     require(entries[0] == kSentinel, "a table written past its last page changed");
     requireThrows<std::invalid_argument>(
         [&] { storage.writeEntries(std::array<uint32_t, 1>{5}, 2, table); },
@@ -340,15 +344,18 @@ void run(const std::string &metallib) {
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
-                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
+                hostGatedStorage.actualAllocatedBytes() ==
+                    uint64_t{128} * hostGatedStorage.bytesPerPage(),
             "elastic Q8 storage did not allocate its first extent");
     elasticHostAvailable = 128ULL * 1024 * 1024;
     require(!hostGatedStorage.allocateExtent(1) &&
-                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
+                hostGatedStorage.actualAllocatedBytes() ==
+                    uint64_t{128} * hostGatedStorage.bytesPerPage(),
             "host pressure did not reject the next KV extent transactionally");
     elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
     require(hostGatedStorage.allocateExtent(1) &&
-                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 256,
+                hostGatedStorage.actualAllocatedBytes() ==
+                    uint64_t{256} * hostGatedStorage.bytesPerPage(),
             "KV growth did not recover after host memory became available");
 
     MemoryGovernor governor(
@@ -361,6 +368,7 @@ void run(const std::string &metallib) {
         "an extent of a part of an alignment unit was accepted");
 
     metal::MetalBuffer table = backend.allocateBuffer(4 * sizeof(SplashKvPage));
+    const metal::MetalBuffer probe = backend.allocateBuffer(sizeof(SplashKvPage));
     metal::MetalBuffer word = backend.allocateBuffer(sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
@@ -372,7 +380,7 @@ void run(const std::string &metallib) {
     require(storage.allocateExtent(0) && storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "an extent was not allocated at exactly its size");
-    require(storage.allocatedExtents() * storage.extentPages() == 128 && storage.isAllocated(127) && !storage.isAllocated(128),
+    require(storage.isAllocated(127) && !storage.isAllocated(128),
             "the first Q8 extent was not the one allocated");
     requireThrows<std::logic_error>([&] { (void)storage.allocateExtent(0); },
                                     "an allocated extent was allocated again");
@@ -381,11 +389,9 @@ void run(const std::string &metallib) {
                 layer.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
             "a layer's region does not follow the layers before it");
 
-    const SplashKvPage runwayPage = storage.entry(5);
+    const SplashKvPage runwayPage = entryOf(storage, 5, probe);
     require(runwayPage && (runwayPage & SPLASH_KV_PAGE_INDEX_MASK) == 5,
             "a page entry does not carry the page's index in its extent");
-    requireThrows<std::logic_error>([&] { (void)storage.entry(200); },
-                                    "a page of an unallocated extent received an entry");
     requireThrows<std::logic_error>([&] { (void)storage.spans(200); },
                                     "a page of an unallocated extent received host memory");
     requireSpansTileExtent(storage, 0);
@@ -396,15 +402,14 @@ void run(const std::string &metallib) {
         [&] { storage.writeEntries(std::array<uint32_t, 5>{0, 1, 2, 3, 4}, 0, table); },
         "a table too small for its entries was written");
 
-    require(storage.allocateExtent(1) &&
-                storage.allocatedExtents() * storage.extentPages() == 256 &&
-                storage.actualAllocatedBytes() == 2 * extentBytes &&
+    require(storage.allocateExtent(1) && storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
             "growth did not add exactly one extent");
     storage.writeEntries(std::array<uint32_t, 4>{200, 5, 255, 128}, 0, table);
     const auto *entries = static_cast<const SplashKvPage *>(table.contents());
     // Pages 200, 255 and 128 share the second extent, at indices 72, 127, 0.
-    require(entries[0] == storage.entry(200) && (entries[0] & SPLASH_KV_PAGE_INDEX_MASK) == 72 &&
+    require(entries[0] == entryOf(storage, 200, probe) &&
+                (entries[0] & SPLASH_KV_PAGE_INDEX_MASK) == 72 &&
                 entries[1] == runwayPage && entries[2] == entries[0] + 55 &&
                 entries[3] == entries[0] - 72 && (runwayPage & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}) !=
                                                      (entries[3] & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}),
@@ -418,19 +423,18 @@ void run(const std::string &metallib) {
         requireThrows<std::logic_error>(
             [&] { storage.releaseExtent(1); },
             "an extent was released while a command was in flight");
-        require(storage.isAllocated(200) && storage.entry(200) == entries[0],
+        require(storage.isAllocated(200) && entryOf(storage, 200, probe) == entries[0],
                 "a refused release changed the extent");
         (void)ticket.wait();
     }
     storage.releaseExtent(1);
-    require(!storage.isAllocated(200) &&
-                storage.allocatedExtents() * storage.extentPages() == 128 &&
+    require(!storage.isAllocated(200) && storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
     requireThrows<std::logic_error>([&] { storage.releaseExtent(1); },
                                     "an unallocated extent was released again");
     require(storage.allocateExtent(1) &&
-                (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
+                (entryOf(storage, 255, probe) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
     entriesFromFirst(storage, table);
     entriesFollowAReallocatedExtent(backend, storage, table);
@@ -440,7 +444,6 @@ void run(const std::string &metallib) {
     require(compactStorage.allocateExtent(0) && compactStorage.layers()[9].extent_pages == 512 &&
                 compactStorage.layers()[9].offset ==
                     9 * 512 * compactLayout.bytesPerLayerPage() &&
-                compactStorage.allocatedExtents() * compactStorage.extentPages() == 512 &&
                 compactStorage.actualAllocatedBytes() ==
                     512 * compactLayout.bytesPerModelPage(),
             "model-provided compact Q8 geometry was not honored");
@@ -453,13 +456,12 @@ void run(const std::string &metallib) {
         require(bf16Layer.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");
-        require(bf16.allocateExtent(0) &&
-                    bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isAllocated(extent) &&
+        require(bf16.allocateExtent(0) && !bf16.isAllocated(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 allocated more than its first admitted extent");
         requireSpansTileExtent(bf16, 0);
-        require(bf16.allocateExtent(1) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
-                    bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
+        require(bf16.allocateExtent(1) &&
+                    bf16.actualAllocatedBytes() == uint64_t{2 * extent} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");
         bf16.releaseExtent(1);
         require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),

@@ -1,5 +1,6 @@
 #include "model/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/TestPageEntries.hpp"
 
 #include "engine/MemoryGovernor.hpp"
 
@@ -266,9 +267,11 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   const uint64_t data = layout.dataBytesPerLayerPage();
   const uint32_t words = static_cast<uint32_t>(data / sizeof(uint32_t));
 
-  // The GPU addresses of a page's key and value slabs in every layer.
+  // The GPU addresses of a page's key and value slabs in every layer. Page
+  // 0 starts its extent, so its entry is the extent's address.
   std::byte *const base = pages.spans(0).front().data();
-  const uint64_t address = pages.entry(0);
+  const uint64_t address = test::entryOf(
+      pages, 0, backend.allocateBuffer(sizeof(SplashKvPage)));
   const auto slabs = [&](uint32_t page, std::vector<uint64_t> &table) {
     for (const auto span : pages.spans(page)) {
       if (span.size() == data) table.push_back(address + static_cast<uint64_t>(span.data() - base));

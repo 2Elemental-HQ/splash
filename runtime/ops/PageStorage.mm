@@ -48,10 +48,11 @@ size_t PageStorage::extentIndex(uint32_t page) const {
     return page / extentPages_;
 }
 
-uint32_t PageStorage::allocatedExtents() const noexcept {
-    return static_cast<uint32_t>(std::count_if(
+uint64_t PageStorage::actualAllocatedBytes() const noexcept {
+    const auto allocated = std::count_if(
         extents_.begin(), extents_.end(),
-        [](const metal::MetalBuffer &extent) { return static_cast<bool>(extent); }));
+        [](const metal::MetalBuffer &extent) { return static_cast<bool>(extent); });
+    return static_cast<uint64_t>(allocated) * extentBytes();
 }
 
 bool PageStorage::isAllocated(uint32_t page) const {
