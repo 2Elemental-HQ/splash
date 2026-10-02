@@ -137,6 +137,9 @@ private:
   [[nodiscard]] std::optional<BatchPlan> nextDecode() const;
   [[nodiscard]] std::optional<BatchPlan>
   planPrefill(std::vector<PrefillRequestView> ready) const;
+  // The rows the lane can take in one command: up to its prompt's end or its
+  // next state boundary.
+  [[nodiscard]] static uint32_t dispatchRemaining(const PrefillRequestView &view) noexcept;
   [[nodiscard]] uint32_t
   prefillBudget(const PrefillRequestView &leader,
                 std::span<const PrefillRequestView> ready) const;

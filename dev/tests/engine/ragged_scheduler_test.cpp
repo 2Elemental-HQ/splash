@@ -735,6 +735,46 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
   }
 }
 
+// At a measured 2.75 ms per row the slice is 128 rows. An arrival that
+// finishes within the full budget, though not within one slice, takes a
+// command of its own rows instead of a full one shared with a long prompt;
+// one that does not finish in it still packs a full command.
+void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
+  const auto beside = [](std::initializer_list<uint32_t> arrivals) {
+    Scheduler scheduler;
+    scheduler.observePrefill(2048, 5632.0);
+    scheduler.submit(request(1, 20'000));
+    scheduler.resourcesReady(1, 0);
+    completePrefill(scheduler, *scheduler.next(), 5632.0);
+    uint64_t id = 2;
+    for (uint32_t prompt : arrivals) {
+      scheduler.submit(request(id, prompt));
+      scheduler.resourcesReady(id++, 0);
+    }
+    return scheduler;
+  };
+  Scheduler chat = beside({300});
+  const BatchPlan plan = *chat.next();
+  require(plan.width() == 1 && plan.items[0].requestId == 2 && plan.items[0].tokenCount == 300,
+          "a short arrival shared a full command with a long prefill");
+  completePrefill(chat, plan, 825.0);
+  completeDecode(chat);
+  const BatchPlan slice = *chat.next();
+  require(slice.width() == 1 && slice.items[0].requestId == 1 &&
+              slice.items[0].tokenCount == 128,
+          "the long prefill did not return to slices beside the decoding arrival");
+
+  const BatchPlan packed = *beside({3000}).next();
+  require(packed.width() == 1 && packed.items[0].requestId == 2 &&
+              packed.items[0].tokenCount == 2048,
+          "an arrival that does not finish in one command lost the full budget");
+
+  const BatchPlan first = *beside({300, 300}).next();
+  require(first.width() == 1 && first.items[0].requestId == 2 &&
+              first.items[0].tokenCount == 300,
+          "two short arrivals shared a command instead of finishing in turn");
+}
+
 void testMeasuredBudgetRetainsOvertakingBound() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 20'000));
@@ -1033,6 +1073,7 @@ int main() {
     testMeasuredBudgetPreservesPurePrefillPacking();
     testTinyTailDoesNotDistortPrefillThroughput();
     testMeasuredBudgetFinishesShortPrefillPromptly();
+    testShortArrivalBesideLongPrefillEndsAtItsLastRow();
     testMeasuredBudgetRetainsOvertakingBound();
     testPriorityPrecedesWorkKindAlternation();
     testPrefillCommandContainsOnePriorityTier();

@@ -1024,9 +1024,11 @@ requests, or with other prefixes cached, it can differ.
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
 of its replay boundary. Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. While requests of the same or a
-higher priority decode, each slice owes them decode time, `--decode-share`
-times its own, before the next slice runs.
+2048-token chunks for long unopposed work. Without contention, a prompt that
+can finish within one 2048-token chunk ends its chunk at its last row instead
+of sharing it with a longer prompt. While requests of the same or a higher
+priority decode, each slice owes them decode time, `--decode-share` times its
+own, before the next slice runs.
 These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended

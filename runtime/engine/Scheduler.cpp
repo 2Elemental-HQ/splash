@@ -268,16 +268,17 @@ std::optional<BatchPlan> Scheduler::nextPrefill() const {
   return planPrefill(std::move(ready));
 }
 
+uint32_t Scheduler::dispatchRemaining(const PrefillRequestView &view) noexcept {
+  uint32_t end = view.request->spec.promptTokens;
+  if (view.request->prefillBoundary)
+    end = std::min(end, *view.request->prefillBoundary);
+  return end - view.promptProcessed;
+}
+
 std::optional<BatchPlan>
 Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   if (ready.empty())
     return std::nullopt;
-  const auto dispatchRemaining = [](const PrefillRequestView &view) {
-    uint32_t end = view.request->spec.promptTokens;
-    if (view.request->prefillBoundary)
-      end = std::min(end, *view.request->prefillBoundary);
-    return end - view.promptProcessed;
-  };
   // Order by the complete remaining prompt, independently of state capture
   // boundaries. After kMaximumOvertakes consecutive skips,
   // an older lane leads the next command to prevent starvation.
@@ -325,8 +326,9 @@ uint32_t Scheduler::prefillBudget(
   while (rows > kMinimumPrefillRows &&
          rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
     rows /= 2;
-  const bool leaderFinishing =
-      leader.request->spec.promptTokens - leader.promptProcessed <= rows;
+  const uint32_t leaderRemaining =
+      leader.request->spec.promptTokens - leader.promptProcessed;
+  const bool leaderFinishing = leaderRemaining <= rows;
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
@@ -339,13 +341,18 @@ uint32_t Scheduler::prefillBudget(
                (leaderFinishing || peer.request->spec.promptTokens -
                                        peer.promptProcessed <= rows);
       });
-  if (!contended)
-    return maximum;
-
-  // Keep long prefills packed. Bound commands for peers decoding or waiting
-  // for a CPU mask, and for peers that can finish prefill within this slice.
-  // The first sample and minimum matrix shape remain limits.
-  return rows;
+  // Bound commands for peers decoding or waiting for a CPU mask, and for
+  // peers that can finish prefill within this slice. The first sample and
+  // minimum matrix shape remain limits.
+  if (contended)
+    return rows;
+  // A leader that finishes within the full budget ends the command at its
+  // last row, or at its next state boundary: prefill cost is linear above
+  // the slice, so shortest-first sequential commands minimise first-token
+  // latency. Long prefills stay packed only when no lane finishes.
+  if (leaderRemaining <= maximum)
+    return dispatchRemaining(leader);
+  return maximum;
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode() const {
