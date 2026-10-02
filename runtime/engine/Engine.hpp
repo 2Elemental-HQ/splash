@@ -306,6 +306,8 @@ private:
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
+  // Arms the next planned boundary, if any, with the scheduler: after
+  // admission, and after the scheduler has taken a command's progress.
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);

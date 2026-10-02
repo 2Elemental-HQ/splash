@@ -218,6 +218,30 @@ void testPerRequestBoundary() {
           "resumed prefill lost the scheduler-owned absolute offset");
 }
 
+// complete() consumes a boundary its command reached, so the next one is
+// armed against the progress after that command: a boundary the request has
+// reached is refused.
+void testReachedBoundaryIsConsumedBeforeTheNextIsArmed() {
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(1, 4096));
+  scheduler.resourcesReady(1, 0);
+  scheduler.setPrefillBoundary(1, 64);
+  const BatchPlan reaching = *scheduler.next({});
+  require(reaching.items[0].tokenCount == 64, "the boundary did not cap the command");
+  completePrefill(scheduler, reaching);
+  bool refused = false;
+  try {
+    scheduler.setPrefillBoundary(1, 64);
+  } catch (const std::invalid_argument &) {
+    refused = true;
+  }
+  require(refused, "a boundary the request has reached was armed again");
+  scheduler.setPrefillBoundary(1, 128);
+  const BatchPlan next = *scheduler.next({});
+  require(next.items[0].promptOffset == 64 && next.items[0].tokenCount == 64,
+          "the next boundary did not cap the next command");
+}
+
 void testEqualPromptsFinishInArrivalOrder() {
   // Equal cold prompts are served oldest first, one whole budget at a time,
   // instead of an equal water-fill share that finishes them all at once.
@@ -1134,6 +1158,7 @@ int main() {
     testWarmupTimingSeedsFirstContendedCommand();
     testShortestRemainingFirstUsesActualRows();
     testPerRequestBoundary();
+    testReachedBoundaryIsConsumedBeforeTheNextIsArmed();
     testEqualPromptsFinishInArrivalOrder();
     testShortArrivalPrecedesLongColdPrompt();
     testBoundaryCapsDispatchWithoutChangingPriority();

@@ -83,7 +83,9 @@ public:
   void remove(uint64_t requestId);
 
   // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same packed command.
+  // padding or shortening any peer in the same packed command. The boundary
+  // must lie past the request's progress; complete() consumes a boundary its
+  // command reached.
   void setPrefillBoundary(uint64_t requestId,
                           std::optional<uint32_t> absoluteTokens);
 

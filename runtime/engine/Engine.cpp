@@ -1170,7 +1170,6 @@ void Engine::publishReachedStateBoundaries(Request &active,
     active.stateBoundaries.clear();
     active.stateBoundaryCursor = 0;
   }
-  armNextStateBoundary(active);
 }
 
 Engine::Prepared Engine::prepare(BatchPlan &plan,
@@ -1718,6 +1717,9 @@ void Engine::apply(const BatchPlan &plan,
       finish(active, result.finished ? EngineFinishReason::Stop
                                      : EngineFinishReason::Length,
              active.scoreLogits);
+    } else if (plan.kind == WorkKind::Prefill &&
+               scheduler_.phase(active.request.id) == Phase::Prefill) {
+      armNextStateBoundary(active);
     }
   }
 }
