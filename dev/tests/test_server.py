@@ -2951,6 +2951,7 @@ class ServerTest(unittest.TestCase):
                     {"role": "user", "content": "hello"},
                     {"role": "system", "content": "dynamic system update"},
                     {"role": "assistant", "content": "acknowledged"},
+                    {"role": "user", "content": "continue"},
                 ]
             ),
             thinking_resolver=no_signed_thinking,
@@ -2961,6 +2962,7 @@ class ServerTest(unittest.TestCase):
                 {"role": "user", "content": "hello"},
                 {"role": "system", "content": "dynamic system update"},
                 {"role": "assistant", "content": "acknowledged"},
+                {"role": "user", "content": "continue"},
             ],
         )
 

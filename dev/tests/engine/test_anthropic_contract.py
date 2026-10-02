@@ -208,6 +208,29 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         self.addCleanup(harness.close)
         return harness
 
+    def test_trailing_assistant_prefill_is_refused(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "Answer in JSON."},
+                {"role": "assistant", "content": "{"},
+            ]
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", {**body, "stream": stream}
+                )
+                self.assertEqual(status, 400, payload)
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["type"], "invalid_request_error")
+                self.assertIn("prefill", error["message"])
+        self.assertEqual(runtime.requests, [])
+        status, _, payload = harness.request("POST", "/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, payload)
+        self.assertGreater(json.loads(payload)["input_tokens"], 0)
+
     def test_redacted_history_count_and_generation_use_same_visible_prompt(self):
         tokenizer = test_server.FakeTokenizer()
         harness = self.harness(tokenizer=tokenizer)

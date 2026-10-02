@@ -664,6 +664,8 @@ def _anthropic_content(value, label):
 
 
 def anthropic_to_chat_body(body, *, thinking_resolver):
+    """A Messages generation request as a Chat body. count_tokens converts
+    only the prompt, so it still counts a final assistant message."""
     max_tokens = body.get("max_tokens")
     if (
         not isinstance(max_tokens, int)
@@ -674,6 +676,14 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
     chat = anthropic_to_chat_prompt(body, thinking_resolver=thinking_resolver)
+    # Anthropic continues a final assistant message (a prefill); Splash would
+    # close that turn and start another, so it refuses it.
+    if body["messages"][-1]["role"] == "assistant":
+        raise APIError(
+            400,
+            "a final assistant message (prefill) is not supported; "
+            "end messages with a user turn",
+        )
     chat.update(
         max_completion_tokens=max_tokens,
         stop=body.get("stop_sequences"),
