@@ -166,7 +166,7 @@ template <class Activate>
 StateAdmission admitIdleLane(const QwenStateStorage &states,
                              Activate activate) {
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-    if (!states.metadata(lane).assigned)
+    if (!states.metadata(lane).assigned())
       return activate(lane);
   }
   return {{}, StateFailure::ConcurrencyLimit};
@@ -1012,7 +1012,7 @@ struct Runtime::Impl {
         throw std::invalid_argument("invalid packed Qwen prefill item");
       }
       const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
-      if (!metadata.assigned || metadata.requestId != entry.id ||
+      if (metadata.requestId != entry.id ||
           metadata.lengths.targetTokens != item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
@@ -2514,21 +2514,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }
 
-uint32_t Runtime::committedStateSlot(uint64_t requestId) {
+uint32_t Runtime::residentLane(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
-  const QwenLaneMetadata &metadata = impl_->states.metadata(entry.stateLane);
-  if (!metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
-      metadata.lengths.targetTokens % kv::kPageTokens) {
-    throw std::logic_error("cannot snapshot uncommitted draft state");
-  }
   return entry.stateLane;
 }
 
 std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
   std::shared_ptr<const CompositeState> state =
-      impl_->states.snapshot(committedStateSlot(requestId));
+      impl_->states.snapshot(residentLane(requestId));
   if (!state)
     return state;
   return impl_->holdStraddledRows(impl_->request(requestId), std::move(state));
@@ -2544,7 +2539,7 @@ bool Runtime::canSnapshotToDisk() const noexcept {
 
 std::unique_ptr<StateOffload>
 Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
-  return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
+  return impl_->states.snapshotToDisk(residentLane(requestId), std::move(completion));
 }
 
 uint32_t Runtime::statesToActivate() const noexcept {

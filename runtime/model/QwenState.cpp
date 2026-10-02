@@ -55,10 +55,7 @@ public:
       : operation_(std::move(operation)), state_(std::move(state)),
         staging_(std::move(staging)) {}
   // The staging copy is the write's source until the worker has stopped.
-  ~FileOffload() override {
-    operation_->drain();
-    staging_->busy = false;
-  }
+  ~FileOffload() override { operation_->drain(); }
   bool ready() const noexcept override { return operation_->ready(); }
   bool finish() override { return operation_->wait(); }
   const std::shared_ptr<const CompositeState> &state() const noexcept override {
@@ -109,23 +106,19 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
   const uint64_t before = backend.memoryStats().allocatedBytes;
   buffers_.stateBase = backend.allocateBuffer(
       layout.cellBytes(), metal::BufferStorage::Shared, label);
-  buffers_.convolutionBase = backend.view(
-      buffers_.stateBase, 0, layout.convolutionBytes());
+  // The cell holds every layer's convolution state, then every layer's
+  // recurrent state.
   buffers_.convolutionLayers.resize(layout.layers);
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    buffers_.convolutionLayers[layer] =
-        backend.view(buffers_.convolutionBase,
-                     uint64_t{layer} * layout.convolutionLayerBytes(),
-                     layout.convolutionLayerBytes());
-  }
-  buffers_.recurrentBase =
-      backend.view(buffers_.stateBase, layout.convolutionBytes(),
-                   layout.recurrentBytes());
   buffers_.recurrentLayers.resize(layout.layers);
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    buffers_.convolutionLayers[layer] =
+        backend.view(buffers_.stateBase,
+                     uint64_t{layer} * layout.convolutionLayerBytes(),
+                     layout.convolutionLayerBytes());
     buffers_.recurrentLayers[layer] = backend.view(
-        buffers_.recurrentBase,
-        uint64_t{layer} * layout.recurrentLayerBytes(),
+        buffers_.stateBase,
+        layout.convolutionBytes() +
+            uint64_t{layer} * layout.recurrentLayerBytes(),
         layout.recurrentLayerBytes());
   }
   actualAllocatedBytes_ =
@@ -169,8 +162,6 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
     const std::shared_ptr<SlotFile> &file, const std::shared_ptr<StateStaging> &staging,
     const std::vector<std::span<std::byte>> &spans, CompositeStateLayout layout,
     QwenLogicalLengths lengths, std::function<void()> completion) {
-  if (staging->busy)
-    throw std::logic_error("a composite state write is already in flight");
   auto disk = file->acquire();
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
@@ -179,7 +170,6 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   std::byte *cursor = staged.data();
   for (auto span : spans)
     cursor = std::copy(span.begin(), span.end(), cursor);
-  staging->busy = true;
   std::shared_ptr<SlotFile::Operation> operation;
   try {
     operation = file->write(
@@ -193,7 +183,6 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   } catch (...) {
     if (operation)
       operation->drain();
-    staging->busy = false;
     throw;
   }
 }
@@ -247,11 +236,8 @@ QwenStateStorage::tryActivateLane(uint32_t index, uint64_t requestId, uint64_t e
   if (!requestId)
     throw std::invalid_argument("request id must be non-zero");
   Lane &current = lane(index);
-  if (current.metadata.assigned) {
+  if (current.metadata.assigned()) {
     throw std::logic_error("Qwen lane is already assigned");
-  }
-  if (current.gdn[0] || current.gdn[1] || current.draft) {
-    throw std::logic_error("idle Qwen lane still owns buffers");
   }
   Buffers buffers;
   if (auto admission = acquire(kLaneCells, "qwen-state-cell-" + std::to_string(index),
@@ -265,9 +251,8 @@ QwenStateStorage::tryActivateLane(uint32_t index, uint64_t requestId, uint64_t e
   // A fresh recurrent sequence reads parity zero immediately. Parity one is
   // fully overwritten by the first transition. Draft validity is controlled
   // by the zero logical lengths below.
-  clear(current.buffers.gdn[0].convolutionBase, "lane convolution state");
-  clear(current.buffers.gdn[0].recurrentBase, "lane recurrent state");
-  current.metadata = {true, requestId, 0, {}};
+  clear(current.buffers.gdn[0].stateBase, "lane GDN state");
+  current.metadata = {requestId, 0, {}};
   return {};
 }
 
@@ -281,11 +266,9 @@ void QwenStateStorage::releaseLane(uint32_t index, uint64_t requestId) {
   // reactivated lane gets its previous buffers back in the same order.
   for (uint32_t parity = current.gdn.size(); parity > 0;) {
     --parity;
-    if (current.gdn[parity])
-      pool_->cells.push_back(std::move(current.gdn[parity]));
+    pool_->cells.push_back(std::move(current.gdn[parity]));
   }
-  if (current.draft)
-    pool_->rings.push_back(std::move(current.draft));
+  pool_->rings.push_back(std::move(current.draft));
   refreshViews(current);
   current.metadata = {};
 }
@@ -479,18 +462,6 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
   }
 }
 
-uint64_t QwenStateStorage::actualSlotBytes(uint32_t index) const {
-  const Lane &current = lane(index);
-  uint64_t result = 0;
-  if (current.gdn[0])
-    result += current.gdn[0]->actualAllocatedBytes();
-  if (current.gdn[1])
-    result += current.gdn[1]->actualAllocatedBytes();
-  if (current.draft)
-    result += current.draft->actualAllocatedBytes();
-  return result;
-}
-
 void QwenStateStorage::refreshViews(Lane &current) {
   for (uint32_t parity = 0; parity < current.gdn.size(); ++parity) {
     current.buffers.gdn[parity] = current.gdn[parity]
@@ -533,7 +504,7 @@ void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
 }
 
 void QwenStateStorage::requireAssigned(const Lane &current) {
-  if (!current.metadata.assigned || !current.metadata.requestId) {
+  if (!current.metadata.assigned()) {
     throw std::logic_error("Qwen lane is not assigned");
   }
 }

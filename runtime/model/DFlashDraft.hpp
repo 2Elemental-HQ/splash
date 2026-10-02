@@ -43,9 +43,6 @@ public:
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &layers() const noexcept {
     return layers_;
   }
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return actualAllocatedBytes_;
-  }
 
 private:
   std::shared_ptr<StateAllocationTracker> tracker_;

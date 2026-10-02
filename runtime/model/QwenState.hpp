@@ -19,8 +19,6 @@ namespace splash::model {
 
 struct GdnParityBuffers final {
   metal::MetalBuffer stateBase;
-  metal::MetalBuffer convolutionBase;
-  metal::MetalBuffer recurrentBase;
   std::vector<metal::MetalBuffer> convolutionLayers;
   std::vector<metal::MetalBuffer> recurrentLayers;
 };
@@ -33,9 +31,6 @@ public:
 
   [[nodiscard]] const GdnParityBuffers &buffers() const noexcept {
     return buffers_;
-  }
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return actualAllocatedBytes_;
   }
 
 private:
@@ -77,10 +72,11 @@ struct QwenLogicalLengths final {
 };
 
 struct QwenLaneMetadata final {
-  bool assigned = false;
   uint64_t requestId = 0;
   uint32_t activeParity = 0;
   QwenLogicalLengths lengths;
+
+  [[nodiscard]] bool assigned() const noexcept { return requestId != 0; }
 };
 
 class QwenStateStorage;
@@ -107,16 +103,16 @@ struct QwenBufferPool final {
 // taken.
 struct StateStaging final {
   metal::MetalBuffer buffer;
-  bool busy = false;
 
   [[nodiscard]] std::span<std::byte> bytes() const {
     return {static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()};
   }
 };
 
-// An immutable composite snapshot owns a private copy of the state that
-// cannot be recovered from sealed Q8 pages. No mutating buffers are exposed
-// after construction; its buffers return to the pool when it is dropped.
+// A copy of one lane's committed state, either in RAM (a pooled GDN cell and
+// draft ring, returned to the pool when the last reference drops) or on disk
+// (one slot of the state file). It cannot be rebuilt from KV pages of either
+// format; nothing mutable is exposed.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -145,7 +141,8 @@ private:
                      std::shared_ptr<SlotFile::Slot> disk);
   // Copies the spans of one state into staging and starts the write that
   // carries them to disk; the ticket's state() is the disk copy. Null when
-  // the tier cannot admit another state.
+  // the tier cannot admit another state. The engine starts one state write
+  // at a time (StateCache::startWrite), so the staging copy is free here.
   [[nodiscard]] static std::unique_ptr<StateOffload>
   write(const std::shared_ptr<SlotFile> &file,
         const std::shared_ptr<StateStaging> &staging,
@@ -236,7 +233,6 @@ public:
   [[nodiscard]] uint64_t stagingBytes() const noexcept override {
     return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
-  [[nodiscard]] uint64_t actualSlotBytes(uint32_t lane) const;
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
 private:

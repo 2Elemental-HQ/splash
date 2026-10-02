@@ -61,9 +61,9 @@ public:
   telemetry() const noexcept override;
 
 private:
-  // The state slot of a resident request whose committed state can be
-  // snapshotted: page-aligned, with a complete draft window.
-  [[nodiscard]] uint32_t committedStateSlot(uint64_t requestId);
+  // The state lane of a resident request; the storage checks that its
+  // committed state can be cached.
+  [[nodiscard]] uint32_t residentLane(uint64_t requestId);
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,

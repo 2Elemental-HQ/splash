@@ -165,10 +165,8 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
-  identical(left.gdn[budget.activeParity].convolutionBase,
-            right.gdn[masked.activeParity].convolutionBase, "GDN convolution");
-  identical(left.gdn[budget.activeParity].recurrentBase,
-            right.gdn[masked.activeParity].recurrentBase, "GDN recurrent");
+  identical(left.gdn[budget.activeParity].stateBase,
+            right.gdn[masked.activeParity].stateBase, "GDN state");
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
     identical(left.draft[layer].keys, right.draft[layer].keys,
               "draft keys layer=" + std::to_string(layer));
@@ -362,10 +360,26 @@ void provideMask(model::Runtime &executor, uint64_t requestId,
                          rejected.value_or(""));
 }
 
+// The convolution and recurrent halves of a GDN cell, which hold BF16 and
+// FP32 values.
+metal::MetalBuffer convolutionHalf(const metal::MetalBackend &backend,
+                                   const model::GdnParityBuffers &gdn,
+                                   const model::GdnStateLayout &layout) {
+  return backend.view(gdn.stateBase, 0, layout.convolutionBytes());
+}
+
+metal::MetalBuffer recurrentHalf(const metal::MetalBackend &backend,
+                                 const model::GdnParityBuffers &gdn,
+                                 const model::GdnStateLayout &layout) {
+  return backend.view(gdn.stateBase, layout.convolutionBytes(),
+                      layout.recurrentBytes());
+}
+
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
-StateSamples sampleCommittedState(const model::QwenStateStorage &states,
-                                   uint32_t lane) {
+StateSamples sampleCommittedState(const metal::MetalBackend &backend,
+                                  const model::QwenStateStorage &states,
+                                  uint32_t lane) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
                        bool bfloat) {
@@ -381,8 +395,9 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
   };
   const auto &buffers = states.buffers(lane);
   const auto &gdn = buffers.gdn[states.metadata(lane).activeParity];
-  add("convolution", gdn.convolutionBase, true);
-  add("recurrent", gdn.recurrentBase, false);
+  const auto &target = states.layout().target;
+  add("convolution", convolutionHalf(backend, gdn, target), true);
+  add("recurrent", recurrentHalf(backend, gdn, target), false);
   add("first_convolution", gdn.convolutionLayers.front(), true);
   add("first_recurrent", gdn.recurrentLayers.front(), false);
   const auto &lengths = states.metadata(lane).lengths;
@@ -748,7 +763,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes + 1,
           "repeated image placements encoded more than once");
-  const auto expected = sampleCommittedState(states, lane);
+  const auto expected = sampleCommittedState(backend, states, lane);
   executor.end(request.id);
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -764,8 +779,8 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                BatchCohort::Greedy, false);
   require(executor.telemetry().imageEncodes == encodes + 2,
           "prefix restore discarded data for a later image placement");
-  compareCommittedSamples(expected, sampleCommittedState(states, *restored.cell),
-                          true);
+  compareCommittedSamples(
+      expected, sampleCommittedState(backend, states, *restored.cell), true);
   executor.end(request.id);
   checkpoint.reset();
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -779,9 +794,11 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // its next transition reads, with 0xFF: NaN, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
-void poisonRecurrentState(const model::QwenStateStorage &states, uint32_t lane) {
-  const metal::MetalBuffer &recurrent =
-      states.buffers(lane).gdn[states.metadata(lane).activeParity].recurrentBase;
+void poisonRecurrentState(const metal::MetalBackend &backend,
+                          const model::QwenStateStorage &states, uint32_t lane) {
+  const metal::MetalBuffer recurrent =
+      recurrentHalf(backend, states.buffers(lane).gdn[states.metadata(lane).activeParity],
+                    states.layout().target);
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
@@ -825,7 +842,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
               "non-finite decode fixture");
   requireOpen(prefillChunk(executor, 202, 0, prompt40, pagesB),
               "non-finite decode fixture");
-  poisonRecurrentState(states, 0);
+  poisonRecurrentState(backend, states, 0);
   const BatchPlan plan{WorkKind::Decode,
                        BatchCohort::Greedy,
                        {{201, 0}, {202, 0}},
@@ -852,7 +869,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
 
   beginCold(executor, makeRequest(203, prompt80, 16), 0);
   prefillChunk(executor, 203, 0, std::span(prompt80).first(64), pagesC);
-  poisonRecurrentState(states, 0);
+  poisonRecurrentState(backend, states, 0);
   const ModelStepResult prefilled = prefillChunk(
       executor, 203, 64, std::span(prompt80).subspan(64), pagesC);
   require(!prefilled.failure.empty() && prefilled.outputTokens.empty(),
@@ -866,7 +883,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   beginCold(executor, constrained, 0);
   prefillChunk(executor, 204, 0, std::span(prompt80).first(64), pagesC,
                BatchCohort::Constrained);
-  poisonRecurrentState(states, 0);
+  poisonRecurrentState(backend, states, 0);
   prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64), pagesC,
                BatchCohort::Constrained);
   require(decodeOne(executor, 204, 80, pagesC, BatchCohort::Constrained,
@@ -1417,7 +1434,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   package.descriptor.target = originalTarget;
   auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
   for (uint32_t lane = 0; lane < 4; ++lane)
-    require(!states.metadata(lane).assigned,
+    require(!states.metadata(lane).assigned(),
             "EOS warmup left an active state lane");
   std::cout << "warmup_eos=PASS prefill_stop=" << prefillStop
             << " decode_stop=" << decodeStop << '\n';
@@ -1572,7 +1589,7 @@ int main(int argc, char **argv) {
       } catch (const std::logic_error &error) {
         rejected = std::string(error.what()).find("runway") != std::string::npos;
       }
-      require(rejected && !states.metadata(0).assigned &&
+      require(rejected && !states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
                   backend.submissionCount() == beforeCommands,
               "real warmup ran without its KV runway or executed/leaked work");
@@ -1739,12 +1756,19 @@ int main(int argc, char **argv) {
             "partitioned prefill logical state diverged");
     const model::QwenSlotBuffers &baselineState = states.buffers(2);
     const model::QwenSlotBuffers &partitionedState = states.buffers(3);
+    const model::GdnStateLayout &gdnLayout = states.layout().target;
     const Similarity convolution = compareBfloat(
-        baselineState.gdn[baselineMetadata.activeParity].convolutionBase,
-        partitionedState.gdn[partitionedMetadata.activeParity].convolutionBase);
+        convolutionHalf(backend, baselineState.gdn[baselineMetadata.activeParity],
+                        gdnLayout),
+        convolutionHalf(backend,
+                        partitionedState.gdn[partitionedMetadata.activeParity],
+                        gdnLayout));
     const Similarity recurrent = compareFloat(
-        baselineState.gdn[baselineMetadata.activeParity].recurrentBase,
-        partitionedState.gdn[partitionedMetadata.activeParity].recurrentBase);
+        recurrentHalf(backend, baselineState.gdn[baselineMetadata.activeParity],
+                      gdnLayout),
+        recurrentHalf(backend,
+                      partitionedState.gdn[partitionedMetadata.activeParity],
+                      gdnLayout));
     std::cout
         << "partition_equivalence conv_cos=" << convolution.cosine
         << " parity=" << baselineMetadata.activeParity << '/'
@@ -1752,9 +1776,13 @@ int main(int argc, char **argv) {
         << " conv_norms=" << convolution.leftNorm << '/'
         << convolution.rightNorm << " partition_other_conv_norm="
         << compareBfloat(
-               baselineState.gdn[baselineMetadata.activeParity].convolutionBase,
-               partitionedState.gdn[partitionedMetadata.activeParity ^ 1]
-                   .convolutionBase)
+               convolutionHalf(backend,
+                               baselineState.gdn[baselineMetadata.activeParity],
+                               gdnLayout),
+               convolutionHalf(
+                   backend,
+                   partitionedState.gdn[partitionedMetadata.activeParity ^ 1],
+                   gdnLayout))
                .rightNorm
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
@@ -2787,11 +2815,11 @@ int main(int argc, char **argv) {
       };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
-        const StateSamples before = repeatDuringReplay
-                                        ? sampleCommittedState(states, stateLane)
-                                        : StateSamples{};
+        const StateSamples before =
+            repeatDuringReplay ? sampleCommittedState(backend, states, stateLane)
+                               : StateSamples{};
         executor.suspend(sequence.id);
-        require(states.actualSlotBytes(stateLane) == 0,
+        require(!states.metadata(stateLane).assigned(),
                 "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
@@ -2807,7 +2835,7 @@ int main(int argc, char **argv) {
                                    pageTable, cohort),
                       "interrupted state replay");
           executor.suspend(sequence.id);
-          require(states.actualSlotBytes(stateLane) == 0,
+          require(!states.metadata(stateLane).assigned(),
                   "repeated preemption retained its state buffers");
           stateLane = resume();
           executor.setDraftContextPlan(
@@ -2817,7 +2845,7 @@ int main(int argc, char **argv) {
             executor, sequence.id, 0, sequence.prompt, pageTable, cohort);
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
-          const StateSamples rebuilt = sampleCommittedState(states, stateLane);
+          const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
           // Decode and prefill use different floating-point graphs. Record
           // that drift, but compare recovery itself to an independent cold
           // teacher-forced execution with the identical history and geometry.
@@ -2831,7 +2859,8 @@ int main(int argc, char **argv) {
                                         teacher.prompt, teacherPages, cohort));
           require(states.metadata(stateLane).lengths == states.metadata(teacherLane).lengths,
                   "recomputed logical lengths differ from teacher forcing");
-          compareCommittedSamples(rebuilt, sampleCommittedState(states, teacherLane), true);
+          compareCommittedSamples(
+              rebuilt, sampleCommittedState(backend, states, teacherLane), true);
           executor.end(teacher.id);
         }
         return replay.nextDecodeStage;
