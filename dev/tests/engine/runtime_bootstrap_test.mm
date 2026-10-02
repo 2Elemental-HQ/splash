@@ -1,3 +1,4 @@
+#include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
@@ -390,14 +391,9 @@ void requireReadyWithoutReducingConcurrency(
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready(),
           "memory-limited warmup did not become ready");
-  protocol::FrameParser parser;
-  const auto parsed = parser.consume(harness.output());
-  require(!parsed.issue && parsed.frame &&
-              parsed.consumedBytes == harness.output().size() && !parser.finish(),
-          "bootstrap did not emit one complete Ready frame");
-  const auto message = protocol::decodeFrame(*parsed.frame);
-  const auto *ready = message ? std::get_if<protocol::ReadyEvent>(&*message.value)
-                              : nullptr;
+  const auto events = protocol::peer::decodeEvents(harness.output());
+  require(events.size() == 1, "bootstrap did not emit one complete Ready frame");
+  const auto *ready = std::get_if<protocol::ReadyEvent>(&events.front());
   require(ready && ready->maxConcurrentRequests == 4,
           "startup budget permanently reduced the advertised concurrency");
 }

@@ -282,7 +282,6 @@ def metrics_dict(result):
     cache = {
         "status": cache_info.status,
         "matched_tokens": cache_info.matched_tokens,
-        "capacity": cache_info.capacity,
         "lane": cache_info.lane if cache_info.lane >= 0 else None,
     }
     metrics = {

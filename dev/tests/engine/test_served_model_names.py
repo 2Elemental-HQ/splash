@@ -312,7 +312,7 @@ class ServedModelNamesTests(unittest.TestCase):
 
     def test_main_wires_served_model_names_into_the_frontend(self):
         runtime = mock.Mock()
-        runtime.readiness = native_wire.ReadyEvent(1, 4, 131072, 0)
+        runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
         args = fixtures.main_args(
             served_model_name=["local"], announce_served_name=True
         )

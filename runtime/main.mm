@@ -243,14 +243,6 @@ std::filesystem::path executablePath() {
   return path;
 }
 
-uint64_t engineInstanceId() {
-  uint64_t process = static_cast<uint64_t>(getpid());
-  uint64_t clock = static_cast<uint64_t>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
-  uint64_t result = (process << 32) ^ clock;
-  return result ? result : 1;
-}
-
 engine::RuntimeBootstrapConfig
 bootstrapConfig(const NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
@@ -265,7 +257,6 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
-  config.nativeLoop.engineInstanceId = engineInstanceId();
   return config;
 }
 

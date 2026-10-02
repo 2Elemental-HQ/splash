@@ -392,7 +392,7 @@ class Frontend:
             for part in message["content"]
             if part.get("type") == "image_url"
         ]
-        limit = wire.ProtocolLimits().max_image_spans
+        limit = wire.MAX_IMAGE_SPANS
         if len(parts) > limit:
             raise APIError(400, f"requests support at most {limit} images")
         prepared = self.images.request_batch()
@@ -436,7 +436,7 @@ class Frontend:
             + wire.IMAGE_SPAN_BYTES * image_count
             + pixel_bytes
         )
-        if frame_bytes > wire.ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES:
+        if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")
 
     def _render_image_tokens(self, messages, template):

@@ -10,16 +10,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from dev.tests.engine import native_peer
 from server import crash_trace
 from server import protocol as wire
 from server import runtime as engine_runtime
 
-READY_FEATURES = int(
-    wire.ReadyFeature.CANCELLATION
-    | wire.ReadyFeature.TOKEN_MASKS
-    | wire.ReadyFeature.STATUS_JSON
-    | wire.ReadyFeature.MULTIPLEXING
-)
+READY = wire.ReadyEvent(4, 131_072, False)
 
 
 class FakeOutput:
@@ -58,7 +54,7 @@ class FakeInput:
     def __init__(self, process):
         self._process = process
         self._condition = threading.Condition()
-        self._parser = wire.FrameParser()
+        self._reader = native_peer.ClientFrameReader()
         self._closed = False
         self.records = []
         self._read_fd, self._write_fd = os.pipe()
@@ -67,26 +63,13 @@ class FakeInput:
         return self._write_fd
 
     def write(self, data):
-        data = bytes(data)
-        dispatched = []
         with self._condition:
             if self._closed:
                 raise BrokenPipeError("fake stdin is closed")
-            offset = 0
-            while offset < len(data):
-                step = self._parser.consume(memoryview(data)[offset:])
-                if step.issue:
-                    raise wire.ProtocolError(step.issue)
-                if not step.consumed_bytes:
-                    raise AssertionError("fake input parser made no progress")
-                offset += step.consumed_bytes
-                if step.frame:
-                    message = wire.decode_frame(step.frame)
-                    raw = wire.serialize_frame(step.frame)
-                    self.records.append((message, raw))
-                    dispatched.append(message)
+            records = self._reader.feed(data)
+            self.records.extend(records)
             self._condition.notify_all()
-        for message in dispatched:
+        for message, _raw in records:
             handler = self._process.input_handler
             if handler:
                 handler(self._process, message)
@@ -140,28 +123,20 @@ class FakeInput:
 class FakeProcess:
     _pids = iter(range(50_000, 60_000))
 
-    def __init__(self, engine_instance_id, input_handler=None, initial_output=None):
+    def __init__(self, input_handler=None, initial_output=None):
         self.pid = next(self._pids)
-        self.engine_instance_id = engine_instance_id
         self.input_handler = input_handler
         self.stdout = FakeOutput()
         self.stdin = FakeInput(self)
         self._condition = threading.Condition()
         self._exit_code = None
         if initial_output is None:
-            self.send(
-                wire.ReadyEvent(
-                    engine_instance_id,
-                    4,
-                    131_072,
-                    READY_FEATURES,
-                )
-            )
+            self.send(READY)
         elif initial_output:
             self.stdout.feed(initial_output)
 
-    def send(self, message):
-        self.stdout.feed(wire.serialize_message(message))
+    def send(self, event):
+        self.stdout.feed(native_peer.serialize_event(event))
 
     def close_stdout(self):
         self.stdout.close()
@@ -203,11 +178,7 @@ class FakeFactory:
         self.processes = []
 
     def __call__(self):
-        process = FakeProcess(
-            1000 + len(self.processes),
-            self.handler,
-            self.initial_output,
-        )
+        process = FakeProcess(self.handler, self.initial_output)
         self.processes.append(process)
         return process
 
@@ -241,16 +212,8 @@ def request(
     )
 
 
-def send_success(process, call, *, slot=0, tokens=(10, 11, 12)):
-    process.send(
-        wire.StartEvent(
-            call.request_id,
-            wire.CacheDisposition.MISS,
-            slot,
-            0,
-            4096,
-        )
-    )
+def send_success(process, call, *, lane=0, tokens=(10, 11, 12)):
+    process.send(wire.StartEvent(call.request_id, lane, 0))
     process.send(wire.TokensEvent(call.request_id, 0, tokens[:2]))
     if tokens[2:]:
         process.send(wire.TokensEvent(call.request_id, 2, tokens[2:]))
@@ -263,6 +226,7 @@ def send_success(process, call, *, slot=0, tokens=(10, 11, 12)):
             100,
             200,
             350,
+            (),
         )
     )
 
@@ -271,13 +235,7 @@ READY_STATUS = b'{"schema_version":%d,"ready":true}' % wire.STATUS_SCHEMA_VERSIO
 
 
 def answer_status(process, message):
-    process.send(
-        wire.StatusJsonEvent(
-            message.correlation_id,
-            wire.STATUS_SCHEMA_VERSION,
-            READY_STATUS,
-        )
-    )
+    process.send(wire.StatusJsonEvent(message.correlation_id, READY_STATUS))
 
 
 def fast_liveness_probe(test):
@@ -388,7 +346,7 @@ class RuntimeTests(unittest.TestCase):
             send_success(
                 process,
                 call,
-                slot=index,
+                lane=index,
                 tokens=(1000 + index, 2000 + index, 3000 + index),
             )
 
@@ -412,7 +370,7 @@ class RuntimeTests(unittest.TestCase):
             )
         self.assertEqual(runtime.pending_count, 0)
         self.assertTrue(runtime.ready)
-        self.assertEqual(runtime.readiness.engine_instance_id, 1000)
+        self.assertEqual(runtime.restart_count, 0)
 
     def test_result_is_available_before_completion_callback_finishes(self):
         factory = FakeFactory()
@@ -464,15 +422,7 @@ class RuntimeTests(unittest.TestCase):
                 call = runtime.submit(request(11))
                 try:
                     if name != "before_start":
-                        process.send(
-                            wire.StartEvent(
-                                call.request_id,
-                                wire.CacheDisposition.MISS,
-                                0,
-                                0,
-                                4096,
-                            )
-                        )
+                        process.send(wire.StartEvent(call.request_id, 0, 0))
                     for offset, tokens in valid_chunks:
                         process.send(wire.TokensEvent(call.request_id, offset, tokens))
                     process.send(
@@ -541,15 +491,7 @@ class RuntimeTests(unittest.TestCase):
                 call = runtime.submit(request(12))
                 try:
                     if started:
-                        process.send(
-                            wire.StartEvent(
-                                call.request_id,
-                                wire.CacheDisposition.MISS,
-                                0,
-                                0,
-                                4096,
-                            )
-                        )
+                        process.send(wire.StartEvent(call.request_id, 0, 0))
                     for offset, tokens in chunks:
                         process.send(wire.TokensEvent(call.request_id, offset, tokens))
                     process.send(
@@ -561,6 +503,7 @@ class RuntimeTests(unittest.TestCase):
                             10,
                             20,
                             30,
+                            (),
                         )
                     )
                     with self.assertRaisesRegex(engine_runtime.ProtocolFatal, message):
@@ -575,26 +518,12 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(request(13, logical_max_output_tokens=3))
-        process.send(
-            wire.StartEvent(
-                call.request_id,
-                wire.CacheDisposition.MISS,
-                0,
-                0,
-                4096,
-            )
-        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.TokensEvent(call.request_id, 0, (20, 21)))
         process.send(wire.TokensEvent(call.request_id, 2, (22,)))
         process.send(
             wire.DoneEvent(
-                call.request_id,
-                wire.FinishReason.LENGTH,
-                2,
-                3,
-                10,
-                20,
-                30,
+                call.request_id, wire.FinishReason.LENGTH, 2, 3, 10, 20, 30, ()
             )
         )
 
@@ -627,13 +556,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(cancel.request_id, call.request_id)
         process.send(
             wire.DoneEvent(
-                call.request_id,
-                wire.FinishReason.CANCELLED,
-                2,
-                0,
-                0,
-                0,
-                10,
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         result = call.result(1.0)
@@ -661,9 +584,7 @@ class RuntimeTests(unittest.TestCase):
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(frame.score_tokens, (101, 202, 303))
         self.assertEqual(frame.logical_max_output_tokens, 0)
-        process.send(
-            wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(
             wire.DoneEvent(
                 call.request_id,
@@ -700,50 +621,19 @@ class RuntimeTests(unittest.TestCase):
                     )
                 )
                 try:
+                    process.send(wire.StartEvent(call.request_id, 0, 0))
                     process.send(
-                        wire.StartEvent(
+                        wire.DoneEvent(
                             call.request_id,
-                            wire.CacheDisposition.MISS,
+                            reason,
+                            2,
                             0,
-                            0,
-                            4096,
+                            100,
+                            decode_micros,
+                            350,
+                            logits,
                         )
                     )
-                    if decode_micros:
-                        # A scored DoneEvent with decode activity is invalid at
-                        # encode time, so inject the malformed frame as raw
-                        # wire bytes to exercise the runtime's real parser.
-                        done = bytearray(
-                            wire.serialize_message(
-                                wire.DoneEvent(
-                                    call.request_id,
-                                    reason,
-                                    2,
-                                    0,
-                                    100,
-                                    0,
-                                    350,
-                                    logits,
-                                )
-                            )
-                        )
-                        done[
-                            wire.FRAME_HEADER_BYTES + 25 : wire.FRAME_HEADER_BYTES + 33
-                        ] = decode_micros.to_bytes(8, "little")
-                        process.stdout.feed(done)
-                    else:
-                        process.send(
-                            wire.DoneEvent(
-                                call.request_id,
-                                reason,
-                                2,
-                                0,
-                                100,
-                                0,
-                                350,
-                                logits,
-                            )
-                        )
                     with self.assertRaises(engine_runtime.ProtocolFatal):
                         call.result(1.0)
                     self.assertFalse(runtime.ready)
@@ -756,9 +646,7 @@ class RuntimeTests(unittest.TestCase):
         process = factory.processes[0]
         call = runtime.submit(request(10))
         try:
-            process.send(
-                wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-            )
+            process.send(wire.StartEvent(call.request_id, 0, 0))
             process.send(
                 wire.DoneEvent(
                     call.request_id,
@@ -788,13 +676,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(call.cancel())
         process.send(
             wire.DoneEvent(
-                call.request_id,
-                wire.FinishReason.CANCELLED,
-                2,
-                0,
-                0,
-                0,
-                10,
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         result = call.result(1.0)
@@ -805,15 +687,7 @@ class RuntimeTests(unittest.TestCase):
         def handler(process, message):
             if not isinstance(message, wire.RequestFrame):
                 return
-            process.send(
-                wire.StartEvent(
-                    message.request_id,
-                    wire.CacheDisposition.PREFIX_HIT,
-                    2,
-                    1,
-                    4096,
-                )
-            )
+            process.send(wire.StartEvent(message.request_id, 2, 1))
             process.send(wire.TokensEvent(message.request_id, 0, (41, 42)))
             process.send(
                 wire.DoneEvent(
@@ -824,6 +698,7 @@ class RuntimeTests(unittest.TestCase):
                     10,
                     20,
                     35,
+                    (),
                 )
             )
 
@@ -833,9 +708,7 @@ class RuntimeTests(unittest.TestCase):
         call = runtime.submit(request(15))
         result = call.result(1.0)
         self.assertEqual(result.done.completion_tokens, 2)
-        self.assertEqual(
-            result.start.cache_disposition, wire.CacheDisposition.PREFIX_HIT
-        )
+        self.assertEqual(result.start.matched_prompt_tokens, 1)
 
     def test_mask_response_preserves_both_ids_and_exact_word_count(self):
         provider_thread = []
@@ -885,27 +758,13 @@ class RuntimeTests(unittest.TestCase):
         )
         healthy = runtime.submit(request(40))
 
-        process.send(
-            wire.StartEvent(
-                bad.request_id,
-                wire.CacheDisposition.MISS,
-                0,
-                0,
-                4096,
-            )
-        )
+        process.send(wire.StartEvent(bad.request_id, 0, 0))
         process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
         cancel = process.stdin.wait_for(wire.CancelFrame)[0]
         self.assertEqual(cancel.request_id, bad.request_id)
         process.send(
             wire.DoneEvent(
-                bad.request_id,
-                wire.FinishReason.CANCELLED,
-                2,
-                0,
-                0,
-                0,
-                10,
+                bad.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         with self.assertRaises(engine_runtime.MaskComputationFailed):
@@ -939,15 +798,7 @@ class RuntimeTests(unittest.TestCase):
                 mask_provider=provider,
             )
         )
-        process.send(
-            wire.StartEvent(
-                call.request_id,
-                wire.CacheDisposition.MISS,
-                0,
-                0,
-                4096,
-            )
-        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
         self.assertTrue(provider_started.wait(1.0))
         self.assertTrue(call.cancel())
@@ -955,13 +806,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(cancel.request_id, call.request_id)
         process.send(
             wire.DoneEvent(
-                call.request_id,
-                wire.FinishReason.CANCELLED,
-                2,
-                0,
-                0,
-                0,
-                10,
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         self.assertEqual(call.result(1.0).done.reason, wire.FinishReason.CANCELLED)
@@ -997,9 +842,7 @@ class RuntimeTests(unittest.TestCase):
                     mask_provider=provider,
                 )
             )
-            call._record_start(
-                wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-            )
+            call._record_start(wire.StartEvent(call.request_id, 0, 0))
             runtime._submit_mask(
                 call, wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6))
             )
@@ -1015,7 +858,7 @@ class RuntimeTests(unittest.TestCase):
                 call.cancel()
                 process.send(
                     wire.DoneEvent(
-                        call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10
+                        call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
                     )
                 )
                 try:
@@ -1029,7 +872,7 @@ class RuntimeTests(unittest.TestCase):
         first.cancel()
         process.send(
             wire.DoneEvent(
-                first.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10
+                first.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         first.result(1.0)
@@ -1062,16 +905,14 @@ class RuntimeTests(unittest.TestCase):
                     mask_provider=provider,
                 )
             )
-            process.send(
-                wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-            )
+            process.send(wire.StartEvent(call.request_id, 0, 0))
             process.send(wire.MaskRequestEvent(call.request_id, 1, 2, ()))
             return call
 
         def cancelled(call):
             process.send(
                 wire.DoneEvent(
-                    call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10
+                    call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
                 )
             )
 
@@ -1109,7 +950,6 @@ class RuntimeTests(unittest.TestCase):
         process.send(
             wire.StatusJsonEvent(
                 first.correlation_id,
-                wire.STATUS_SCHEMA_VERSION,
                 b'{"schema_version":%d,"late":true}' % wire.STATUS_SCHEMA_VERSION,
             )
         )
@@ -1217,7 +1057,7 @@ class RuntimeTests(unittest.TestCase):
         after_unhealthy = runtime.submit(request(100))
         second = factory.processes[1]
         self.assertEqual(runtime.restart_count, 1)
-        self.assertEqual(runtime.readiness.engine_instance_id, 1001)
+        self.assertEqual(len(factory.processes), 2)
         second.send(
             wire.ErrorEvent(
                 wire.FailureClass.PROTOCOL_FATAL,
@@ -1495,25 +1335,6 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_startup_rejects_ready_missing_required_features(self):
-        ready = wire.serialize_message(
-            wire.ReadyEvent(
-                engine_instance_id=1,
-                max_concurrent_requests=4,
-                max_context_tokens=131_072,
-                feature_bits=int(wire.ReadyFeature.CANCELLATION),
-            )
-        )
-        factory = FakeFactory(initial_output=ready)
-        with self.assertRaisesRegex(
-            engine_runtime.ProtocolFatal, "missing required native protocol features"
-        ):
-            engine_runtime.MultiplexedRuntime(
-                process_factory=factory,
-                startup_timeout=0.2,
-            )
-        self.assertIsNotNone(factory.processes[0].poll())
-
     def test_deadline_helper_serializes_absolute_and_remaining_clocks(self):
         deadline = engine_runtime.Deadline.after(
             1.25,
@@ -1563,7 +1384,7 @@ class RuntimeTests(unittest.TestCase):
             process = factory.processes[0]
             self.assertIsNone(process.poll())
             self.assertEqual(process.stdin.messages(wire.RequestFrame), [])
-            process.send(wire.ReadyEvent(1000, 4, 131072, READY_FEATURES))
+            process.send(READY)
             call = long.result(0.5)
         frames = process.stdin.messages(wire.RequestFrame)
         self.assertEqual([frame.prompt_tokens for frame in frames], [(2, 3)])
@@ -1797,12 +1618,9 @@ class RuntimeTests(unittest.TestCase):
             call = writer.result(0)
         while select.select([read_fd], [], [], 0)[0]:
             received += os.read(read_fd, 1 << 20)
-        parser, offset, frames = wire.FrameParser(), 0, []
-        while offset < len(received):
-            step = parser.consume(memoryview(received)[offset:])
-            offset += step.consumed_bytes
-            if step.frame:
-                frames.append(wire.decode_frame(step.frame))
+        frames = [
+            message for message, _raw in native_peer.ClientFrameReader().feed(received)
+        ]
         self.assertEqual([frame.request_id for frame in frames], [call.request_id])
         self.assertEqual(frames[0].prompt_tokens, large.prompt_tokens)
         # The engine, not the transport, now fails the expired request alone.

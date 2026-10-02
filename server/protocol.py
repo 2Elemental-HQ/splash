@@ -1,6 +1,8 @@
-"""Strict Python codec for the Splash native protocol.
+"""The server's side of the Splash native protocol.
 
-Wire framing and typed payload validation mirror ``runtime/engine/Protocol.*``.
+It encodes client frames and decodes engine events; ``runtime/engine/
+Protocol.*`` does the reverse. ``dev/tests/engine/protocol_golden.txt`` pins
+the bytes both sides agree on.
 """
 
 from __future__ import annotations
@@ -24,7 +26,17 @@ MAX_SCORE_TOKENS = 255
 # Patches per image, the most the vision encoder takes; the server's pixel
 # cap may allow fewer.
 MAX_IMAGE_PATCHES = 16384
-ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
+# Image pixels travel inside the request frame; a multi-image agent turn can
+# carry well over 64 MiB of resized RGB bytes.
+MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
+MAX_STATUS_JSON_BYTES = 32 * 1024 * 1024
+MAX_ERROR_STRING_BYTES = 1024 * 1024
+MAX_PROMPT_TOKENS = 1 << 20
+MAX_LOGICAL_OUTPUT_TOKENS = 1 << 20
+MAX_TOKEN_BATCH = 4096
+MAX_SIMULATION_TOKENS = 32
+MAX_IMAGE_SPANS = 64
+MAX_MASK_WORDS = 1 << 20
 
 _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
@@ -35,14 +47,14 @@ _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
-_READY = struct.Struct("<QIIQ")
-_START = struct.Struct("<QBiII")
+_READY = struct.Struct("<IIB")
+_START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQ")
+_DONE = struct.Struct("<QBIIQQQI")
 _ERROR = struct.Struct("<BBQII")
-_STATUS_JSON = struct.Struct("<QI")
+_STATUS_JSON = struct.Struct("<Q")
 
 assert (
     array.array("I").itemsize == 4
@@ -52,9 +64,11 @@ assert (
 assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 87
 assert _IMAGE_SPAN.size == 32
-assert _START.size == 21
-assert _DONE.size == 41
+assert _READY.size == 9
+assert _START.size == 16
+assert _DONE.size == 45
 assert _ERROR.size == 18
+assert _STATUS_JSON.size == 8
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -76,12 +90,28 @@ class FrameType(IntEnum):
     PROMPT_PROGRESS = 0x0108
 
 
+# The frame types the engine sends; the others are the server's.
+_EVENT_TYPES = frozenset(
+    {
+        FrameType.READY,
+        FrameType.START,
+        FrameType.TOKENS,
+        FrameType.MASK_REQUEST,
+        FrameType.DONE,
+        FrameType.ERROR,
+        FrameType.STATUS_JSON,
+        FrameType.PROMPT_PROGRESS,
+    }
+)
+
+
 class FailureClass(IntEnum):
     REQUEST_ERROR = 1
     ENGINE_UNHEALTHY = 2
     PROTOCOL_FATAL = 3
 
 
+# Issue codes travel by name; the values need not be contiguous.
 class IssueCode(IntEnum):
     NONE = 0
     BAD_MAGIC = 1
@@ -100,7 +130,6 @@ class IssueCode(IntEnum):
     INVALID_COUNT = 14
     INVALID_CONSTRAINT = 15
     INVALID_ERROR_CLASSIFICATION = 16
-    INVALID_STATUS_SCHEMA = 17
     LIMIT_EXCEEDED = 18
     INTEGER_OVERFLOW = 19
     ALLOCATION_FAILURE = 20
@@ -122,8 +151,8 @@ def issue_code_name(code: IssueCode) -> str:
 class ProtocolIssue:
     failure_class: FailureClass
     code: IssueCode
-    request_id: int = 0
-    message: str = ""
+    request_id: int
+    message: str
 
     def describe(self) -> str:
         result = (
@@ -140,19 +169,6 @@ class ProtocolError(Exception):
     def __init__(self, issue: ProtocolIssue):
         self.issue = issue
         super().__init__(issue.describe())
-
-
-@dataclass(slots=True, frozen=True)
-class ProtocolLimits:
-    max_frame_payload_bytes: int = ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES
-    max_status_json_bytes: int = 32 * 1024 * 1024
-    max_error_string_bytes: int = 1 * 1024 * 1024
-    max_prompt_tokens: int = 1 << 20
-    max_logical_output_tokens: int = 1 << 20
-    max_token_batch: int = 4096
-    max_simulation_tokens: int = 32
-    max_image_spans: int = 64
-    max_mask_words: int = 1 << 20
 
 
 class RequestPriority(IntEnum):
@@ -230,16 +246,16 @@ class RequestFrame:
     constraint: ConstraintMode
     # Sorted, non-overlapping image spans and their resized uint8 RGB pixels
     # concatenated in span order; both empty for text-only requests.
-    image_spans: tuple[ImageSpan, ...] = ()
-    image_pixels: bytes = b""
-    return_progress: bool = False
+    image_spans: tuple[ImageSpan, ...]
+    image_pixels: bytes
+    return_progress: bool
     # Option token ids for score-only requests; empty means ordinary
     # generation. Score tokens serialize after the image pixel bytes.
-    score_tokens: tuple[int, ...] = ()
+    score_tokens: tuple[int, ...]
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown. It must leave at least one prompt token.
-    generation_prompt_tokens: int = 0
-    flags: RequestFlag = RequestFlag(0)
+    generation_prompt_tokens: int
+    flags: RequestFlag
 
 
 @dataclass(slots=True, frozen=True)
@@ -259,39 +275,20 @@ class StatusRequestFrame:
     correlation_id: int
 
 
-class ReadyFeature(IntFlag):
-    CANCELLATION = 1 << 0
-    TOKEN_MASKS = 1 << 1
-    STATUS_JSON = 1 << 2
-    MULTIPLEXING = 1 << 3
-    # Requests may carry image spans; clear for a model serving without vision.
-    VISION = 1 << 4
-
-
 @dataclass(slots=True, frozen=True)
 class ReadyEvent:
-    engine_instance_id: int
     max_concurrent_requests: int
     max_context_tokens: int
-    feature_bits: int | ReadyFeature
-
-    @property
-    def vision(self) -> bool:
-        return bool(int(self.feature_bits) & ReadyFeature.VISION)
-
-
-class CacheDisposition(IntEnum):
-    MISS = 0
-    PREFIX_HIT = 1
+    # Requests may carry image spans; false for a model serving without vision.
+    vision: bool
 
 
 @dataclass(slots=True, frozen=True)
 class StartEvent:
     request_id: int
-    cache_disposition: CacheDisposition
     lane: int
+    # The cached prefix the request starts from; zero for a cold start.
     matched_prompt_tokens: int
-    capacity_tokens: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -343,7 +340,7 @@ class DoneEvent:
     wall_micros: int
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
-    option_logits: tuple[float, ...] = ()
+    option_logits: tuple[float, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -355,19 +352,19 @@ class ErrorEvent:
     message: bytes
 
 
+# The JSON is opaque to the transport: the document carries its own
+# schema_version.
 @dataclass(slots=True, frozen=True)
 class StatusJsonEvent:
     correlation_id: int
-    schema_version: int
     json: bytes
 
 
-Message: TypeAlias = (
-    RequestFrame
-    | CancelFrame
-    | MaskResponseFrame
-    | StatusRequestFrame
-    | ReadyEvent
+ClientMessage: TypeAlias = (
+    RequestFrame | CancelFrame | MaskResponseFrame | StatusRequestFrame
+)
+EngineEvent: TypeAlias = (
+    ReadyEvent
     | StartEvent
     | PromptProgressEvent
     | TokensEvent
@@ -409,6 +406,11 @@ def _fail(
     raise ProtocolError(_issue(failure_class, code, message, request_id))
 
 
+def _fatal(code: IssueCode, message: str, request_id: int = 0) -> None:
+    """An engine event that breaks the protocol: the stream is not trusted."""
+    _fail(FailureClass.PROTOCOL_FATAL, code, message, request_id)
+
+
 def _allocation_issue(message: str) -> ProtocolIssue:
     return _issue(FailureClass.ENGINE_UNHEALTHY, IssueCode.ALLOCATION_FAILURE, message)
 
@@ -425,10 +427,6 @@ def _u32(value: object, label: str) -> int:
 
 def _u64(value: object, label: str) -> int:
     return _integer(value, 0, 0xFFFFFFFFFFFFFFFF, label)
-
-
-def _i32(value: object, label: str) -> int:
-    return _integer(value, -(1 << 31), (1 << 31) - 1, label)
 
 
 def _float32(value: object, label: str) -> float:
@@ -489,69 +487,15 @@ def _words(values: object, label: str) -> array.array:
     return array.array("I", (_u32(value, f"{label} element") for value in values))
 
 
-def _limits_issue(limits: ProtocolLimits) -> ProtocolIssue | None:
-    try:
-        max_frame = _u64(limits.max_frame_payload_bytes, "max frame payload")
-        max_status = _u64(limits.max_status_json_bytes, "max status JSON")
-        max_error = _u64(limits.max_error_string_bytes, "max error string")
-        counts = (
-            _u32(limits.max_prompt_tokens, "max prompt tokens"),
-            _u32(limits.max_logical_output_tokens, "max output tokens"),
-            _u32(limits.max_token_batch, "max token batch"),
-            _u32(limits.max_simulation_tokens, "max simulation tokens"),
-            _u32(limits.max_mask_words, "max mask words"),
-            _u32(limits.max_image_spans, "max image spans"),
-        )
-    except (AttributeError, ValueError) as error:
-        return _issue(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.LIMIT_EXCEEDED,
-            f"invalid protocol limits: {error}",
-        )
-    if not _REQUEST.size <= max_frame <= ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES:
-        return _issue(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.LIMIT_EXCEEDED,
-            f"maxFramePayloadBytes must be in [{_REQUEST.size}, 256 MiB]",
-        )
-    if max_status > max_frame - _STATUS_JSON.size:
-        return _issue(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.LIMIT_EXCEEDED,
-            "status JSON limit does not fit the configured frame limit",
-        )
-    if max_error > max_frame:
-        return _issue(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.LIMIT_EXCEEDED,
-            "error string limit exceeds the configured frame limit",
-        )
-    if not all(counts):
-        return _issue(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.LIMIT_EXCEEDED,
-            "all configured token and mask limits must be non-zero",
-        )
-    return None
-
-
-def _check_limits(limits: ProtocolLimits) -> None:
-    if issue := _limits_issue(limits):
-        raise ProtocolError(issue)
-
-
-def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int, int]:
+def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
     match frame_type:
         case FrameType.REQUEST:
             # Image pixels dominate prompt tokens; the frame limit is the bound.
-            bounds = (_REQUEST.size, limits.max_frame_payload_bytes)
+            bounds = (_REQUEST.size, MAX_FRAME_PAYLOAD_BYTES)
         case FrameType.CANCEL:
             bounds = (_CANCEL.size, _CANCEL.size)
         case FrameType.MASK_RESPONSE:
-            bounds = (
-                _MASK_RESPONSE.size,
-                _MASK_RESPONSE.size + limits.max_mask_words * 4,
-            )
+            bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
         case FrameType.READY:
@@ -561,36 +505,25 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
         case FrameType.START:
             bounds = (_START.size, _START.size)
         case FrameType.TOKENS:
-            bounds = (_TOKENS.size, _TOKENS.size + limits.max_token_batch * 4)
+            bounds = (_TOKENS.size, _TOKENS.size + MAX_TOKEN_BATCH * 4)
         case FrameType.MASK_REQUEST:
             bounds = (
                 _MASK_REQUEST.size,
-                _MASK_REQUEST.size + limits.max_simulation_tokens * 4,
+                _MASK_REQUEST.size + MAX_SIMULATION_TOKENS * 4,
             )
         case FrameType.DONE:
-            bounds = (
-                _DONE.size + 4,
-                _DONE.size + 4 + MAX_SCORE_TOKENS * 4,
-            )
+            bounds = (_DONE.size, _DONE.size + MAX_SCORE_TOKENS * 4)
         case FrameType.ERROR:
-            bounds = (
-                _ERROR.size,
-                _ERROR.size + limits.max_error_string_bytes * 2,
-            )
+            bounds = (_ERROR.size, _ERROR.size + MAX_ERROR_STRING_BYTES * 2)
         case FrameType.STATUS_JSON:
-            bounds = (
-                _STATUS_JSON.size,
-                _STATUS_JSON.size + limits.max_status_json_bytes,
-            )
-    return bounds[0], min(bounds[1], limits.max_frame_payload_bytes)
+            bounds = (_STATUS_JSON.size, _STATUS_JSON.size + MAX_STATUS_JSON_BYTES)
+    return bounds[0], min(bounds[1], MAX_FRAME_PAYLOAD_BYTES)
 
 
 def _payload_length_issue(
-    frame_type: FrameType,
-    payload_bytes: int,
-    limits: ProtocolLimits,
+    frame_type: FrameType, payload_bytes: int
 ) -> ProtocolIssue | None:
-    minimum, maximum = _payload_bounds(frame_type, limits)
+    minimum, maximum = _payload_bounds(frame_type)
     if payload_bytes > maximum:
         return _issue(
             FailureClass.PROTOCOL_FATAL,
@@ -606,53 +539,6 @@ def _payload_length_issue(
             f"is below its required minimum {minimum}",
         )
     return None
-
-
-def _unpack_words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
-    if len(payload) - offset != count * 4:
-        raise ValueError("word count does not match binary payload")
-    return _unpack_prefix_words(payload, offset, count)
-
-
-def _unpack_prefix_words(payload: bytes, offset: int, count: int) -> tuple[int, ...]:
-    byte_count = count * 4
-    if len(payload) - offset < byte_count:
-        raise ValueError("word count does not match binary payload")
-    if not count:
-        return ()
-    words = array.array("I")
-    words.frombytes(payload[offset : offset + byte_count])
-    return tuple(words)
-
-
-def _pack_floats(values: tuple[float, ...]) -> bytes:
-    if not values:
-        return b""
-    return array.array("f", values).tobytes()
-
-
-def _unpack_floats(payload: bytes, offset: int, count: int) -> tuple[float, ...]:
-    byte_count = count * 4
-    if len(payload) - offset != byte_count:
-        raise ValueError("float count does not match binary payload")
-    if not count:
-        return ()
-    floats = array.array("f")
-    floats.frombytes(payload[offset : offset + byte_count])
-    return tuple(floats)
-
-
-def _score_logits(values: object, label: str) -> tuple[float, ...]:
-    if type(values) is not tuple:
-        raise ValueError(f"{label} must be a tuple of finite float32 values")
-    logits = tuple(_float32(value, f"{label} element") for value in values)
-    if any(not math.isfinite(value) for value in logits):
-        raise ValueError(f"{label} must be finite")
-    if logits and not MIN_SCORE_TOKENS <= len(logits) <= MAX_SCORE_TOKENS:
-        raise ValueError(
-            f"{label} must be empty or {MIN_SCORE_TOKENS}..{MAX_SCORE_TOKENS} values"
-        )
-    return logits
 
 
 def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
@@ -686,7 +572,7 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
 
 
 def _validated_request(
-    request: RequestFrame, limits: ProtocolLimits
+    request: RequestFrame,
 ) -> tuple[array.array, array.array, tuple]:
     """The request's prompt and score words as uint32 arrays and its float32
     sampling block, each checked once; raises a ProtocolError with the first
@@ -747,11 +633,11 @@ def _validated_request(
                     "score requests must not generate output tokens",
                     request_id,
                 )
-        elif not output_tokens or output_tokens > limits.max_logical_output_tokens:
+        elif not output_tokens or output_tokens > MAX_LOGICAL_OUTPUT_TOKENS:
             raise ValueError("logical max output token count exceeds its limit")
-        if not prompt or len(prompt) > limits.max_prompt_tokens:
+        if not prompt or len(prompt) > MAX_PROMPT_TOKENS:
             raise ValueError("prompt token count exceeds its limit")
-        if len(request.image_spans) > limits.max_image_spans:
+        if len(request.image_spans) > MAX_IMAGE_SPANS:
             raise ValueError("image span count exceeds its limit")
     except ValueError as error:
         _fail(
@@ -844,24 +730,6 @@ def _validated_request(
     return prompt, scores, sampling
 
 
-def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
-    try:
-        request_id = _u64(cancel.request_id, "cancel request id")
-    except ValueError as error:
-        return _issue(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_REQUEST_ID,
-            str(error),
-        )
-    if request_id:
-        return None
-    return _issue(
-        FailureClass.REQUEST_ERROR,
-        IssueCode.INVALID_REQUEST_ID,
-        "cancel request id must be non-zero",
-    )
-
-
 def _mask_payload(values):
     if isinstance(values, bytes):
         if len(values) % 4:
@@ -870,281 +738,8 @@ def _mask_payload(values):
     return _words(values, "mask words").tobytes()
 
 
-def _mask_response_issue(
-    response: MaskResponseFrame,
-    limits: ProtocolLimits,
-) -> ProtocolIssue | None:
-    request_id = response.request_id if type(response.request_id) is int else 0
-    try:
-        request_id = _u64(response.request_id, "mask response request id")
-        mask_request_id = _u64(response.mask_request_id, "mask request id")
-        if not request_id or not mask_request_id:
-            raise ValueError("mask response request ids must be non-zero")
-    except ValueError as error:
-        return _issue(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_REQUEST_ID,
-            str(error),
-            request_id,
-        )
-    try:
-        payload = _mask_payload(response.mask_words)
-    except ValueError as error:
-        return _issue(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            str(error),
-            request_id,
-        )
-    if not payload or len(payload) // 4 > limits.max_mask_words:
-        return _issue(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            "mask response word count exceeds its limit",
-            request_id,
-        )
-    return None
-
-
-def _ready_issue(event: ReadyEvent, failure: FailureClass) -> ProtocolIssue | None:
-    try:
-        instance = _u64(event.engine_instance_id, "engine instance id")
-        concurrent = _u32(event.max_concurrent_requests, "max concurrent requests")
-        context = _u32(event.max_context_tokens, "max context tokens")
-        feature_bits = (
-            int(event.feature_bits)
-            if isinstance(event.feature_bits, ReadyFeature)
-            else event.feature_bits
-        )
-        _u64(feature_bits, "feature bits")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error))
-    if instance and concurrent and context:
-        return None
-    return _issue(
-        failure,
-        IssueCode.INVALID_COUNT,
-        "ready event capacities and instance id must be non-zero",
-    )
-
-
-def _start_issue(event: StartEvent, failure: FailureClass) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "start request id")
-        if not request_id:
-            raise ValueError("start event request id must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        _enum_value(event.cache_disposition, CacheDisposition, "cache disposition")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
-    try:
-        lane = _i32(event.lane, "lane")
-        matched = _u32(event.matched_prompt_tokens, "matched prompt tokens")
-        capacity = _u32(event.capacity_tokens, "capacity tokens")
-        if lane < -1 or not capacity or matched > capacity:
-            raise ValueError("start event capacity or lane is invalid")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    return None
-
-
-def _progress_issue(
-    event: PromptProgressEvent, limits: ProtocolLimits, failure: FailureClass
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        if not _u64(event.request_id, "progress request id"):
-            raise ValueError("prompt progress id must be non-zero")
-        if _u32(event.processed_tokens, "processed tokens") > limits.max_prompt_tokens:
-            raise ValueError("prompt progress token count exceeds its limit")
-        _u64(event.elapsed_micros, "progress elapsed microseconds")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    return None
-
-
-def _tokens_issue(
-    event: TokensEvent,
-    limits: ProtocolLimits,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "tokens request id")
-        if not request_id:
-            raise ValueError("tokens event request id must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        offset = _u32(event.sequence_offset, "sequence offset")
-        tokens = _words(event.tokens, "tokens")
-        if not tokens or len(tokens) > limits.max_token_batch:
-            raise ValueError("tokens event batch size exceeds its limit")
-    except ValueError as error:
-        return _issue(failure, IssueCode.LIMIT_EXCEEDED, str(error), request_id)
-    if offset + len(tokens) > 0xFFFFFFFF:
-        return _issue(
-            failure,
-            IssueCode.INTEGER_OVERFLOW,
-            "tokens event sequence range overflows uint32",
-            request_id,
-        )
-    return None
-
-
-def _mask_request_issue(
-    event: MaskRequestEvent,
-    limits: ProtocolLimits,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "mask request request id")
-        mask_request_id = _u64(event.mask_request_id, "mask request id")
-        if not request_id or not mask_request_id:
-            raise ValueError("mask request ids must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        words_per_mask = _u32(event.words_per_mask, "words per mask")
-        tokens = _words(event.simulation_tokens, "simulation tokens")
-        if not words_per_mask or len(tokens) > limits.max_simulation_tokens:
-            raise ValueError("mask request dimensions are invalid")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    if words_per_mask * (len(tokens) + 1) > limits.max_mask_words:
-        return _issue(
-            failure,
-            IssueCode.LIMIT_EXCEEDED,
-            "mask request output would exceed the mask limit",
-            request_id,
-        )
-    return None
-
-
-def _done_issue(event: DoneEvent, failure: FailureClass) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "done request id")
-        if not request_id:
-            raise ValueError("done event request id must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        reason = _enum_value(event.reason, FinishReason, "finish reason")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
-    try:
-        _u32(event.prompt_tokens, "done prompt tokens")
-        _u32(event.completion_tokens, "done completion tokens")
-        _u64(event.prefill_micros, "prefill microseconds")
-        _u64(event.decode_micros, "decode microseconds")
-        _u64(event.wall_micros, "wall microseconds")
-        logits = _score_logits(event.option_logits, "option logits")
-        if logits:
-            if reason is not FinishReason.STOP:
-                raise ValueError("scored done events must finish with stop")
-            if event.completion_tokens or event.decode_micros:
-                raise ValueError(
-                    "scored done events carry no completion or decode activity"
-                )
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    return None
-
-
-def _error_issue(
-    event: ErrorEvent,
-    limits: ProtocolLimits,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        classification = _enum_value(
-            event.failure_class, FailureClass, "error classification"
-        )
-        request_id = _u64(event.request_id, "error request id")
-        if type(event.retryable) is not bool:
-            raise ValueError("error retryable field must be boolean")
-        if (classification is FailureClass.REQUEST_ERROR and not request_id) or (
-            classification is not FailureClass.REQUEST_ERROR and request_id
-        ):
-            raise ValueError("only request errors may carry a non-zero request id")
-    except ValueError as error:
-        return _issue(
-            failure,
-            IssueCode.INVALID_ERROR_CLASSIFICATION,
-            str(error),
-            request_id,
-        )
-    try:
-        code = _bytes(event.code, "error code")
-        message = _bytes(event.message, "error message")
-    except ValueError as error:
-        return _issue(failure, IssueCode.LIMIT_EXCEEDED, str(error), request_id)
-    if (
-        not code
-        or len(code) > limits.max_error_string_bytes
-        or len(message) > limits.max_error_string_bytes
-    ):
-        return _issue(
-            failure,
-            IssueCode.LIMIT_EXCEEDED,
-            "error code or message exceeds its safe limit",
-            request_id,
-        )
-    return None
-
-
-def _status_issue(
-    event: StatusJsonEvent,
-    limits: ProtocolLimits,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    try:
-        _u64(event.correlation_id, "status correlation id")
-        schema = _u32(event.schema_version, "status schema version")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_STATUS_SCHEMA, str(error))
-    if schema != STATUS_SCHEMA_VERSION:
-        return _issue(
-            failure,
-            IssueCode.INVALID_STATUS_SCHEMA,
-            "status JSON schema version must match the native protocol",
-        )
-    try:
-        payload = _bytes(event.json, "status JSON")
-    except ValueError as error:
-        return _issue(failure, IssueCode.LIMIT_EXCEEDED, str(error))
-    if not payload or len(payload) > limits.max_status_json_bytes:
-        return _issue(
-            failure,
-            IssueCode.LIMIT_EXCEEDED,
-            "status JSON byte count exceeds its safe limit",
-        )
-    return None
-
-
-def _raise_issue(issue: ProtocolIssue | None) -> None:
-    if issue:
-        raise ProtocolError(issue)
-
-
-def _request_frame(request: RequestFrame, limits: ProtocolLimits) -> bytearray:
-    """The whole request frame, header included, in one buffer that each part
-    is copied into once: image pixels run to hundreds of MiB."""
-    _check_limits(limits)
-    prompt, scores, sampling = _validated_request(request, limits)
-    prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
-    spans_offset = prompt_offset + 4 * len(prompt)
-    pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
-    scores_offset = pixels_offset + len(request.image_pixels)
-    payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
-    if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes, limits):
-        _fail(FailureClass.REQUEST_ERROR, issue.code, issue.message, request.request_id)
+def _frame(frame_type: FrameType, payload_bytes: int) -> bytearray:
+    """A frame's header, in a buffer sized for the payload written after it."""
     frame = bytearray(FRAME_HEADER_BYTES + payload_bytes)
     _HEADER.pack_into(
         frame,
@@ -1152,11 +747,26 @@ def _request_frame(request: RequestFrame, limits: ProtocolLimits) -> bytearray:
         _MAGIC,
         PROTOCOL_VERSION,
         FRAME_HEADER_BYTES,
-        int(FrameType.REQUEST),
+        int(frame_type),
         0,
         payload_bytes,
         0,
     )
+    return frame
+
+
+def _request_frame(request: RequestFrame) -> bytearray:
+    """The whole request frame, header included, in one buffer that each part
+    is copied into once: image pixels run to hundreds of MiB."""
+    prompt, scores, sampling = _validated_request(request)
+    prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
+    spans_offset = prompt_offset + 4 * len(prompt)
+    pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
+    scores_offset = pixels_offset + len(request.image_pixels)
+    payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
+    if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
+        _fail(FailureClass.REQUEST_ERROR, issue.code, issue.message, request.request_id)
+    frame = _frame(FrameType.REQUEST, payload_bytes)
     _REQUEST.pack_into(
         frame,
         FRAME_HEADER_BYTES,
@@ -1194,167 +804,84 @@ def _request_frame(request: RequestFrame, limits: ProtocolLimits) -> bytearray:
     return frame
 
 
-def _encode_message(
-    message: Message, limits: ProtocolLimits = ProtocolLimits()
-) -> Frame:
-    if isinstance(message, RequestFrame):
-        frame = _request_frame(message, limits)
-        return Frame(
-            FrameType.REQUEST, memoryview(frame)[FRAME_HEADER_BYTES:].tobytes()
-        )
-    _check_limits(limits)
-    frame_type: FrameType
-    payload: bytes
-    if isinstance(message, CancelFrame):
-        _raise_issue(_cancel_issue(message))
-        payload = _CANCEL.pack(message.request_id)
-        frame_type = FrameType.CANCEL
-    elif isinstance(message, MaskResponseFrame):
-        _raise_issue(_mask_response_issue(message, limits))
-        mask = _mask_payload(message.mask_words)
-        payload = (
-            _MASK_RESPONSE.pack(
-                message.request_id, message.mask_request_id, len(mask) // 4
-            )
-            + mask
-        )
-        frame_type = FrameType.MASK_RESPONSE
-    elif isinstance(message, StatusRequestFrame):
-        try:
-            correlation_id = _u64(message.correlation_id, "status correlation id")
-        except ValueError as error:
-            _fail(
-                FailureClass.REQUEST_ERROR,
-                IssueCode.INTEGER_OVERFLOW,
-                str(error),
-            )
-        payload = _STATUS_REQUEST.pack(correlation_id)
-        frame_type = FrameType.STATUS_REQUEST
-    elif isinstance(message, ReadyEvent):
-        _raise_issue(_ready_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = _READY.pack(
-            message.engine_instance_id,
-            message.max_concurrent_requests,
-            message.max_context_tokens,
-            message.feature_bits,
-        )
-        frame_type = FrameType.READY
-    elif isinstance(message, StartEvent):
-        _raise_issue(_start_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = _START.pack(
-            message.request_id,
-            int(message.cache_disposition),
-            message.lane,
-            message.matched_prompt_tokens,
-            message.capacity_tokens,
-        )
-        frame_type = FrameType.START
-    elif isinstance(message, PromptProgressEvent):
-        _raise_issue(_progress_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
-        payload = _PROMPT_PROGRESS.pack(
-            message.request_id, message.processed_tokens, message.elapsed_micros
-        )
-        frame_type = FrameType.PROMPT_PROGRESS
-    elif isinstance(message, TokensEvent):
-        _raise_issue(_tokens_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
-        tokens = _words(message.tokens, "tokens")
-        payload = (
-            _TOKENS.pack(message.request_id, message.sequence_offset, len(tokens))
-            + tokens.tobytes()
-        )
-        frame_type = FrameType.TOKENS
-    elif isinstance(message, MaskRequestEvent):
-        _raise_issue(
-            _mask_request_issue(message, limits, FailureClass.ENGINE_UNHEALTHY)
-        )
-        tokens = _words(message.simulation_tokens, "simulation tokens")
-        payload = (
-            _MASK_REQUEST.pack(
-                message.request_id,
-                message.mask_request_id,
-                message.words_per_mask,
-                len(tokens),
-            )
-            + tokens.tobytes()
-        )
-        frame_type = FrameType.MASK_REQUEST
-    elif isinstance(message, DoneEvent):
-        _raise_issue(_done_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = (
-            _DONE.pack(
-                message.request_id,
-                int(message.reason),
-                message.prompt_tokens,
-                message.completion_tokens,
-                message.prefill_micros,
-                message.decode_micros,
-                message.wall_micros,
-            )
-            + struct.pack("<I", len(message.option_logits))
-            + _pack_floats(message.option_logits)
-        )
-        frame_type = FrameType.DONE
-    elif isinstance(message, ErrorEvent):
-        _raise_issue(_error_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
-        payload = (
-            _ERROR.pack(
-                int(message.failure_class),
-                int(message.retryable),
-                message.request_id,
-                len(message.code),
-                len(message.message),
-            )
-            + message.code
-            + message.message
-        )
-        frame_type = FrameType.ERROR
-    elif isinstance(message, StatusJsonEvent):
-        _raise_issue(_status_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
-        payload = (
-            _STATUS_JSON.pack(message.correlation_id, message.schema_version)
-            + message.json
-        )
-        frame_type = FrameType.STATUS_JSON
-    else:
-        _fail(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.UNKNOWN_FRAME_TYPE,
-            "message type is not defined by native protocol",
-        )
-
-    if issue := _payload_length_issue(frame_type, len(payload), limits):
-        client = frame_type in {
-            FrameType.CANCEL,
-            FrameType.MASK_RESPONSE,
-            FrameType.STATUS_REQUEST,
-        }
-        request_id = getattr(message, "request_id", 0)
-        raise ProtocolError(
-            ProtocolIssue(
-                FailureClass.REQUEST_ERROR if client else FailureClass.ENGINE_UNHEALTHY,
-                issue.code,
-                request_id,
-                issue.message,
-            )
-        )
-    return Frame(frame_type, payload)
-
-
-def encode_message(
-    message: Message, limits: ProtocolLimits = ProtocolLimits()
-) -> Frame:
-    """Validate and encode one typed runtime message into a payload frame."""
-
+def _cancel_frame(cancel: CancelFrame) -> bytearray:
     try:
-        return _encode_message(message, limits)
+        if not _u64(cancel.request_id, "cancel request id"):
+            raise ValueError("cancel request id must be non-zero")
+    except ValueError as error:
+        _fail(FailureClass.REQUEST_ERROR, IssueCode.INVALID_REQUEST_ID, str(error))
+    frame = _frame(FrameType.CANCEL, _CANCEL.size)
+    _CANCEL.pack_into(frame, FRAME_HEADER_BYTES, cancel.request_id)
+    return frame
+
+
+def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
+    request_id = response.request_id if type(response.request_id) is int else 0
+    try:
+        request_id = _u64(response.request_id, "mask response request id")
+        mask_request_id = _u64(response.mask_request_id, "mask request id")
+        if not request_id or not mask_request_id:
+            raise ValueError("mask response request ids must be non-zero")
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_REQUEST_ID,
+            str(error),
+            request_id,
+        )
+    try:
+        mask = _mask_payload(response.mask_words)
+        if not mask or len(mask) // 4 > MAX_MASK_WORDS:
+            raise ValueError("mask response word count exceeds its limit")
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.LIMIT_EXCEEDED,
+            str(error),
+            request_id,
+        )
+    frame = _frame(FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask))
+    _MASK_RESPONSE.pack_into(
+        frame, FRAME_HEADER_BYTES, request_id, mask_request_id, len(mask) // 4
+    )
+    frame[FRAME_HEADER_BYTES + _MASK_RESPONSE.size :] = mask
+    return frame
+
+
+def _status_request_frame(request: StatusRequestFrame) -> bytearray:
+    try:
+        correlation_id = _u64(request.correlation_id, "status correlation id")
+    except ValueError as error:
+        _fail(FailureClass.REQUEST_ERROR, IssueCode.INTEGER_OVERFLOW, str(error))
+    frame = _frame(FrameType.STATUS_REQUEST, _STATUS_REQUEST.size)
+    _STATUS_REQUEST.pack_into(frame, FRAME_HEADER_BYTES, correlation_id)
+    return frame
+
+
+def serialize_message(message: ClientMessage) -> bytearray:
+    """Validate and serialize one client message as a whole frame, built in
+    one buffer: a request's image pixels are copied once."""
+    try:
+        if isinstance(message, RequestFrame):
+            return _request_frame(message)
+        if isinstance(message, CancelFrame):
+            return _cancel_frame(message)
+        if isinstance(message, MaskResponseFrame):
+            return _mask_response_frame(message)
+        if isinstance(message, StatusRequestFrame):
+            return _status_request_frame(message)
     except MemoryError as error:
         raise ProtocolError(
-            _allocation_issue("allocation failed while encoding protocol message")
+            _allocation_issue("allocation failed while serializing a client frame")
         ) from error
+    _fail(
+        FailureClass.PROTOCOL_FATAL,
+        IssueCode.UNKNOWN_FRAME_TYPE,
+        "message is not a native protocol client message",
+    )
 
 
-def _checked_frame(frame: Frame, limits: ProtocolLimits) -> tuple[FrameType, bytes]:
-    _check_limits(limits)
+def _checked_frame(frame: Frame) -> tuple[FrameType, bytes]:
     try:
         frame_type = FrameType(frame.type)
     except (TypeError, ValueError) as error:
@@ -1368,19 +895,16 @@ def _checked_frame(frame: Frame, limits: ProtocolLimits) -> tuple[FrameType, byt
     try:
         payload = _bytes(frame.payload, "frame payload")
     except ValueError as error:
-        _fail(
-            FailureClass.PROTOCOL_FATAL,
-            IssueCode.INVALID_PAYLOAD_LENGTH,
-            str(error),
-        )
-    _raise_issue(_payload_length_issue(frame_type, len(payload), limits))
+        _fatal(IssueCode.INVALID_PAYLOAD_LENGTH, str(error))
+    if issue := _payload_length_issue(frame_type, len(payload)):
+        raise ProtocolError(issue)
     return frame_type, payload
 
 
-def serialize_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> bytes:
+def serialize_frame(frame: Frame) -> bytes:
     """Serialize a validated low-level frame with a strict runtime header."""
 
-    frame_type, payload = _checked_frame(frame, limits)
+    frame_type, payload = _checked_frame(frame)
     try:
         return (
             _HEADER.pack(
@@ -1397,22 +921,6 @@ def serialize_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> 
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing protocol frame")
-        ) from error
-
-
-def serialize_message(
-    message: Message,
-    limits: ProtocolLimits = ProtocolLimits(),
-) -> bytes | bytearray:
-    """Validate and serialize one typed message as a whole frame. A request
-    frame is built in place, so its image pixels are copied once."""
-    if not isinstance(message, RequestFrame):
-        return serialize_frame(encode_message(message, limits), limits)
-    try:
-        return _request_frame(message, limits)
-    except MemoryError as error:
-        raise ProtocolError(
-            _allocation_issue("allocation failed while serializing a request frame")
         ) from error
 
 
@@ -1442,309 +950,177 @@ def refresh_request_deadline(frame: bytes, now_unix_micros: int) -> bytes:
     return frame[: _HEADER.size] + head + frame[_HEADER.size + _REQUEST_HEAD.size :]
 
 
-def _decode_enum(
-    value: int,
-    enum_type: type[IntEnum],
-    label: str,
-    failure: FailureClass,
-    request_id: int = 0,
-) -> IntEnum:
-    try:
-        return _enum_value(value, enum_type, label)
-    except ValueError as error:
-        _fail(failure, IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
-
-
-def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
-    (
-        request_id,
-        priority,
-        constraint,
-        absolute_deadline,
-        remaining_deadline,
-        max_output,
-        prompt_count,
-        image_span_count,
-        temperature,
-        top_p,
-        top_k,
-        presence_penalty,
-        frequency_penalty,
-        repetition_penalty,
-        min_p,
-        seed,
-        return_progress,
-        score_count,
-        generation_prompt_tokens,
-        flags,
-    ) = _REQUEST.unpack_from(payload)
-    if return_progress > 1:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_ENUM_VALUE,
-            "return_progress must be a boolean",
-            request_id,
-        )
-    if score_count > MAX_SCORE_TOKENS:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_COUNT,
-            "score option count exceeds its limit",
-            request_id,
-        )
-    if prompt_count > limits.max_prompt_tokens:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            "prompt token count exceeds its limit",
-            request_id,
-        )
-    if image_span_count > limits.max_image_spans:
-        _fail(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.LIMIT_EXCEEDED,
-            "image span count exceeds its limit",
-            request_id,
-        )
-    try:
-        prompt = _unpack_prefix_words(payload, _REQUEST.size, prompt_count)
-        cursor = _REQUEST.size + 4 * prompt_count
-        image_spans = []
-        for _ in range(image_span_count):
-            image_spans.append(ImageSpan(*_IMAGE_SPAN.unpack_from(payload, cursor)))
-            cursor += _IMAGE_SPAN.size
-        score_bytes = 4 * score_count
-        score_offset = len(payload) - score_bytes
-        if score_offset < cursor:
-            raise ValueError("score tokens")
-        image_pixels = payload[cursor:score_offset]
-        if len(image_pixels) != sum(span.pixel_bytes for span in image_spans):
-            raise ValueError("image pixels")
-        score_tokens = _unpack_prefix_words(payload, score_offset, score_count)
-    except (ValueError, struct.error):
-        _fail(
-            FailureClass.REQUEST_ERROR,
+def _tail(
+    payload: bytes, offset: int, count: int, code: str, label: str, request_id: int
+) -> tuple:
+    """The ``count`` words (``I``) or floats (``f``) that end an event payload."""
+    if len(payload) - offset != count * 4:
+        _fatal(
             IssueCode.INVALID_PAYLOAD_LENGTH,
-            "prompt count does not match the binary token payload",
+            f"{label} count does not match the binary event payload",
             request_id,
         )
-    request = RequestFrame(
-        request_id,
-        _decode_enum(
-            priority,
-            RequestPriority,
-            "request priority",
-            FailureClass.REQUEST_ERROR,
-            request_id,
-        ),
-        absolute_deadline,
-        remaining_deadline,
-        max_output,
-        prompt,
-        SamplingParameters(
-            temperature,
-            top_p,
-            top_k,
-            presence_penalty,
-            frequency_penalty,
-            repetition_penalty,
-            min_p,
-        ),
-        seed,
-        _decode_enum(
-            constraint,
-            ConstraintMode,
-            "constraint mode",
-            FailureClass.REQUEST_ERROR,
-            request_id,
-        ),
-        tuple(image_spans),
-        bytes(image_pixels),
-        bool(return_progress),
-        score_tokens,
-        generation_prompt_tokens,
-        RequestFlag(flags),
-    )
-    _validated_request(request, limits)
-    return request
+    values = array.array(code)
+    values.frombytes(payload[offset:])
+    return tuple(values)
 
 
-def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Message:
-    frame_type, payload = _checked_frame(frame, limits)
-    if frame_type is FrameType.REQUEST:
-        return _decode_request(payload, limits)
-    if frame_type is FrameType.CANCEL:
-        message = CancelFrame(_CANCEL.unpack(payload)[0])
-        _raise_issue(_cancel_issue(message))
-        return message
-    if frame_type is FrameType.MASK_RESPONSE:
-        request_id, mask_request_id, count = _MASK_RESPONSE.unpack_from(payload)
-        if count > limits.max_mask_words:
-            _fail(
-                FailureClass.REQUEST_ERROR,
-                IssueCode.LIMIT_EXCEEDED,
-                "mask response word count exceeds its limit",
-                request_id,
-            )
-        try:
-            words = _unpack_words(payload, _MASK_RESPONSE.size, count)
-        except ValueError:
-            _fail(
-                FailureClass.REQUEST_ERROR,
-                IssueCode.INVALID_PAYLOAD_LENGTH,
-                "mask word count does not match the binary payload",
-                request_id,
-            )
-        message = MaskResponseFrame(request_id, mask_request_id, words)
-        _raise_issue(_mask_response_issue(message, limits))
-        return message
-    if frame_type is FrameType.STATUS_REQUEST:
-        return StatusRequestFrame(_STATUS_REQUEST.unpack(payload)[0])
+def _decode_event(frame: Frame) -> EngineEvent:
+    frame_type, payload = _checked_frame(frame)
     if frame_type is FrameType.READY:
-        message = ReadyEvent(*_READY.unpack(payload))
-        _raise_issue(_ready_issue(message, FailureClass.PROTOCOL_FATAL))
-        return message
+        concurrent, context, vision = _READY.unpack(payload)
+        if vision > 1:
+            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready vision must be a boolean")
+        if not concurrent or not context:
+            _fatal(IssueCode.INVALID_COUNT, "ready event capacities must be non-zero")
+        return ReadyEvent(concurrent, context, bool(vision))
     if frame_type is FrameType.START:
-        request_id, disposition, lane, matched, capacity = _START.unpack(payload)
-        message = StartEvent(
-            request_id,
-            _decode_enum(
-                disposition,
-                CacheDisposition,
-                "cache disposition",
-                FailureClass.PROTOCOL_FATAL,
-                request_id,
-            ),
-            lane,
-            matched,
-            capacity,
-        )
-        _raise_issue(_start_issue(message, FailureClass.PROTOCOL_FATAL))
-        return message
+        request_id, lane, matched = _START.unpack(payload)
+        if not request_id:
+            _fatal(
+                IssueCode.INVALID_REQUEST_ID, "start event request id must be non-zero"
+            )
+        return StartEvent(request_id, lane, matched)
     if frame_type is FrameType.PROMPT_PROGRESS:
-        message = PromptProgressEvent(*_PROMPT_PROGRESS.unpack(payload))
-        _raise_issue(_progress_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
+        request_id, processed, elapsed = _PROMPT_PROGRESS.unpack(payload)
+        if not request_id or processed > MAX_PROMPT_TOKENS:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "prompt progress id or token count is invalid",
+                request_id,
+            )
+        return PromptProgressEvent(request_id, processed, elapsed)
     if frame_type is FrameType.TOKENS:
         request_id, offset, count = _TOKENS.unpack_from(payload)
-        if count > limits.max_token_batch:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.LIMIT_EXCEEDED,
-                "tokens event batch size exceeds its limit",
+        tokens = _tail(payload, _TOKENS.size, count, "I", "token", request_id)
+        if not request_id:
+            _fatal(
+                IssueCode.INVALID_REQUEST_ID, "tokens event request id must be non-zero"
+            )
+        if not tokens:
+            _fatal(
+                IssueCode.LIMIT_EXCEEDED, "tokens event carries no token", request_id
+            )
+        if offset + len(tokens) > 0xFFFFFFFF:
+            _fatal(
+                IssueCode.INTEGER_OVERFLOW,
+                "tokens event sequence range overflows uint32",
                 request_id,
             )
-        try:
-            tokens = _unpack_words(payload, _TOKENS.size, count)
-        except ValueError:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.INVALID_PAYLOAD_LENGTH,
-                "token count does not match the binary event payload",
-                request_id,
-            )
-        message = TokensEvent(request_id, offset, tokens)
-        _raise_issue(_tokens_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
+        return TokensEvent(request_id, offset, tokens)
     if frame_type is FrameType.MASK_REQUEST:
         request_id, mask_request_id, words_per_mask, count = _MASK_REQUEST.unpack_from(
             payload
         )
-        if count > limits.max_simulation_tokens:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.LIMIT_EXCEEDED,
-                "mask request simulation token count exceeds its limit",
-                request_id,
-            )
-        try:
-            tokens = _unpack_words(payload, _MASK_REQUEST.size, count)
-        except ValueError:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.INVALID_PAYLOAD_LENGTH,
-                "simulation token count does not match the binary event payload",
-                request_id,
-            )
-        message = MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
-        _raise_issue(_mask_request_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
-    if frame_type is FrameType.DONE:
-        values = _DONE.unpack_from(payload)
-        request_id = values[0]
-        score_count = struct.unpack_from("<I", payload, _DONE.size)[0]
-        try:
-            logits = _unpack_floats(payload, _DONE.size + 4, score_count)
-        except ValueError:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
-                IssueCode.INVALID_PAYLOAD_LENGTH,
-                "option logit count does not match the binary event payload",
-                request_id,
-            )
-        message = DoneEvent(
-            request_id,
-            _decode_enum(
-                values[1],
-                FinishReason,
-                "finish reason",
-                FailureClass.PROTOCOL_FATAL,
-                request_id,
-            ),
-            *values[2:],
-            logits,
+        tokens = _tail(
+            payload, _MASK_REQUEST.size, count, "I", "simulation token", request_id
         )
-        _raise_issue(_done_issue(message, FailureClass.PROTOCOL_FATAL))
-        return message
+        if not request_id or not mask_request_id:
+            _fatal(
+                IssueCode.INVALID_REQUEST_ID,
+                "mask request ids must be non-zero",
+                request_id,
+            )
+        if not words_per_mask:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "mask request dimensions are invalid",
+                request_id,
+            )
+        if words_per_mask * (len(tokens) + 1) > MAX_MASK_WORDS:
+            _fatal(
+                IssueCode.LIMIT_EXCEEDED,
+                "mask request output would exceed the mask limit",
+                request_id,
+            )
+        return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
+    if frame_type is FrameType.DONE:
+        request_id, reason, *counts, logit_count = _DONE.unpack_from(payload)
+        logits = _tail(
+            payload, _DONE.size, logit_count, "f", "option logit", request_id
+        )
+        try:
+            reason = FinishReason(reason)
+        except ValueError:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "done finish reason is invalid",
+                request_id,
+            )
+        if not request_id:
+            _fatal(
+                IssueCode.INVALID_REQUEST_ID, "done event request id must be non-zero"
+            )
+        event = DoneEvent(request_id, reason, *counts, logits)
+        if logits and (
+            len(logits) < MIN_SCORE_TOKENS
+            or not all(map(math.isfinite, logits))
+            or reason is not FinishReason.STOP
+            or event.completion_tokens
+            or event.decode_micros
+        ):
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "scored done events need 2..255 finite logits, stop, and no "
+                "completion or decode activity",
+                request_id,
+            )
+        return event
     if frame_type is FrameType.ERROR:
         failure, retryable, request_id, code_bytes, message_bytes = _ERROR.unpack_from(
             payload
         )
         if retryable > 1 or code_bytes + message_bytes != len(payload) - _ERROR.size:
-            _fail(
-                FailureClass.PROTOCOL_FATAL,
+            _fatal(
                 IssueCode.INVALID_PAYLOAD_LENGTH,
                 "error string lengths do not match the frame payload",
             )
-        code_start = _ERROR.size
-        message_start = code_start + code_bytes
         try:
             classification = FailureClass(failure)
-        except ValueError as error:
-            raise ProtocolError(
-                _issue(
-                    FailureClass.PROTOCOL_FATAL,
-                    IssueCode.INVALID_ERROR_CLASSIFICATION,
-                    "error event classification is invalid",
-                    request_id,
-                )
-            ) from error
-        message = ErrorEvent(
+        except ValueError:
+            _fatal(
+                IssueCode.INVALID_ERROR_CLASSIFICATION,
+                "error event classification is invalid",
+                request_id,
+            )
+        if (classification is FailureClass.REQUEST_ERROR) != bool(request_id):
+            _fatal(
+                IssueCode.INVALID_ERROR_CLASSIFICATION,
+                "only request errors may carry a non-zero request id",
+                request_id,
+            )
+        if (
+            not code_bytes
+            or code_bytes > MAX_ERROR_STRING_BYTES
+            or message_bytes > MAX_ERROR_STRING_BYTES
+        ):
+            _fatal(
+                IssueCode.LIMIT_EXCEEDED,
+                "error code or message exceeds its safe limit",
+                request_id,
+            )
+        message_start = _ERROR.size + code_bytes
+        return ErrorEvent(
             classification,
             request_id,
             bool(retryable),
-            payload[code_start:message_start],
+            payload[_ERROR.size : message_start],
             payload[message_start:],
         )
-        _raise_issue(_error_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
     if frame_type is FrameType.STATUS_JSON:
-        correlation_id, schema = _STATUS_JSON.unpack_from(payload)
-        message = StatusJsonEvent(correlation_id, schema, payload[_STATUS_JSON.size :])
-        _raise_issue(_status_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
-    _fail(
-        FailureClass.PROTOCOL_FATAL,
-        IssueCode.UNKNOWN_FRAME_TYPE,
-        "frame type is not defined by native protocol",
-    )
+        (correlation_id,) = _STATUS_JSON.unpack_from(payload)
+        json = payload[_STATUS_JSON.size :]
+        if not json:
+            _fatal(IssueCode.LIMIT_EXCEEDED, "status JSON is empty")
+        return StatusJsonEvent(correlation_id, json)
+    _fatal(IssueCode.UNKNOWN_FRAME_TYPE, "frame type is not a native protocol event")
 
 
-def decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Message:
-    """Decode and strictly validate one typed payload frame."""
+def decode_frame(frame: Frame) -> EngineEvent:
+    """Decode and strictly validate one engine event."""
 
     try:
-        return _decode_frame(frame, limits)
+        return _decode_event(frame)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while decoding protocol message")
@@ -1752,20 +1128,16 @@ def decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Mes
 
 
 class FrameParser:
-    """Incremental, one-frame-at-a-time runtime stream parser."""
+    """Incremental, one-frame-at-a-time parser of engine events. A client
+    frame type is an unknown frame type."""
 
-    def __init__(self, limits: ProtocolLimits = ProtocolLimits()):
-        self._limits = limits
+    def __init__(self):
         self._header = bytearray()
         self._reading_payload = False
-        self._current_type = FrameType.REQUEST
+        self._current_type = FrameType.READY
         self._expected_payload_bytes = 0
         self._payload = bytearray()
-        self._terminal_issue = _limits_issue(limits)
-
-    @property
-    def failed(self) -> bool:
-        return self._terminal_issue is not None
+        self._terminal_issue: ProtocolIssue | None = None
 
     def _fail(self, consumed: int, issue: ProtocolIssue) -> ParseStep:
         self._terminal_issue = issue
@@ -1799,14 +1171,13 @@ class FrameParser:
                 IssueCode.INVALID_HEADER_SIZE,
                 "native protocol frame header must be exactly 24 bytes",
             )
-        try:
-            self._current_type = FrameType(raw_type)
-        except ValueError:
+        if raw_type not in _EVENT_TYPES:
             return _issue(
                 FailureClass.PROTOCOL_FATAL,
                 IssueCode.UNKNOWN_FRAME_TYPE,
-                "frame type is not defined by native protocol",
+                "frame type is not a native protocol event",
             )
+        self._current_type = FrameType(raw_type)
         if flags:
             return _issue(
                 FailureClass.PROTOCOL_FATAL,
@@ -1819,9 +1190,7 @@ class FrameParser:
                 IssueCode.NON_ZERO_RESERVED_FIELD,
                 "native protocol reserved header field must be zero",
             )
-        if issue := _payload_length_issue(
-            self._current_type, payload_bytes, self._limits
-        ):
+        if issue := _payload_length_issue(self._current_type, payload_bytes):
             return issue
         self._expected_payload_bytes = payload_bytes
         self._payload.clear()

@@ -10,19 +10,6 @@
 #include <variant>
 
 namespace splash::engine {
-namespace {
-
-protocol::CacheDisposition mapCacheDisposition(EngineCacheStatus status) {
-  switch (status) {
-  case EngineCacheStatus::Miss:
-    return protocol::CacheDisposition::Miss;
-  case EngineCacheStatus::PrefixHit:
-    return protocol::CacheDisposition::PrefixHit;
-  }
-  throw std::logic_error("invalid engine cache status");
-}
-
-} // namespace
 
 NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                              model::Model &model, ByteSink output,
@@ -33,7 +20,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
       statusProvider_(std::move(statusProvider)), clocks_(std::move(clocks)),
       limits_(limits), parser_(limits_),
       core_(config_.engine, cache, model, *this) {
-  if (!config_.engineInstanceId || !output_ || !statusProvider_) {
+  if (!output_ || !statusProvider_) {
     throw std::invalid_argument("invalid native engine loop config");
   }
   if (auto issue = protocol::validateLimits(limits_))
@@ -137,12 +124,9 @@ void NativeRuntime::announceReady() {
   }
   if (ready_)
     throw std::logic_error("ready was already announced");
-  uint64_t features = protocol::kNativeFeatureBits;
-  if (config_.engine.maxImagePatches)
-    features |= protocol::FeatureVision;
-  if (!send(protocol::ReadyEvent{config_.engineInstanceId,
-                                 model::ExecutionLimits::maximumBatchWidth,
-                                 config_.engine.maxContext, features})) {
+  if (!send(protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth,
+                                 config_.engine.maxContext,
+                                 config_.engine.maxImagePatches != 0})) {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;
@@ -158,7 +142,7 @@ std::optional<double> NativeRuntime::millisecondsUntilNextWakeup() const {
   return std::max(0.0, *wakeup - now);
 }
 
-bool NativeRuntime::handle(protocol::Message &message) {
+bool NativeRuntime::handle(protocol::ClientMessage &message) {
   return std::visit(
       [&](auto &typed) -> bool {
         using T = std::decay_t<decltype(typed)>;
@@ -168,14 +152,8 @@ bool NativeRuntime::handle(protocol::Message &message) {
           return handleCancel(typed);
         } else if constexpr (std::is_same_v<T, protocol::MaskResponseFrame>) {
           return handleMask(typed);
-        } else if constexpr (std::is_same_v<T, protocol::StatusRequestFrame>) {
-          return handleStatus(typed);
         } else {
-          protocol::ProtocolIssue issue;
-          issue.failureClass = protocol::FailureClass::ProtocolFatal;
-          issue.code = protocol::IssueCode::InvalidEnumValue;
-          issue.message = "client sent a server-only native protocol message";
-          return handleIssue(std::move(issue));
+          return handleStatus(typed);
         }
       },
       message);
@@ -262,8 +240,7 @@ bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
   std::string json = statusProvider_();
   if (json.empty())
     throw std::runtime_error("empty status document");
-  return send(protocol::StatusJsonEvent{
-      status.correlationId, protocol::kStatusSchemaVersion, std::move(json)});
+  return send(protocol::StatusJsonEvent{status.correlationId, std::move(json)});
 }
 
 bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
@@ -318,10 +295,10 @@ void NativeRuntime::engineError(std::string code, std::string message) {
   closeConnection_ = true;
 }
 
-bool NativeRuntime::send(protocol::Message message) {
+bool NativeRuntime::send(const protocol::EngineEvent &event) {
   if (closeConnection_)
     return false;
-  auto serialized = protocol::serializeMessage(message, limits_);
+  auto serialized = protocol::serializeEvent(event, limits_);
   if (!serialized) {
     // An event the engine cannot put on the wire is an engine defect. Report
     // it once and stop the stream, so the client sees the cause instead of a
@@ -330,7 +307,7 @@ bool NativeRuntime::send(protocol::Message message) {
     closeConnection_ = true;
     if (engineFailure_.empty())
       engineFailure_ = "protocol_encode_failed: " + serialized.issue->message;
-    auto report = protocol::serializeMessage(
+    auto report = protocol::serializeEvent(
         protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                              "protocol_encode_failed",
                              serialized.issue->message},
@@ -371,13 +348,11 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
   }
 }
 
-void NativeRuntime::started(uint64_t requestId, EngineCacheStatus cacheStatus,
-                            uint32_t matchedTokens, uint32_t lane) {
+void NativeRuntime::started(uint64_t requestId, uint32_t matchedTokens,
+                            uint32_t lane) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   telemetry.startedMilliseconds = clocks_.monotonicMilliseconds();
-  send(protocol::StartEvent{requestId, mapCacheDisposition(cacheStatus),
-                            static_cast<int32_t>(lane), matchedTokens,
-                            config_.engine.maxContext});
+  send(protocol::StartEvent{requestId, lane, matchedTokens});
 }
 
 void NativeRuntime::promptProgress(uint64_t requestId,

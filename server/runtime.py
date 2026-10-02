@@ -133,15 +133,9 @@ class Deadline:
 
 
 MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], Sequence[int] | bytes]
-EventCallback: TypeAlias = Callable[["RuntimeCall", wire.Message], None]
+EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
 
-_REQUIRED_READY_FEATURES = int(
-    wire.ReadyFeature.CANCELLATION
-    | wire.ReadyFeature.TOKEN_MASKS
-    | wire.ReadyFeature.STATUS_JSON
-    | wire.ReadyFeature.MULTIPLEXING
-)
 _READ_CHUNK_BYTES = 64 * 1024
 
 
@@ -247,7 +241,7 @@ class RuntimeCall:
         self._client._cancel_call(self)
         return True
 
-    def _emit(self, message: wire.Message) -> None:
+    def _emit(self, message: wire.EngineEvent) -> None:
         with self._lock:
             callback = self._on_event
         if callback is None:
@@ -1126,7 +1120,7 @@ class MultiplexedRuntime:
         # stream unless they arrive as a valid ErrorEvent.
         return ProtocolFatal(issue.describe())
 
-    def _dispatch_message(self, generation: int, message: wire.Message) -> None:
+    def _dispatch_message(self, generation: int, message: wire.EngineEvent) -> None:
         if isinstance(message, wire.ReadyEvent):
             with self._state_lock:
                 if generation != self._generation or self._terminal_error is not None:
@@ -1145,27 +1139,20 @@ class MultiplexedRuntime:
                     raise EngineUnhealthy("native ReadyEvent timed out")
                 first = self._first_ready
                 if first is None:
-                    if int(message.feature_bits) & _REQUIRED_READY_FEATURES != (
-                        _REQUIRED_READY_FEATURES
-                    ):
-                        raise ProtocolFatal(
-                            "native ReadyEvent is missing required native "
-                            "protocol features"
-                        )
                     self._first_ready = message
                 elif (
                     message.max_context_tokens,
                     message.max_concurrent_requests,
-                    message.feature_bits,
+                    message.vision,
                 ) != (
                     first.max_context_tokens,
                     first.max_concurrent_requests,
-                    first.feature_bits,
+                    first.vision,
                 ):
                     # The frontend serves the first engine's limits. Every
                     # relaunch would load the model to announce them again.
                     self._fatal_error = EngineUnhealthy(
-                        "native context window, concurrency or features "
+                        "native context window, concurrency or vision "
                         "changed; restart the Splash server"
                     )
                     raise self._fatal_error.restate()

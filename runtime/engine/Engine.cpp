@@ -803,10 +803,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   scheduler_.resourcesReady(active.request.id, resumeBoundary);
   armNextStateBoundary(active);
   cache_.recordLookup(lookup);
-  events_.started(active.request.id,
-                  resumeBoundary ? EngineCacheStatus::PrefixHit
-                                 : EngineCacheStatus::Miss,
-                  resumeBoundary, *active.lane);
+  events_.started(active.request.id, resumeBoundary, *active.lane);
   if (active.request.returnProgress) {
     active.reportedPromptTokens = resumeBoundary;
     events_.promptProgress(active.request.id, resumeBoundary);

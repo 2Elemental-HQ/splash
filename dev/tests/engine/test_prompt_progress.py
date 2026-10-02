@@ -190,9 +190,7 @@ class PromptProgressTests(unittest.TestCase):
             result = RuntimeCall(
                 None, 1, 1, replace(request(10), return_progress=enabled), None, None
             )
-            result._record_start(
-                wire.StartEvent(1, wire.CacheDisposition.PREFIX_HIT, 0, 1, 8192)
-            )
+            result._record_start(wire.StartEvent(1, 0, 1))
             return result
 
         self.assertIsNotNone(

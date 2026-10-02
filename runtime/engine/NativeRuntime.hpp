@@ -17,7 +17,6 @@ namespace splash::engine {
 
 struct NativeLoopConfig {
   engine::EngineConfig engine;
-  uint64_t engineInstanceId = 1;
   RuntimeMetrics *metrics = nullptr;
 };
 
@@ -106,7 +105,7 @@ private:
     uint64_t expectedWords = 0;
   };
 
-  bool handle(protocol::Message &message);
+  bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
@@ -117,10 +116,10 @@ private:
                     bool retryable = false);
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
-  bool send(protocol::Message message);
+  bool send(const protocol::EngineEvent &event);
 
-  void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-               uint32_t matchedTokens, uint32_t lane) override;
+  void started(uint64_t requestId, uint32_t matchedTokens,
+               uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
                       uint32_t acceptedDraftTokens,

@@ -9,9 +9,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from dev.tests.engine import native_peer
 from dev.tests.engine.test_native_backend import FakeTokenizer as NativeTokenizer
 from dev.tests.engine.test_native_backend import make_job
-from dev.tests.engine.test_runtime import READY_FEATURES, FakeFactory
+from dev.tests.engine.test_runtime import READY, FakeFactory
 from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
 from install import launcher
 from server import backend as backend_api
@@ -285,11 +286,7 @@ class ServerRecoveryTests(unittest.TestCase):
 
         def respond(process, message):
             if isinstance(message, wire.StatusRequestFrame):
-                process.send(
-                    wire.StatusJsonEvent(
-                        message.correlation_id, wire.STATUS_SCHEMA_VERSION, payload
-                    )
-                )
+                process.send(wire.StatusJsonEvent(message.correlation_id, payload))
 
         factory = FakeFactory(handler=respond, initial_output=b"")
         runtime = engine_runtime.MultiplexedRuntime(
@@ -304,7 +301,7 @@ class ServerRecoveryTests(unittest.TestCase):
             for _ in range(10):
                 self.assertFalse(backend.can_submit())
             self.assertEqual(len(factory.processes), 1)
-            factory.processes[0].send(wire.ReadyEvent(1000, 4, 131072, READY_FEATURES))
+            factory.processes[0].send(READY)
             for waiter in waiters:
                 self.assertTrue(waiter.result(1))
         self.wait_until(lambda: not backend.status_refresh_inflight)
@@ -408,53 +405,43 @@ class ServerRecoveryTests(unittest.TestCase):
             self.assertNotIn("error", transport)
 
     def test_startup_protocol_failure_ends_with_one_error_line(self):
-        missing = READY_FEATURES & ~wire.ReadyFeature.MULTIPLEXING
         runtime_type = engine_runtime.MultiplexedRuntime
-        for output, reason in (
-            (
-                wire.serialize_message(wire.ReadyEvent(1000, 4, 131072, missing)),
-                "missing required native protocol features",
+        factory = FakeFactory(
+            initial_output=b"not a frame".ljust(wire.FRAME_HEADER_BYTES, b"\0")
+        )
+        with (
+            mock.patch.object(api, "parse_args", return_value=main_args()),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
-            (b"not a frame".ljust(wire.FRAME_HEADER_BYTES, b"\0"), "bad_magic"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(
+                api.engine_runtime,
+                "MultiplexedRuntime",
+                side_effect=lambda _command, **options: runtime_type(
+                    process_factory=factory, **options
+                ),
+            ),
+            mock.patch.object(api, "FrontendServer"),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaisesRegex(SystemExit, "1"),
         ):
-            with self.subTest(reason=reason):
-                factory = FakeFactory(initial_output=output)
-                with (
-                    mock.patch.object(api, "parse_args", return_value=main_args()),
-                    mock.patch.object(api, "load_thinking_key", return_value=None),
-                    mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
-                    ),
-                    mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates"),
-                    mock.patch.object(
-                        api.engine_runtime,
-                        "MultiplexedRuntime",
-                        side_effect=lambda _command, **options: runtime_type(
-                            process_factory=factory, **options
-                        ),
-                    ),
-                    mock.patch.object(api, "FrontendServer"),
-                    mock.patch.object(api.signal, "signal"),
-                    mock.patch("sys.stdout", new_callable=io.StringIO),
-                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
-                    self.assertRaisesRegex(SystemExit, "1"),
-                ):
-                    api.main()
-                (line,) = stderr.getvalue().splitlines()
-                self.assertIn("Error · ", line)
-                self.assertIn(reason, line)
-                self.assertIsNotNone(factory.processes[0].poll())
+            api.main()
+        (line,) = stderr.getvalue().splitlines()
+        self.assertIn("Error · ", line)
+        self.assertIn("bad_magic", line)
+        self.assertIsNotNone(factory.processes[0].poll())
 
     def test_restarted_native_must_match_the_original_ready_event(self):
-        original = wire.ReadyEvent(1001, 4, 131072, READY_FEATURES)
         for restarted in (
-            original,
-            dataclasses.replace(original, max_context_tokens=65536),
-            dataclasses.replace(original, max_concurrent_requests=1),
-            dataclasses.replace(
-                original, feature_bits=READY_FEATURES | wire.ReadyFeature.VISION
-            ),
+            READY,
+            dataclasses.replace(READY, max_context_tokens=65536),
+            dataclasses.replace(READY, max_concurrent_requests=1),
+            dataclasses.replace(READY, vision=True),
         ):
             with self.subTest(restarted=restarted):
                 factory = FakeFactory()
@@ -464,8 +451,8 @@ class ServerRecoveryTests(unittest.TestCase):
                     with mock.patch.object(runtime._crash_trace, "dump"):
                         factory.processes[0].kill()
                         self.wait_until(lambda: not runtime.ready)
-                        factory.initial_output = wire.serialize_message(restarted)
-                        if restarted is original:
+                        factory.initial_output = native_peer.serialize_event(restarted)
+                        if restarted is READY:
                             self.assertTrue(runtime.wait_ready(1))
                         else:
                             # The difference would recur on every relaunch.

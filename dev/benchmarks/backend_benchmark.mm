@@ -38,16 +38,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-std::string_view cacheStatusName(EngineCacheStatus status) noexcept {
-  switch (status) {
-  case EngineCacheStatus::Miss:
-    return "miss";
-  case EngineCacheStatus::PrefixHit:
-    return "prefix_hit";
-  }
-  std::terminate();
-}
-
 double milliseconds(Clock::time_point value) {
   return std::chrono::duration<double, std::milli>(value.time_since_epoch())
       .count();
@@ -82,10 +72,10 @@ public:
     ++batchSequence_;
   }
 
-  void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-               uint32_t matchedTokens, uint32_t) override {
+  void started(uint64_t requestId, uint32_t matchedTokens,
+               uint32_t) override {
     Observation &value = observations_[requestId];
-    value.cacheStatus = cacheStatusName(cacheStatus);
+    value.cacheStatus = matchedTokens ? "prefix_hit" : "miss";
     value.matchedTokens = matchedTokens;
   }
 

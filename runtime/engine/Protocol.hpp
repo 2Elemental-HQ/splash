@@ -13,6 +13,9 @@
 #include <variant>
 #include <vector>
 
+// The engine decodes client frames and encodes engine events;
+// server/protocol.py does the reverse. dev/tests/engine/protocol_golden.txt
+// pins the bytes both sides agree on.
 namespace splash::protocol {
 
 inline constexpr uint16_t kProtocolVersion = 7;
@@ -71,7 +74,6 @@ enum class IssueCode : uint16_t {
   InvalidCount,
   InvalidConstraint,
   InvalidErrorClassification,
-  InvalidStatusSchema,
   LimitExceeded,
   IntegerOverflow,
   AllocationFailure,
@@ -169,6 +171,23 @@ struct RequestFrame {
   bool operator==(const RequestFrame &) const = default;
 };
 
+// The other payloads, in wire order; counts precede what they count, and
+// the variable parts come last:
+//   Cancel         u64 requestId
+//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
+//   StatusRequest  u64 correlationId
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
+//   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
+//   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
+//   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
+//                  u32 count, u32 simulation tokens
+//   Done           u64 requestId, u8 reason, u32 promptTokens,
+//                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
+//                  u64 wallMicros, u32 count, f32 option logits
+//   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
+//                  bytes, u32 message bytes, the code, the message
+//   StatusJson     u64 correlationId, the JSON
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -189,42 +208,21 @@ struct StatusRequestFrame {
   bool operator==(const StatusRequestFrame &) const = default;
 };
 
-enum ReadyFeature : uint64_t {
-  FeatureCancellation = 1ULL << 0,
-  FeatureTokenMasks = 1ULL << 1,
-  FeatureStatusJson = 1ULL << 2,
-  FeatureMultiplexing = 1ULL << 3,
-  // Requests may carry image spans. A model serving without vision leaves it
-  // clear and rejects each image request with a request error.
-  FeatureVision = 1ULL << 4,
-};
-
-// The native runtime implements every other feature; ReadyEvent announces
-// them all, and FeatureVision when the loaded model has vision.
-inline constexpr uint64_t kNativeFeatureBits =
-    FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
-    FeatureMultiplexing;
-
 struct ReadyEvent {
-  uint64_t engineInstanceId = 0;
   uint32_t maxConcurrentRequests = 0;
   uint32_t maxContextTokens = 0;
-  uint64_t featureBits = 0;
+  // Requests may carry image spans. A model serving without vision rejects
+  // each image request with a request error.
+  bool vision = false;
 
   bool operator==(const ReadyEvent &) const = default;
 };
 
-enum class CacheDisposition : uint8_t {
-  Miss = 0,
-  PrefixHit = 1,
-};
-
 struct StartEvent {
   uint64_t requestId = 0;
-  CacheDisposition cacheDisposition = CacheDisposition::Miss;
-  int32_t lane = -1;
+  uint32_t lane = 0;
+  // The cached prefix the request starts from; zero for a cold start.
   uint32_t matchedPromptTokens = 0;
-  uint32_t capacityTokens = 0;
 
   bool operator==(const StartEvent &) const = default;
 };
@@ -282,22 +280,21 @@ struct ErrorEvent {
   bool operator==(const ErrorEvent &) const = default;
 };
 
-// JSON is deliberately opaque to the transport.  Its independent schema
-// number is always present, and the frame length carries the exact JSON byte
-// count (including whitespace) without line or C-string assumptions.
+// JSON is deliberately opaque to the transport: the document carries its
+// own schema_version, and the frame length carries the exact JSON byte count
+// (including whitespace) without line or C-string assumptions.
 struct StatusJsonEvent {
   uint64_t correlationId = 0;
-  uint32_t schemaVersion = kStatusSchemaVersion;
   std::string json;
 
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
-using Message =
-    std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                 StatusRequestFrame, ReadyEvent, StartEvent,
-                 PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
-                 ErrorEvent, StatusJsonEvent>;
+using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
+                                   StatusRequestFrame>;
+using EngineEvent =
+    std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
+                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;
@@ -306,12 +303,12 @@ struct Frame {
   bool operator==(const Frame &) const = default;
 };
 
-[[nodiscard]] ProtocolResult<Frame>
-encodeMessage(const Message &message, const ProtocolLimits &limits = {});
-[[nodiscard]] ProtocolResult<Message>
-decodeFrame(const Frame &frame, const ProtocolLimits &limits = {});
+[[nodiscard]] ProtocolResult<ClientMessage>
+decodeFrame(const Frame &frame, const ProtocolLimits &limits);
+// The whole frame, header included. An event that breaks its rules is the
+// engine's defect: the issue is EngineUnhealthy.
 [[nodiscard]] ProtocolResult<std::vector<uint8_t>>
-serializeMessage(const Message &message, const ProtocolLimits &limits = {});
+serializeEvent(const EngineEvent &event, const ProtocolLimits &limits);
 
 struct ParseStep {
   size_t consumedBytes = 0;
@@ -319,19 +316,17 @@ struct ParseStep {
   std::optional<ProtocolIssue> issue;
 };
 
-// Incremental one-frame-at-a-time parser.  consume() stops as soon as it
-// yields one complete frame, so callers can process arbitrarily long streams
-// without retaining a batch of frames.  finish() must be called at EOF to
-// turn a partial header or payload into a protocol-fatal truncation.
+// Incremental one-frame-at-a-time parser of client frames.  consume() stops
+// as soon as it yields one complete frame, so callers can process arbitrarily
+// long streams without retaining a batch of frames.  An event type is an
+// unknown frame type.  finish() must be called at EOF to turn a partial
+// header or payload into a protocol-fatal truncation.
 class FrameParser {
 public:
-  explicit FrameParser(ProtocolLimits limits = {});
+  explicit FrameParser(ProtocolLimits limits);
 
   [[nodiscard]] ParseStep consume(std::span<const uint8_t> bytes);
   [[nodiscard]] std::optional<ProtocolIssue> finish();
-  [[nodiscard]] bool failed() const noexcept {
-    return terminalIssue_.has_value();
-  }
 
 private:
   [[nodiscard]] std::optional<ProtocolIssue> parseHeader();

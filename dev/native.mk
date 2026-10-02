@@ -316,17 +316,20 @@ $(TEST_ELASTIC_KV_TEST): runtime/engine/KvPool.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_PROTOCOL_TEST): runtime/engine/Protocol.cpp \
-		dev/tests/engine/protocol_test.cpp | $(ENGINE_TEST_BUILD)
+		dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/protocol_test.cpp \
+		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
+		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_BOOTSTRAP_TEST): dev/tests/engine/runtime_bootstrap_test.mm \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+		dev/tests/engine/ProtocolPeer.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		dev/tests/engine/ProtocolPeer.cpp $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_RESOURCES_TEST): dev/tests/engine/runtime_resources_test.mm \
@@ -647,7 +650,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_CACHE_TEST)
 	$(TEST_KV_FIRST_ENGINE_TEST)
 	$(TEST_ELASTIC_KV_TEST)
-	$(TEST_PROTOCOL_TEST)
+	$(TEST_PROTOCOL_TEST) dev/tests/engine/protocol_golden.txt
 	$(TEST_NATIVE_LOOP_TEST)
 	$(TEST_FD_TRANSPORT_TEST)
 	$(TEST_BOOTSTRAP_TEST)
@@ -759,6 +762,7 @@ $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \
 		runtime/engine/FdTransport.cpp \
+		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_fd_transport_test.cpp
 $(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN): \
 		dev/tuning/Tuning.cpp \
