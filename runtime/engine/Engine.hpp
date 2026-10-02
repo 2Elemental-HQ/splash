@@ -308,11 +308,11 @@ private:
   // host reuses what the engine holds; when that gives nothing, a request in
   // service retries as one (EngineConfig::serving), which only the engine's
   // limit and critical pressure refuse. A refusal from the engine's limit
-  // reclaims cache; when that gives nothing, fallback may let go of what the
-  // request itself pins, and the reclaim goes on.
+  // reclaims cache; when that gives nothing, fallback, given the denial so
+  // far, may let go of what the request itself pins, and the reclaim goes on.
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
-                              const std::function<bool()> &fallback = {})
+                              const std::function<bool(const Denial &)> &fallback = {})
       -> Allocation<std::invoke_result_t<Attempt &>>;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,

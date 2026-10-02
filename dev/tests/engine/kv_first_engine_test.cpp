@@ -2708,6 +2708,117 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
           "admission waited on its own cache pin instead of recomputing cold");
 }
 
+// A start refused memory beside a resident lane is held back by that lane
+// (judge() yields): it waits with the state its prompt resumes from still
+// cached, rather than release its lease to the reclaim and evict that state.
+void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  const std::vector<uint32_t> prompt(65, 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  executor.decodeFinishes = false;
+  auto lane = request(2, std::vector<uint32_t>(65, 2));
+  lane.maxNewTokens = 1000;
+  engine.submit(std::move(lane));
+  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+            "the resident lane did not decode");
+  // The budget refuses the start while the lane is resident.
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 3 && executor.requests.contains(2);
+  };
+  const uint32_t prefillRows = executor.prefillRows;
+  engine.submit(request(3, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(resources.probe(prompt).cachedTokens() == 64 &&
+              engine.resourceWaitSnapshot(now).memory == 1 &&
+              executor.prefillRows == prefillRows,
+          "a start held back by a resident lane gave up its own cached state");
+  executor.decodeFinishes = true;
+  const uint32_t restored = executor.restored;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the held start did not run");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              executor.restored == restored + 64 && events.failedCount == 0,
+          "the held start did not resume from its cached state");
+}
+
+// Memory a state write in flight holds comes back by itself (judge() waits):
+// a start refused memory meanwhile keeps the state its prompt resumes from.
+void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  auto write = std::make_shared<OffloadControl>();
+  resources.beginRequest(999);
+  require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(999, std::vector<uint32_t>(64, 9), 64),
+      std::make_shared<OffloadState>(write));
+  resources.endRequest(999);
+  require(resources.reclaimOneState(false, 0, false) &&
+              resources.snapshot().stateCache.bytes == 0,
+          "the fixture state was not written");
+  double now = 1;
+  const std::vector<uint32_t> prompt(65, 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  executor.beginGrowthBlocked = [&] { return !write->ready; };
+  engine.submit(request(2, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(resources.probe(prompt).cachedTokens() == 64 &&
+              engine.resourceWaitSnapshot(now).memory == 1 && events.startIds.size() == 1,
+          "a start waiting for a write in flight gave up its own cached state");
+  write->ready = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the waiting start did not run");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.failedCount == 0,
+          "the waiting start did not resume from its cached state");
+}
+
+// A start alone with nothing else to free releases its own lease, and the
+// reclaim writes the state to disk; holding its lane, it looks up again and
+// restores that copy instead of recomputing the prefix.
+void testDroppedLeaseLooksUpAgain() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 17);
+  auto write = std::make_shared<OffloadControl>();
+  write->ready = true;
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  cache.publishCompositeState(cache.publishCommittedBlocks(999, prompt, 64),
+                              std::make_shared<OffloadState>(write));
+  cache.endRequest(999);
+  executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.bytes != 0; };
+  executor.restoreControl->ready = true;
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  require(executor.diskReads == 1 && executor.restored == 64 && executor.prefillRows == 1 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.failedCount == 0,
+          "a start that dropped its lease recomputed the state the reclaim wrote");
+}
+
 void testSingletonCapacityFailureTerminatesCleanly() {
   test::TestKvStorage storage(2, 4096, 1);
   storage.budgetPages = 1;
@@ -7462,6 +7573,9 @@ int main() {
     testRequiredWorkDoesNotReserveAnExtraPage();
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
+    testRefusedStartKeepsItsLeaseBesideAResidentLane();
+    testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
+    testDroppedLeaseLooksUpAgain();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();

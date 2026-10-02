@@ -611,15 +611,19 @@ bool Engine::admit(Request &active, double now) {
   // (anotherResident): it starts through the host's pause once reuse gives
   // nothing.
   const bool inService = !anotherResident(active.request.id);
-  // A useful restore remains pinned throughout ordinary eviction. If that
-  // pin is the last obstacle to admitting even one lane, prefer cold
-  // recomputation over waiting forever for our own cache lease.
+  // The request's own lease goes only when nothing else can free memory
+  // (judge() says Fail: no other lane is resident, nothing is pending, the
+  // host is not refusing). It then starts without the pin rather than wait
+  // for ever, and looks up again once it holds its lane, so a state the
+  // reclaim wrote to disk is restored, not recomputed.
+  bool droppedLease = false;
   const auto state = allocate(
       [&] { return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest); },
-      inService, [&] {
-        if (!lookup.state)
+      inService, [&](const Denial &denial) {
+        if (!lookup.state || judge(denial, active.request.id) != Verdict::Fail)
           return false;
         lookup = {};
+        droppedLease = true;
         return true;
       });
   if (!state.admission.granted()) {
@@ -639,6 +643,8 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(active.request.id);
   active.stateCell = *state.admission.cell;
   active.admission = ++admissions_;
+  if (droppedLease)
+    lookup = cache_.lookup(modelRequest.prompt, active.request.images);
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -1223,7 +1229,7 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
 
 template <class Attempt>
 auto Engine::allocate(Attempt &&attempt, bool inService,
-                      const std::function<bool()> &fallback)
+                      const std::function<bool(const Denial &)> &fallback)
     -> Allocation<std::invoke_result_t<Attempt &>> {
   using Admission = std::invoke_result_t<Attempt &>;
   // Set once a request in service has nothing held left to reuse: from then
@@ -1250,13 +1256,14 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
       admission = tryOnce();
       continue;
     }
+    denial.allocationFailure = admission.allocationFailure;
     denial.pending = reclaimed.pending;
     if (paused && inService && !serving && !reclaimed.pending) {
       serving = true;
       admission = tryOnce();
       continue;
     }
-    if (!paused && fallback && fallback())
+    if (!paused && fallback && fallback(denial))
       continue;
     break;
   }
