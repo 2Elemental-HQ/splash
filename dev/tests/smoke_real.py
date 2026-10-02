@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import http.client
 import io
 import json
@@ -890,15 +891,18 @@ def run_sampling(port: int, model: str) -> None:
         "ignore_eos": chat_body(model, prompt, ignore_eos=True),
     }
     results = {}
-
-    def send(name: str) -> None:
-        results[name] = request(port, "POST", "/v1/chat/completions", bodies[name])
-
-    workers = [threading.Thread(target=send, args=(name,)) for name in bodies]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
+    with concurrent.futures.ThreadPoolExecutor(len(bodies)) as pool:
+        futures = {
+            name: pool.submit(request, port, "POST", "/v1/chat/completions", body)
+            for name, body in bodies.items()
+        }
+        for name, future in futures.items():
+            try:
+                results[name] = future.result(timeout=300)
+            except Exception as error:
+                raise SmokeFailure(
+                    f"concurrent {name} request failed: {error!r}"
+                ) from error
     for name, (code, document) in results.items():
         require(code == 200, f"concurrent {name} request failed: {document!r}")
     calls = results["tool"][1]["choices"][0]["message"].get("tool_calls", [])

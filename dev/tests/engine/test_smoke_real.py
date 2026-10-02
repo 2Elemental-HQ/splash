@@ -460,10 +460,12 @@ class SmokeRealTests(unittest.TestCase):
                 )
 
     def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
-        def serve(repeat=True, arguments=None, ignored=32, heaviest="x"):
+        def serve(repeat=True, arguments=None, ignored=32, heaviest="x", failing=None):
             answers = iter(("first", "second", "second" if repeat else "third"))
 
             def answer(port, method, path, body=None, **_kwargs):
+                if body.get("min_p") == 0.1 and failing == "min_p":
+                    raise TimeoutError("timed out")
                 if body.get("tools"):
                     call = {
                         "function": {
@@ -496,6 +498,7 @@ class SmokeRealTests(unittest.TestCase):
             ("min_p 1 did not answer", serve(heaviest="y")),
             ("tool call failed", serve(arguments={"value": "no"})),
             ("stopped early", serve(ignored=7)),
+            ("concurrent min_p request failed", serve(failing="min_p")),
         ):
             with (
                 self.subTest(failure=failure),
