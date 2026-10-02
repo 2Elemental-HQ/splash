@@ -869,27 +869,6 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
-// A zero table entry is no page: a store through it writes nothing.
-void testZeroEntryStoresNothing(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                                id<MTLComputePipelineState> store) {
-  Case data = makeCase(device, 40, 8, 32);
-  for (id<MTLBuffer> extent : data.pool->extents)
-    std::memset(extent.contents, 0xa5, extent.length);
-  static_cast<SplashKvPage *>(data.pageTableBuffer.contents)[1] = 0;
-  fillCurrent(data);
-  id<MTLCommandBuffer> command = [queue commandBuffer];
-  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-  encodeStore(encoder, store, data);
-  [encoder endEncoding];
-  finish(command);
-  for (id<MTLBuffer> extent : data.pool->extents) {
-    const auto *bytes = static_cast<const uint8_t *>(extent.contents);
-    require(std::all_of(bytes, bytes + extent.length,
-                        [](uint8_t value) { return value == 0xa5; }),
-            "a store through a zero page entry wrote KV");
-  }
-}
-
 void testContract() {
   static_assert(sizeof(Q8PrefillAttentionParams) == 28);
   static_assert(offsetof(Q8PrefillAttentionParams, committed_tokens) == 0);
@@ -945,7 +924,6 @@ void run(const char *libraryPath) {
   testChunkAndSplitReference(device, queue, store, attention);
   testInvalidAttentionParams(device, queue, attention);
   testCommitIndexOverwrite(device, queue, store);
-  testZeroEntryStoresNothing(device, queue, store);
   testBatchedVerifyStore(device, queue, verifyStore);
   std::cout << "q8_chunked_prefill_metal_test: ok\n";
 }

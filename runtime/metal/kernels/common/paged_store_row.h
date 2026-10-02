@@ -39,10 +39,9 @@ inline ulong splash_current_value_index(uint stride, uint head, uint token,
 }
 
 // One lane per dimension stores a current row in its final page slot.
-// INT8 derives a per-row scale; BF16 copies the original bits. A zero table
-// entry has no page and stores nothing. Slots are addressed inside the
-// head's slab of the page: the page index functions at page zero and head
-// zero.
+// INT8 derives a per-row scale; BF16 copies the original bits. Slots are
+// addressed inside the head's slab of the page: the page index functions at
+// page zero and head zero.
 template <uint KVHeads, typename CacheElement>
 __attribute__((always_inline)) inline void splash_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
@@ -52,8 +51,6 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
     uint simd_lane, uint simd_group) {
   uint logical_token = params.committed_tokens + chunk_token;
   const SplashKvPage page = page_table[logical_token / SplashQ8PageTokens];
-  if (!page)
-    return;
   const SplashKvPageTensors<CacheElement> slab =
       SplashKvAddressing<KVHeads, CacheElement>(params.kv, head).page(page);
   uint page_token = logical_token % SplashQ8PageTokens;

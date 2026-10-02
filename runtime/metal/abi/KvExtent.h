@@ -13,7 +13,6 @@
 
 // One KV page as kernels address it: the GPU address of the extent that holds
 // it, 16 KiB-aligned, with the page's index in the extent in the low bits.
-// Zero is no page.
 typedef uint64_t SplashKvPage;
 #define SPLASH_KV_PAGE_INDEX_BITS 14u
 #define SPLASH_KV_PAGE_INDEX_MASK ((1u << SPLASH_KV_PAGE_INDEX_BITS) - 1u)
