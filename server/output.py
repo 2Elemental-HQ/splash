@@ -222,21 +222,27 @@ class StreamingToolCallProjector:
         self._emit_argument(_tool_json(value)[1:-1], events)
 
     def _finish_parameter(self, events):
+        # Only text that may begin the closing marker stays pending, so each
+        # character of a value is scanned and copied a bounded number of times.
         value_end = self.pending.find(self._PARAMETER_CLOSE)
-        if self.streaming_string and value_end < 0:
-            ready, self.pending = hold_partial(self.pending, self._PARAMETER_CLOSE)
-            self._emit_string_value(ready, events)
-            return False
         if value_end < 0:
+            ready, self.pending = hold_partial(self.pending, self._PARAMETER_CLOSE)
+            if self.streaming_string:
+                self._emit_string_value(ready, events)
+            elif ready:
+                self.parameter_value_fragments.append(ready)
             return False
-        raw_value = self.pending[:value_end]
+        tail = self.pending[:value_end]
         self.pending = self.pending[value_end + len(self._PARAMETER_CLOSE) :]
         if self.streaming_string:
-            self._emit_string_value(raw_value, events)
+            self._emit_string_value(tail, events)
             value = "".join(self.parameter_value_fragments)
             self._emit_argument('"', events)
         else:
-            value = _typed_tool_value(raw_value, self.string_schema)
+            self.parameter_value_fragments.append(tail)
+            value = _typed_tool_value(
+                "".join(self.parameter_value_fragments), self.string_schema
+            )
             prefix = "" if len(self.arguments) == 0 else ","
             fragment = (
                 prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)

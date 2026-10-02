@@ -15,7 +15,12 @@ from dev.tests.test_server import (
 from server import api_shapes
 from server import output as model_output
 from server import server as api
-from server.tool_schema import TOOL_CALL_OPEN, ToolPolicy, normalize_tools
+from server.tool_schema import (
+    PARAMETER_CLOSE,
+    TOOL_CALL_OPEN,
+    ToolPolicy,
+    normalize_tools,
+)
 
 SCHEMA = {
     "type": "object",
@@ -567,6 +572,34 @@ class PartialToolOutputTests(unittest.TestCase):
         self.assertEqual(
             [call["function"]["arguments"] for call in expected[1]],
             ['{"city":"Paris"}', '{"city":"Par'],
+        )
+
+    def test_typed_parameter_value_keeps_pending_bounded(self):
+        # A JSON value held whole until its close would be rescanned and
+        # copied by every put, quadratic in its length.
+        schema = {"type": "object", "properties": {"items": {"type": "array"}}}
+        policy = ToolPolicy(
+            {"store": Draft202012Validator(schema)}, {"store": schema}, False, True
+        )
+        items = ["x" * 100] * 2048
+        text = (
+            "<tool_call>\n<function=store>\n<parameter=items>\n"
+            + json.dumps(items)
+            + "\n</parameter>\n</function>\n</tool_call>"
+        )
+        projector = model_output.StreamingToolCallProjector(policy, "typed")
+        projected = []
+        for offset in range(0, len(text), 4):
+            projected += projector.put(text[offset : offset + 4])
+            if projector.state == "parameter_value":
+                self.assertLess(len(projector.pending), len(PARAMETER_CLOSE))
+        self.assertEqual(
+            "".join(
+                value["function"].get("arguments", "")
+                for kind, value in projected
+                if kind == "tool"
+            ),
+            json.dumps({"items": items}, separators=(",", ":")),
         )
 
     def test_closed_calls_still_require_schema_validation_at_length(self):
