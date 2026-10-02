@@ -418,8 +418,7 @@ void PagedAttention::addVerify(
     const VerifyAttentionPlan &plan) {
   const uint32_t lanes = plan.lanes;
   constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-  if (storeParams.size() != maximumLanes ||
-      attentionParams.size() != maximumLanes ||
+  if (storeParams.size() != lanes || attentionParams.size() != lanes ||
       buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
   }
@@ -453,7 +452,7 @@ void PagedAttention::addVerify(
                                     kv::kQ8VerifyMaximumRows))
       throw std::invalid_argument("paged verify lane history does not match plan");
   }
-  for (uint32_t lane = 0; lane < maximumLanes; ++lane)
+  for (uint32_t lane = 0; lane < lanes; ++lane)
     stores[lane].kv = attention[lane].kv = layer;
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),

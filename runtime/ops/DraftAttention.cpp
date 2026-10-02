@@ -160,7 +160,7 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   requireBuffer(buffers.dynamic, uint64_t{lanes} * kRows * shape.dynamicSize * 2);
   requireBuffer(buffers.weights, uint64_t{4} * shape.hiddenSize * 2);
   const KernelLayout kernel = kernelShape(shape);
-  const DraftConvBatchParams params{groups, finish, lanes};
+  const DraftConvBatchParams params{groups, finish};
   graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"
                                                : "draft_conv_h2048",
             {std::move(buffers.input), std::move(buffers.dynamic),
@@ -189,7 +189,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const uint64_t ropeBytes = uint64_t{lanes} * kRows * shape.headDimension / 2 * 4;
   requireBuffer(buffers.ropeCos, ropeBytes);
   requireBuffer(buffers.ropeSin, ropeBytes);
-  const DraftQkvBatchParams params{groups, lanes};
+  const DraftQkvBatchParams params{groups};
   graph.add("draft_attention_qkv",
             {std::move(buffers.qkv), std::move(buffers.groupedQueries),
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
@@ -204,7 +204,7 @@ void DraftAttention::addDecode(
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
-  if (cacheLengths.size() != kMaximumLanes ||
+  if (cacheLengths.size() != lanes ||
       buffers.persistentKeys.size() != kMaximumLanes ||
       buffers.persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft attention geometry");
@@ -242,7 +242,7 @@ void DraftAttention::addReorder(metal::CommandGraph &graph,
   const uint32_t lanes = plan.lanes();
   requireBuffer(grouped, queryRowsBytes(plan));
   requireBuffer(packed, queryRowsBytes(plan));
-  const DraftQkvBatchParams params{groups, lanes};
+  const DraftQkvBatchParams params{groups};
   graph.add("draft_attention_reorder",
             {std::move(grouped), std::move(packed)}, params,
             {groups, lanes, 1});
@@ -274,12 +274,11 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentKeys,
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
-    std::span<const uint32_t> startPositions, DraftAttentionShape shape,
-    uint32_t lanes) {
+    std::span<const uint32_t> startPositions, DraftAttentionShape shape) {
+  const auto lanes = static_cast<uint32_t>(startPositions.size());
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
-  if (startPositions.size() != kMaximumLanes ||
-      persistentKeys.size() != kMaximumLanes ||
+  if (persistentKeys.size() != kMaximumLanes ||
       persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft context commit geometry");
   // Each lane commits up to its eight verify rows.
@@ -290,7 +289,7 @@ void DraftAttention::addContextCommit(
     requireBuffer(persistentKeys[lane], ringBytes(shape));
     requireBuffer(persistentValues[lane], ringBytes(shape));
   }
-  DraftContextBatchParams params{lanes, {}};
+  DraftContextBatchParams params{};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
   std::vector<metal::MetalBuffer> bindings{

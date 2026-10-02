@@ -159,10 +159,10 @@ void DFlashDraft::addContextPrefill(
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
     const ops::Projection &vocabularyProjection,
-    std::span<const uint32_t> cacheLengths, uint32_t lanes,
+    std::span<const uint32_t> cacheLengths,
     ops::LinearDispatchStats &stats) const {
+  const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
-      cacheLengths.size() != ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
       buffers.persistentValues.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft decode batch");
@@ -256,10 +256,10 @@ void DFlashDraft::addDecode(
 
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
-    std::span<const uint32_t> startPositions, uint32_t lanes,
+    std::span<const uint32_t> startPositions,
     ops::LinearDispatchStats &stats) const {
+  const uint32_t lanes = static_cast<uint32_t>(startPositions.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
-      startPositions.size() != ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
       buffers.persistentValues.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft context batch");
@@ -284,7 +284,7 @@ void DFlashDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape(), lanes);
+        startPositions, layout.attentionShape());
   }
 }
 

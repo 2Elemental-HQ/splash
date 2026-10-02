@@ -1350,10 +1350,8 @@ struct Runtime::Impl {
       return decodeArena->packed(tensor, storage);
     };
     std::array<uint32_t, kLaneCount> cacheLengths{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      cacheLengths[lane] =
-          static_cast<uint32_t>(logicalPositions[std::min(lane, lanes - 1)]);
-    }
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
 
     DFlashDecodeBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
@@ -1379,8 +1377,8 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel.vocabularyProjection(), cacheLengths,
-                         lanes, stats);
+                         targetModel.vocabularyProjection(),
+                         std::span(cacheLengths).first(lanes), stats);
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -1413,9 +1411,6 @@ struct Runtime::Impl {
     const uint32_t storage = targetModel.decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, storage);
-    };
-    auto paddedItem = [&](uint32_t lane) -> const ModelBatchItem & {
-      return items[std::min(lane, lanes - 1)];
     };
 
     std::array<Q8ChunkedPrefillParams, kLaneCount> q8{};
@@ -1456,15 +1451,16 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      const ModelBatchItem &item = paddedItem(lane);
-      q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
-                          item.pageTable);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      q8[lane] = q8Params(items[lane].logicalPosition, kDecodeRows, kTileRows,
+                          items[lane].pageTable);
       verify[lane] = kv::q8VerifyAttentionParams(
           q8[lane].committed_tokens, q8[lane].chunk_tokens,
           q8[lane].chunk_stride, q8[lane].page_table_entries);
       if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
         throw std::invalid_argument("invalid batched KV verify geometry");
+    }
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
@@ -1487,8 +1483,9 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(), q8,
-                          verify, lanes, stats);
+    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
+                          std::span(q8).first(lanes),
+                          std::span(verify).first(lanes), lanes, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1524,9 +1521,8 @@ struct Runtime::Impl {
     };
 
     std::array<uint32_t, kLaneCount> startPositions{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
-      startPositions[lane] = static_cast<uint32_t>(
-          items[std::min(lane, lanes - 1)].logicalPosition);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      startPositions[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
     DFlashContextBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
@@ -1537,8 +1533,8 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers), startPositions,
-                                lanes, stats);
+    draftModel.addContextCommit(graph, std::move(buffers),
+                                std::span(startPositions).first(lanes), stats);
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,

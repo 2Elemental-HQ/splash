@@ -96,7 +96,6 @@ void runWidth(MetalBackend &backend, uint32_t width,
             std::begin(params.remaining));
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
-  params.lanes = width;
   ComputeDispatch dispatch;
   dispatch.pipelineName = "decode_accept_dflash";
   dispatch.buffers = {{0, draft},

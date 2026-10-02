@@ -188,7 +188,8 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
     std::memcpy(queries.contents(), input.data(), input.size() * 2);
     CommandGraph graph;
     DraftAttention::addDecode(graph,
-        {queries, keys, values, queryKeys, queryValues}, cacheLengths,
+        {queries, keys, values, queryKeys, queryValues},
+        std::span(cacheLengths).first(lanes),
         DraftAttention::plan(shape, lanes, configuration));
     const auto dispatches = graph.dispatches();
     require(dispatches.size() == 2 &&
@@ -207,6 +208,15 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       require(std::equal(baseline.begin(), baseline.end(), output),
               "draft attention candidate changed core output");
   }
+  // A cache length for each of the plan's lanes, no fewer.
+  CommandGraph mismatched;
+  rejects([&] {
+    DraftAttention::addDecode(mismatched,
+        {queries, keys, values, queryKeys, queryValues},
+        std::span(cacheLengths).first(lanes - 1),
+        DraftAttention::plan(shape, lanes));
+  });
+  require(mismatched.empty(), "mismatched cache lengths encoded a graph");
 
   const auto *output = static_cast<const uint16_t *>(queries.contents());
   std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
@@ -340,14 +350,14 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
       CommandGraph graph;
       DraftAttention::addConvolution(graph,
           {input, dynamic, weights, residual, output}, plan, stage);
-      std::array<uint32_t, 3> params{};
+      std::array<uint32_t, 2> params{};
       std::memcpy(params.data(), graph.dispatches()[0].bytes[0].data,
                   sizeof(params));
       const uint32_t expectedGroups = configuration.groups
           ? configuration.groups
           : (kRows * shape.hiddenSize + 255) / 256;
       require(graph.dispatches()[0].threadgroups.x == params[0] &&
-                  params[0] == expectedGroups && params[2] == lanes,
+                  params[0] == expectedGroups,
               "convolution dispatch and loop stride permit overlapping writes");
       static_cast<void>(backend.submitCommand(graph.dispatches()));
       const auto *actual = static_cast<const uint16_t *>(output.contents());
@@ -430,8 +440,8 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const std::array<uint32_t, kLanes> lengths{};
   rejects([&] {
     DraftAttention::addDecode(invalid,
-        {queries, emptyRings, emptyRings, queryKeys, queryValues}, lengths,
-        baselinePlan);
+        {queries, emptyRings, emptyRings, queryKeys, queryValues},
+        std::span(lengths).first(lanes), baselinePlan);
   });
   require(invalid.empty(), "invalid draft request partially encoded a graph");
 }
@@ -536,7 +546,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
 
   // Commit: three lanes retaining 8, 3 and (clamped) 8 of their verify rows.
   constexpr uint32_t kCommitLanes = 3;
-  const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 0};
+  const std::array<uint32_t, kCommitLanes> starts{2044, 0, 4101};
   const uint32_t retained[kCommitLanes] = {8, 3, 12};
   const MetalBuffer laneKv =
       randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
@@ -554,7 +564,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
-                                   shape, kCommitLanes);
+                                   shape);
   static_cast<void>(backend.submitCommand(commit.dispatches()));
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -585,12 +595,21 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     std::array<MetalBuffer, kLanes> rings = laneValues;
     rings[kCommitLanes - 1] = last;
     DraftAttention::addContextCommit(invalid, q, keyNorm, laneCos, laneSin,
-                                     laneKeys, rings, counts, starts, shape,
-                                     kCommitLanes);
+                                     laneKeys, rings, counts, starts, shape);
   };
   rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing)); });
   rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing); });
   rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing); });
+  // The start positions name the lanes: none, or more than a batch, commit
+  // nothing.
+  const std::array<uint32_t, kLanes + 1> overfull{};
+  for (const std::span<const uint32_t> positions :
+       {std::span<const uint32_t>(), std::span<const uint32_t>(overfull)})
+    rejects([&] {
+      DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
+                                       laneSin, laneKeys, laneValues,
+                                       retainedCounts, positions, shape);
+    });
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
 }

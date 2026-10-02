@@ -15,8 +15,6 @@ inline void full_qkv_decode_phase(
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   ulong kv_lane_stride = ulong(KHeads) * params.row_stride * HeadDim;
   FullPrefillParams lane_params{Rows, params.cache_stride, params.row_stride};
   full_qkv_storage_phase<QHeads, KHeads>(

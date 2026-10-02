@@ -377,8 +377,7 @@ void QwenTarget::addVerify(
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
-      q8.size() != ExecutionLimits::maximumBatchWidth ||
-      verify.size() != ExecutionLimits::maximumBatchWidth ||
+      q8.size() != lanes || verify.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
       buffers.gdnMixed.size() != geometry_.stateLayout.layers ||

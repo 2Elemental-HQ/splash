@@ -212,7 +212,7 @@ public:
 
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths, uint32_t lanes,
+                 std::span<const uint32_t> cacheLengths,
                  ops::LinearDispatchStats &stats) const;
   void addSelection(metal::CommandGraph &graph,
                     DFlashSelectionBuffers buffers,
@@ -222,7 +222,6 @@ public:
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
-                        uint32_t lanes,
                         ops::LinearDispatchStats &stats) const;
 
 private:

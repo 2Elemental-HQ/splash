@@ -127,8 +127,6 @@ kernel void draft_context_kv_commit(
   constexpr uint RopeLaneStride = Rows * 64;
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
-  if (batch >= params.lanes)
-    return;
   device bfloat *keys =
       batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
   device bfloat *values = batch == 0
@@ -457,8 +455,6 @@ inline void draft_conv_decode_batch_impl(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Dynamic = Hidden / 4;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   draft_conv_phase<Hidden>(input + batch * Rows * Hidden,
                            dynamic + batch * Rows * Dynamic, base,
                            residual + batch * Rows * Hidden,
@@ -514,8 +510,6 @@ kernel void draft_attention_qkv(
   constexpr ulong HeadDim = 128;
   constexpr ulong RopeStride = Rows * 64;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   threadgroup float reductions[8];
   threadgroup bfloat head[128];
   draft_qkv_prepare_phase(
@@ -553,8 +547,6 @@ kernel void draft_attention_bf16_split(
   constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   device bfloat *keys =
       batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
   device bfloat *values = batch == 0
@@ -591,8 +583,6 @@ kernel void draft_attention_bf16_reduce(
   constexpr ulong HeadDim = 128;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
@@ -613,8 +603,6 @@ kernel void draft_attention_reorder(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = 4096;
   uint batch = group.y;
-  if (batch >= params.lanes)
-    return;
   draft_attention_reorder_phase(grouped + batch * Rows * Attention,
                                 row_major + batch * Rows * Attention,
                                 params.groups, group.x, thread_index);

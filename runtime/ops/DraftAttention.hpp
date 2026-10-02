@@ -143,8 +143,7 @@ public:
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, DraftAttentionShape shape,
-      uint32_t lanes);
+      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
 };
 
 } // namespace splash::ops

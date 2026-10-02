@@ -366,8 +366,6 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
   for (uint32_t lane = lanes; lane < 4; ++lane) {
     data.tables[lane] = data.tables[0];
     data.pages[lane] = data.pages[0];
-    data.stores[lane] = data.stores[0];
-    data.attention[lane] = data.attention[0];
   }
   return data;
 }
@@ -553,7 +551,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
       ops::PagedVerifyBuffers buffers{data.keys, data.values, data.queries,
                                       partialBuffer, statisticsBuffer, output, data.tables};
       ops::PagedAttention::addVerify(
-          graph, data.layer, buffers, data.stores, data.attention, plan);
+          graph, data.layer, buffers, std::span(data.stores).first(plan.lanes),
+          std::span(data.attention).first(plan.lanes), plan);
     }
   };
   if (testBounds) {

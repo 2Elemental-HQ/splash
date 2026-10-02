@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -170,7 +171,7 @@ private:
 // A fixture's extents start its one allocation and its tensors are views of
 // the rest, resident for every command like every backend buffer; kernels
 // reach the extents only through the lanes' page tables. Lanes past the
-// plan's repeat lane 0, as padded verify lanes do.
+// plan's lanes bind lane 0's page table, as the runtime's padded lanes do.
 class AttentionFixture final {
 public:
   using Tensor = AttentionFixturePlan::Tensor;
@@ -200,11 +201,8 @@ public:
       attention_[lane] = kv::q8VerifyAttentionParams(
           plan_.histories[lane], kv::kQ8VerifyMaximumRows, plan_.stride, plan_.pages[lane]);
     }
-    for (uint32_t lane = plan_.lanes; lane < AttentionFixturePlan::kMaximumLanes; ++lane) {
+    for (uint32_t lane = plan_.lanes; lane < AttentionFixturePlan::kMaximumLanes; ++lane)
       tables_[lane] = tables_[0];
-      stores_[lane] = stores_[0];
-      attention_[lane] = attention_[0];
-    }
   }
 
   // Zeroes the allocation, then writes the page tables, every lane's
@@ -285,7 +283,8 @@ public:
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
          buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
-        stores_, attention_, attention);
+        std::span(stores_).first(attention.lanes), std::span(attention_).first(attention.lanes),
+        attention);
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }

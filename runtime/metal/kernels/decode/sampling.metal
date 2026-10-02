@@ -1226,8 +1226,6 @@ kernel void draft_select_edges(
   constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
   uint batch = row / Positions;
   uint position = row % Positions;
-  if (batch >= params.lanes)
-    return;
   threadgroup uint successors[Candidates];
   threadgroup uint predecessors[Candidates];
   if (simd_group == 0) {
@@ -1305,8 +1303,6 @@ kernel void draft_select_dflash(
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[thread_position_in_grid]]) {
-  if (batch >= params.lanes)
-    return;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
@@ -1513,16 +1509,13 @@ kernel void verify_input_tokens(
     device uint *verify_input [[buffer(2)]],
     constant VerifyInputBatchParams &params [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
-  uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS;
-  if (index < count) {
-    uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
-    uint row = index % SPLASH_TARGET_VERIFY_ROWS;
-    uint token = row == 0
-                     ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
-                     : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
-                                    row - 1];
-    verify_input[index] = min(token, params.vocabulary - 1u);
-  }
+  uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
+  uint row = index % SPLASH_TARGET_VERIFY_ROWS;
+  uint token = row == 0
+                   ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
+                   : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
+                                  row - 1];
+  verify_input[index] = min(token, params.vocabulary - 1u);
 }
 
 inline void accept_greedy_lane(device const uint *draft_tokens,
@@ -1550,8 +1543,6 @@ kernel void decode_accept_dflash(
     device uint *accepted_count [[buffer(7)]],
     constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  if (batch >= params.lanes)
-    return;
   uint remaining = params.remaining[batch];
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1};

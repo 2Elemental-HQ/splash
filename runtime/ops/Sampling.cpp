@@ -247,11 +247,10 @@ void Sampling::addDraftSelector(
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.vocabulary = vocabulary_;
-  for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
-    const uint32_t source = std::min(lane, lanes - 1);
-    params.anchor[lane] = anchors[source];
-    params.temperature[lane] = policies[source].temperature;
-    if (lane < lanes && policies[lane].samples())
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.anchor[lane] = anchors[lane];
+    params.temperature[lane] = policies[lane].temperature;
+    if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
   graph.add("draft_select_top16_sharded",
@@ -279,11 +278,11 @@ void Sampling::addAcceptance(
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
       maximumRetained.size() > kMaximumLanes)
     throw std::invalid_argument("invalid DFlash acceptance batch");
+  const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
   AcceptBatchParams params{};
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
-  params.lanes = static_cast<uint32_t>(maximumRetained.size());
-  for (uint32_t lane = 0; lane < params.lanes; ++lane) {
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
         maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid DFlash retention limit");
@@ -296,7 +295,7 @@ void Sampling::addAcceptance(
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
              buffers.acceptedCounts},
-            params, {params.lanes, 1, 1}, {1, 1, 1});
+            params, {lanes, 1, 1}, {1, 1, 1});
 }
 
 void Sampling::addVerifyInput(metal::CommandGraph &graph,
@@ -306,7 +305,7 @@ void Sampling::addVerifyInput(metal::CommandGraph &graph,
                               uint32_t lanes) const {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid verify input batch");
-  const VerifyInputBatchParams params{lanes, vocabulary_};
+  const VerifyInputBatchParams params{vocabulary_};
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},

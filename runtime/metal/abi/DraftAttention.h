@@ -8,22 +8,23 @@
 #include <stdint.h>
 #endif
 
+// The batched draft kernels' grids cover exactly the dispatch's lanes:
+// per-lane arrays hold those lanes, and entries past them are zero and unread.
+
 struct DraftConvBatchParams {
   uint32_t groups;
   uint32_t finish;
-  uint32_t lanes;
 };
 
-static_assert(sizeof(DraftConvBatchParams) == 12,
-              "Draft convolution parameters are 12 bytes on both sides");
+static_assert(sizeof(DraftConvBatchParams) == 8,
+              "Draft convolution parameters are 8 bytes on both sides");
 
 struct DraftQkvBatchParams {
   uint32_t groups;
-  uint32_t lanes;
 };
 
-static_assert(sizeof(DraftQkvBatchParams) == 8,
-              "Draft QKV parameters are 8 bytes on both sides");
+static_assert(sizeof(DraftQkvBatchParams) == 4,
+              "Draft QKV parameters are 4 bytes on both sides");
 
 // The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.
@@ -52,12 +53,11 @@ static_assert(sizeof(DraftContextParams) == 8,
               "Draft context prefill parameters are 8 bytes on both sides");
 
 struct DraftContextBatchParams {
-  uint32_t lanes;
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 20,
-              "Draft context commit parameters are 20 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 16,
+              "Draft context commit parameters are 16 bytes on both sides");
 
 struct CaptureParams {
   uint32_t rows;
