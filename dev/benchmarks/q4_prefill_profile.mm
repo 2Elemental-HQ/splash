@@ -60,7 +60,7 @@ void profileShape(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
   std::memset(weights.contents(), 0x5a, weights.sizeBytes());
   std::memset(scales.contents(), 0x3c, scales.sizeBytes());
   std::memset(biases.contents(), 0x3c, biases.sizeBytes());
-  Q4PrefillParams params{outputSize, inputSize};
+  Q4Params params{outputSize, inputSize};
 
   ComputeDispatch sum;
   sum.pipelineName = sumPipeline;
@@ -137,7 +137,7 @@ void profileUpSilu(MetalBackend &backend, uint32_t rows, uint32_t inputSize,
   std::memset(scales.contents(), 0x3c, scales.sizeBytes());
   std::memset(biases.contents(), 0x3c, biases.sizeBytes());
   std::memset(gate.contents(), 0x3c, gate.sizeBytes());
-  Q4PrefillParams params{outputSize, inputSize};
+  Q4Params params{outputSize, inputSize};
 
   ComputeDispatch sum;
   sum.pipelineName = "prefill_linear_q4_sums32";
@@ -184,7 +184,7 @@ void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
   MetalBuffer sums = shared(
       backend, uint64_t{allocatedRows} * (width / kQuantGroup) * sizeof(float),
       label + " sums");
-  Q4PrefillParams params{width, width};
+  Q4Params params{width, width};
   ComputeDispatch rms{"norm_rms",
                       {{0, input}, {1, weight}, {2, output}},
                       {{3, &width, sizeof(width)}},

@@ -75,7 +75,9 @@ struct LinearWorkload final {
 
 struct LinearConfig final {
   LinearTile tile = LinearTile::N128;
-  // Decode grid size. Prefill uses its matrix grid and requires zero here.
+  // Persistent threadgroups of the N128, N256, Paired128 and Paired256 decode
+  // tiles (1 to their column tiles); 0 for every other plan, whose grid
+  // covers the matrix.
   uint32_t groups = 0;
   // Simdgroups per threadgroup, independent of the persistent grid size: the
   // cooperative scope of one tile (Paired256 runs four).
@@ -152,6 +154,9 @@ public:
   [[nodiscard]] FloatOutput destination() const noexcept { return destination_; }
   [[nodiscard]] uint32_t storageRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
+  // Threadgroups over the column tiles: the configured groups of a
+  // persistent decode tile, every column tile otherwise.
+  [[nodiscard]] uint32_t groups() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
   [[nodiscard]] LinearInput input() const noexcept;

@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
-            const LinearConfig config{tile, N / 64, registerTile ? LinearSimdgroups::Four : LinearSimdgroups::Two,
+            const LinearConfig config{tile, 0, registerTile ? LinearSimdgroups::Four : LinearSimdgroups::Two,
                                       splits};
             cases.push_back({"L" + std::to_string(lanes),
                              std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),

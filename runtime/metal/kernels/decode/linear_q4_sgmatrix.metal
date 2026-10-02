@@ -22,12 +22,13 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
-                   constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
-                   threadgroup uint *arrival) {
+                   constant Q4Params &p, uint3 tg, uint3 grid, uint tid, uint sg,
+                   uint lane, threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, groups = p.input_size / 64;
-  const uint splits = p.persistent_groups;
+  // grid.y partitions K; the host takes only splits that divide the groups.
+  const uint splits = grid.y;
   // Independent eight-row tiles share the weight layout and dispatch.
   // Each tile owns its activation workspace and split completion counters.
   table += ulong(tg.z) * p.input_size * 8;
@@ -39,7 +40,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
     counters += ulong(tg.z) * N / tileN;
   }
   const uint first = tg.y * (groups / splits);
-  const uint end = tg.y + 1 == splits ? groups : first + groups / splits;
+  const uint end = first + groups / splits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
   const uint base = tg.x * tileN + sg * (gateUp ? 8 : 16);
@@ -148,8 +149,9 @@ kernel void decode_linear_q4_prepare(
     device Out *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
     device coherent(device) float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
 #define Q4_SG_THREADS \
-    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+    uint3 tg [[threadgroup_position_in_grid]], uint3 grid [[threadgroups_per_grid]], \
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]]
 
 // The plain projection into bf16 and into fp32 (_f32: the logits,
 // ops::Projection::destination); the input table stands in for the residual
@@ -158,7 +160,7 @@ kernel void decode_linear_q4_prepare(
   kernel void Name(Q4_SG_INPUTS(Out), constant Q4Params &p [[buffer(8)]], Q4_SG_THREADS) { \
     threadgroup uint arrival; \
     q4sg::decode<q4sg::Epilogue::Affine>(table, weights, scales, biases, output, sums, partials, \
-        counters, table, weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
+        counters, table, weights, scales, biases, p, tg, grid, tid, sg, lane, &arrival); \
   }
 Q4_SG_AFFINE(decode_linear_q4_sg, bfloat)
 Q4_SG_AFFINE(decode_linear_q4_sg_f32, float)
@@ -167,14 +169,14 @@ kernel void decode_linear_q4_sg_residual(Q4_SG_INPUTS(bfloat),
     device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q4_SG_THREADS) {
   threadgroup uint arrival;
   q4sg::decode<q4sg::Epilogue::Residual>(table, weights, scales, biases, output, sums,
-      partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
+      partials, counters, residual, weights, scales, biases, p, tg, grid, tid, sg, lane, &arrival);
 }
 kernel void decode_linear_q4_sg_gate_up(Q4_SG_INPUTS(bfloat), device const uchar *up [[buffer(8)]],
     device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],
     constant Q4Params &p [[buffer(11)]], Q4_SG_THREADS) {
   threadgroup uint arrival;
   q4sg::decode<q4sg::Epilogue::GateUp>(table, weights, scales, biases, output, sums,
-      partials, counters, output, up, upScales, upBiases, p, tg, tid, sg, lane, &arrival);
+      partials, counters, output, up, upScales, upBiases, p, tg, grid, tid, sg, lane, &arrival);
 }
 #undef Q4_SG_INPUTS
 #undef Q4_SG_THREADS

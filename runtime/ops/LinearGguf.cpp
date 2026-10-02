@@ -90,11 +90,11 @@ std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
 
 // The decode tile configurations over an n x k matrix on `cores` cores.
 LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
-  return {LinearTile::GgufRegister, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Four,
+  return {LinearTile::GgufRegister, 0, LinearSimdgroups::Four,
           decodeSplits(n, k, cores, kRegisterTiers)};
 }
 LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily) {
-  return {LinearTile::GgufStaged, n / GGUF_TILE_COLUMNS, LinearSimdgroups::Two,
+  return {LinearTile::GgufStaged, 0, LinearSimdgroups::Two,
           decodeSplits(n, k, cores, stagedTiers(appleGpuFamily))};
 }
 
@@ -198,13 +198,13 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
 } // namespace
 
 void LinearPlan::requireBlockConfiguration() const {
-  const auto [n, k] = workload_.matrix;
+  const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on 256-input coefficient units.
-    if (workload_.phase != LinearPhase::Decode || c.groups != n / tileColumns() ||
-        c.simdgroups != LinearSimdgroups::Four || !c.validSplits() || k / 256 < c.splits)
-      throw std::invalid_argument("the register block decode tile takes the full column grid and a K unit per split");
+    if (workload_.phase != LinearPhase::Decode || c.simdgroups != LinearSimdgroups::Four ||
+        !c.validSplits() || k / 256 < c.splits)
+      throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
   if (!c.validSplits() || (k / 32) % c.splits)
@@ -213,10 +213,10 @@ void LinearPlan::requireBlockConfiguration() const {
     // Four simdgroups: 128-row prefill tiles. Two: the decode tiles, which
     // split K as in decode.
     const bool decodeTile = c.simdgroups == LinearSimdgroups::Two && workload_.rows <= kMaximumDecodeTileRows;
-    if (c.groups || (c.simdgroups != LinearSimdgroups::Four && !decodeTile) || (c.splits > 1 && !decodeTile))
+    if ((c.simdgroups != LinearSimdgroups::Four && !decodeTile) || (c.splits > 1 && !decodeTile))
       throw std::invalid_argument("invalid block prefill configuration");
-  } else if (c.groups != n / tileColumns() || c.simdgroups != LinearSimdgroups::Two) {
-    throw std::invalid_argument("the staged block decode tile takes the full column grid");
+  } else if (c.simdgroups != LinearSimdgroups::Two) {
+    throw std::invalid_argument("the staged block decode tile takes two simdgroups");
   }
 }
 

@@ -1,24 +1,25 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
-// Decode projections: persistent threadgroups stride over TileN-wide output
-// tiles, TileCall names the q4_mpp_tiles.h instantiation and Sums holds eight
-// input sums per row. The auxiliary buffer is the residual the epilogue adds
-// or the gate it applies SiLU to; a plain projection reads none (its input
-// stands in) and writes a destination of type Out.
+// Decode projections: the grid's params.groups persistent threadgroups
+// stride over TileN-wide output tiles, TileCall names the q4_mpp_tiles.h
+// instantiation and Sums holds eight input sums per row. The auxiliary buffer
+// is the residual the epilogue adds or the gate it applies SiLU to; a plain
+// projection reads none (its input stands in) and writes a destination of
+// type Out.
 #define Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, Out)                     \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \
                    device Out *output [[buffer(4)]],                           \
-                   constant Q4Params &params [[buffer(5)]],                    \
+                   constant Q4PersistentParams &params [[buffer(5)]],          \
                    uint group [[threadgroup_position_in_grid]],                \
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
     uint tiles = params.output_size / TileN;                                   \
-    for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
+    for (uint tile = group; tile < tiles; tile += params.groups) {             \
       TileCall(input, weights, scales, biases, output, weights, scales,        \
                biases, input, params.output_size, params.input_size,           \
                input_sums, tile * TileN, simd_lane, simd_group);               \
@@ -38,13 +39,13 @@
                    device bfloat *biases [[buffer(3)]],                        \
                    device bfloat *Auxiliary [[buffer(4)]],                     \
                    device bfloat *output [[buffer(5)]],                        \
-                   constant Q4Params &params [[buffer(6)]],                    \
+                   constant Q4PersistentParams &params [[buffer(6)]],          \
                    uint group [[threadgroup_position_in_grid]],                \
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
     uint tiles = params.output_size / TileN;                                   \
-    for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
+    for (uint tile = group; tile < tiles; tile += params.groups) {             \
       TileCall(input, weights, scales, biases, output, weights, scales,        \
                biases, Auxiliary, params.output_size, params.input_size,       \
                input_sums, tile * TileN, simd_lane, simd_group);               \
@@ -60,13 +61,13 @@
                    device uchar *weights_1 [[buffer(5)]],                      \
                    device bfloat *scales_1 [[buffer(6)]],                      \
                    device bfloat *biases_1 [[buffer(7)]],                      \
-                   constant Q4Params &params [[buffer(8)]],                    \
+                   constant Q4PersistentParams &params [[buffer(8)]],          \
                    uint group [[threadgroup_position_in_grid]],                \
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
     uint tiles = params.output_size / TileN;                                   \
-    for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
+    for (uint tile = group; tile < tiles; tile += params.groups) {             \
       TileCall(input, weights_0, scales_0, biases_0, output, weights_1,        \
                scales_1, biases_1, output, params.output_size,                 \
                params.input_size, input_sums, tile * TileN, simd_lane,         \

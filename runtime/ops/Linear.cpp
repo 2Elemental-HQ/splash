@@ -27,6 +27,11 @@ static_assert(sizeof(LinearMatrix) == 8);
 bool oneLaneTile(LinearTile tile) noexcept {
   return tile == LinearTile::Paired128 || tile == LinearTile::Paired256;
 }
+// The decode tiles whose threadgroups stream several column tiles.
+bool persistentTile(LinearTile tile) noexcept {
+  return tile == LinearTile::N128 || tile == LinearTile::N256 || tile == LinearTile::Paired128 ||
+         tile == LinearTile::Paired256;
+}
 // Simdgroups fixed by the kernel instance: the paired N256 tile runs four and
 // Split128 the N128 tile's eight.
 std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
@@ -132,6 +137,9 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   }
   return 0;
 }
+uint32_t LinearPlan::groups() const noexcept {
+  return config_.groups ? config_.groups : workload_.matrix.outputSize / tileColumns();
+}
 uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
 }
@@ -183,6 +191,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool ggufTile = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufRegister;
   if (ggufTile != (w.weightLayout == WeightLayout::Block32))
     throw std::invalid_argument("block projections run the GGUF tiles, affine ones the Q4 tiles");
+  if (w.phase == LinearPhase::Decode && persistentTile(config.tile)
+          ? !config.groups || config.groups > w.matrix.outputSize / tileColumns()
+          : config.groups != 0)
+    throw std::invalid_argument("a persistent decode tile takes 1 to its column tiles in groups, every other plan 0");
   if (ggufTile) {
     // Kernel names follow the segment formats (LinearGguf.cpp).
     requireBlockConfiguration();
@@ -206,7 +218,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool residual = w.epilogue == LinearEpilogue::Residual;
   const bool four = config.simdgroups == LinearSimdgroups::Four;
   if (w.phase == LinearPhase::Prefill) {
-    if (config.groups || oneLaneTile(config.tile) || splitsK)
+    if (oneLaneTile(config.tile) || splitsK)
       throw std::invalid_argument("invalid Q4 prefill configuration");
     if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
@@ -226,25 +238,22 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
     }
     return;
   }
-  if (!config.groups || config.groups > w.matrix.outputSize / tileColumns())
-    throw std::invalid_argument("invalid Q4 decode group count");
   const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
   if (oneLaneTile(config.tile) && (lane != 0 || w.matrix.outputSize % 256))
     throw std::invalid_argument("paired Q4 tile requires one lane and paired columns");
   if (usesSimdgroup()) {
     const uint32_t groups = w.matrix.inputSize / kQuantGroup;
-    if (config.groups != w.matrix.outputSize / tileColumns() || !config.validSplits() || groups % config.splits)
-      throw std::invalid_argument("simdgroup Q4 requires full column grid and whole power-of-two K partitions");
+    if (!config.validSplits() || groups % config.splits)
+      throw std::invalid_argument("simdgroup Q4 requires whole power-of-two K partitions");
     pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
         residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
     return;
   }
   if (config.tile == LinearTile::Split128) {
     // Every partition holds at least one of the kernel's 256-input blocks.
-    if (config.groups != w.matrix.outputSize / tileColumns() || !config.validSplits() ||
-        config.splits < 2 || w.matrix.inputSize / kInputSumBlock < config.splits)
-      throw std::invalid_argument(
-          "Split128 requires the full column grid and 2, 4 or 8 K partitions of 256-input blocks");
+    if (!config.validSplits() || config.splits < 2 ||
+        w.matrix.inputSize / kInputSumBlock < config.splits)
+      throw std::invalid_argument("Split128 requires 2, 4 or 8 K partitions of 256-input blocks");
     constexpr std::array plainNames{"decode_linear_q4_n128_split", "decode_linear_q4_n128_split_m16",
         "decode_linear_q4_n128_split_m24", "decode_linear_q4_n128_split_m32"};
     constexpr std::array residualNames{"decode_linear_q4_n128_split_residual",
@@ -459,11 +468,11 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     while (splits < LinearConfig::kMaximumSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
            groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
       splits *= 2;
-    return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
+    return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits};
   }
   if (appleGpuFamily_ >= 10) {
     if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
-      return {LinearTile::Split128, tiles128, LinearSimdgroups::Eight, splits};
+      return {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
     if (lanes == 1)
       if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
   }
@@ -560,17 +569,16 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (gate) bindings.insert(bindings.end(), {weights.weights, weights.scales, weights.biases});
     else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
     graph.add(kernelInstance(selected.pipeline(), selected.destination()), std::move(bindings),
-        Q4Params{n, k, selected.configuration().splits},
-        {selected.configuration().groups, selected.configuration().splits,
-         w.rows / SPLASH_TARGET_VERIFY_ROWS}, {128, 1, 1});
+        Q4Params{n, k},
+        {selected.groups(), selected.configuration().splits, w.rows / SPLASH_TARGET_VERIFY_ROWS},
+        {128, 1, 1});
     if (stats) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
     return {b.input, LinearInput::Table64};
   }
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
-      graph.add(std::string(name), bindings,
-          Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
+      graph.add(std::string(name), bindings, Q4Params{n, k},
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
@@ -580,8 +588,14 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
       std::vector<metal::MetalBuffer> buffers(bindings);
       if (config.tile == LinearTile::Split128)
         buffers.insert(buffers.end(), {b.scratch.partials, b.scratch.counters});
-      graph.add(kernelInstance(name, selected.destination()), std::move(buffers), Q4Params{n, k, config.groups},
-                {config.groups, config.splits, 1}, {selected.threadsPerThreadgroup(), 1, 1});
+      const std::string kernel = kernelInstance(name, selected.destination());
+      const metal::DispatchSize groups{selected.groups(), config.splits, 1};
+      const metal::DispatchSize threads{selected.threadsPerThreadgroup(), 1, 1};
+      // The persistent tiles stride over the column tiles by their groups.
+      if (persistentTile(config.tile))
+        graph.add(kernel, std::move(buffers), Q4PersistentParams{n, k, selected.groups()}, groups, threads);
+      else
+        graph.add(kernel, std::move(buffers), Q4Params{n, k}, groups, threads);
     }
   };
   const bool prefill = w.phase == LinearPhase::Prefill;
@@ -621,7 +635,7 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
   requireBytes(input, storageRows * consumer.inputSize * 2, "input");
   requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
   graph.add("prefill_linear_q4_sums32", {input, sums},
-            Q4PrefillParams{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
+            Q4Params{consumer.outputSize, consumer.inputSize}, {tiles, 1, 1});
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                         metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,

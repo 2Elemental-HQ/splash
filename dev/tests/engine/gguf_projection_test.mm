@@ -390,12 +390,11 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload (its full column grid) or a prefill chunk.
+// The configuration of `tile` for a decode workload or a prefill chunk.
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits) {
   if (w.phase == LinearPhase::Prefill) return {LinearTile::GgufStaged, 0, LinearSimdgroups::Two, splits};
-  const uint32_t groups = w.matrix.outputSize / 64;
-  return tile == LinearTile::GgufRegister ? LinearConfig{tile, groups, LinearSimdgroups::Four, splits}
-                                           : LinearConfig{tile, groups, LinearSimdgroups::Two, splits};
+  return tile == LinearTile::GgufRegister ? LinearConfig{tile, 0, LinearSimdgroups::Four, splits}
+                                           : LinearConfig{tile, 0, LinearSimdgroups::Two, splits};
 }
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue, WeightLayout::Block32};

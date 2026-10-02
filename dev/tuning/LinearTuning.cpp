@@ -192,7 +192,7 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
   if (device.appleGpuFamily >= 10)
     for (uint32_t splits = 2;
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / 256; splits *= 2)
-      append({LinearTile::Split128, columns / 128, LinearSimdgroups::Eight, splits});
+      append({LinearTile::Split128, 0, LinearSimdgroups::Eight, splits});
   if (w.rows == SPLASH_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None)
     append({LinearTile::Paired256, columns / 256, LinearSimdgroups::Four});
   return result;

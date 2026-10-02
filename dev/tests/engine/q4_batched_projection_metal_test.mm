@@ -46,7 +46,7 @@ MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
 ComputeDispatch affine(std::string pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer output,
-                       const Q4Params &params) {
+                       const Q4PersistentParams &params) {
   ComputeDispatch result;
   result.pipelineName = std::move(pipeline);
   result.buffers = {{0, std::move(input)},
@@ -55,7 +55,7 @@ ComputeDispatch affine(std::string pipeline, MetalBuffer input,
                     {3, std::move(biases)},
                     {4, std::move(output)}};
   result.bytes = {{5, &params, sizeof(params)}};
-  result.threadgroups = {params.persistent_groups, 1, 1};
+  result.threadgroups = {params.groups, 1, 1};
   result.threadsPerThreadgroup = {256, 1, 1};
   return result;
 }
@@ -63,7 +63,7 @@ ComputeDispatch affine(std::string pipeline, MetalBuffer input,
 ComputeDispatch gateUp(std::string pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer output,
-                       const Q4Params &params) {
+                       const Q4PersistentParams &params) {
   ComputeDispatch result;
   result.pipelineName = std::move(pipeline);
   result.buffers = {{0, std::move(input)},
@@ -75,7 +75,7 @@ ComputeDispatch gateUp(std::string pipeline, MetalBuffer input,
                     {6, std::move(scales)},
                     {7, std::move(biases)}};
   result.bytes = {{8, &params, sizeof(params)}};
-  result.threadgroups = {params.persistent_groups, 1, 1};
+  result.threadgroups = {params.groups, 1, 1};
   result.threadsPerThreadgroup = {256, 1, 1};
   return result;
 }
@@ -88,7 +88,7 @@ ComputeDispatch withThreads(ComputeDispatch dispatch, uint32_t threads) {
 ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer gate,
-                       MetalBuffer output, const Q4Params &params) {
+                       MetalBuffer output, const Q4PersistentParams &params) {
   ComputeDispatch result;
   result.pipelineName = std::move(pipeline);
   result.buffers = {{0, std::move(input)},
@@ -98,7 +98,7 @@ ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
                     {4, std::move(gate)},
                     {5, std::move(output)}};
   result.bytes = {{6, &params, sizeof(params)}};
-  result.threadgroups = {params.persistent_groups, 1, 1};
+  result.threadgroups = {params.groups, 1, 1};
   result.threadsPerThreadgroup = {256, 1, 1};
   return result;
 }
@@ -226,7 +226,7 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
     auto *data = static_cast<uint16_t *>(buffer->contents());
     for (uint64_t i = 0; i < count; ++i) data[i] = floatToBf16(values(random));
   }
-  const LinearConfig config{LinearTile::Split128, n / 128, LinearSimdgroups::Eight, c.splits};
+  const LinearConfig config{LinearTile::Split128, 0, LinearSimdgroups::Eight, c.splits};
   const auto plan = [&](uint32_t lanes) {
     return Linear::plan({c.matrix, lanes * kRows, LinearPhase::Decode, c.epilogue}, config, c.destination);
   };
@@ -354,7 +354,7 @@ void run(const std::string &metallibPath) {
 
   // Every Q4 projection has one StorageN=256 representation. These compute
   // kernels consume it with TileN=128 for the four fixed DFlash batch widths.
-  const Q4Params params{kOutput, kInput, kGroups};
+  const Q4PersistentParams params{kOutput, kInput, kGroups};
   std::vector<ComputeDispatch> singles;
   std::memset(reference.contents(), 0, reference.sizeBytes());
   singles.clear();
@@ -462,8 +462,8 @@ void run(const std::string &metallibPath) {
     MetalBuffer persistent = shared(backend, outputBytes, "q4-persistent");
     std::memset(singleTile.contents(), 0, outputBytes);
     std::memset(persistent.contents(), 0, outputBytes);
-    const Q4Params oneTileEach{kPersistentOutput, persistentInput,
-                               kPersistentOutput / 128};
+    const Q4PersistentParams oneTileEach{kPersistentOutput, persistentInput,
+                                         kPersistentOutput / 128};
     std::vector<ComputeDispatch> dispatches;
     for (uint32_t lane = 0; lane < kPersistentLanes; ++lane) {
       dispatches.push_back(affine(
@@ -473,7 +473,7 @@ void run(const std::string &metallibPath) {
           backend.view(singleTile, lane * laneOutputBytes, laneOutputBytes),
           oneTileEach));
     }
-    const Q4Params oneGroup{kPersistentOutput, persistentInput, 1};
+    const Q4PersistentParams oneGroup{kPersistentOutput, persistentInput, 1};
     dispatches.push_back(affine(
         "decode_linear_q4_n128_m24",
         backend.view(input, 0, kPersistentLanes * laneInputBytes), weights,
@@ -495,7 +495,7 @@ void run(const std::string &metallibPath) {
   MetalBuffer wide = shared(backend, laneBytes, "q4-n256-sg4-output");
   for (const uint32_t groups : {20u, kOutput / 256}) {
     std::memset(wide.contents(), 0, laneBytes);
-    const Q4Params wideParams{kOutput, kInput, groups};
+    const Q4PersistentParams wideParams{kOutput, kInput, groups};
     (void)backend.submit(withThreads(affine("decode_linear_q4_n256_paired_sg4", lane0Input,
                                             weights, scales, biases, wide, wideParams), 128));
     if (std::memcmp(lane0Reference.contents(), wide.contents(), laneBytes))

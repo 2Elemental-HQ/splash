@@ -112,8 +112,7 @@ bool within(const Reference &ref, uint16_t actual) {
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
-  const auto plan = Linear::plan(workload,
-      {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
+  const auto plan = Linear::plan(workload, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
@@ -239,8 +238,7 @@ void splitVisibility(metal::MetalBackend &backend,
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
-                              LinearSimdgroups::Four, splits});
+    return Linear::plan(w, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
   };
   LinearScratchSize size;
   const auto grow = [&](const LinearPlan &p) {

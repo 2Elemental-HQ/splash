@@ -3,7 +3,7 @@
 
 kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
                               device float *sums [[buffer(1)]],
-                              constant Q4PrefillParams &params [[buffer(2)]],
+                              constant Q4Params &params [[buffer(2)]],
                               uint tile [[threadgroup_position_in_grid]],
                               uint simd_lane [[thread_index_in_simdgroup]],
                               uint simd_group
@@ -140,7 +140,7 @@ kernel void prefill_linear_q4_n128(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
-    constant Q4PrefillParams &params [[buffer(6)]],
+    constant Q4Params &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -161,7 +161,7 @@ kernel void prefill_linear_q4_n256(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
-    constant Q4PrefillParams &params [[buffer(6)]],
+    constant Q4Params &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -183,7 +183,7 @@ kernel void prefill_linear_q4_n128_residual(
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
-    constant Q4PrefillParams &params [[buffer(7)]],
+    constant Q4Params &params [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -205,7 +205,7 @@ kernel void prefill_linear_q4_n256_residual(
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
-    constant Q4PrefillParams &params [[buffer(7)]],
+    constant Q4Params &params [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -249,7 +249,7 @@ kernel void prefill_linear_q4_n256_up_silu_sums(
     device bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     device float *output_sums [[buffer(7)]],
-    constant Q4PrefillParams &params [[buffer(8)]],
+    constant Q4Params &params [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -274,7 +274,7 @@ kernel void prefill_linear_q4_n128_sg4(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
-    constant Q4PrefillParams &params [[buffer(6)]],
+    constant Q4Params &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -294,7 +294,7 @@ kernel void prefill_linear_q4_n128_residual_sg4(
     device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
-    constant Q4PrefillParams &params [[buffer(7)]],
+    constant Q4Params &params [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -316,7 +316,7 @@ kernel void prefill_linear_q4_n128_up_silu_sums_sg4(
     device bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     device float *output_sums [[buffer(7)]],
-    constant Q4PrefillParams &params [[buffer(8)]],
+    constant Q4Params &params [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
