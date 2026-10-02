@@ -381,9 +381,11 @@ public:
       *kvGrowthBlocked = false;
     return released;
   }
-  void provideMask(uint64_t id, std::span<const uint32_t>) override {
+  std::optional<std::string> provideMask(uint64_t id,
+                                         std::span<const uint32_t>) override {
     if (overlap && overlap->emitted && overlap->requestId == id)
       overlap->provided = true;
+    return std::nullopt;
   }
   void end(uint64_t id) override {
     requests.erase(id);
@@ -511,13 +513,13 @@ public:
     ++completedCount;
     usage[id] = {prompt, completion};
   }
-  void failed(uint64_t, std::string code, std::string message,
-              bool retryable) override {
+  void failed(uint64_t, LaneOutcome outcome, std::string message) override {
     ++failedCount;
-    if (code == kCapacityExhausted)
+    if (outcome == LaneOutcome::CapacityExhausted)
       ++capacityExhaustedCount;
-    failures.push_back(std::move(code));
-    failureDetails.emplace_back(std::move(message), retryable);
+    const LaneOutcomeWire wire = laneOutcomeWire(outcome);
+    failures.emplace_back(wire.code);
+    failureDetails.emplace_back(std::move(message), wire.retryable);
   }
 
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
@@ -735,7 +737,7 @@ void testSharedPrefillProducerFailureReleasesWaiters() {
     if (cancelled)
       engine.cancel(1);
     else
-      engine.failRequest(1, "test_failure", "producer failed");
+      engine.failRequest(1, LaneOutcome::InvalidMask, "producer failed");
     runUntilIdle(engine);
     require(events.outputs[2] == std::vector<uint32_t>{42} &&
                 cache.snapshot().activeRequests == 0 && model.requests.empty(),
@@ -2272,7 +2274,7 @@ void testEngineLimitBindsThroughTheHostPause() {
   paused = true;
   while (now < 1000 && !events.failedCount && !events.completedCount)
     static_cast<void>(engine.tick(now++));
-  require(events.failures == std::vector<std::string>{std::string(kCapacityExhausted)} &&
+  require(events.failures == std::vector<std::string>{"capacity_exhausted"} &&
               executor.suspensions == 0 && pool.snapshot().pagesAllocated == 8,
           "a lone request at the engine's limit waited for the host instead of failing");
 }
@@ -3180,6 +3182,9 @@ void testUnadmittedRequestsHonorCancellationAndDeadline() {
   require(engine.snapshot().cancelled == 1 && events.failedCount == 1 &&
               events.completedCount == 2 && executor.beginAttempts == 1,
           "queued cancellation or deadline allocated resources or failed cleanup");
+  require(events.failures == std::vector<std::string>{"deadline_exceeded"} &&
+              events.failureDetails.front().first == "request deadline exceeded",
+          "a queued request's deadline lost its outcome or message");
 }
 
 void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
@@ -4704,7 +4709,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     engine.cancel(201);
     const std::array<uint32_t, 1> lateMask{1};
     engine.provideMask(201, lateMask);
-    engine.failRequest(201, "invalid_mask_response", "late mask");
+    engine.failRequest(201, LaneOutcome::InvalidMask, "late mask");
     require(executor.overlap->abandoned && engine.tick(7) && engine.idle() &&
                 events.completedCount == 1 && events.failedCount == 0 &&
                 events.emitted == 0,
@@ -4818,6 +4823,8 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
     const uint32_t expectedSnapshots = heldKind == WorkKind::Prefill ? 0 : 1;
     require(engine.tick(102) && engine.idle() && events.failedCount == 1 &&
                 events.failures.front() == "deadline_exceeded" &&
+                events.failureDetails.front().first ==
+                    "request deadline exceeded" &&
                 events.completedCount == 0 && events.emitted == 0 &&
                 executor.snapshotAttempts == expectedSnapshots &&
                 executor.requests.empty(),
@@ -6084,6 +6091,10 @@ void testAsyncRestoreLifecycle() {
     else
       require(executor.restored == 0 && !events.outputs.contains(1),
               "cancelled or expired restore emitted output");
+    if (outcome == 2)
+      require(events.failures == std::vector<std::string>{"deadline_exceeded"} &&
+                  events.failureDetails.front().first == "request deadline exceeded",
+              "an expired restore lost its outcome or message");
   }
 }
 
@@ -7181,7 +7192,7 @@ void testEveryEndReleasesTheReplayPoint() {
     if (end == End::Cancel)
       engine.cancel(1);
     else if (end == End::Failure)
-      engine.failRequest(1, "test_failure", "the request failed");
+      engine.failRequest(1, LaneOutcome::InvalidMask, "the request failed");
     require(end == End::Deadline || end == End::Capacity ||
                 resources.snapshot().stateCache.inUse == 0,
             "the request's end did not release its replay point at once");

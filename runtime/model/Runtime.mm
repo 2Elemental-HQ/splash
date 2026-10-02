@@ -2428,7 +2428,8 @@ uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
   return released;
 }
 
-void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
+std::optional<std::string>
+Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   Impl::Request &entry = impl_->request(requestId);
   const bool acceptsMask =
       waitsForMask(entry.decodeStage) || entry.verifyMaskInFlight;
@@ -2442,25 +2443,26 @@ void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   uint64_t expected = entry.verifyMaskInFlight
                           ? uint64_t{kDecodeRows + 1} * maskWords
                           : maskWords;
+  // The native loop matches each response's word count to its request.
   if (words.size() != expected) {
-    throw std::invalid_argument("token mask has the wrong word count");
+    throw std::logic_error("token mask has the wrong word count");
   }
   const uint32_t rows = static_cast<uint32_t>(words.size() / maskWords);
   for (uint32_t row = 0; row < rows; ++row) {
     auto begin = words.begin() + uint64_t{row} * maskWords;
     if (std::none_of(begin, begin + maskWords,
                      [](uint32_t word) { return word != 0; })) {
-      throw std::invalid_argument("token mask row permits no vocabulary token");
+      return "token mask row permits no vocabulary token";
     }
   }
   if (entry.verifyMaskInFlight) {
     if (!entry.pendingToken || (words[*entry.pendingToken / 32] &
                                 (1U << (*entry.pendingToken % 32))) == 0) {
-      throw std::invalid_argument(
-          "verify mask is not synchronized to the pending anchor");
+      return "verify mask is not synchronized to the pending anchor";
     }
   }
   entry.maskWords.assign(words.begin(), words.end());
+  return std::nullopt;
 }
 
 void Runtime::end(uint64_t requestId) {

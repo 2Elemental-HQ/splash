@@ -246,20 +246,18 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
                  "engine warmup has not completed", true);
     return true;
   }
-  uint64_t nowUnix = clocks_.unixMicros();
-  double nowMonotonic = clocks_.monotonicMilliseconds();
-  if (!std::isfinite(nowMonotonic) ||
-      request.absoluteDeadlineUnixMicros <= nowUnix) {
-    requestError(request.requestId, "deadline_exceeded",
-                 "request deadline elapsed before admission");
-    return true;
-  }
-  uint64_t absoluteRemaining = request.absoluteDeadlineUnixMicros - nowUnix;
-  uint64_t remaining =
-      std::min(absoluteRemaining, request.remainingDeadlineMicros);
-  if (!remaining) {
-    requestError(request.requestId, "deadline_exceeded",
-                 "request deadline elapsed before admission");
+  const uint64_t nowUnix = clocks_.unixMicros();
+  const double nowMonotonic = clocks_.monotonicMilliseconds();
+  const uint64_t remaining =
+      request.absoluteDeadlineUnixMicros > nowUnix
+          ? std::min(request.absoluteDeadlineUnixMicros - nowUnix,
+                     request.remainingDeadlineMicros)
+          : 0;
+  if (!std::isfinite(nowMonotonic) || !remaining) {
+    const LaneOutcomeWire deadline =
+        laneOutcomeWire(LaneOutcome::DeadlineExceeded);
+    requestError(request.requestId, std::string(deadline.code),
+                 std::string(kDeadlineExceededMessage), deadline.retryable);
     return true;
   }
 
@@ -354,33 +352,19 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
     // A CPU mask calculation can finish after the request ends.
     return true;
   }
-  auto failMaskRequest = [&](std::string code, std::string message) -> bool {
-    try {
-      core_.failRequest(mask.requestId, std::move(code), std::move(message));
-      return true;
-    } catch (const std::exception &error) {
-      engineError("mask_response_failure", error.what());
-    } catch (...) {
-      engineError("mask_response_failure", "unknown mask terminal exception");
-    }
-    return false;
-  };
-
-  auto found = pendingMasks_.find(mask.requestId);
-  if (found == pendingMasks_.end() ||
-      found->second.maskRequestId != mask.maskRequestId ||
-      found->second.expectedWords != mask.maskWords.size()) {
-    return failMaskRequest("invalid_mask_response",
-                           "mask response does not match the pending request");
-  }
   try {
-    core_.provideMask(mask.requestId, mask.maskWords);
+    auto found = pendingMasks_.find(mask.requestId);
+    if (found == pendingMasks_.end() ||
+        found->second.maskRequestId != mask.maskRequestId ||
+        found->second.expectedWords != mask.maskWords.size()) {
+      core_.failRequest(mask.requestId, LaneOutcome::InvalidMask,
+                        "mask response does not match the pending request");
+      return true;
+    }
+    // Erased before the engine reads the mask: unusable contents fail the
+    // request there, and its failure event erases the same entry.
     pendingMasks_.erase(found);
-  } catch (const std::invalid_argument &error) {
-    // Correctly framed mask contents (for example an all-zero row) are a
-    // request-scoped semantic error. Internal state/allocator failures
-    // are handled below as engine-unhealthy.
-    return failMaskRequest("invalid_mask_response", error.what());
+    core_.provideMask(mask.requestId, mask.maskWords);
   } catch (const std::exception &error) {
     engineError("mask_response_failure", error.what());
     return false;
@@ -413,9 +397,9 @@ bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
     return true;
   }
   try {
-    core_.failRequest(issue.requestId,
-                      std::string(protocol::issueCodeName(issue.code)),
-                      std::move(issue.message));
+    core_.failRequest(issue.requestId, LaneOutcome::InvalidMask,
+                      std::string(protocol::issueCodeName(issue.code)) + ": " +
+                          issue.message);
   } catch (const std::exception &error) {
     engineError("mask_response_failure", error.what());
     return false;
@@ -593,11 +577,13 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
   telemetry_.erase(requestId);
 }
 
-void NativeRuntime::failed(uint64_t requestId, std::string code,
-                           std::string message, bool retryable) {
-  if (config_.metrics && code == kCapacityExhausted)
+void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
+                           std::string message) {
+  const LaneOutcomeWire wire = laneOutcomeWire(outcome);
+  if (config_.metrics && outcome == LaneOutcome::CapacityExhausted)
     config_.metrics->capacityFailed();
-  requestError(requestId, std::move(code), std::move(message), retryable);
+  requestError(requestId, std::string(wire.code), std::move(message),
+               wire.retryable);
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
 }

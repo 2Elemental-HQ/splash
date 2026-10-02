@@ -90,16 +90,15 @@ struct EngineSnapshot final {
 // KV blocks define prefix identity; composite recurrent state is attached
 // at sparse progress points, replay boundaries, and shared KV junctions.
 //
-// Failure contract. A request the engine cannot serve ends with its own
-// failure event (EngineEventSink::failed), which the engine reports and
-// survives. submit() reports an invalid request with std::invalid_argument,
-// which the caller answers with that request's error, and provideMask()
-// reports unusable mask contents the same way. Any other exception out of
-// submit() or provideMask(), and every exception out of tick(), cancel(),
-// failRequest() and reclaimMemory(), is engine-fatal: NativeRuntime reports
-// EngineUnhealthy and the process exits. Code below them therefore does not
-// roll back on an exception; the only cleanup on that path is RAII teardown
-// itself needs (state IO drains, FileRestore, Serving).
+// Failure contract. A request the engine cannot serve ends with a LaneOutcome
+// (Types.hpp): its own result, which the engine reports and survives. submit()
+// reports an invalid request with std::invalid_argument, which the caller
+// answers with that request's error. Any other exception out of submit(), and
+// every exception out of tick(), cancel(), failRequest(), provideMask() and
+// reclaimMemory(), is engine-fatal: NativeRuntime reports EngineUnhealthy and
+// the process exits. Code below them therefore does not roll back on an
+// exception; the only cleanup on that path is RAII teardown itself needs
+// (state IO drains, FileRestore, Serving).
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -110,7 +109,7 @@ public:
     scheduler_.observePrefill(rows, wallMilliseconds);
   }
   void cancel(uint64_t requestId);
-  void failRequest(uint64_t requestId, std::string code, std::string message);
+  void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
   void setCompletionNotifier(std::function<void()> notifier);
 
@@ -136,10 +135,9 @@ public:
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
 
 private:
-  struct Failure final {
-    std::string code;
+  struct LaneEnd final {
+    LaneOutcome outcome;
     std::string message;
-    bool retryable = false;
   };
 
   struct ResourceWait final {
@@ -203,7 +201,9 @@ private:
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
-    std::optional<Failure> failure;
+    // The outcome that ends this lane once the command or restore it is in
+    // drains; the first one stands.
+    std::optional<LaneEnd> pendingEnd;
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
@@ -338,12 +338,21 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
+  // Whether the command in flight holds the request's lane.
+  [[nodiscard]] bool inFlight(uint64_t requestId) const;
+  // Ends a request early. While its command or restore runs, the first end
+  // waits there (the command's mask wait is abandoned, the restore's read
+  // cancelled) and apply()/pollRestores() settle it once that work drains;
+  // otherwise the request ends now: Cancelled completes it, any other
+  // outcome fails it.
+  void settle(Request &request, LaneEnd end);
+  [[nodiscard]] static LaneEnd deadlineEnd();
+  [[nodiscard]] static LaneEnd capacityExhausted(std::string_view what,
+                                                 metal::AllocationFailure failure,
+                                                 std::string_view detail = {});
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
-  void finishFailure(Request &request, Failure failure);
-  void finishCapacity(Request &request, std::string_view what,
-                      metal::AllocationFailure failure,
-                      std::string_view detail = {});
+  void finishFailure(Request &request, LaneEnd end);
   void release(Request &request);
   void sweepTerminal();
 

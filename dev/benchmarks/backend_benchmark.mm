@@ -106,9 +106,10 @@ public:
     observations_[requestId].completed = true;
   }
 
-  void failed(uint64_t requestId, std::string code, std::string message,
-              bool) override {
-    observations_[requestId].failure = std::move(code) + ":" + message;
+  void failed(uint64_t requestId, LaneOutcome outcome,
+              std::string message) override {
+    observations_[requestId].failure =
+        std::string(laneOutcomeWire(outcome).code) + ":" + message;
   }
 
   [[nodiscard]] const Observation &get(uint64_t requestId) const {

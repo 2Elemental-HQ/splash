@@ -148,12 +148,14 @@ public:
     return std::make_shared<State>();
   }
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t> words) override {
+  std::optional<std::string>
+  provideMask(uint64_t, std::span<const uint32_t> words) override {
     // As in the model, a mask row must permit some token.
     if (std::none_of(words.begin(), words.end(),
                      [](uint32_t word) { return word != 0; }))
-      throw std::invalid_argument("token mask row permits no vocabulary token");
+      return "token mask row permits no vocabulary token";
     ++providedMasks;
+    return std::nullopt;
   }
   uint32_t providedMasks = 0;
   void end(uint64_t id) override { requests_.erase(id); }
@@ -621,7 +623,9 @@ void testCapacityFailureHasOneTerminalFrame() {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++errors;
       capacity += error->failureClass == protocol::FailureClass::RequestError &&
-                  !error->retryable && error->code == engine::kCapacityExhausted;
+                  !error->retryable &&
+                  error->code ==
+                      laneOutcomeWire(LaneOutcome::CapacityExhausted).code;
     }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
@@ -757,6 +761,51 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
     }
     require(errors == 1, "duplicate id produced multiple terminal errors");
   }
+}
+
+// The protocol frees an id when its request ends. A cancel and a new request
+// for that id in one input start the new request while the engine still
+// holds the cancelled one's finished entry.
+void testCancelledIdIsReusableInTheSameInput() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeRuntime loop(
+      {}, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  loop.announceReady();
+  const auto first = protocol::serializeMessage(protocol::Message{request(7, 4)});
+  require(first && loop.receive(*first.value) && loop.tick() && loop.tick() &&
+              !loop.commandInFlight(),
+          "the first request did not start");
+  const auto cancel =
+      protocol::serializeMessage(protocol::Message{protocol::CancelFrame{7}});
+  const auto again = protocol::serializeMessage(protocol::Message{request(7)});
+  require(cancel && again, "cancel or request wire failed");
+  std::vector<uint8_t> input = *cancel.value;
+  input.insert(input.end(), again.value->begin(), again.value->end());
+  require(loop.receive(input),
+          "a cancel and a request for one id closed the connection");
+  runUntilIdle(loop);
+  std::vector<protocol::FinishReason> done;
+  uint32_t errors = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
+      done.push_back(event->reason);
+    errors += std::holds_alternative<protocol::ErrorEvent>(message);
+  }
+  require(errors == 0 &&
+              done == std::vector<protocol::FinishReason>{
+                          protocol::FinishReason::Cancelled,
+                          protocol::FinishReason::Stop},
+          "a cancelled id was not reusable in the same input");
 }
 
 void testControlFailureUsesExecutionBoundary() {
@@ -1371,6 +1420,7 @@ void testConstrainedMaskExchange() {
 
     std::optional<protocol::FinishReason> done;
     std::vector<std::string> errors;
+    std::string errorMessage;
     uint32_t maskRequests = 0;
     for (const auto &message : decodeMessages(output)) {
       if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
@@ -1380,6 +1430,7 @@ void testConstrainedMaskExchange() {
                     error->failureClass == protocol::FailureClass::RequestError,
                 "mask response failure was not the request's own error");
         errors.push_back(error->code);
+        errorMessage = error->message;
       }
       maskRequests += std::holds_alternative<protocol::MaskRequestEvent>(message);
     }
@@ -1395,12 +1446,13 @@ void testConstrainedMaskExchange() {
                   executor.providedMasks == 0,
               "mask response after cancellation was not ignored");
     } else {
-      const std::string expected = reply == Reply::Malformed
-                                       ? "invalid_payload_length"
-                                       : "invalid_mask_response";
-      require(!done && errors == std::vector<std::string>{expected} &&
+      require(!done &&
+                  errors == std::vector<std::string>{"invalid_mask_response"} &&
                   executor.providedMasks == 0,
               "mismatched mask response did not fail only its request");
+      require(reply != Reply::Malformed ||
+                  errorMessage.starts_with("invalid_payload_length: "),
+              "a malformed mask response lost its decoding issue");
     }
   }
 }
@@ -1419,6 +1471,7 @@ int main() {
     testRequestErrorKeepsFraming();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
+    testCancelledIdIsReusableInTheSameInput();
     testControlFailureUsesExecutionBoundary();
     testAdmissionExceptionStopsTheEngineOnce();
     testEngineFailureNamesItsReason();

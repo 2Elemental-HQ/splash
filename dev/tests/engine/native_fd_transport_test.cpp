@@ -78,7 +78,10 @@ public:
     return {};
   }
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t>) override {}
+  std::optional<std::string> provideMask(uint64_t,
+                                         std::span<const uint32_t>) override {
+    return std::nullopt;
+  }
   void end(uint64_t) override {}
 
 private:

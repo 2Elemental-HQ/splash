@@ -357,6 +357,15 @@ std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens) {
   return result;
 }
 
+// Gives the request a mask the runtime must take.
+void provideMask(model::Runtime &executor, uint64_t requestId,
+                 std::span<const uint32_t> words) {
+  const std::optional<std::string> rejected =
+      executor.provideMask(requestId, words);
+  require(!rejected, "the runtime rejected a usable token mask: " +
+                         rejected.value_or(""));
+}
+
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
 StateSamples sampleCommittedState(const model::QwenStateStorage &states,
@@ -867,7 +876,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                     DecodeStage::RequestInitialMask)
                   .nextDecodeStage == DecodeStage::ApplyInitialMask,
           "the non-finite constrained fixture did not request its mask");
-  executor.provideMask(204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
+  provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
   // A failed first selection leaves no anchor to verify, so its decode is
   // complete at once; one that selected a token would wait for its next mask.
   const BatchPlan apply{WorkKind::Decode,
@@ -1371,7 +1380,7 @@ int main(int argc, char **argv) {
     require(microInitialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "constrained short prefill did not preserve mask handshake");
     const std::array<uint32_t, 1> forcedMicroToken{106};
-    executor.provideMask(56, singletonMasks(forcedMicroToken));
+    provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
         decodeOne(executor, 56, 0, prompt8.size(), constrainedPages,
                   BatchCohort::Constrained, DecodeStage::ApplyInitialMask);
@@ -1432,7 +1441,7 @@ int main(int argc, char **argv) {
       require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
-      executor.provideMask(replayId, singletonMasks(firstAnchor));
+      provideMask(executor, replayId, singletonMasks(firstAnchor));
       auto pending = beginMaskedDecodeOne(executor, replayId, 1, 129,
                                           replayPages,
                                           DecodeStage::ApplyInitialMask);
@@ -1449,7 +1458,7 @@ int main(int argc, char **argv) {
       }
       if (stored < proposed.size())
         maskTokens[stored] = proposed[stored] == 101 ? 102 : 101;
-      executor.provideMask(replayId, singletonMasks(maskTokens));
+      provideMask(executor, replayId, singletonMasks(maskTokens));
       const auto replayed = finishMaskedDecode(std::move(pending));
       require(replayed.size() == 1 &&
                   replayed[0].acceptedDraftTokens == stored - 1 &&
@@ -1585,7 +1594,7 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> initialWords = singletonMasks(initialTokens);
     require(initialWords.size() == kMaskWords,
             "empty simulation did not produce exactly one mask row");
-    executor.provideMask(40, initialWords);
+    provideMask(executor, 40, initialWords);
 
     PendingMaskedDecode verify = beginMaskedDecodeOne(
         executor, 40, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
@@ -1602,7 +1611,7 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> verifyWords = singletonMasks(verifyTokens);
     require(verifyWords.size() == uint64_t{9} * kMaskWords,
             "DFlash-8 verify did not produce nine mask rows");
-    executor.provideMask(40, verifyWords);
+    provideMask(executor, 40, verifyWords);
     auto constrainedResults = finishMaskedDecode(std::move(verify));
     require(constrainedResults.size() == 1,
             "constrained overlap returned the wrong batch width");
@@ -1636,7 +1645,7 @@ int main(int argc, char **argv) {
             "perfect constrained accounting skipped its initial mask");
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
-    executor.provideMask(44, singletonMasks(perfectInitialTokens));
+    provideMask(executor, 44, singletonMasks(perfectInitialTokens));
     PendingMaskedDecode perfectPending = beginMaskedDecodeOne(
         executor, 44, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
     require(perfectPending.maskRequests.size() == 1 &&
@@ -1655,7 +1664,7 @@ int main(int argc, char **argv) {
                                           125,
                                           126,
                                           127};
-    executor.provideMask(44, singletonMasks(perfectVerify));
+    provideMask(executor, 44, singletonMasks(perfectVerify));
     auto perfectResults = finishMaskedDecode(std::move(perfectPending));
     require(perfectResults.size() == 1,
             "perfect constrained overlap returned the wrong width");
@@ -1683,7 +1692,7 @@ int main(int argc, char **argv) {
             "second exact constrained hit skipped initial mask");
     const uint32_t anchorC = 105;
     std::array<uint32_t, 1> alternateTokens{anchorC};
-    executor.provideMask(41, singletonMasks(alternateTokens));
+    provideMask(executor, 41, singletonMasks(alternateTokens));
     ModelStepResult alternateOutput =
         decodeOne(executor, 41, 0, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::ApplyInitialMask);
@@ -1742,8 +1751,8 @@ int main(int argc, char **argv) {
         "B2 constrained initial masks are not empty simulations");
     std::array<uint32_t, 1> crossAnchor0{110};
     std::array<uint32_t, 1> crossAnchor1{111};
-    executor.provideMask(42, singletonMasks(crossAnchor0));
-    executor.provideMask(43, singletonMasks(crossAnchor1));
+    provideMask(executor, 42, singletonMasks(crossAnchor0));
+    provideMask(executor, 43, singletonMasks(crossAnchor1));
     crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
     PendingMaskedDecode crossPending =
         beginMaskedDecode(executor, crossInitialPlan, crossItems);
@@ -1759,8 +1768,8 @@ int main(int argc, char **argv) {
       const uint32_t rejected = simulation[1] == 112 ? 113 : 112;
       crossVerify[lane] =
           {anchor, rejected, 114, 115, 116, 117, 118, 119, 120};
-      executor.provideMask(crossPending.maskRequests[lane].requestId,
-                           singletonMasks(crossVerify[lane]));
+      provideMask(executor, crossPending.maskRequests[lane].requestId,
+                  singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
     require(crossResults.size() == 2 &&
@@ -2307,7 +2316,7 @@ int main(int argc, char **argv) {
                 "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
-          executor.provideMask(sequence.id, singletonMasks(anchor));
+          provideMask(executor, sequence.id, singletonMasks(anchor));
         }
         slot = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
@@ -2368,7 +2377,7 @@ int main(int argc, char **argv) {
                 "preemption fixture did not request initial mask");
         if (!preempt) {
           const std::array<uint32_t, 1> anchor{100};
-          executor.provideMask(sequence.id, singletonMasks(anchor));
+          provideMask(executor, sequence.id, singletonMasks(anchor));
         }
       }
       if (preempt)
@@ -2385,7 +2394,7 @@ int main(int argc, char **argv) {
           std::array<uint32_t, 9> forced;
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;
-          executor.provideMask(sequence.id, singletonMasks(forced));
+          provideMask(executor, sequence.id, singletonMasks(forced));
           result = finishMaskedDecode(std::move(pending)).front();
           for (size_t row = 0; row < result.outputTokens.size(); ++row)
             require(row < forced.size() && result.outputTokens[row] == forced[row],

@@ -124,8 +124,8 @@ private:
   void completed(uint64_t requestId, EngineFinishReason reason,
                  uint32_t promptTokens, uint32_t completionTokens,
                  std::span<const float> optionLogits) override;
-  void failed(uint64_t requestId, std::string code, std::string message,
-              bool retryable) override;
+  void failed(uint64_t requestId, LaneOutcome outcome,
+              std::string message) override;
 
   static NativeLoopClocks defaultClocks();
   static uint64_t durationMicros(double startMilliseconds,
