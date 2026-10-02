@@ -25,9 +25,6 @@ public:
   void suspend(uint64_t requestId) override;
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
-  void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                     std::shared_ptr<const CompositeState> restoredState,
-                     bool restoreDraftState) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint64_t requestId, uint32_t boundary,
       std::shared_ptr<const CompositeState> state, bool restoreDraft,

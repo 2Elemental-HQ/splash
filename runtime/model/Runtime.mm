@@ -2079,21 +2079,6 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateSlot)
   return admission;
 }
 
-void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                      std::shared_ptr<const CompositeState> restoredState,
-                      bool restoreDraftState) {
-  Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident || !restoredState) {
-    throw std::invalid_argument("cannot restore a nonresident request");
-  }
-  if (restoredPrefixLength >= entry.promptTokens) {
-    throw std::invalid_argument(
-        "reusable Qwen prefix must leave an input token to replay");
-  }
-  impl_->states.restore(entry.slot, *restoredState, restoreDraftState);
-  finishRestore(requestId, restoredPrefixLength, restoreDraftState);
-}
-
 std::unique_ptr<StateRestore> Runtime::beginRestore(
     uint64_t requestId, uint32_t boundary,
     std::shared_ptr<const CompositeState> state, bool restoreDraft,
@@ -2858,7 +2843,8 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     estimatedPeakBytes = impl_->estimatedWarmupPeak();
     end(id);
     beginColdRequest(request, 1);
-    restore(id, prefixTokens, cachedState, true);
+    if (beginRestore(id, prefixTokens, cachedState, true, {}))
+      throw std::logic_error("a resident state restore returned a read");
     setDraftContextPlan(
         id, planDraftContext(prefixTokens, promptTokens, prefixTokens, {}));
     const auto &restored = impl_->states.metadata(1).lengths;

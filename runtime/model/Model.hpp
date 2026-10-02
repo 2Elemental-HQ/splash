@@ -465,16 +465,13 @@ public:
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
-  virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
-                       bool restoreDraftState) = 0;
+  // Restores a cached state into the request's lane at `boundary`. A RAM
+  // state is copied now and the call returns null; a disk state returns the
+  // read, whose finish() commits it. `completion` only wakes the engine.
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
                std::shared_ptr<const CompositeState> state, bool restoreDraft,
-               std::function<void()>) {
-    restore(requestId, boundary, std::move(state), restoreDraft);
-    return {};
-  }
+               std::function<void()> completion) = 0;
   virtual void setDraftContextPlan(uint64_t requestId,
                                    DraftContextPlan plan) = 0;
   // Optional async wake hook; an immediately ready ticket need not call it.

@@ -417,37 +417,24 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
   return {};
 }
 
-void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
+void QwenStateStorage::restore(uint32_t index, const QwenCompositeState &state,
                                bool restoreDraftState) {
-  const auto *typed = dynamic_cast<const QwenCompositeState *>(&state);
-  if (!typed) {
-    throw std::invalid_argument("composite state is not Qwen state");
-  }
-  if (typed->layout_ != layout_) {
-    throw std::invalid_argument("composite state layout does not match model");
-  }
-  validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
-  requireAssigned(destination);
-  if (!typed->slot_.gdn || !typed->slot_.draft) {
-    throw std::invalid_argument("incompatible Qwen composite state");
-  }
-
   const uint32_t active = destination.metadata.activeParity;
   copyExact(destination.gdn[active]->buffers().stateBase,
-            typed->slot_.gdn->buffers().stateBase, "restored GDN state");
+            state.slot_.gdn->buffers().stateBase, "restored GDN state");
   if (restoreDraftState) {
     for (uint32_t layer = 0; layer < destination.buffers.draft.size();
          ++layer) {
       copyExact(destination.buffers.draft[layer].keys,
-                typed->slot_.draft->layers()[layer].keys,
+                state.slot_.draft->layers()[layer].keys,
                 "restored draft keys");
       copyExact(destination.buffers.draft[layer].values,
-                typed->slot_.draft->layers()[layer].values,
+                state.slot_.draft->layers()[layer].values,
                 "restored draft values");
     }
   }
-  restoreLengths(index, typed->lengths_, restoreDraftState);
+  restoreLengths(index, state.lengths_, restoreDraftState);
 }
 
 void QwenStateStorage::restoreLengths(uint32_t index, QwenLogicalLengths lengths,
@@ -467,14 +454,14 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
   const auto *typed = dynamic_cast<const QwenCompositeState *>(&state);
   if (!typed || typed->layout_ != layout_)
     throw std::invalid_argument("incompatible Qwen composite state");
-  if (!typed->disk_) {
-    restore(index, state, restoreDraftState);
-    committed();
-    return {};
-  }
   validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
   requireAssigned(destination);
+  if (!typed->disk_) {
+    restore(index, *typed, restoreDraftState);
+    committed();
+    return {};
+  }
   auto spans = stateSpans(destination.buffers.gdn[destination.metadata.activeParity],
                           destination.buffers.draft);
   auto commit = [this, index, lengths = typed->lengths_, restoreDraftState,

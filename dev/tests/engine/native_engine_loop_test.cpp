@@ -69,12 +69,13 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {{}, StateFailure::ConcurrencyLimit};
   }
-  void restore(uint64_t, uint32_t length,
-                     std::shared_ptr<const CompositeState> state,
-                     bool) override {
+  std::unique_ptr<StateRestore> beginRestore(uint64_t, uint32_t length,
+                                             std::shared_ptr<const CompositeState> state,
+                                             bool, std::function<void()>) override {
     if (!state)
       throw std::runtime_error("missing composite state");
     restored_ += length;
+    return {};
   }
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
   std::vector<ModelStepResult>

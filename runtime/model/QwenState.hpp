@@ -223,9 +223,9 @@ public:
   // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t slot, std::function<void()> completion);
-  void restore(uint32_t slot, const CompositeState &state,
-               bool restoreDraftState);
-
+  // Restores `state` into the slot's current cell, and into its draft ring
+  // when restoreDraftState. A RAM state is copied now, runs `committed` and
+  // returns null; a disk state returns the read, whose finish() runs it.
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint32_t slot, const CompositeState &state, bool restoreDraftState,
       std::function<void()> completion, std::function<void()> committed);
@@ -265,6 +265,8 @@ private:
   // The bytes of the cells and the ring the pool lacks of that.
   [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
   static void refreshViews(Slot &slot);
+  void restore(uint32_t slot, const QwenCompositeState &state,
+               bool restoreDraftState);
   void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot, QwenLogicalLengths lengths);

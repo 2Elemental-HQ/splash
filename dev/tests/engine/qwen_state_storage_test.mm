@@ -243,7 +243,10 @@ void testDiskRestore(metal::MetalBackend &backend) {
     word(layer.keys) = 0;
     word(layer.values) = 0;
   }
-  storage.restore(0, *promoted, true);
+  committed = false;
+  require(!storage.beginRestore(0, *promoted, true, {}, [&] { committed = true; }) &&
+              committed,
+          "a resident restore returned a read or did not commit");
   require(word(buffers.gdn[0].stateBase) == 0x12345678 &&
               storage.metadata(0).lengths.hasCompleteDraftWindow(2048),
           "promotion lost the original complete state when execution skipped draft");
@@ -519,7 +522,8 @@ void run(const std::string &metallib) {
     word(slot1.draft[0].keys) = 0xb2b2b2b2;
     void *destinationGdnBase = slot1.gdn[0].stateBase.contents();
     void *destinationDraftBase = slot1.draft[0].keys.contents();
-    storage.restore(1, *prefix, true);
+    require(!storage.beginRestore(1, *prefix, true, {}, [] {}),
+            "a resident restore returned a read");
 
     require(storage.metadata(1).requestId == 202 &&
                 storage.metadata(1).activeParity == 0 &&
@@ -548,7 +552,8 @@ void run(const std::string &metallib) {
     // overwritten by the next prefill commands.
     storage.swapParity(1);
     word(slot1.draft[0].keys) = 0xd2d2d2d2;
-    storage.restore(1, *prefix, false);
+    require(!storage.beginRestore(1, *prefix, false, {}, [] {}),
+            "a resident restore returned a read");
     require(word(slot1.gdn[storage.metadata(1).activeParity].convolutionBase) ==
                 0x21212121,
             "GDN-only restore did not restore convolution state");
@@ -645,7 +650,8 @@ void run(const std::string &metallib) {
     require(storage.actualAllocatedBytes() == beforeDrop,
             "denied snapshot leaked cache slot bytes");
     admitNewAllocations = true;
-    storage.restore(1, *pooled, true);
+    require(!storage.beginRestore(1, *pooled, true, {}, [] {}),
+            "a resident restore returned a read");
     require(storage.metadata(1).activeParity == 1 &&
                 storage.metadata(1).lengths == lengths &&
                 word(slot1.gdn[1].convolutionBase) == 0xe1e1e1e1 &&

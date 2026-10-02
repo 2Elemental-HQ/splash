@@ -231,27 +231,18 @@ public:
     }
     return {{}, StateFailure::ConcurrencyLimit};
   }
-  void restore(uint64_t id, uint32_t length,
-               std::shared_ptr<const CompositeState> state,
-               bool restoreDraftState) override {
-    if (!state)
-      throw std::runtime_error("empty restore state");
-    requests.at(id).position = length;
-    restored += length;
-    restoredDraft = restoreDraftState;
-  }
   std::unique_ptr<StateRestore> beginRestore(
       uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
       bool restoreDraft, std::function<void()>) override {
     if (state->residentBytes()) {
-      restore(id, length, std::move(state), restoreDraft);
+      applyRestore(id, length, std::move(state), restoreDraft);
       return {};
     }
     ++diskReads;
     auto ticket = std::make_unique<RestoreTicket>();
     ticket->control = restoreControl;
     ticket->commit = [this, id, length, state, restoreDraft] {
-      restore(id, length, state, restoreDraft);
+      applyRestore(id, length, state, restoreDraft);
     };
     return ticket;
   }
@@ -553,6 +544,17 @@ public:
   std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
   std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
   std::shared_ptr<MaskOverlapState> overlap;
+
+private:
+  void applyRestore(uint64_t id, uint32_t length,
+                    std::shared_ptr<const CompositeState> state,
+                    bool restoreDraftState) {
+    if (!state)
+      throw std::runtime_error("empty restore state");
+    requests.at(id).position = length;
+    restored += length;
+    restoredDraft = restoreDraftState;
+  }
 };
 
 class Events final : public EngineEventSink {

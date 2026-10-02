@@ -219,7 +219,8 @@ ModelBatchItem withRevision(ModelBatchItem item) {
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
                          const std::shared_ptr<const CompositeState> &state) {
-  executor.restore(requestId, boundary, state, true);
+  require(!executor.beginRestore(requestId, boundary, state, true, {}),
+          "resident restore returned a read");
   executor.setDraftContextPlan(
       requestId, planDraftContext(boundary, promptTokens, boundary, {}));
 }
@@ -1068,7 +1069,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     if (id == 115) {
       bool refused = false;
       try {
-        executor.restore(id, 32, beforeImage, true);
+        static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {}));
       } catch (const std::invalid_argument &error) {
         refused = std::string(error.what()) ==
                   "restore stops before images its activation left out";
