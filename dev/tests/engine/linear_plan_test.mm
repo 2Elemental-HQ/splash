@@ -729,39 +729,6 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
     rejects([&] { (void)Linear::plan(prefill, {LinearTile::N256, 0, LinearSimdgroups::Four}); });
     rejects([&] { (void)Linear::plan(prefill, {LinearTile::N128, 1, LinearSimdgroups::Four}); });
   }
-
-  const LinearWorkload other{{768, 768}, 16, LinearPhase::Decode, LinearEpilogue::None};
-  const auto original = linear.plan(other).configuration();
-  const LinearConfig selected{LinearTile::N256, 1};
-  const std::array choices{LinearChoice{other, selected}, LinearChoice{valid, selected}};
-  linear.setChoices(choices);
-  require(linear.plan(valid).configuration() == selected &&
-              linear.plan(other).configuration() == selected,
-          "unsorted profile choices did not take effect");
-  const std::array duplicate{choices[0], choices[0]};
-  rejects([&] { linear.setChoices(duplicate); });
-  const std::array invalid{LinearChoice{valid, {LinearTile::N128, 0}}};
-  rejects([&] { linear.setChoices(invalid); });
-  require(linear.plan(other).configuration() == selected,
-          "invalid profile update changed installed choices");
-  linear.setChoices({});
-  require(linear.plan(other).configuration() == original,
-          "clearing profile did not restore the shipped baseline");
-  const auto baselineFourWorkload = linear.plan(fourWorkload);
-  const std::array fourChoices{LinearChoice{fourWorkload, fourConfig}};
-  linear.setChoices(fourChoices);
-  require(linear.plan(fourWorkload).configuration() == fourConfig &&
-              linear.plan(fourWorkload).threadsPerThreadgroup() == 128,
-          "installed four-SIMDgroup choice did not reach the selected plan");
-  const std::array invalidScope{LinearChoice{valid, fourConfig}};
-  rejects([&] { linear.setChoices(invalidScope); });
-  require(linear.plan(fourWorkload).configuration() == fourConfig,
-          "invalid scope update changed installed choices");
-  linear.setChoices({});
-  require(linear.plan(fourWorkload).configuration() == baselineFourWorkload.configuration() &&
-              linear.plan(fourWorkload).threadsPerThreadgroup() ==
-                  baselineFourWorkload.threadsPerThreadgroup(),
-          "clearing choices did not restore the shipped execution scope");
 }
 
 // Every affine plan for families 9-11, reported core counts 0-128 and a grid
@@ -1265,15 +1232,7 @@ void scalingContracts() {
                 for (size_t j = 0; j < i; ++j)
                   require(plan.configuration() != candidates[j].configuration(),
                           "core scaling produced duplicate candidates");
-                const std::array choice{LinearChoice{w, plan.configuration()}};
-                linear.setChoices(choice);
-                const auto scratch = linear.decodeScratchSize(w);
-                for (const auto required : {baseline.scratchSize(), plan.scratchSize()})
-                  require(scratch.input >= required.input && scratch.sums >= required.sums &&
-                              scratch.partials >= required.partials && scratch.counters >= required.counters,
-                          "installed candidate exceeds admitted Q4 workspace");
               }
-              linear.setChoices({});
               // N128 is available for every non-gated decode workload. Its
               // candidate waves must follow the device, including tiny GPUs.
               if (epilogue != LinearEpilogue::GateUp) {

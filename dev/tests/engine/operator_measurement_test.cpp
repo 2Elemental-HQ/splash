@@ -44,71 +44,6 @@ void diagnosticNames() {
           "invalid diagnostic enum did not have a bounded fallback");
 }
 
-void comparableWarmupPairs() {
-  splash::model::WarmupStepResult baseline;
-  baseline.wallSeconds = 2;
-  baseline.lanes.resize(4);
-  for (size_t lane = 0; lane < baseline.lanes.size(); ++lane) {
-    auto &result = baseline.lanes[lane];
-    result.step.requestId = lane + 1;
-    result.step.outputTokens = {10, 11, 12, 13};
-    result.step.draftedTokens = 7;
-    result.step.acceptedDraftTokens = 3;
-    result.pendingToken = 14;
-    result.committedTokens = 103;
-  }
-  auto candidate = baseline;
-  candidate.wallSeconds = 0.25;
-  for (auto &lane : candidate.lanes) {
-    lane.step.outputTokens = {20, 21, 22, 23};
-    lane.pendingToken = 24;
-  }
-  std::vector<PairedTiming> gpu, wall;
-  for (size_t pair = 0; pair < kMinPairedSamples; ++pair) {
-    const auto order = measurementOrder(pair);
-    const auto [gpuPair, wallPair] =
-        pairWarmupMeasurements(baseline, 1, candidate, 0.125, order);
-    require(gpuPair.first == order && wallPair.first == order &&
-                gpuPair.baselineSeconds == 1 && gpuPair.candidateSeconds == 0.125 &&
-                wallPair.baselineSeconds == 2 && wallPair.candidateSeconds == 0.25,
-            "comparable warmup pair lost its metric or execution order");
-    gpu.push_back(gpuPair);
-    wall.push_back(wallPair);
-  }
-  require(evaluate(gpu).verdict == TimingVerdict::Improved &&
-              evaluate(wall).verdict == TimingVerdict::Improved,
-          "token identity alone prevented a comparable-work confirmation");
-
-  const auto reject = [&](const auto &before, const auto &after,
-                           std::string_view diagnostic) {
-    bool rejected = false;
-    try {
-      (void)pairWarmupMeasurements(before, 1, after, 0.125,
-                                   MeasurementOrder::CandidateFirst);
-    } catch (const std::runtime_error &error) {
-      rejected = std::string_view(error.what()).find(diagnostic) != std::string_view::npos;
-    }
-    require(rejected, "different warmup work was admitted as a faster timing pair");
-  };
-  // Only the final lane differs: a first-lane-only check would accept every
-  // apparently faster candidate below, despite its changed decode work.
-  for (unsigned change = 0; change < 4; ++change) {
-    auto different = candidate;
-    auto &last = different.lanes.back();
-    if (change == 0) --last.step.acceptedDraftTokens;
-    if (change == 1) --last.committedTokens;
-    if (change == 2) last.step.outputTokens.pop_back();
-    if (change == 3) last.pendingToken.reset();
-    reject(baseline, different, "different warmup work at lane 4");
-  }
-  auto different = candidate;
-  different.lanes.pop_back();
-  reject(baseline, different, "lane counts");
-  different = candidate;
-  different.lanes.clear();
-  reject(different, different, "lane counts");
-}
-
 void completeRun() {
   std::vector<CandidateId> invocations;
   const auto result = measureWorkload(kCandidate, kWorkload,
@@ -414,7 +349,6 @@ void uncertainAcceptance() {
 int main() {
   try {
     diagnosticNames();
-    comparableWarmupPairs();
     uncertainAcceptance();
     require(measurementBatchRepetitions(0.010) == 1 &&
                 measurementBatchRepetitions(0.005) == 1 &&

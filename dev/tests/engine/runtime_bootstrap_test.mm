@@ -34,40 +34,6 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-void testWarmupLaneComparisons() {
-  const model::WarmupLaneResult baseline{
-      {17, 32, {101, 102}, false, DecodeStage::Regular, 7, 2, 0}, 103, 34};
-  require(baseline == baseline, "warmup result equality is not reflexive");
-  require(baseline.sameWorkAs(baseline), "warmup work equality is not reflexive");
-  auto requireDifferent = [&](auto change, bool changesWork = true) {
-    auto candidate = baseline;
-    change(candidate);
-    require(candidate != baseline, "warmup comparison ignored an observable result");
-    require(candidate.sameWorkAs(baseline) != changesWork,
-            "warmup work comparison confused token identity and work counts");
-  };
-  requireDifferent([](auto &value) { ++value.step.requestId; });
-  requireDifferent([](auto &value) { ++value.step.consumedPromptTokens; });
-  requireDifferent([](auto &value) { ++value.step.outputTokens[0]; }, false);
-  requireDifferent([](auto &value) { value.step.outputTokens.pop_back(); });
-  requireDifferent([](auto &value) { value.step.finished = true; });
-  requireDifferent([](auto &value) {
-    value.step.nextDecodeStage = DecodeStage::ApplyInitialMask;
-  });
-  requireDifferent([](auto &value) { ++value.step.draftedTokens; });
-  requireDifferent([](auto &value) { ++value.step.acceptedDraftTokens; });
-  requireDifferent([](auto &value) { ++value.step.outputTokensWithoutKv; });
-  requireDifferent([](auto &value) { ++*value.pendingToken; }, false);
-  requireDifferent([](auto &value) { value.pendingToken.reset(); });
-  requireDifferent([](auto &value) { ++value.committedTokens; });
-  std::vector lanes{baseline, baseline};
-  ++lanes[1].step.requestId;
-  auto reordered = lanes;
-  std::swap(reordered[0], reordered[1]);
-  require(lanes != reordered, "warmup comparison ignored batch-plan lane order");
-  require(lanes != std::vector{baseline}, "warmup comparison ignored missing lanes");
-}
-
 class TemporaryModelRoot final {
 public:
   TemporaryModelRoot() {
@@ -707,7 +673,6 @@ void testProtocolLimitsFollowTheModel() {
 
 int main() {
   try {
-    testWarmupLaneComparisons();
     testInstalledManifestBindsExecutionGeometry();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();

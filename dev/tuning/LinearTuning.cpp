@@ -177,14 +177,13 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
                               const MeasurementStop &shouldStop) {
   const auto start = Clock::now();
   LinearTuningResult result;
-  result.choice.workload = input.workload;
   auto elapsed = [&] {
     return std::chrono::duration<double>(Clock::now() - start).count();
   };
   try {
     Linear linear(backend.capabilities());
     const auto plans = linear.candidates(input.workload);
-    result.choice.configuration = plans.front().configuration();
+    result.configuration = plans.front().configuration();
     if (!validMeasurementOptions(options) || !admit)
       throw std::invalid_argument("invalid Linear tuning measurement options or admission");
     if (input.weights.empty() || input.weights.size() > kMaximumLinearTuningRepresentatives)
@@ -383,7 +382,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     const auto wall = selectCandidate(wallCandidates, {&workloadId, 1}, options.policy);
     if (gpu.verdict == SelectionVerdict::Selected &&
         wall.verdict == SelectionVerdict::Selected && gpu.candidate == wall.candidate)
-      result.choice.configuration = plans.at(gpu.candidate.value).configuration();
+      result.configuration = plans.at(gpu.candidate.value).configuration();
     result.complete = true;
   } catch (...) {
     result.failure = std::current_exception();

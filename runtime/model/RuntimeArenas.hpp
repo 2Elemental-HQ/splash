@@ -132,8 +132,7 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
   return static_cast<Tensor>(static_cast<uint32_t>(Tensor::MoeScratch) + field);
 }
 
-// Sizes depend on the geometry and the installed operator choices; the arena
-// bounds include the operator defaults and every installed configuration.
+// Sizes depend on the geometry and the device's operator plans.
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators);

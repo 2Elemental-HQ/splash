@@ -325,45 +325,38 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                                 error.what(), deviceStatusJson(device));
   }
 
-  // One selection owner is used both before allocation and during encoding.
-  // The engine lends it to model execution without inspecting kernel choices.
+  // One plan owner is used both before allocation and during encoding. The
+  // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
-  auto prepareMemory = [&]() -> EngineMemoryPlan {
-    model::ModelMemoryPlan modelMemoryPlan;
-    try {
-      modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
-    } catch (const std::exception &error) {
-      throw RuntimeResourcesError(
-          RuntimeResourceStage::MemoryPlanning,
-          std::string("model allocated-size plan is invalid: ") + error.what(),
-          deviceStatusJson(device));
-    }
+  model::ModelMemoryPlan modelMemoryPlan;
+  try {
+    modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
+  } catch (const std::exception &error) {
+    throw RuntimeResourcesError(
+        RuntimeResourceStage::MemoryPlanning,
+        std::string("model allocated-size plan is invalid: ") + error.what(),
+        deviceStatusJson(device));
+  }
 
-    ModelMemoryFootprint footprint{
-        package.targetActualAllocatedBytes(),
-        package.draft.actualAllocatedBytes,
-        package.vision.actualAllocatedBytes,
-        modelMemoryPlan,
-        stateStagingBytes,
-    };
-
-    ModelMemoryProfile modelProfile{
-        package.name(), package.maximumContextTokens(),
-        package.targetKvLayout(config.kvFormat), footprint};
-    EngineMemoryPlanResult planResult =
-        evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
-    if (!planResult.plan) {
-      throw RuntimeResourcesError(
-          RuntimeResourceStage::MemoryPlanning, planResult.status.message,
-          planResult.status.toStatusJson(), planResult.status.describe());
-    }
-    EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
-    return memoryPlan;
+  ModelMemoryFootprint footprint{
+      package.targetActualAllocatedBytes(),
+      package.draft.actualAllocatedBytes,
+      package.vision.actualAllocatedBytes,
+      modelMemoryPlan,
+      stateStagingBytes,
   };
-  // Establish the serving baseline and the one real memory governor before
-  // installing the shipped choices. Selected workspace never gets a separate
-  // allowance or replaces the immutable engine-wide ceiling.
-  EngineMemoryPlan memoryPlan = prepareMemory();
+
+  ModelMemoryProfile modelProfile{
+      package.name(), package.maximumContextTokens(),
+      package.targetKvLayout(config.kvFormat), footprint};
+  EngineMemoryPlanResult planResult =
+      evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+  if (!planResult.plan) {
+    throw RuntimeResourcesError(
+        RuntimeResourceStage::MemoryPlanning, planResult.status.message,
+        planResult.status.toStatusJson(), planResult.status.describe());
+  }
+  EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
 
   RuntimeCacheIdentity cacheIdentity;
   try {
@@ -378,50 +371,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   }
 
   try {
-    const auto baselineMemoryPlan = memoryPlan;
-    const EngineMemoryBreakdown &baselineBudget = baselineMemoryPlan.breakdown();
-    const uint64_t runtimeReserve =
-        baselineBudget.pipelineReserveBytes + baselineBudget.runtimeOverheadReserveBytes;
+    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
     // allocator reserves, so memory outside the backend's buffers is charged
     // only beyond them, and elastic state and KV never grow into them.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, baselineBudget.hardBudgetBytes, hostReserveBytes,
-        hostAvailableMemory, runtimeReserve);
+        *backend, budget.hardBudgetBytes, hostReserveBytes, hostAvailableMemory,
+        budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
-    std::string rejected;
-    auto adoptChoices = [&](const ops::OperatorChoices &choices) {
-      try {
-        operators.install(choices);
-        auto selectedMemoryPlan = prepareMemory();
-        const auto &selected = selectedMemoryPlan.breakdown();
-        if (selected.pipelineReserveBytes + selected.runtimeOverheadReserveBytes !=
-                runtimeReserve || selected.hardBudgetBytes != baselineBudget.hardBudgetBytes)
-          throw std::logic_error("operator choices changed the memory governor ceiling");
-        memoryPlan = std::move(selectedMemoryPlan);
-        return true;
-      } catch (const std::exception &error) {
-        // An illegal table entry or a host/user limit that no longer fits the
-        // selected scratch keeps the operator defaults, never a partial table.
-        rejected = error.what();
-        operators.install({});
-        memoryPlan = baselineMemoryPlan;
-        return false;
-      }
-    };
     logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
                " with ", device.gpuCoreCount, " cores.");
-    if (config.operatorChoices && !config.operatorChoices->empty()) {
-      if (adoptChoices(*config.operatorChoices))
-        logStartup("Installed supplied kernel choices.");
-      else
-        logStartup("Supplied kernel choices rejected (", rejected,
-                   "); using the kernel policy.");
-    }
 
-    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     // Page ids for every extent the hard budget could hold: the governor,
     // never the id range, limits the pool.
     const uint64_t poolExtents = std::min<uint64_t>(

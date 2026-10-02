@@ -3,8 +3,6 @@
 // through the production encoders, and prints one line per key: the winner
 // with its paired GPU/wall gain, or "default kept". With --candidates every
 // timed candidate is listed, so a policy rule can be judged by what it costs.
-// --confirm times the complete prefill/decode graphs, defaults versus winners.
-#include "engine/Bootstrap.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
@@ -14,16 +12,12 @@
 
 #import <Foundation/Foundation.h>
 
-#include <array>
 #include <charconv>
-#include <chrono>
 #include <cmath>
 #include <csignal>
-#include <ctime>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <algorithm>
 #include <optional>
 #include <sstream>
@@ -42,11 +36,9 @@ using namespace splash::ops::tuning;
 
 constexpr std::string_view kUsage =
     "usage: tune-kernels METALLIB MODEL_ROOT [--seconds PER_KEY] [--pairs N]\n"
-    "                    [--confirm [PAIRS]] [--candidates]\n"
+    "                    [--candidates]\n"
     "  --seconds  wall budget per operator key (default 10)\n"
     "  --pairs    paired samples per candidate, 12..64 (default 12)\n"
-    "  --confirm  also time the complete prefill/decode graphs, defaults vs\n"
-    "             winners, with PAIRS pairs each (default 12, the minimum)\n"
     "  --candidates  after each Linear key, list every timed candidate with its\n"
     "             median GPU/wall gain over the default, best first\n";
 
@@ -55,7 +47,6 @@ void stopSignal(int) { interrupted = 1; }
 
 struct Options final {
   MeasurementOptions measurement;
-  std::optional<size_t> confirmPairs;
   bool candidates = false;
 };
 
@@ -90,9 +81,6 @@ Options parse(int argc, char **argv) {
       options.measurement.samplePairs = pairCount(argv[++i], option);
     } else if (option == "--candidates") {
       options.candidates = true;
-    } else if (option == "--confirm") {
-      options.confirmPairs =
-          hasValue ? pairCount(argv[++i], option) : kMinPairedSamples;
     } else {
       throw std::invalid_argument("unknown option or missing value: " + std::string(option) +
                                   "\n" + std::string(kUsage));
@@ -101,8 +89,8 @@ Options parse(int argc, char **argv) {
   return options;
 }
 
-// The choice lines are pasted as code, so an enumerator prints as the token of
-// its own case label: a rename changes both, and -Wswitch catches a new one.
+// An enumerator prints as the token of its own case label: a rename changes
+// both, and -Wswitch catches a new one.
 #define ENUMERATOR_NAME(enumerator) \
   case enumerator:                  \
     return #enumerator
@@ -207,89 +195,6 @@ void outcome(const std::string &workload, bool complete, bool changed,
   std::cout << '\n';
 }
 
-struct Confirmation final {
-  std::string graph;
-  TimingAssessment gpu;
-  TimingAssessment wall;
-};
-
-// Complete-graph timing, defaults versus winners, through the production
-// bootstrap. Arenas are sized for both because the winners are supplied as
-// the creation-time choices; only those two tables are ever installed.
-std::vector<Confirmation> confirm(const std::filesystem::path &metallib,
-                                  const std::filesystem::path &modelRoot,
-                                  const OperatorChoices &winners, size_t pairs) {
-  engine::RuntimeBootstrapConfig config;
-  config.resources.metallibPath = metallib;
-  config.resources.modelRoot = modelRoot;
-  config.resources.model = model::inspectModelPackage(modelRoot);
-  config.resources.buildId = SPLASH_BUILD_ID;
-  config.resources.operatorChoices = winners;
-  auto bootstrap = engine::RuntimeBootstrap::start(
-      std::move(config), [](std::span<const uint8_t>) {},
-      []() -> std::string { throw std::logic_error("no status requests during tuning"); });
-  auto &resources = bootstrap->resources();
-  auto &runtime = bootstrap->modelRuntime();
-  const OperatorChoices &choices = winners;
-  if (choices.empty()) throw std::runtime_error("no kernel choices to confirm");
-
-  std::vector<Confirmation> results;
-  auto measure = [&](const std::string &graph, auto &&run) {
-    std::vector<PairedTiming> gpu, wall;
-    for (size_t pair = 0; pair < pairs && !interrupted; ++pair) {
-      const MeasurementOrder order = measurementOrder(pair);
-      double gpuSeconds[2]{};
-      std::array<model::WarmupStepResult, 2> steps;
-      for (int slot = 0; slot < 2; ++slot) {
-        const bool baseline = (slot == 0) == (order == MeasurementOrder::BaselineFirst);
-        resources.installOperatorChoices(baseline ? OperatorChoices{} : choices);
-        auto [g, step] = run();
-        gpuSeconds[baseline ? 0 : 1] = g;
-        steps[baseline ? 0 : 1] = std::move(step);
-      }
-      try {
-        const auto [gpuPair, wallPair] = pairWarmupMeasurements(
-            steps[0], gpuSeconds[0], steps[1], gpuSeconds[1], order);
-        gpu.push_back(gpuPair);
-        wall.push_back(wallPair);
-      } catch (const std::runtime_error &error) {
-        throw std::runtime_error(graph + ": " + error.what());
-      }
-    }
-    resources.installOperatorChoices(choices);
-    results.push_back({graph, evaluate(gpu), evaluate(wall)});
-  };
-  measure("prefill 2048 rows", [&] {
-    auto step = runtime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
-    return std::pair{runtime.telemetry().lastPrefillGpuSeconds, std::move(step)};
-  });
-  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
-    measure("decode B" + std::to_string(width), [&] {
-      auto step = runtime.warmupDecodeBatch(width);
-      return std::pair{runtime.telemetry().lastDecodeGpuSeconds, std::move(step)};
-    });
-  }
-  return results;
-}
-
-void printAssessment(std::string_view label, const TimingAssessment &value) {
-  std::cout << "  " << label << ' ' << std::fixed << std::setprecision(2)
-            << value.baselineMedianSeconds * 1000 << " -> "
-            << value.candidateMedianSeconds * 1000 << " ms, "
-            << timingVerdictName(value.verdict);
-  if (value.verdict == TimingVerdict::Improved || value.verdict == TimingVerdict::Stable ||
-      value.verdict == TimingVerdict::Uncertain || value.verdict == TimingVerdict::Regressed)
-    std::cout << " (median gain " << percent(value.medianPairedGain) << ")";
-  std::cout << '\n';
-}
-
-std::string today() {
-  char buffer[32];
-  std::time_t now = std::time(nullptr);
-  std::strftime(buffer, sizeof buffer, "%Y-%m-%d", std::localtime(&now));
-  return buffer;
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -305,15 +210,9 @@ int main(int argc, char **argv) {
       std::cout << std::unitbuf;  // progress lines reach a log as they happen
       const std::filesystem::path metallib = argv[1], modelRoot = argv[2];
 
-      OperatorChoices choices;
       uint32_t measured = 0, changed = 0, incomplete = 0, failed = 0;
-      std::string deviceName, modelName;
-      uint32_t gpuFamily = 0;
-      {
       metal::MetalBackend backend(metallib.string());
       const auto &device = backend.capabilities();
-      deviceName = device.deviceName;
-      gpuFamily = device.appleGpuFamily;
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
       const uint64_t budget =
           engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
@@ -344,7 +243,6 @@ int main(int argc, char **argv) {
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);
-      modelName = package->name();
 
       std::cout << "tune-kernels: " << device.deviceName << " (Apple GPU family "
                 << device.appleGpuFamily << "), model " << package->name() << ", build "
@@ -363,12 +261,11 @@ int main(int argc, char **argv) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
         const auto baseline = linear.plan(input.workload).configuration();
-        const bool didChange = result.complete && result.choice.configuration != baseline;
-        if (didChange) choices.linear.push_back(result.choice);
+        const bool didChange = result.complete && result.configuration != baseline;
         outcome(describe(input.workload), result.complete, didChange,
-                describe(result.choice.configuration),
+                describe(result.configuration),
                 evidence(result.measurements,
-                         candidateOf(linear.candidates(input.workload), result.choice.configuration)),
+                         candidateOf(linear.candidates(input.workload), result.configuration)),
                 result.failure);
         if (options.candidates) {
           // Every candidate's own paired evidence against the default, so a
@@ -400,31 +297,7 @@ int main(int argc, char **argv) {
 
       std::cout << "\nmeasured " << measured << " keys: " << changed << " changed, "
                 << incomplete << " incomplete, " << failed << " failed"
-                << (interrupted ? ", interrupted" : "") << "\n\n";
-      }  // sweep scope: release the model, fixtures and backend before confirmation
-
-      std::cout << "// Apple GPU family " << gpuFamily << " (" << deviceName
-                << "), " << modelName
-                << ", tune-kernels " << today() << ", build " << SPLASH_BUILD_ID << "\n"
-                << "// " << changed << " of " << measured
-                << " keys have a candidate that beat the policy default; if a margin\n"
-                << "// matters, change the rules in runtime/ops, not a table.\n";
-      for (const auto &c : choices.linear)
-        std::cout << "choices.linear.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      if (choices.empty()) std::cout << "// (no entry: every measured key kept its default)\n";
-
-      if (options.confirmPairs && !interrupted && !choices.empty()) {
-        std::cout << "confirming complete graphs (" << *options.confirmPairs
-                  << " pairs each; defaults -> winners)...\n";
-        for (const auto &row : confirm(metallib, modelRoot, choices, *options.confirmPairs)) {
-          std::cout << row.graph << '\n';
-          printAssessment("GPU ", row.gpu);
-          printAssessment("wall", row.wall);
-        }
-        std::cout << '\n';
-      }
-
+                << (interrupted ? ", interrupted" : "") << '\n';
       return failed || interrupted ? 1 : 0;
     } catch (const std::exception &error) {
       std::cerr << "tune-kernels: " << error.what() << '\n';

@@ -25,7 +25,8 @@ struct LinearTuningInput final {
 };
 
 struct LinearTuningResult final {
-  LinearChoice choice;
+  // The selected configuration: the baseline's unless a candidate won.
+  LinearConfig configuration;
   std::vector<MeasurementResult> measurements;
   bool complete = false;
   std::exception_ptr failure;
@@ -54,7 +55,7 @@ struct LinearTuningResult final {
 // Both timing metrics must independently select the same non-baseline winner.
 // complete includes timing rejections, but excludes interrupted/failed sweeps.
 // Metal failures are preserved and never retried. No result is persisted here;
-// any winner still requires caller-owned production graph confirmation.
+// a winner still needs a whole-model A/B before any policy change.
 [[nodiscard]] LinearTuningResult tuneLinear(
     metal::MetalBackend &backend, const metal::AllocationAdmission &admit,
     const LinearTuningInput &input,

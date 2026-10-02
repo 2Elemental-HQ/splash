@@ -132,7 +132,7 @@ struct Selection final {
 // gain. Their conservative mean must meet minimumMeanImprovement, so an
 // all-identical candidate cannot win. Ties prefer the greater worst-workload
 // gain, then the smaller candidate ID, independently of input order.
-// The winner still requires caller-owned production graph confirmation.
+// A winner still needs a whole-model A/B before any policy change.
 [[nodiscard]] Selection
 selectCandidate(std::span<const CandidateMeasurements> candidates,
                 std::span<const WorkloadId> requiredWorkloads,

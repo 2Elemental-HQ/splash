@@ -17,7 +17,7 @@ template <typename Function> void rejects(Function function) {
   bool rejected = false;
   try { function(); }
   catch (const std::invalid_argument &) { rejected = true; }
-  require(rejected, "invalid operator choice or lookup was accepted");
+  require(rejected, "invalid operator lookup was accepted");
 }
 
 // The target attention shapes: query heads over a KV layout.
@@ -75,7 +75,7 @@ void baselinePlans() {
           const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
-                  "empty linear choices changed the device baseline");
+                  "the plans' decode Linear departed from the device policy");
           if (epilogue == LinearEpilogue::GateUp)
             gateBound = std::max(gateBound, baseline.plan(w).gateScratchBytes());
         }
@@ -89,7 +89,7 @@ void baselinePlans() {
           const LinearWorkload w{matrix, rows, LinearPhase::Prefill, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
-                  "empty choices changed prefill baseline");
+                  "the plans' prefill Linear departed from the device policy");
         }
     }
     for (const auto &[queryHeads, kvLayout] : attentionShapes) {
@@ -238,66 +238,9 @@ void ggufMoePlans() {
   rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
 }
 
-void allCandidates() {
-  ExecutionPlans plans(device());
-  const ExecutionPlans shipped(device());
-  const Linear baseline(device());
-  for (auto matrix : matrices) {
-    for (uint32_t rows : {1U, 17U, 2048U, 8U, 16U, 24U, 32U}) {
-      const auto phase = rows == 1 || rows == 17 || rows == 2048
-                             ? LinearPhase::Prefill : LinearPhase::Decode;
-      for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
-                            phase == LinearPhase::Prefill
-                                ? LinearEpilogue::UpWithGate
-                                : LinearEpilogue::GateUp}) {
-        const LinearWorkload w{matrix, rows, phase, epilogue};
-        for (const auto &candidate : baseline.candidates(w)) {
-          OperatorChoices choices;
-          choices.linear.push_back({w, candidate.configuration()});
-          plans.install(choices);
-          const auto selected = plans.linear().plan(w);
-          require(selected.configuration() == candidate.configuration() &&
-                      selected.pipeline() == candidate.pipeline() &&
-                      selected.threadsPerThreadgroup() == candidate.threadsPerThreadgroup(),
-                  "linear candidate configuration/pipeline/scope not selected together");
-          // A four-SIMDgroup choice keeps the shipped plan's rows and sums and
-          // needs no more gate scratch: the one-lane Split32 gate/up tile
-          // needs none where the shipped plan runs Split128's gate pass.
-          if (candidate.configuration().simdgroups == LinearSimdgroups::Four) {
-            const auto original = shipped.linear().plan(w);
-            require(selected.storageRows() == original.storageRows() &&
-                        selected.sumsBytes() == original.sumsBytes() &&
-                        selected.gateScratchBytes() <= original.gateScratchBytes() &&
-                        selected.downSumsBytes() == original.downSumsBytes() &&
-                        plans.gateUpWorkspace(affineGateUp(matrix)) == shipped.gateUpWorkspace(affineGateUp(matrix)),
-                    "four-SIMDgroup choice changed an external workspace requirement");
-          }
-          require(plans.gateUpWorkspace(affineGateUp(matrix)) >= candidate.gateScratchBytes() ||
-                      phase == LinearPhase::Prefill,
-                  "gate scratch omitted a selected decode width");
-        }
-      }
-    }
-  }
-}
-
-OperatorChoices mixedChoices() {
-  OperatorChoices choices;
-  choices.linear.push_back({{matrices[0], 8, LinearPhase::Decode,
-                              LinearEpilogue::GateUp}, {LinearTile::N256, 60}});
-  return choices;
-}
-
-void requireMixed(const ExecutionPlans &plans) {
-  require(plans.linear().plan(mixedChoices().linear[0].workload).configuration() ==
-              LinearConfig{LinearTile::N256, 60}, "linear table was partially replaced");
-}
-
-void policyKeysAndBounds() {
-  ExecutionPlans plans(device());
-  plans.install(mixedChoices());
-  requireMixed(plans);
-  std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
+void workspaceBounds() {
+  const ExecutionPlans plans(device());
+  const std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
   const auto padded = plans.verifyAttention(3, 24, attentionShapes[0].layout, histories);
   require(padded.laneSplits[3] == 0 && padded.splits == kv::q8VerifyAttentionSplits(2049, 8),
           "padded inactive lookup history was not ignored");
@@ -315,7 +258,7 @@ void policyKeysAndBounds() {
           "MoE decode workspace per lane changed");
   require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
               plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
-          "B1 gate choice hid the B3/B4 baseline requirement");
+          "gate/up workspace omitted the B3/B4 gate pass");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
   // attention partials behind them.
@@ -323,27 +266,6 @@ void policyKeysAndBounds() {
               draft.groupedQueriesBytes == 65536 + 8 * 4 * 16640 &&
               draft.queryKeysBytes == 16384 && draft.queryValuesBytes == 16384,
           "draft workspace ABI changed");
-  plans.install({});
-  require(plans.linear().plan(mixedChoices().linear[0].workload).configuration() ==
-              Linear(device()).plan(mixedChoices().linear[0].workload).configuration(),
-          "empty install did not reset the table");
-}
-
-void atomicInvalidChoices() {
-  ExecutionPlans plans(device());
-  plans.install(mixedChoices());
-  const auto invalid = [&](auto change) {
-    auto pending = mixedChoices();
-    pending.linear[0].configuration.groups = 32;
-    change(pending);
-    rejects([&] { plans.install(pending); });
-    requireMixed(plans);
-  };
-  invalid([](auto &c) { c.linear[0].configuration.groups = 0; });
-  invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups::Four; });
-  invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups(6); });
-  invalid([](auto &c) { c.linear[0].workload.rows = 9; });
-  invalid([](auto &c) { c.linear.push_back(c.linear[0]); });
 }
 
 void invalidLookupsAndContextEdges() {
@@ -383,13 +305,10 @@ int main() {
     baselinePlans();
     moeDeviceTiles();
     ggufMoePlans();
-    allCandidates();
-    policyKeysAndBounds();
-    atomicInvalidChoices();
+    workspaceBounds();
     invalidLookupsAndContextEdges();
-    std::cout << "PASS execution plans: typed policies, device MoE tiles, atomic "
-                 "install, all candidates, B1-B4 and prefill workspace bounds "
-                 "(CPU only)\n";
+    std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
+                 "and prefill workspace bounds (CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

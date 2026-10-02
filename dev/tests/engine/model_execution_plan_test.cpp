@@ -132,8 +132,8 @@ void checkMixedLayouts() {
 
 // One decode arena serves every lane count, and on Apple10 and later a
 // Split128 plan's partials grow with the rows. The arena must hold every
-// lane's plan of every affine target and draft projection, including an
-// installed choice at eight splits, at the measured core counts.
+// lane's plan of every affine target and draft projection at the measured
+// core counts.
 void checkLaneScratch(const model::ModelPackage &package) {
   const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
@@ -144,18 +144,12 @@ void checkLaneScratch(const model::ModelPackage &package) {
       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
   for (const auto &p : geometry.target.decodeProjections)
     if (p.layout == ops::WeightLayout::Affine64) matrices.push_back({p.outputSize, p.inputSize});
-  const ops::LinearWorkload chosen{{d.hiddenSize, d.targetHiddenSize}, model::kLaneCount * model::kDecodeRows,
-                                   ops::LinearPhase::Decode, ops::LinearEpilogue::None};
   for (uint32_t family : {10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      ops::ExecutionPlans plans(device);
-      ops::OperatorChoices choices;
-      choices.linear.push_back({chosen, {ops::LinearTile::Split128, d.hiddenSize / 128,
-                                         ops::LinearSimdgroups::Eight, 8}});
-      plans.install(choices);
+      const ops::ExecutionPlans plans(device);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
@@ -166,9 +160,6 @@ void checkLaneScratch(const model::ModelPackage &package) {
             require(scratch.partials >= need.partials && scratch.counters >= need.counters,
                     "decode arena scratch below a lane's affine plan");
           }
-      require(plans.linear().plan(chosen).configuration().splits == 8 &&
-                  scratch.partials >= plans.linear().plan(chosen).scratchSize().partials,
-              "decode arena scratch lost the installed split choice");
     }
 }
 

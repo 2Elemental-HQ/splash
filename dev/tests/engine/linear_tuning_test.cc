@@ -127,7 +127,7 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
     return metal::AllocationResult{};
   };
   auto assertStopped = [&](const LinearTuningResult &result, bool failure) {
-    require(!result.complete && result.choice.configuration == baseline &&
+    require(!result.complete && result.configuration == baseline &&
         bool(result.failure) == failure && result.measurements.empty(),
         "early exit lost baseline or failure");
     require(BackendInstrumentation::submittedCommands(backend) == before, "early exit submitted GPU work");
@@ -247,7 +247,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
   const auto wallWinner = selectCandidate(wallCandidates, {&id, 1}, options.policy);
   const bool agreed = gpuWinner.verdict == SelectionVerdict::Selected &&
       wallWinner.verdict == SelectionVerdict::Selected && gpuWinner.candidate == wallWinner.candidate;
-  require(result.choice.workload == workload && result.choice.configuration ==
+  require(result.configuration ==
       plans[agreed ? gpuWinner.candidate.value : 0].configuration(),
       "tuning accepted a winner without independent GPU/wall agreement");
 }
@@ -270,7 +270,7 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
     const auto result = tuneLinear(backend, admit, input, options,
         pressure ? stop : MeasurementStop{}, pressure ? MeasurementStop{} : stop);
     require(!result.complete && !result.failure && result.measurements.size() == 1 &&
-        result.choice.configuration == plans.front().configuration() &&
+        result.configuration == plans.front().configuration() &&
         result.measurements[0].status == (pressure ? MeasurementStatus::UnderPressure :
             MeasurementStatus::Cancelled) && result.measurements[0].pairCount == 1 &&
         result.measurements[0].measurement.returnedCalls == 3 &&
@@ -421,7 +421,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   options.maximumWallSeconds = 30;
   // Candidate ID changes order/accounting only: both calls encode exactly the
   // same 16 complete baseline operators. This is a diagnostic, not a synthetic
-  // performance win or a replacement for production-graph confirmation.
+  // performance win or a replacement for a whole-model A/B.
   const auto measurement = measureWorkload({1}, {0}, [&](CandidateId) {
     return invoke(baseline, 0, 16);
   }, options);

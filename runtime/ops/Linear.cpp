@@ -3,7 +3,6 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/Linear.h"
-#include "ops/ChoiceTable.hpp"
 
 #include <algorithm>
 #include <array>
@@ -540,7 +539,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
-  return LinearPlan(workload, chosenConfiguration(choices_, workload, baseline(workload)));
+  return LinearPlan(workload, baseline(workload));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
@@ -548,17 +547,7 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   w.weightLayout = p.layout();
   const std::array<const Projection *, 2> projections{&p, gate};
-  return LinearPlan(w, chosenConfiguration(choices_, w, baseline(w, projections)), p.destination);
-}
-void Linear::setChoices(std::span<const LinearChoice> choices) {
-  std::vector<LinearChoice> pending(choices.begin(), choices.end());
-  for (const auto &choice : pending) {
-    if (choice.workload.weightLayout == WeightLayout::Block32)
-      throw std::invalid_argument("block projection plans are not tuned");
-    (void)plan(choice.workload, choice.configuration);
-  }
-  sortUniqueChoices(pending);
-  choices_ = std::move(pending);
+  return LinearPlan(w, baseline(w, projections), p.destination);
 }
 
 std::vector<LinearPlan> Linear::candidates(LinearWorkload w) const {
@@ -636,7 +625,7 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 
 LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
   if (w.weightLayout == WeightLayout::Block32) return ggufDecodeScratchSize(w);
-  return LinearPlan(w, baseline(w)).scratchSize().include(plan(w).scratchSize());
+  return plan(w).scratchSize();
 }
 
 

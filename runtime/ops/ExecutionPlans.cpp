@@ -1,10 +1,7 @@
 #include "ops/ExecutionPlans.hpp"
 
-#include "ops/ChoiceTable.hpp"
-
 #include <algorithm>
 #include <stdexcept>
-#include <utility>
 
 namespace splash::ops {
 namespace {
@@ -27,20 +24,9 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), baselineLinear_(device),
-      moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
+    : linear_(device), moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
       appleGpuFamily_(device.appleGpuFamily) {}
-
-void ExecutionPlans::install(const OperatorChoices &choices) {
-  OperatorChoices pending = choices;
-  Linear nextLinear = baselineLinear_;
-  nextLinear.setChoices(pending.linear);
-  // All potentially throwing work is above. No partial table install can
-  // affect a production lookup if validation or allocation fails.
-  std::swap(linear_, nextLinear);
-  std::swap(choices_, pending);
-}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout,
@@ -127,8 +113,7 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
                                   LinearPhase::Decode, LinearEpilogue::GateUp, shape.layout};
-    bound = std::max({bound, baselineLinear_.plan(workload).gateScratchBytes(),
-                      linear_.plan(workload).gateScratchBytes()});
+    bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;
 }

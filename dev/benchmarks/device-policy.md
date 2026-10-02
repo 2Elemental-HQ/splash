@@ -84,19 +84,19 @@ On a new device, run the tuning tool on an installed model:
 
 ```sh
 make tune-kernels MODEL=mlx-community/Qwen3.8-27B-4bit \
-  TUNE_ARGS='--seconds 30 --pairs 31 --candidates --confirm 12'
+  TUNE_ARGS='--seconds 30 --pairs 31 --candidates'
 ```
 
 Record GPU family/core count, power mode, OS/toolchain and source identity.
-Keep other GPU work idle. The tool prints measurements and confirms complete
-prefill/decode graphs; it does not persist a serving profile. Operator timings
-include standalone preparation and do not substitute for fused-producer or
-cold full-model measurements. Promote a default change only after repeatable
-whole-model A/B results, unchanged correctness/state-restoration behavior,
-and acceptable speculative acceptance and memory use. Check both models,
-short/long prompts and batch widths 1–4. Preserve the baseline when evidence
-is mixed. For the family-only MoE rule, separately compare four/eight groups
-on the missing hardware; the tuner measures no MoE plan.
+Keep other GPU work idle. The tool prints measurements; it installs nothing
+and persists no serving profile. Operator timings include standalone
+preparation and do not substitute for fused-producer or cold full-model
+measurements. Promote a default change only after repeatable whole-model A/B
+results, unchanged correctness/state-restoration behavior, and acceptable
+speculative acceptance and memory use. Check both models, short/long prompts
+and batch widths 1–4. Preserve the baseline when evidence is mixed. For the
+family-only MoE rule, separately compare four/eight groups on the missing
+hardware; the tuner measures no MoE plan.
 
 ## Convergence validation (2026-09-21)
 
@@ -106,9 +106,9 @@ on the missing hardware; the tuner measures no MoE plan.
   pipeline names and workspace sizes are byte-identical. These simulated core
   counts establish policy consistency, not measured performance on those GPUs.
 - Permanent CPU tests cover 84,240 decode workload/device combinations: valid
-  grids, bounded unique candidates, retained defaults and workspace admission
-  after installing each candidate. `test-engine-cpu` now runs `linear-plan
-  --cpu`, so these checks do not depend on a Metal test run.
+  grids, bounded unique candidates and retained defaults. `test-engine-cpu`
+  now runs `linear-plan --cpu`, so these checks do not depend on a Metal test
+  run.
 - M3 Max 40, M5 Pro 16 and M5 Pro 20 pass full builds and CPU suites, Linear
   candidate numerical tests, tuning controls/batch reuse, and the 168-case
   independent fp64 simdgroup test with GPU shader validation. Both remote

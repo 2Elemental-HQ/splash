@@ -213,8 +213,7 @@ void checkPair(ModelPackage package) {
 }
 
 // A GGUF target is not tuned: the collector takes none of its projections,
-// only the affine draft's, and a choice table may not hold a block
-// projection.
+// only the affine draft's.
 void blockTarget() {
   ModelPackage package;
   const Qwen3_6MoeLayout layout;
@@ -247,17 +246,6 @@ void blockTarget() {
                 input.matrix != LinearMatrix{layout.packedGdnWidth, layout.hiddenSize} &&
                 input.matrix != LinearMatrix{layout.packedFullWidth, layout.hiddenSize},
             "a GGUF target's projections were collected for tuning");
-  splash::DeviceCapabilities device;
-  device.appleGpuFamily = 10;
-  device.gpuCoreCount = 16;
-  ExecutionPlans plans(device);
-  OperatorChoices choices;
-  choices.linear.push_back({{{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
-                             LinearEpilogue::None, WeightLayout::Block32},
-                            plans.linear().plan({{layout.vocabularySize, layout.hiddenSize}, 8, LinearPhase::Decode,
-                                                 LinearEpilogue::None, WeightLayout::Block32})
-                                .configuration()});
-  rejects([&] { plans.install(choices); });
 }
 
 void run() {

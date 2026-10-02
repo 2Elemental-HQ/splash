@@ -97,11 +97,6 @@ struct LinearConfig final {
   bool operator==(const LinearConfig &) const = default;
 };
 
-struct LinearChoice final {
-  LinearWorkload workload;
-  LinearConfig configuration;
-};
-
 // Reused serially within one decode command stream. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams. Within a batched dispatch of
@@ -257,9 +252,6 @@ public:
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config,
                                        FloatOutput destination = FloatOutput::BFloat16);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
-  // Installed only at startup; encoding does a read-only lookup, never tuning.
-  // Block projection plans are not tuned: their workloads take no choice.
-  void setChoices(std::span<const LinearChoice> choices);
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
                     const Projection &projection, const LinearPlan &plan,
@@ -322,7 +314,6 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
-  std::vector<LinearChoice> choices_;
 };
 
 } // namespace splash::ops

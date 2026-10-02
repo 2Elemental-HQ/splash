@@ -339,8 +339,6 @@ class ArchitectureTests(unittest.TestCase):
             assembly.write_text(
                 '#include "model/Runtime.hpp"\n'
                 "ops::ExecutionPlans plans(device);\n"
-                "ops::OperatorChoices choices;\n"
-                "plans.install(choices);\n"
                 "ops::tuning::MeasurementOptions options;\n"
             )
             with mock.patch.object(check_architecture, "ROOT", root):
