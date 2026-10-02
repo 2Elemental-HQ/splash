@@ -7,6 +7,7 @@ from llguidance import LLMatcher, LLTokenizer
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from dev.tests.test_server import _byte_alphabet
+from dev.tests.tool_output import argument_grammar
 from server import output as model_output
 from server import server as api
 from server import tool_schema
@@ -346,8 +347,8 @@ class StructuredToolGrammarTest(unittest.TestCase):
         array = json.loads(json.dumps(scalar))
         array["properties"]["query"]["type"] = ["string"]
         self.assertEqual(
-            tool_schema._tool_arguments_grammar(scalar),
-            tool_schema._tool_arguments_grammar(array),
+            argument_grammar(scalar),
+            argument_grammar(array),
         )
 
     def test_json_strings_can_contain_tool_delimiter_bytes(self):

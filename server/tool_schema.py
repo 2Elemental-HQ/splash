@@ -468,15 +468,13 @@ def _json_size(value, limit):
     return size
 
 
-def tool_argument_schema(root, budget=None):
+def tool_argument_schema(root, budget):
     """Project object fields for XML framing; validate the untouched schema.
 
     Cross-field assertions remain on ToolPolicy.validators. This projection
     preserves the set of possible field values rather than choosing a branch
     before the model has supplied the discriminator or dependent properties.
     """
-    if budget is None:
-        budget = [MAX_FRAMED_SCHEMA_BYTES]
 
     def charge(size):
         budget[0] -= size
@@ -612,10 +610,6 @@ def tool_argument_schema(root, budget=None):
     }
     shape["additionalProperties"] = framed(shape["additionalProperties"])
     return shape
-
-
-def _tool_arguments_grammar(schema):
-    return _argument_grammar(tool_argument_schema(schema))
 
 
 def _parameter_rules(rule, prefix, value_schema):

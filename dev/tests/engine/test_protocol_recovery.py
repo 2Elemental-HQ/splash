@@ -5,6 +5,7 @@ from itertools import product
 from unittest import mock
 
 from dev.tests.test_server import FakeRuntime, Harness, Plan
+from dev.tests.tool_output import argument_grammar
 from server import errors as api_errors
 from server import output as model_output
 from server import server as api
@@ -425,7 +426,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 "properties": {"value": union},
                 "required": ["value"],
             }
-            grammar = tool_schema._tool_arguments_grammar(schema)
+            grammar = argument_grammar(schema)
             generated, _ = json.JSONDecoder().raw_decode(grammar.split("%json ", 1)[1])
             generated.pop("x-guidance", None)
             self.assertEqual(generated, union)

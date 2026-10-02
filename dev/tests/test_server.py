@@ -23,6 +23,7 @@ from tokenizers import Tokenizer, decoders, models
 
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
+from dev.tests.tool_output import argument_grammar
 from server import api_shapes, diagnostics, documents, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
@@ -4988,7 +4989,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", tool_schema._tool_arguments_grammar(schema))
+        self.assertIn("/(?s:.*)/", argument_grammar(schema))
         valid = {
             "id": "call_1",
             "type": "function",
@@ -5025,7 +5026,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", tool_schema._tool_arguments_grammar(schema))
+        self.assertIn("/(?s:.*)/", argument_grammar(schema))
 
         valid = {
             "id": "call_1",
@@ -5066,7 +5067,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertNotIn("propertyNames", grammar)
         invalid = {
             "id": "call_1",
@@ -5105,7 +5106,7 @@ class ServerTest(unittest.TestCase):
             "required",
             False,
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         self.assertEqual(json.dumps(schema), original)
         for path in ("website/index.html", "../secret", "website/../secret"):
@@ -5166,7 +5167,7 @@ class ServerTest(unittest.TestCase):
             "required",
             False,
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         for reference in references:
             self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
@@ -5215,7 +5216,7 @@ class ServerTest(unittest.TestCase):
             json.loads(calls[0]["function"]["arguments"]),
             {"direct": "123", "chained": "456"},
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertIn('[suffix="\\n</parameter>\\n"]', grammar)
         self.assertEqual(grammar.count("/(?s:.*)/"), 3)
         self.assertNotIn(r'[^"\s]', grammar)
@@ -5312,7 +5313,7 @@ class ServerTest(unittest.TestCase):
             json.loads(calls[0]["function"]["arguments"]), {"text": " edge "}
         )
         with self.assertRaisesRegex(api.APIError, "XML framing"):
-            tool_schema._tool_arguments_grammar(
+            argument_grammar(
                 {
                     "type": "object",
                     "properties": {
@@ -6268,7 +6269,7 @@ class ServerTest(unittest.TestCase):
                     "value": {keyword: [{"type": value_type}, {"type": "null"}]}
                 },
             }
-            grammar = tool_schema._tool_arguments_grammar(schema)
+            grammar = argument_grammar(schema)
             self.assertIn("%json", grammar)
             self.assertNotIn("RAW_START", grammar)
 
@@ -6286,7 +6287,7 @@ class ServerTest(unittest.TestCase):
                     "properties": {"value": value_schema},
                     "required": ["value"],
                 }
-                grammar = tool_schema._tool_arguments_grammar(schema)
+                grammar = argument_grammar(schema)
                 self.assertIn("%json", grammar)
                 policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
                 values = []
