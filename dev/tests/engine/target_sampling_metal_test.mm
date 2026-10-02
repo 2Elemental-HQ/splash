@@ -13,7 +13,10 @@
 // sum in token order places the uniform. DFlash acceptance must accept and
 // correct as a sequential decode would. Data within float rounding of a
 // min_p or top_p cut or of a draw's boundary fail as ambiguous, or are
-// allowed either way, instead of passing by chance.
+// allowed either way, instead of passing by chance. A lane selects the same,
+// bit for bit, whatever lanes share its batch; a distribution of one token
+// selects the masked argmax; and a lane that ignores end-of-sequence never
+// selects a stop token.
 // Extreme repetition penalties saturate to exact, finite outcomes. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
@@ -66,6 +69,12 @@ template <class Function> void rejects(Function function, const char *what) {
     return;
   }
   throw std::runtime_error(std::string("accepted ") + what);
+}
+
+// Stop tokens in the first shard of the vocabulary and in the last, so a
+// lane that excludes them skips them in both.
+std::array<uint32_t, 2> shardEdgeStopTokens(uint32_t vocabulary) {
+  return {1, vocabulary - 2};
 }
 
 class Random final {
@@ -948,14 +957,22 @@ void setDraft(const Batch &batch, uint32_t lane, uint32_t position,
   batch.inputTokens()[lane * kRows + position + 1] = draft;
 }
 
-enum class Shape { Peaked, Flat, Graded };
+enum class Shape { Peaked, Flat, Graded, Ties };
 
 // Peaked rows are fillRow's forty spikes, of which a 0.95 nucleus keeps a
 // few; flat ones spread their mass over the whole vocabulary; graded ones
-// descend over 300 tokens, so a nucleus holds tens to hundreds.
+// descend over 300 tokens, so a nucleus holds tens to hundreds; tied ones
+// take seven values, with -inf at random tokens.
 void fillShaped(float *row, uint32_t vocabulary, Shape shape, Random &random) {
   if (shape == Shape::Peaked)
     return fillRow(row, vocabulary, random);
+  if (shape == Shape::Ties) {
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      row[token] = random.next() % 11 == 0
+                       ? -INFINITY
+                       : float(int(random.next() % 7) - 3);
+    return;
+  }
   for (uint32_t token = 0; token < vocabulary; ++token)
     row[token] =
         shape == Shape::Flat ? random.unit() : -6.0F + 2.0F * random.unit();
@@ -1093,6 +1110,296 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
         require(batch.outputTokens()[0] ==
                     referenceArgmax(batch.row(offset), vocabulary, admits),
                 rowLabel + ": a greedy first token lost its argmax");
+    }
+  }
+}
+
+// Every mixed policy mask against isolated lane execution: a lane's rows
+// select the same, bit for bit, whatever lanes share its batch. The outputs
+// are poisoned, so a missing argmax or draw cannot pass by reading old data.
+void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
+  constexpr uint32_t vocabulary = 1003;
+  Sampling sampling(vocabulary, kRows);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  batch.poison();
+  Random random(9831 + lanes);
+  std::vector<SamplingPolicy> policies;
+  auto *candidates =
+      static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
+  auto *proposal =
+      static_cast<float *>(batch.buffers.draftProbabilities.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    policies.push_back(
+        {8 + lane, (samplingMask & (1U << lane)) ? 0.7F : 0.0F, 0.9F, false});
+    for (uint32_t row = 0; row < kRows; ++row)
+      fillShaped(batch.row(lane * kRows + row), vocabulary,
+                 row % 2 ? Shape::Ties : Shape::Peaked, random);
+  }
+  for (uint32_t row = 0; row < batch.rows; ++row)
+    batch.inputTokens()[row] = random.next() % vocabulary;
+  for (uint32_t entry = 0; entry < lanes * kPositions * kDraftCandidates;
+       ++entry) {
+    candidates[entry] = random.next() % vocabulary;
+    proposal[entry] = 0.5F * (random.unit() + 1.0F) / kDraftCandidates;
+  }
+  for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+    batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch.buffers, stops[0], stops[1]);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const Batch single = makeBatch(backend, vocabulary, 1);
+    single.poison();
+    const auto copy = [&](const MetalBuffer &from, const MetalBuffer &to) {
+      std::memcpy(to.contents(),
+                  static_cast<const uint8_t *>(from.contents()) +
+                      lane * to.sizeBytes(),
+                  to.sizeBytes());
+    };
+    copy(batch.buffers.logits, single.buffers.logits);
+    copy(batch.buffers.inputTokens, single.buffers.inputTokens);
+    copy(batch.buffers.draftCandidates, single.buffers.draftCandidates);
+    copy(batch.buffers.draftProbabilities, single.buffers.draftProbabilities);
+    copy(batch.buffers.uniforms, single.buffers.uniforms);
+    CommandGraph reference;
+    sampling.addVerify(reference, std::span(policies).subspan(lane, 1),
+                       single.buffers, stops[0], stops[1]);
+    static_cast<void>(backend.submitCommand(reference.dispatches()));
+    if (policies[lane].samples())
+      require(std::memcmp(&batch.record(lane * kRows), &single.record(0),
+                          single.buffers.vocabularyRows.sizeBytes()) == 0,
+              "mixed verification changed sampled rows");
+    else
+      require(std::memcmp(batch.outputTokens() + lane * kRows,
+                          single.outputTokens(),
+                          single.buffers.outputTokens.sizeBytes()) == 0,
+              "mixed verification changed greedy tokens");
+  }
+}
+
+// Constrained greedy lanes (the argmax kernels) and constrained sampled
+// lanes with top-k 1 (a distribution of one token) must agree with a
+// full-vocabulary CPU argmax, including ties, row offsets and masks: the
+// first token, every greedy verify row's token, and every sampled verify
+// row's draw and its draft token's probability, 1 for the argmax and 0
+// otherwise. Every scratch and output buffer is poisoned, so nothing passes
+// on stale data. The fp32 logits carry offsets below the bf16 spacing of
+// their values, which decide the argmax among equal integer parts: reading
+// them rounded would pick the lowest id instead.
+void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
+  Sampling sampling(vocabulary, kRows);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  const uint32_t words = batch.maskWords();
+  for (uint32_t row = 0; row < batch.rows; ++row)
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      batch.row(row)[token] = float(int((token * 7 + row * 13) % 23) - 11) +
+                              float(token % 3) * 0x1p-12F;
+  for (uint32_t row = 0; row < lanes * (kRows + 1); ++row)
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      if ((token + row) % 17 == 0)
+        batch.masks()[uint64_t{row} * words + token / 32] |= 1U << (token % 32);
+  constexpr uint32_t kUnmasked = ~0U;
+  const auto expected = [&](uint32_t row, uint32_t maskRow) {
+    float best = -INFINITY;
+    uint32_t id = ~0U;
+    for (uint32_t token = 0; token < vocabulary; ++token) {
+      if (maskRow != kUnmasked &&
+          !(batch.masks()[uint64_t{maskRow} * words + token / 32] &
+            (1U << (token % 32))))
+        continue;
+      const float value = batch.row(row)[token];
+      if (value > best) {
+        best = value;
+        id = token;
+      }
+    }
+    return id;
+  };
+  const uint32_t *tokens = batch.outputTokens();
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  for (const float temperature : {0.0F, 0.8F}) {
+    batch.poison();
+    CommandGraph initial;
+    sampling.addInitial(initial, {1, temperature, 0.5F, true}, batch.buffers,
+                        kRows - 1, stops[0], stops[1]);
+    static_cast<void>(backend.submitCommand(initial.dispatches()));
+    require(tokens[0] == expected(kRows - 1, 0),
+            "initial target differs from masked CPU argmax");
+  }
+  // Odd verify rows draft their argmax, even ones another token.
+  for (uint32_t row = 0; row < batch.rows; ++row) {
+    if (row % kRows == kRows - 1)
+      continue;
+    const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
+    const uint32_t id = expected(row, maskRow);
+    batch.inputTokens()[row + 1] = row % 2 ? id : (id + 1) % vocabulary;
+  }
+  batch.poison();
+  std::vector<SamplingPolicy> policies(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    policies[lane] = {1, lane % 2 ? 0.8F : 0.0F, 0.5F, true};
+  CommandGraph verify;
+  sampling.addVerify(verify, policies, batch.buffers, stops[0], stops[1]);
+  static_cast<void>(backend.submitCommand(verify.dispatches()));
+  for (uint32_t row = 0; row < batch.rows; ++row) {
+    const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
+    const uint32_t id = expected(row, maskRow);
+    if (!policies[row / kRows].samples()) {
+      require(tokens[row] == id,
+              "batched target differs from masked CPU argmax");
+      continue;
+    }
+    const TargetVocabularyRow &record = batch.record(row);
+    require(record.token == id,
+            "a sampled top-1 row drew other than its masked CPU argmax");
+    if (row % kRows != kRows - 1)
+      require(record.draft_probability ==
+                  (batch.inputTokens()[row + 1] == id ? 1.0F : 0.0F),
+              "a sampled top-1 row's draft probability is not one-hot");
+  }
+  const SamplingPolicy greedy{1, 0.0F, 1.0F, false};
+  batch.poison();
+  CommandGraph initialArgmax;
+  sampling.addInitial(initialArgmax, greedy, batch.buffers, kRows - 1,
+                      stops[0], stops[1]);
+  static_cast<void>(backend.submitCommand(initialArgmax.dispatches()));
+  require(tokens[0] == expected(kRows - 1, kUnmasked),
+          "initial argmax differs from CPU argmax");
+  batch.poison();
+  CommandGraph verifyArgmax;
+  sampling.addVerify(verifyArgmax, std::vector<SamplingPolicy>(lanes, greedy),
+                     batch.buffers, stops[0], stops[1]);
+  static_cast<void>(backend.submitCommand(verifyArgmax.dispatches()));
+  for (uint32_t row = 0; row < batch.rows; ++row)
+    require(tokens[row] == expected(row, kUnmasked),
+            "batched argmax differs from CPU argmax");
+}
+
+// A lane that ignores end-of-sequence never selects a stop token: not in the
+// sample after a prefill chunk, not in any verify row, greedy or sampled,
+// alone or batched beside lanes that keep them, and a stop token its draft
+// proposes is rejected. The stop tokens lead every row, so a lane that keeps
+// them selects one; the other lanes take the row's best remaining token.
+void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  Sampling sampling(vocabulary, kRows);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const auto best = [&](uint32_t row) {
+    return 5 + row * 7919 % (vocabulary - 8);
+  };
+  for (uint32_t row = 0; row < batch.rows; ++row) {
+    float *values = batch.row(row);
+    for (uint32_t token = 0; token < vocabulary; ++token)
+      values[token] = -4.0F + float(token % 7) * 0.01F;
+    values[best(row)] = 8.0F;
+    values[stops[0]] = 12.0F;
+    values[stops[1]] = 11.0F;
+  }
+  float *uniforms = batch.uniforms();
+  const uint32_t *tokens = batch.outputTokens();
+  const auto stop = [&](uint32_t token) {
+    return token == stops[0] || token == stops[1];
+  };
+
+  for (const bool excludes : {false, true}) {
+    for (const float temperature : {0.0F, 0.8F}) {
+      for (const float uniform : {0.0F, 0.5F, 0.999F}) {
+        batch.poison();
+        uniforms[0] = uniform;
+        CommandGraph initial;
+        sampling.addInitial(initial, {32, temperature, 1.0F, false, excludes},
+                            batch.buffers, kRows - 1, stops[0], stops[1]);
+        static_cast<void>(backend.submitCommand(initial.dispatches()));
+        if (excludes)
+          require(tokens[0] == best(kRows - 1) ||
+                      (temperature > 0.0F && tokens[0] < vocabulary &&
+                       !stop(tokens[0])),
+                  "an excluding lane selected a stop token after prefill");
+        else
+          require(stop(tokens[0]), "the initial sample skipped the stop tokens");
+      }
+    }
+  }
+
+  // Drafts propose the first stop token, with all of their mass on it; it
+  // is verify input row 1 of each lane.
+  AcceptanceBuffers acceptance{
+      allocate(backend, uint64_t{kLanes} * kPositions * sizeof(uint32_t)),
+      batch.buffers.draftCandidates,
+      batch.buffers.draftProbabilities,
+      batch.buffers.vocabularyRows,
+      batch.buffers.uniforms,
+      batch.buffers.outputTokens,
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t))};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    static_cast<uint32_t *>(
+        acceptance.proposedTokens.contents())[lane * kPositions] = stops[0];
+    batch.inputTokens()[lane * kRows + 1] = stops[0];
+    static_cast<uint32_t *>(acceptance.candidates.contents())
+        [uint64_t{lane} * kPositions * kDraftCandidates] = stops[0];
+    static_cast<float *>(acceptance.proposalProbabilities.contents())
+        [uint64_t{lane} * kPositions * kDraftCandidates] = 1.0F;
+  }
+  std::fill(uniforms, uniforms + kLanes * 2 * kRows, 0.5F);
+  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+    for (uint32_t excludeMask = 0; excludeMask < (1U << lanes); ++excludeMask) {
+      for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+        std::vector<SamplingPolicy> policies;
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          policies.push_back({32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F,
+                              1.0F, false, (excludeMask >> lane & 1U) != 0});
+        batch.poison();
+        CommandGraph verify;
+        sampling.addVerify(verify, policies, batch.buffers, stops[0],
+                           stops[1]);
+        static_cast<void>(backend.submitCommand(verify.dispatches()));
+        // Only an excluding lane's distribution leaves out the stop token
+        // drafted at row 0, and none of its rows draws a stop token.
+        for (uint32_t row = 0; row < lanes * kRows; ++row) {
+          const SamplingPolicy &policy = policies[row / kRows];
+          if (!policy.samples()) {
+            require(tokens[row] ==
+                        (policy.excludesStopTokens ? best(row) : stops[0]),
+                    "a greedy verify row mishandled the stop tokens");
+            continue;
+          }
+          const TargetVocabularyRow &record = batch.record(row);
+          require(row % kRows != 0 || (record.draft_probability > 0.0F) !=
+                                          policy.excludesStopTokens,
+                  "a verify distribution mishandled the stop tokens");
+          require(!policy.excludesStopTokens ||
+                      (record.token < vocabulary && !stop(record.token)),
+                  "an excluding verify row drew a stop token");
+        }
+        CommandGraph accept;
+        sampling.addAcceptance(accept, acceptance,
+                               std::span(maximumRetained).first(lanes),
+                               policies, stops[0], stops[1]);
+        static_cast<void>(backend.submitCommand(accept.dispatches()));
+        const auto *retained =
+            static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+        const auto *anchors =
+            static_cast<const uint32_t *>(acceptance.nextAnchors.contents());
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          const uint32_t *output = tokens + lane * kRows;
+          if (!policies[lane].excludesStopTokens) {
+            require(retained[lane] == 1 && output[0] == stops[0] &&
+                        anchors[lane] == stops[0],
+                    "the target did not accept the drafted stop token");
+            continue;
+          }
+          require(retained[lane] >= 1 && retained[lane] <= kRows &&
+                      !stop(anchors[lane]),
+                  "an excluding lane accepted a stop token");
+          for (uint32_t index = 0; index < retained[lane]; ++index)
+            require(output[index] < vocabulary && !stop(output[index]),
+                    "an excluding lane accepted a stop token");
+        }
+      }
     }
   }
 }
@@ -1697,9 +2004,20 @@ int main(int argc, char **argv) {
         sampledRows(backend, vocabulary, lanes, false);
         stage = "min_p rows" + batch;
         sampledRows(backend, vocabulary, lanes, true);
+        stage = "top-1 rows" + batch;
+        targetTop1(backend, vocabulary, lanes);
       }
       require(changedSelections > 0,
               "the penalties changed no greedy selection");
+      stage = "excluded stop tokens, vocabulary " + std::to_string(vocabulary);
+      excludedStopTokens(backend, vocabulary);
+    }
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      for (uint32_t mask = 0; mask < (1U << lanes); ++mask) {
+        stage = "mixed verify B" + std::to_string(lanes) + ", sampling mask " +
+                std::to_string(mask);
+        mixedVerify(backend, lanes, mask);
+      }
     }
     std::cout << "target_sampling_metal_test: PASS\n";
     return 0;
