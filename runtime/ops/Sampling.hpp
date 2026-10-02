@@ -64,14 +64,6 @@ struct SamplingWorkspace final {
   uint64_t vocabularyArrivalsBytes = 0;
 };
 
-struct DraftSelectorWorkspace final {
-  uint64_t partialIdsBytes = 0;
-  uint64_t partialValuesBytes = 0;
-  uint64_t candidatesBytes = 0;
-  uint64_t unaryBytes = 0;
-  uint64_t proposalProbabilitiesBytes = 0;
-};
-
 struct SamplingBuffers final {
   // fp32 [rows][vocabulary].
   metal::MetalBuffer logits;
@@ -102,21 +94,6 @@ struct SamplingBuffers final {
   metal::MetalBuffer vocabularyArrivals;
 };
 
-struct DraftSelectorBuffers final {
-  // fp32 [rows][vocabulary].
-  metal::MetalBuffer logits;
-  metal::MetalBuffer partialIds;
-  metal::MetalBuffer partialValues;
-  metal::MetalBuffer candidates;
-  metal::MetalBuffer unary;
-  metal::MetalBuffer selectorHidden;
-  metal::MetalBuffer predecessorCodebook;
-  metal::MetalBuffer successorCodebook;
-  metal::MetalBuffer uniforms;
-  metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer proposalProbabilities;
-};
-
 struct AcceptanceBuffers final {
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer candidates;
@@ -128,10 +105,10 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
 };
 
-// Target token policy. This operator owns the sampling penalties,
-// min-p/top-k/top-p, constrained selection, stop-token exclusion and greedy
-// argmax pipeline ABIs; the model only supplies policy, buffers, penalty
-// words and its stop tokens.
+// Target token policy (penalties, min-p/top-k/top-p, constrained selection,
+// stop-token exclusion, greedy argmax) and DFlash acceptance of the draft's
+// proposals; the model only supplies policy, buffers, penalty words and its
+// stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
   explicit Sampling(uint32_t vocabulary);
@@ -139,7 +116,6 @@ public:
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a packed batch; the operator owns sharding.
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
-  [[nodiscard]] static DraftSelectorWorkspace draftWorkspace(uint32_t positions);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
   // when it takes a state lane from the history the lane's prefill consumes:
@@ -177,21 +153,11 @@ public:
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties) const;
-  // proposalTokens is the kernels' SPLASH_DRAFT_PROPOSAL_TOKENS.
-  void addDraftSelector(
-      metal::CommandGraph &graph, DraftSelectorBuffers buffers,
-      std::span<const uint32_t> anchors,
-      std::span<const SamplingPolicy> policies, uint32_t proposalTokens) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
-  void addVerifyInput(metal::CommandGraph &graph,
-                      metal::MetalBuffer draftInputTokens,
-                      metal::MetalBuffer proposedTokens,
-                      metal::MetalBuffer verifyInputTokens,
-                      uint32_t lanes) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h

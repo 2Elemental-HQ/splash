@@ -99,18 +99,12 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
-    metal::CommandGraph &graph, DFlashSelectionBuffers buffers,
+    metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies, uint32_t proposalTokens) const {
-  selector_.addDraftSelector(
-      graph,
-      {std::move(buffers.logits), std::move(buffers.partialIds),
-       std::move(buffers.partialValues), std::move(buffers.candidates),
-       std::move(buffers.unary), std::move(buffers.selectorHidden),
-       weights_.predecessorCodebook, weights_.successorCodebook,
-       std::move(buffers.uniforms), std::move(buffers.proposedTokens),
-       std::move(buffers.proposalProbabilities)},
-      anchors, policies, proposalTokens);
+    std::span<const ops::SamplingPolicy> policies) const {
+  selector_.add(graph, buffers,
+                {weights_.predecessorCodebook, weights_.successorCodebook},
+                anchors, policies);
 }
 
 void DFlashDraft::addContextPrefill(

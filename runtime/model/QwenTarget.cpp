@@ -509,6 +509,16 @@ void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hid
                         scratch, normalized);
 }
 
+void QwenTarget::addVerifyInput(metal::CommandGraph &graph,
+                                metal::MetalBuffer draftInput,
+                                metal::MetalBuffer proposals,
+                                metal::MetalBuffer verifyInput,
+                                uint32_t lanes) const {
+  ops::Embedding::addVerifyInput(graph, std::move(draftInput),
+                                 std::move(proposals), std::move(verifyInput),
+                                 geometry_.vocabularySize, lanes);
+}
+
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,
                               metal::MetalBuffer hidden,

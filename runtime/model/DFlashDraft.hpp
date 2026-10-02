@@ -4,10 +4,10 @@
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
-#include "ops/Sampling.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -137,18 +137,6 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer ropeSin;
 };
 
-struct DFlashSelectionBuffers final {
-  metal::MetalBuffer logits;
-  metal::MetalBuffer partialIds;
-  metal::MetalBuffer partialValues;
-  metal::MetalBuffer candidates;
-  metal::MetalBuffer unary;
-  metal::MetalBuffer selectorHidden;
-  metal::MetalBuffer uniforms;
-  metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer proposalProbabilities;
-};
-
 struct DFlashDraftLayerWeights final {
   ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
@@ -199,8 +187,9 @@ using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCh
 loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
                        DFlashDraftLayout layout = {});
 
-// Builds the draft layer graph from packed buffers and persistent context.
-// Sampling and acceptance policy remain outside the model.
+// Builds the draft layer graph and its proposal selection
+// (ops::DraftSelector) from packed buffers and persistent context; the
+// target's sampling and acceptance policy remain outside the model.
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
@@ -215,10 +204,9 @@ public:
                  std::span<const uint32_t> cacheLengths,
                  ops::LinearDispatchStats &stats) const;
   void addSelection(metal::CommandGraph &graph,
-                    DFlashSelectionBuffers buffers,
+                    const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies,
-                    uint32_t proposalTokens) const;
+                    std::span<const ops::SamplingPolicy> policies) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
@@ -228,7 +216,7 @@ private:
   const DFlashDraftWeights &weights_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
-  ops::Sampling selector_;
+  ops::DraftSelector selector_;
   // Each layer's key and value rows of its QKV projection, views of its
   // planes, which the context writers project with.
   std::vector<ops::Projection> contextKvProjections_;

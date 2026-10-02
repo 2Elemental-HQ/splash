@@ -124,9 +124,9 @@ struct SamplingPenaltyParams {
 static_assert(sizeof(SamplingPenaltyParams) == 112,
               "Sampling penalty parameters are 112 bytes on both sides");
 
-// The batched selector, verify-input and acceptance kernels' grids cover
-// exactly the dispatch's lanes: per-lane arrays hold those lanes, and entries
-// past them are zero and unread.
+// The batched selector and acceptance kernels' grids cover exactly the
+// dispatch's lanes: per-lane arrays hold those lanes, and entries past them
+// are zero and unread.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -137,13 +137,6 @@ struct SelectorBatchParams {
 
 static_assert(sizeof(SelectorBatchParams) == 44,
               "Draft selector parameters are 44 bytes on both sides");
-
-struct VerifyInputBatchParams {
-  uint32_t vocabulary;
-};
-
-static_assert(sizeof(VerifyInputBatchParams) == 4,
-              "Verify input parameters are 4 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];

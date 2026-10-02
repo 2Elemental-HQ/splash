@@ -296,6 +296,11 @@ public:
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                     uint32_t lanes, ops::LinearScratch scratch,
                     ops::LinearDispatchStats &stats) const;
+  // The verify input tokens addEmbedding then gathers: each lane's anchor,
+  // row 0 of its draft input, and the draft's proposals.
+  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
+                      metal::MetalBuffer proposals,
+                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,

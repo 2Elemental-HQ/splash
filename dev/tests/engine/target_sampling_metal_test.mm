@@ -22,6 +22,7 @@
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
 #include "metal/MetalBackend.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
 #import <Foundation/Foundation.h>
@@ -149,7 +150,7 @@ struct Batch final {
 Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   const uint32_t rows = lanes * kRows;
   const auto space = Sampling::workspace(rows);
-  const auto proposals = Sampling::draftWorkspace(lanes * kPositions);
+  const auto proposals = DraftSelector::workspace(lanes * kPositions);
   return {SamplingBuffers{
               allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
               allocate(backend, space.partialMassesBytes),

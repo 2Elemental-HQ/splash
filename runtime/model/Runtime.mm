@@ -1391,8 +1391,7 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes),
-        kDraftProposalTokens);
+        std::span(anchors).first(lanes), std::span(policies).first(lanes));
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -1575,7 +1574,7 @@ struct Runtime::Impl {
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    sampling.addVerifyInput(
+    targetModel.addVerifyInput(
         graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
         decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes);

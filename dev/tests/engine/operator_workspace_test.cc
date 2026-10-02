@@ -1,5 +1,6 @@
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
@@ -123,6 +124,7 @@ void moe() {
 }
 
 void sampling() {
+  using splash::ops::DraftSelector;
   using splash::ops::Sampling;
   // Independent ABI formulas, including one lane and B1-B4 packed
   // extents. No backend, allocation or GPU graph is needed to size buffers.
@@ -140,7 +142,7 @@ void sampling() {
   }
   for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,
                              std::numeric_limits<uint32_t>::max()}) {
-    const auto workspace = Sampling::draftWorkspace(positions);
+    const auto workspace = DraftSelector::workspace(positions);
     const uint64_t count = positions;
     // Partial values carry the 16 x 16 edge table of every position behind
     // the eight shard partials.
@@ -152,7 +154,7 @@ void sampling() {
             "draft sampling workspace changed from the shipped 8-shard ABI");
   }
   rejects([] { return Sampling::workspace(0); });
-  rejects([] { return Sampling::draftWorkspace(0); });
+  rejects([] { return DraftSelector::workspace(0); });
 }
 
 } // namespace

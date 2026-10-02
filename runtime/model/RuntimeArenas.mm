@@ -1,5 +1,6 @@
 #include "model/RuntimeArenas.hpp"
 
+#include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
@@ -170,7 +171,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   const auto draftWorkspace =
       operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
-  const auto selectorWorkspace = ops::Sampling::draftWorkspace(kDraftProposalTokens);
+  const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
