@@ -39,19 +39,23 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
   return "invalid";
 }
 
-// The memory of the engine's page pool: extents of whole pages, each
-// allocated or not. Implementations provide Metal storage or deterministic
-// test storage.
+// The memory of the engine's page pool: extents of extentPages() pages,
+// pageCount() a whole number of them. Only KvPool allocates and releases
+// them. Implementations provide Metal storage or deterministic test storage.
 class ExtentStorage {
 public:
   virtual ~ExtentStorage() = default;
   [[nodiscard]] virtual uint32_t pageCount() const noexcept = 0;
   [[nodiscard]] virtual uint64_t bytesPerPage() const noexcept = 0;
-  [[nodiscard]] virtual bool isAllocated(uint32_t page) const = 0;
-  [[nodiscard]] virtual metal::AllocationResult ensureAllocated(uint32_t page) = 0;
-  [[nodiscard]] virtual bool releaseExtentOf(uint32_t page) = 0;
-  [[nodiscard]] virtual uint32_t extentFirstPage(uint32_t page) const = 0;
-  [[nodiscard]] virtual uint32_t extentPageCount(uint32_t page) const = 0;
+  [[nodiscard]] virtual uint32_t extentPages() const noexcept = 0;
+  // Allocates extent `extent`, which is not allocated: granted, or the
+  // refusal's cause with nothing allocated. std::logic_error for an
+  // allocated extent.
+  [[nodiscard]] virtual metal::AllocationResult allocateExtent(uint32_t extent) = 0;
+  // Releases allocated extent `extent` at once. std::logic_error, changing
+  // nothing, for an unallocated extent or while a command is in flight (a
+  // command reaches extents through its page tables without retaining them).
+  virtual void releaseExtent(uint32_t extent) = 0;
 };
 
 // One attention layer of the pool as kernels address it: where its region

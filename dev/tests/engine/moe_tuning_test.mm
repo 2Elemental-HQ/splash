@@ -203,7 +203,7 @@ void nativeMeasurement(const char *library) {
   const AllocationAdmission denied = [&](uint64_t bytes, const auto &) {
     ++admissions;
     require(bytes == moeTuningFixtureBytes(workload), "wrong admitted fixture bytes");
-    return false;
+    return AllocationFailure::EngineBudget;
   };
   const auto deniedResult = tuneMoe(backend, denied, input);
   require(admissions == 1 && !deniedResult.complete && !deniedResult.failure &&
@@ -236,7 +236,7 @@ void nativeMeasurement(const char *library) {
   const AllocationAdmission allowed = [&](uint64_t bytes, const auto &allocate) {
     require(bytes == moeTuningFixtureBytes(workload), "wrong fixture reservation");
     allocate();
-    return true;
+    return AllocationResult{};
   };
   const uint64_t emptyBytes = backend.memoryStats().allocatedBytes;
   const auto invalidWeights = tuneMoe(backend, allowed, input);

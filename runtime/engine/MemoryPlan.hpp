@@ -18,6 +18,14 @@ deviceStatusJson(const DeviceCapabilities &device);
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
+// The pages of the KV runway in extents of extentPages pages: the whole
+// extents that hold the pages startup warmup runs on, which the KV pool
+// allocates when it is built.
+[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
+  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
+         extentPages * extentPages;
+}
+
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.

@@ -267,7 +267,7 @@ QwenStateStorage::tryActivateSlot(uint32_t index, uint64_t requestId, uint64_t e
   clear(current.buffers.gdn[0].convolutionBase, "slot convolution state");
   clear(current.buffers.gdn[0].recurrentBase, "slot recurrent state");
   current.metadata = {true, requestId, 0, {}};
-  return true;
+  return {};
 }
 
 void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
@@ -430,7 +430,7 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
   } else {
     buffers.draft = std::move(fresh.draft);
   }
-  return true;
+  return {};
 }
 
 void QwenStateStorage::restore(uint32_t index, const CompositeState &state,

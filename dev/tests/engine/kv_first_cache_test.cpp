@@ -91,47 +91,6 @@ struct SharedBudget {
   void release(uint64_t bytes) { used -= bytes; }
 };
 
-class BudgetStorage final : public kv::ExtentStorage {
-public:
-  explicit BudgetStorage(SharedBudget &budget) : budget_(budget) {}
-  ~BudgetStorage() override {
-    for (bool allocated : allocated_) {
-      if (allocated)
-        budget_.release(bytesPerPage());
-    }
-  }
-  uint32_t pageCount() const noexcept override { return allocated_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 100; }
-  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
-  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
-    if (isAllocated(page))
-      return true;
-    if (!budget_.acquire(bytesPerPage()))
-      return false;
-    allocated_[page] = true;
-    return true;
-  }
-  bool releaseExtentOf(uint32_t page) override {
-    if (!isAllocated(page))
-      return false;
-    allocated_[page] = false;
-    budget_.release(bytesPerPage());
-    return true;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    static_cast<void>(allocated_.at(page));
-    return page;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    static_cast<void>(allocated_.at(page));
-    return 1;
-  }
-
-private:
-  SharedBudget &budget_;
-  std::array<bool, 4> allocated_{};
-};
-
 class BudgetState final : public CompositeState {
 public:
   explicit BudgetState(SharedBudget &budget) : budget_(budget) {
@@ -177,14 +136,16 @@ TokenAdmission admitRestore(engine::Cache &cache, uint64_t requestId,
   return admitLikeEngine(cache, [&] { return cache.restoreRequest(requestId, lookup); });
 }
 
+// Four pages, all allocated, and a budget of no more.
 struct CacheFixture {
-  test::TestKvStorage storage{4, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{5, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache;
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
   explicit CacheFixture(model::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+    storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
         prompt.push_back(1000 + block * 100 + row);
@@ -332,8 +293,8 @@ void testProbeFallsBackWhenKvChanges() {
   require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 32,
           "admission probe reused an evicted KV block");
 
-  test::TestKvStorage storage{1, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{1, 100, 1};
+  KvPool pool{storage, 1};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt(33, 77);
   const CacheProbe cold = cache.probe(prompt);
@@ -350,8 +311,8 @@ void testProbeFallsBackWhenKvChanges() {
 }
 
 void testProbeBindsImageIdentity() {
-  test::TestKvStorage storage{1, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{1, 100, 1};
+  KvPool pool{storage, 1};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt(33, 77);
   ImageSpan image{0, 32, 1, 1, 101, 202};
@@ -373,10 +334,10 @@ void testProbeBindsImageIdentity() {
 }
 
 void testProbeCannotCrossCaches() {
-  test::TestKvStorage firstStorage{1, 100};
-  test::TestKvStorage secondStorage{1, 100};
-  KvPool firstPool{firstStorage};
-  KvPool secondPool{secondStorage};
+  test::TestKvStorage firstStorage{1, 100, 1};
+  test::TestKvStorage secondStorage{1, 100, 1};
+  KvPool firstPool{firstStorage, 1};
+  KvPool secondPool{secondStorage, 1};
   engine::Cache first{firstPool, cacheNamespace()};
   engine::Cache second{secondPool, cacheNamespace()};
   const std::vector<uint32_t> firstPrompt(33, 11);
@@ -600,8 +561,8 @@ void testUnifiedRecencyAndReleasedByteAccounting() {
 // than the tail, so the unified LRU evicts the state-free tail leaves first
 // and the state only once its own block is the oldest leaf.
 void testFinishedRequestLeavesTailKvBeforeItsState() {
-  test::TestKvStorage storage{4, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt;
   for (uint32_t token = 0; token < 129; ++token)
@@ -804,8 +765,10 @@ void testCheckpointPinsAndBoundaryUpgrade() {
 
 void testCheckpointPressurePreservesHotPrefix() {
   SharedBudget budget;
-  BudgetStorage storage(budget);
-  KvPool pool(storage);
+  test::TestKvStorage storage(4, 100, 1);
+  storage.growthAllowed = [&](uint32_t) { return budget.acquire(100); };
+  storage.released = [&] { budget.release(100); };
+  KvPool pool(storage, 0);
   engine::Cache cache(pool, cacheNamespace());
   const std::vector<uint32_t> hot(33, 11);
   const std::vector<uint32_t> cold(65, 22);
@@ -1430,8 +1393,8 @@ void testDiskReplacementSpansStatesAndKv() {
 void testQuotaWithoutTheKvTier() {
   constexpr uint64_t size = model::SlotFile::kAlignmentBytes;
   auto budget = std::make_shared<model::DiskBudget>(4 * size);
-  test::TestKvStorage storage{4, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache(pool, cacheNamespace(), nullptr, budget);
   model::SlotFile states(size, budget);
   auto slot = states.acquire();
@@ -1450,8 +1413,8 @@ void testQuotaWithoutTheKvTier() {
 // without the tier is a hit with it. The disk only adds.
 void testTierOnlyAddsToTierOff() {
   struct Prefixes {
-    test::TestKvStorage storage{4, 100};
-    KvPool pool{storage};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     engine::Cache cache{pool, cacheNamespace()};
     std::array<std::vector<uint32_t>, 4> prompts;
     std::array<uint64_t, 4> blocks{};
@@ -1935,14 +1898,15 @@ void testWaitingCheckpointHoldsBackNothingElse() {
 // attempt costs one refusal, not one per cached block.
 void testFullTierStopsTheScan() {
   struct Prefixes {
-    test::TestKvStorage storage{4, 100};
-    KvPool pool{storage};
+    test::TestKvStorage storage{5, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     engine::Cache cache{pool, cacheNamespace(), &tier};
     std::array<std::vector<uint32_t>, 4> prompts;
     std::array<uint64_t, 4> blocks{};
 
     Prefixes() {
+      storage.budgetPages = 4;
       for (uint32_t i = 0; i < prompts.size(); ++i) {
         prompts[i].assign(KvCache::pageTokens, 1000 + i);
         cache.beginRequest(i + 1);
@@ -2016,8 +1980,8 @@ void testRestoresInFlightMakeAShortfallPending() {
 void testDiskReplacementOrder() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   struct Prefixes {
-    test::TestKvStorage storage{4, 100};
-    KvPool pool{storage};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     engine::Cache cache{pool, cacheNamespace(), &tier};
     std::array<std::vector<uint32_t>, 4> prompts;
@@ -2156,8 +2120,9 @@ void testTransferFailures() {
 // the request lets go, and the prefix above gives its pages up again, even
 // after the fault has closed the tier.
 void testFailedRestoreDropsTheBlocksBelow() {
-  test::TestKvStorage storage{8, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{9, 100, 1};
+  storage.budgetPages = 8;
+  KvPool pool{storage, 8};
   test::TestKvTier tier;
   engine::Cache cache{pool, cacheNamespace(), &tier};
   auto control = std::make_shared<TransferControl>();
@@ -2227,8 +2192,8 @@ void testReclaimCacheCountsPendingPages() {
 void testBusyTierPreservesDiskVictim() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   for (const bool restored : {false, true}) {
-    test::TestKvStorage storage{4, 100};
-    KvPool pool{storage};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     tier.capacity = 2;
     tier.transferLimit = 1;
@@ -2364,8 +2329,8 @@ void testDemotionKeepsThePageUnderANewState() {
 // other copies, never the block under it.
 void testCancelledRestoreKeepsThePageUnderANewState() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
-  test::TestKvStorage storage{8, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
   test::TestKvTier tier;
   engine::Cache cache{pool, cacheNamespace(), &tier};
   auto control = std::make_shared<TransferControl>();
@@ -2413,8 +2378,8 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
 void testLargeSharedDiskRestore() {
   constexpr uint32_t pages = 4096;
   constexpr uint32_t tokens = pages * KvCache::pageTokens;
-  test::TestKvStorage storage{pages, 100};
-  KvPool pool{storage};
+  test::TestKvStorage storage{pages, 100, 1};
+  KvPool pool{storage, pages};
   test::TestKvTier tier;
   tier.capacity = pages;
   tier.transferLimit = 96;

@@ -326,17 +326,17 @@ void run(const std::string &metallib) {
   bool admitNewAllocations = true;
   uint32_t admissions = 0;
   auto admitState = [&governor, &admitNewAllocations, &admissions](
-                        uint64_t bytes,
-                        const std::function<void()> &allocate) {
+                        uint64_t bytes, const std::function<void()> &allocate)
+      -> metal::AllocationResult {
     if (!admitNewAllocations)
-      return false;
+      return metal::AllocationFailure::EngineBudget;
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)
-      return false;
+      return metal::AllocationFailure::EngineBudget;
     allocate();
     reservation->commit();
     ++admissions;
-    return true;
+    return {};
   };
   constexpr kv::Layout kvLayout{16, 4, 256};
   kv::PageStorage pageStorage(backend, governor.allocationAdmission(),

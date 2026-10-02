@@ -17,18 +17,16 @@ namespace splash::metal {
 
 enum class AllocationFailure : uint8_t {
   None,
-  Capacity, // A refusal that names no cause, as from a storage without a governor.
   EngineBudget,
   HostPressure,
   DriverRejected,
 };
 
 struct AllocationResult final {
-  AllocationFailure failure;
-  AllocationResult(bool granted)
-      : failure(granted ? AllocationFailure::None
-                        : AllocationFailure::Capacity) {}
-  AllocationResult(AllocationFailure reason) : failure(reason) {}
+  AllocationFailure failure = AllocationFailure::None;
+  // Granted.
+  AllocationResult() noexcept = default;
+  AllocationResult(AllocationFailure reason) noexcept : failure(reason) {}
   [[nodiscard]] explicit operator bool() const noexcept {
     return failure == AllocationFailure::None;
   }
@@ -38,7 +36,6 @@ struct AllocationResult final {
     AllocationFailure failure) noexcept {
   switch (failure) {
   case AllocationFailure::None: return "none";
-  case AllocationFailure::Capacity: return "allocation capacity unavailable";
   case AllocationFailure::EngineBudget: return "engine memory budget exceeded";
   case AllocationFailure::HostPressure: return "host memory reserve protected";
   case AllocationFailure::DriverRejected:
@@ -49,8 +46,8 @@ struct AllocationResult final {
 
 // Allocators use this callback to obtain engine-governed headroom
 // without depending on the engine policy type. The operation runs while the
-// caller's reservation is held and returns false without side effects when
-// admission is denied.
+// caller's reservation is held; the callback returns the refusal's cause,
+// with no side effects, when admission is denied.
 using AllocationAdmission =
     std::function<AllocationResult(uint64_t, const std::function<void()> &)>;
 

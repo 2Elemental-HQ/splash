@@ -302,18 +302,15 @@ void run(const std::string &metallib) {
         [&elasticHostAvailable] { return elasticHostAvailable; });
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
-    if (hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() != 128) {
-        throw std::runtime_error(
-            "elastic Q8 storage started with " +
-            std::to_string(hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages()) +
-            " allocated pages instead of 128");
-    }
+    require(hostGatedStorage.allocateExtent(0) &&
+                hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
+            "elastic Q8 storage did not allocate its first extent");
     elasticHostAvailable = 128ULL * 1024 * 1024;
-    require(!hostGatedStorage.ensureAllocated(128) &&
+    require(!hostGatedStorage.allocateExtent(1) &&
                 hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 128,
             "host pressure did not reject the next KV extent transactionally");
     elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
-    require(hostGatedStorage.ensureAllocated(128) &&
+    require(hostGatedStorage.allocateExtent(1) &&
                 hostGatedStorage.allocatedExtents() * hostGatedStorage.extentPages() == 256,
             "KV growth did not recover after host memory became available");
 
@@ -332,11 +329,16 @@ void run(const std::string &metallib) {
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
     const uint64_t extentBytes = 128 * kvLayout.bytesPerModelPage();
     require(uint64_t{storage.pageCount()} * storage.bytesPerPage() == 3 * extentBytes && storage.extentBytes() == extentBytes &&
-                storage.actualAllocatedBytes() == extentBytes &&
+                storage.actualAllocatedBytes() == 0 &&
+                backend.memoryStats().allocatedBytes == before,
+            "KV page storage allocated an extent when it was built");
+    require(storage.allocateExtent(0) && storage.actualAllocatedBytes() == extentBytes &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
-            "the runway extent was not allocated at exactly its size");
+            "an extent was not allocated at exactly its size");
     require(storage.allocatedExtents() * storage.extentPages() == 128 && storage.isAllocated(127) && !storage.isAllocated(128),
-            "the first Q8 extent is not the allocated runway");
+            "the first Q8 extent was not the one allocated");
+    requireThrows<std::logic_error>([&] { (void)storage.allocateExtent(0); },
+                                    "an allocated extent was allocated again");
     const auto layer = storage.layer(15);
     require(layer.format == kv::Format::Int8 && layer.kv.extent_pages == 128 &&
                 layer.kv.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
@@ -358,7 +360,7 @@ void run(const std::string &metallib) {
         "a table too small for its entries was written");
 
     const uint64_t generation = storage.generation();
-    require(storage.ensureAllocated(200) && storage.generation() == generation + 1 &&
+    require(storage.allocateExtent(1) && storage.generation() == generation + 1 &&
                 storage.allocatedExtents() * storage.extentPages() == 256 &&
                 storage.actualAllocatedBytes() == 2 * extentBytes &&
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
@@ -378,25 +380,27 @@ void run(const std::string &metallib) {
         const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
         auto ticket = backend.submitAsync(kick);
         requireThrows<std::logic_error>(
-            [&] { (void)storage.releaseExtentOf(200); },
+            [&] { storage.releaseExtent(1); },
             "an extent was released while a command was in flight");
         require(storage.isAllocated(200) && storage.entry(200) == entries[0] &&
                     storage.generation() == generation + 1,
                 "a refused release changed the extent");
         (void)ticket.wait();
     }
-    require(storage.releaseExtentOf(200) && !storage.isAllocated(200) &&
+    storage.releaseExtent(1);
+    require(!storage.isAllocated(200) &&
                 storage.generation() == generation + 2 && storage.allocatedExtents() * storage.extentPages() == 128 &&
                 backend.memoryStats().allocatedBytes == before + extentBytes,
             "a released extent did not return its memory at once");
-    require(!storage.releaseExtentOf(200), "an unallocated extent was released again");
-    require(storage.ensureAllocated(255) && storage.generation() == generation + 3 &&
+    requireThrows<std::logic_error>([&] { storage.releaseExtent(1); },
+                                    "an unallocated extent was released again");
+    require(storage.allocateExtent(1) && storage.generation() == generation + 3 &&
                 (storage.entry(255) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
 
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);
-    require(compactStorage.layer(9).kv.extent_pages == 512 &&
+    require(compactStorage.allocateExtent(0) && compactStorage.layer(9).kv.extent_pages == 512 &&
                 compactStorage.layer(9).kv.offset ==
                     9 * 512 * compactLayout.bytesPerLayerPage() &&
                 compactStorage.allocatedExtents() * compactStorage.extentPages() == 512 &&
@@ -413,15 +417,16 @@ void run(const std::string &metallib) {
                     bf16Layer.kv.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");
-        require(bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isAllocated(extent) &&
+        require(bf16.allocateExtent(0) &&
+                    bf16.allocatedExtents() * bf16.extentPages() == extent && !bf16.isAllocated(extent) &&
                     bf16.actualAllocatedBytes() == extent * layout.bytesPerModelPage(),
                 "BF16 allocated more than its first admitted extent");
         requireSpansTileExtent(bf16, 0);
-        require(bf16.ensureAllocated(extent) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
+        require(bf16.allocateExtent(1) && bf16.allocatedExtents() * bf16.extentPages() == 2 * extent &&
                     bf16.actualAllocatedBytes() == uint64_t{bf16.pageCount()} * bf16.bytesPerPage(),
                 "BF16 growth did not account for both extents");
-        require(bf16.releaseExtentOf(extent), "BF16 extent release failed");
-        require(!bf16.isAllocated(extent) && bf16.ensureAllocated(extent),
+        bf16.releaseExtent(1);
+        require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),
                 "BF16 extent could not be allocated again after release");
     }
     std::cout << "KV page storage tests passed\n";

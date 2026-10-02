@@ -99,6 +99,24 @@ void testBf16BudgetAndStatus() {
           "BF16 startup admitted less than its minimum resident footprint");
 }
 
+// The minimum holds the KV runway, the whole smallest extents that hold the
+// pages startup warmup runs on: two of the 27B's 32-page BF16 extents.
+void testMinimumHoldsTheWarmupRunway() {
+  auto profile = model();
+  profile.targetKvLayout.format = kv::Format::BFloat16;
+  require(profile.targetKvLayout.minimumExtentPages() == 32,
+          "the BF16 fixture's smallest extent changed");
+  const EngineMemoryPlan plan = requireEngineMemoryPlan(device(), profile);
+  const auto &budget = plan.breakdown();
+  require(budget.minimumDynamicBytes ==
+              budget.activeStateCellBytes + 64 * budget.kvPageBytes,
+          "the minimum does not hold the warmup runway");
+  const auto refused =
+      evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1);
+  require(!refused.plan && refused.status.code == BudgetErrorCode::KvPoolDoesNotFit,
+          "a budget short of the warmup runway was accepted");
+}
+
 void testUserCeilingAndFailure() {
   EngineMemoryPlan automatic = requireEngineMemoryPlan(device(), model());
   const uint64_t ceiling =
@@ -293,6 +311,7 @@ int main() {
   try {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
+    testMinimumHoldsTheWarmupRunway();
     testUserCeilingAndFailure();
     testDiskTierKvStagingIsBudgeted();
     testHardBudgetBoundaries();

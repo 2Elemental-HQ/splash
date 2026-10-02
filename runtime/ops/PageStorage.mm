@@ -1,5 +1,6 @@
 #include "ops/PageStorage.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -32,13 +33,6 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
             "KV page pool is not a whole number of extents");
     }
     extents_.resize(pageCount_ / extentPages_);
-    // One small runway makes startup warmup and the first requests allocation
-    // free. Every later extent is allocated when real tokens need it.
-    if (auto result = ensureAllocated(0); !result) {
-        throw metal::MetalAllocationError(
-            std::string("unable to allocate the first KV extent: ") +
-                metal::allocationFailureName(result.failure), result.failure);
-    }
 }
 
 size_t PageStorage::extentIndex(uint32_t page) const {
@@ -46,33 +40,32 @@ size_t PageStorage::extentIndex(uint32_t page) const {
     return page / extentPages_;
 }
 
-uint32_t PageStorage::extentFirstPage(uint32_t page) const {
-    return static_cast<uint32_t>(extentIndex(page)) * extentPages_;
-}
-
-uint32_t PageStorage::extentPageCount(uint32_t page) const {
-    static_cast<void>(extentIndex(page));
-    return extentPages_;
+uint32_t PageStorage::allocatedExtents() const noexcept {
+    return static_cast<uint32_t>(std::count_if(
+        extents_.begin(), extents_.end(),
+        [](const metal::MetalBuffer &extent) { return static_cast<bool>(extent); }));
 }
 
 bool PageStorage::isAllocated(uint32_t page) const {
     return static_cast<bool>(extents_[extentIndex(page)]);
 }
 
-metal::AllocationResult PageStorage::ensureAllocated(uint32_t page) {
-    metal::MetalBuffer &extent = extents_[extentIndex(page)];
-    if (extent) return true;
+metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
+    metal::MetalBuffer &buffer = extents_.at(extent);
+    if (buffer) {
+        throw std::logic_error(
+            "KV extent " + std::to_string(extent) + " is already allocated");
+    }
     const uint64_t bytes = extentBytes();
     try {
         return admitAllocation_(bytes, [&] {
             metal::MetalBuffer allocated = backend_.allocateAddressed(
-                bytes, "kv-extent-" + std::to_string(extentFirstPage(page)));
+                bytes, "kv-extent-" + std::to_string(extent * extentPages_));
             if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
                 throw std::logic_error(
                     "KV extent address leaves no room for the page index");
             }
-            extent = std::move(allocated);
-            ++allocatedExtents_;
+            buffer = std::move(allocated);
             ++generation_;
         });
     } catch (const metal::MetalAllocationError &error) {
@@ -80,17 +73,18 @@ metal::AllocationResult PageStorage::ensureAllocated(uint32_t page) {
     }
 }
 
-bool PageStorage::releaseExtentOf(uint32_t page) {
-    metal::MetalBuffer &extent = extents_[extentIndex(page)];
-    if (!extent) return false;
+void PageStorage::releaseExtent(uint32_t extent) {
+    metal::MetalBuffer &buffer = extents_.at(extent);
+    if (!buffer) {
+        throw std::logic_error(
+            "KV extent " + std::to_string(extent) + " is not allocated");
+    }
     if (backend_.commandInFlight()) {
         throw std::logic_error(
             "cannot release a KV extent while a command is in flight");
     }
-    extent = {};
-    --allocatedExtents_;
+    buffer = {};
     ++generation_;
-    return true;
 }
 
 LayerStorage PageStorage::layer(uint32_t index) const {

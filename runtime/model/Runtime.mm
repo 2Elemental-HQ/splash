@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -498,7 +499,7 @@ struct Runtime::Impl {
     if (encoder)
       vision = std::move(encoder);
     stagedImages.emplace(request.id, std::move(staged));
-    return true;
+    return {};
   }
 
   // Hands an admitted request its staged images. Only then do its embedding
@@ -1882,7 +1883,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
     impl_->states.releaseSlot(stateSlot, request.id);
     throw;
   }
-  return true;
+  return {};
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
@@ -2411,22 +2412,16 @@ WarmupStepResult warmupResult(uint64_t estimatedPeakBytes, double wallSeconds,
   return {true, estimatedPeakBytes, std::move(detail), wallSeconds, {}};
 }
 
-std::vector<uint32_t> warmupPages(kv::PageStorage &storage, uint32_t first,
-                                  uint32_t count) {
-  if (!count || uint64_t{first} + count > storage.pageCount()) {
-    throw std::invalid_argument("warmup KV page range is unavailable");
-  }
-  std::vector<uint32_t> result(count);
-  for (uint32_t index = 0; index < count; ++index) {
-    const uint32_t page = first + index;
-    if (auto admission = storage.ensureAllocated(page); !admission) {
-      throw metal::MetalAllocationError(
-          std::string("warmup could not allocate its KV extents: ") +
-              metal::allocationFailureName(admission.failure), admission.failure);
+// Warmup runs on the startup runway the engine's KV pool allocated
+// (ExecutionLimits::warmupKvPages); it never allocates KV.
+void requireRunwayPages(const kv::PageStorage &storage,
+                        std::span<const uint32_t> pages) {
+  for (uint32_t page : pages) {
+    if (page >= ExecutionLimits::warmupKvPages || !storage.isAllocated(page)) {
+      throw std::logic_error("warmup KV page " + std::to_string(page) +
+                             " is outside the startup runway");
     }
-    result[index] = page;
   }
-  return result;
 }
 
 } // namespace
@@ -2458,8 +2453,9 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   request.maxNewTokens = 16;
   beginColdRequest(request, 0);
   try {
-    std::vector<uint32_t> pages = warmupPages(
-        impl_->kvPages, 0, (rows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::vector<uint32_t> pages((rows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::iota(pages.begin(), pages.end(), 0u);
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{WorkKind::Prefill,
                    BatchCohort::Greedy,
                    {{id, rows}},
@@ -2507,7 +2503,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
       beginColdRequest(request, slotOrder[lane]);
-      pages[lane] = warmupPages(impl_->kvPages, 5 + lane, 1);
+      pages[lane] = {5 + lane};
+      requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{WorkKind::Prefill,
                             BatchCohort::Greedy,
                             {{request.id, 1}},
@@ -2591,7 +2588,8 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
   request.maxNewTokens = 16;
   beginColdRequest(request, 0);
   try {
-    std::vector<uint32_t> pages = warmupPages(impl_->kvPages, 9, 1);
+    const std::vector<uint32_t> pages{9};
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan prefillPlan{WorkKind::Prefill,
                           BatchCohort::Greedy,
                           {{id, 1}},
@@ -2639,12 +2637,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);
   try {
-    if (impl_->kvPages.pageCount() <= 12) {
-      throw std::runtime_error(
-          "historical prefix warmup requires at least 13 KV pages");
-    }
     // Deliberately non-contiguous physical ids exercise page-table lookup.
     const std::vector<uint32_t> pages{12, 10, 11};
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{WorkKind::Prefill,
                    BatchCohort::Greedy,
                    {{id, prefixTokens}},

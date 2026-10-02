@@ -2,7 +2,6 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 
-#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -139,8 +138,7 @@ uint32_t grantKvPages(MemoryGovernor &governor,
                       const EngineMemoryBreakdown &budget) {
   uint32_t granted = 0;
   while (granted < budget.kvCapacityPages) {
-    const uint32_t pages =
-        std::min(budget.kvExtentPages, budget.kvCapacityPages - granted);
+    const uint32_t pages = budget.kvExtentPages;
     const uint64_t bytes = uint64_t{pages} * budget.kvPageBytes;
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)

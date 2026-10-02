@@ -20,9 +20,10 @@ struct KvPoolSnapshot {
   uint64_t allocatedBytes = 0;
   uint64_t reclaimableBytes = 0;
   // Extents allocated and released through the pool, and the longest
-  // allocation and release of one: what memory costs the serving loop per
-  // extent. How long a whole reclaim pass holds the loop shows in its
-  // longest tick.
+  // allocation and release of one: what memory costs per extent. The counts
+  // and the longest allocation include the runway the pool allocates when it
+  // is built, before the serving loop runs. How long a whole reclaim pass
+  // holds the loop shows in its longest tick.
   uint64_t extentAllocations = 0;
   uint64_t extentReleases = 0;
   double extentAllocateMaxMilliseconds = 0.0;
@@ -39,15 +40,20 @@ struct KvPageAcquisition {
   }
 };
 
-// Sole owner of KV page references and of which extents are allocated.
-// Resource policy may ask for pages or release references, but cannot
-// directly allocate or release Metal memory. Free pages are handed out from
-// the allocated extent with the most live pages first, so partially used
-// extents fill up, empty extents are touched last, and cold extents drain to
-// empty, the only state in which an extent can be released.
+// Sole owner of KV page references and of which extents are allocated. It
+// alone allocates and releases extents, starting with the runway its
+// constructor allocates. Resource policy may ask for pages or release
+// references, but cannot directly allocate or release Metal memory. Free
+// pages are handed out from the allocated extent with the most live pages
+// first, so partially used extents fill up, empty extents are touched last,
+// and cold extents drain to empty, the only state in which an extent can be
+// released.
 class KvPool final {
 public:
-  explicit KvPool(kv::ExtentStorage &storage);
+  // Allocates the runway, the extents that hold pages [0, runwayPages), or
+  // throws metal::MetalAllocationError with the budget's cause;
+  // std::invalid_argument for a runway longer than the pool.
+  KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
 
   [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count,
                                                bool prefixOwner);
@@ -63,24 +69,21 @@ public:
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
 
   // Releases completely unreferenced extents, at most `limit` of them.
-  // keepRunway retains one of them to avoid adding allocation latency to the
-  // next request.
-  [[nodiscard]] uint32_t
-  reclaimEmptyExtents(bool keepRunway,
-                      uint32_t limit = std::numeric_limits<uint32_t>::max());
+  // keepRunway keeps one empty extent warm, so the next request does not wait
+  // for an allocation; unlike the runway the constructor allocates, it is
+  // always a single extent.
+  [[nodiscard]] uint32_t reclaimEmptyExtents(bool keepRunway, uint32_t limit);
   [[nodiscard]] KvPoolSnapshot snapshot() const;
 
 private:
   static constexpr uint32_t noIndex = std::numeric_limits<uint32_t>::max();
-  enum class FreeClass : uint8_t { None, Allocated, Unallocated };
 
   struct PageRecord {
     uint32_t activeReferences = 0;
     uint32_t prefixReferences = 0;
-    uint32_t extent = noIndex;
     uint32_t previousFree = noIndex;
     uint32_t nextFree = noIndex;
-    FreeClass freeClass = FreeClass::None;
+    bool onFreeList = false;
   };
 
   struct IndexList {
@@ -89,18 +92,24 @@ private:
   };
 
   struct ExtentRecord {
-    uint32_t firstPage = 0;
-    uint32_t pageCount = 0;
     uint32_t usedPages = 0;
     uint32_t previousReclaimable = noIndex;
     uint32_t nextReclaimable = noIndex;
+    // The extent's pages nothing holds; only an allocated extent lists any.
     IndexList freePages;
     bool allocated = false;
     bool reclaimable = false;
   };
 
-  [[nodiscard]] IndexList &freeList(FreeClass kind, uint32_t page) noexcept;
-  void insertFree(uint32_t page, FreeClass kind) noexcept;
+  [[nodiscard]] uint32_t extentOf(uint32_t page) const noexcept {
+    return page / extentPages_;
+  }
+  [[nodiscard]] uint32_t firstPage(uint32_t extent) const noexcept {
+    return extent * extentPages_;
+  }
+  // The lowest extent that is not allocated; noIndex when all of them are.
+  [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
+  void insertFree(uint32_t page) noexcept;
   void removeFree(uint32_t page) noexcept;
   [[nodiscard]] uint32_t popFree() noexcept;
   [[nodiscard]] uint32_t packingExtent() noexcept;
@@ -109,9 +118,13 @@ private:
   void setExtentAllocated(uint32_t extent, bool allocated) noexcept;
   void setExtentReclaimable(uint32_t extent, bool reclaimable) noexcept;
 
-  bool releaseExtent(uint32_t extent);
+  // Every allocation and release of an extent, timed and counted; the
+  // extent's record follows the storage.
+  [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent);
+  void releaseExtent(uint32_t extent);
 
   kv::ExtentStorage &storage_;
+  uint32_t extentPages_ = 0;
   uint64_t extentAllocations_ = 0;
   uint64_t extentReleases_ = 0;
   double extentAllocateMaxMilliseconds_ = 0.0;
@@ -123,12 +136,10 @@ private:
   // changes, so a burst of allocations rescans the extents once per extent
   // it moves into.
   uint32_t packingExtent_ = noIndex;
-  IndexList unallocated_;
   IndexList reclaimableExtents_;
   uint32_t activePages_ = 0;
   uint32_t prefixPages_ = 0;
-  uint32_t allocatedPages_ = 0;
-  uint64_t reclaimableBytes_ = 0;
+  uint32_t allocatedExtents_ = 0;
 };
 
 } // namespace splash::engine

@@ -890,38 +890,34 @@ int main(int argc, char **argv) {
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
         [admit = governed, &allocationFault, &backend](
-            uint64_t bytes, const std::function<void()> &allocate) {
+            uint64_t bytes, const std::function<void()> &allocate)
+            -> metal::AllocationResult {
           if (bytes > allocationFault.remainingBytes)
-            return false;
+            return metal::AllocationFailure::EngineBudget;
           if (allocationFault.remaining == 0) {
             if (allocationFault.throwAfterAllocation) {
               require(static_cast<bool>(admit(bytes, allocate)),
                       "test allocation unexpectedly exceeded real budget");
               throw std::runtime_error("injected image allocation");
             }
-            return false;
+            return metal::AllocationFailure::EngineBudget;
           }
           if (allocationFault.remaining > 0)
             --allocationFault.remaining;
           // An admission spends what it allocates.
           const uint64_t before = backend.memoryStats().allocatedBytes;
-          if (!admit(bytes, allocate))
-            return false;
+          if (const metal::AllocationResult result = admit(bytes, allocate); !result)
+            return result;
           allocationFault.remainingBytes -=
               backend.memoryStats().allocatedBytes - before;
-          return true;
+          return {};
         };
-    metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
-    kv::PageStorage pages(
-        backend,
-        [&governed, &kvAdmissionFailure](
-            uint64_t bytes, const std::function<void()> &allocate)
-            -> metal::AllocationResult {
-          if (kvAdmissionFailure != metal::AllocationFailure::None)
-            return kvAdmissionFailure;
-          return governed(bytes, allocate);
-        },
-        kvLayout, pageCount, extentPages);
+    kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
+    // The oracle's requests address pages directly, without a pool, so every
+    // extent is allocated up front.
+    for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+      require(static_cast<bool>(pages.allocateExtent(extent)),
+              "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout());
@@ -947,38 +943,30 @@ int main(int argc, char **argv) {
     }
     model::Runtime executor(context);
     arenaReservation->commit();
-    // Fault only physical KV admission, after actual state activation. This
-    // exercises Runtime::warmupPrefill's failure propagation and cleanup.
-    require(pages.releaseExtentOf(0), "warmup refusal fixture was not allocated");
-    const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
-    for (auto failure : {metal::AllocationFailure::HostPressure,
-                         metal::AllocationFailure::EngineBudget,
-                         metal::AllocationFailure::DriverRejected}) {
-      kvAdmissionFailure = failure;
+    // Warmup runs on the KV runway and never allocates: without it, after
+    // actual state activation, warmupPrefill fails and cleans up.
+    pages.releaseExtent(0);
+    {
+      const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
       const uint64_t beforeCommands = backend.submissionCount();
       bool rejected = false;
       try {
         static_cast<void>(executor.warmupPrefill(1));
-      } catch (const metal::MetalAllocationError &error) {
-        rejected = error.failure() == failure &&
-            std::string(error.what()).find("its KV extents") != std::string::npos;
+      } catch (const std::logic_error &error) {
+        rejected = std::string(error.what()).find("runway") != std::string::npos;
       }
       require(rejected && !states.metadata(0).assigned &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
-                  backend.submissionCount() == beforeCommands &&
-                  pages.allocatedExtents() == 0,
-              "real warmup lost its KV refusal cause or executed/leaked work");
+                  backend.submissionCount() == beforeCommands,
+              "real warmup ran without its KV runway or executed/leaked work");
     }
-    kvAdmissionFailure = metal::AllocationFailure::None;
-    require(static_cast<bool>(pages.ensureAllocated(0)),
-            "warmup refusal fixture failed to recover KV admission");
+    require(static_cast<bool>(pages.allocateExtent(0)),
+            "warmup runway fixture failed to recover its KV extent");
     static_cast<void>(states.releaseIdle(false));
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {
       requireAtomicImageAdmission(executor, backend, model, allocationFault);
-      for (uint32_t page : pageRange(120, 4))
-        require(static_cast<bool>(pages.ensureAllocated(page)), "image oracle KV extent is unavailable");
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
     } else {

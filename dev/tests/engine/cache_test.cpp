@@ -1,3 +1,4 @@
+#include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
 #include <chrono>
@@ -5,78 +6,12 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 using namespace splash;
 using namespace splash::engine;
 
 namespace {
-
-class Storage final : public kv::ExtentStorage {
-public:
-  explicit Storage(uint32_t pages, uint32_t maximumAllocatedPages =
-                                       std::numeric_limits<uint32_t>::max())
-      : allocated_(pages), maximumAllocatedPages_(maximumAllocatedPages) {}
-  uint32_t pageCount() const noexcept override { return allocated_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
-  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
-    const uint32_t first = extentFirstPage(page);
-    const uint32_t count = extentPageCount(page);
-    uint32_t additional = 0;
-    for (uint32_t index = first; index < first + count; ++index)
-      additional += !allocated_.at(index);
-    if (uint64_t{allocatedPages()} + additional > maximumAllocatedPages_) {
-      return false;
-    }
-    for (uint32_t index = first; index < first + count; ++index) {
-      allocated_.at(index) = true;
-    }
-    if (additional)
-      ++allocatedExtents;
-    return true;
-  }
-  bool releaseExtentOf(uint32_t page) override {
-    const uint32_t first = extentFirstPage(page);
-    const uint32_t count = extentPageCount(page);
-    for (uint32_t index = first; index < first + count; ++index) {
-      allocated_.at(index) = false;
-    }
-    const auto start = std::chrono::steady_clock::now();
-    std::this_thread::sleep_for(releaseTime);
-    const double taken = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-    longestRelease = std::max(longestRelease, taken);
-    totalRelease += taken;
-    ++releasedExtents;
-    return true;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    return page - page % 4;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, allocated_.size() - extentFirstPage(page));
-  }
-  uint32_t allocatedPages() const noexcept {
-    uint32_t count = 0;
-    for (bool value : allocated_)
-      count += value;
-    return count;
-  }
-  uint32_t allocatedExtents = 0;
-  uint32_t releasedExtents = 0;
-  // How long releasing one extent takes.
-  std::chrono::milliseconds releaseTime{0};
-  // What the releases took as measured here, in milliseconds: the longest,
-  // and all of them together.
-  double longestRelease = 0.0;
-  double totalRelease = 0.0;
-private:
-  std::vector<bool> allocated_;
-  uint32_t maximumAllocatedPages_;
-};
 
 class State final : public CompositeState {
 public:
@@ -111,8 +46,8 @@ std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {
 }
 
 void testCanonicalPagesAndSparseState() {
-  Storage storage(16);
-  KvPool pool(storage);
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(65);
   resources.beginRequest(1);
@@ -136,8 +71,8 @@ void testCanonicalPagesAndSparseState() {
 }
 
 void testKvDeeperThanStateAndDependencyEviction() {
-  Storage storage(8);
-  KvPool pool(storage);
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(97);
   resources.beginRequest(1);
@@ -162,8 +97,9 @@ void testKvDeeperThanStateAndDependencyEviction() {
 }
 
 void testActiveTipProtectsTheContentChain() {
-  Storage storage(4);
-  KvPool pool(storage);
+  test::TestKvStorage storage(8, 4096, 4);
+  storage.budgetPages = 4;
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(97, 1000);
   resources.beginRequest(1);
@@ -186,8 +122,9 @@ void testActiveTipProtectsTheContentChain() {
 }
 
 void testGrowthReclaimsOneWholeCachedExtent() {
-  Storage storage(8, 4);
-  KvPool pool(storage);
+  test::TestKvStorage storage(8, 4096, 4);
+  storage.budgetPages = 4;
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   auto prompt = tokens(129, 2000);
   resources.beginRequest(1);
@@ -213,8 +150,9 @@ void testGrowthReclaimsOneWholeCachedExtent() {
 }
 
 void testFragmentedColdKvPrecedesNewerState() {
-  Storage storage(8, 4);
-  KvPool pool(storage);
+  test::TestKvStorage storage(8, 4096, 4);
+  storage.budgetPages = 4;
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   const auto prompt = tokens(129);
   resources.beginRequest(1);
@@ -233,8 +171,9 @@ void testFragmentedColdKvPrecedesNewerState() {
 }
 
 void testReplacementKeepsTheExtentItEmpties() {
-  Storage storage(8, 4);
-  KvPool pool(storage);
+  test::TestKvStorage storage(8, 4096, 4);
+  storage.budgetPages = 4;
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   resources.beginRequest(1);
   const auto prompt = tokens(33);
@@ -249,7 +188,7 @@ void testReplacementKeepsTheExtentItEmpties() {
           "replacement released the newly reusable extent");
   resources.beginRequest(2);
   require(resources.ensureTokens(2, 128).granted() &&
-              storage.allocatedExtents == 1 && storage.releasedExtents == 0,
+              pool.snapshot().extentAllocations == 1 && storage.releasedExtents == 0,
           "replacement allocated the reusable extent again");
   resources.endRequest(2);
   require(resources.reclaimCache(0, false) == 4 * 4096 &&
@@ -261,8 +200,8 @@ void testReplacementKeepsTheExtentItEmpties() {
 // are, then evicts the cache and releases the extents that empties.
 void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t empty = 200;
-  Storage storage(4 * (empty + 1));
-  KvPool pool(storage);
+  test::TestKvStorage storage(4 * (empty + 1), 4096, 4);
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   const auto prompt = tokens(33);
   resources.beginRequest(1);
@@ -297,9 +236,9 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 // one; the loop's longest tick covers the whole pass.
 void testReleaseTimeCoversOneExtent() {
   constexpr uint32_t extents = 6;
-  Storage storage(4 * extents);
+  test::TestKvStorage storage(4 * extents, 4096, 4);
   storage.releaseTime = std::chrono::milliseconds(5);
-  KvPool pool(storage);
+  KvPool pool(storage, 0);
   engine::Cache resources(pool, cacheNamespace());
   for (uint32_t chain = 0; chain < extents; ++chain) {
     const uint64_t id = chain + 1;

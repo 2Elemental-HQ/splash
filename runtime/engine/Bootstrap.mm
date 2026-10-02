@@ -187,7 +187,8 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   // serving concurrency limit: the engine still admits lanes dynamically.
   const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
       model::ExecutionLimits::maximumBatchWidth,
-      (budget.dynamicBudgetBytes - budget.kvExtentBytes) /
+      (budget.dynamicBudgetBytes -
+       kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
           budget.activeStateCellBytes));
   for (uint32_t width = 1;
        width <= model::ExecutionLimits::maximumBatchWidth; ++width) {

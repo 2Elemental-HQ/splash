@@ -304,7 +304,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before preparing or registering its
     // weights. Beside them the plan needs at least the runtime reserves, one
-    // state cell, one KV extent and any disk tier state staging; the full plan
+    // state cell, the KV runway and any disk tier state staging; the full plan
     // below adds the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
@@ -313,7 +313,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
          {model::preparedModelWeightBytes(config.modelRoot, config.model),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           config.model.stateLayout.activeCellBytes(),
-          uint64_t{kvLayout.minimumExtentPages()} *
+          kvRunwayPages(kvLayout.minimumExtentPages()) *
               kvLayout.bytesPerModelPage(),
           stateStagingBytes}) {
       if (!checkedAdd(requiredBytes, bytes, requiredBytes))
@@ -322,8 +322,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     if (requiredBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
-          "model weights with the runtime reserves, one state cell, one KV "
-          "extent and any disk tier state staging require " +
+          "model weights with the runtime reserves, one state cell, the KV "
+          "runway and any disk tier state staging require " +
               std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
@@ -471,6 +471,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
+    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
     // One disk quota serves KV pages and states. Without room for a state,
     // disk KV cannot preserve a restorable prefix, so the tier stays off.
     std::shared_ptr<model::DiskBudget> diskBudget;
@@ -505,7 +506,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                    error.what(), ").");
       }
     }
-    auto kvPool = std::make_unique<KvPool>(*kvPages);
     auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
                                                  kvTier.get(), diskBudget);
 
@@ -568,7 +568,10 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
-  report.kvAllocatedBytes = kvPages_->actualAllocatedBytes();
+  if (kvPool_->allocatedBytes() != kvPages_->actualAllocatedBytes()) {
+    throw std::logic_error("the KV pool and its storage disagree on allocated extents");
+  }
+  report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = stateStorage_->stagingBytes();
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.

@@ -1,4 +1,5 @@
 #include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 #include "engine/FdTransport.hpp"
 
@@ -25,26 +26,6 @@ using namespace splash;
 using namespace splash::engine;
 
 namespace {
-
-class Storage final : public kv::ExtentStorage {
-public:
-  Storage() : allocated_(8, true) {}
-  uint32_t pageCount() const noexcept override { return allocated_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
-  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
-    allocated_.at(page) = true;
-    return true;
-  }
-  bool releaseExtentOf(uint32_t page) override {
-    allocated_.at(page) = false;
-    return true;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override { return page; }
-  uint32_t extentPageCount(uint32_t) const override { return 1; }
-private:
-  std::vector<bool> allocated_;
-};
 
 class Executor final : public model::Model {
 public:
@@ -122,8 +103,8 @@ struct Harness final {
       : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
                   inputQueueBytes) {}
   Pipes pipes;
-  Storage storage;
-  KvPool pool{storage};
+  test::TestKvStorage storage{8, 4096, 1};
+  KvPool pool{storage, 8};
   engine::Cache resources{pool, CacheNamespace{}};
   Executor executor;
   engine::FdTransport transport;
@@ -306,8 +287,8 @@ void testLoopRecordsItsLongestTick() {
 // engine's next deadline and then fails the request that reached it.
 void testLoopWakesForAnEngineDeadline() {
   Pipes pipes;
-  Storage storage;
-  KvPool pool{storage};
+  test::TestKvStorage storage{8, 4096, 1};
+  KvPool pool{storage, 8};
   engine::Cache resources{pool, CacheNamespace{}};
   Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};

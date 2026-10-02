@@ -248,7 +248,7 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
       return error.failure();
     }
     reservation->commit();
-    return true;
+    return {};
   };
 }
 

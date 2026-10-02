@@ -100,7 +100,7 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
   // Beside its weights a model needs at least the runtime reserves, one state
-  // cell and one KV extent. The low ceiling is one byte short of all that, so
+  // cell and the KV runway. The low ceiling is one byte short of all that, so
   // every directory must be counted. The other ceilings must reach the real
   // loader, whose expected weight files are deliberately absent. No actual
   // model package is needed for this test.
@@ -109,7 +109,7 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       root.packageBytes + model::kPipelineReserveBytes +
       model::kRuntimeOverheadReserveBytes +
       config.model.stateLayout.activeCellBytes() +
-      uint64_t{kvLayout.minimumExtentPages()} * kvLayout.bytesPerModelPage();
+      kvRunwayPages(kvLayout.minimumExtentPages()) * kvLayout.bytesPerModelPage();
   for (uint64_t ceiling : {minimumBytes - 1, minimumBytes, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
     try {

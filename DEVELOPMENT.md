@@ -504,7 +504,7 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, one KV extent and any disk tier
+pipeline and runtime reserves, one state cell, the KV runway and any disk tier
 state staging, exceed the hard budget, so a model that can never fit is not
 prepared. File backing does not make Metal-resident pages reclaimable.
 Every buffer the backend allocates or wraps belongs to one residency set
@@ -519,19 +519,22 @@ KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, with a 64 KiB-aligned region per
 attention layer, sized to leave the fewest of the budget's pages unused
 (`Layout::extentPagesFor`). The pool allocates an extent when it needs one of
-its pages. An extent whose last page is free stays allocated until a reclaim
-releases it, at once and only between commands: memory pressure, an admission
-the budget denies, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the residency
-set makes extents resident for every command. The host reaches the same
-memory (`PageStorage::spans`), which is how the disk tier moves pages. A
+its pages. When it is built it allocates the runway, the extents of the first
+64 pages, which startup warmup runs on; nothing but the pool allocates or
+releases an extent. An extent whose last page is free stays allocated until a
+reclaim releases it, at once and only between commands: memory pressure, an
+admission the budget denies, or startup cleanup. Kernels reach a page through
+the GPU address in its request's page table, so no command binds KV; the
+residency set makes extents resident for every command. The host reaches the
+same memory (`PageStorage::spans`), which is how the disk tier moves pages. A
 reclaim pass releases every extent that is empty or that its evictions empty.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
-(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released and
-the longest allocation and release of one; how long a whole pass holds the loop
-shows in `loop.max_tick_ms`.
+(`allocated_bytes`, `reclaimable_bytes`), and the extents allocated and
+released and the longest allocation and release of one. The counts and the
+longest allocation include the runway allocated at startup, before serving
+begins; how long a whole pass holds the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or

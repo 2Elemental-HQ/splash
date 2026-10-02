@@ -312,12 +312,13 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
-  // The minimum holds one state cell and the smallest extent a pool can use.
-  uint64_t minimumExtentBytes = 0;
+  // The minimum holds one state cell and the KV runway: the whole smallest
+  // extents holding the pages warmup runs on.
+  uint64_t runwayBytes = 0;
   if (!checkedMultiply(breakdown.kvPageBytes,
-                       model.targetKvLayout.minimumExtentPages(),
-                       minimumExtentBytes) ||
-      !checkedAdd(breakdown.activeStateCellBytes, minimumExtentBytes,
+                       kvRunwayPages(model.targetKvLayout.minimumExtentPages()),
+                       runwayBytes) ||
+      !checkedAdd(breakdown.activeStateCellBytes, runwayBytes,
                   breakdown.minimumDynamicBytes) ||
       !checkedAdd(breakdown.fixedRuntimeBytes, breakdown.minimumDynamicBytes,
                   breakdown.minimumRequiredBytes)) {
@@ -361,7 +362,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
         std::nullopt,
         failure(
             BudgetErrorCode::KvPoolDoesNotFit,
-            "hard budget cannot fit one active state cell and one KV extent",
+            "hard budget cannot fit one active state cell and the KV runway",
             std::move(breakdown))};
   }
 

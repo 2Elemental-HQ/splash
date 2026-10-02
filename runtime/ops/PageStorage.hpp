@@ -40,24 +40,25 @@ public:
     return layout_.bytesPerModelPage();
   }
   [[nodiscard]] Layout layout() const noexcept { return layout_; }
-  [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
+  [[nodiscard]] uint32_t extentPages() const noexcept override {
+    return extentPages_;
+  }
   [[nodiscard]] uint64_t extentBytes() const noexcept {
     return uint64_t{extentPages_} * layout_.bytesPerModelPage();
   }
-  // The extents that hold memory now, and their bytes.
-  [[nodiscard]] uint32_t allocatedExtents() const noexcept { return allocatedExtents_; }
+  // The extents that hold memory now, and their bytes: a measurement of the
+  // buffers, which KvPool's record of its extents must match.
+  [[nodiscard]] uint32_t allocatedExtents() const noexcept;
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
-    return uint64_t{allocatedExtents_} * extentBytes();
+    return uint64_t{allocatedExtents()} * extentBytes();
   }
-  [[nodiscard]] bool isAllocated(uint32_t page) const override;
-  [[nodiscard]] metal::AllocationResult ensureAllocated(uint32_t page) override;
+  [[nodiscard]] bool isAllocated(uint32_t page) const;
+  // std::out_of_range for an extent past the pool.
+  [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent) override;
   // The caller must prove that no active, prefix, reserved, or in-flight
-  // reference remains anywhere in this extent. A command reaches extents
-  // through its tables without retaining them, so releasing one while a
-  // command is in flight throws std::logic_error and leaves it intact.
-  [[nodiscard]] bool releaseExtentOf(uint32_t page) override;
-  [[nodiscard]] uint32_t extentFirstPage(uint32_t page) const override;
-  [[nodiscard]] uint32_t extentPageCount(uint32_t page) const override;
+  // reference remains anywhere in this extent. std::out_of_range for an
+  // extent past the pool.
+  void releaseExtent(uint32_t extent) override;
   [[nodiscard]] LayerStorage layer(uint32_t index) const;
 
   // The entry kernels reach a page by. Throws std::logic_error for a page
@@ -88,7 +89,6 @@ private:
   uint32_t extentPages_ = 0;
   // Empty while the extent is not allocated.
   std::vector<metal::MetalBuffer> extents_;
-  uint32_t allocatedExtents_ = 0;
   uint64_t generation_ = 0;
 };
 

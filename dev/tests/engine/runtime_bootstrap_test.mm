@@ -1,12 +1,12 @@
 #include "Q8PageFormatReference.hpp"
 #include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "TestModel.hpp"
 
 #import <Foundation/Foundation.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -243,31 +243,6 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   return actual;
 }
 
-class Storage final : public kv::ExtentStorage {
-public:
-  explicit Storage(uint32_t pages) : allocated_(pages, true) {}
-  uint32_t pageCount() const noexcept override { return allocated_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isAllocated(uint32_t page) const override { return allocated_.at(page); }
-  splash::metal::AllocationResult ensureAllocated(uint32_t page) override {
-    allocated_.at(page) = true;
-    return true;
-  }
-  bool releaseExtentOf(uint32_t page) override {
-    const bool allocated = allocated_.at(page);
-    allocated_.at(page) = false;
-    return allocated;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    return page - page % 4;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, allocated_.size() - extentFirstPage(page));
-  }
-private:
-  std::vector<bool> allocated_;
-};
-
 class State final : public CompositeState {
 public:
   uint64_t bytes() const noexcept override { return 64; }
@@ -364,7 +339,7 @@ class Harness final {
 public:
   Harness(const EngineMemoryPlan &plan, int failingStep = -1,
           int throwingStep = -1, bool failReadyWrite = false)
-      : backing_(16), pool_(backing_),
+      : backing_(16, 4096, 4), pool_(backing_, 16),
         resources_(pool_, CacheNamespace{}),
         executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
                   throwingStep),
@@ -389,7 +364,7 @@ private:
     return config;
   }
 
-  Storage backing_;
+  test::TestKvStorage backing_;
   KvPool pool_;
   engine::Cache resources_;
   Executor executor_;
@@ -454,7 +429,7 @@ void requireReadyWithoutReducingConcurrency(
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
   const auto complete = memoryPlan().breakdown();
   for (uint32_t width : {1U, 2U, 3U}) {
-    // Enough for the requested resident cells and one KV extent, with less
+    // Enough for the requested resident cells and the KV runway, with less
     // than one extra cell of headroom. This is a valid single-lane plan.
     const uint64_t ceiling = complete.minimumRequiredBytes +
                             (width - 1) * complete.activeStateCellBytes +

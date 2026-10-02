@@ -126,7 +126,7 @@ void metalTests(const char *metallib) {
     ++calls;
     admittedBytes = bytes;
     allocate();
-    return true;
+    return metal::AllocationResult{};
   };
   for (auto shape : shapes)
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -140,12 +140,13 @@ void metalTests(const char *metallib) {
     }
   const DraftAttentionWorkload workload{shapes[0], 3};
   const auto denied = tuneDraftAttention(backend,
-      [](uint64_t, const auto &) { return false; }, workload, options);
+      [](uint64_t, const auto &) { return metal::AllocationFailure::EngineBudget; }, workload,
+      options);
   require(!denied.complete && denied.measurements.empty() && !denied.failure &&
               denied.choice.configuration == DraftAttentionConfiguration{},
           "draft admission denial did not retain baseline without commands");
   const auto invalidAdmission = tuneDraftAttention(backend,
-      [](uint64_t, const auto &) { return true; }, workload, options);
+      [](uint64_t, const auto &) { return metal::AllocationResult{}; }, workload, options);
   require(!invalidAdmission.complete && invalidAdmission.failure &&
               invalidAdmission.measurements.empty(),
           "draft accepted successful admission without an allocation");

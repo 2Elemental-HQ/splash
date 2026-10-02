@@ -433,11 +433,11 @@ void metalTests(const char *metallib) {
     ++admissionCalls;
     admittedBytes = bytes;
     allocate();
-    return true;
+    return metal::AllocationResult{};
   };
   const metal::AllocationAdmission deny = [&](uint64_t, const auto &) {
     ++admissionCalls;
-    return false;
+    return metal::AllocationFailure::EngineBudget;
   };
   // The sweep's verify IDs index the tuning order of this device's baseline.
   const auto verifyBaseline = VerifyAttentionConfig{};
@@ -481,7 +481,7 @@ void metalTests(const char *metallib) {
               invalidPrefill.probes.empty() && admissionCalls == beforeInvalidPrefill,
           "ragged prefill policy allocated a calibration fixture");
   const auto invalidAdmission = tuneVerifyAttention(backend,
-      [](uint64_t, const auto &) { return true; }, workload, options);
+      [](uint64_t, const auto &) { return metal::AllocationResult{}; }, workload, options);
   require(!invalidAdmission.complete && invalidAdmission.failure &&
               invalidAdmission.measurements.empty(),
           "successful admission without an allocation was not reported");

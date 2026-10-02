@@ -72,8 +72,8 @@ struct MemoryGovernorSnapshot {
   // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
   uint64_t chargedBytes = 0;
-  // The charged bytes once warmup released all but one lane's state and the
-  // KV runway (markServingFootprint); zero until then.
+  // The charged bytes once warmup released all but one lane's state and one
+  // empty KV extent (markServingFootprint); zero until then.
   uint64_t servingFootprintBytes = 0;
   uint64_t reservedBytes = 0;
   uint64_t headroomBytes = 0;
@@ -200,8 +200,8 @@ public:
   // ends the waiver.
   void reclaimed(ReclaimOutcome outcome) noexcept;
   // Records what is charged once warmup has released all but one lane's
-  // state and the KV runway: the footprint a request is served from. Growth
-  // back to it needs only the host's reserve (tryReserve).
+  // state and one empty KV extent: the footprint a request is served from.
+  // Growth back to it needs only the host's reserve (tryReserve).
   void markServingFootprint() noexcept;
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
