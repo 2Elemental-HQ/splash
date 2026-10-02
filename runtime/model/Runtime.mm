@@ -173,18 +173,42 @@ StateAdmission admitIdleSlot(const QwenStateStorage &states,
 } // namespace
 
 struct Runtime::Impl {
-  // Repeated placements share one encode and its buffers. Pixels are released
-  // on completion; embeddings remain until every placement has finished.
-  struct ImageData final {
+  // An image by content: the fields a placement's span identifies it by.
+  struct ImageKey final {
+    uint64_t digestLo = 0;
+    uint64_t digestHi = 0;
+    uint32_t gridHeight = 0;
+    uint32_t gridWidth = 0;
+
+    bool operator==(const ImageKey &) const = default;
+  };
+  struct ImageKeyHash final {
+    // The digest is already a content hash.
+    size_t operator()(const ImageKey &key) const noexcept {
+      return static_cast<size_t>(key.digestLo ^ key.digestHi);
+    }
+  };
+
+  // One image's encoded rows, shared by every placement that still has rows
+  // to inject (repeated placements and concurrent requests alike) and by
+  // the embedding cache. Whichever placement's chunk reaches the image
+  // first encodes it and the others inject after it; the pixels go once
+  // the encode has completed.
+  struct ImageRows final {
+    ImageKey key;
     MetalBuffer pixels;
     MetalBuffer embeddings;
     bool encoding = false;
     bool encoded = false;
+    // Its entry in the embedding cache while the cache holds it.
+    std::optional<std::list<std::shared_ptr<ImageRows>>::iterator> cached;
   };
 
+  // A placement keeps its rows until its last row is injected; its span
+  // stays, because rotary positions after it depend on its grid.
   struct ImageState final {
     ImageSpan span;
-    std::shared_ptr<ImageData> data;
+    std::shared_ptr<ImageRows> rows;
   };
 
   struct Request final {
@@ -259,18 +283,19 @@ struct Runtime::Impl {
   // its request's slot, which need not be its lane.
   MetalBuffer penaltyTable;
   std::unordered_map<uint64_t, Request> requests;
-  // Allocated for image cache misses and reclaimable once pending encodes
-  // finish. Injecting already encoded rows needs no vision arena.
+  // Allocated for images that need an encode and reclaimable once no image
+  // waits for one. Injecting already encoded rows needs no vision arena.
   std::unique_ptr<ops::Vision> vision;
-  // Encoded rows retained for reuse, including prefix hits that land inside
-  // an image and still need its remaining rows. Byte-bounded LRU; the memory
-  // reclaimer drops it entirely.
-  struct CachedEmbeddings final {
-    ImageSpan key;
-    MetalBuffer embeddings;
-  };
+  // Every image's rows while anything holds them, so that a placement of
+  // the same image anywhere shares them. Entries of rows nothing holds any
+  // more go when a lookup or a walk finds them.
+  std::unordered_map<ImageKey, std::weak_ptr<ImageRows>, ImageKeyHash> imageRows;
+  // Encoded rows kept for reuse once no placement has rows of them left to
+  // inject, including prefix hits that land inside an image and still need
+  // its remaining rows. Most recently used first, bounded by bytes; the
+  // memory reclaimer drops it entirely.
   static constexpr uint64_t kEmbeddingCacheBytes = 512ULL * 1024 * 1024;
-  std::list<CachedEmbeddings> embeddingCache;
+  std::list<std::shared_ptr<ImageRows>> embeddingCache;
   uint64_t embeddingCacheBytes = 0;
   uint32_t maximumImagePatches = 0;
   uint64_t pipelineReserveBytes = 0;
@@ -352,60 +377,71 @@ struct Runtime::Impl {
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
-  static bool sameImage(const ImageSpan &left,
-                        const ImageSpan &right) noexcept {
-    return left.digestLo == right.digestLo && left.digestHi == right.digestHi &&
-           left.gridHeight == right.gridHeight &&
-           left.gridWidth == right.gridWidth;
+  static ImageKey imageKey(const ImageSpan &span) noexcept {
+    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth};
   }
 
-  // Encoded rows for an identical image, moved to the front of the LRU.
-  MetalBuffer cachedEmbeddings(const ImageSpan &span) {
-    for (auto entry = embeddingCache.begin(); entry != embeddingCache.end();
-         ++entry) {
-      if (!sameImage(entry->key, span))
-        continue;
-      embeddingCache.splice(embeddingCache.begin(), embeddingCache, entry);
-      return entry->embeddings;
+  // The rows of an identical image that something still holds, moved to the
+  // front of the embedding cache when it is there; null otherwise.
+  std::shared_ptr<ImageRows> findRows(const ImageSpan &span) {
+    const auto found = imageRows.find(imageKey(span));
+    if (found == imageRows.end())
+      return {};
+    std::shared_ptr<ImageRows> rows = found->second.lock();
+    if (!rows) {
+      imageRows.erase(found);
+      return {};
     }
-    return {};
+    if (rows->cached)
+      embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
+    return rows;
   }
 
-  void retainEmbeddings(const ImageState &image) {
-    if (!image.data || !image.data->encoded || !image.data->embeddings ||
-        embeddingBytes(image.span) > kEmbeddingCacheBytes ||
-        cachedEmbeddings(image.span)) {
+  // Keeps encoded rows for reuse as the most recently used, dropping the
+  // least recently used beyond the cache's bytes.
+  void retain(const std::shared_ptr<ImageRows> &rows) {
+    if (rows->cached) {
+      embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
       return;
     }
-    embeddingCache.push_front({image.span, image.data->embeddings});
-    embeddingCacheBytes += embeddingBytes(image.span);
-    while (embeddingCacheBytes > kEmbeddingCacheBytes) {
-      embeddingCacheBytes -= embeddingBytes(embeddingCache.back().key);
-      embeddingCache.pop_back();
-    }
+    const uint64_t bytes = rows->embeddings.sizeBytes();
+    if (bytes > kEmbeddingCacheBytes)
+      return;
+    embeddingCache.push_front(rows);
+    rows->cached = embeddingCache.begin();
+    embeddingCacheBytes += bytes;
+    while (embeddingCacheBytes > kEmbeddingCacheBytes)
+      static_cast<void>(uncache(std::prev(embeddingCache.end())));
   }
 
-  // Rows served from the cache stay held by the request using them, so
-  // dropping their entry frees nothing until that request ends.
-  [[nodiscard]] bool
-  embeddingsHeld(const MetalBuffer &embeddings) const noexcept {
-    for (const auto &[_, entry] : requests) {
-      for (const ImageState &image : entry.images) {
-        if (image.data && image.data->embeddings.sameView(embeddings))
-          return true;
-      }
-    }
-    return false;
+  // Drops one entry of the embedding cache and returns the bytes it held.
+  uint64_t uncache(std::list<std::shared_ptr<ImageRows>>::iterator entry) noexcept {
+    const uint64_t bytes = (*entry)->embeddings.sizeBytes();
+    (*entry)->cached.reset();
+    embeddingCache.erase(entry);
+    embeddingCacheBytes -= bytes;
+    return bytes;
   }
 
+  // A request lets go of its images; the encoded ones stay in the cache.
+  void releaseImages(Request &entry) {
+    for (const ImageState &image : entry.images) {
+      if (image.rows && image.rows->encoded)
+        retain(image.rows);
+    }
+    entry.images.clear();
+  }
+
+  // Empties the embedding cache and returns what that frees: rows a
+  // placement still holds stay allocated.
   uint64_t dropEmbeddingCache() noexcept {
     uint64_t released = 0;
-    for (const CachedEmbeddings &entry : embeddingCache) {
-      if (!embeddingsHeld(entry.embeddings))
-        released += embeddingBytes(entry.key);
+    while (!embeddingCache.empty()) {
+      const bool held = embeddingCache.front().use_count() > 1;
+      const uint64_t bytes = uncache(embeddingCache.begin());
+      if (!held)
+        released += bytes;
     }
-    embeddingCache.clear();
-    embeddingCacheBytes = 0;
     return released;
   }
 
@@ -422,12 +458,14 @@ struct Runtime::Impl {
   };
 
   // A request's lane with everything else its start allocates, in one
-  // admission: the shared vision scratch when no encoder exists and the
-  // pixel and embedding buffers of the images not yet encoded. At the budget
-  // the engine retries a denied start after each reclaim step, and a denial
-  // builds nothing, so no encoder arena, image buffer or state cell is built
-  // and dropped every time. The refusal keeps its cause; a grant hands the
-  // request's images to `images`.
+  // admission: the shared vision scratch when an image still needs an
+  // encode and no encoder exists, and the pixel and embedding buffers of
+  // the images nothing holds yet. Rows something holds are shared, encoded
+  // or not. At the budget the engine retries a denied start after each
+  // reclaim step, and a denial builds nothing, so no encoder arena, image
+  // buffer or state cell is built and dropped every time. The refusal keeps
+  // its cause; a grant hands the request's images to `images` and counts
+  // the rows it shares as reuses, each once.
   metal::AllocationResult activate(const ModelRequest &request, uint32_t slot,
                                    std::vector<ImageState> &images) {
     if (request.images.empty())
@@ -437,31 +475,29 @@ struct Runtime::Impl {
       throw std::logic_error("image request reached a model without vision");
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
+    std::vector<std::shared_ptr<ImageRows>> shared;
     uint64_t bytes = 0;
+    bool encodes = false;
     for (const ImageSpan &span : request.images) {
-      ImageState image{span, {}};
-      const auto duplicate = std::find_if(
-          staged.begin(), staged.end(), [&](const ImageState &previous) {
-            return sameImage(previous.span, span);
-          });
-      if (duplicate != staged.end()) {
-        image.data = duplicate->data;
-      } else {
-        image.data = std::make_shared<ImageData>();
-        image.data->embeddings = cachedEmbeddings(span);
-        image.data->encoded = static_cast<bool>(image.data->embeddings);
-        if (!image.data->encoded)
-          bytes += span.pixelBytes() + embeddingBytes(span);
+      // New rows enter the registry now, so a repeated placement shares
+      // them; they have no buffers until the admission allocates them.
+      std::shared_ptr<ImageRows> rows = findRows(span);
+      if (!rows) {
+        rows = std::make_shared<ImageRows>();
+        rows->key = imageKey(span);
+        imageRows.insert_or_assign(rows->key, rows);
+        bytes += span.pixelBytes() + embeddingBytes(span);
+      } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
+        shared.push_back(rows);
       }
-      staged.push_back(std::move(image));
+      encodes |= !rows->encoded;
+      staged.push_back({span, std::move(rows)});
     }
-    // Keep cache references alive during admission. Only misses need the
-    // encoder; cached rows can be injected after its arena has been reclaimed.
     const uint64_t encoderBytes =
-        bytes && !vision ? ops::Vision::scratchBytes(
-                               package.vision.tensors.layout,
-                               maximumImagePatches)
-                         : 0;
+        encodes && !vision ? ops::Vision::scratchBytes(
+                                 package.vision.tensors.layout,
+                                 maximumImagePatches)
+                           : 0;
     std::unique_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
@@ -471,12 +507,13 @@ struct Runtime::Impl {
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
-        if (!image.data->embeddings) {
-          image.data->pixels = backend.allocateBuffer(
+        ImageRows &rows = *image.rows;
+        if (!rows.embeddings) {
+          rows.pixels = backend.allocateBuffer(
               span.pixelBytes(), BufferStorage::Shared, "image pixels");
-          std::memcpy(contents<uint8_t>(image.data->pixels, "image pixels"), pixels,
+          std::memcpy(contents<uint8_t>(rows.pixels, "image pixels"), pixels,
                       static_cast<size_t>(span.pixelBytes()));
-          image.data->embeddings = backend.allocateBuffer(
+          rows.embeddings = backend.allocateBuffer(
               embeddingBytes(span), BufferStorage::Private, "image embeddings");
         }
         pixels += span.pixelBytes();
@@ -488,30 +525,22 @@ struct Runtime::Impl {
       return admission;
     if (encoder)
       vision = std::move(encoder);
+    counters.imageEmbeddingReuses += shared.size();
     images = std::move(staged);
     return {};
   }
 
-  // Gives an admitted request its images. Only an admitted request's cache
-  // hits count as reuses; the engine retries denied admissions.
-  void adoptImages(Request &entry, std::vector<ImageState> images) {
-    entry.images = std::move(images);
-    for (auto image = entry.images.begin(); image != entry.images.end();
-         ++image) {
-      const bool repeated = std::any_of(
-          entry.images.begin(), image,
-          [&](const ImageState &first) { return first.data == image->data; });
-      if (image->data->encoded && !repeated)
-        ++counters.imageEmbeddingReuses;
-    }
-  }
-
-  [[nodiscard]] bool visionIdle() const noexcept {
-    for (const auto &[_, entry] : requests) {
-      for (const ImageState &image : entry.images) {
-        if (image.data && !image.data->encoded && image.data->embeddings)
-          return false;
+  // No image waits for its encode, so the vision arena can go.
+  [[nodiscard]] bool visionIdle() {
+    for (auto entry = imageRows.begin(); entry != imageRows.end();) {
+      const std::shared_ptr<ImageRows> rows = entry->second.lock();
+      if (!rows) {
+        entry = imageRows.erase(entry);
+        continue;
       }
+      if (!rows->encoded)
+        return false;
+      ++entry;
     }
     return true;
   }
@@ -526,23 +555,23 @@ struct Runtime::Impl {
     for (ImageState &image : entry.images) {
       const uint64_t begin = std::max<uint64_t>(chunkBegin, image.span.offset);
       const uint64_t end = std::min<uint64_t>(chunkEnd, image.span.end());
-      if (begin >= end || !image.data || !image.data->embeddings)
+      if (begin >= end || !image.rows)
         continue;
-      ImageData &data = *image.data;
-      if (!data.encoded && !data.encoding) {
+      ImageRows &rows = *image.rows;
+      if (!rows.encoded && !rows.encoding) {
         if (!vision)
           throw std::logic_error("image request has no vision encoder");
         vision->encode(graph, {image.span.gridHeight, image.span.gridWidth},
-                       data.pixels, data.embeddings);
-        data.encoding = true;
+                       rows.pixels, rows.embeddings);
+        rows.encoding = true;
         ++counters.imageEncodes;
       }
-      const uint32_t rows = static_cast<uint32_t>(end - begin);
       ops::Vision::inject(
-          graph, data.embeddings, prefillArena->get(PrefillTensor::Hidden0),
+          graph, rows.embeddings, prefillArena->get(PrefillTensor::Hidden0),
           package.vision.tensors.layout.outputHiddenSize,
           static_cast<uint32_t>(begin - image.span.offset),
-          rowBegin + static_cast<uint32_t>(begin - chunkBegin), rows);
+          rowBegin + static_cast<uint32_t>(begin - chunkBegin),
+          static_cast<uint32_t>(end - begin));
     }
   }
 
@@ -1841,7 +1870,7 @@ void Runtime::suspend(uint64_t requestId) {
   }
   impl_->states.releaseSlot(entry.slot, requestId);
   impl_->pageTableBindings[entry.slot] = {};
-  entry.images.clear();
+  impl_->releaseImages(entry);
   entry.draftContextPlan.reset();
   entry.draftContextValid = false;
   entry.draftContextThrough = 0;
@@ -1867,7 +1896,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
-    impl_->adoptImages(entry, std::move(images));
+    entry.images = std::move(images);
     impl_->bindPenalties(entry, request.prompt);
   }
   rollback.committed = admission.granted();
@@ -1939,7 +1968,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
-  impl_->adoptImages(entry, std::move(images));
+  entry.images = std::move(images);
   impl_->bindPenalties(entry, request.prompt);
   auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
   if (!inserted) {
@@ -1993,7 +2022,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   // stay because rotary positions after them depend on their grids.
   for (Impl::ImageState &image : entry.images) {
     if (image.span.end() <= restoredPrefixLength) {
-      image.data.reset();
+      image.rows.reset();
     }
   }
   entry.promptComplete = false;
@@ -2055,7 +2084,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
                            [](const auto &image) {
-                             return image.data && image.data->encoding;
+                             return image.rows && image.rows->encoding;
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
@@ -2069,12 +2098,22 @@ Runtime::prefillAsync(const BatchPlan &plan,
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      const uint64_t chunkEnd = items[lane].promptOffset + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
-        if (!image.data || !image.data->encoding)
+        if (!image.rows)
           continue;
-        image.data->encoding = false;
-        image.data->encoded = true;
-        image.data->pixels = MetalBuffer{};
+        Impl::ImageRows &rows = *image.rows;
+        if (rows.encoding) {
+          rows.encoding = false;
+          rows.encoded = true;
+          rows.pixels = MetalBuffer{};
+        }
+        // Its last row is injected: the cache owns the rows from now on, so
+        // reclaim can free them while the request decodes.
+        if (image.span.end() <= chunkEnd) {
+          impl->retain(image.rows);
+          image.rows.reset();
+        }
       }
     }
 
@@ -2469,8 +2508,7 @@ void Runtime::end(uint64_t requestId) {
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
     return;
-  for (const Impl::ImageState &image : found->second.images)
-    impl_->retainEmbeddings(image);
+  impl_->releaseImages(found->second);
   if (found->second.resident) {
     impl_->states.releaseSlot(found->second.slot, requestId);
     impl_->pageTableBindings[found->second.slot] = {};
@@ -2827,6 +2865,10 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.warmIdleStateCells = impl_->states.idleCells();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
+  for (const auto &[_, held] : impl_->imageRows) {
+    if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
+      result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
+  }
   return result;
 }
 

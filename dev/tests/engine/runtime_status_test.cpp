@@ -171,6 +171,7 @@ void testCleanRuntimeStatus() {
   executorTelemetry.imageEmbeddingReuses = 4;
   executorTelemetry.visionArenaBytes = 5;
   executorTelemetry.embeddingCacheBytes = 6;
+  executorTelemetry.imageRowsBytes = 7;
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
@@ -201,7 +202,8 @@ void testCleanRuntimeStatus() {
               std::string::npos,
           "status advertised model capacity instead of the active engine limit");
   require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4,"
-                    "\"arena_bytes\":5,\"cached_bytes\":6}") != std::string::npos,
+                    "\"arena_bytes\":5,\"cached_bytes\":6,\"rows_bytes\":7}") !=
+              std::string::npos,
           "image telemetry is missing from status");
   require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                     "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"

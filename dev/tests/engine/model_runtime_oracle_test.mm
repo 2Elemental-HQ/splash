@@ -896,6 +896,130 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   std::cout << "non_finite_rows=PASS\n";
 }
 
+// A 64-token request with one image of the given span, its pixels a pattern.
+EngineRequest imageRequest(uint64_t id, ImageSpan span) {
+  std::vector<uint32_t> prompt(64);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  EngineRequest request = makeRequest(id, prompt, 1);
+  request.images = {span};
+  request.imagePixels.resize(span.pixelBytes());
+  for (size_t index = 0; index < request.imagePixels.size(); ++index)
+    request.imagePixels[index] = static_cast<uint8_t>(index * 13 + id);
+  return request;
+}
+
+// Two requests with the same image share its rows from their start: both
+// admitted before either prefills, one packed command encodes the image
+// once and both lanes inject it.
+void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
+                                             metal::MetalBackend &backend) {
+  while (executor.reclaimIdleState(false)) {
+  }
+  const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
+  const EngineRequest first = imageRequest(110, {16, 16, 8, 8, 167, 449});
+  EngineRequest second = first;
+  second.id = 111;
+  const uint64_t reuses = executor.telemetry().imageEmbeddingReuses;
+  const StateAdmission firstAdmission = executor.begin(first.modelView());
+  const uint64_t oneImage = executor.telemetry().imageRowsBytes;
+  const StateAdmission secondAdmission = executor.begin(second.modelView());
+  require(firstAdmission.granted() && secondAdmission.granted() && oneImage &&
+              executor.telemetry().imageRowsBytes == oneImage &&
+              executor.telemetry().imageEmbeddingReuses == reuses + 1,
+          "a second request with the same image did not share its rows");
+  BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy, {}, DecodeStage::Regular};
+  std::array<ModelBatchItem, 2> items;
+  const std::array<std::vector<uint32_t>, 2> pages{pageRange(116, 4), pageRange(120, 4)};
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const EngineRequest &request = lane ? second : first;
+    const uint32_t slot = *(lane ? secondAdmission : firstAdmission).cell;
+    executor.setDraftContextPlan(
+        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
+                                     std::nullopt, {}));
+    plan.items.push_back({request.id, static_cast<uint32_t>(request.prompt.size())});
+    items[lane] = withRevision({request.id, slot, 0, 0,
+                                static_cast<uint32_t>(request.prompt.size()), pages[lane]});
+    items[lane].inputTokens = request.prompt;
+  }
+  const uint64_t encodes = executor.telemetry().imageEncodes;
+  static_cast<void>(executor.prefill(plan, items));
+  require(executor.telemetry().imageEncodes == encodes + 1,
+          "two requests with the same image encoded it twice");
+  executor.end(first.id);
+  executor.end(second.id);
+  while (executor.reclaimIdleState(false)) {
+  }
+  require(backend.memoryStats().allocatedBytes == originalBytes,
+          "shared image rows leaked resources");
+  std::cout << "concurrent_image_requests_share_one_encode=PASS\n";
+}
+
+// A lane suspended inside its image keeps the encoded rows for its resume:
+// the cache takes them, and the replay injects them without an encode.
+void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
+                                      metal::MetalBackend &backend) {
+  while (executor.reclaimIdleState(false)) {
+  }
+  const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
+  const EngineRequest request = imageRequest(112, {16, 32, 8, 16, 173, 457});
+  const std::span<const uint32_t> prompt(request.prompt);
+  const std::vector<uint32_t> pages = pageRange(120, 4);
+  const StateAdmission admission = executor.begin(request.modelView());
+  require(admission.granted(), "suspended image request was not admitted");
+  executor.setDraftContextPlan(
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
+  const uint64_t encodes = executor.telemetry().imageEncodes;
+  prefillChunk(executor, request.id, *admission.cell, 0, 0, prompt.first(32), pages,
+               BatchCohort::Greedy, false);
+  executor.suspend(request.id);
+  const StateAdmission resumed = executor.resume(request.modelView());
+  require(resumed.granted(), "suspended image request did not resume");
+  executor.setDraftContextPlan(
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
+  prefillChunk(executor, request.id, *resumed.cell, 0, 0, prompt, pages,
+               BatchCohort::Greedy, true);
+  require(executor.telemetry().imageEncodes == encodes + 1,
+          "a resumed lane encoded its image again");
+  executor.end(request.id);
+  while (executor.reclaimIdleState(false)) {
+  }
+  require(backend.memoryStats().allocatedBytes == originalBytes,
+          "a suspended image request leaked resources");
+  std::cout << "suspended_lane_keeps_its_rows=PASS\n";
+}
+
+// Once a request has injected its image's last row the cache owns the rows,
+// so reclaim frees them, and the idle encoder, while the request still holds
+// its lane.
+void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
+                                          metal::MetalBackend &backend) {
+  while (executor.reclaimIdleState(false)) {
+  }
+  const EngineRequest request = imageRequest(113, {16, 16, 8, 8, 179, 461});
+  const StateAdmission admission = executor.begin(request.modelView());
+  require(admission.granted(), "reclaimable image request was not admitted");
+  executor.setDraftContextPlan(
+      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
+                                   std::nullopt, {}));
+  prefillChunk(executor, request.id, *admission.cell, 0, 0, request.prompt,
+               pageRange(120, 4), BatchCohort::Greedy, false);
+  const model::ModelTelemetry injected = executor.telemetry();
+  require(injected.embeddingCacheBytes && injected.visionArenaBytes &&
+              injected.imageRowsBytes == injected.embeddingCacheBytes,
+          "injected rows did not pass to the embedding cache");
+  const uint64_t before = backend.memoryStats().allocatedBytes;
+  uint64_t released = 0;
+  while (const uint64_t bytes = executor.reclaimIdleState(false))
+    released += bytes;
+  require(released == injected.embeddingCacheBytes + injected.visionArenaBytes &&
+              before - backend.memoryStats().allocatedBytes == released &&
+              executor.telemetry().imageRowsBytes == 0,
+          "reclaim did not free the rows a running request has injected");
+  executor.end(request.id);
+  std::cout << "injected_rows_become_reclaimable=PASS\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -1123,13 +1247,17 @@ int main(int argc, char **argv) {
       requireAtomicImageAdmission(executor, backend, model, allocationFault);
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
+      requireConcurrentRequestsShareOneEncode(executor, backend);
+      requireSuspendedLaneKeepsItsRows(executor, backend);
+      requireInjectedRowsBecomeReclaimable(executor, backend);
     } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
     }
     if (imagesOnly) {
       std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
-                << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images)\n";
+                << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
+                   " shared, suspended and injected rows)\n";
       return 0;
     }
 
