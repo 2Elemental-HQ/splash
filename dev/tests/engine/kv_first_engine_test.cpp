@@ -2898,8 +2898,8 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   }
 }
 
-// A budget denial releases every empty extent and tries again at once; if
-// that admits the request it runs, and if reclaim has nothing more to free
+// A budget denial releases one empty extent per step and retries after each;
+// if that admits the request it runs, and if reclaim has nothing more to free
 // the lone request fails as exhausted capacity in the same tick, since a
 // release takes effect when it is made.
 void testBudgetDenialRetriesAfterRelease() {
@@ -2946,10 +2946,6 @@ void testBudgetDenialRetriesAfterRelease() {
   }
 }
 
-// A prefill chunk that needs more new extents than the budget has room for
-// takes that room once: its retries, each after one cached prefix is
-// evicted, reuse the extents the denied attempts allocated rather than
-// releasing and allocating them again.
 // A lane's admission keeps the pooled buffers a lane starts from: its
 // activation takes them, so releasing them would only make the retry allocate
 // them again. KV growth has no use for them and releases them.
@@ -3024,6 +3020,10 @@ void testPausedStateAdmissionReusesCachedStates() {
   }
 }
 
+// A prefill chunk that needs more new extents than the budget has room for
+// takes that room once: its retry, after one reclaim step evicts the cached
+// prefixes it lacks, reuses the extents the denied attempt allocated rather
+// than releasing and allocating them again.
 void testDeniedGrowthAllocatesEachExtentOnce() {
   constexpr uint32_t cachedExtents = 24;
   constexpr uint32_t budgetExtents = 32;
@@ -3462,7 +3462,7 @@ void testRecoveryDrainEndsWithItsCause() {
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     // A resident lane waits for its initial mask without a command in
-    // flight; the other fills the first extent and must map another.
+    // flight; the other fills the first extent and must allocate another.
     auto resident = constrainedRequest(1, 100'000);
     resident.priority = RequestPriority::Background;
     engine.submit(std::move(resident));
@@ -4719,10 +4719,6 @@ void testGrowthWaitsForTheStateWriteInFlight() {
   }
 }
 
-// A shortfall of pages is covered in one pass: when the pool cannot
-// allocate another extent, the reclaim between attempts demotes as many
-// leaves as the shortfall needs, within the tier's share, and the lane waits
-// once for their pages instead of once per page.
 // A lane that cannot run must never leave the engine without a wakeup: the
 // transfer it waits for wakes it, and if that wake is missed the retry
 // deadline does once no command is in flight (a command's completion wakes
@@ -4798,6 +4794,10 @@ void testNothingInFlightIsNotPending() {
           "the lane did not run on leaves the unwritable tier had to drop");
 }
 
+// A shortfall of pages is covered in one pass: when the pool cannot
+// allocate another extent, the reclaim between attempts demotes as many
+// leaves as the shortfall needs, within the tier's share, and the lane waits
+// once for their pages instead of once per page.
 void testPageShortfallDemotesInBulk() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);

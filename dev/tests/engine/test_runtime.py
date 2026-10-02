@@ -1173,13 +1173,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(process.stdin.messages(wire.StatusRequestFrame)), probes)
         self.assertTrue(runtime.ready)
 
-    def test_request_and_capacity_failures_are_scoped(self):
+    def test_request_failures_are_scoped(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         request_error = runtime.submit(request(50))
-        capacity = runtime.submit(request(60))
         healthy = runtime.submit(request(70))
 
         process.send(
@@ -1191,26 +1190,12 @@ class RuntimeTests(unittest.TestCase):
                 b"request deadline expired",
             )
         )
-        process.send(
-            wire.ErrorEvent(
-                wire.FailureClass.REQUEST_ERROR,
-                capacity.request_id,
-                True,
-                b"capacity_exhausted",
-                b"could not allocate KV target: engine budget",
-            )
-        )
         send_success(process, healthy)
 
         with self.assertRaises(engine_runtime.RequestFailed) as caught:
             request_error.result(1.0)
         self.assertTrue(caught.exception.retryable)
         self.assertEqual(caught.exception.code, b"deadline_exceeded")
-        with self.assertRaises(engine_runtime.RequestFailed) as caught:
-            capacity.result(1.0)
-        self.assertTrue(caught.exception.retryable)
-        self.assertEqual(caught.exception.code, b"capacity_exhausted")
-        self.assertIn("engine budget", str(caught.exception))
         self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
         self.assertTrue(runtime.ready)
 
@@ -1477,7 +1462,7 @@ class RuntimeTests(unittest.TestCase):
 
         class SlowTeardown(FakeProcess):
             def terminate(self):
-                pass  # Still releasing its memory; SIGTERM only asked it to.
+                pass  # Still exiting gracefully; SIGTERM only asked it to.
 
             def wait(self, timeout=None):
                 waiting.set()

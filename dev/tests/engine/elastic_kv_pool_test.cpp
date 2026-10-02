@@ -105,23 +105,10 @@ void testIdExhaustionIsALogicError() {
             "running out of page ids kept the pages taken");
 }
 
-void testFailedGrowthRollsBackAtomically() {
-    TestKvStorage storage(12, 100, 4);
-    storage.growthAllowed = [](uint32_t extent) { return extent != 1; };
-    KvPool pool(storage, 0);
-    auto pages = pool.acquirePages(5, false);
-    require(!pages.granted() && pages.failure == AllocationFailure::EngineBudget,
-            "failed growth was not reported as denied");
-    auto status = pool.snapshot();
-    require(status.pagesAllocated == 4 && status.pagesFree == 4 &&
-                status.pagesActive == 0 && status.pagesPrefix == 0 &&
-                storage.allocationAttempts == 2,
-            "failed growth leaked references");
-}
-
-// A failed acquisition keeps the extents it allocated, reclaimable: the
-// retry takes their pages instead of allocating them again, and a reclaim
-// pass returns them if nothing does.
+// An extent the storage refuses denies the acquisition, which holds no page
+// and keeps the extents it allocated, reclaimable: the retry takes their
+// pages instead of allocating them again, and a reclaim pass returns them if
+// nothing does.
 void testFailedGrowthKeepsItsExtentsForTheRetry() {
     TestKvStorage storage(16, 100, 4);
     storage.growthAllowed = [](uint32_t extent) { return extent != 2; };
@@ -129,12 +116,15 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
     const auto before = pool.snapshot().extentReleases;
     auto pages = pool.acquirePages(9, false);
     auto status = pool.snapshot();
-    require(!pages.granted() && storage.releasedExtents == 0 &&
+    require(!pages.granted() && pages.failure == AllocationFailure::EngineBudget &&
+                storage.allocationAttempts == 3 &&
+                storage.releasedExtents == 0 &&
                 pool.snapshot().extentReleases == before &&
                 status.pagesAllocated == 8 && status.reclaimableExtents == 2 &&
                 status.pagesFree == 8 && status.pagesActive == 0 &&
-                status.extentAllocations == 2,
-            "a failed acquisition did not keep the extents it allocated");
+                status.pagesPrefix == 0 && status.extentAllocations == 2,
+            "a failed acquisition was not denied, held pages or did not "
+            "keep its extents");
     storage.growthAllowed = nullptr;
     pages = pool.acquirePages(9, false);
     require(pages.granted() && pool.snapshot().extentAllocations == 3 &&
@@ -293,7 +283,6 @@ int main() {
         testGrowthPacksAllocatedExtents();
         testRunwayIsAllocatedThroughThePool();
         testIdExhaustionIsALogicError();
-        testFailedGrowthRollsBackAtomically();
         testFailedGrowthKeepsItsExtentsForTheRetry();
         testThrowingStorageKeepsAccounting();
         testPressureReusesFreePagesAndDeniesGrowth();

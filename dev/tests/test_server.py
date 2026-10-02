@@ -3662,7 +3662,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             handlers, {signal.SIGTERM: signal.SIG_IGN, signal.SIGINT: signal.SIG_IGN}
         )
-        # While the engine releases its memory, a second Ctrl+C stops it now.
+        # While the engine exits gracefully, a second Ctrl+C stops it now.
         (closing,) = closing_handlers
         self.assertIs(closing[signal.SIGTERM], signal.SIG_IGN)
         runtime.kill.assert_not_called()

@@ -905,7 +905,7 @@ void testBoundedArbitraryStatusJson() {
   }
 }
 
-void testFailureTaxonomyAndCapacityEvent() {
+void testFailureTaxonomy() {
   constexpr std::string_view test = "failure taxonomy";
   for (ErrorEvent expected : {
            ErrorEvent{FailureClass::RequestError, 5, true, "busy",
@@ -1088,7 +1088,7 @@ int main() {
     testPromptAndImageSpanRejections();
     testRequestFlags();
     testBoundedArbitraryStatusJson();
-    testFailureTaxonomyAndCapacityEvent();
+    testFailureTaxonomy();
     testOverflowLimitsAndOuterTruncation();
     testFuzzLikeInputsAndMutations();
   } catch (const std::exception &error) {

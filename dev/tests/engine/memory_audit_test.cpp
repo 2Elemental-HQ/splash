@@ -113,8 +113,9 @@ void testUnreportedAllocationsCountAgainstReserves() {
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the warmup estimate that includes it.
 void testStateStagingHasItsOwnBound() {
-  const uint64_t ring = 130 * kMiB;
-  const auto memoryPlan = plan(kGiB, ring);
+  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  const uint64_t staging = 187 * kMiB;
+  const auto memoryPlan = plan(kGiB, staging);
   const auto &budget = memoryPlan.breakdown();
   const uint64_t reserves =
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
@@ -127,11 +128,11 @@ void testStateStagingHasItsOwnBound() {
     actual.estimatedWarmupPeakBytes += stagingBytes;
     return auditActualMemory(memoryPlan, actual);
   };
-  const auto staged = audit(ring, reserves);
+  const auto staged = audit(staging, reserves);
   require(staged.valid && staged.backendUnclassifiedBytes == reserves &&
               staged.warmupPeakDeviationBasisPoints == 0,
           "state staging was charged to the reserves or counted twice");
-  require(audit(ring + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
+  require(audit(staging + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
           "state staging beyond its plan was accepted");
   require(audit(0, 0).valid,
           "a plan with state staging failed without a started disk tier");

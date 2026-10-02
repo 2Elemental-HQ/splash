@@ -262,14 +262,14 @@ engine::NativeProcessExit run(std::span<const uint8_t> input) {
   return harness.transport.run(harness.loop);
 }
 
-// A shutdown request ends run() with a clean exit while the input is still
-// open, and a control handler that reports pending work is run again at the
-// loop's next wake, without another control notification, until it reports
-// none. Here input wakes the loop, as a landing transfer's completion does.
 void wakeWithStatusRequest(Harness &harness, uint64_t id) {
   writeAll(harness.pipes.input[1], wire(protocol::Message{protocol::StatusRequestFrame{id}}));
 }
 
+// A shutdown request ends run() with a clean exit while the input is still
+// open, and a control handler that reports pending work is run again at the
+// loop's next wake, without another control notification, until it reports
+// none. Here input wakes the loop, as a landing transfer's completion does.
 void testShutdownRequestAndControlContinuation() {
   {
     Harness harness;

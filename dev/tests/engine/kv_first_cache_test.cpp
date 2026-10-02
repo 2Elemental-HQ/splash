@@ -1708,13 +1708,11 @@ void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
   }
 }
 
-// A demotion the tier cannot take right now keeps its leaf: the requester is
-// told to wait, the leaf is written when the tier has room. Only a tier that
-// can never write again lets the leaf go as without a tier.
-// Room that transfers in flight will free is worth waiting for: the leaf
-// stays and the shortfall is Pending. Room or a file that nothing will
-// free is not: the leaf goes, exactly as it would without a tier, unless a
-// disk subtree depends on it.
+// A demotion the tier cannot take right now keeps its leaf while transfers
+// in flight will free room: the shortfall is Pending and the leaf is written
+// once the tier has room. Room or a file that nothing will free is not worth
+// waiting for: the leaf goes as without a tier, unless a disk subtree
+// depends on it.
 void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;

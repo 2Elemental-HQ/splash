@@ -1013,7 +1013,7 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(issue.failure_class, p.FailureClass.PROTOCOL_FATAL)
         self.assertEqual(issue.code, p.IssueCode.FRAME_TOO_LARGE)
 
-    def test_failure_taxonomy_and_capacity_event(self):
+    def test_failure_taxonomy(self):
         errors = (
             p.ErrorEvent(
                 p.FailureClass.REQUEST_ERROR,
