@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.engine.test_runtime import FakeFactory, request, send_success
@@ -127,7 +128,7 @@ class RequestLifetimeTests(unittest.TestCase):
                     self.assertIsNone(result.__traceback__)
                 elif outcome == "runtime_callback_error":
                     self.assertEqual(result.message, "event callback failed")
-                    self.assertIsNone(call.callback_errors[0].__traceback__)
+                    self.assertIsNone(call.callback_error.__traceback__)
                 del call, job
                 self.assert_released(cache, owner)
                 self.assertFalse(backend.active)
@@ -226,7 +227,7 @@ class RequestLifetimeTests(unittest.TestCase):
         release.set()
         thread.join(1)
         self.assertFalse(thread.is_alive())
-        self.assertFalse(call.callback_errors)
+        self.assertIsNone(call.callback_error)
         self.assert_released(cache, owner)
 
     def test_callback_failure_after_native_failure_does_not_retain_retired_state(self):
@@ -273,8 +274,10 @@ class RequestLifetimeTests(unittest.TestCase):
                     except ValueError as cause:
                         raise RuntimeError("callback failed") from cause
 
+                # A failed event callback cancels its call.
+                client = SimpleNamespace(_cancel_call=lambda _call: None)
                 call = engine_runtime.RuntimeCall(
-                    None,
+                    client,
                     1,
                     1,
                     request(100, image_owner=job.image_owner),
@@ -283,8 +286,9 @@ class RequestLifetimeTests(unittest.TestCase):
                 )
                 if not completion:
                     call._emit(None)
+                    self.assertTrue(call.cancel_requested)
                 call._set_terminal(error=engine_runtime.RuntimeClosed("finished"))
-                (failure,) = call.callback_errors
+                failure = call.callback_error
                 self.assertIsInstance(failure, RuntimeError)
                 self.assertEqual(str(failure), "callback failed")
                 self.assertIsNone(failure.__traceback__)

@@ -237,7 +237,6 @@ class _JobState:
     job: Job
     streamer: CallbackStreamer
     call: object | None = None
-    callback_error: Exception | None = None
     terminal_enqueued: bool = False
     detached: bool = False
     shutdown_requested: bool = False
@@ -246,7 +245,6 @@ class _JobState:
     def detach(self):
         self.detached = True
         self.call = None
-        self.callback_error = None
         self.streamer.on_stop = None
 
 
@@ -528,7 +526,8 @@ class NativeBackend:
                 if state.call is None:
                     state.call = call
                 cancel = job.cancelled.is_set() or self.closing
-            self._on_event(state, call, event)
+            # A raise here is the call's callback error, which cancels it.
+            self._on_event(state, event)
             if cancel:
                 call.cancel()
 
@@ -612,43 +611,37 @@ class NativeBackend:
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
 
-    def _on_event(self, state, call, event):
+    def _on_event(self, state, event):
         job = state.job
-        try:
-            if isinstance(event, wire.StartEvent):
-                cache = CacheInfo(
-                    "hit" if event.matched_prompt_tokens else "miss",
-                    event.matched_prompt_tokens,
-                    event.lane,
-                )
-                with self.lock:
-                    job.cache = cache
-                job.events.put(("start", cache.status))
-            elif isinstance(event, wire.PromptProgressEvent):
-                job.events.put(
-                    (
-                        "progress",
-                        {
-                            "total": len(job.prompt_tokens),
-                            "cache": job.cache.matched_tokens,
-                            "processed": event.processed_tokens,
-                            "time_ms": event.elapsed_micros / 1000.0,
-                        },
-                    )
-                )
-            elif isinstance(event, wire.TokensEvent):
-                if job.latency is not None and event.tokens:
-                    job.latency.tokens()
-                if event.sequence_offset == 0:
-                    state.first_token_batch_tokens = len(event.tokens)
-                if job.constraint is not None:
-                    job.constraint.commit(event.tokens)
-                state.streamer.put_tokens(event.tokens)
-        except Exception as error:
+        if isinstance(event, wire.StartEvent):
+            cache = CacheInfo(
+                "hit" if event.matched_prompt_tokens else "miss",
+                event.matched_prompt_tokens,
+                event.lane,
+            )
             with self.lock:
-                if not state.detached and state.callback_error is None:
-                    state.callback_error = error
-            call.cancel()
+                job.cache = cache
+            job.events.put(("start", cache.status))
+        elif isinstance(event, wire.PromptProgressEvent):
+            job.events.put(
+                (
+                    "progress",
+                    {
+                        "total": len(job.prompt_tokens),
+                        "cache": job.cache.matched_tokens,
+                        "processed": event.processed_tokens,
+                        "time_ms": event.elapsed_micros / 1000.0,
+                    },
+                )
+            )
+        elif isinstance(event, wire.TokensEvent):
+            if job.latency is not None and event.tokens:
+                job.latency.tokens()
+            if event.sequence_offset == 0:
+                state.first_token_batch_tokens = len(event.tokens)
+            if job.constraint is not None:
+                job.constraint.commit(event.tokens)
+            state.streamer.put_tokens(event.tokens)
 
     def cancel(self, job, timed_out=False):
         call = None
@@ -678,12 +671,9 @@ class NativeBackend:
         error = None
         result = None
         try:
-            native = call.result(0)
-            if state.callback_error is not None:
-                raise self._api_error(state.callback_error)
-            if call.callback_errors:
-                raise self._api_error(call.callback_errors[0])
-            done = native.done
+            done = call.result(0)
+            if call.callback_error is not None:
+                raise self._api_error(call.callback_error)
             if (
                 job.constraint is not None
                 and done.reason != wire.FinishReason.CANCELLED

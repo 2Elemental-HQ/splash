@@ -171,13 +171,6 @@ class GenerationRequest:
     flags: wire.RequestFlag = wire.RequestFlag(0)
 
 
-@dataclass(slots=True, frozen=True)
-class GenerationResult:
-    request_id: int
-    start: wire.StartEvent | None
-    done: wire.DoneEvent
-
-
 class RuntimeCall:
     """Future-like handle for one directly admitted native request."""
 
@@ -195,18 +188,16 @@ class RuntimeCall:
         self.generation = generation
         self.request = request
         self._on_event = on_event
-        self._completion_callbacks = []
-        if on_complete:
-            self._completion_callbacks.append(on_complete)
+        self._on_complete = on_complete
         self._event = threading.Event()
         self._lock = threading.Lock()
-        self._result: GenerationResult | None = None
+        self._result: wire.DoneEvent | None = None
         self._error: EngineRuntimeError | None = None
         self._start: wire.StartEvent | None = None
         self._progress: wire.PromptProgressEvent | None = None
         self._next_token_offset = 0
         self._mask_error: MaskComputationFailed | None = None
-        self._callback_errors: list[BaseException] = []
+        self._callback_error: BaseException | None = None
         self._cancel_requested = False
         self._cancel_timer = None
 
@@ -220,11 +211,12 @@ class RuntimeCall:
             return self._cancel_requested
 
     @property
-    def callback_errors(self) -> tuple[BaseException, ...]:
+    def callback_error(self) -> BaseException | None:
+        """The first error an event or completion callback raised."""
         with self._lock:
-            return tuple(self._callback_errors)
+            return self._callback_error
 
-    def result(self, timeout: float | None = None) -> GenerationResult:
+    def result(self, timeout: float | None = None) -> wire.DoneEvent:
         if not self._event.wait(timeout):
             raise TimeoutError(f"request {self.request_id} did not finish in time")
         with self._lock:
@@ -249,7 +241,9 @@ class RuntimeCall:
         try:
             callback(self, message)
         except BaseException as error:
+            # A request whose consumer failed cannot be delivered; stop it.
             self._record_callback_error(error)
+            self.cancel()
 
     def _record_callback_error(self, error: BaseException) -> None:
         # Keep diagnostics without retaining the callback's request frames.
@@ -257,13 +251,8 @@ class RuntimeCall:
         error.__context__ = None
         error.__cause__ = None
         with self._lock:
-            self._callback_errors.append(error)
-
-    def _invoke_completion(self, callback: CompletionCallback) -> None:
-        try:
-            callback(self)
-        except BaseException as error:
-            self._record_callback_error(error)
+            if self._callback_error is None:
+                self._callback_error = error
 
     def _record_start(self, event: wire.StartEvent) -> bool:
         with self._lock:
@@ -325,7 +314,7 @@ class RuntimeCall:
             if not self._event.is_set() and self._mask_error is None:
                 self._mask_error = error
 
-    def _build_result(self, done: wire.DoneEvent) -> GenerationResult:
+    def _check_done(self, done: wire.DoneEvent) -> wire.DoneEvent:
         with self._lock:
             prompt_tokens = len(self.request.prompt_tokens)
             logical_max = self.request.logical_max_output_tokens
@@ -384,7 +373,7 @@ class RuntimeCall:
                 raise ProtocolFatal(
                     "DoneEvent returned option logits for a generation request"
                 )
-            return GenerationResult(self.request_id, self._start, done)
+            return done
 
     def _terminal_mask_error(self) -> MaskComputationFailed | None:
         with self._lock:
@@ -393,7 +382,7 @@ class RuntimeCall:
     def _set_terminal(
         self,
         *,
-        result: GenerationResult | None = None,
+        result: wire.DoneEvent | None = None,
         error: EngineRuntimeError | None = None,
     ) -> bool:
         with self._lock:
@@ -402,20 +391,21 @@ class RuntimeCall:
             self._result = result
             self._error = error
             self._on_event = None
-            callbacks = tuple(self._completion_callbacks)
-            self._completion_callbacks.clear()
+            callback, self._on_complete = self._on_complete, None
             self._event.set()
             if self._cancel_timer is not None:
                 self._cancel_timer.cancel()
                 self._cancel_timer = None
-        for callback in callbacks:
-            self._invoke_completion(callback)
+        if callback is not None:
+            try:
+                callback(self)
+            except BaseException as error:
+                self._record_callback_error(error)
         return True
 
 
 @dataclass(slots=True)
 class _StatusWaiter:
-    generation: int
     event: threading.Event = field(default_factory=threading.Event)
     result: wire.StatusJsonEvent | None = None
     error: EngineRuntimeError | None = None
@@ -483,8 +473,6 @@ class MultiplexedRuntime:
         self._process: ProcessLike | None = None
         self._reader_thread: threading.Thread | None = None
         self._generation = 0
-        self._ever_started = False
-        self._restart_count = 0
         self._startup_attempt: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
         self._first_ready: wire.ReadyEvent | None = None
@@ -531,7 +519,7 @@ class MultiplexedRuntime:
     @property
     def restart_count(self) -> int:
         with self._state_lock:
-            return self._restart_count
+            return max(0, self._generation - 1)
 
     @property
     def readiness(self) -> wire.ReadyEvent | None:
@@ -551,20 +539,9 @@ class MultiplexedRuntime:
             )
 
     @property
-    def last_status(self) -> wire.StatusJsonEvent | None:
-        with self._state_lock:
-            return self._last_status
-
-    @property
     def last_crash_trace(self) -> str | None:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
-
-    def __enter__(self) -> MultiplexedRuntime:
-        return self
-
-    def __exit__(self, *_args) -> None:
-        self.close()
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         self._ensure_process(timeout=timeout)
@@ -665,7 +642,7 @@ class MultiplexedRuntime:
             self._require_generation_ready_locked(generation)
             correlation_id = next(self._status_ids)
             self._last_status_id = correlation_id
-            waiter = _StatusWaiter(generation)
+            waiter = _StatusWaiter()
             self._status_waiters[correlation_id] = waiter
         try:
             encoded = wire.serialize_message(wire.StatusRequestFrame(correlation_id))
@@ -879,9 +856,6 @@ class MultiplexedRuntime:
             else:
                 self._generation += 1
                 generation = self._generation
-                if self._ever_started:
-                    self._restart_count += 1
-                self._ever_started = True
                 self._process = process
                 self._terminal_error = None
                 self._ready_message = None
@@ -1167,7 +1141,7 @@ class MultiplexedRuntime:
                 raise ProtocolFatal("native event arrived before ReadyEvent")
 
         if isinstance(message, wire.StatusJsonEvent):
-            self._dispatch_status(generation, message)
+            self._dispatch_status(message)
             return
         if isinstance(message, wire.ErrorEvent):
             self._dispatch_error(generation, message)
@@ -1189,13 +1163,11 @@ class MultiplexedRuntime:
             return
         if isinstance(message, wire.MaskRequestEvent):
             call = self._require_call(generation, message.request_id)
-            call._emit(message)
             self._submit_mask(call, message)
             return
         if isinstance(message, wire.DoneEvent):
             call = self._require_call(generation, message.request_id)
-            result = call._build_result(message)
-            call._emit(message)
+            result = call._check_done(message)
             if error := call._terminal_mask_error():
                 self._finish_call(call, error=error)
             else:
@@ -1217,7 +1189,6 @@ class MultiplexedRuntime:
     def _dispatch_error(self, generation: int, event: wire.ErrorEvent) -> None:
         if event.failure_class is wire.FailureClass.REQUEST_ERROR:
             call = self._require_call(generation, event.request_id)
-            call._emit(event)
             self._finish_call(
                 call,
                 error=RequestFailed(
@@ -1232,21 +1203,17 @@ class MultiplexedRuntime:
             raise EngineUnhealthy(event.message.decode("utf-8", errors="replace"))
         raise ProtocolFatal(event.message.decode("utf-8", errors="replace"))
 
-    def _dispatch_status(self, generation: int, event: wire.StatusJsonEvent) -> None:
+    def _dispatch_status(self, event: wire.StatusJsonEvent) -> None:
         with self._state_lock:
             self._last_status = event
             waiter = self._status_waiters.pop(event.correlation_id, None)
             if waiter is None:
-                if event.correlation_id == 0:
-                    return
                 if 0 < event.correlation_id <= self._last_status_id:
                     return
                 raise ProtocolFatal(
                     f"native status references unknown correlation "
                     f"{event.correlation_id}"
                 )
-            if waiter.generation != generation:
-                return
             waiter.result = event
             waiter.event.set()
 
@@ -1319,13 +1286,13 @@ class MultiplexedRuntime:
 
     def _mask_failed(self, call: RuntimeCall, error: MaskComputationFailed) -> None:
         call._record_mask_error(error)
-        self._cancel_call(call)
+        call.cancel()
 
     def _finish_call(
         self,
         call: RuntimeCall,
         *,
-        result: GenerationResult | None = None,
+        result: wire.DoneEvent | None = None,
         error: EngineRuntimeError | None = None,
     ) -> None:
         with self._state_lock:

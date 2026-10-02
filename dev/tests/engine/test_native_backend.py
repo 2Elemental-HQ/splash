@@ -88,7 +88,7 @@ class FakeCall:
         self.request = request
         self.on_event = on_event
         self.on_complete = on_complete
-        self.callback_errors = ()
+        self.callback_error = None
         self.cancel_requested = False
         self.cancel_writes = 0
         self._result = None
@@ -100,7 +100,12 @@ class FakeCall:
         return self._done
 
     def emit(self, event):
-        self.on_event(self, event)
+        try:
+            self.on_event(self, event)
+        except Exception as error:
+            if self.callback_error is None:
+                self.callback_error = error
+            self.cancel()
 
     def complete(self, *, result=None, error=None):
         if self._done:
@@ -132,7 +137,6 @@ class FakeRuntime:
         self.complete_on_close = complete_on_close
         self.calls = []
         self.ready = True
-        self.last_status = None
         self.status_calls = 0
         self.status_event = native_peer.status_event()
         self.pending_limit = 8
@@ -166,8 +170,6 @@ class FakeRuntime:
         if self.mode == "complete_then_raise":
             call.complete(error=runtime.EngineUnhealthy("native write failed"))
             raise runtime.EngineUnhealthy("native write failed")
-        if self.mode == "raise":
-            raise runtime.EngineUnhealthy("submit failed")
         return call
 
     def status(self, timeout=5.0):
@@ -179,7 +181,6 @@ class FakeRuntime:
         if self.mode == "status_timeout_once":
             self.mode = "normal"
             raise TimeoutError("native status response timed out")
-        self.last_status = self.status_event
         return self.status_event
 
     def close(self):
@@ -214,10 +215,9 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
 
 
 def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
-    done = wire.DoneEvent(
+    return wire.DoneEvent(
         call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000, ()
     )
-    return runtime.GenerationResult(call.request_id, None, done)
 
 
 class NativeBackendContractTests(unittest.TestCase):
@@ -799,9 +799,6 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_status_timeout_without_valid_cache_is_fail_closed(self):
         runtime = FakeRuntime("status_timeout")
         transport, _runtime = self.make_transport(runtime)
-        self.assertFalse(transport.is_ready())
-
-        runtime.last_status = native_peer.status_event()
         self.assertFalse(transport.is_ready())
 
     def test_timed_out_status_keeps_one_background_refresh_alive(self):

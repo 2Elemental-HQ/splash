@@ -319,7 +319,7 @@ class FakeCall:
         self.request = request
         self.on_event = on_event
         self.on_complete = on_complete
-        self.callback_errors = ()
+        self.callback_error = None
         self.cancel_requested = False
         self._result = None
         self._error = None
@@ -335,7 +335,9 @@ class FakeCall:
         try:
             self.on_event(self, event)
         except Exception as error:
-            self.callback_errors = (*self.callback_errors, error)
+            if self.callback_error is None:
+                self.callback_error = error
+            self.cancel()
 
     def complete(self, *, result=None, error=None):
         with self._lock:
@@ -444,7 +446,6 @@ class FakeRuntime:
             else {
                 "stop": native_wire.FinishReason.STOP,
                 "length": native_wire.FinishReason.LENGTH,
-                "cancelled": native_wire.FinishReason.CANCELLED,
             }[plan.reason]
         )
         plan.terminal.set()
@@ -461,9 +462,7 @@ class FakeRuntime:
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
         )
-        call.complete(
-            result=api.engine_runtime.GenerationResult(call.request_id, None, done)
-        )
+        call.complete(result=done)
 
     def close(self):
         if self.closed:
