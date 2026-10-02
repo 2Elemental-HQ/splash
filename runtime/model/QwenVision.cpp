@@ -1,4 +1,5 @@
 #include "model/QwenVision.hpp"
+#include "model/VisionLoader.hpp"
 
 #include <string>
 #include <utility>
