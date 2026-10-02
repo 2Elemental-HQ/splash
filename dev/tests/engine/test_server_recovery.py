@@ -15,7 +15,6 @@ from dev.tests.engine.test_native_backend import FakeTokenizer as NativeTokenize
 from dev.tests.engine.test_native_backend import make_job
 from dev.tests.engine.test_runtime import READY, FakeFactory
 from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
-from install import launcher
 from server import backend as backend_api
 from server import protocol as wire
 from server import runtime as engine_runtime
@@ -462,17 +461,6 @@ class ServerRecoveryTests(unittest.TestCase):
         self.assertEqual(
             harness.request("POST", "/v1/messages/count_tokens", self.body())[0], 200
         )
-
-    def test_launcher_accepts_a_recovering_instance_without_calling_it_ready(self):
-        snapshot = {
-            "ready": False,
-            "transport": {"ready": False, "recovering": True, "status_stale": False},
-        }
-        with mock.patch.object(launcher, "_request_json", return_value=snapshot):
-            self.assertIs(launcher._running_status(), snapshot)
-            self.assertFalse(snapshot["ready"])
-            snapshot["transport"]["recovering"] = False
-            self.assertEqual(launcher._running_status(), snapshot)
 
     def test_background_recovery_and_waiters_share_the_native_startup(self):
         factory = FakeFactory(handler=answer_status)

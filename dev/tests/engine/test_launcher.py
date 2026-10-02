@@ -764,19 +764,16 @@ class LauncherTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 requests.append((self.path, self.headers.get("Authorization")))
-                payload = (
-                    {"maximum_context_tokens": 102400}
-                    if self.path == "/status"
-                    else {
-                        "data": [
-                            {
-                                "id": MODEL_ID,
-                                "owned_by": "splash",
-                                "input_modalities": ["text", "image", "pdf"],
-                            }
-                        ]
-                    }
-                )
+                payload = {
+                    "data": [
+                        {
+                            "id": MODEL_ID,
+                            "owned_by": "splash",
+                            "context_length": 102400,
+                            "input_modalities": ["text", "image", "pdf"],
+                        }
+                    ]
+                }
                 body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -831,12 +828,61 @@ class LauncherTests(unittest.TestCase):
                 worker.join(timeout=5)
             self.assertEqual(
                 requests,
-                [
-                    (path, "Bearer test-key")
-                    for _ in launcher.clients.INSTALL_URLS
-                    for path in ("/status", "/v1/models")
-                ],
+                [("/v1/models", "Bearer test-key")]
+                * len(launcher.clients.INSTALL_URLS),
             )
+
+    def test_client_setup_works_while_status_is_unavailable(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/status":
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps(
+                    {
+                        "data": [
+                            {
+                                "id": MODEL_ID,
+                                "owned_by": "splash",
+                                "context_length": 4096,
+                                "input_modalities": ["text"],
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                with (
+                    mock.patch.dict(
+                        os.environ, {"SPLASH_PORT": str(server.server_port)}
+                    ),
+                    mock.patch.object(
+                        launcher.clients, "find_executable", return_value="/bin/echo"
+                    ),
+                    mock.patch.object(
+                        launcher.clients, "command", return_value=(["codex"], {})
+                    ) as command,
+                    mock.patch.object(launcher.os, "execvpe") as execute,
+                    mock.patch("sys.stdout", io.StringIO()),
+                ):
+                    self.assertIsNone(launcher.main(["codex"]))
+            finally:
+                server.shutdown()
+                worker.join(timeout=5)
+        self.assertEqual(command.call_args.args[3:5], (MODEL_ID, 4096))
+        execute.assert_called_once()
 
     def test_source_script_runs_its_checkout_launcher_through_links(self):
         with tempfile.TemporaryDirectory() as temporary:

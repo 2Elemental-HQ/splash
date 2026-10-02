@@ -404,11 +404,6 @@ class ServedModelNamesTests(unittest.TestCase):
                         launcher.clients, "find_executable", return_value="codex"
                     ),
                     mock.patch.object(
-                        launcher,
-                        "_running_status",
-                        return_value={"maximum_context_tokens": 4096},
-                    ),
-                    mock.patch.object(
                         launcher, "_request_json", return_value=json.loads(payload)
                     ),
                     mock.patch.object(

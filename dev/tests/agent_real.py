@@ -1136,7 +1136,7 @@ def main(argv=None):
                     start_new_session=True,
                 )
             deadline = time.monotonic() + 900
-            while launcher._running_status() is None:
+            while launcher._request_json("/status", timeout=10) is None:
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise AgentFailure(
                         f"serve did not become ready; see {directory / 'server.log'}"

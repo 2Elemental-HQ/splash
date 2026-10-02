@@ -104,13 +104,6 @@ def _request_json(path, timeout=2, *, port=PORT):
         return None
 
 
-def _running_status(port=PORT):
-    status = _request_json("/status", timeout=10, port=port)
-    if not isinstance(status, dict):
-        return None
-    return status
-
-
 def _ensure_installed(selection):
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
@@ -322,28 +315,25 @@ def serve(args):
 
 def coding_client(args):
     path = clients.find_executable(args.command)
-    snapshot = _running_status(args.port)
-    if snapshot is None:
+    listing = _request_json("/v1/models", port=args.port)
+    if listing is None:
         raise LauncherError(
             f"No ready Splash server at {_base_url(args.port)}. "
             "Run 'splash serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
-    listing = _request_json("/v1/models", port=args.port)
     models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
         or not models
         or not isinstance(models[0], dict)
         or models[0].get("owned_by") != "splash"
+        or type(models[0].get("context_length")) is not int
+        or models[0]["context_length"] <= 0
     ):
         raise LauncherError("Could not identify the local Splash server")
     # The first entry is the name responses report.
-    model, context = models[0].get("id"), snapshot.get("maximum_context_tokens")
-    if type(context) is not int or context <= 0:
-        raise LauncherError(
-            "Splash is running but its context limit is not available yet; wait and retry"
-        )
+    model, context = models[0].get("id"), models[0]["context_length"]
     # Only opencode needs its major version: the launch defaults changed
     # between its first and second major releases. A failed probe adds nothing.
     client_version = (
