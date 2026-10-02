@@ -970,6 +970,38 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
           "capacity failure prevented subsequent service");
 }
 
+// A request that fails in an admission pass stays listed until the pass
+// ends; a sibling admitted after it in the same pass plans no junction for
+// it.
+void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
+  // 64 shared tokens, then 33 of each one's own.
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  // Alone, the first cannot get its state: it fails at once.
+  executor.deniedBegins = 1;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 64, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(events.capacityExhaustedCount == 1 && events.startIds == std::vector<uint64_t>{2},
+          "the two requests were not admitted in one pass");
+  runUntilIdle(engine);
+  const auto &boundaries = executor.plans.at(2).boundaries;
+  require(std::none_of(boundaries.begin(), boundaries.end(),
+                       [](const DraftBoundaryPlan &boundary) {
+                         return boundary.boundary == 64;
+                       }) &&
+              engine.snapshot().junctionMaterializations == 0 && events.completedCount == 1,
+          "a sibling planned a junction for a request that failed before it");
+}
+
 // A cold request publishes its replay state; once that state is gone, the
 // next request over the same prompt rebuilds it where the KV still matches,
 // as a replay state, and the one after resumes from it.
@@ -6859,6 +6891,42 @@ void testSharedPrefillWaitsForARestoringProducer() {
           "the sibling read the state again or prefilled the shared span");
 }
 
+// A restoring producer that is cancelled keeps its lane until its read has
+// drained, but publishes nothing: its waiting sibling starts at once and
+// restores the prefix itself.
+void testCancelledRestoringProducerReleasesItsWaiter() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  publishDiskState(cache, prompt);
+  const std::shared_ptr<RestoreControl> producerRead = executor.restoreControl;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 192, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(executor.diskReads == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+          "the sibling did not wait for the restoring producer");
+  engine.cancel(1);
+  executor.restoreControl = std::make_shared<RestoreControl>();
+  static_cast<void>(engine.tick(2));
+  require(executor.diskReads == 2 && engine.resourceWaitSnapshot(2).restoring == 2 &&
+              executor.requests.contains(1),
+          "the sibling waited for a cancelled producer's read to drain");
+  producerRead->ready = true;
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              engine.snapshot().cancelled == 1 && events.completedCount == 2,
+          "the sibling did not restore the prefix itself");
+}
+
 // A request whose restore could not fit ignores the cache until it starts:
 // it uses no producer's state, so it does not wait for one, even for one
 // restoring the same prefix with a boundary planned inside it, and no
@@ -8133,6 +8201,7 @@ int main() {
     testLateSharedPrefillExtendsTheProducerPlan();
     testSharedJunctionAtACheckpointIsReusable();
     testSharedPrefillCapacityFailureDoesNotDeadlock();
+    testSiblingFailedInTheAdmissionPassGetsNoJunction();
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
@@ -8141,6 +8210,7 @@ int main() {
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testRestoringRequestIsNotWaitingForMemory();
     testSharedPrefillWaitsForARestoringProducer();
+    testCancelledRestoringProducerReleasesItsWaiter();
     testSkipCacheRequestDoesNotWaitForAProducer();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();

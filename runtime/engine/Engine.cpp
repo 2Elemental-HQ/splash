@@ -578,14 +578,14 @@ bool Engine::pendingSharedPrefill(const Request &active,
   if (active.skipCache)
     return false;
   for (const auto &[id, peer] : requests_) {
-    if (!peer.stateCell || peer.finalized || peer.pendingEnd ||
-        peer.request.priority > active.request.priority)
+    if (!peer.stateCell || peer.request.priority > active.request.priority)
       continue;
     // A peer still restoring its prefix from disk has planned its boundaries
     // at admission; siblings wait for it rather than each reading the same
     // state. A failed restore discards those boundaries (pollRestores), which
-    // releases them.
-    if (scheduler_.phase(id) != Phase::Prefill && !peer.restore)
+    // releases them. A restoring producer that was cancelled or expired
+    // publishes nothing; it only waits for its read to drain.
+    if ((scheduler_.phase(id) != Phase::Prefill && !peer.restore) || peer.pendingEnd)
       continue;
     const uint32_t shared = sharedPrefillBoundary(active, peer);
     for (size_t i = peer.stateBoundaryCursor; i < peer.stateBoundaries.size(); ++i) {
@@ -919,9 +919,10 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
 bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   bool changed = false;
   for (const auto &[id, peer] : requests_) {
-    // A request that ignores the cache uses no junction.
+    // A request finalized earlier in this admission pass is still listed
+    // until the pass ends. A request that ignores the cache uses no junction.
     if (id == active.request.id || peer.stateCell || peer.suspended ||
-        peer.finalized || peer.pendingEnd || peer.skipCache ||
+        peer.finalized || peer.skipCache ||
         peer.request.priority < active.request.priority)
       continue;
     changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false) ||
@@ -1007,10 +1008,14 @@ void Engine::publishReachedStateBoundaries(Request &active,
     if (cache_.reuseCompositeState(block, checkpoint)) {
       ++counters_.deduplicatedStatePublications;
     } else {
-      // Recycle the previous recovery point before allocating its replacement.
-      // A restore lease can delay this optional publication. A checkpoint
-      // only on disk frees no cache slot for an ordinary state, so it stays
-      // the recovery point until that state is published.
+      // The previous recovery point retires here or after the publication.
+      // Here, before the snapshot, a resident one hands its buffers to its
+      // replacement; room made for the snapshot instead would recycle the
+      // oldest state, perhaps another lane's checkpoint. A restore lease
+      // can delay this optional publication. A checkpoint only on disk
+      // frees no cache slot for an ordinary state, so it stays the recovery
+      // point until that state is published; it retires after the
+      // publication, as does the one a reused state leaves.
       if ((checkpoint || cache_.stateResident(active.latestCheckpoint.kvBlock)) &&
           !retireCheckpoint(active) && checkpoint) {
         ++failures;
@@ -1062,8 +1067,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         continue;
       }
     }
-    if (active.latestCheckpoint.kvBlock != block)
-      static_cast<void>(retireCheckpoint(active));
+    // The previous recovery point, if the lane still holds one, retires now.
+    static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
   }
