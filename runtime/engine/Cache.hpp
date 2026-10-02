@@ -306,27 +306,28 @@ public:
   // states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
   // One step of room for the snapshot of a state to publish at forBlock,
-  // taking nothing of a higher class than that publication; the disk tier
-  // keeps a state it admits. An optional publication (checkpointsOnly) takes
-  // one checkpoint, an ordinary one a checkpoint, else its oldest ordinary
-  // state. A publication in use takes what reclaimOne() takes, in its order,
-  // but only what frees memory now (ReclaimTiming::Immediate): the snapshot
-  // follows at once, since the lane's state moves on with its next command.
-  // That is an extent of free pages, a checkpoint, KV no state restores
-  // through, the oldest ordinary state or KV leaf, and last the oldest state
-  // in use, which is never dropped for a busy write slot: while the write in
-  // flight holds it, nothing goes. KV frees memory only as an extent it
-  // empties, released before the call returns, so KV goes only while
-  // evicting it can empty one (extentWithinReach); otherwise the oldest
-  // ordinary state goes before the state in use. Like every release, that
-  // needs no command in flight; the engine publishes a lane's states between
-  // commands. After a step that gave extent bytes the caller steps again
-  // while its snapshot does not fit and the bytes given are less than one
-  // snapshot; after a step that gave a state it does not, so a snapshot
-  // denied for another reason costs one state or one snapshot's worth of
-  // extents at most. While the engine may not grow (`growth` false) an
-  // extent's bytes are of no use to a snapshot: extents and KV stay, and a
-  // publication in use takes states alone, like every other.
+  // taking nothing of a class above the publication's; the disk tier keeps a
+  // state it admits. An optional publication (checkpointsOnly) takes one
+  // checkpoint. An ordinary one takes what reclaimOne() takes of the
+  // ordinary class, in its order, but only what frees memory now
+  // (ReclaimTiming::Immediate), since the snapshot follows at once: an extent
+  // of free pages, a checkpoint, KV no state restores through, then the
+  // oldest of ordinary states and KV leaves. One in use goes on to the oldest
+  // state in use, last. KV frees memory only as an extent it empties,
+  // released before the call returns, so KV goes only while evicting it can
+  // empty one (extentWithinReach); otherwise the oldest ordinary state goes.
+  // Only a publication in use, whose lane's state moves on with its next
+  // command, drops a victim whose write must wait for the write in flight;
+  // other publications leave it and move on, and a state in use is never
+  // dropped so: while the write in flight holds it, nothing goes. Like every
+  // release, that needs no command in flight; the engine publishes a lane's
+  // states between commands. After a step that gave extent bytes the caller
+  // steps again while its snapshot does not fit and the bytes given are less
+  // than one snapshot; after a step that gave a state it does not, so a
+  // snapshot denied for another reason costs one state or one snapshot's
+  // worth of extents at most. While the engine may not grow (`growth` false)
+  // an extent's bytes are of no use to a snapshot: extents and KV stay, and
+  // every publication takes states alone.
   [[nodiscard]] StateRoom reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth);
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, taking nothing of a class above upTo. For

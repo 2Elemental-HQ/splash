@@ -550,9 +550,9 @@ extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
-use, or startup cleanup. Kernels reach a page through the GPU address in its
-request's page table, so no command binds KV; the residency set makes extents
-resident for every command. The host reaches the same memory
+use or a junction, or startup cleanup. Kernels reach a page through the GPU
+address in its request's page table, so no command binds KV; the residency set
+makes extents resident for every command. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others as soon as they cover the extent that holds
@@ -985,11 +985,14 @@ decoding lane: its own suspension pays for the memory, and while other lanes fit
 it waits for them, resident. A publication in use takes cached KV and states in
 the same order, then the oldest state in use; of the KV it takes only leaves
 whose page frees at once, and only while an extent can be emptied; the extent is
-released at once, and the snapshot follows. Other publications recycle only
-states, a disk copy in use may displace the oldest copy in use, and ordinary or
-optional work never displaces anything in use. Nothing in use is pinned, so
-running work that needs the memory still takes it once nothing else is left. A
-resumed lane that lost its prompt's replay point rebuilds it on the way.
+released at once, and the snapshot follows. An ordinary publication (a junction)
+makes room the same way short of what is in use, and an optional checkpoint
+takes only checkpoints; neither drops a state whose write must wait for the
+write in flight. A disk copy in use may displace the oldest copy in use, and
+ordinary or optional work never displaces anything in use. Nothing in use is
+pinned, so running work that needs the memory still takes it once nothing else
+is left. A resumed lane that lost its prompt's replay point rebuilds it on the
+way.
 `/status` reports under `state` the replay points unfinished requests hold
 (`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 

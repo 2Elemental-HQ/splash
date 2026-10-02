@@ -430,42 +430,42 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
 
 StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth) {
   using Unwritten = StateCache::Unwritten;
-  const auto recycle = [&](const CacheEvictionCandidate &state, Unwritten unwritten) {
-    return StateRoom{states_.reclaim(state.id, unwritten).evicted};
+  const bool inUse = !checkpointsOnly && states_.inUse(forBlock);
+  // Only a publication in use cannot leave a victim to the write in flight:
+  // its lane's state moves on with the next command.
+  const Unwritten unwritten = inUse ? Unwritten::Drop : Unwritten::Wait;
+  const auto recycle = [&](const std::optional<CacheEvictionCandidate> &state,
+                           Unwritten mode) {
+    return state && states_.reclaim(state->id, mode).evicted;
   };
-  const auto checkpoint = states_.checkpointCandidate(false);
-  if (checkpointsOnly)
-    return checkpoint ? recycle(*checkpoint, Unwritten::Drop) : StateRoom{};
-  const auto oldest = checkpoint ? checkpoint : states_.ordinaryCandidate(false);
-  // Without growth an extent's bytes are no room for a snapshot: every
-  // publication recycles states, and one in use the oldest in use after them.
-  if (!states_.inUse(forBlock) || (!growth && oldest))
-    return oldest ? recycle(*oldest, Unwritten::Drop) : StateRoom{};
-  if (growth) {
-    // A publication in use makes room as running work does, with what
-    // frees memory now.
+  // Without growth an extent's bytes are no room for a snapshot, and only
+  // states go.
+  if (growth && !checkpointsOnly) {
     if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
       return {true, released.reclaimedBytes};
-    if (checkpoint)
-      return recycle(*checkpoint, Unwritten::Drop);
-    // KV makes room with the extent its free pages fill, released at once,
-    // and goes only while one can be emptied.
-    if (extentWithinReach()) {
-      while (const auto victim = reclaimOldest({.inUse = false,
-                                                .keepResumePoint = false,
-                                                .unwritten = Unwritten::Drop,
-                                                .timing = ReclaimTiming::Immediate})) {
-        if (!victim->kv)
-          return {true};
-        if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
-          return {true, released.reclaimedBytes};
-      }
-    } else if (oldest) {
-      return recycle(*oldest, Unwritten::Drop);
-    }
   }
-  const auto used = states_.inUseCandidate();
-  return used ? recycle(*used, Unwritten::Wait) : StateRoom{};
+  if (recycle(states_.checkpointCandidate(false), unwritten))
+    return {true};
+  if (checkpointsOnly)
+    return {};
+  // KV makes room with the extent its free pages fill, released at once,
+  // and goes only while one can be emptied.
+  if (growth && extentWithinReach()) {
+    while (const auto victim = reclaimOldest({.inUse = false,
+                                              .keepResumePoint = false,
+                                              .unwritten = unwritten,
+                                              .timing = ReclaimTiming::Immediate})) {
+      if (!victim->kv)
+        return {true};
+      if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
+        return {true, released.reclaimedBytes};
+    }
+  } else if (recycle(states_.ordinaryCandidate(false), unwritten)) {
+    return {true};
+  }
+  if (inUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
+    return {true};
+  return {};
 }
 
 CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {

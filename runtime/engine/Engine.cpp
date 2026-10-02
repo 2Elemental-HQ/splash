@@ -1033,8 +1033,9 @@ void Engine::publishReachedStateBoundaries(Request &active,
       if (!state)
         state = model_.snapshot(active.request.id);
       // Room comes from what this publication's class may take: cached KV
-      // and states in use only for a block in use. A state in use is never
-      // dropped for a busy write slot; this publication gives way instead.
+      // unless it is an optional checkpoint, and states in use only for a
+      // block in use. A state in use is never dropped for a busy write
+      // slot; this publication gives way instead.
       // The command that reached this boundary is consumed and the next one
       // not yet submitted, so KV that empties an extent releases it now. A
       // recycled state hands over its buffers; an extent may hold less

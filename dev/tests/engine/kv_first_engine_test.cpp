@@ -3865,9 +3865,11 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
 }
 
 // A snapshot that extents do not let fit is denied for a reason other than
-// the budget: once the extents its publication released cover one snapshot,
-// the publication ends. It cost the other conversation one extent's worth of
-// KV at most, and the replay point goes unpublished.
+// the budget: once the extents a publication released cover one snapshot,
+// that publication ends. The resumed lane's two replay points, its prompt's
+// in use and its history's ordinary, each cost the other conversation one
+// extent: the first its last page, moved into the free pages, the second a
+// whole extent of four. Neither point is published.
 void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   LostReplayPoint fixture;
   fixture.executor.stateBytes = 4 * 4096;
@@ -3876,10 +3878,43 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   std::vector<uint32_t> next = fixture.prompt;
   next.resize(next.size() + 40, 9);
   require(idle(fixture.engine) && fixture.events.completedCount == 1 &&
-              fixture.storage.releasedExtents == fixture.releases + 1 &&
-              fixture.resources.lookup(fixture.other).kvBoundary >= 256 - 4 * 32 &&
+              fixture.storage.releasedExtents == fixture.releases + 2 &&
+              fixture.resources.lookup(fixture.other).kvBoundary == 256 - 5 * 32 &&
               fixture.resources.probe(next).cachedTokens() == 0,
           "a denied snapshot took more than one snapshot's worth of extents");
+}
+
+// A shared prefill's junction is an ordinary publication: with no cached
+// state to recycle, it makes room from another conversation's cached KV, an
+// extent at a time, and the sibling resumes from it rather than recompute
+// the shared prefix.
+void testSharedJunctionPublishesFromCachedKv() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  // Another conversation's KV, with no state, fills two whole extents.
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256));
+  resources.endRequest(900);
+  // A snapshot needs memory that only a released extent gives.
+  const uint32_t releases = storage.releasedExtents;
+  executor.snapshotRoom = [&] { return storage.releasedExtents > releases; };
+  for (uint32_t id = 1; id <= 2; ++id) {
+    std::vector<uint32_t> prompt(193, 7);
+    std::fill(prompt.begin() + 160, prompt.end(), id + 10);
+    engine.submit(request(id, prompt));
+  }
+  runUntilIdle(engine);
+  const auto snapshot = engine.snapshot();
+  require(snapshot.junctionMaterializations == 1 &&
+              snapshot.junctionMaterializationFailures == 0 && executor.restored == 160 &&
+              executor.prefillRows == 193 + 33 && events.completedCount == 2,
+          "the shared junction did not make room from cached KV");
 }
 
 // While growth is paused a released extent gives a snapshot nothing, so a
@@ -5393,7 +5428,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
               resources.lookup(prompt).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
-  require(resources.reclaimOneState(false, 0, true) &&
+  require(resources.reclaimOneState(false, 0, false) &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
@@ -6098,7 +6133,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
@@ -6173,7 +6208,7 @@ void testPageShortfallDemotesInBulk() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   // The cached blocks fill two extents but two of their pages: those two
@@ -6242,7 +6277,7 @@ void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers() &&
+  require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
 }
@@ -6526,7 +6561,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
@@ -6683,7 +6718,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
@@ -6750,7 +6785,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
@@ -7647,6 +7682,7 @@ int main() {
     testResumedLaneRebuildsItsPointFromCachedKv(1);
     testResumedLaneRebuildsItsPointFromCachedKv(2);
     testDeniedSnapshotTakesAtMostOneSnapshotOfExtents();
+    testSharedJunctionPublishesFromCachedKv();
     testPausedPublicationInUseTakesNoKv();
     testPreemptedDecodeRestoresItsResidentCompositeState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();
