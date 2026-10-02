@@ -4099,10 +4099,10 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
 
 // A snapshot that extents do not let fit is denied for a reason other than
 // the budget: once the extents a publication released cover one snapshot,
-// that publication ends. The resumed lane's two replay points, its prompt's
-// in use and its history's ordinary, each cost the other conversation one
-// extent: the first its last page, moved into the free pages, the second a
-// whole extent of four. Neither point is published.
+// that publication ends. The resumed lane's prompt replay point, in use,
+// costs the other conversation one extent, its last page moved into the
+// free pages; the point its history reaches is a checkpoint, which takes
+// only checkpoints. Neither point is published.
 void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   LostReplayPoint fixture;
   fixture.executor.stateBytes = 4 * 4096;
@@ -4111,8 +4111,8 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   std::vector<uint32_t> next = fixture.prompt;
   next.resize(next.size() + 40, 9);
   require(idle(fixture.engine) && fixture.events.completedCount == 1 &&
-              fixture.storage.releasedExtents == fixture.releases + 2 &&
-              fixture.resources.lookup(fixture.other).kvBoundary == 256 - 5 * 32 &&
+              fixture.storage.releasedExtents == fixture.releases + 1 &&
+              fixture.resources.lookup(fixture.other).kvBoundary == 256 - 32 &&
               fixture.resources.probe(next).cachedTokens() == 0,
           "a denied snapshot took more than one snapshot's worth of extents");
 }
@@ -7436,9 +7436,11 @@ void testSuspendedRequestKeepsItsReplayPoint() {
           "the next turn lost the replay point its predecessor resumed from");
 }
 
-// A resumed lane keeps using its prompt's replay point: the point its
+// A resumed lane keeps using its prompt's replay point. The point its
 // generated history reaches lies inside the generation prompt, which the
-// conversation's next turn renders anew, so that point stays ordinary.
+// conversation's next turn renders anew: that state is the lane's own
+// progress, a checkpoint, and once the lane has finished, reclaim takes it
+// before the prompt's point.
 void testResumedLaneKeepsThePromptReplayPoint() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
@@ -7467,28 +7469,102 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   for (; now < 400 && resources.snapshot().stateCache.entries < 3; ++now)
     static_cast<void>(engine.tick(now));
   require(executor.resumptions == 1 && executor.restored == 32 &&
-              resources.snapshot().stateCache.entries == 3,
-          "the resumed lane did not publish its history's replay point");
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "the resumed lane did not publish its history's point as a checkpoint");
   // Prompt tokens are the request id.
-  const uint64_t id = executor.resumedPrompts.front().front();
-  require(!events.usage.contains(id), "the resumed lane finished early");
-  while (resources.snapshot().stateCache.entries > 1) {
+  const std::vector<uint32_t> history = executor.resumedPrompts.front();
+  const uint64_t id = history.front();
+  require(!events.usage.contains(id) && resources.probe(history).cachedTokens() == 64,
+          "the resumed lane finished early");
+  for (; now < 400 && !idle(engine); ++now)
+    static_cast<void>(engine.tick(now));
+  require(idle(engine), "the resumed lane did not finish");
+  // The first state reclaim takes is the history's checkpoint.
+  while (resources.snapshot().stateCache.entries == 3) {
     require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "the cache could not be reclaimed");
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.probe(history).cachedTokens() == 32,
+          "the history's point outlasted the prompt's");
+  // A shrink that keeps the resume point keeps the prompt's point.
+  while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse, true)
+             .madeProgress) {
   }
   // The next turn keeps the text before the generation prompt.
   std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
   next.resize(80, 7);
-  require(resources.probe(next).cachedTokens() == 32,
-          "the history's replay point outlasted the prompt's");
-  for (; now < 400 && !idle(engine); ++now)
-    static_cast<void>(engine.tick(now));
+  require(resources.snapshot().stateCache.entries == 1 &&
+              resources.probe(next).cachedTokens() == 32,
+          "the shrink did not keep the prompt's replay point");
   engine.submit(request(266, next));
   for (; now < 500 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && events.starts.back() ==
               std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 32},
           "the next turn did not resume from the prompt's replay point");
+}
+
+// A lane suspended right after publishing the end of its generated history
+// resumes from that checkpoint, which stays one: it is the lane's own
+// progress, not where the conversation's next turn resumes, so once the lane
+// has finished, reclaim takes it before the prompt's replay point.
+void testRestoredHistoryCheckpointStaysDisposable() {
+  test::TestKvStorage storage(64, 4096, 1);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hostPressure = [&](bool refused) {
+    paused = refused;
+    storage.growthBlocked = refused;
+    storage.allocationFailure = refused ? metal::AllocationFailure::HostPressure
+                                        : metal::AllocationFailure::EngineBudget;
+  };
+  auto value = request(1, std::vector<uint32_t>(65, 5));
+  // The prompt's replay point lands at 32; a history of 89 tokens ends at 64.
+  value.generationPromptTokens = 30;
+  value.maxNewTokens = 30;
+  value.priority = RequestPriority::Background;
+  engine.submit(std::move(value));
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); }, "the lane did not decode");
+  // The page its 24th token needs is refused: the lane yields with a history
+  // of 89 tokens, resumes from the prompt's point and checkpoints at 64.
+  hostPressure(true);
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; }, "the lane was not suspended");
+  hostPressure(false);
+  tickUntil(engine, now, [&] { return engine.snapshot().checkpointPublications == 1; },
+            "the resumed lane did not checkpoint its history's end");
+  // A foreground start refused memory makes it yield again at once.
+  hostPressure(true);
+  auto foreground = request(2, std::vector<uint32_t>(65, 9));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  tickUntil(engine, now, [&] { return executor.suspensions == 2; },
+            "the lane did not yield to the foreground start");
+  hostPressure(false);
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
+  const std::vector<uint32_t> history = executor.resumedPrompts.back();
+  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 89 &&
+              events.completedCount == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "the lane did not resume from its history's checkpoint, or made it ordinary");
+  const uint32_t entries = resources.snapshot().stateCache.entries;
+  while (resources.snapshot().stateCache.entries == entries) {
+    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+            "the cache could not be reclaimed");
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.probe(history).cachedTokens() == 32,
+          "the history's checkpoint outlasted the prompt's replay point");
 }
 
 // Requests with the same prompt resume from the same replay point and each
@@ -7868,6 +7944,7 @@ int main() {
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();
     testResumedLaneKeepsThePromptReplayPoint();
+    testRestoredHistoryCheckpointStaysDisposable();
     testSharedReplayPointCountsEachRequest();
     testRestoredEndpointIsInUse();
     testReplayPointRecyclesAnOlderPointInUse();

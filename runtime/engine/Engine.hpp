@@ -269,9 +269,11 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
-  // Where the state a later request resumes from is kept: the last whole
-  // page before the replay's final input token and, while the lane replays
-  // only its prompt, before the prompt's generation prompt.
+  // Where the lane's last state is kept: the last whole page before the
+  // replay's final input token and, while the lane replays only its prompt,
+  // before the prompt's generation prompt, where a later request resumes.
+  // Generated history that a resumed lane replays is its own: the state
+  // there is a checkpoint.
   [[nodiscard]] static uint32_t
   replayStateBoundary(const Request &request) noexcept;
   // replayStateBoundary while the lane replays only its prompt.

@@ -536,7 +536,7 @@ bool Engine::admitQueued(double now) {
 
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
   // A later request may not share the generation prompt; generated history
-  // that a resumed lane replays is its own.
+  // that a resumed lane replays is its own: the state there is a checkpoint.
   if (active.replayTokens == active.promptTokens)
     return promptReplayBoundary(active);
   return (active.replayTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;
@@ -716,18 +716,19 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.latestCheckpoint = {};
   if (lookup.state) {
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
-    // A restored endpoint already has the ordinary replay state we need, in
-    // whichever tier holds it: a promotion that found no cache slot leaves
-    // it on disk. Other restored progress points retain their rolling
+    // A restored replay point of the prompt already has the ordinary state
+    // we need, in whichever tier holds it: a promotion that found no cache
+    // slot leaves it on disk. Other restored progress points, the end of a
+    // resumed lane's generated history among them, retain their rolling
     // lifetime.
-    if (active.latestCheckpoint &&
-        resumeBoundary == replayStateBoundary(active)) {
-      if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
-        ++counters_.deduplicatedStatePublications;
-      active.latestCheckpoint = {};
-    }
-    if (resumeBoundary == promptReplayBoundary(active))
+    if (resumeBoundary == promptReplayBoundary(active)) {
+      if (active.latestCheckpoint) {
+        if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
+          ++counters_.deduplicatedStatePublications;
+        active.latestCheckpoint = {};
+      }
       active.replayPoint = cache_.useState(lookup.state->kvBlock());
+    }
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
@@ -877,7 +878,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false);
-  addStateBoundary(active, stateBoundary, latestReplayBoundary, false);
+  addStateBoundary(active, stateBoundary, latestReplayBoundary,
+                   latestReplayBoundary != promptReplayBoundary(active));
   // A resumed lane below its prompt's replay point lost that state; it
   // rebuilds the one its conversation's next turn resumes from on the way.
   addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false);

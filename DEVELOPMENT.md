@@ -996,7 +996,7 @@ write in flight. A disk copy in use may displace the oldest copy in use, and
 ordinary or optional work never displaces anything in use. Nothing in use is
 pinned, so running work that needs the memory still takes it once nothing else
 is left. A resumed lane that lost its prompt's replay point rebuilds it on the
-way.
+way; the point its generated history reaches is a disposable checkpoint.
 `/status` reports under `state` the replay points unfinished requests hold
 (`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 
