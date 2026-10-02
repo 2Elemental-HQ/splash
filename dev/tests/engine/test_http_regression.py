@@ -206,6 +206,66 @@ class HttpRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "transcript differs"):
                 benchmark.summarize([baseline, changed])
 
+    def burst_rows(self, failures, ttft, decode):
+        """One burst per round in ABBA order: each version's replay-point
+        publication failures, and per round the next turn's time to first
+        token (no next turn when ttft is None) and the burst's decode time
+        per token."""
+        return [
+            {
+                "version": version,
+                "round": round,
+                "sample": round // 2,
+                "context": 16384,
+                "scenario": "burst",
+                "replay_state_publication_failures": failures[version],
+                "decode_ms_per_token": decode[round],
+                "maximum_context_tokens": 100000,
+                "follow_ups": []
+                if ttft is None
+                else [
+                    {"ttft_ms": ttft[round], "matched_tokens": 16352, "resumed": True}
+                ],
+            }
+            for round, version in enumerate(benchmark.ROUNDS)
+        ]
+
+    def test_a_burst_keeps_the_candidate_only_by_every_rule(self):
+        lost = {"baseline": 2, "candidate": 0}
+        sooner = (100, 80, 81, 102)
+        steady = (10, 10.1, 10.1, 10)
+        kept = benchmark.summarize_bursts(self.burst_rows(lost, sooner, steady))[0]
+        self.assertTrue(kept["keep"])
+        self.assertEqual(kept["baseline"]["failures_per_burst"], 2)
+        self.assertEqual(kept["candidate"]["resumed_follow_ups"], 2)
+        for name, failures, ttft, decode in (
+            ("nothing lost", {"baseline": 0, "candidate": 0}, sooner, steady),
+            ("still lost", {"baseline": 2, "candidate": 1}, sooner, steady),
+            ("not 15% sooner", lost, (100, 90, 90, 100), steady),
+            ("overlapping rounds", lost, (100, 60, 85, 80), steady),
+            ("decode slower", lost, sooner, (10, 10.5, 10.5, 10)),
+            ("decode inconclusive", lost, sooner, (10, 9, 10, 10)),
+            ("no follow-ups", lost, None, steady),
+        ):
+            with self.subTest(name):
+                summary = benchmark.summarize_bursts(
+                    self.burst_rows(failures, ttft, decode)
+                )[0]
+                self.assertFalse(summary["keep"])
+
+    def test_a_follow_up_needs_a_burst_of_two(self):
+        model = "incoai/Qwen3.8-27B-Splash"
+        for extra in (["--follow-up"], ["--burst", "1", "--follow-up"]):
+            with (
+                self.subTest(extra=extra),
+                contextlib.redirect_stderr(io.StringIO()) as error,
+                self.assertRaises(SystemExit),
+            ):
+                benchmark.parse_args(
+                    ["--model", model, "--baseline-binary", "baseline", *extra]
+                )
+            self.assertIn("--burst needs two or more", error.getvalue())
+
     def test_decode_uses_native_decode_time_per_token(self):
         rows = self.abba_rows((10, 10, 10, 10))
         for row in rows:

@@ -1409,7 +1409,12 @@ It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
 release check's speed rule and prepared bytes, and saves
-`build/release/http-regression.json`.
+`build/release/http-regression.json`. With `--burst N` it sends N requests of
+each context at once instead, 16 output tokens each, and reports each build's
+replay points lost to the burst (`replay_state_publication_failures`), its
+decode rate and advertised context; `--follow-up`, which a burst run needs to
+pass, then sends each conversation's next turn and compares their time to
+first token and how many resumed at their replay point.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.
