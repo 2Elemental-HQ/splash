@@ -640,10 +640,10 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
-// ragged split counts and inactive rows exercise the shared-weight reduction.
-// Eight active rows run the verify entry and, up to its split maximum, the
-// prefill entry, which must agree bit for bit; fewer rows run the prefill
-// entry alone.
+// ragged split counts and inactive rows exercise the reduction both entries
+// share. Eight active rows run the verify entry and, up to its split
+// maximum, the prefill entry, whose parameters must lead to the same bits;
+// fewer rows run the prefill entry alone.
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
@@ -682,11 +682,9 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     finish(command);
     return output;
   };
-  // The fp64 merge of each active row, the poison kept past the eight-row
-  // view and, for the verify entry, which writes every row it owns, the
-  // inactive rows' zeros. The prefill entry leaves rows past the tile's
-  // active rows untouched.
-  const auto check = [&](id<MTLBuffer> output, bool zeroesInactive) {
+  // The fp64 merge of each active row, the inactive rows' zeros and the
+  // poison kept past the eight-row view.
+  const auto check = [&](id<MTLBuffer> output) {
     const auto *out = static_cast<const BFloat16Bits *>(output.contents);
     for (uint32_t head = 0; head < shape.kvHeads; ++head)
       for (uint32_t row = 0; row < m; ++row) {
@@ -694,8 +692,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         if (!active) {
           for (uint32_t dim = 0; dim < d; ++dim)
-            require(!zeroesInactive || out[offset + dim] == 0,
-                    "inactive attention row was not exactly zero");
+            require(out[offset + dim] == 0, "inactive attention row was not exactly zero");
           continue;
         }
         double maximum = -INFINITY;
@@ -732,16 +729,15 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   if (activeRows == kRows) {
     const Q8VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits};
     verify = reduce("verify_attention_q8_reduce", params);
-    check(verify, true);
+    check(verify);
   }
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     const Q8PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits};
     id<MTLBuffer> prefill = reduce("prefill_attention_q8_reduce", params);
-    check(prefill, false);
-    // Guard against acceptance-changing reassociation between the entries.
+    check(prefill);
     if (verify)
       require(!std::memcmp(verify.contents, prefill.contents, verify.length),
-              "verify merge changed the prefill reduction result");
+              "verify and prefill entries merged the same partials differently");
   }
 }
 

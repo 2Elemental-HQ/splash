@@ -289,42 +289,11 @@ inline void splash_paged_attention_tile(
 // [slot][fused row]{max, sum}. The callers lay slots out as
 // [tile][KV head][split] (prefill) and [lane][KV head][split] (verify).
 // Combines the splits of one fused row in split order. Only splits that own
-// at least one page were written; the partition is recomputed here.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile>
-inline void splash_q8_attention_reduce_row(
-    device const float *partials, device const float *statistics,
-    device bfloat *tile_output, uint committed_tokens, uint active_rows,
-    uint splits, ulong head_slot, uint fused_row, uint thread_index) {
-  constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
-  constexpr ushort D = SplashQ8HeadDimension;
-  uint query_row = fused_row / QueryHeadsPerKVHead;
-  uint visible_tokens = committed_tokens + active_rows;
-  uint pages = splash_attention_pages(visible_tokens);
-  uint per_split = splash_attention_pages_per_split(pages, splits);
-  uint written = (pages + per_split - 1) / per_split;
-  float value = 0.0f;
-  if (query_row < active_rows) {
-    float maximum = -INFINITY;
-    for (uint split = 0; split < written; ++split)
-      maximum =
-          max(maximum, statistics[((head_slot + split) * M + fused_row) * 2]);
-    float numerator = 0.0f;
-    float denominator = 0.0f;
-    for (uint split = 0; split < written; ++split) {
-      ulong stat = ((head_slot + split) * M + fused_row) * 2;
-      float weight = fast::exp(statistics[stat] - maximum);
-      numerator +=
-          weight *
-          partials[((head_slot + split) * M + fused_row) * D + thread_index];
-      denominator += weight * statistics[stat + 1];
-    }
-    value = denominator > 0.0f ? numerator / denominator : 0.0f;
-  }
-  tile_output[fused_row * D + thread_index] = bfloat(value);
-}
-
-// Statistics are shared by all 256 output dimensions. Compute their weights
-// once per row, then let each lane stream one dimension of the partials.
+// at least one page were written; the partition is recomputed here. The
+// statistics are shared by all 256 output dimensions: their weights are
+// computed once per row, then each lane streams one dimension of the
+// partials. A row past the tile's active rows is written as zeros; a
+// threadgroup owns one fused row, so it returns uniformly.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile>
 inline void splash_q8_attention_reduce_row_shared(
     device const float *partials, device const float *statistics,

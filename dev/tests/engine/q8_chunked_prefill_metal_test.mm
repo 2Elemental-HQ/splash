@@ -603,6 +603,9 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
       const auto *output = static_cast<const BFloat16Bits *>(data.output.contents);
       const std::vector<BFloat16Bits> first(
           output, output + data.output.length / sizeof(BFloat16Bits));
+      // The reduction writes every row of the chunk's query tiles, zeros
+      // past the chunk, and nothing beyond them.
+      const uint32_t tiledRows = prefillAttentionTiles(chunk) * kQ8PrefillAttentionTileRows;
       const auto validateCoverage = [&] {
         for (uint32_t head = 0; head < kQueryHeads; ++head)
           for (uint32_t row = 0; row < rows; ++row)
@@ -610,8 +613,10 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
               const auto value = output[attentionIndex(rows, head, row, dimension)];
               if (row < chunk) {
                 require(std::isfinite(bfloat16ToFloat(value)), "chunked output is nonfinite");
+              } else if (row < tiledRows) {
+                require(value == 0, "an inactive row of a query tile was not zeroed");
               } else {
-                require(value == 0xffff, "prefill split overwrote an inactive output row");
+                require(value == 0xffff, "prefill attention wrote past its query tiles");
               }
             }
       };
