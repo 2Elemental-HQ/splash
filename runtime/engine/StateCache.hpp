@@ -53,7 +53,7 @@ private:
 };
 
 // Marks the block whose state an unfinished request's conversation resumes
-// from; see StateCache::use.
+// from; see StateCache::useState.
 class StateUse final {
 public:
   StateUse() = default;
@@ -139,28 +139,28 @@ public:
   // boundary upgrades a checkpoint; a checkpoint cannot downgrade an
   // ordinary state. False for a state that is absent or only on disk: the
   // caller publishes the copy it holds, which is promotion without a read.
-  [[nodiscard]] bool touchIfResident(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
   // The same for a copy in either tier.
-  [[nodiscard]] bool touchIfStored(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
 
   // Publishes a RAM copy; a disk copy of the block stays beside it.
-  void publish(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
-               bool checkpoint = false);
+  void publishCompositeState(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
+                             bool checkpoint = false);
   // Publishes a state that has no RAM copy by writing it from its lane: the
   // entry is the disk copy the ticket carries, with the write in flight. A
   // block whose state is on disk already is published as it is. False when
   // the one write in flight holds the staging buffer, or when the quota
   // cannot admit the state after makeRoom gave up what it could; nothing is
   // published then.
-  [[nodiscard]] bool publishToDisk(uint64_t kvBlock, const StateWriter &write,
-                                   const std::function<void()> &completion,
-                                   const DiskRoom &makeRoom, bool checkpoint = false);
+  [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
+                                        const std::function<void()> &completion,
+                                        const DiskRoom &makeRoom, bool checkpoint = false);
   // Publication identity protects replacement states from stale handles.
-  [[nodiscard]] StateCheckpoint checkpoint(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // Ensures this publication is no longer a disposable checkpoint. Returns
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
-  bool retireCheckpoint(StateCheckpoint checkpoint) noexcept;
+  bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
   // Refreshes recency. No-op when absent or pinned.
   void touch(uint64_t kvBlock) noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -170,16 +170,16 @@ public:
   // else and only to running work or to a copy that is itself in use.
   // Requests sharing the block each hold a handle. A state in use is
   // reusable, so a checkpoint there becomes ordinary.
-  [[nodiscard]] StateUse use(uint64_t kvBlock);
+  [[nodiscard]] StateUse useState(uint64_t kvBlock);
   [[nodiscard]] bool inUse(uint64_t kvBlock) const noexcept {
     return uses_.contains(kvBlock);
   }
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
-  [[nodiscard]] bool resident(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // The RAM copies a reclaim may free: the unpinned ones, in use or not.
-  [[nodiscard]] uint32_t evictable() const noexcept {
+  [[nodiscard]] uint32_t evictableStates() const noexcept {
     return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() + inUse_.size());
   }
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
@@ -212,7 +212,7 @@ public:
   // Drops a redundant disk copy.
   void dropDisk(uint64_t kvBlock);
   // A read of this copy failed: it leaves once unpinned, a RAM copy stays.
-  void invalidate(uint64_t kvBlock, const CompositeState *state) noexcept;
+  void discardState(uint64_t kvBlock, const CompositeState *state) noexcept;
   // Whatever the block holds leaves once unpinned.
   void invalidate(uint64_t kvBlock) noexcept;
   // A restored disk copy without a RAM copy takes one.

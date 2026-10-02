@@ -101,11 +101,11 @@ void StateCache::recordLookup(bool hit, bool disk) noexcept {
   if (disk) ++diskHits_;
 }
 
-bool StateCache::touchIfResident(uint64_t kvBlock, bool checkpoint) {
-  return resident(kvBlock) && touchIfStored(kvBlock, checkpoint);
+bool StateCache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
+  return stateResident(kvBlock) && reuseStoredState(kvBlock, checkpoint);
 }
 
-bool StateCache::touchIfStored(uint64_t kvBlock, bool checkpoint) {
+bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
     return false;
@@ -130,7 +130,7 @@ void StateCache::touch(uint64_t kvBlock) noexcept {
   reindex(kvBlock, found->second);
 }
 
-StateUse StateCache::use(uint64_t kvBlock) {
+StateUse StateCache::useState(uint64_t kvBlock) {
   if (!kv_.contains(kvBlock)) {
     throw std::invalid_argument("composite state KV block is unknown");
   }
@@ -162,9 +162,9 @@ void StateCache::unuse(uint64_t kvBlock) noexcept {
   }
 }
 
-void StateCache::publish(uint64_t kvBlock,
-                         std::shared_ptr<const CompositeState> state,
-                         bool checkpoint) {
+void StateCache::publishCompositeState(uint64_t kvBlock,
+                                       std::shared_ptr<const CompositeState> state,
+                                       bool checkpoint) {
   if (!state || !state->bytes()) {
     throw std::invalid_argument("composite state payload is empty");
   }
@@ -179,7 +179,7 @@ void StateCache::publish(uint64_t kvBlock,
   if (bytes_ > std::numeric_limits<uint64_t>::max() - stateBytes) {
     throw std::overflow_error("composite state byte count overflowed");
   }
-  if (resident(kvBlock))
+  if (stateResident(kvBlock))
     throw std::logic_error("duplicate composite state key");
 
   Entry &entry = publicationEntry(kvBlock, checkpoint);
@@ -193,18 +193,18 @@ void StateCache::publish(uint64_t kvBlock,
   ++publications_;
 }
 
-bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
-                               const std::function<void()> &completion,
-                               const DiskRoom &makeRoom, bool checkpoint) {
+bool StateCache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
+                                    const std::function<void()> &completion,
+                                    const DiskRoom &makeRoom, bool checkpoint) {
   if (!kv_.contains(kvBlock)) {
     throw std::invalid_argument("composite state KV block is unknown");
   }
   if (publications_ == std::numeric_limits<uint64_t>::max())
     throw std::overflow_error("composite state publication count overflowed");
-  if (resident(kvBlock))
+  if (stateResident(kvBlock))
     throw std::logic_error("duplicate composite state key");
   // The state is on disk already; a second copy would add nothing.
-  if (touchIfStored(kvBlock, checkpoint))
+  if (reuseStoredState(kvBlock, checkpoint))
     return true;
   // A checkpoint replaces older copies like any state: it is the only
   // progress a suspended request keeps once the quota is full.
@@ -220,14 +220,14 @@ bool StateCache::publishToDisk(uint64_t kvBlock, const StateWriter &write,
   return true;
 }
 
-StateCheckpoint StateCache::checkpoint(uint64_t kvBlock) const noexcept {
+StateCheckpoint StateCache::checkpointState(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   if (found == entries_.end() || !found->second.checkpoint)
     return {};
   return {kvBlock, found->second.publication};
 }
 
-bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
+bool StateCache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || !found->second.checkpoint ||
       found->second.publication != checkpoint.publication)
@@ -262,7 +262,7 @@ uint64_t StateCache::resumePoint() const noexcept {
   return newest ? newest->id : 0;
 }
 
-bool StateCache::resident(uint64_t kvBlock) const noexcept {
+bool StateCache::stateResident(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && found->second.ram != nullptr;
 }
@@ -339,7 +339,7 @@ void StateCache::dropDisk(uint64_t kvBlock) {
   reindex(kvBlock, target);
 }
 
-void StateCache::invalidate(uint64_t kvBlock, const CompositeState *state) noexcept {
+void StateCache::discardState(uint64_t kvBlock, const CompositeState *state) noexcept {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
     return;
@@ -362,7 +362,7 @@ void StateCache::invalidate(uint64_t kvBlock, const CompositeState *state) noexc
 void StateCache::invalidate(uint64_t kvBlock) noexcept {
   const auto found = entries_.find(kvBlock);
   if (found != entries_.end())
-    invalidate(kvBlock, copy(found->second).get());
+    discardState(kvBlock, copy(found->second).get());
 }
 
 bool StateCache::promotable(uint64_t kvBlock, const CompositeState *source) const noexcept {

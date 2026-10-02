@@ -164,7 +164,7 @@ public:
   // start.
   [[nodiscard]] bool pollTransfers();
   void discardState(uint64_t block, const CompositeState *state) {
-    states_.invalidate(block, state);
+    states_.discardState(block, state);
   }
   void beginRequest(uint64_t requestId);
   void endRequest(uint64_t requestId);
@@ -216,8 +216,8 @@ public:
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   // The request holding the handle is unfinished and its conversation
-  // resumes from the state at this block: see StateCache::use.
-  [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.use(kvBlock); }
+  // resumes from the state at this block: see StateCache::useState.
+  [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
@@ -306,7 +306,7 @@ public:
   // evictableStates() are those it can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane();
   [[nodiscard]] uint32_t evictableStates() const noexcept {
-    return states_.evictable();
+    return states_.evictableStates();
   }
   [[nodiscard]] CacheSnapshot snapshot() const;
 
