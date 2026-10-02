@@ -206,6 +206,9 @@ private:
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
 // Permits exactly one submitted-but-not-applied command on its command queue.
+// One thread submits, allocates and looks up pipelines; checkHealth(),
+// healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
+// called from any thread.
 class MetalBackend final {
 public:
   // Every buffer stays wired until residencyKeepAliveSeconds pass without a

@@ -278,15 +278,13 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
-    bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+    void commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
-        if (stopping) return false;
         activeCommand = command;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, steadySeconds());
         [command commit];
-        return true;
     }
 
     void releaseSubmission(uint64_t sequence) noexcept {
@@ -473,7 +471,7 @@ struct MetalBackend::Impl {
     std::shared_ptr<Residency> residency;
     __strong id<MTLLibrary> library = nil;
     // Looked up for every dispatch on the encode path, which the GPU waits
-    // for; a hit allocates nothing.
+    // for; a hit allocates nothing. Used only by the submitting thread.
     std::unordered_map<std::string, id<MTLComputePipelineState>,
                        PipelineNameHash, std::equal_to<>>
         pipelines;
@@ -483,7 +481,6 @@ struct MetalBackend::Impl {
         std::make_shared<AllocationAccounting>();
     std::shared_ptr<BackendAsyncState> asyncState =
         std::make_shared<BackendAsyncState>();
-    mutable std::mutex commandMutex;
 
     void sampleDeviceMemory() const noexcept {
         asyncState->sampleDeviceMemory();
@@ -958,8 +955,6 @@ CommandTicket MetalBackend::submitCommandAsync(
         prepared.push_back(item);
     }
 
-    std::lock_guard commandLock(impl_->commandMutex);
-    impl_->ensureHealthy();
     for (PreparedDispatch &item : prepared) {
         item.pipeline = impl_->pipeline(item.source->pipelineName);
         if (item.threadCount >
@@ -1041,15 +1036,10 @@ CommandTicket MetalBackend::submitCommandAsync(
         }];
         impl_->sampleDeviceMemory();
         impl_->residency->use();
-        std::shared_ptr<BackendAsyncState> backend = impl_->asyncState;
-        if (!backend->healthy.load(std::memory_order_acquire)) {
-            ticketState->finish({}, "Metal backend became unhealthy before command submission");
-        } else if (!backend->commitSubmission(ticketState->sequence, command,
-                       [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
-                           if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
-                       })) {
-            ticketState->finish({}, "Metal backend stopped before command submission");
-        }
+        impl_->asyncState->commitSubmission(ticketState->sequence, command,
+            [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
+                if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
+            });
     }
     return CommandTicket(std::move(ticketState));
 }
@@ -1084,7 +1074,6 @@ bool MetalBackend::commandInFlight() const noexcept {
 }
 
 size_t MetalBackend::pipelineCount() const noexcept {
-    std::lock_guard lock(impl_->commandMutex);
     return impl_->pipelines.size();
 }
 

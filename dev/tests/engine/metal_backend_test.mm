@@ -453,6 +453,30 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
     std::cout << "PASS abandoned ticket returns after the command watchdog\n";
 }
 
+// A stopped backend refuses the next submission before encoding it, and
+// stopping is not a failure: the backend stays healthy with nothing in flight.
+void stopRefusesSubmission(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    backend.stop();
+    std::string error;
+    try {
+        (void)backend.submitAsync(dispatch);
+    } catch (const MetalBackendError &failure) {
+        error = failure.what();
+    }
+    require(error.find("stopping") != std::string::npos,
+            "a stopped backend accepted a submission: " + error);
+    require(backend.healthy() && !backend.commandInFlight(),
+            "refusing a submission while stopping marked the backend unhealthy "
+            "or left a command in flight");
+    std::cout << "PASS stopped backend refuses submission\n";
+}
+
 std::atomic<unsigned> blitEncoders{0};
 std::atomic<unsigned> computeEncoders{0};
 IMP originalBlitEncoder = nullptr;
@@ -1078,6 +1102,7 @@ int main(int argc, const char *argv[]) {
             pendingCommandStillTimesOut(argv[1]);
             synchronousWaitObeysTheWatchdog(argv[1]);
             abandonedTicketReturnsAfterTheWatchdog(argv[1]);
+            stopRefusesSubmission(argv[1]);
             buffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
