@@ -291,8 +291,8 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
     const uint32_t missing = count - std::min(count, pool_.freePageCount());
     const uint32_t pending = pendingPages();
     const bool covered = pending > 0 && pending >= missing;
-    return {covered ? KvPageAcquireFailure::Pending : acquired.failure,
-            count, pool_.freePageCount(), acquired.allocationFailure};
+    return {covered ? TokenAdmissionFailure::Pending : TokenAdmissionFailure::Denied,
+            count, pool_.freePageCount(), acquired.failure};
   }
   pages = std::move(acquired.pages);
   return {};

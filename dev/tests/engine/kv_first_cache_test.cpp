@@ -156,11 +156,11 @@ CacheNamespace cacheNamespace() {
 TokenAdmission admitLikeEngine(engine::Cache &cache,
                                const std::function<TokenAdmission()> &attempt) {
   TokenAdmission admission = attempt();
-  while (admission.failure == KvPageAcquireFailure::Denied) {
+  while (admission.failure == TokenAdmissionFailure::Denied) {
     const CacheReclaimResult step = cache.reclaimOne(CacheReclaimMode::KeepExtents);
     if (!step.madeProgress) {
       if (step.pending)
-        admission.failure = KvPageAcquireFailure::Pending;
+        admission.failure = TokenAdmissionFailure::Pending;
       break;
     }
     admission = attempt();
@@ -830,7 +830,7 @@ void testCheckpointPressurePreservesHotPrefix() {
   require(budget.used == SharedBudget::capacity,
           "checkpoint did not fill the shared allocation budget");
   const TokenAdmission denied = cache.ensureTokens(3, 64);
-  require(denied.failure == KvPageAcquireFailure::Denied,
+  require(denied.failure == TokenAdmissionFailure::Denied,
           "necessary KV growth was not denied by the shared budget");
   const auto reclaimed = cache.reclaimOne(CacheReclaimMode::KeepExtents);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 200 &&
@@ -1773,7 +1773,7 @@ void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
               fixture.cache.snapshot().kvCache.blocks == 4,
           "a leaf was dropped or the wait was not reported while the tier was busy");
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 32).failure == KvPageAcquireFailure::Pending,
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending,
           "a request was failed while a transfer was landing");
   fixture.cache.endRequest(2);
   tier.complete();
@@ -1855,11 +1855,11 @@ void testParentOfDiskChildrenSurvivesRefusal() {
   // rather than told to wait for something that will never happen.
   tier.transferLimit = 0;
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 64).failure == KvPageAcquireFailure::Denied &&
+  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Denied &&
               fixture.cache.snapshot().kvCache.blocks == 3 && tier.demotions == 1,
           "the parent of a disk block was dropped, or the request was told to wait");
   tier.transferLimit = 8;
-  require(admitTokens(fixture.cache, 2, 64).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 2,
           "the parent was not written once the tier had room");
   tier.complete();
@@ -1963,12 +1963,12 @@ void testFullTierStopsTheScan() {
   // that page rather than evicting more.
   p.tier.transferLimit = 1;
   p.cache.beginRequest(9);
-  require(admitTokens(p.cache, 9, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(p.cache, 9, 32).failure == TokenAdmissionFailure::Pending &&
               p.tier.demotions == 1 && p.cache.snapshot().kvCache.blocks == 4,
           "the first leaf was not written, or a leaf was dropped");
   // A larger shortfall meets a tier that the transfer in flight fills. Every
   // leaf would answer the same, so the scan asks once and waits.
-  require(admitTokens(p.cache, 9, 64).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(p.cache, 9, 64).failure == TokenAdmissionFailure::Pending &&
               p.cache.snapshot().kvTier.demotionsRefused == 1 &&
               p.cache.snapshot().kvCache.blocks == 4,
           "a full tier was asked once per leaf, or a leaf was dropped");
@@ -1998,11 +1998,11 @@ void testRestoresInFlightMakeAShortfallPending() {
   require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.pool.freePageCount() == 0,
           "restore did not take the free page");
   fixture.cache.beginRequest(3);
-  require(admitTokens(fixture.cache, 3, 32).failure == KvPageAcquireFailure::Pending,
+  require(admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Pending,
           "a shortfall during a restore was reported as exhausted");
   tier.complete();
   require(fixture.cache.pollTransfers() &&
-              admitTokens(fixture.cache, 3, 32).failure == KvPageAcquireFailure::Denied,
+              admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
           "pages held by an active request were not exhausted");
   lookup = {};
   fixture.cache.endRequest(2);
@@ -2085,11 +2085,11 @@ void testPendingPagesGateAllocation() {
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4 &&
               fixture.cache.snapshot().kvTier.pendingPages == 1,
           "allocation evicted past the page on its way back");
-  require(admitTokens(fixture.cache, 2, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 1,
           "a retry before the copy landed demoted more");
   tier.complete();
@@ -2311,7 +2311,7 @@ void testRestoreKeepsTheBlockItExtends() {
   // Making room demotes a leaf: the restore waits for its copy and holds no
   // page meanwhile.
   const TokenAdmission waiting = admitRestore(fixture.cache, 4, lookup);
-  require(waiting.failure == KvPageAcquireFailure::Pending &&
+  require(waiting.failure == TokenAdmissionFailure::Pending &&
               fixture.cache.pageTable(4).pages.empty(),
           "a restore without a page did not wait for the room being made");
   tier.complete();

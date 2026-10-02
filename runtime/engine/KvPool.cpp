@@ -70,7 +70,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
     // with fewer of them than its budget (a test's) runs out.
     if (!unallocated_.count) {
       returnSelected();
-      return {{}, KvPageAcquireFailure::Denied, metal::AllocationFailure::Capacity};
+      return {{}, metal::AllocationFailure::Capacity};
     }
     const uint32_t page = unallocated_.head;
     const uint32_t extent = pages_[page].extent;
@@ -88,7 +88,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
       // their pages first instead of allocating them again. A reclaim pass
       // returns them if they stay unused.
       returnSelected();
-      return {{}, KvPageAcquireFailure::Denied, allocated.failure};
+      return {{}, allocated.failure};
     }
     ++extentAllocations_;
     extentAllocateMaxMilliseconds_ =
@@ -104,7 +104,7 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
     references = 1;
     ++(prefixOwner ? prefixPages_ : activePages_);
   }
-  return {std::move(selected), KvPageAcquireFailure::None};
+  return {std::move(selected)};
 }
 
 void KvPool::retainPage(uint32_t page, bool prefixOwner) {

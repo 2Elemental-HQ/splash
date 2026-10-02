@@ -1100,7 +1100,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
   bool pendingReclaim = false;
   TokenAdmission admission = attempt();
   while (!admission.granted() &&
-         admission.failure == KvPageAcquireFailure::Denied) {
+         admission.failure == TokenAdmissionFailure::Denied) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const CacheReclaimResult progress = paused
@@ -1115,7 +1115,7 @@ Engine::KvAdmission Engine::admitKv(const std::function<TokenAdmission()> &attem
   Denial denial;
   if (!admission.granted()) {
     denial.allocationFailure = admission.allocationFailure;
-    denial.pending = admission.failure == KvPageAcquireFailure::Pending || pendingReclaim;
+    denial.pending = admission.failure == TokenAdmissionFailure::Pending || pendingReclaim;
     // Pages on their way back end the shortage without the residents.
     if (!denial.pending)
       allocationFailed_ = true;

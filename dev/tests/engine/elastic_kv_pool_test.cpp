@@ -124,10 +124,7 @@ void testFailedGrowthRollsBackAtomically() {
     storage.failExtent = 1;
     KvPool pool(storage);
     auto pages = pool.acquirePages(5, false);
-    require(!pages.granted() &&
-                pages.failure ==
-                    splash::engine::KvPageAcquireFailure::Denied,
-            "failed growth was not reported as denied");
+    require(!pages.granted(), "failed growth was not reported as denied");
     auto status = pool.snapshot();
     require(status.pagesAllocated == 4 && status.pagesFree == 4 &&
                 status.pagesActive == 0 && status.pagesPrefix == 0 &&
@@ -197,10 +194,7 @@ void testPressureReusesFreePagesAndDeniesGrowth() {
                 reused.pages.front() == 2,
             "critical pressure rejected a free page of an allocated extent");
     auto denied = pool.acquirePages(2, false);
-    require(!denied.granted() &&
-                denied.failure ==
-                    splash::engine::KvPageAcquireFailure::Denied,
-            "critical pressure admitted a new extent");
+    require(!denied.granted(), "critical pressure admitted a new extent");
     require(pool.activeReferences(active.pages[0]) == 1 &&
                 pool.activeReferences(active.pages[1]) == 1 &&
                 pool.activeReferences(reused.pages.front()) == 1 &&

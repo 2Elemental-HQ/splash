@@ -29,22 +29,13 @@ struct KvPoolSnapshot {
   double extentReleaseMaxMilliseconds = 0.0;
 };
 
-enum class KvPageAcquireFailure : uint8_t {
-  None,
-  // The pool could not grow by an extent; allocationFailure says why.
-  Denied,
-  // A transfer in flight (a KV demotion, a KV restore or the one state write)
-  // holds what the request needs; retry when it lands.
-  Pending,
-};
-
 struct KvPageAcquisition {
   std::vector<uint32_t> pages;
-  KvPageAcquireFailure failure = KvPageAcquireFailure::None;
-  metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  // Why the pool could not grow by an extent; None when granted.
+  metal::AllocationFailure failure = metal::AllocationFailure::None;
 
   [[nodiscard]] bool granted() const noexcept {
-    return failure == KvPageAcquireFailure::None;
+    return failure == metal::AllocationFailure::None;
   }
 };
 

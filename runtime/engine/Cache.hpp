@@ -88,14 +88,23 @@ struct CacheSnapshot final {
   uint32_t activeRequests = 0;
 };
 
+enum class TokenAdmissionFailure : uint8_t {
+  None,
+  // The pool could not grow by an extent; allocationFailure says why.
+  Denied,
+  // A transfer in flight (a KV demotion, a KV restore or the one state write)
+  // holds what the request needs; retry when it lands.
+  Pending,
+};
+
 struct TokenAdmission final {
-  KvPageAcquireFailure failure = KvPageAcquireFailure::None;
+  TokenAdmissionFailure failure = TokenAdmissionFailure::None;
   uint32_t additionalPages = 0;
   uint32_t availablePages = 0;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
 
   [[nodiscard]] bool granted() const noexcept {
-    return failure == KvPageAcquireFailure::None;
+    return failure == TokenAdmissionFailure::None;
   }
 };
 
