@@ -3,9 +3,9 @@
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
-#include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
+#include "ops/RowCopy.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -184,6 +184,18 @@ void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayer
     throw std::logic_error("Qwen target layer partition mismatch");
 }
 
+// Copies `rows` rows of a capture layer's output, from row `sourceRow`, into
+// capture slot `slot` of the captured hidden rows from row `destinationRow`.
+void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, uint32_t slot,
+                metal::MetalBuffer output, uint32_t sourceRow, metal::MetalBuffer captured,
+                uint32_t destinationRow, uint32_t rows) {
+  const uint32_t width = geometry.hiddenSize, capturedWidth = geometry.capturedHiddenSize();
+  if (slot >= capturedWidth / width)
+    throw std::logic_error("Qwen target capture slot past the captured hidden rows");
+  ops::RowCopy::add(graph, std::move(output), {sourceRow, width, 0}, std::move(captured),
+                    {destinationRow, capturedWidth, slot * width}, rows, width);
+}
+
 } // namespace
 
 // The state a prefill command's layers share: its inputs and the next GDN
@@ -246,9 +258,8 @@ metal::MetalBuffer QwenTarget::addPrefill(
         for (const QwenTargetPrefillSequence &sequence : sequences)
           for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
             const QwenTargetPrefillCapture &c = sequence.captures[capture];
-            ops::DraftAttention::captureTargetHidden(graph, output, buffers.captured, c.rows, *slot,
-                                                     c.sourceStart, c.destinationStart, geometry_.hiddenSize,
-                                                     geometry_.capturedHiddenSize());
+            addCapture(graph, geometry_, *slot, output, c.sourceStart, buffers.captured, c.destinationStart,
+                       c.rows);
           }
     }
   }, weights_);
@@ -403,8 +414,7 @@ void QwenTarget::addVerify(
           [&](const auto &mixer) { return addVerifyMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
       addVerifyFfn(step, layer, residual, output);
       if (const auto slot = geometry_.captureSlot(index))
-        ops::DraftAttention::captureTargetHidden(graph, output, buffers.capturedTargetHidden, rows, *slot, 0, 0,
-                                                 geometry_.hiddenSize, geometry_.capturedHiddenSize());
+        addCapture(graph, geometry_, *slot, output, 0, buffers.capturedTargetHidden, 0, rows);
     }
     requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   }, weights_);

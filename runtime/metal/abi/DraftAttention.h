@@ -58,23 +58,3 @@ struct DraftContextBatchParams {
 
 static_assert(sizeof(DraftContextBatchParams) == 16,
               "Draft context commit parameters are 16 bytes on both sides");
-
-struct CaptureParams {
-  uint32_t rows;
-  uint32_t slot;
-  uint32_t source_start;
-  uint32_t destination_start;
-  uint32_t hidden_width;
-  uint32_t target_width;
-};
-
-static_assert(sizeof(CaptureParams) == 24,
-              "Target hidden capture parameters are 24 bytes on both sides");
-
-struct LastHiddenRowsParams {
-  uint32_t rows;
-  uint32_t width;
-};
-
-static_assert(sizeof(LastHiddenRowsParams) == 8,
-              "Last hidden row parameters are 8 bytes on both sides");

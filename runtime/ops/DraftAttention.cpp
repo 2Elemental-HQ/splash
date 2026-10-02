@@ -109,34 +109,6 @@ DraftAttention::plan(DraftAttentionShape shape, uint32_t lanes,
   return {shape, lanes, configuration};
 }
 
-void DraftAttention::captureTargetHidden(
-    metal::CommandGraph &graph, metal::MetalBuffer source,
-    metal::MetalBuffer captured, uint32_t rows, uint32_t captureSlot,
-    uint32_t sourceStart, uint32_t destinationStart, uint32_t hiddenWidth,
-    uint32_t targetWidth) {
-  if (!rows || !hiddenWidth || !targetWidth ||
-      targetWidth % hiddenWidth != 0 ||
-      captureSlot >= targetWidth / hiddenWidth)
-    throw std::invalid_argument("invalid target hidden capture");
-  const CaptureParams params{rows, captureSlot, sourceStart, destinationStart,
-                             hiddenWidth, targetWidth};
-  graph.add("capture_target_hidden",
-            {std::move(source), std::move(captured)}, params,
-            {(hiddenWidth + 127) / 128, 1, 1});
-}
-
-void DraftAttention::gatherLastRows(metal::CommandGraph &graph,
-                                    metal::MetalBuffer source,
-                                    metal::MetalBuffer destination,
-                                    uint32_t rows, uint32_t width) {
-  if (!rows || !width)
-    throw std::invalid_argument("invalid last-row gather");
-  const LastHiddenRowsParams params{rows, width};
-  graph.add("prefill_gather_last_hidden_rows8",
-            {std::move(source), std::move(destination)}, params,
-            {(width + 127) / 128, 1, 1});
-}
-
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
                                     DraftConvolutionBuffers buffers,
                                     const DraftAttentionPlan &plan,

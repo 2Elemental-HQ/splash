@@ -4,11 +4,11 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
-#include "ops/DraftAttention.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
+#include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 
@@ -1253,12 +1253,13 @@ struct Runtime::Impl {
       if (entry.replayingGeneration ||
           item.logicalPosition + item.tokenCount != entry.promptTokens)
         continue;
-      ops::DraftAttention::gatherLastRows(
+      const uint32_t hidden = geometry.target.hiddenSize;
+      ops::RowCopy::add(
           graph,
-          prefillU16(finalHidden, sequence.rowBegin + item.tokenCount - 1, 1,
-                     geometry.target.hiddenSize),
-          decodeArena->get(sequence.lane, DecodeTensor::Hidden0), 1,
-          geometry.target.hiddenSize);
+          prefillU16(finalHidden, sequence.rowBegin, item.tokenCount, hidden),
+          {item.tokenCount - 1, hidden, 0},
+          decodeArena->get(sequence.lane, DecodeTensor::Hidden0),
+          {0, hidden, 0}, 1, hidden);
       if (entry.constraint != ConstraintMode::None)
         continue;
       const bool scoring = !entry.scoreTokens.empty();

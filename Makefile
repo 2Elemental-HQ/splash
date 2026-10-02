@@ -240,6 +240,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/RoPE.cpp \
+	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \

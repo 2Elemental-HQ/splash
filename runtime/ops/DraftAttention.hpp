@@ -103,15 +103,6 @@ public:
   plan(DraftAttentionShape shape, uint32_t lanes,
        DraftAttentionConfiguration configuration = {});
 
-  static void captureTargetHidden(
-      metal::CommandGraph &graph, metal::MetalBuffer source,
-      metal::MetalBuffer captured, uint32_t rows, uint32_t captureSlot,
-      uint32_t sourceStart, uint32_t destinationStart, uint32_t hiddenWidth,
-      uint32_t targetWidth);
-  static void gatherLastRows(metal::CommandGraph &graph,
-                             metal::MetalBuffer source,
-                             metal::MetalBuffer destination, uint32_t rows,
-                             uint32_t width);
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
                              const DraftAttentionPlan &plan,
