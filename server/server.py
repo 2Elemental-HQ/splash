@@ -608,18 +608,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
-        if not prompt_only and not self.app.backend.can_submit():
-            failure = self.app.backend.engine_error
-            self._safe_error(
-                APIError(
-                    529 if systemone else 503,
-                    "engine is recovering; retry shortly"
-                    + (f" (last failure: {failure})" if failure else ""),
-                    "engine_recovering",
-                ),
-                anthropic,
-                log=False,
-            )
+        refusal = None if prompt_only else self.app.backend.refusal()
+        if refusal is not None:
+            if systemone and refusal.status == 503:
+                refusal = APIError(529, refusal.message, refusal.code)
+            self._safe_error(refusal, anthropic, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside

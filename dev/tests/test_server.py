@@ -1068,6 +1068,7 @@ class ServerTest(unittest.TestCase):
             {
                 "ready": True,
                 "recovering": False,
+                "stopped": False,
                 "pending": 0,
                 "pending_limit": 4,
                 "restarts": 0,
@@ -7658,7 +7659,10 @@ class ServerTest(unittest.TestCase):
         class PressuredRuntime(FakeRuntime):
             def __init__(self):
                 super().__init__()
-                self.status_event = native_peer.status_event(memory_pressure="critical")
+                # The engine is not ready under critical pressure.
+                self.status_event = native_peer.status_event(
+                    ready=False, memory_pressure="critical"
+                )
 
         harness = self.harness(PressuredRuntime())
         status, _, payload = harness.request("GET", "/ready")

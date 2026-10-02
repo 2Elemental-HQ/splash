@@ -9,6 +9,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests.test_server import FakeRuntime, Harness
+from server.errors import APIError
 
 
 class PromptToolsTests(unittest.TestCase):
@@ -219,7 +220,11 @@ class PromptToolsTests(unittest.TestCase):
     def test_utilities_do_not_require_engine_admission_or_fit_context(self):
         self.harness.app.max_context = 1
         with (
-            mock.patch.object(self.harness.backend, "can_submit", return_value=False),
+            mock.patch.object(
+                self.harness.backend,
+                "refusal",
+                return_value=APIError(503, "engine is recovering", "engine_recovering"),
+            ),
             mock.patch.object(
                 self.harness.server.requests,
                 "acquire",

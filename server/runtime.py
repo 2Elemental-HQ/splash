@@ -110,13 +110,10 @@ class MaskComputationFailed(EngineRuntimeError):
         return MaskComputationFailed(*self.args, retryable=self.retryable)
 
 
-class StatusUnanswered(TimeoutError):
-    """The native loop accepted a status request but did not answer it in time."""
-
-
 MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], bytes]
 EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
+FailureListener: TypeAlias = Callable[[EngineRuntimeError, float], None]
 
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_U64 = (1 << 64) - 1
@@ -474,6 +471,8 @@ class MultiplexedRuntime:
         self._generation = 0
         self._startup_attempt: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
+        # When the current generation's ReadyEvent arrived.
+        self._ready_at: float | None = None
         self._first_ready: wire.ReadyEvent | None = None
         # Set when a relaunch cannot help; no further engine is started.
         self._fatal_error: EngineRuntimeError | None = None
@@ -488,10 +487,11 @@ class MultiplexedRuntime:
         self._crash_trace = CrashTraceRing(
             self._command, enabled=os.environ.get("SPLASH_CRASH_TRACE") == "1"
         )
-        # Called with the failure once an engine that reached Ready has
-        # failed for any reason but close(). It runs, without locks, on the
-        # thread that saw the failure and must return quickly.
-        self.on_engine_failure: Callable[[EngineRuntimeError], None] | None = None
+        # Called with the failure and the seconds the engine served once an
+        # engine that reached Ready has failed for any reason but close(). It
+        # runs, without locks, on the thread that saw the failure, before the
+        # engine's calls end, and must not block.
+        self.on_engine_failure: FailureListener | None = None
 
         if eager_start:
             self._ensure_process()
@@ -538,11 +538,22 @@ class MultiplexedRuntime:
             )
 
     @property
+    def fatal_error(self) -> EngineRuntimeError | None:
+        """Why no engine is started any more, once a relaunch cannot help."""
+        with self._state_lock:
+            return self._fatal_error
+
+    @property
     def last_crash_trace(self) -> str | None:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
 
     def wait_ready(self, timeout: float | None = None) -> bool:
+        """Start an engine unless one serves, and wait for its Ready.
+
+        Raises why the startup ended before Ready. Returns whether the engine
+        still serves: on_engine_failure reports a failure after Ready.
+        """
         self._ensure_process(timeout=timeout)
         return self.ready
 
@@ -553,7 +564,11 @@ class MultiplexedRuntime:
         on_event: EventCallback | None = None,
         on_complete: CompletionCallback | None = None,
     ) -> RuntimeCall:
-        """Admit and immediately write one request without client scheduling."""
+        """Admit and immediately write one request without client scheduling.
+
+        A runtime that is not ready refuses at once; only wait_ready() starts
+        an engine.
+        """
 
         deadline = request.deadline
         request_id = next(self._request_ids)
@@ -576,12 +591,12 @@ class MultiplexedRuntime:
                 encoded = wire.serialize_message(frame)
             except wire.ProtocolError as error:
                 raise self._request_protocol_error(request_id, error.issue) from error
-            generation = self._ensure_process(
-                timeout=min(_remaining(deadline), threading.TIMEOUT_MAX)
-            )
-            _remaining(deadline)
             with self._state_lock:
-                self._require_generation_ready_locked(generation)
+                if self._closed:
+                    raise RuntimeClosed("runtime is closed")
+                if not self.ready:
+                    raise EngineUnhealthy("native process is not ready")
+                generation = self._generation
                 # Created under the lock so that a call exists exactly when
                 # _pending owns its admission slot; the release below relies
                 # on that.
@@ -608,10 +623,16 @@ class MultiplexedRuntime:
                 self._admission_slots.release()
             raise
 
-    def status(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
-        return self._status(timeout, None)
+    def status(
+        self, timeout: float = 5.0, *, fail_unanswered: bool = False
+    ) -> wire.StatusJsonEvent:
+        """The engine's status JSON. With fail_unanswered, a loop that leaves
+        the request unanswered for `timeout` fails the engine it ran."""
+        return self._status(timeout, None, fail_unanswered)
 
-    def _status(self, timeout: float, generation: int | None) -> wire.StatusJsonEvent:
+    def _status(
+        self, timeout: float, generation: int | None, fail_unanswered: bool
+    ) -> wire.StatusJsonEvent:
         """Asks the engine of ``generation``, or the current one when None, so
         that a probe never measures a newer engine."""
         if not math.isfinite(timeout) or timeout <= 0:
@@ -640,7 +661,14 @@ class MultiplexedRuntime:
                 if self._status_waiters.pop(correlation_id, None) is waiter:
                     expired = True
             if expired:
-                raise StatusUnanswered("native status response timed out")
+                if fail_unanswered:
+                    self._fail_generation(
+                        generation,
+                        EngineUnhealthy(
+                            f"native loop did not answer status within {timeout:g} s"
+                        ),
+                    )
+                raise TimeoutError("native status response timed out")
         if waiter.error:
             raise waiter.error.restate()
         assert waiter.result is not None
@@ -692,7 +720,7 @@ class MultiplexedRuntime:
             return EngineUnhealthy(issue.describe())
         return ProtocolFatal(issue.describe())
 
-    def _ensure_process(self, timeout: float | None = None) -> int:
+    def _ensure_process(self, timeout: float | None = None) -> None:
         if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("ready timeout must be positive")
         caller_deadline = None if timeout is None else time.monotonic() + timeout
@@ -711,7 +739,7 @@ class MultiplexedRuntime:
                     and self._ready_message is not None
                     and self._terminal_error is None
                 ):
-                    return self._generation
+                    return
                 attempt = self._startup_attempt
                 if attempt is not None and not attempt.event.is_set():
                     pass
@@ -748,22 +776,16 @@ class MultiplexedRuntime:
                 if time.monotonic() < attempt.deadline:
                     raise TimeoutError("native ready wait timed out")
                 self._expire_startup_attempt(attempt)
+                # Another thread may still be delivering the engine's failure.
+                attempt.event.wait()
             with self._state_lock:
                 if attempt.error is not None:
                     raise attempt.error.restate()
                 if self._closed:
                     raise RuntimeClosed("runtime is closed")
-                if (
-                    attempt.generation == self._generation
-                    and self._process is not None
-                    and self._process.poll() is None
-                    and self._ready_message is not None
-                    and self._terminal_error is None
-                ):
-                    return self._generation
-                if self._terminal_error is not None:
-                    raise self._terminal_error.restate()
-                raise EngineUnhealthy("native process failed before ReadyEvent")
+            # The engine reached Ready; on_engine_failure reports any failure
+            # since.
+            return
 
     def _run_startup_attempt(self, attempt, old_process, old_reader) -> None:
         self._launch_startup_attempt(attempt, old_process, old_reader)
@@ -775,11 +797,13 @@ class MultiplexedRuntime:
         with self._state_lock:
             if self._startup_attempt is not attempt or attempt.event.is_set():
                 return
-            attempt.error = error
-            attempt.event.set()
             generation = attempt.generation
-        if generation is not None:
-            self._fail_generation(generation, error)
+            if generation is None:
+                attempt.error = error
+                attempt.event.set()
+                return
+        # The engine's failure ends the attempt.
+        self._fail_generation(generation, error)
 
     def _complete_startup_attempt(
         self,
@@ -1013,20 +1037,14 @@ class MultiplexedRuntime:
             with self._state_lock:
                 if not self._liveness_wanted_locked(generation):
                     return
-            timeout = self._liveness_timeout_seconds
             try:
-                self._status(timeout, generation)
-            except StatusUnanswered:
-                self._fail_generation(
-                    generation,
-                    EngineUnhealthy(
-                        f"native loop did not answer status within {timeout:g} s "
-                        "while requests were pending"
-                    ),
+                self._status(
+                    self._liveness_timeout_seconds, generation, fail_unanswered=True
                 )
             except (EngineRuntimeError, TimeoutError):
-                # The generation failed meanwhile, or the write lock stayed
-                # taken; _write_bytes fences a started write that stalls.
+                # Left unanswered, the generation has failed. Otherwise it
+                # failed meanwhile, or the write lock stayed taken;
+                # _write_bytes fences a started write that stalls.
                 pass
         finally:
             with self._state_lock:
@@ -1114,6 +1132,7 @@ class MultiplexedRuntime:
                     )
                     raise self._fatal_error.restate()
                 self._ready_message = message
+                self._ready_at = time.monotonic()
                 attempt.event.set()
             return
 
@@ -1296,16 +1315,12 @@ class MultiplexedRuntime:
             # kept, so its frames do not outlive the requests they ran for.
             failure = error.restate()
             self._terminal_error = failure
-            served = self._ready_message is not None
+            served_seconds = (
+                None if self._ready_at is None else time.monotonic() - self._ready_at
+            )
             self._ready_message = None
+            self._ready_at = None
             attempt = self._startup_attempt
-            if (
-                attempt is not None
-                and attempt.generation == generation
-                and not attempt.event.is_set()
-            ):
-                attempt.error = failure
-                attempt.event.set()
             process = self._process
             calls = tuple(self._pending.values())
             self._pending.clear()
@@ -1328,6 +1343,18 @@ class MultiplexedRuntime:
                     process_returncode=returncode,
                     last_status=last_status,
                 )
+                listener = self.on_engine_failure
+                if served_seconds is not None and listener:
+                    # Before the calls end, so their terminals can follow
+                    # what the listener decided about the engine.
+                    try:
+                        listener(failure, served_seconds)
+                    except Exception:
+                        pass
+            if attempt is not None and attempt.generation == generation:
+                # After the crash trace, so a startup's waiter that learns of
+                # this failure finds its trace written.
+                self._complete_startup_attempt(attempt, failure)
             for call in calls:
                 self._admission_slots.release()
                 call._set_terminal(error=failure)
@@ -1337,13 +1364,6 @@ class MultiplexedRuntime:
                 except OSError:
                     pass
                 self._arm_kill_fallback(process)
-            listener = self.on_engine_failure
-            if served and listener and not isinstance(failure, RuntimeClosed):
-                # The failure is already delivered; a listener cannot change it.
-                try:
-                    listener(failure)
-                except Exception:
-                    pass
 
         return finish
 

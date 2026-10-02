@@ -28,11 +28,14 @@ no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
-An engine that fails is restarted at once, and failed restarts back off from
-1 to 16 seconds. Meanwhile generation requests get 503 `engine_recovering`,
-whose message names the last failure. An engine whose loop stops answering
-while requests are pending is failed after 30 seconds and restarted the same
-way.
+An engine that fails is restarted at once. If it fails again within 60 s of
+starting, the next restart waits 5 s; after a third such failure (failed
+restarts count) Splash stops restarting it, and requests get 500
+`engine_failed` naming the crash trace until the server is restarted.
+Meanwhile generation requests get 503 `engine_recovering`, whose message names
+the last failure. An engine whose loop leaves a status request unanswered for
+30 seconds, while requests are pending or during a background status refresh,
+is failed and restarted by the same rules.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -936,7 +939,12 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
+
+`GET /ready` is 200 while the engine's own `ready` is true. While the engine
+loop is busy, `/ready` keeps its last answer until the loop has left status
+requests unanswered for 30 s; a loop that leaves a status refresh unanswered
+that long fails the engine, which then restarts.
 
 `GET /metrics` exposes the same counters in Prometheus text format.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not

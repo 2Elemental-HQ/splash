@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.engine import native_peer
@@ -142,6 +143,7 @@ class FakeRuntime:
         self.pending_limit = 8
         self.restart_count = 3
         self.last_crash_trace = None
+        self.fatal_error = None
         self.closed = False
         self.submit_attempts = 0
         self.submit_entered = threading.Event()
@@ -155,10 +157,8 @@ class FakeRuntime:
         self.submit_attempts += 1
         if self.mode == "pending_limit":
             raise runtime.PendingLimitExceeded("full")
-        if self.mode == "raise_before_call" or (
-            self.mode == "raise_once_before_call" and self.submit_attempts == 1
-        ):
-            raise runtime.EngineUnhealthy("native startup failed")
+        if self.mode == "raise_before_call":
+            raise runtime.EngineUnhealthy("native process is not ready")
         call = FakeCall(len(self.calls) + 1, request, on_event, on_complete)
         self.calls.append(call)
         if self.mode == "block_after_call":
@@ -172,7 +172,10 @@ class FakeRuntime:
             raise runtime.EngineUnhealthy("native write failed")
         return call
 
-    def status(self, timeout=5.0):
+    def wait_ready(self):
+        return self.ready
+
+    def status(self, timeout=5.0, *, fail_unanswered=False):
         if timeout <= 0:
             raise ValueError("status timeout must be positive")
         self.status_calls += 1
@@ -226,6 +229,12 @@ class NativeBackendContractTests(unittest.TestCase):
         transport = backend_api.NativeBackend(runtime, FakeTokenizer())
         self.addCleanup(transport.close)
         return transport, runtime
+
+    def wait_for_recovery(self, transport):
+        deadline = time.monotonic() + 1.0
+        while transport.recovery is not None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertIsNone(transport.recovery)
 
     @staticmethod
     def terminal(job, timeout=1.0):
@@ -518,34 +527,18 @@ class NativeBackendContractTests(unittest.TestCase):
             job.events.get(timeout=0.05)
         self.assertFalse(transport.active)
 
-    def test_pre_admission_native_failure_retries_once_then_succeeds(self):
-        runtime_client = FakeRuntime("raise_once_before_call")
-        transport, _runtime = self.make_transport(runtime_client)
-        job = make_job()
-
-        with mock.patch.object(backend_api, "NATIVE_RECOVERY_GRACE_SECONDS", 0):
-            transport.submit(job)
-        self.assertEqual(runtime_client.submit_attempts, 2)
-        self.assertEqual(len(runtime_client.calls), 1)
-        runtime_client.calls[0].complete(result=success_result(runtime_client.calls[0]))
-        self.assertEqual(self.terminal(job)[0], "done")
-        self.assertFalse(transport.active)
-
-    def test_pre_admission_native_failure_has_one_bounded_retry(self):
+    def test_pre_admission_native_failure_is_refused_once_without_retry(self):
+        # The engine died after do_POST's own refusal check passed.
         runtime_client = FakeRuntime("raise_before_call")
+        runtime_client.ready = False
         transport, _runtime = self.make_transport(runtime_client)
         job = make_job()
 
-        with mock.patch.object(backend_api, "NATIVE_RECOVERY_GRACE_SECONDS", 0):
-            transport.submit(job)
-        self.assertEqual(runtime_client.submit_attempts, 2)
+        transport.submit(job)
+        self.assertEqual(runtime_client.submit_attempts, 1)
         kind, error = self.terminal(job)
         self.assertEqual(kind, "error")
-        self.assertEqual(error.status, 503)
-        self.assertEqual(error.code, "runtime_unavailable")
-        # A failure to start, rather than of an engine running the request,
-        # keeps its own reason.
-        self.assertEqual(error.message, "native startup failed")
+        self.assertEqual((error.status, error.code), (503, "engine_recovering"))
         self.assertFalse(transport.active)
 
     def test_pending_limit_does_not_leave_active_state(self):
@@ -725,19 +718,22 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertFalse(transport.finalizer.is_alive())
         self.assertFalse(transport.active)
 
-    def test_status_schema_and_memory_pressure_are_fail_closed(self):
+    def test_native_ready_is_authoritative_and_malformed_status_fails_closed(self):
         transport, runtime = self.make_transport()
         runtime.status_event = wire.StatusJsonEvent(1, b"[]")
         self.assertFalse(transport.is_ready())
 
-        runtime.status_event = native_peer.status_event(memory_pressure="critical")
+        # Native ready already folds in memory pressure and Metal health.
+        runtime.status_event = native_peer.status_event(
+            ready=False, memory_pressure="critical"
+        )
         self.assertFalse(transport.is_ready())
 
         runtime.status_event = native_peer.status_event(ready="false")
         self.assertFalse(transport.is_ready())
 
         runtime.status_event = native_peer.status_event(memory_pressure=None)
-        self.assertFalse(transport.is_ready())
+        self.assertTrue(transport.is_ready())
 
         runtime.status_event = native_peer.status_event()
         self.assertTrue(transport.is_ready())
@@ -758,6 +754,7 @@ class NativeBackendContractTests(unittest.TestCase):
             {
                 "ready": True,
                 "recovering": False,
+                "stopped": False,
                 "pending": 0,
                 "pending_limit": 8,
                 "restarts": 3,
@@ -767,25 +764,154 @@ class NativeBackendContractTests(unittest.TestCase):
             },
         )
 
-    def test_status_timeout_fails_closed_even_with_a_cached_snapshot(self):
+    def test_busy_loop_keeps_last_readiness_until_status_is_unanswered_for_the_bound(
+        self,
+    ):
         runtime = FakeRuntime()
         transport, _runtime = self.make_transport(runtime)
+        clock = [100.0]
+        with mock.patch.object(
+            backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+        ):
+            self.assertTrue(transport.status()["ready"])
+            runtime.mode = "status_timeout"
+
+            status = transport.status(timeout=0.01)
+
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["schema_version"], wire.STATUS_SCHEMA_VERSION)
+            self.assertTrue(status["transport"]["status_stale"])
+            # The transport itself is still live: launchers use this to tell a
+            # busy engine from a missing server.
+            self.assertTrue(status["transport"]["ready"])
+            self.assertIsInstance(status["transport"]["status_age_ms"], float)
+            self.assertEqual(
+                status["transport"]["error"], "native status response timed out"
+            )
+            self.assertTrue(transport.is_ready())
+
+            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            status = transport.status(timeout=0.01)
+            self.assertFalse(status["ready"])
+            self.assertTrue(status["transport"]["status_stale"])
+            self.assertFalse(transport.is_ready())
+
+    def test_failed_engine_snapshot_is_not_ready_after_restart(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
         self.assertTrue(transport.status()["ready"])
-        runtime.mode = "status_timeout"
-
-        status = transport.status(timeout=0.01)
-
-        self.assertFalse(status["ready"])
-        self.assertEqual(status["schema_version"], wire.STATUS_SCHEMA_VERSION)
-        self.assertTrue(status["transport"]["status_stale"])
-        # The transport itself is still live: launchers use this to tell a
-        # busy engine from a missing server.
-        self.assertTrue(status["transport"]["ready"])
-        self.assertIsInstance(status["transport"]["status_age_ms"], float)
-        self.assertEqual(
-            status["transport"]["error"], "native status response timed out"
-        )
+        native.mode = "status_timeout"
+        with mock.patch.object(backend_api, "print_status"):
+            transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+            # The relaunch succeeds; its status refresh is not answered.
+            self.wait_for_recovery(transport)
+        self.assertTrue(native.ready)
+        self.assertFalse(transport.status(timeout=0.01)["ready"])
         self.assertFalse(transport.is_ready())
+
+    def test_late_status_answer_cannot_undo_an_engine_failure(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
+        self.assertTrue(transport.status()["ready"])
+        decode = transport._decode_status_event
+        answered = []
+
+        def fail_after_the_answer(event):
+            if not answered:
+                answered.append(event)
+                native.ready = False
+                transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+            return decode(event)
+
+        with (
+            mock.patch.object(
+                transport, "_decode_status_event", side_effect=fail_after_the_answer
+            ),
+            mock.patch.object(backend_api, "print_status") as console,
+        ):
+            self.assertFalse(transport.status()["ready"])
+            self.wait_for_recovery(transport)
+        self.assertNotIn(mock.call("Engine restarted"), console.call_args_list)
+        self.assertEqual(transport.engine_error, "gpu fault")
+        self.assertFalse(transport.status_snapshot["ready"])
+        # The relaunched engine is busy: the failed one's answer is no evidence.
+        native.ready = True
+        native.mode = "status_timeout"
+        self.assertFalse(transport.status(timeout=0.01)["ready"])
+
+    def test_skipped_probe_does_not_start_the_unanswered_clock(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
+        clock = [100.0]
+        cached = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        cache_status = transport._cache_status
+
+        def cache_then_hold_the_refresh(snapshot):
+            cache_status(snapshot)
+            if threading.current_thread() is transport.recovery:
+                cached.set()
+                release.wait(2.0)
+
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(
+                transport, "_cache_status", side_effect=cache_then_hold_the_refresh
+            ),
+        ):
+            self.assertTrue(transport.status()["ready"])
+            native.mode = "status_timeout_once"
+            self.assertTrue(transport.status()["ready"])
+            self.assertTrue(cached.wait(1.0))
+            # Skipped: the refresh has answered but its worker still runs.
+            self.assertTrue(transport.status()["ready"])
+            release.set()
+            self.wait_for_recovery(transport)
+            self.assertIsNone(transport.status_unanswered_since)
+            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            native.mode = "status_timeout_once"
+            # One missed probe later on is a busy loop, not a wedged one.
+            self.assertTrue(transport.status()["ready"])
+
+    def test_answered_refresh_stops_the_unanswered_clock(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
+        clock = [100.0]
+
+        def status(timeout, fail_unanswered=False):
+            if fail_unanswered:
+                # Answered, though not with a status this server reads.
+                return wire.StatusJsonEvent(1, b"[]")
+            raise TimeoutError("native status response timed out")
+
+        self.assertTrue(transport.status()["ready"])
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(native, "status", side_effect=status),
+        ):
+            self.assertTrue(transport.status()["ready"])
+            self.wait_for_recovery(transport)
+            self.assertIsNone(transport.status_unanswered_since)
+            clock[0] += backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS
+            self.assertTrue(transport.status()["ready"])
+            self.wait_for_recovery(transport)
+
+    def test_malformed_status_fails_closed_while_the_loop_is_busy(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
+        self.assertTrue(transport.status()["ready"])
+        native.mode = "status_timeout"
+        self.assertTrue(transport.status()["ready"])
+        self.wait_for_recovery(transport)
+        self.assertIsNotNone(transport.status_unanswered_since)
+        native.mode = "normal"
+        native.status_event = wire.StatusJsonEvent(1, b"[]")
+        self.assertFalse(transport.status()["ready"])
 
     def test_status_timeout_without_cache_keeps_type_stable(self):
         transport, _runtime = self.make_transport(FakeRuntime("status_timeout"))
@@ -809,15 +935,12 @@ class NativeBackendContractTests(unittest.TestCase):
 
         stale = transport.status(timeout=0.01)
         self.assertTrue(stale["transport"]["status_stale"])
-        deadline = time.monotonic() + 1.0
-        while transport.status_refresh_inflight and time.monotonic() < deadline:
-            time.sleep(0.001)
-        self.assertFalse(transport.status_refresh_inflight)
+        self.wait_for_recovery(transport)
         refreshed = transport.status()
         self.assertFalse(refreshed["transport"]["status_stale"])
         self.assertTrue(refreshed["ready"])
 
-    def test_close_waits_for_background_status_thread_to_start(self):
+    def test_close_waits_for_the_recovery_worker_to_start(self):
         transport, _runtime = self.make_transport(FakeRuntime("status_timeout_once"))
         starting = threading.Event()
         release_start = threading.Event()
@@ -827,10 +950,10 @@ class NativeBackendContractTests(unittest.TestCase):
         start = threading.Thread.start
 
         def gated_start(thread):
-            if thread.name == "splash-status-refresh":
+            if thread.name == "splash-engine-recovery":
                 starting.set()
                 if not release_start.wait(2.0):
-                    raise TimeoutError("test did not release status thread start")
+                    raise TimeoutError("test did not release the worker start")
             return start(thread)
 
         def status():
@@ -882,20 +1005,20 @@ class NativeBackendContractTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "cannot start thread"):
                 transport.status(timeout=0.01)
-        self.assertFalse(transport.status_refresh_inflight)
-        self.assertIsNone(transport.status_refresh_thread)
+        self.assertIsNone(transport.recovery)
+        self.assertTrue(transport.refresh_due)
 
         refreshed = threading.Event()
-        native.mode = "normal"
-        status = native.status
 
-        def refresh(**kwargs):
-            result = status(**kwargs)
+        def status(timeout, fail_unanswered=False):
+            if not fail_unanswered:
+                raise TimeoutError("native status response timed out")
             refreshed.set()
-            return result
+            return native.status_event
 
-        with mock.patch.object(native, "status", side_effect=refresh):
-            transport._ensure_background_status_refresh()
+        with mock.patch.object(native, "status", side_effect=status):
+            # The next probe starts the refresh still owed.
+            transport.status(timeout=0.01)
             self.assertTrue(refreshed.wait(1.0))
             transport.close()
         self.assertFalse(transport.finalizer.is_alive())
