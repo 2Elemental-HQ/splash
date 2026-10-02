@@ -92,14 +92,15 @@ Tauri apps', calls the API from another origin, which its browser names in
 `http://localhost:3000`; repeat it for more, or pass `'*'` for every origin,
 which is vLLM's default. The server then answers the browser's preflight
 `OPTIONS` request and names the origin in `Access-Control-Allow-Origin` on its
-responses. A page of any other origin gets 403. Its browser hides that response
-from the page, which sees a network error, so the server prints the refused
-origin and the `--allowed-origin` flag that would accept it, once per origin. A
-`file://` page or a sandboxed frame sends `Origin: null` instead, which only
-`'*'` admits; the server does not print its refusal. Origins match exactly: a
-pattern such as `tauri://*` or `http://*.example.com` is refused at startup;
-only a bare `'*'` admits every origin. With `'*'` every page open in a browser
-that reaches the server can use it, so set `--api-key` too; the server warns at
+responses, which let the page read `Retry-After` and `WWW-Authenticate` too. A
+page of any other origin gets 403. Its browser hides that response from the
+page, which sees a network error, so the server prints the refused origin and
+the `--allowed-origin` flag that would accept it, once per origin. A `file://`
+page or a sandboxed frame sends `Origin: null` instead, which only `'*'`
+admits; the server does not print its refusal. Origins match exactly: a pattern
+such as `tauri://*` or `http://*.example.com` is refused at startup; only a
+bare `'*'` admits every origin. With `'*'` every page open in a browser that
+reaches the server can use it, so set `--api-key` too; the server warns at
 startup without one.
 
 Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same

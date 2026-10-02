@@ -327,11 +327,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def end_headers(self):
         # A browser hands a page the response from another origin only when
         # the response names that origin, so every response to an admitted
-        # origin does: errors and event streams too.
+        # origin does, errors and event streams too, and exposes the retry
+        # and authentication hints, which CORS hides by default.
         if self._allow_origin is not None:
             self.send_header("Access-Control-Allow-Origin", self._allow_origin)
             if self._allow_origin != ANY_ORIGIN:
                 self.send_header("Vary", "Origin")
+            self.send_header(
+                "Access-Control-Expose-Headers", "Retry-After, WWW-Authenticate"
+            )
         super().end_headers()
 
     def _send(self, status, data, content_type):

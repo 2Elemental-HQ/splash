@@ -211,7 +211,8 @@ class ServerAccessTests(unittest.TestCase):
                 "600",
             ],
         )
-        # An answer, a stream and a refusal alike name the origin.
+        # An answer, a stream and a refusal alike name the origin, and let the
+        # page read the retry and authentication hints.
         for sent, fields, expected in (
             ({**origin, **key}, {}, 200),
             ({**origin, **key}, {"stream": True}, 200),
@@ -224,6 +225,10 @@ class ServerAccessTests(unittest.TestCase):
                     headers["Access-Control-Allow-Origin"], "tauri://localhost"
                 )
                 self.assertEqual(headers["Vary"], "Origin")
+                self.assertEqual(
+                    headers["Access-Control-Expose-Headers"],
+                    "Retry-After, WWW-Authenticate",
+                )
                 if fields:
                     self.assertTrue(
                         headers["Content-Type"].startswith("text/event-stream")
@@ -252,12 +257,13 @@ class ServerAccessTests(unittest.TestCase):
             error=True,
         )
         # A client that is no page, and the server's own pages, get no such
-        # header.
+        # headers.
         host = "%s:%s" % harness.server.server_address
         for sent in (key, {**key, "Origin": f"http://{host}"}):
             status, headers, _ = exchange("GET", sent, path="/v1/models")
             self.assertEqual(status, 200)
             self.assertIsNone(headers["Access-Control-Allow-Origin"])
+            self.assertIsNone(headers["Access-Control-Expose-Headers"])
         self.assertEqual(len(runtime.requests), 2)
 
     def test_every_origin_is_admitted_when_asked(self):
@@ -274,6 +280,10 @@ class ServerAccessTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
                 self.assertIsNone(response.headers["Vary"])
+                self.assertEqual(
+                    response.headers["Access-Control-Expose-Headers"],
+                    "Retry-After, WWW-Authenticate",
+                )
 
     def test_refused_origins_are_logged_once_each_and_bounded(self):
         log = server.RefusedOriginLog()
