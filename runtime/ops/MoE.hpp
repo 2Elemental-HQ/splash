@@ -76,17 +76,17 @@ struct AffineMoeWeights final {
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
 // Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
-// The measured Apple10 crossover is about 26 rows per GPU core, with a
-// 20-core fallback when the core count is unknown. Both tiles preserve scores.
+// The measured Apple10 crossover is about 26 rows per GPU core; an unknown
+// core count plans for ops::kAssumedGpuCores (Linear.hpp). Both tiles
+// preserve scores.
 struct MoeRouteTile final {
   uint32_t rows;
   uint32_t experts;
 };
-inline constexpr uint32_t kMoeRouteWideRows = 512;
 inline constexpr uint32_t kMoeRouteRowsPerCore = 26;
 
-[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t gpuCores) noexcept {
-  return gpuCores ? gpuCores * kMoeRouteRowsPerCore : kMoeRouteWideRows;
+[[nodiscard]] constexpr uint32_t moeRouteWideRows(uint32_t plannedCores) noexcept {
+  return plannedCores * kMoeRouteRowsPerCore;
 }
 
 [[nodiscard]] constexpr MoeRouteTile
@@ -249,7 +249,7 @@ struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
   // plans derive it from the GPU core count.
-  uint32_t routeWideRows = kMoeRouteWideRows;
+  uint32_t routeWideRows = moeRouteWideRows(kAssumedGpuCores);
   // Simdgroups of the affine 8-row expert tiles, which decode plans run; the
   // execution plans derive it from the GPU family for decode plans and keep
   // eight for prefill plans.

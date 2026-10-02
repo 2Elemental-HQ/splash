@@ -46,7 +46,7 @@ private:
   [[nodiscard]] MoeConfig moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const;
 
   Linear linear_;
-  uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
+  uint32_t moeRouteWideRows_;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
   uint32_t appleGpuFamily_ = 0;
 };

@@ -24,7 +24,7 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
+    : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
       appleGpuFamily_(device.appleGpuFamily) {}
 

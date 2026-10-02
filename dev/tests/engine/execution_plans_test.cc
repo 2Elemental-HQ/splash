@@ -228,15 +228,39 @@ void ggufMoePlans() {
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
   // The register tile reads GGUF 8-row tiles only.
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
                                                        MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, kMoeRouteWideRows,
+  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
                                                  MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
   // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
   // ones for 32-row prefill and 8-row decode tiles.
   rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
+}
+
+// A device that reports no core count gets the plans of kAssumedGpuCores
+// cores, Linear and MoE alike.
+void unknownCoreCount() {
+  for (uint32_t family : {9U, 10U}) {
+    DeviceCapabilities assumed = device(family);
+    assumed.gpuCoreCount = kAssumedGpuCores;
+    const ExecutionPlans unknown(device(family)), planned(assumed);
+    for (auto matrix : matrices)
+      for (auto layout : {WeightLayout::Affine64, WeightLayout::Block32})
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+            const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue, layout};
+            require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
+                    "an unknown core count planned a decode projection for other than the assumed cores");
+          }
+    MoeShape block = routedShape;
+    block.weightLayout = WeightLayout::Block32;
+    for (auto shape : {routedShape, block})
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        require(unknown.moeDecode(shape, lanes).configuration() == planned.moeDecode(shape, lanes).configuration(),
+                "an unknown core count planned a MoE decode step for other than the assumed cores");
+  }
 }
 
 void workspaceBounds() {
@@ -301,6 +325,7 @@ int main() {
     baselinePlans();
     moeDeviceTiles();
     ggufMoePlans();
+    unknownCoreCount();
     workspaceBounds();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "

@@ -205,6 +205,15 @@ struct LinearDispatchStats final {
   uint64_t m32Dispatches = 0;
 };
 
+// Missing core metadata uses one intermediate estimate for all families.
+// This is a fallback, not a calibrated optimum. Reported counts always win.
+inline constexpr uint32_t kAssumedGpuCores = 32;
+// The GPU core count kernel policy plans for: the reported one, or
+// kAssumedGpuCores when the device does not report it.
+[[nodiscard]] constexpr uint32_t plannedGpuCores(const DeviceCapabilities &device) noexcept {
+  return device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores;
+}
+
 // Owns projection pipeline selection and dispatch for both weight layouts.
 // Device policy uses GPU family, core count and workload tile counts.
 class Linear final {

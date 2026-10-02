@@ -372,9 +372,6 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // wide-tile rule below; it was sized for them and remains unremeasured there.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
-// Missing core metadata uses one intermediate estimate for all families.
-// This is a fallback, not a calibrated optimum. Reported counts always win.
-constexpr uint32_t kAssumedGpuCores = 32;
 
 // Apple10 and later decode split K across the threadgroups of the Split128
 // tile (256 threads) by one rule at every batch width: the largest power of
@@ -422,7 +419,7 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 
 Linear::Linear(const DeviceCapabilities &device) noexcept
     : appleGpuFamily_(device.appleGpuFamily),
-      gpuCores_(device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores) {}
+      gpuCores_(plannedGpuCores(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   return plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None, shape.layout})

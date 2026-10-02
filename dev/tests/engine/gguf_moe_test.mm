@@ -56,6 +56,7 @@ using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
 using splash::ops::MoeScratchField;
+using splash::ops::kAssumedGpuCores;
 using splash::ops::kMoeScratchFields;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
@@ -63,6 +64,7 @@ using splash::ops::MoeGgufTile;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::MoeWeights;
+using splash::ops::moeRouteWideRows;
 using splash::ops::LinearEpilogue;
 using splash::ops::LinearMatrix;
 using splash::ops::LinearPhase;
@@ -588,7 +590,8 @@ int moe(MetalBackend &backend) {
       std::vector<uint16_t> widest;
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
         const MoePlan plan = MoE::decodePlan(
-            shape, lanes, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
+            shape, lanes,
+            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                   std::to_string(lanes);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
@@ -603,7 +606,8 @@ int moe(MetalBackend &backend) {
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
         const MoePlan plan = MoE::prefillPlan(
-            shape, chunk, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
+            shape, chunk,
+            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
                                   std::to_string(chunk);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);

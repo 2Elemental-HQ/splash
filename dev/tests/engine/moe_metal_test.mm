@@ -41,7 +41,7 @@ using splash::model::q4PackedBytes;
 using splash::ops::AffineMoeWeights;
 using splash::ops::ExecutionPlans;
 using splash::ops::ExpertProjection;
-using splash::ops::kMoeRouteWideRows;
+using splash::ops::kAssumedGpuCores;
 using splash::ops::kMoeScratchFields;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
@@ -50,6 +50,7 @@ using splash::ops::MoeScratchField;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoePhase;
+using splash::ops::moeRouteWideRows;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::MoeWeights;
@@ -62,8 +63,11 @@ constexpr uint32_t kIntermediate = 512;
 constexpr uint32_t kExperts = 8;
 constexpr uint32_t kTopK = 2;
 constexpr uint32_t kRoutesPerRow = kTopK + 1;
-// Covers both router tiles: 8-row tiles below kMoeRouteWideRows and 32-row
-// tiles with a ragged 8-row tail above it.
+// The planned GPU: 20 cores, whose router takes the 32-row scores tile from
+// moeRouteWideRows(20) = 520 rows.
+constexpr uint32_t kGpuCores = 20;
+// Covers both router tiles: 8-row tiles below 520 rows and 32-row tiles with
+// a ragged 8-row tail from there.
 constexpr uint32_t kMaximumRows = 520;
 constexpr uint32_t kStorageColumns = 256;
 
@@ -90,13 +94,12 @@ private:
   uint64_t state_;
 };
 
-// The production plans of a GPU of `family` whose core count is unknown, so
-// every plan keeps the shipped router threshold (kMoeRouteWideRows): family 9
-// decodes with the four-simdgroup 8-row tiles, other families with the
-// shipped eight.
+// The production plans of a kGpuCores-core GPU of `family`: family 9 decodes
+// with the four-simdgroup 8-row tiles, other families with the shipped eight.
 ExecutionPlans plans(uint32_t family) {
   splash::DeviceCapabilities device;
   device.appleGpuFamily = family;
+  device.gpuCoreCount = kGpuCores;
   return ExecutionPlans(device);
 }
 
@@ -547,37 +550,33 @@ void checkPlan(const MoePlan &plan) {
 }
 
 void planBounds() {
-  // The wide-tile threshold scales with core count; unknown counts use the
-  // measured 512-row fallback.
-  require(splash::ops::moeRouteWideRows(20) == 520 &&
-              splash::ops::moeRouteWideRows(40) == 1040 &&
-              splash::ops::moeRouteWideRows(10) == 260 &&
-              splash::ops::moeRouteWideRows(0) == 512,
+  // The wide-tile threshold scales with the planned core count.
+  require(moeRouteWideRows(20) == 520 && moeRouteWideRows(40) == 1040 && moeRouteWideRows(10) == 260,
           "router wide-tile threshold does not scale with the core count");
   require(splash::ops::moeRouteTile(519, 520).rows == 8 &&
               splash::ops::moeRouteTile(520, 520).rows == 32 &&
-              splash::ops::moeRouteTile(512, kMoeRouteWideRows).rows == 32,
+              splash::ops::moeRouteTile(832, moeRouteWideRows(kAssumedGpuCores)).rows == 32,
           "router tile selection ignores the configured threshold");
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
     const ExecutionPlans shipped = plans(10);
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
       const MoePlan plan = shipped.moePrefill(shape, rows);
-      require(plan.configuration() == MoeConfig{MoeExpertTile::M32} && plan.splitExperts() &&
-                  plan.rows() == rows,
+      require(plan.configuration() == MoeConfig{MoeExpertTile::M32, moeRouteWideRows(kGpuCores)} &&
+                  plan.splitExperts() && plan.rows() == rows,
               "prefill plans run the split 32-row expert passes over their actual rows");
       checkPlan(plan);
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = shipped.moeDecode(shape, lanes);
-      require(plan.configuration() == MoeConfig{MoeExpertTile::M8} && !plan.splitExperts() &&
-                  plan.rows() == lanes * 8,
+      require(plan.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)} &&
+                  !plan.splitExperts() && plan.rows() == lanes * 8,
               "decode plans run the fused 8-row expert tile over the DFlash rows");
       checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped plan.
       const MoePlan narrow = plans(9).moeDecode(shape, lanes);
-      require(narrow.configuration() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
+      require(narrow.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores),
                                                   MoeExpertSimdgroups::Four} &&
                   narrow.rows() == plan.rows() && narrow.tileRows() == plan.tileRows() &&
                   narrow.maximumTiles() == plan.maximumTiles() && !narrow.splitExperts() &&
@@ -594,7 +593,7 @@ void planBounds() {
             "affine 8-row prefill tile");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
             "affine 32-row decode tile");
-    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
+    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, moeRouteWideRows(kGpuCores),
                                                   static_cast<MoeExpertSimdgroups>(6)}); },
             "uncompiled expert simdgroups");
   }
@@ -917,10 +916,10 @@ void run(const std::string &metallibPath) {
                    label + " four-simdgroup");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
-    // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
+    // 33 and 263 leave 8-row ones next to full tiles; 519/520 straddle the
     // wide router tile threshold.
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
-                          255U, 256U, 263U, 511U, 512U, kMaximumRows})
+                          255U, 256U, 263U, 519U, kMaximumRows})
       (void)execute(shipped.moePrefill(fixture.shape, rows), "prefill rows=" + std::to_string(rows));
   }
   std::cout << "moe_metal_test: PASS cases=" << cases
