@@ -122,6 +122,8 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
     dispatch.threadgroups = {1, 1, 1};
     dispatch.threadsPerThreadgroup = {1, 1, 1};
+    // Creates the pipeline, whose creation samples memory, before counting.
+    (void)backend.submit(dispatch);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -136,6 +138,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
                              reinterpret_cast<IMP>(delayedCompletionMemoryQuery));
     originalAllocatedSize = memory.original;
     auto ticket = backend.submitAsync(dispatch);
+    const bool sampledOnSubmission = memoryQueries != 0;
     const bool completed = gpuDone.wait_for(std::chrono::seconds(5)) ==
                            std::future_status::ready;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -149,6 +152,8 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     require(callbackDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
             "completion handler did not drain after telemetry was released");
     require(completed, "test GPU command did not complete");
+    require(!sampledOnSubmission,
+            "submission sampled device memory while the GPU idled");
     require(ready && healthy && completionMemoryQueries == 0,
             "completed GPU work depends on memory telemetry and can trip the watchdog");
     require(memoryQueries > queriesBeforeConsumption,
@@ -157,7 +162,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     (void)ticket.wait();
     require(memoryQueries == queriesAfterConsumption,
             "an already-released ticket queried device memory again");
-    require(*static_cast<uint32_t *>(buffer.contents()) == increment,
+    require(*static_cast<uint32_t *>(buffer.contents()) == 2 * increment,
             "completion telemetry test produced the wrong result");
     std::cout << "PASS GPU completion independent of memory telemetry\n";
 }
@@ -1009,6 +1014,29 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
 }
 
+// Bindings of consecutive entries reach Metal as one run, each buffer at its
+// own offset, in whatever order the dispatch lists them.
+void bindingRunsKeepOffsets(MetalBackend &backend) {
+    constexpr uint32_t kWords = 8, count = 4;
+    MetalBuffer source = backend.allocateBuffer(kWords * sizeof(uint32_t));
+    MetalBuffer destination = backend.allocateBuffer(kWords * sizeof(uint32_t));
+    auto *in = static_cast<uint32_t *>(source.contents());
+    auto *out = static_cast<uint32_t *>(destination.contents());
+    for (uint32_t word = 0; word < kWords; ++word) {
+        in[word] = 100 + word;
+        out[word] = 0;
+    }
+    const ComputeDispatch dispatch{"test_copy_u32",
+        {{1, backend.view(destination, 4 * sizeof(uint32_t), 4 * sizeof(uint32_t))},
+         {0, backend.view(source, 2 * sizeof(uint32_t), 4 * sizeof(uint32_t))}},
+        {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}};
+    (void)backend.submit(dispatch);
+    for (uint32_t word = 0; word < kWords; ++word) {
+        require(out[word] == (word < 4 ? 0 : 98 + word),
+                "a run of bindings lost a buffer's entry or offset");
+    }
+}
+
 void sharedMemoryCompletionLifetime(MetalBackend &backend) {
     struct Gate {
         std::mutex mutex;
@@ -1309,6 +1337,7 @@ void run(const std::string &metallibPath) {
     require(backend.memoryStats().allocatedBytes == 0,
             "private allocation release was not tracked");
 
+    bindingRunsKeepOffsets(backend);
     sharedMemoryCompletionLifetime(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");

@@ -170,7 +170,8 @@ struct MetalMemoryStats {
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
   // Highest sampled device.currentAllocatedSize. Sampled after allocations
-  // and pipeline creation, before submission, and on host-side retirement.
+  // and pipeline creation, on host-side retirement and whenever admission
+  // refreshes the stats.
   uint64_t devicePeakAllocatedBytes = 0;
 };
 

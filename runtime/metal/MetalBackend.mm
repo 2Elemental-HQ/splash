@@ -11,7 +11,9 @@
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -21,7 +23,6 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include <unistd.h>
@@ -432,8 +433,9 @@ struct CommandTicket::State {
             }
         }
         if (shouldRelease && backend) {
-            // Refresh admission telemetry on the consuming thread after GPU
-            // completion, before allowing the next submission.
+            // Refresh the cached device telemetry, which status reports, on
+            // the consuming thread after GPU completion; admission samples
+            // its own (refreshMemoryStats).
             if (backend->healthy.load(std::memory_order_acquire))
                 backend->sampleDeviceMemory();
             backend->releaseSubmission(sequence);
@@ -493,6 +495,8 @@ struct MetalBackend::Impl {
         MTLSize groups{};
         MTLSize threads{};
         uint64_t threadCount = 0;
+        // The argument table entries its buffers take, one bit each.
+        uint32_t bufferIndices = 0;
         __strong id<MTLComputePipelineState> pipeline = nil;
     };
 
@@ -596,6 +600,7 @@ struct MetalBackend::Impl {
         }
         PreparedCommand command;
         command.dispatches.reserve(dispatches.size());
+        size_t bindings = 0;
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
@@ -639,6 +644,7 @@ struct MetalBackend::Impl {
                         "compute dispatch buffer belongs to another backend");
                 }
                 claim(binding.index);
+                item.bufferIndices |= uint32_t{1} << binding.index;
             }
             for (const BytesBinding &binding : dispatch.bytes) {
                 if (!binding.data || !binding.sizeBytes) {
@@ -646,6 +652,7 @@ struct MetalBackend::Impl {
                 }
                 claim(binding.index);
             }
+            bindings += dispatch.buffers.size();
             command.dispatches.push_back(item);
         }
 
@@ -658,15 +665,23 @@ struct MetalBackend::Impl {
             }
         }
 
-        std::unordered_set<const MetalAllocation *> retained;
+        // Each allocation the command binds, once.
+        std::vector<const std::shared_ptr<MetalAllocation> *> bound;
+        bound.reserve(bindings);
         for (const ComputeDispatch &dispatch : dispatches) {
-            for (const BufferBinding &binding : dispatch.buffers) {
-                const auto &allocation = binding.buffer.impl_->allocation;
-                if (retained.insert(allocation.get()).second) {
-                    command.retainedAllocations.push_back(allocation);
-                }
-            }
+            for (const BufferBinding &binding : dispatch.buffers)
+                bound.push_back(&binding.buffer.impl_->allocation);
         }
+        const auto allocation =
+            [](const std::shared_ptr<MetalAllocation> *owner) {
+                return owner->get();
+            };
+        std::ranges::sort(bound, {}, allocation);
+        const auto repeated = std::ranges::unique(bound, {}, allocation);
+        bound.erase(repeated.begin(), repeated.end());
+        command.retainedAllocations.reserve(bound.size());
+        for (const std::shared_ptr<MetalAllocation> *owner : bound)
+            command.retainedAllocations.push_back(*owner);
         return command;
     }
 
@@ -704,14 +719,27 @@ struct MetalBackend::Impl {
             if (!encoder) {
                 failBeforeCommit("unable to create Metal compute encoder");
             }
+            // Indexed by argument table entry. The ticket and the dispatches
+            // keep the buffers alive.
+            __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
+            NSUInteger offsets[kBufferArgumentEntries];
             for (const PreparedDispatch &item : dispatches) {
                 const ComputeDispatch &dispatch = *item.source;
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                    [encoder setBuffer:buffer.allocation->buffer
-                                offset:buffer.offsetBytes
-                               atIndex:binding.index];
+                    buffers[binding.index] = buffer.allocation->buffer;
+                    offsets[binding.index] = buffer.offsetBytes;
+                }
+                // One call per run of consecutive entries: a command graph's
+                // dispatch binds a single run.
+                for (uint32_t unbound = item.bufferIndices; unbound;) {
+                    const uint32_t first = std::countr_zero(unbound);
+                    const uint32_t count = std::countr_one(unbound >> first);
+                    [encoder setBuffers:buffers + first
+                                offsets:offsets + first
+                              withRange:NSMakeRange(first, count)];
+                    unbound &= ~(((uint32_t{1} << count) - 1) << first);
                 }
                 for (const BytesBinding &binding : dispatch.bytes) {
                     [encoder setBytes:binding.data
@@ -724,14 +752,13 @@ struct MetalBackend::Impl {
             [encoder endEncoding];
 
             // Driver callbacks only complete the ticket. Device-wide memory
-            // telemetry is sampled on the host before submission and when
-            // consuming the result. The handler holds the ticket's state
-            // strongly: once a waiter gives up on the command, it keeps the
-            // retained allocations until the GPU ends.
+            // telemetry is sampled on the host when consuming the result. The
+            // handler holds the ticket's state strongly: once a waiter gives
+            // up on the command, it keeps the retained allocations until the
+            // GPU ends.
             [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                 ticketState->finishCommand(completed);
             }];
-            sampleDeviceMemory();
             residency->use();
             asyncState->commitSubmission(ticketState->sequence, command,
                 [weakTicket = std::weak_ptr(ticketState)](
