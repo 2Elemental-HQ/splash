@@ -334,6 +334,33 @@ struct Runtime::Impl {
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
+    preparePolicyPipelines();
+  }
+
+  // Warmup selects greedily, so the first sampled, penalized or constrained
+  // request would compile the policy's kernels inside its TTFT and stall the
+  // engine meanwhile; compile them now. A sampled, penalized and constrained
+  // lane and a greedy one reach every kernel the first-token and verify
+  // selections dispatch.
+  void preparePolicyPipelines() const {
+    const ops::SamplingPolicy sampled{.topK = 0,
+                                      .temperature = 1.0F,
+                                      .topP = 0.95F,
+                                      .constrained = true,
+                                      .penalties = {1.1F, 0.5F, 0.5F},
+                                      .minP = 0.05F};
+    const std::array<ops::SamplingPolicy, 2> policies{
+        sampled, {.topK = 1, .temperature = 0.0F}};
+    const std::array<uint32_t, 2> stateLanes{0, 1};
+    const ops::PenaltyTable penalties{penaltyTable, stateLanes};
+    CommandGraph graph;
+    sampling.addInitial(graph, sampled, samplingBuffersForLane(0), 0,
+                        geometry.target.stopTokens[0],
+                        geometry.target.stopTokens[1], penalties);
+    sampling.addVerify(graph, policies, samplingBuffers(2),
+                       geometry.target.stopTokens[0],
+                       geometry.target.stopTokens[1], penalties);
+    backend.preparePipelines(graph.dispatches());
   }
 
   Request &request(uint64_t id) {

@@ -1103,6 +1103,12 @@ CommandTicket MetalBackend::submitCommandAsync(
                          std::move(completion));
 }
 
+void MetalBackend::preparePipelines(
+    std::span<const ComputeDispatch> dispatches) {
+    checkOperation();
+    static_cast<void>(impl_->prepare(dispatches));
+}
+
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {
     // Reading MTLDevice.currentAllocatedSize can synchronize with an active
     // command on some Apple GPUs. Every allocation and command lifecycle

@@ -1659,6 +1659,29 @@ int main(int argc, char **argv) {
               << " decode_cycle_wall_seconds="
               << telemetry.lastDecodeWallSeconds << '\n';
 
+    // The runtime builds every policy kernel when it is constructed: after
+    // a greedy first token and verify, a sampled, penalized request's
+    // compile nothing more.
+    {
+      const size_t pipelines = BackendInstrumentation::cachedPipelines(backend);
+      EngineRequest sampled = makeRequest(2, prompt128, 16);
+      sampled.sampling = {
+          .temperature = 1.0F, .topP = 0.95F, .topK = 0, .seed = 4242};
+      sampled.sampling.minP = 0.05F;
+      sampled.sampling.repetitionPenalty = 1.1F;
+      sampled.sampling.presencePenalty = 0.5F;
+      sampled.sampling.frequencyPenalty = 0.5F;
+      beginCold(executor, sampled, 1);
+      const std::vector<uint32_t> sampledPages = pageRange(8, 8);
+      static_cast<void>(firstStep(
+          executor, prefillChunk(executor, 2, 0, prompt128, sampledPages), 2,
+          128, sampledPages));
+      require(BackendInstrumentation::cachedPipelines(backend) == pipelines,
+              "a sampled, penalized request compiled a pipeline the runtime "
+              "had not built at construction");
+      executor.end(2);
+    }
+
     executor.end(1);
     EngineRequest reusedId = makeRequest(1, {1}, 1);
     beginCold(executor, reusedId, 0);

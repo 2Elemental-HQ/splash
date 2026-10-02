@@ -645,6 +645,39 @@ void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
     std::cout << "PASS dispatch profiling covers every command\n";
 }
 
+// Preparing a dispatch compiles its pipeline without submitting anything, so
+// its submission compiles nothing, and rejects what submission would.
+void preparedPipelinesCompileAhead(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, increment = 1;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    backend.preparePipelines({&dispatch, 1});
+    require(BackendInstrumentation::cachedPipelines(backend) == 1 &&
+                BackendInstrumentation::submittedCommands(backend) == 0 &&
+                *value == 0,
+            "preparing a dispatch did more than compile its pipeline");
+    (void)backend.submit(dispatch);
+    require(BackendInstrumentation::cachedPipelines(backend) == 1 && *value == 1,
+            "submitting a prepared dispatch compiled its pipeline again");
+    ComputeDispatch oversized = dispatch;
+    oversized.threadsPerThreadgroup = {4096, 1, 1};
+    requireBackendError([&] { backend.preparePipelines({&oversized, 1}); },
+                        "a dispatch past its pipeline's thread limit was prepared");
+    ComputeDispatch missing = dispatch;
+    missing.pipelineName = "does_not_exist";
+    requireBackendError([&] { backend.preparePipelines({&missing, 1}); },
+                        "a dispatch of a missing function was prepared");
+    require(backend.healthy() &&
+                BackendInstrumentation::submittedCommands(backend) == 1,
+            "a rejected preparation poisoned the backend or submitted work");
+    std::cout << "PASS prepared pipelines compile ahead\n";
+}
+
 std::atomic<unsigned> blitEncoders{0};
 std::atomic<unsigned> computeEncoders{0};
 IMP originalBlitEncoder = nullptr;
@@ -1374,6 +1407,7 @@ int main(int argc, const char *argv[]) {
             shutdownLeavesTicketTeardownToTheCommand(argv[1]);
             shutdownSparesACommandThatCompletes(argv[1]);
             dispatchProfilingCoversEveryCommand(argv[1]);
+            preparedPipelinesCompileAhead(argv[1]);
             buffersStayResident(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);

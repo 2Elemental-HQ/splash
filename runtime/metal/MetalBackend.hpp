@@ -272,6 +272,11 @@ public:
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
 
+  // Startup: compiles now the pipelines a later submission of these
+  // dispatches would compile. Validates them as submission does and throws
+  // as it would, but encodes and commits nothing.
+  void preparePipelines(std::span<const ComputeDispatch> dispatches);
+
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
   // control-plane status query must use memoryStats() so it can never wait
