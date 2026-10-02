@@ -197,8 +197,6 @@ public:
                bool restoreDraftState) override {
     if (!state)
       throw std::runtime_error("empty restore state");
-    if (restoreObserver)
-      restoreObserver();
     requests.at(id).position = length;
     restored += length;
     restoredDraft = restoreDraftState;
@@ -454,7 +452,6 @@ public:
   bool resumeDenied = false;
   uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;
-  std::function<void()> restoreObserver;
   std::function<void()> snapshotObserver;
   std::function<bool()> snapshotRoom;
   std::function<bool()> beginGrowthBlocked;
@@ -1315,6 +1312,30 @@ void testCancellationAfterJunctionDiscardsLaterState() {
               cancelled.cancelled == 1 && executor.requests.empty() &&
               cancelled.resources.activeRequests == 0,
           "cancellation leaked or removed the wrong sparse state");
+}
+
+// A publication's expected refusals are values (a null snapshot, a refused
+// disk write). An exception is a broken invariant: it ends the engine
+// instead of counting as a failed publication.
+void testPublicationInvariantFailureIsFatal() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  executor.snapshotObserver = [] { throw std::logic_error("snapshot invariant"); };
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(3, std::vector<uint32_t>(65, 7)));
+  bool threw = false;
+  try {
+    for (double now = 1; now < 32; ++now)
+      static_cast<void>(engine.tick(now));
+  } catch (const std::logic_error &error) {
+    threw = std::string(error.what()) == "snapshot invariant";
+  }
+  require(threw && engine.snapshot().replayStatePublicationFailures == 0,
+          "a broken publication invariant was counted as a failed publication");
 }
 
 // Nothing is reserved at admission, so a boundary the model cannot snapshot
@@ -2674,34 +2695,6 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
               engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0 &&
               resources.snapshot().lookup.lookups == 2,
           "admission waited on its own cache pin instead of recomputing cold");
-}
-
-// A model failure while a request is admitted is engine-fatal, but the
-// admission first returns what it took: the model's state cell, the restored
-// KV pages and the cache lease.
-void testFailedAdmissionReturnsWhatItTook() {
-  test::TestKvStorage storage(16, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
-  Executor executor(1);
-  Events events;
-  engine::Engine engine({}, resources, executor, events);
-  guardReleases(storage, engine);
-  const std::vector<uint32_t> prompt(65, 7);
-  engine.submit(request(1, prompt));
-  runUntilIdle(engine);
-  executor.restoreObserver = [] { throw std::runtime_error("restore failed"); };
-  engine.submit(request(2, prompt));
-  bool threw = false;
-  try {
-    static_cast<void>(engine.tick(100));
-  } catch (const std::runtime_error &) {
-    threw = true;
-  }
-  const auto after = resources.snapshot();
-  require(threw && executor.requests.empty() && after.activeRequests == 0 &&
-              after.pool.pagesActive == 0 && after.stateCache.pinned == 0,
-          "failed admission kept its state cell, KV pages or cache lease");
 }
 
 void testSingletonCapacityFailureTerminatesCleanly() {
@@ -7331,6 +7324,7 @@ int main() {
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
+    testPublicationInvariantFailureIsFatal();
     testDeniedSnapshotCostsOnlyThatAttempt();
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
@@ -7368,7 +7362,6 @@ int main() {
     testRequiredWorkDoesNotReserveAnExtraPage();
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
-    testFailedAdmissionReturnsWhatItTook();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();

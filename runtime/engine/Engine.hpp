@@ -89,6 +89,17 @@ struct EngineSnapshot final {
 
 // KV blocks define prefix identity; composite recurrent state is attached
 // at sparse progress points, replay boundaries, and shared KV junctions.
+//
+// Failure contract. A request the engine cannot serve ends with its own
+// failure event (EngineEventSink::failed), which the engine reports and
+// survives. submit() reports an invalid request with std::invalid_argument,
+// which the caller answers with that request's error, and provideMask()
+// reports unusable mask contents the same way. Any other exception out of
+// submit() or provideMask(), and every exception out of tick(), cancel(),
+// failRequest() and reclaimMemory(), is engine-fatal: NativeRuntime reports
+// EngineUnhealthy and the process exits. Code below them therefore does not
+// roll back on an exception; the only cleanup on that path is RAII teardown
+// itself needs (state IO drains, FileRestore, Serving).
 class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,

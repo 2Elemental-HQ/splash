@@ -189,7 +189,8 @@ public:
 };
 
 // A normal capacity failure. Callers may evict cache or return a retryable
-// admission error; the Metal backend remains healthy.
+// admission error; the Metal backend remains healthy. MemoryGovernor's
+// allocationAdmission is the one place it becomes a value (AllocationResult).
 class MetalAllocationError final : public MetalBackendError {
 public:
   explicit MetalAllocationError(

@@ -1940,15 +1940,10 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.slot = stateSlot;
   entry.resident = true;
   impl_->adoptImages(entry, std::move(images));
-  try {
-    impl_->bindPenalties(entry, request.prompt);
-    auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
-    if (!inserted) {
-      throw std::logic_error("request insertion lost uniqueness");
-    }
-  } catch (...) {
-    impl_->states.releaseSlot(stateSlot, request.id);
-    throw;
+  impl_->bindPenalties(entry, request.prompt);
+  auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
+  if (!inserted) {
+    throw std::logic_error("request insertion lost uniqueness");
   }
   return {};
 }

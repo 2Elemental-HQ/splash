@@ -29,6 +29,7 @@ public:
 class Executor final : public model::Model {
 public:
   std::shared_ptr<std::atomic<bool>> ticketReady;
+  std::function<void()> onBegin;
   std::function<void()> onSubmit;
   std::function<void()> onHealthCheck;
   // Score requests whose final prompt chunk reports a per-lane model failure.
@@ -45,6 +46,8 @@ public:
       onHealthCheck();
   }
   StateAdmission begin(const ModelRequest &request) override {
+    if (onBegin)
+      onBegin();
     beganFlags[request.id] = request.flags;
     beganSampling[request.id] = request.sampling;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
@@ -794,6 +797,41 @@ void testControlFailureUsesExecutionBoundary() {
   }
 }
 
+// An exception while the engine admits a request is engine-fatal: nothing
+// below the engine rolls back, and the loop reports it once.
+void testAdmissionExceptionStopsTheEngineOnce() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.onBegin = [] { throw std::runtime_error("begin failed"); };
+  std::vector<uint8_t> output;
+  engine::NativeRuntime loop(
+      {}, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  const auto wire = protocol::serializeMessage(protocol::Message{request(1)});
+  require(wire && loop.receive(*wire.value), "admission fixture was refused");
+  require(!loop.tick() && !loop.engineHealthy() && loop.connectionMustClose(),
+          "an admission exception did not stop the engine");
+  uint32_t errors = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+      require(error->requestId == 0 &&
+                  error->failureClass == protocol::FailureClass::EngineUnhealthy &&
+                  error->code == "engine_execution_failed" &&
+                  error->message == "begin failed",
+              "an admission exception lost its engine failure");
+      ++errors;
+    }
+  }
+  require(errors == 1, "an admission exception was reported more than once");
+}
+
 // Every path that stops the engine keeps its reason for the exit log, not
 // only the ones that report through engineError().
 void testEngineFailureNamesItsReason() {
@@ -1382,6 +1420,7 @@ int main() {
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
     testControlFailureUsesExecutionBoundary();
+    testAdmissionExceptionStopsTheEngineOnce();
     testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
