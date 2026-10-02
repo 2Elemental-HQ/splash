@@ -167,7 +167,10 @@ struct DispatchTiming {
 // without blocking the submitting thread; wait() is normally called only
 // after the host event loop receives the completion notification.
 // Destroying or replacing an unfinished ticket waits for GPU completion and
-// retains its allocations throughout that wait.
+// retains its allocations throughout that wait. Each of these waits runs the
+// command watchdog every second: once the watchdog gives up on the command,
+// wait() throws MetalBackendError and destruction or replacement returns,
+// leaving the allocations to the command's completion handler.
 class CommandTicket final {
 public:
   CommandTicket();
@@ -384,6 +387,7 @@ public:
   // Serving-loop check of actual GPU commands and pending unmaps. Terminal
   // results may invoke completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
+  // A synchronous ticket wait runs the same command watchdog.
   void checkHealth();
   [[nodiscard]] bool needsHealthCheck() const noexcept;
   [[nodiscard]] std::string unhealthyReason() const;
