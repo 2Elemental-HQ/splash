@@ -70,8 +70,9 @@ struct ResourceWaitSnapshot final {
   uint32_t concurrency = 0;
   // Requests that admission holds back behind the first one refused memory,
   // whatever they wait for themselves, and that request itself while a pass
-  // keeps it out of its memory wait. During recovery only suspended
-  // requests are admitted, and only they count.
+  // keeps it out of its memory wait. During recovery only suspended requests
+  // and those of a strictly higher priority are admitted, and only they
+  // count.
   uint32_t heldBehindRefusal = 0;
   // Requests admitted into a restore of their prefix from disk, waiting for
   // its reads rather than for memory.
@@ -104,6 +105,8 @@ struct EngineSnapshot final {
   uint64_t checkpointPublications = 0;
   uint64_t checkpointPublicationFailures = 0;
   uint64_t resourceSuspensions = 0;
+  // Resident lanes suspended for a request of a strictly higher priority.
+  uint64_t prioritySuspensions = 0;
   uint64_t resourceResumptions = 0;
   // All prefill rows after preemption, including an unfinished prompt suffix.
   uint64_t resourceReplayTokens = 0;
@@ -357,7 +360,7 @@ private:
   // The resident lane in prefill or decode that yields first when every
   // lane's growth fails (yieldsBefore; on a tie, the later submission), or
   // nullptr without one. prepare() gates that lane's growth and suspends
-  // that lane.
+  // that lane; preemptBelow() suspends it for a higher priority.
   [[nodiscard]] Request *laneToYield();
   // Runs one allocation of a lane's state or of KV pages, reclaiming cache
   // up to class upTo between attempts while that makes progress: what is in
@@ -372,9 +375,25 @@ private:
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {})
       -> Allocation<std::invoke_result_t<Attempt &>>;
+  // Takes a resident request's lane: its state cell and KV pages go back,
+  // and it waits, for `reason`, until admission resumes it with room for
+  // workEnd tokens of KV to replay its history from the cache.
+  void suspendLane(Request &request, uint64_t workEnd, metal::AllocationFailure failure,
+                   StateFailure reason, double nowMilliseconds);
+  // A lane that could not grow yields its memory: it waits for memory, and
+  // resident lanes drain before admission resumes.
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);
+  // The tokens the request's KV pages hold room for.
+  [[nodiscard]] uint64_t kvCapacity(uint64_t requestId) const;
+  // For a request of this priority that cannot start: suspends the lane that
+  // yields first (laneToYield) if its priority is strictly lower, without a
+  // drain. The lane waits as for a free one, and resumes from its current KV
+  // capacity once admission reaches it again. True when one was suspended.
+  // Memory on its way back makes no lane yield, as in prepare(): a request
+  // refused while it is pending waits for it instead.
+  [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
   // The wait keeps the denial's allocation failure for its timeout message.
@@ -427,8 +446,16 @@ private:
   // memory is still short (growth is paused or allocationFailed_), up to the
   // drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
-  // Admission recovers from a suspension: only suspended requests start.
-  [[nodiscard]] bool anySuspended() const;
+  // The highest priority among suspended requests: admission recovers from a
+  // suspension while there is one.
+  [[nodiscard]] std::optional<RequestPriority> suspendedTier() const;
+  // Whether admission tries the request. During recovery (`tier`) only the
+  // requests of a strictly higher priority than every suspended one are,
+  // and, once the drain is over, the suspended ones; the others wait behind
+  // the suspended lanes.
+  [[nodiscard]] static bool admissionTries(const Request &request,
+                                           std::optional<RequestPriority> tier,
+                                           bool draining) noexcept;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // The state cells admit() has obtained so far, including those it gave

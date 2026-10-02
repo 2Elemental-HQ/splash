@@ -797,30 +797,38 @@ preserves visible history without recovering the private reasoning.
 `/status.admission` distinguishes memory and concurrency waits, counts the
 requests held back behind one refused memory (`held_behind_refusal`, the
 refused request included while a pass defers it; during recovery, the suspended
-ones) and those waiting for a disk restore (`restoring`), reports suspended
-requests, recovery draining and the oldest current wait age, which for a request
-holding admission closed runs from when its wait began. Memory transitions
-also appear in the console. When macOS runs short of memory, growth that no
-request in service needs pauses and the cache gives memory back, a paced pass at
-a time, down to one lane's state buffers and one KV extent. A pass counts only
-memory that leaves the engine; a cached state it evicts first refills the lane's
-state buffers it keeps. A request in service keeps growing within
-`--max-memory`, first into cached pages no request holds: it takes cached KV,
-and a cached state only where it sits on the KV that goes next, since a state's
-buffers give it no page.
-A new request waits while another is in service unless it can start from what
-the engine already holds, and with none in service it starts. A request whose
-start was refused memory, under host pressure or at `--max-memory`, holds back
-the requests that arrived after it until it starts, fails or is cancelled, so
-the lanes that finish leave their memory to it; a higher priority is not held
-back. It keeps holding them back while it waits for a prefix another lane is
-computing. After a suspension, suspended requests resume first, one at a time,
-higher priority first and then in the order they arrived; one refused memory
-holds back the suspended requests after it, and their resource waits do not
-run out while it does. Critical pressure evicts every unpinned cache entry and
-stops all growth. `/ready` stays healthy under warning pressure, and reports
-503 while macOS reports critical pressure; requests already running continue,
-and one that needs more memory is suspended until the pressure lifts.
+ones and those of a strictly higher priority) and those waiting for a disk
+restore (`restoring`), reports suspended requests, recovery draining and the
+oldest current wait age, which for a request holding admission closed runs from
+when its wait began. Memory transitions also appear in the console. When macOS
+runs short of memory, growth that no request in service needs pauses and the
+cache gives memory back, a paced pass at a time, down to one lane's state
+buffers and one KV extent. A pass counts only memory that leaves the engine; a
+cached state it evicts first refills the lane's state buffers it keeps. A
+request in service keeps growing within `--max-memory`, first into cached pages
+no request holds: it takes cached KV, and a cached state only where it sits on
+the KV that goes next, since a state's buffers give it no page. A new request
+waits while another is in service unless it can start from what the engine
+already holds, and with none in service it starts. A request whose start was
+refused memory, under host pressure or at `--max-memory`, holds back the
+requests that arrived after it until it starts, fails or is cancelled, so the
+lanes that finish leave their memory to it; a higher priority is not held back.
+It keeps holding them back while it waits for a prefix another lane is
+computing. After a suspension, suspended requests resume before new work of
+their priority or below, one at a time, higher priority first and then in the
+order they arrived; one refused memory holds back the suspended requests after
+it, and their resource waits do not run out while it does. A request of a
+strictly higher priority than every suspended request waits for neither. When
+every lane is taken, or a new request's start is refused memory that no copy
+being written to disk is about to free, the resident of the lowest priority
+below it is suspended for it (`cache.priority_suspensions` in `/status`) and
+resumes once a lane and its memory are free. A new request below the priority
+of a running lane neither starts nor takes a lane until no lane of that
+priority runs, since it could not run before. Critical pressure evicts every
+unpinned cache entry and stops all growth. `/ready` stays healthy under warning
+pressure, and reports 503 while macOS reports critical pressure; requests
+already running continue, and one that needs more memory is suspended until the
+pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and
@@ -1033,14 +1041,16 @@ runs.
 These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
-requests then resume first, each within its own resource wait. A resource
-wait's limit restarts whenever a lane submitted before the waiting request, or
-admitted before the request was first refused memory or was suspended, has
-work in flight, since that lane holds memory the request waits for until it
-finishes; other lanes do not extend it. Readiness does not guarantee that a
-request-sized allocation fits. A request that cannot fit even alone, after
-every cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
-`--max-memory` and `--max-context`; retrying it fails the same way.
+requests then resume first, each within its own resource wait. A request of a
+strictly higher priority than every suspended request waits for neither. A
+resource wait's limit restarts whenever a lane submitted before the waiting
+request, or admitted before the request was first refused memory or was
+suspended, has work in flight, since that lane holds memory the request waits
+for until it finishes; other lanes do not extend it. Readiness does not
+guarantee that a request-sized allocation fits. A request that cannot fit even
+alone, after every cached prefix was evicted, fails with 400
+`capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
+fails the same way.
 
 ### Disk cache
 

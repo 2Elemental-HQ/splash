@@ -216,6 +216,7 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_publication_failures\":"
       << core.checkpointPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
+      << ",\"priority_suspensions\":" << core.prioritySuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"

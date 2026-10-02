@@ -79,6 +79,8 @@ void testCleanRuntimeStatus() {
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
   engine.resourceReplayTokens = 1234;
+  engine.resourceSuspensions = 5;
+  engine.prioritySuspensions = 2;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
@@ -278,6 +280,8 @@ void testCleanRuntimeStatus() {
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
+          json.find("\"resource_suspensions\":5,\"priority_suspensions\":2,") !=
+              std::string::npos &&
           json.find("\"cache\":{\"lookups\":3,\"probe_hashed_blocks\":7,") !=
               std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
