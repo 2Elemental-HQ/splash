@@ -235,11 +235,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       !kv::validFormat(config.kvFormat) ||
       !config.model.valid() ||
       config.buildId.empty() || !config.maximumImagePatches ||
-      config.maximumImagePatches % 4) {
+      config.maximumImagePatches % 4 ||
+      config.maximumImagePatches > ops::kMaximumImagePatches) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
         "metallib path, model root, build id, and a merge-aligned image "
-        "patch limit are required");
+        "patch limit no larger than the protocol's are required");
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {

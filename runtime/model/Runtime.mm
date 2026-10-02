@@ -2825,6 +2825,8 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
   result.stateAllocatedBytes = impl_->states.actualAllocatedBytes();
   result.warmIdleStateCells = impl_->states.idleCells();
+  result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
+  result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   return result;
 }
 

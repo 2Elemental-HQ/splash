@@ -2417,7 +2417,13 @@ def parse_args(argv=None):
         help="decode time owed per unit of prefill time while other requests "
         "decode (default: 0.5; 0 alternates one command each)",
     )
-    parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
+    parser.add_argument(
+        "--max-image-pixels",
+        type=int,
+        default=image_input.MAX_PIXELS,
+        help=f"maximum resized pixels per image (default: {image_input.MAX_PIXELS}); "
+        "also sizes the engine's vision scratch",
+    )
     parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
@@ -2485,6 +2491,10 @@ def _native_command(args):
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
+    if args.max_image_pixels != image_input.MAX_PIXELS:
+        command.extend(
+            ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
+        )
     return command
 
 

@@ -179,6 +179,27 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
                             "reach the model loader");
 }
 
+// The image patch limit is a positive multiple of four up to the
+// protocol's per-image ceiling; anything else is refused before the backend
+// is created.
+void testImagePatchCapIsBounded(const char *metallibPath) {
+  TemporaryModelRoot root;
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  for (const uint32_t patches : {ops::kMaximumImagePatches + 4, 6U}) {
+    config.maximumImagePatches = patches;
+    try {
+      auto resources = RuntimeResources::create(config);
+      throw std::runtime_error("an image patch cap outside the protocol's was accepted");
+    } catch (const RuntimeResourcesError &error) {
+      require(std::string(error.what()).find("[configuration]") != std::string::npos,
+              "an invalid image patch cap was not a configuration error");
+    }
+  }
+  config.maximumImagePatches = 4096;
+  requireReachesModelLoader(config, root.path,
+                            "a smaller image patch cap did not reach the model loader");
+}
+
 // A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
 // with what the runtime needs beside them. Startup refuses it before any
 // weight is prepared or registered.
@@ -294,6 +315,7 @@ int main(int argc, char **argv) {
       testLoadedVisionIsRequiredOnlyWithVision();
       testWeightBudgetBeforeLoading(argv[1]);
       testStateStagingNeedsAStartedTier(argv[1]);
+      testImagePatchCapIsBounded(argv[1]);
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);

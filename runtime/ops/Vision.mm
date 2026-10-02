@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -107,11 +106,10 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
+  // New backend buffers are zero-filled, so padding rows read by whole tiles
+  // start finite.
   arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,
                                   "vision-scratch");
-  // Padding rows and tokens are read by whole tiles but never consumed as
-  // results; zeroed storage guarantees they are finite.
-  std::memset(arena_.contents(), 0, static_cast<size_t>(total));
   uint64_t cursor = 0;
   const auto layout = scratchLayout(model.layout, maximumPatches);
   for (uint32_t index = 0; index < layout.size(); ++index) {

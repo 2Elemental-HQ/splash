@@ -109,8 +109,8 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
-  // Patches per image; the engine sizes its vision scratch from the same
-  // value, so a frame limit violation is never a late allocation failure.
+  // Patches per image the wire accepts; the engine admits only what its
+  // vision scratch covers (EngineConfig::maxImagePatches).
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
 

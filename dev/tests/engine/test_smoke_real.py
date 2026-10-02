@@ -141,6 +141,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
                     with (

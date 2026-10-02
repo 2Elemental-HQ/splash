@@ -67,7 +67,7 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   StateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  uint32_t maximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
 };

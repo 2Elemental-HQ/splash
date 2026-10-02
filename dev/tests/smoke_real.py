@@ -113,6 +113,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.max_image_pixels is not None:
+            command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
@@ -1449,6 +1451,7 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 

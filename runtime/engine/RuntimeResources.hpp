@@ -79,9 +79,9 @@ struct RuntimeResourcesConfig {
   uint64_t maximumMemoryBytes = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
-  // Patches per image the vision scratch covers. The engine admits images up
-  // to it when the model loaded vision and none otherwise; the wire parser's
-  // limit defaults to the same constant.
+  // Patches per image the vision scratch covers, from --max-image-patches;
+  // the engine admits images up to it when the model loaded vision and none
+  // otherwise. The wire parser keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation

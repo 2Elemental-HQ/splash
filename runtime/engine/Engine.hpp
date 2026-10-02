@@ -27,7 +27,8 @@ struct EngineConfig final {
   // reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
-  // Patches per image the model's vision scratch covers; zero rejects images.
+  // Patches per image the server's --max-image-pixels allows and the vision
+  // scratch covers; zero rejects images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Decode time owed for each unit of time a prefill runs while requests of
