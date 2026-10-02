@@ -194,7 +194,6 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
   if (!bytes) {
     throw std::invalid_argument("memory reservation must be positive");
   }
-  std::lock_guard lock(mutex_);
   uint64_t observed = chargedBytes(true);
   bool overflows =
       reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
@@ -252,24 +251,20 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
 }
 
 void MemoryGovernor::setServing(bool serving) noexcept {
-  std::lock_guard lock(mutex_);
   serving_ = serving;
 }
 
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
-  std::lock_guard lock(mutex_);
   systemPressure_ = pressure;
 }
 
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
-  std::lock_guard lock(mutex_);
   reclaimExhausted_ = outcome == ReclaimOutcome::Exhausted;
 }
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
-  std::lock_guard lock(mutex_);
   uint64_t observed = chargedBytes();
   uint64_t used = observed;
   if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
@@ -320,7 +315,6 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
 }
 
 void MemoryGovernor::release(uint64_t bytes) noexcept {
-  std::lock_guard lock(mutex_);
   if (bytes > reservedBytes_) {
     reservedBytes_ = 0;
     return;

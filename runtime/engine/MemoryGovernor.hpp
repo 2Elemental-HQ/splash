@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <optional>
 
 namespace splash::engine {
@@ -147,7 +146,9 @@ private:
 // The sole memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
 // is about to allocate Metal memory. That keeps policy out of MetalBackend
-// and makes every growth operation transactional.
+// and makes every growth operation transactional. Single-threaded: startup,
+// the engine and the control pass all run on the native loop thread; nothing
+// here is synchronized.
 class MemoryGovernor final {
 public:
   using HostAvailableMemoryProvider =
@@ -234,7 +235,6 @@ private:
   uint64_t hostReserveBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
   uint64_t untrackedReserveBytes_ = 0;
-  mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
   uint64_t deniedReservations_ = 0;
