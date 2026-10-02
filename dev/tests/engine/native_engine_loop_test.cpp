@@ -117,7 +117,7 @@ public:
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
       // A constrained request asks for its initial mask before any token.
-      if (plan.cohort == BatchCohort::Constrained &&
+      if (plan.constrained &&
           plan.decodeStage == DecodeStage::RequestInitialMask) {
         results.push_back({item.requestId, 0, {}, false,
                            DecodeStage::ApplyInitialMask, 0, 0});
@@ -212,7 +212,6 @@ protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
   protocol::RequestFrame result;
   result.requestId = id;
   result.priority = RequestPriority::Foreground;
-  result.cohort = protocol::Cohort::Greedy;
   result.constraint = ConstraintMode::None;
   result.absoluteDeadlineUnixMicros = 2'000'000;
   result.remainingDeadlineMicros = 1'000'000;
@@ -503,7 +502,6 @@ void testSamplingReachesTheModel() {
   auto greedy = request(1);
   greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
   auto sampled = request(2);
-  sampled.cohort = protocol::Cohort::Sampling;
   sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f, 0.05f};
   sampled.sampling.seed = 77;
   for (const auto &input : {greedy, sampled}) {
@@ -1472,7 +1470,6 @@ void testConstrainedMaskExchange() {
     };
     auto constrained = request(7);
     constrained.priority = RequestPriority::Background;
-    constrained.cohort = protocol::Cohort::Constrained;
     constrained.constraint = ConstraintMode::TokenMask;
     constrained.absoluteDeadlineUnixMicros = 601'000'000;
     constrained.remainingDeadlineMicros = 600'000'000;

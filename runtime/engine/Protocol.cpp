@@ -330,11 +330,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidEnumValue,
                    "request priority is not defined by native protocol");
   }
-  if (!validEnum(static_cast<uint8_t>(request.cohort),
-                 {Cohort::Greedy, Cohort::Sampling, Cohort::Constrained})) {
-    return invalid(IssueCode::InvalidEnumValue,
-                   "cohort is not defined by native protocol");
-  }
   if (!validEnum(static_cast<uint8_t>(request.constraint),
                  {ConstraintMode::None, ConstraintMode::TokenMask})) {
     return invalid(IssueCode::InvalidEnumValue,
@@ -399,18 +394,9 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   if (auto error = request.sampling.validationError()) {
     return invalid(IssueCode::InvalidSampling, std::string(*error));
   }
-  Cohort expected = Cohort::Constrained;
-  if (request.constraint == ConstraintMode::None) {
-    expected =
-        request.sampling.temperature > 0.0f ? Cohort::Sampling : Cohort::Greedy;
-  }
-  if (request.cohort != expected) {
-    return invalid(IssueCode::InvalidCohortConstraint,
-                   "cohort does not match sampling and constraint semantics");
-  }
   if (scoring) {
     if (request.constraint != ConstraintMode::None) {
-      return invalid(IssueCode::InvalidCohortConstraint,
+      return invalid(IssueCode::InvalidConstraint,
                      "score requests cannot carry a constraint");
     }
     if (!request.sampling.isNeutral()) {
@@ -421,7 +407,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   // A grammar decides where constrained output ends.
   if ((request.flags & RequestIgnoreEndOfSequence) &&
       (scoring || request.constraint != ConstraintMode::None)) {
-    return invalid(IssueCode::InvalidCohortConstraint,
+    return invalid(IssueCode::InvalidConstraint,
                    "only unconstrained generation can ignore end-of-sequence");
   }
   return std::nullopt;
@@ -626,7 +612,6 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   Writer writer(static_cast<size_t>(payloadBytes));
   writer.u64(request.requestId);
   writer.u8(static_cast<uint8_t>(request.priority));
-  writer.u8(static_cast<uint8_t>(request.cohort));
   writer.u8(static_cast<uint8_t>(request.constraint));
   writer.u64(request.absoluteDeadlineUnixMicros);
   writer.u64(request.remainingDeadlineMicros);
@@ -824,14 +809,13 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   Reader reader(frame.payload);
   RequestFrame request;
   uint8_t priority = 0;
-  uint8_t cohort = 0;
   uint8_t constraint = 0;
   uint8_t returnProgress = 0;
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
   uint32_t scoreCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
-      !reader.u8(cohort) || !reader.u8(constraint) ||
+      !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
       !reader.u64(request.remainingDeadlineMicros) ||
       !reader.u32(request.logicalMaxOutputTokens) || !reader.u32(promptCount) ||
@@ -857,7 +841,6 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   }
   request.returnProgress = returnProgress;
   request.priority = static_cast<RequestPriority>(priority);
-  request.cohort = static_cast<Cohort>(cohort);
   request.constraint = static_cast<ConstraintMode>(constraint);
   if (scoreCount > ExecutionLimits::maximumScoreOptions) {
     return failure<Message>(
@@ -1277,8 +1260,8 @@ std::string_view issueCodeName(IssueCode code) {
     return "invalid_sampling";
   case IssueCode::InvalidCount:
     return "invalid_count";
-  case IssueCode::InvalidCohortConstraint:
-    return "invalid_cohort_constraint";
+  case IssueCode::InvalidConstraint:
+    return "invalid_constraint";
   case IssueCode::InvalidErrorClassification:
     return "invalid_error_classification";
   case IssueCode::InvalidStatusSchema:

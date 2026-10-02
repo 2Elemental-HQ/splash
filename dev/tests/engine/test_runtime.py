@@ -220,7 +220,6 @@ def request(
     deadline=None,
     sampling=None,
     seed=0,
-    cohort=wire.Cohort.GREEDY,
     constraint=wire.ConstraintMode.NONE,
     mask_provider=None,
     image_owner=None,
@@ -234,7 +233,6 @@ def request(
         priority=priority,
         sampling=sampling or wire.SamplingParameters(),
         seed=seed,
-        cohort=cohort,
         constraint=constraint,
         mask_provider=mask_provider,
         image_owner=image_owner,
@@ -311,12 +309,10 @@ class RuntimeTests(unittest.TestCase):
             request(
                 200,
                 sampling=wire.SamplingParameters(0.7, 0.9, 16),
-                cohort=wire.Cohort.SAMPLING,
                 seed=66,
             ),
             request(
                 300,
-                cohort=wire.Cohort.CONSTRAINED,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
                 mask_provider=lambda event: (
                     (1,) * (event.words_per_mask * event.mask_rows)
@@ -385,7 +381,6 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertEqual(frame.sampling.top_k, source.sampling.top_k)
             self.assertEqual(frame.seed, source.seed)
-            self.assertEqual(frame.cohort, source.cohort)
             self.assertEqual(frame.constraint, source.constraint)
 
         reverse_calls = list(reversed(calls))
@@ -861,7 +856,6 @@ class RuntimeTests(unittest.TestCase):
         call = runtime.submit(
             request(
                 20,
-                cohort=wire.Cohort.CONSTRAINED,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
                 mask_provider=provider,
             )
@@ -885,7 +879,6 @@ class RuntimeTests(unittest.TestCase):
         bad = runtime.submit(
             request(
                 30,
-                cohort=wire.Cohort.CONSTRAINED,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
                 mask_provider=lambda _event: (1,),
             )
@@ -942,7 +935,6 @@ class RuntimeTests(unittest.TestCase):
         call = runtime.submit(
             request(
                 31,
-                cohort=wire.Cohort.CONSTRAINED,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
                 mask_provider=provider,
             )
@@ -1001,7 +993,6 @@ class RuntimeTests(unittest.TestCase):
             call = runtime.submit(
                 request(
                     31,
-                    cohort=wire.Cohort.CONSTRAINED,
                     constraint=wire.ConstraintMode.TOKEN_MASK,
                     mask_provider=provider,
                 )
@@ -1067,7 +1058,6 @@ class RuntimeTests(unittest.TestCase):
             call = runtime.submit(
                 request(
                     token,
-                    cohort=wire.Cohort.CONSTRAINED,
                     constraint=wire.ConstraintMode.TOKEN_MASK,
                     mask_provider=provider,
                 )

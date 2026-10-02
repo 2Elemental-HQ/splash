@@ -160,7 +160,6 @@ class GenerationRequest:
     priority: wire.RequestPriority = wire.RequestPriority.NORMAL
     sampling: wire.SamplingParameters = field(default_factory=wire.SamplingParameters)
     seed: int = 0
-    cohort: wire.Cohort = wire.Cohort.GREEDY
     constraint: wire.ConstraintMode = wire.ConstraintMode.NONE
     mask_provider: MaskProvider | None = None
     # Image spans in prompt order with their concatenated resized pixels.
@@ -613,7 +612,6 @@ class MultiplexedRuntime:
                 prompt_tokens=request.prompt_tokens,
                 sampling=request.sampling,
                 seed=request.seed,
-                cohort=request.cohort,
                 constraint=request.constraint,
                 image_spans=request.image_spans,
                 image_pixels=request.image_pixels,

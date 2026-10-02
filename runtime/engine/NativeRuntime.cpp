@@ -12,18 +12,6 @@
 namespace splash::engine {
 namespace {
 
-BatchCohort mapCohort(protocol::Cohort cohort) {
-  switch (cohort) {
-  case protocol::Cohort::Greedy:
-    return BatchCohort::Greedy;
-  case protocol::Cohort::Sampling:
-    return BatchCohort::Sampling;
-  case protocol::Cohort::Constrained:
-    return BatchCohort::Constrained;
-  }
-  throw std::invalid_argument("invalid protocol cohort");
-}
-
 protocol::CacheDisposition mapCacheDisposition(EngineCacheStatus status) {
   switch (status) {
   case EngineCacheStatus::Miss:
@@ -221,7 +209,6 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     EngineRequest engineRequest;
     engineRequest.id = request.requestId;
     engineRequest.priority = request.priority;
-    engineRequest.cohort = mapCohort(request.cohort);
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
     engineRequest.images = std::move(request.imageSpans);

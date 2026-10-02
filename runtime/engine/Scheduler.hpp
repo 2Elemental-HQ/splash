@@ -27,7 +27,7 @@ enum class Phase : uint8_t {
 struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  BatchCohort cohort = BatchCohort::Greedy;
+  bool constrained = false;
   // Tokens to prefill: the prompt, and after resumeFromResources the
   // replayed history.
   uint32_t prefillTokens = 0;
@@ -52,9 +52,6 @@ struct SchedulerSnapshot final {
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
-  // Committed decode batches containing both Greedy and Sampling requests.
-  // Counts scheduler dispatches, not completed GPU commands or sampled tokens.
-  uint64_t decodeMixedGreedySamplingBatches = 0;
 };
 
 // One single-owner policy for the specialized backend. Prefill packs the

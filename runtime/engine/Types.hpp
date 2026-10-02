@@ -35,7 +35,6 @@ enum class EngineCacheStatus : uint8_t { Miss, PrefixHit };
 struct EngineRequest final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  BatchCohort cohort = BatchCohort::Greedy;
   std::vector<uint32_t> prompt;
   // Trailing prompt tokens a later request may not share (a chat template's
   // generation prompt, which the next turn may render differently), so
@@ -57,8 +56,8 @@ struct EngineRequest final {
   uint32_t flags = 0;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,           cohort,   prompt,     images,      imagePixels,
-            maxNewTokens, sampling, constraint, scoreTokens, flags};
+    return {id,       prompt,     images,      imagePixels, maxNewTokens,
+            sampling, constraint, scoreTokens, flags};
   }
 };
 

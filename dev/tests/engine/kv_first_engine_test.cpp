@@ -295,7 +295,7 @@ public:
           item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
-      if (plan.cohort == BatchCohort::Constrained &&
+      if (plan.constrained &&
           plan.decodeStage == DecodeStage::RequestInitialMask) {
         result.push_back({item.requestId,
                           0,
@@ -348,8 +348,7 @@ public:
     checkPageTables(items);
     // Every constrained cycle after the initial mask request waits for its
     // mask inside the ticket, as the production constrained ticket does.
-    if (plan.kind == WorkKind::Decode &&
-        plan.cohort == BatchCohort::Constrained &&
+    if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage != DecodeStage::RequestInitialMask) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
@@ -5193,7 +5192,6 @@ void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
 EngineRequest constrainedRequest(uint64_t id, double deadline = 10'000.0) {
   EngineRequest value = request(id, {1});
   value.maxNewTokens = 2;
-  value.cohort = BatchCohort::Constrained;
   value.constraint = ConstraintMode::TokenMask;
   value.deadlineMilliseconds = deadline;
   return value;

@@ -20,7 +20,6 @@
 
 namespace splash {
 
-enum class BatchCohort : uint8_t { Greedy, Sampling, Constrained };
 enum class WorkKind : uint8_t { Prefill, Decode };
 
 enum class DecodeStage : uint8_t {
@@ -103,7 +102,6 @@ struct SamplingParameters final {
 // priority and deadline policy deliberately do not cross this boundary.
 struct ModelRequest final {
   uint64_t id = 0;
-  BatchCohort cohort = BatchCohort::Greedy;
   std::span<const uint32_t> prompt;
   std::span<const struct ImageSpan> images;
   std::span<const uint8_t> imagePixels;
@@ -256,7 +254,9 @@ struct BatchItem final {
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
-  BatchCohort cohort = BatchCohort::Greedy;
+  // A decode's lanes exchange token masks with the host; constrained and
+  // unconstrained lanes never share a command.
+  bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
 

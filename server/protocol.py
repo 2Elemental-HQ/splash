@@ -26,7 +26,7 @@ ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
-_REQUEST_HEAD = struct.Struct("<QBBBQQ")
+_REQUEST_HEAD = struct.Struct("<QBBQQ")
 _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
@@ -47,7 +47,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 88
+assert _REQUEST.size == 87
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -95,7 +95,7 @@ class IssueCode(IntEnum):
     INVALID_DEADLINE = 12
     INVALID_SAMPLING = 13
     INVALID_COUNT = 14
-    INVALID_COHORT_CONSTRAINT = 15
+    INVALID_CONSTRAINT = 15
     INVALID_ERROR_CLASSIFICATION = 16
     INVALID_STATUS_SCHEMA = 17
     LIMIT_EXCEEDED = 18
@@ -159,12 +159,6 @@ class RequestPriority(IntEnum):
     BACKGROUND = 2
 
 
-class Cohort(IntEnum):
-    GREEDY = 0
-    SAMPLING = 1
-    CONSTRAINED = 2
-
-
 class ConstraintMode(IntEnum):
     NONE = 0
     TOKEN_MASK = 1
@@ -225,7 +219,6 @@ class RequestFrame:
     prompt_tokens: tuple[int, ...]
     sampling: SamplingParameters
     seed: int
-    cohort: Cohort
     constraint: ConstraintMode
     # Sorted, non-overlapping image spans and their resized uint8 RGB pixels
     # concatenated in span order; both empty for text-only requests.
@@ -703,7 +696,6 @@ def _request_issue(
         if not isinstance(request.return_progress, bool):
             raise ValueError("return_progress must be a boolean")
         _enum_value(request.priority, RequestPriority, "request priority")
-        cohort = _enum_value(request.cohort, Cohort, "cohort")
         constraint = _enum_value(request.constraint, ConstraintMode, "constraint mode")
         flags = _u32(
             int(request.flags)
@@ -815,18 +807,8 @@ def _request_issue(
     if scores and constraint is not ConstraintMode.NONE:
         return _issue(
             FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_COHORT_CONSTRAINT,
+            IssueCode.INVALID_CONSTRAINT,
             "score requests do not accept output constraints",
-            request_id,
-        )
-    expected = Cohort.CONSTRAINED
-    if constraint is ConstraintMode.NONE:
-        expected = Cohort.SAMPLING if temperature > 0.0 else Cohort.GREEDY
-    if cohort is not expected:
-        return _issue(
-            FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_COHORT_CONSTRAINT,
-            "cohort does not match sampling and constraint semantics",
             request_id,
         )
     # A grammar decides where constrained output ends.
@@ -835,7 +817,7 @@ def _request_issue(
     ):
         return _issue(
             FailureClass.REQUEST_ERROR,
-            IssueCode.INVALID_COHORT_CONSTRAINT,
+            IssueCode.INVALID_CONSTRAINT,
             "only unconstrained generation can ignore end-of-sequence",
             request_id,
         )
@@ -1155,7 +1137,6 @@ def _encode_message(
             _REQUEST.pack(
                 message.request_id,
                 int(message.priority),
-                int(message.cohort),
                 int(message.constraint),
                 message.absolute_deadline_unix_micros,
                 message.remaining_deadline_micros,
@@ -1397,13 +1378,12 @@ def refresh_request_deadline(frame: bytes, now_unix_micros: int) -> bytes:
     _, _, _, frame_type, _, _, _ = _HEADER.unpack_from(frame)
     if frame_type != FrameType.REQUEST:
         return frame
-    request_id, priority, cohort, constraint, _, remaining = _REQUEST_HEAD.unpack_from(
+    request_id, priority, constraint, _, remaining = _REQUEST_HEAD.unpack_from(
         frame, _HEADER.size
     )
     head = _REQUEST_HEAD.pack(
         request_id,
         priority,
-        cohort,
         constraint,
         min(now_unix_micros + remaining, 0xFFFFFFFFFFFFFFFF),
         remaining,
@@ -1428,7 +1408,6 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
     (
         request_id,
         priority,
-        cohort,
         constraint,
         absolute_deadline,
         remaining_deadline,
@@ -1521,13 +1500,6 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             min_p,
         ),
         seed,
-        _decode_enum(
-            cohort,
-            Cohort,
-            "cohort",
-            FailureClass.REQUEST_ERROR,
-            request_id,
-        ),
         _decode_enum(
             constraint,
             ConstraintMode,

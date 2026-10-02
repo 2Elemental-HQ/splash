@@ -128,7 +128,7 @@ void Engine::submit(EngineRequest value) {
   scheduler_.submit(
       {.id = id,
        .priority = stored.request.priority,
-       .cohort = stored.request.cohort,
+       .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds});
   ++counters_.submitted;

@@ -43,8 +43,7 @@ void check(bool condition, std::string_view expression, std::string_view test,
 // offset plus that field's size.
 namespace request_offset {
 constexpr size_t priority = 8;
-constexpr size_t cohort = priority + 1;
-constexpr size_t constraint = cohort + 1;
+constexpr size_t constraint = priority + 1;
 constexpr size_t absoluteDeadline = constraint + 1;
 constexpr size_t remainingDeadline = absoluteDeadline + 8;
 constexpr size_t logicalMaxOutput = remainingDeadline + 8;
@@ -157,7 +156,6 @@ RequestFrame exampleRequest() {
   request.promptTokens = {0, 1, 42, 0x80000000U, 0xffffffffU};
   request.sampling = {0.8f, 0.95f, 32};
   request.sampling.seed = 0xfedcba9876543210ULL;
-  request.cohort = Cohort::Constrained;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
   return request;
@@ -185,7 +183,6 @@ RequestFrame exampleScoreRequest() {
   request.promptTokens = {1, 2, 3, 4};
   request.sampling = {0.0f, 1.0f, 0};
   request.sampling.seed = 7;
-  request.cohort = Cohort::Greedy;
   request.constraint = ConstraintMode::None;
   request.scoreTokens = {32, 65, 97};
   return request;
@@ -322,12 +319,10 @@ void testScoreRequestAndDoneLogits() {
 
   RequestFrame constrained = request;
   constrained.constraint = ConstraintMode::TokenMask;
-  constrained.cohort = Cohort::Constrained;
-  expectRequestIssue(constrained, IssueCode::InvalidCohortConstraint);
+  expectRequestIssue(constrained, IssueCode::InvalidConstraint);
 
   RequestFrame sampling = request;
   sampling.sampling = {0.8f, 0.95f, 32};
-  sampling.cohort = Cohort::Sampling;
   expectRequestIssue(sampling, IssueCode::InvalidSampling);
 
   // A score request reads raw logits: it may carry any seed, and no other
@@ -721,14 +716,14 @@ void testMalformedPayloadClassification() {
     CHECK(test, samplingResult.issue->code == IssueCode::InvalidSampling);
   }
 
-  auto mismatchedConstraint = *serialized.value;
-  mismatchedConstraint[kFrameHeaderBytes + request_offset::constraint] =
-      static_cast<uint8_t>(ConstraintMode::None);
-  auto cohortResult = decodeFrame(decodeSingleFrame(mismatchedConstraint));
-  CHECK(test, !cohortResult);
-  if (cohortResult.issue) {
-    CHECK(test, cohortResult.issue->failureClass == FailureClass::RequestError);
-    CHECK(test, cohortResult.issue->code == IssueCode::InvalidCohortConstraint);
+  auto undefinedConstraint = *serialized.value;
+  undefinedConstraint[kFrameHeaderBytes + request_offset::constraint] = 2;
+  auto constraintResult = decodeFrame(decodeSingleFrame(undefinedConstraint));
+  CHECK(test, !constraintResult);
+  if (constraintResult.issue) {
+    CHECK(test,
+          constraintResult.issue->failureClass == FailureClass::RequestError);
+    CHECK(test, constraintResult.issue->code == IssueCode::InvalidEnumValue);
   }
 
   auto tokenWire = serializeMessage(Message{TokensEvent{7, 0, {1, 2}}});
@@ -1022,7 +1017,6 @@ void testSamplingBlock() {
 void testRequestFlags() {
   constexpr std::string_view test = "request flags";
   RequestFrame request = exampleRequest();
-  request.cohort = Cohort::Sampling;
   request.constraint = ConstraintMode::None;
   request.flags = RequestIgnoreEndOfSequence;
   auto serialized = serializeMessage(Message{request});
@@ -1065,10 +1059,10 @@ void testRequestFlags() {
   }
   RequestFrame constrained = exampleRequest();
   constrained.flags = RequestIgnoreEndOfSequence;
-  expectIssue(constrained, IssueCode::InvalidCohortConstraint);
+  expectIssue(constrained, IssueCode::InvalidConstraint);
   RequestFrame score = exampleScoreRequest();
   score.flags = RequestIgnoreEndOfSequence;
-  expectIssue(score, IssueCode::InvalidCohortConstraint);
+  expectIssue(score, IssueCode::InvalidConstraint);
 }
 
 std::string jsonOfExactSize(size_t bytes) {

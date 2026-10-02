@@ -303,7 +303,6 @@ class CrashTraceTest(unittest.TestCase):
             prompt_tokens=(1,) * 262_144,
             sampling=wire.SamplingParameters(),
             seed=99,
-            cohort=wire.Cohort.GREEDY,
             constraint=wire.ConstraintMode.NONE,
         )
         for outcome in ("timeout", "protocol_error", "eof"):
@@ -475,7 +474,6 @@ class CrashTraceTest(unittest.TestCase):
             prompt_tokens=(1, 2, 3) * 100_000,
             sampling=wire.SamplingParameters(0.5, 0.25, 8),
             seed=99,
-            cohort=wire.Cohort.CONSTRAINED,
             constraint=wire.ConstraintMode.TOKEN_MASK,
         )
         with tempfile.TemporaryDirectory() as temporary:

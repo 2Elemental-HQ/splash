@@ -834,8 +834,8 @@ def run_sampling(port: int, model: str) -> None:
     greedy request repeats itself exactly once its prompt is cached (the first
     run chunks the prompt differently), a sampled request whose min_p of 1
     leaves each row its most likely token answers what a greedy one does, and
-    penalized requests of every cohort finish side by side with an
-    unpenalized one and with sampled ones whose top_k keeps every token or
+    penalized greedy, sampled and constrained requests finish side by side with
+    an unpenalized one and with sampled ones whose top_k keeps every token or
     which min_p cuts."""
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(

@@ -219,7 +219,6 @@ struct Runtime::Impl {
     uint32_t promptTokens = 0;
     uint32_t maxNewTokens = 0;
     uint32_t generatedTokens = 0;
-    BatchCohort cohort = BatchCohort::Greedy;
     SamplingParameters sampling;
     ConstraintMode constraint = ConstraintMode::None;
     // RequestFlag bits.
@@ -1953,13 +1952,12 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
   entry.maxNewTokens = request.maxNewTokens;
-  entry.cohort = request.cohort;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
   entry.scoreTokens.assign(request.scoreTokens.begin(),
                            request.scoreTokens.end());
-  entry.decodeStage = entry.cohort == BatchCohort::Constrained
+  entry.decodeStage = entry.constraint == ConstraintMode::TokenMask
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
   std::vector<Impl::ImageState> images;
@@ -2208,7 +2206,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
-  const bool constrained = plan.cohort == BatchCohort::Constrained;
+  const bool constrained = plan.constrained;
   if (plan.decodeStage != DecodeStage::Regular && !constrained) {
     throw std::invalid_argument(
         "only constrained decode uses a specialized decode stage");
@@ -2221,8 +2219,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
   for (uint32_t lane = 0; lane < items.size(); ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
-    if ((entry.cohort == BatchCohort::Constrained) != constrained) {
-      throw std::invalid_argument("request does not belong to batch cohort");
+    if ((entry.constraint == ConstraintMode::TokenMask) != constrained) {
+      throw std::invalid_argument(
+          "request does not belong to the batch's constraint mode");
     }
     if (entry.decodeStage != plan.decodeStage) {
       throw std::logic_error("request decode stage does not match decode plan");
@@ -2511,10 +2510,9 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     std::vector<uint32_t> pages((rows + kv::kPageTokens - 1) / kv::kPageTokens);
     std::iota(pages.begin(), pages.end(), 0u);
     requireRunwayPages(impl_->kvPages, pages);
-    BatchPlan plan{WorkKind::Prefill,
-                   BatchCohort::Greedy,
-                   {{id, rows}},
-                   DecodeStage::Regular};
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{id, rows}},
+                   .decodeStage = DecodeStage::Regular};
     ModelBatchItem item = warmupItem(id, 0, rows, pages);
     item.inputTokens = request.prompt;
     const auto phaseStart = Clock::now();
@@ -2560,10 +2558,9 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       beginColdRequest(request, stateLaneOrder[lane]);
       pages[lane] = {5 + lane};
       requireRunwayPages(impl_->kvPages, pages[lane]);
-      BatchPlan prefillPlan{WorkKind::Prefill,
-                            BatchCohort::Greedy,
-                            {{request.id, 1}},
-                            DecodeStage::Regular};
+      BatchPlan prefillPlan{.kind = WorkKind::Prefill,
+                            .items = {{request.id, 1}},
+                            .decodeStage = DecodeStage::Regular};
       ModelBatchItem item = warmupItem(request.id, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
       requireLanesSucceeded(
@@ -2572,7 +2569,6 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     }
     BatchPlan plan;
     plan.kind = WorkKind::Decode;
-    plan.cohort = BatchCohort::Greedy;
     std::vector<ModelBatchItem> items;
     for (uint32_t lane = 0; lane < width; ++lane) {
       plan.items.push_back({firstId + lane, 0});
@@ -2647,10 +2643,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     // Deliberately non-contiguous physical ids exercise page-table lookup.
     const std::vector<uint32_t> pages{12, 10, 11};
     requireRunwayPages(impl_->kvPages, pages);
-    BatchPlan plan{WorkKind::Prefill,
-                   BatchCohort::Greedy,
-                   {{id, prefixTokens}},
-                   DecodeStage::Regular};
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{id, prefixTokens}},
+                   .decodeStage = DecodeStage::Regular};
     ModelBatchItem item = warmupItem(id, 0, prefixTokens, pages);
     item.inputTokens =
         std::span<const uint32_t>(request.prompt).first(prefixTokens);
@@ -2673,10 +2668,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     // Continue from committed KV history. This M8 command teacher-forces a
     // new chunk, then the real speculative cycle overwrites its speculative
     // page suffix and advances only the accepted commit length.
-    BatchPlan suffixPlan{WorkKind::Prefill,
-                         BatchCohort::Greedy,
-                         {{id, suffixTokens}},
-                         DecodeStage::Regular};
+    BatchPlan suffixPlan{.kind = WorkKind::Prefill,
+                         .items = {{id, suffixTokens}},
+                         .decodeStage = DecodeStage::Regular};
     ModelBatchItem suffix = warmupItem(id, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
@@ -2686,8 +2680,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     const double continuationWallSeconds =
         impl_->counters.lastPrefillWallSeconds;
     wallSeconds += continuationWallSeconds;
-    BatchPlan decodePlan{
-        WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
+    BatchPlan decodePlan{.kind = WorkKind::Decode,
+                         .items = {{id, 0}},
+                         .decodeStage = DecodeStage::Regular};
     ModelBatchItem decodeItem = warmupItem(id, promptTokens, 0, pages);
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));

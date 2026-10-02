@@ -98,7 +98,6 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(request.prompt_tokens, (9, 14, 15, 16, 17))
         self.assertEqual(request.generation_prompt_tokens, 0)
         self.assertEqual(request.logical_max_output_tokens, 8)
-        self.assertEqual(request.cohort, wire.Cohort.GREEDY)
         self.assertEqual(request.constraint, wire.ConstraintMode.NONE)
 
     def test_token_ids_are_sent_as_given_within_the_vocabulary(self):
@@ -271,7 +270,6 @@ class TextCompletionTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, response)
         request = runtime.requests[0]
-        self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
         self.assertEqual(
             request.sampling,
             wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1, 0.25),

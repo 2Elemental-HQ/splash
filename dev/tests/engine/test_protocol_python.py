@@ -16,11 +16,11 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c4807001800010000006c0000000000000000000000efcdab8967452301"
-    "000201008098281765060040a5ae0200000000008000000500000000000000cd"
-    "cc4c3f3333733f200000000000c03f000080becdcc8c3fcdcc4c3d1032547698"
-    "badcfe0000000000020000000000000000000000010000002a00000000000080"
-    "ffffffff"
+    "53504c4807001800010000006b0000000000000000000000efcdab8967452301"
+    "0001008098281765060040a5ae0200000000008000000500000000000000cdcc"
+    "4c3f3333733f200000000000c03f000080becdcc8c3fcdcc4c3d1032547698ba"
+    "dcfe0000000000020000000000000000000000010000002a00000000000080ff"
+    "ffffff"
 )
 ERROR_GOLDEN = (
     "53504c4807001800050100002700000000000000000000000200000000000000"
@@ -40,7 +40,6 @@ INITIAL_MASK_GOLDEN = (
 REQUEST_FIELDS = (
     "request_id",
     "priority",
-    "cohort",
     "constraint",
     "absolute_deadline",
     "remaining_deadline",
@@ -107,7 +106,6 @@ int main() {
     request.promptTokens = {0, 1, 42, 0x80000000U, 0xffffffffU};
     request.sampling = {0.8f, 0.95f, 32, 1.5f, -0.25f, 1.1f, 0.05f};
     request.sampling.seed = 0xfedcba9876543210ULL;
-    request.cohort = Cohort::Constrained;
     request.constraint = ConstraintMode::TokenMask;
     request.generationPromptTokens = 2;
     show(request);
@@ -123,12 +121,10 @@ int main() {
     score.promptTokens = {5, 6, 7};
     score.logicalMaxOutputTokens = 0;
     score.sampling = {.seed = request.sampling.seed};
-    score.cohort = Cohort::Greedy;
     score.constraint = ConstraintMode::None;
     score.scoreTokens = {101, 202, 303};
     show(score);
     RequestFrame ignoreEos = request;
-    ignoreEos.cohort = Cohort::Sampling;
     ignoreEos.constraint = ConstraintMode::None;
     ignoreEos.flags = RequestIgnoreEndOfSequence;
     show(ignoreEos);
@@ -180,7 +176,6 @@ def example_request():
             f32(0.8), f32(0.95), 32, 1.5, -0.25, f32(1.1), f32(0.05)
         ),
         seed=0xFEDCBA9876543210,
-        cohort=p.Cohort.CONSTRAINED,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
     )
@@ -202,7 +197,6 @@ def example_score_request():
         logical_max_output_tokens=0,
         prompt_tokens=(5, 6, 7),
         sampling=p.SamplingParameters(),
-        cohort=p.Cohort.GREEDY,
         constraint=p.ConstraintMode.NONE,
         score_tokens=(101, 202, 303),
     )
@@ -211,7 +205,6 @@ def example_score_request():
 def example_ignore_eos_request():
     return replace(
         example_request(),
-        cohort=p.Cohort.SAMPLING,
         constraint=p.ConstraintMode.NONE,
         flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE,
     )
@@ -586,11 +579,7 @@ class ProtocolPythonTests(unittest.TestCase):
             ),
             (
                 replace(base, constraint=p.ConstraintMode.TOKEN_MASK),
-                p.IssueCode.INVALID_COHORT_CONSTRAINT,
-            ),
-            (
-                replace(base, cohort=p.Cohort.SAMPLING),
-                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+                p.IssueCode.INVALID_CONSTRAINT,
             ),
             (
                 replace(
@@ -860,7 +849,7 @@ class ProtocolPythonTests(unittest.TestCase):
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),
-                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+                p.IssueCode.INVALID_CONSTRAINT,
             )
             for base in (example_request(), example_score_request())
         ]
@@ -896,7 +885,7 @@ class ProtocolPythonTests(unittest.TestCase):
         base = example_request()
         bad_values = (
             True,
-            p.Cohort.GREEDY,
+            p.ConstraintMode.NONE,
             -1,
             0x100000000,
             1.0,
@@ -1090,14 +1079,12 @@ class ProtocolPythonTests(unittest.TestCase):
             ),
         )
         constraint = bytearray(wire)
-        constraint[p.FRAME_HEADER_BYTES + OFFSET["constraint"]] = int(
-            p.ConstraintMode.NONE
-        )
+        constraint[p.FRAME_HEADER_BYTES + OFFSET["constraint"]] = 2
         cases += (
             (
                 bytes(constraint),
                 p.FailureClass.REQUEST_ERROR,
-                p.IssueCode.INVALID_COHORT_CONSTRAINT,
+                p.IssueCode.INVALID_ENUM_VALUE,
             ),
         )
         for mutated, failure, code in cases:

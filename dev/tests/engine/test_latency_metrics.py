@@ -8,13 +8,11 @@ from server.metrics import prometheus_metrics
 
 
 class LatencyTests(unittest.TestCase):
-    def test_mixed_decode_metric_preserves_zero_and_missing_status(self):
-        name = "splash_scheduler_decode_mixed_greedy_sampling_batches_total"
+    def test_scheduler_metric_preserves_zero_and_missing_status(self):
+        name = "splash_scheduler_decode_batches_total"
         self.assertIn(
             name + " 0",
-            prometheus_metrics(
-                {"scheduler": {"decode_mixed_greedy_sampling_batches": 0}}
-            ).splitlines(),
+            prometheus_metrics({"scheduler": {"decode_batches": 0}}).splitlines(),
         )
         self.assertNotIn(name, prometheus_metrics({"scheduler": {}}))
 

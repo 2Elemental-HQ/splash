@@ -69,7 +69,7 @@ enum class IssueCode : uint16_t {
   InvalidDeadline,
   InvalidSampling,
   InvalidCount,
-  InvalidCohortConstraint,
+  InvalidConstraint,
   InvalidErrorClassification,
   InvalidStatusSchema,
   LimitExceeded,
@@ -115,31 +115,24 @@ struct ProtocolLimits {
 [[nodiscard]] std::optional<ProtocolIssue>
 validateLimits(const ProtocolLimits &limits);
 
-enum class Cohort : uint8_t {
-  Greedy = 0,
-  Sampling = 1,
-  Constrained = 2,
-};
-
 // A request payload starts with these fields, at these byte offsets:
 //    0 u64 requestId
 //    8 u8  priority
-//    9 u8  cohort
-//   10 u8  constraint
-//   11 u64 absoluteDeadlineUnixMicros
-//   19 u64 remainingDeadlineMicros
-//   27 u32 logicalMaxOutputTokens
-//   31 u32 prompt token count
-//   35 u32 image span count
-//   39 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
+//    9 u8  constraint
+//   10 u64 absoluteDeadlineUnixMicros
+//   18 u64 remainingDeadlineMicros
+//   26 u32 logicalMaxOutputTokens
+//   30 u32 prompt token count
+//   34 u32 image span count
+//   38 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
 //      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP, u64 seed
-//   75 u8  returnProgress
-//   76 u32 score token count
-//   80 u32 generationPromptTokens
-//   84 u32 flags
+//   74 u8  returnProgress
+//   75 u32 score token count
+//   79 u32 generationPromptTokens
+//   83 u32 flags
 // then the prompt tokens, the 32-byte image spans, the image pixels and the
 // score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 88;
+inline constexpr uint64_t kRequestFixedBytes = 87;
 
 struct RequestFrame {
   uint64_t requestId = 0;
@@ -161,7 +154,6 @@ struct RequestFrame {
   // The defaults are greedy selection with nothing changing the logits,
   // which score requests require (seed aside).
   SamplingParameters sampling;
-  Cohort cohort = Cohort::Greedy;
   ConstraintMode constraint = ConstraintMode::None;
   bool returnProgress = false;
   // Empty selects ordinary generation. Nonempty selects score-only mode:
