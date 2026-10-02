@@ -185,7 +185,7 @@ using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCh
 
 [[nodiscard]] DFlashDraftWeights
 loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
-                       DFlashDraftLayout layout = {});
+                       DFlashDraftLayout layout);
 
 // Builds the draft layer graph and its proposal selection
 // (ops::DraftSelector) from packed buffers and persistent context; the
