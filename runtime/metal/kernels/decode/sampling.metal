@@ -191,7 +191,7 @@ inline bool at_or_before(uint key, uint token, OrderBoundary boundary) {
 // Among the tokens tied at one logit, the tie order puts a smaller id first;
 // every other token has kNoKey.
 struct LogitOrder {
-  bool by_logit() const { return true; }
+  static constexpr constant bool by_logit = true;
   uint key(float value, uint) const { return logit_key(value); }
   float logit(uint key) const { return key_logit(key); }
 };
@@ -201,24 +201,34 @@ struct TieOrder {
   uint key(float value, uint token) const {
     return logit_key(value) == tied_key ? vocabulary - token : kNoKey;
   }
-  bool by_logit() const { return false; }
+  static constexpr constant bool by_logit = false;
   float logit(uint) const { return key_logit(tied_key); }
 };
 
 // What a search keeps: the tokens in order until their count, or their mass
-// (the sum of their weights), exceeds the target.
-struct SearchTarget {
-  bool by_mass;
+// (the sum of their weights), exceeds the target. A count search measures
+// counts alone (top-k, and the tie order's first ids), a mass search counts
+// and masses (top-p).
+struct CountTarget {
+  static constexpr constant bool by_mass = false;
   uint count;
+
+  bool exceeded(uint measured_count, float) const {
+    return measured_count > count;
+  }
+};
+struct MassTarget {
+  static constexpr constant bool by_mass = true;
   float mass;
 
-  bool exceeded(uint measured_count, float measured_mass) const {
-    return by_mass ? measured_mass > mass : measured_count > count;
+  bool exceeded(uint, float measured_mass) const {
+    return measured_mass > mass;
   }
 };
 
 // A key range [lo, hi) and the count and mass of the tokens with at least
-// each end's key: lo's exceed the search target, hi's do not.
+// each end's key: lo's exceed the search target, hi's do not. A count
+// search narrows the counts alone and leaves the masses as they came in.
 struct Bracket {
   uint lo;
   uint hi;
@@ -231,11 +241,13 @@ struct Bracket {
 };
 
 // The last token a search keeps, and the count and mass of the tokens at or
-// before it.
+// before it. A ranked selection leaves those tokens in the scratch keys and
+// ids, in order (resolve).
 struct Selection {
   OrderBoundary last;
   uint count;
   float mass;
+  bool ranked;
 };
 
 struct VocabularyScratch {
@@ -281,7 +293,7 @@ template <class Order>
 inline void place_pivots(Order order, Bracket bracket, float temperature,
                          thread uint (&pivots)[kPivots]) {
   const ulong width = bracket.hi - bracket.lo;
-  if (!order.by_logit()) {
+  if (!order.by_logit) {
     for (uint pivot = 0; pivot < kPivots; ++pivot)
       pivots[pivot] = bracket.lo + uint(width * (pivot + 1) / (kPivots + 1));
     return;
@@ -301,21 +313,22 @@ inline void place_pivots(Order order, Bracket bracket, float temperature,
         bracket.lo + uint(width * (pivot + 1) / (kKeyPivots + 1));
 }
 
-// The count and mass of the admitted tokens at or before the floor whose
-// keys are at least each pivot's, summed per thread in token order and then
-// over the group in a fixed order.
-template <class Order>
-inline void measure_pivots(TargetRow row, Order order,
-                           OrderBoundary floor,
-                           thread const uint (&pivots)[kPivots],
+// The count and, with Masses, the mass of the admitted tokens at or before
+// the floor whose keys are at least each pivot's, summed per thread in token
+// order and then over the group in a fixed order. Counts alone weigh no
+// token.
+template <bool Masses, uint Pivots, class Order>
+inline void measure_pivots(TargetRow row, Order order, OrderBoundary floor,
+                           thread const uint (&pivots)[Pivots],
                            threadgroup VocabularyScratch &scratch,
                            uint thread_index, uint lane, uint simd_group) {
-  uint counts[kPivots];
-  float masses[kPivots];
+  uint counts[Pivots];
+  float masses[Pivots];
   uint lowest = pivots[0];
-  for (uint pivot = 0; pivot < kPivots; ++pivot) {
+  for (uint pivot = 0; pivot < Pivots; ++pivot) {
     counts[pivot] = 0;
-    masses[pivot] = 0.0f;
+    if constexpr (Masses)
+      masses[pivot] = 0.0f;
     lowest = min(lowest, pivots[pivot]);
   }
   for (uint token = thread_index; token < row.vocabulary;
@@ -326,65 +339,96 @@ inline void measure_pivots(TargetRow row, Order order,
     if (key < lowest || !row.admits(token) ||
         !at_or_before(logit_key(value), token, floor))
       continue;
-    const float weight = row.weight(value);
-    for (uint pivot = 0; pivot < kPivots; ++pivot) {
-      const bool above = key >= pivots[pivot];
-      counts[pivot] += above ? 1u : 0u;
-      masses[pivot] += above ? weight : 0.0f;
+    if constexpr (Masses) {
+      const float weight = row.weight(value);
+      for (uint pivot = 0; pivot < Pivots; ++pivot) {
+        const bool above = key >= pivots[pivot];
+        counts[pivot] += above ? 1u : 0u;
+        masses[pivot] += above ? weight : 0.0f;
+      }
+    } else {
+      for (uint pivot = 0; pivot < Pivots; ++pivot)
+        counts[pivot] += key >= pivots[pivot] ? 1u : 0u;
     }
   }
-  for (uint pivot = 0; pivot < kPivots; ++pivot) {
+  for (uint pivot = 0; pivot < Pivots; ++pivot) {
     const uint count = simd_sum(counts[pivot]);
-    const float mass = simd_sum(masses[pivot]);
-    if (lane == 0) {
+    if (lane == 0)
       scratch.counts[simd_group][pivot] = count;
-      scratch.masses[simd_group][pivot] = mass;
+    if constexpr (Masses) {
+      const float mass = simd_sum(masses[pivot]);
+      if (lane == 0)
+        scratch.masses[simd_group][pivot] = mass;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < kPivots) {
+  if (thread_index < Pivots) {
     uint count = 0;
-    float mass = 0.0f;
-    for (uint simd = 0; simd < kVocabularySimdgroups; ++simd) {
+    for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
       count += scratch.counts[simd][thread_index];
-      mass += scratch.masses[simd][thread_index];
-    }
     scratch.total_counts[thread_index] = count;
-    scratch.total_masses[thread_index] = mass;
+    if constexpr (Masses) {
+      float mass = 0.0f;
+      for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
+        mass += scratch.masses[simd][thread_index];
+      scratch.total_masses[thread_index] = mass;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+// The count and mass of the admitted tokens at or before the floor whose
+// logits' keys are at least key, summed as measure_pivots sums a pivot's.
+struct Measure {
+  uint count;
+  float mass;
+};
+inline Measure measure_at_or_above(TargetRow row, OrderBoundary floor,
+                                   uint key,
+                                   threadgroup VocabularyScratch &scratch,
+                                   uint thread_index, uint lane,
+                                   uint simd_group) {
+  const uint pivots[1] = {key};
+  measure_pivots<true>(row, LogitOrder{}, floor, pivots, scratch,
+                       thread_index, lane, simd_group);
+  const Measure measure{scratch.total_counts[0], scratch.total_masses[0]};
+  // Every thread reads the totals before the next pass rewrites them.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return measure;
+}
+
 // Narrows the bracket until it holds at most one token per thread or a
 // single key.
-template <class Order>
+template <class Order, class Target>
 inline Bracket narrow(TargetRow row, Order order, OrderBoundary floor,
-                      Bracket bracket, SearchTarget target,
+                      Bracket bracket, Target target,
                       threadgroup VocabularyScratch &scratch,
                       uint thread_index, uint lane, uint simd_group) {
   while (bracket.tokens() > kVocabularyThreads &&
          bracket.hi - bracket.lo > 1) {
     uint pivots[kPivots];
     place_pivots(order, bracket, row.temperature, pivots);
-    measure_pivots(row, order, floor, pivots, scratch, thread_index, lane,
-                   simd_group);
+    measure_pivots<Target::by_mass>(row, order, floor, pivots, scratch,
+                                    thread_index, lane, simd_group);
     // The highest pivot whose measure exceeds the target and the lowest one
     // whose measure does not bound the new bracket. A pivot at lo never
     // becomes hi: lo's measure may come from another sum (the shards' masses,
     // or the top-k selection's), and rounding must not empty the bracket.
     for (uint pivot = 0; pivot < kPivots; ++pivot) {
       const uint count = scratch.total_counts[pivot];
-      const float mass = scratch.total_masses[pivot];
+      const float mass = Target::by_mass ? scratch.total_masses[pivot] : 0.0f;
       if (target.exceeded(count, mass)) {
         if (pivots[pivot] >= bracket.lo) {
           bracket.lo = pivots[pivot];
           bracket.lo_count = count;
-          bracket.lo_mass = mass;
+          if (Target::by_mass)
+            bracket.lo_mass = mass;
         }
       } else if (pivots[pivot] > bracket.lo && pivots[pivot] < bracket.hi) {
         bracket.hi = pivots[pivot];
         bracket.hi_count = count;
-        bracket.hi_mass = mass;
+        if (Target::by_mass)
+          bracket.hi_mass = mass;
       }
     }
     // Every thread reads the totals before the next pass rewrites them.
@@ -395,28 +439,46 @@ inline Bracket narrow(TargetRow row, Order order, OrderBoundary floor,
 
 // The last token the target keeps in a bracket of at most one token per
 // thread: its tokens are gathered, put in order by rank, and added to the
-// measure at hi one at a time until it exceeds the target.
-template <class Order>
+// measure at hi one at a time until it exceeds the target. A count search in
+// logit order measures no masses while it narrows: its gather sums the mass
+// at hi as measure_pivots would have, or, when every token from lo up fits
+// the group, gathers them all and adds them from the first, which leaves the
+// tokens it keeps ranked in the scratch (Selection::ranked).
+template <class Order, class Target>
 inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
-                         Bracket bracket, SearchTarget target,
+                         Bracket bracket, Target target,
                          threadgroup VocabularyScratch &scratch,
-                         uint thread_index) {
+                         uint thread_index, uint lane, uint simd_group) {
+  constexpr bool unmeasured = Order::by_logit && !Target::by_mass;
+  const bool ranked = unmeasured && bracket.lo_count <= kVocabularyThreads;
+  const bool measures = unmeasured && !ranked;
   if (thread_index == 0)
     atomic_store_explicit(&scratch.gathered, 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  float above = 0.0f;
   for (uint token = thread_index; token < row.vocabulary;
        token += kVocabularyThreads) {
     const float value = row.logits[token];
     const uint key = order.key(value, token);
-    if (key < bracket.lo || key >= bracket.hi || !row.admits(token) ||
+    if (key < bracket.lo || !row.admits(token) ||
         !at_or_before(logit_key(value), token, floor))
       continue;
+    if (!ranked && key >= bracket.hi) {
+      if (measures)
+        above += row.weight(value);
+      continue;
+    }
     const uint slot = atomic_fetch_add_explicit(&scratch.gathered, 1u,
                                                 memory_order_relaxed);
     if (slot < kVocabularyThreads) {
       scratch.keys[slot] = key;
       scratch.ids[slot] = token;
     }
+  }
+  if (measures) {
+    above = simd_sum(above);
+    if (lane == 0)
+      scratch.masses[simd_group][0] = above;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint gathered = min(atomic_load_explicit(&scratch.gathered,
@@ -442,15 +504,23 @@ inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index == 0) {
-    // Rounding may leave the target unreached: keep the whole bracket.
-    Selection selection{{bracket.lo, 0xffffffffu}, bracket.lo_count,
-                        bracket.lo_mass};
-    uint count = bracket.hi_count;
-    float mass = bracket.hi_mass;
+    uint count = ranked ? 0 : bracket.hi_count;
+    float mass = ranked ? 0.0f : bracket.hi_mass;
+    if (measures) {
+      mass = 0.0f;
+      for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
+        mass += scratch.masses[simd][0];
+    }
+    // Rounding may leave a mass target unreached: keep the whole bracket.
+    Selection selection{{bracket.lo, 0xffffffffu},
+                        bracket.lo_count,
+                        Target::by_mass ? bracket.lo_mass : mass,
+                        ranked};
     for (uint index = 0; index < gathered; ++index) {
       count += 1;
       mass += row.weight(order.logit(scratch.keys[index]));
-      selection = {{scratch.keys[index], scratch.ids[index]}, count, mass};
+      selection = {{scratch.keys[index], scratch.ids[index]}, count, mass,
+                   ranked};
       if (target.exceeded(count, mass))
         break;
     }
@@ -462,42 +532,55 @@ inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
 
 // The last token the target keeps among the admitted tokens at or before
 // the floor, starting from a bracket in logit order.
+template <class Target>
 inline Selection select_last(TargetRow row, OrderBoundary floor,
-                             Bracket bracket, SearchTarget target,
+                             Bracket bracket, Target target,
                              threadgroup VocabularyScratch &scratch,
                              uint thread_index, uint lane, uint simd_group) {
   bracket = narrow(row, LogitOrder{}, floor, bracket, target, scratch,
                    thread_index, lane, simd_group);
   if (bracket.tokens() <= kVocabularyThreads)
     return resolve(row, LogitOrder{}, floor, bracket, target, scratch,
-                   thread_index);
+                   thread_index, lane, simd_group);
   // More tokens tie at one logit than a group gathers: the target keeps its
-  // first ones by id, each of the same weight.
+  // first ones by id, each of the same weight, after the mass above them,
+  // which a count search measures in one more pass.
   const uint ties = bracket.tokens();
   const float weight = row.weight(key_logit(bracket.lo));
-  const uint keep =
-      target.by_mass
-          ? 1u + uint(clamp((target.mass - bracket.hi_mass) / weight, 0.0f,
-                            float(ties - 1)))
-          : target.count + 1 - bracket.hi_count;
+  float above;
+  uint keep;
+  if constexpr (Target::by_mass) {
+    above = bracket.hi_mass;
+    keep = 1u + uint(clamp((target.mass - above) / weight, 0.0f,
+                           float(ties - 1)));
+  } else {
+    above = measure_at_or_above(row, floor, bracket.hi, scratch, thread_index,
+                                lane, simd_group)
+                .mass;
+    keep = target.count + 1 - bracket.hi_count;
+  }
   uint last = bracket.lo == floor.key ? floor.last : 0xffffffffu;
   if (keep < ties) {
     const TieOrder order{bracket.lo, row.vocabulary};
-    const SearchTarget first{false, keep - 1, 0.0f};
+    const CountTarget first{keep - 1};
     Bracket tied{1, row.vocabulary + 1, ties, 0, 0.0f, 0.0f};
     tied = narrow(row, order, floor, tied, first, scratch, thread_index, lane,
                   simd_group);
-    last = resolve(row, order, floor, tied, first, scratch, thread_index)
+    last = resolve(row, order, floor, tied, first, scratch, thread_index, lane,
+                   simd_group)
                .last.last;
   }
   return {{bracket.lo, last}, bracket.hi_count + keep,
-          bracket.hi_mass + float(keep) * weight};
+          above + float(keep) * weight, false};
 }
 
 // The last token of the row's distribution: the tokens that weigh at least
 // min_p of the heaviest, then the top_k of those, then within those the top_p
 // nucleus, whose mass is measured against the mass of what the two cuts
-// before it keep. A row that keeps every admitted token ends at {kNoKey, 0}.
+// before it keep. A top-k selection the scratch holds ranked is walked for
+// the nucleus in that order, with the sums it was selected with; otherwise
+// the nucleus is searched for. A row that keeps every admitted token ends at
+// {kNoKey, 0}.
 inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       float top_p, float mass, uint admitted,
                                       threadgroup VocabularyScratch &scratch,
@@ -510,37 +593,49 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
     // A token weighs min_p of the heaviest, which weighs 1, at the logit
     // -temperature * log(min_p) below the maximum. The tokens at or above
     // that logit stay, the heaviest always.
-    const float lowest =
-        min(row.maximum + row.temperature * log(min_p), row.maximum);
-    uint pivots[kPivots];
-    for (uint pivot = 0; pivot < kPivots; ++pivot)
-      pivots[pivot] = logit_key(lowest);
-    measure_pivots(row, LogitOrder{}, end, pivots, scratch, thread_index, lane,
-                   simd_group);
-    const uint kept = scratch.total_counts[0];
-    const float kept_mass = scratch.total_masses[0];
-    // Every thread reads the totals before the next pass rewrites them.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (kept < admitted) {
-      end = {pivots[0], 0xffffffffu};
-      bracket.lo = end.key;
-      bracket.lo_count = kept;
-      bracket.lo_mass = kept_mass;
+    const uint lowest = logit_key(
+        min(row.maximum + row.temperature * log(min_p), row.maximum));
+    const Measure kept = measure_at_or_above(row, end, lowest, scratch,
+                                             thread_index, lane, simd_group);
+    if (kept.count < admitted) {
+      end = {lowest, 0xffffffffu};
+      bracket.lo = lowest;
+      bracket.lo_count = kept.count;
+      bracket.lo_mass = kept.mass;
     }
   }
   if (top_k < bracket.lo_count) {
     // A min_p cut ends on a whole key, which the bracket bounds from below,
     // so this search needs no floor.
     const Selection top = select_last(row, {kNoKey, 0}, bracket,
-                                      {false, top_k - 1, 0.0f}, scratch,
+                                      CountTarget{top_k - 1}, scratch,
                                       thread_index, lane, simd_group);
     end = top.last;
+    if (top.ranked && top_p < 1.0f) {
+      // Every thread reads the selection before the walk rewrites it.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (thread_index == 0) {
+        // Rounding may leave the nucleus unreached: keep the whole top-k.
+        const float nucleus = top_p * top.mass;
+        float walked = 0.0f;
+        for (uint index = 0; index < top.count; ++index) {
+          walked += row.weight(key_logit(scratch.keys[index]));
+          if (walked > nucleus) {
+            end = {scratch.keys[index], scratch.ids[index]};
+            break;
+          }
+        }
+        scratch.selection.last = end;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      return scratch.selection.last;
+    }
     bracket.lo = end.key;
     bracket.lo_count = top.count;
     bracket.lo_mass = top.mass;
   }
   if (top_p < 1.0f)
-    end = select_last(row, end, bracket, {true, 0, top_p * bracket.lo_mass},
+    end = select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
                       scratch, thread_index, lane, simd_group)
               .last;
   return end;

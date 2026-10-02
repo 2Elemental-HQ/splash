@@ -967,15 +967,16 @@ void fillShaped(float *row, uint32_t vocabulary, Shape shape, Random &random) {
           4.0F - 0.02F * float(rank) + 0.005F * random.unit();
 }
 
-// Sampled lanes with the default top-k of 20, a larger one, a disabled one
-// and one past the vocabulary, constrained or ignoring end-of-sequence, in
-// batches beside greedy lanes that are constrained or ignore end-of-sequence
-// too, over every row shape: every sampled row as requireSampledRow checks
-// it, and every greedy row's argmax among the tokens its lane admits. The
-// first token after a prompt follows the same rules. With minP the sampled
-// lanes cut by min_p first: alone, before a top-k and a nucleus, at 1, which
-// leaves the most likely token and its ties, and so low that it drops
-// nothing; a greedy lane ignores it.
+// Sampled lanes with the default top-k of 20, larger ones (one past what a
+// group ranks, whose nucleus is searched for rather than walked), a
+// disabled one and one past the vocabulary, constrained or ignoring
+// end-of-sequence, in batches beside greedy lanes that are constrained or
+// ignore end-of-sequence too, over every row shape: every sampled row as
+// requireSampledRow checks it, and every greedy row's argmax among the
+// tokens its lane admits. The first token after a prompt follows the same
+// rules. With minP the sampled lanes cut by min_p first: alone, before a
+// top-k and a nucleus, at 1, which leaves the most likely token and its
+// ties, and so low that it drops nothing; a greedy lane ignores it.
 void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                  bool minP) {
   Random random(0x77696465 + uint64_t{vocabulary} * 8 + lanes +
@@ -986,6 +987,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   const SamplingPolicy disabled{0, 1.0F, 0.95F, false};
   const SamplingPolicy fifty{50, 0.8F, 0.9F, true};
   const SamplingPolicy thousand{1000, 1.3F, 1.0F, false, true};
+  const SamplingPolicy wide{2000, 1.0F, 0.95F, false};
   const SamplingPolicy beyond{vocabulary + 5, 0.6F, 0.7F, false};
   const SamplingPolicy greedy{1, 0.0F, 1.0F, false};
   const SamplingPolicy maskedGreedy{1, 0.0F, 1.0F, true};
@@ -1003,7 +1005,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
            : std::array<std::vector<SamplingPolicy>, kLanes>{
                  std::vector{disabled}, std::vector{fifty, maskedGreedy},
                  std::vector{beyond, narrow, stoplessGreedy},
-                 std::vector{disabled, thousand, greedy, fifty}};
+                 std::vector{wide, thousand, greedy, fifty}};
   const std::vector<SamplingPolicy> &policies = batches[lanes - 1];
   for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
        ++index)
@@ -1387,9 +1389,10 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // Ties where a distribution ends: more tokens tie at the logit where top_k
 // or top_p cuts than a group orders in threadgroup memory, and fewer; the
 // distribution keeps the lowest ids among them, and saturated penalized
-// logits tie the same way. Draft tokens at both sides of the cut test it
-// exactly: the last tie kept has its probability, the first one cut has
-// none.
+// logits tie the same way. A top_p cut within the ties a top_k cut kept
+// measures against the mass above the ties as well. Draft tokens at both
+// sides of the cut test it exactly: the last tie kept has its probability,
+// the first one cut has none.
 void ties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
   Sampling sampling(vocabulary);
@@ -1406,6 +1409,10 @@ void ties(MetalBackend &backend) {
   for (const Case c :
        {Case{"top_k within 3000 ties", 3000, 10, {1510, 1.0F, 1.0F, false}},
         Case{"top_k within 600 ties", 600, 10, {310, 0.7F, 1.0F, false}},
+        Case{"top_k then top_p within 3000 ties",
+             3000,
+             10,
+             {1510, 2.0F, 0.9F, false}},
         Case{"top_p within 3000 ties", 3000, 0, {0, 1.0F, 0.4999F, false}},
         Case{"top_p within 3000 saturated ties",
              3000,
