@@ -143,9 +143,12 @@ private:
   std::string budgetDescription_;
 };
 
-// Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> KV pool -> state -> KV page storage -> governor ->
-// model package -> Metal backend.
+// Owns every process-wide native resource exactly once. Members go in
+// reverse declaration order: Cache -> KV pool -> KV disk tier -> state
+// storage -> KV page storage -> governor -> model package -> Metal backend.
+// The KV disk tier must go before the KV page storage: its IO worker reads
+// and writes pages in place in the extents, and its destructor waits for
+// every transfer in flight.
 class RuntimeResources final {
 public:
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
