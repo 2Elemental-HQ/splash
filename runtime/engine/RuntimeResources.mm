@@ -294,11 +294,26 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     requireStartupHeadroom(hostAvailableMemory, preparationReserveBytes, level);
   };
   backend->setOperationGuard(admitMetalOperation);
+  // One disk quota serves KV pages and states. Without room for a state,
+  // disk KV cannot preserve a restorable prefix, so the tier stays off, and
+  // no state's write needs the staging buffer the plan would set aside.
+  std::shared_ptr<model::DiskBudget> diskBudget;
+  std::shared_ptr<model::SlotFile> stateFile;
+  const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
+  if (config.maximumCacheDiskBytes) {
+    diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
+    try {
+      stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
+    } catch (const std::exception &error) {
+      diskBudget.reset();
+      logStartup("Cache disk tier disabled (", error.what(),
+                 "); no state staging is set aside.");
+    }
+  }
   // A state's write to the disk tier stages through one buffer of a state's
   // size. It is the backend's like every other, so the governor charges it
   // beside the weights and the plan sets it aside before it sizes KV.
-  const uint64_t stateStagingBytes =
-      config.maximumCacheDiskBytes ? config.model.stateLayout.cachedBytes() : 0;
+  const uint64_t stateStagingBytes = stateFile ? stateBytes : 0;
   try {
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
@@ -472,20 +487,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
-    // One disk quota serves KV pages and states. Without room for a state,
-    // disk KV cannot preserve a restorable prefix, so the tier stays off.
-    std::shared_ptr<model::DiskBudget> diskBudget;
-    std::shared_ptr<model::SlotFile> stateFile;
-    const uint64_t stateBytes = package.stateLayout().cachedBytes();
-    if (config.maximumCacheDiskBytes) {
-      diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
-      try {
-        stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
-      } catch (const std::exception &error) {
-        diskBudget.reset();
-        logStartup("Cache disk tier disabled (", error.what(), ").");
-      }
-    }
     std::unique_ptr<model::StateStorage> stateStorage = model::createStateStorage(
         *backend, memoryGovernor->allocationAdmission(), package, stateFile);
     if (!stateStorage) {

@@ -39,8 +39,8 @@ struct ModelMemoryFootprint final {
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   // The buffer a state's write to the disk tier stages through, set aside
-  // whenever --max-cache-disk is set, even if the tier then fails to start;
-  // zero without the flag.
+  // when the tier's state file opened (a quota that holds one state); zero
+  // otherwise.
   uint64_t stateStagingBytes = 0;
 };
 
