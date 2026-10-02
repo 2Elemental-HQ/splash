@@ -2718,7 +2718,8 @@ ModelMemoryActual Runtime::actualRuntimeMemory() const {
 ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
   result.stateAllocatedBytes = impl_->states.actualAllocatedBytes();
-  result.warmIdleStateCells = impl_->states.idleCells();
+  result.idleGdnCells = impl_->states.idleCells();
+  result.idleDraftRings = impl_->states.idleRings();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);

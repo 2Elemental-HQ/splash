@@ -100,7 +100,7 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
     ):
         smoke.require(after["scheduler"][phase] == 0, f"request left {phase} work")
     smoke.require(
-        after["state"]["active_cells"] == 0 and after["kv"]["pages_active"] == 0,
+        after["state"]["active_lanes"] == 0 and after["kv"]["pages_active"] == 0,
         "active resources leaked",
     )
     delta = {

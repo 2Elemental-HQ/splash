@@ -1166,7 +1166,7 @@ class ServerTest(unittest.TestCase):
                         "in_use": 1,
                         "in_use_evictions": 3,
                         "bytes": 4096,
-                        "active_cells": 2,
+                        "active_lanes": 2,
                         "publications": 3,
                         "evictions": 1,
                     },
@@ -1242,6 +1242,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_in_use 1", metrics)
         self.assertIn("splash_state_in_use_evictions_total 3", metrics)
+        self.assertIn("splash_state_active_lanes 2", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
         self.assertIn("splash_cache_cold_misses_total 4", metrics)
         self.assertIn("splash_cache_reused_tokens_total 1024", metrics)

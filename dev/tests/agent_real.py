@@ -313,7 +313,7 @@ def idle_status():
                     "waiting_mask",
                 )
             )
-            and value["state"]["active_cells"] == 0
+            and value["state"]["active_lanes"] == 0
             and value["state"]["pinned"] == 0
             and value["state"]["in_use"] == 0
             and value["kv"]["pages_active"] == 0
