@@ -304,11 +304,17 @@ uint64_t expectedBytes(AttentionShape shape, uint32_t rows, uint32_t lanes,
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const uint32_t lanePages = (histories[lane] + rows + 31) / 32;
     pages += lanePages;
-    tables += align(uint64_t{lanePages} * 4);
+    tables += align(uint64_t{lanePages} * 8);
   }
-  const uint32_t physicalPages = pages + 1 + pages % 2;
-  const uint64_t data = uint64_t{physicalPages} * shape.kvHeads * 32 * 256;
-  const uint64_t scales = uint64_t{physicalPages} * shape.kvHeads * 32 * 4;
+  // The pool's pages sit in extents of whole 64 KiB-aligned units, 128 pages
+  // for four KV heads and 256 for two, of at most 16383 pages each.
+  const uint32_t poolPages = pages + 1 + pages % 2;
+  const uint32_t unit = shape.kvHeads == 4 ? 128 : 256;
+  const uint32_t extentPages =
+      std::min(16383 / unit * unit, (poolPages + unit - 1) / unit * unit);
+  const uint64_t pageBytes = 2 * uint64_t{shape.kvHeads} * 32 * (256 + 4);
+  const uint64_t extents =
+      (poolPages + extentPages - 1) / extentPages * align(extentPages * pageBytes);
   const uint32_t stride = (rows + 31) / 32 * 32;
   const uint64_t chunks = uint64_t{lanes} * shape.kvHeads * stride * 256 * 2;
   const uint64_t queries = uint64_t{lanes} * shape.queryHeads * stride * 256 * 2;
@@ -323,8 +329,8 @@ uint64_t expectedBytes(AttentionShape shape, uint32_t rows, uint32_t lanes,
                              shape.queryHeads * 256 * 4;
   const uint64_t statistics = uint64_t{lanes} * slots * 8 *
                                shape.queryHeads * 2 * 4;
-  return 2 * align(data) + 2 * align(scales) + 2 * align(chunks) +
-         3 * align(queries) + align(partials) + align(statistics) + tables;
+  return align(extents) + 2 * align(chunks) + 2 * align(queries) + align(partials) +
+         align(statistics) + tables;
 }
 
 void cpuTests() {
@@ -427,11 +433,11 @@ void metalTests(const char *metallib) {
     ++admissionCalls;
     admittedBytes = bytes;
     allocate();
-    return true;
+    return metal::AllocationResult{};
   };
   const metal::AllocationAdmission deny = [&](uint64_t, const auto &) {
     ++admissionCalls;
-    return false;
+    return metal::AllocationFailure::EngineBudget;
   };
   // The sweep's verify IDs index the tuning order of this device's baseline.
   const auto verifyBaseline = VerifyAttentionConfig{};
@@ -475,7 +481,7 @@ void metalTests(const char *metallib) {
               invalidPrefill.probes.empty() && admissionCalls == beforeInvalidPrefill,
           "ragged prefill policy allocated a calibration fixture");
   const auto invalidAdmission = tuneVerifyAttention(backend,
-      [](uint64_t, const auto &) { return true; }, workload, options);
+      [](uint64_t, const auto &) { return metal::AllocationResult{}; }, workload, options);
   require(!invalidAdmission.complete && invalidAdmission.failure &&
               invalidAdmission.measurements.empty(),
           "successful admission without an allocation was not reported");

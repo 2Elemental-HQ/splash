@@ -278,10 +278,10 @@ bootstrapConfig(const NativeArguments &arguments) {
 }
 
 // SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
-// process, so the KV backing is released one extent at a time by the normal
-// destructors. An inherited ignored SIGHUP (nohup) stays ignored, as it does
-// for the server. SIGPIPE is ignored: a closed parent pipe surfaces as EPIPE,
-// which the transport already reports as an I/O failure.
+// process, so the normal destructors run. An inherited ignored SIGHUP (nohup)
+// stays ignored, as it does for the server. SIGPIPE is ignored: a closed
+// parent pipe surfaces as EPIPE, which the transport already reports as an
+// I/O failure.
 std::atomic<engine::FdTransport *> gShutdownTransport{nullptr};
 
 void requestShutdownFromSignal(int) {
@@ -338,7 +338,8 @@ int runNative(const NativeArguments &arguments) {
         published->modelRuntime().telemetry(), resources.cacheIdentity(),
         resources.memoryGovernor().snapshot(), healthy,
         healthy ? std::string{} : backend.unhealthyReason(),
-        published->nativeLoop().resourceWaitSnapshot());
+        published->nativeLoop().resourceWaitSnapshot(),
+        engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
   engine::StartupRetryWindow recovery(kStartupMemoryRecoveryTimeout);
@@ -396,24 +397,22 @@ int runNative(const NativeArguments &arguments) {
     const engine::ResourceWaitSnapshot wait =
         published->nativeLoop().resourceWaitSnapshot();
     const std::string diagnostic =
-        memoryReporter.update(wait, memory.growthAllowed);
+        memoryReporter.update(wait, memory.hostGrowthAllowed);
     if (!diagnostic.empty())
       writeStderrLine(diagnostic);
-    engine::MemoryReclaimDirective directive =
-        pressurePolicy.update(memory, now, wait.memory || wait.suspended);
-    if (!directive.reclaimEmptyKvExtents)
+    // Requests held back by a refusal wait for memory too, the refused one
+    // included while a pass defers it.
+    engine::MemoryReclaimDirective directive = pressurePolicy.update(
+        memory, now, wait.memory || wait.suspended || wait.heldBehindRefusal);
+    if (!directive.reclaim)
       return false;
     const engine::MemoryReclaimResult reclaim =
         published->nativeLoop().reclaimMemory(directive);
     pressurePolicy.reclaimed(directive, reclaim);
     governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
-    // KV backing is returned one extent at a time, and a target that
-    // transfers held back continues as they land. Ask to run again at the
-    // next command-free point meanwhile, so the rest follows without a
-    // burst of kernel work.
-    return published->nativeLoop().reclaimDeferred() ||
-           reclaim.outcome == engine::ReclaimOutcome::Pending;
+    // What transfers held back continues at the next command-free point.
+    return reclaim.outcome == engine::ReclaimOutcome::Pending;
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {
@@ -426,11 +425,14 @@ int runNative(const NativeArguments &arguments) {
   case engine::NativeProcessExit::EngineFailure:
     writeStderrLine(
         "error: native transport stopped after an engine failure (" +
-        bootstrap->nativeLoop().engineFailure() + ")");
+        (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
+                                     : transport.failure()) +
+        ")");
     break;
   case engine::NativeProcessExit::IoFailure:
     writeStderrLine(
-        "error: native transport stopped after an I/O failure");
+        "error: native transport stopped after an I/O failure (" +
+        transport.failure() + ")");
     break;
   }
   return static_cast<int>(exit);

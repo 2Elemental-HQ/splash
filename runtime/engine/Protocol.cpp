@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 72;
+constexpr uint64_t kRequestFixedBytes = 88;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -32,7 +32,6 @@ constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 45;
 constexpr uint64_t kErrorFixedBytes = 18;
-constexpr uint64_t kCapacityExhaustedFixedBytes = 24;
 constexpr uint64_t kStatusJsonFixedBytes = 12;
 
 struct PayloadBounds {
@@ -136,8 +135,6 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
       return std::nullopt;
     }
     return bounded(kErrorFixedBytes, maximum);
-  case FrameType::CapacityExhausted:
-    return bounded(kCapacityExhaustedFixedBytes, kCapacityExhaustedFixedBytes);
   case FrameType::StatusJson:
     if (!checkedAdd(kStatusJsonFixedBytes, limits.maxStatusJsonBytes,
                     maximum)) {
@@ -187,7 +184,6 @@ bool validFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskRequest:
   case FrameType::Done:
   case FrameType::Error:
-  case FrameType::CapacityExhausted:
   case FrameType::StatusJson:
     type = static_cast<FrameType>(raw);
     return true;
@@ -449,11 +445,19 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   const SamplingParameters &sampling = request.sampling;
   if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
       !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
-      sampling.topP > 1.0f || sampling.topK > 32 ||
-      (sampling.temperature > 0.0f && !sampling.topK)) {
+      sampling.topP > 1.0f || !(sampling.minP >= 0.0f) ||
+      sampling.minP > 1.0f) {
     return invalid(IssueCode::InvalidSampling,
-                   "sampling requires temperature>=0, top_p in (0,1], and "
-                   "top_k in [1,32] when sampling is enabled");
+                   "sampling requires temperature>=0, top_p in (0,1] and "
+                   "min_p in [0,1]");
+  }
+  if (!(std::fabs(sampling.presencePenalty) <= 2.0f) ||
+      !(std::fabs(sampling.frequencyPenalty) <= 2.0f) ||
+      !std::isfinite(sampling.repetitionPenalty) ||
+      sampling.repetitionPenalty <= 0.0f) {
+    return invalid(IssueCode::InvalidSampling,
+                   "sampling requires presence and frequency penalties in "
+                   "[-2,2] and a positive repetition penalty");
   }
   Cohort expected = Cohort::Constrained;
   if (request.constraint == ConstraintMode::None) {
@@ -469,8 +473,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
       return invalid(IssueCode::InvalidCohortConstraint,
                      "score requests cannot carry a constraint");
     }
-    if (sampling.temperature != 0.0f || sampling.topP != 1.0f ||
-        sampling.topK != 0) {
+    if (sampling != SamplingParameters{}) {
       return invalid(IssueCode::InvalidSampling,
                      "score requests require greedy default sampling");
     }
@@ -642,20 +645,6 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
   return std::nullopt;
 }
 
-std::optional<ProtocolIssue>
-validateCapacityExhausted(const CapacityExhaustedEvent &event,
-                          FailureClass failureClass) {
-  if (!event.requestId) {
-    return makeIssue(failureClass, IssueCode::InvalidRequestId, 0,
-                     "capacity event request id must be non-zero");
-  }
-  if (!event.requiredKvPages) {
-    return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
-                     "capacity event required page count must be non-zero");
-  }
-  return std::nullopt;
-}
-
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits,
                                                 FailureClass failureClass) {
@@ -707,6 +696,10 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.f32(request.sampling.temperature);
   writer.f32(request.sampling.topP);
   writer.u32(request.sampling.topK);
+  writer.f32(request.sampling.presencePenalty);
+  writer.f32(request.sampling.frequencyPenalty);
+  writer.f32(request.sampling.repetitionPenalty);
+  writer.f32(request.sampling.minP);
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
@@ -873,20 +866,6 @@ ProtocolResult<Frame> encodeError(const ErrorEvent &event,
   return success(Frame{FrameType::Error, writer.take()});
 }
 
-ProtocolResult<Frame>
-encodeCapacityExhausted(const CapacityExhaustedEvent &event) {
-  if (auto issue =
-          validateCapacityExhausted(event, FailureClass::EngineUnhealthy)) {
-    return failure<Frame>(std::move(*issue));
-  }
-  Writer writer(kCapacityExhaustedFixedBytes);
-  writer.u64(event.requestId);
-  writer.u32(event.requiredKvPages);
-  writer.u32(event.availableKvPages);
-  writer.u64(event.retryAfterMicros);
-  return success(Frame{FrameType::CapacityExhausted, writer.take()});
-}
-
 ProtocolResult<Frame> encodeStatusJson(const StatusJsonEvent &event,
                                        const ProtocolLimits &limits) {
   if (auto issue =
@@ -919,7 +898,11 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.u32(imageSpanCount) ||
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
-      !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
+      !reader.u32(request.sampling.topK) ||
+      !reader.f32(request.sampling.presencePenalty) ||
+      !reader.f32(request.sampling.frequencyPenalty) ||
+      !reader.f32(request.sampling.repetitionPenalty) ||
+      !reader.f32(request.sampling.minP) || !reader.u64(request.seed) ||
       !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
       !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags)) {
@@ -1230,23 +1213,6 @@ ProtocolResult<Message> decodeError(const Frame &frame,
   return success(Message{std::move(event)});
 }
 
-ProtocolResult<Message> decodeCapacityExhausted(const Frame &frame) {
-  Reader reader(frame.payload);
-  CapacityExhaustedEvent event;
-  if (!reader.u64(event.requestId) || !reader.u32(event.requiredKvPages) ||
-      !reader.u32(event.availableKvPages) ||
-      !reader.u64(event.retryAfterMicros) || reader.remaining()) {
-    return failure<Message>(
-        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
-                  0, "capacity exhausted payload has an invalid length"));
-  }
-  if (auto issue =
-          validateCapacityExhausted(event, FailureClass::ProtocolFatal)) {
-    return failure<Message>(std::move(*issue));
-  }
-  return success(Message{event});
-}
-
 ProtocolResult<Message> decodeStatusJson(const Frame &frame,
                                          const ProtocolLimits &limits) {
   Reader reader(frame.payload);
@@ -1288,8 +1254,6 @@ std::string_view frameTypeName(FrameType type) {
     return "done";
   case FrameType::Error:
     return "error";
-  case FrameType::CapacityExhausted:
-    return "capacity_exhausted";
   case FrameType::StatusJson:
     return "status_json";
   }
@@ -1405,8 +1369,6 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
-          } else if constexpr (std::is_same_v<T, CapacityExhaustedEvent>) {
-            return encodeCapacityExhausted(value);
           } else {
             return encodeStatusJson(value, limits);
           }
@@ -1478,8 +1440,6 @@ ProtocolResult<Message> decodeFrame(const Frame &frame,
       return decodeDone(frame);
     case FrameType::Error:
       return decodeError(frame, limits);
-    case FrameType::CapacityExhausted:
-      return decodeCapacityExhausted(frame);
     case FrameType::StatusJson:
       return decodeStatusJson(frame, limits);
     }

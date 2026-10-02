@@ -37,9 +37,7 @@ class RequestLifetimeTests(unittest.TestCase):
             prompt_tokens=[101, 102],
             max_new_tokens=16,
             seed=0,
-            temperature=0,
-            top_p=1,
-            top_k=1,
+            sampling=wire.SamplingParameters(top_k=1),
             deadline=time.monotonic() + 30,
             image_owner=owner,
         )
@@ -62,7 +60,7 @@ class RequestLifetimeTests(unittest.TestCase):
         for outcome in (
             "complete",
             "cancel",
-            "capacity",
+            "request_error",
             "callback_error",
             "runtime_callback_error",
             "shutdown",
@@ -87,9 +85,15 @@ class RequestLifetimeTests(unittest.TestCase):
                 call = backend.active[job.request_id].call
                 if outcome in ("complete", "runtime_callback_error"):
                     send_success(process, call, tokens=(4,))
-                elif outcome == "capacity":
+                elif outcome == "request_error":
                     process.send(
-                        wire.CapacityExhaustedEvent(call.request_id, 40, 12, 50000)
+                        wire.ErrorEvent(
+                            wire.FailureClass.REQUEST_ERROR,
+                            call.request_id,
+                            False,
+                            b"capacity_exhausted",
+                            b"could not allocate KV target: engine budget",
+                        )
                     )
                 elif outcome == "shutdown":
                     backend.close()

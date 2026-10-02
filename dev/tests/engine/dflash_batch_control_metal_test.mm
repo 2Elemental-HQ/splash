@@ -51,20 +51,16 @@ void runWidth(MetalBackend &backend, uint32_t width,
   MetalBuffer draftProbabilities =
       shared(backend, kLanes * kProposals * 16 * sizeof(float),
              "accept-draft-probabilities");
-  MetalBuffer targetIds =
-      shared(backend, kLanes * kRows * 32 * sizeof(uint32_t),
-             "accept-target-ids");
-  MetalBuffer targetProbabilities =
-      shared(backend, kLanes * kRows * 32 * sizeof(float),
-             "accept-target-probabilities");
+  // Every lane is greedy here; sampled lanes read their target rows.
+  MetalBuffer targetRows =
+      shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
+             "accept-target-rows");
   MetalBuffer uniforms =
       shared(backend, kLanes * 2 * kRows * sizeof(float), "accept-uniforms");
   MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
                               "accept-output");
   MetalBuffer retained =
       shared(backend, kLanes * sizeof(uint32_t), "accept-retained");
-  MetalBuffer next =
-      shared(backend, kLanes * sizeof(uint32_t), "accept-next");
   MetalBuffer accepted =
       shared(backend, kLanes * sizeof(uint32_t), "accept-count");
 
@@ -73,12 +69,9 @@ void runWidth(MetalBackend &backend, uint32_t width,
   std::memset(draftIds.contents(), 0, draftIds.sizeBytes());
   std::memset(draftProbabilities.contents(), 0,
               draftProbabilities.sizeBytes());
-  std::memset(targetIds.contents(), 0, targetIds.sizeBytes());
-  std::memset(targetProbabilities.contents(), 0,
-              targetProbabilities.sizeBytes());
+  std::memset(targetRows.contents(), 0, targetRows.sizeBytes());
   std::memset(uniforms.contents(), 0, uniforms.sizeBytes());
   std::memset(retained.contents(), 0, retained.sizeBytes());
-  std::memset(next.contents(), 0, next.sizeBytes());
   std::memset(accepted.contents(), 0, accepted.sizeBytes());
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     for (uint32_t token = 0; token < kProposals; ++token) {
@@ -109,20 +102,17 @@ void runWidth(MetalBackend &backend, uint32_t width,
   dispatch.buffers = {{0, draft},
                       {1, draftIds},
                       {2, draftProbabilities},
-                      {3, targetIds},
-                      {4, targetProbabilities},
-                      {5, uniforms},
-                      {6, output},
-                      {7, retained},
-                      {8, next},
-                      {9, accepted}};
-  dispatch.bytes = {{10, &params, sizeof(params)}};
+                      {3, targetRows},
+                      {4, uniforms},
+                      {5, output},
+                      {6, retained},
+                      {7, accepted}};
+  dispatch.bytes = {{8, &params, sizeof(params)}};
   dispatch.threadgroups = {width, 1, 1};
   dispatch.threadsPerThreadgroup = {1, 1, 1};
   static_cast<void>(backend.submit(dispatch));
 
   const auto *retainedCounts = contents<uint32_t>(retained);
-  const auto *nextTokens = contents<uint32_t>(next);
   const auto *acceptedCounts = contents<uint32_t>(accepted);
   for (uint32_t lane = 0; lane < width; ++lane) {
     uint32_t expectedRetained =
@@ -133,9 +123,6 @@ void runWidth(MetalBackend &backend, uint32_t width,
             "accepted proposal count mismatch");
     require(retainedCounts[lane] == expectedRetained,
             "retained token count mismatch");
-    require(nextTokens[lane] ==
-                targetTokens[lane * kRows + expectedRetained - 1],
-            "next anchor mismatch");
   }
 }
 
@@ -156,7 +143,7 @@ int main(int argc, char **argv) {
 
     // Output limits and stop tokens shorten the committed prefix without
     // changing the physical eight-row graph.  The accepted proposal count is
-    // still seven in every lane; only retained rows and the next anchor move.
+    // still seven in every lane; only retained rows move.
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);

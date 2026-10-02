@@ -16,7 +16,7 @@ namespace splash::protocol {
 
 inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
-inline constexpr uint32_t kStatusSchemaVersion = 5;
+inline constexpr uint32_t kStatusSchemaVersion = 6;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
@@ -36,7 +36,6 @@ enum class FrameType : uint16_t {
   MaskRequest = 0x0103,
   Done = 0x0104,
   Error = 0x0105,
-  CapacityExhausted = 0x0106,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
 };
@@ -147,10 +146,23 @@ enum RequestFlag : uint32_t {
 
 inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 
+// The defaults are greedy selection with nothing changing the logits, which
+// score requests require.
 struct SamplingParameters {
   float temperature = 0.0f;
   float topP = 1.0f;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
+  // The penalties: presence and frequency in [-2, 2] lower the logits of
+  // output tokens; a positive repetition scales those of prompt and output
+  // tokens.
+  float presencePenalty = 0.0f;
+  float frequencyPenalty = 0.0f;
+  float repetitionPenalty = 1.0f;
+  // Sampling drops the tokens less likely than minP, in [0, 1], times the
+  // most likely one, before top-k and top-p; 0 drops none.
+  float minP = 0.0f;
 
   bool operator==(const SamplingParameters &) const = default;
 };
@@ -328,15 +340,6 @@ struct ErrorEvent {
   bool operator==(const ErrorEvent &) const = default;
 };
 
-struct CapacityExhaustedEvent {
-  uint64_t requestId = 0;
-  uint32_t requiredKvPages = 0;
-  uint32_t availableKvPages = 0;
-  uint64_t retryAfterMicros = 0;
-
-  bool operator==(const CapacityExhaustedEvent &) const = default;
-};
-
 // JSON is deliberately opaque to the transport.  Its independent schema
 // number is always present, and the frame length carries the exact JSON byte
 // count (including whitespace) without line or C-string assumptions.
@@ -352,7 +355,7 @@ using Message =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                  StatusRequestFrame, ReadyEvent, StartEvent,
                  PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
-                 ErrorEvent, CapacityExhaustedEvent, StatusJsonEvent>;
+                 ErrorEvent, StatusJsonEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -15,12 +14,6 @@ namespace splash::engine {
 namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
-
-uint64_t saturatingAdd(uint64_t left, uint64_t right) noexcept {
-  return right > std::numeric_limits<uint64_t>::max() - left
-             ? std::numeric_limits<uint64_t>::max()
-             : left + right;
-}
 
 void appendBatch(std::ostringstream &out,
                  const RuntimeBatchMetricsSnapshot &batch) {
@@ -37,19 +30,22 @@ void appendBatch(std::ostringstream &out,
 } // namespace
 
 std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool growthAllowed) {
-  const unsigned state = (!growthAllowed ? 1u : 0u) |
+                                         bool hostGrowthAllowed) {
+  const unsigned state = (!hostGrowthAllowed ? 1u : 0u) |
                          (wait.memory ? 2u : 0u) |
                          (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u);
+                         (wait.draining ? 8u : 0u) |
+                         (wait.heldBehindRefusal ? 16u : 0u);
   if (state == state_)
     return {};
   state_ = state;
   if (!state)
     return "Memory: growth available; resource wait cleared";
   std::ostringstream out;
-  out << "Memory: growth " << (growthAllowed ? "available" : "paused")
+  out << "Memory: growth " << (hostGrowthAllowed ? "available" : "paused")
       << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
+  if (wait.heldBehindRefusal)
+    out << "; held=" << wait.heldBehindRefusal;
   if (wait.draining)
     out << "; waiting for resident requests to finish";
   return out.str();
@@ -62,18 +58,17 @@ std::string runtimeStatusJson(
     const model::ModelTelemetry &executorTelemetry,
     const engine::RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait) {
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
   const auto &state = resources.stateCache;
   const auto &lookup = resources.lookup;
-  const uint64_t trackedPhysical = saturatingAdd(
-      metalMemory.allocatedBytes, metalMemory.sparseResidentBytes);
-  const uint64_t currentBytes =
-      std::max(trackedPhysical, metalMemory.deviceCurrentAllocatedBytes);
+  const uint64_t currentBytes = std::max(
+      metalMemory.allocatedBytes, metalMemory.deviceCurrentAllocatedBytes);
   const uint64_t peakBytes = std::max(
-      {currentBytes, metalMemory.peakResidentBytes,
+      {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
   // critical verdict makes host pressure a readiness failure.
@@ -106,9 +101,12 @@ std::string runtimeStatusJson(
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
       << ",\"waiting_concurrency\":" << resourceWait.concurrency
+      << ",\"held_behind_refusal\":" << resourceWait.heldBehindRefusal
+      << ",\"restoring\":" << resourceWait.restoring
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
@@ -123,17 +121,13 @@ std::string runtimeStatusJson(
     out << ",\"q8\":" << kvIdentity.str();
   out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()
-      << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
-      << ",\"sparse_virtual_bytes\":" << metalMemory.sparseVirtualBytes
-      << ",\"sparse_resident_bytes\":" << metalMemory.sparseResidentBytes
+      << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
-      << ",\"observed_resident_bytes\":" << memoryGovernor.observedResidentBytes
-      << ",\"serving_footprint_bytes\":" << memoryGovernor.servingFootprintBytes
-      << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
+      << ",\"charged_bytes\":" << memoryGovernor.chargedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
-      << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
+      << ",\"growth_allowed\":" << boolean(memoryGovernor.hostGrowthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
       << ",\"system_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
@@ -146,29 +140,24 @@ std::string runtimeStatusJson(
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
       << ",\"blocks\":" << resources.kvCache.blocks
       << ",\"cache_bytes\":" << resources.kvCache.bytes
-      << ",\"pages_total\":" << pool.pagesTotal
+      << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix
       << ",\"pages_free\":" << pool.pagesFree
-      << ",\"pages_free_resident\":" << pool.pagesFreeResident
-      << ",\"pages_resident\":" << pool.pagesResident
-      << ",\"resident_backing_bytes\":" << pool.residentBackingBytes
-      << ",\"reclaimable_backing_bytes\":" << pool.reclaimableBackingBytes
-      << ",\"sparse_tile_bytes\":" << metalMemory.sparseTileBytes
-      << ",\"pending_unmaps\":" << metalMemory.pendingSparseUnmaps
-      << ",\"pending_unmap_ms\":"
-      << metalMemory.pendingSparseUnmapSeconds * 1000.0
-      << ",\"unmaps_completed\":" << metalMemory.completedSparseUnmaps
-      << ",\"unmap_last_ms\":" << metalMemory.lastSparseUnmapSeconds * 1000.0
-      << ",\"unmap_max_ms\":" << metalMemory.maxSparseUnmapSeconds * 1000.0
-      << ",\"map_wait_event\":" << metalMemory.sparseMapWaitEvent
-      << ",\"pending_map_wait_ms\":" << metalMemory.pendingSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_last_ms\":" << metalMemory.lastSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_max_ms\":" << metalMemory.maxSparseMapWaitSeconds * 1000.0
+      << ",\"allocated_bytes\":" << pool.allocatedBytes
+      << ",\"reclaimable_bytes\":" << pool.reclaimableBytes
+      << ",\"extent_allocations\":" << pool.extentAllocations
+      << ",\"extent_releases\":" << pool.extentReleases
+      << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
+      << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
+      << ",\"extent_compactions\":" << pool.extentCompactions
+      << ",\"pages_moved\":" << pool.pagesMoved
+      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
-      << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes
-      << ",\"resident_bytes\":" << executorTelemetry.stateResidentBytes
+      << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
+      << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes
+      << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
       << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth

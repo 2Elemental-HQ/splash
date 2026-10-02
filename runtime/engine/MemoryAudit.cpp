@@ -47,8 +47,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   // Vision weights are absent without a vision tower. Loading already
   // requires them for a model with vision.
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
-      !actual.stateResidentBytes || !actual.sharedPrefillBytes ||
-      !actual.sharedDecodeBytes || !actual.kvResidentBytes ||
+      !actual.stateAllocatedBytes || !actual.sharedPrefillBytes ||
+      !actual.sharedDecodeBytes || !actual.kvAllocatedBytes ||
       !actual.backendAllocatedBytes || !actual.deviceCurrentAllocatedBytes ||
       !actual.devicePeakAllocatedBytes || !actual.estimatedWarmupPeakBytes) {
     return fail(MemoryAuditError::MissingMeasurement,
@@ -58,7 +58,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   // The plan takes the weight categories from what loaded, so they are
   // counted but have no bound of their own. A buffer a loader does not report
   // is unclassified backend memory, which the pipeline and runtime reserves
-  // bound; only the arenas, KV storage and the disk tier's KV staging have
+  // bound; only the arenas, KV storage and the disk tier's state staging have
   // planned category bounds.
   uint64_t categorized = 0;
   for (const uint64_t weights : {actual.targetWeightsBytes,
@@ -77,8 +77,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   const Category categories[] = {
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
-      {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
-      {"KV staging", actual.kvStagingBytes, budget.kvStagingBytes},
+      {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
+      {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
   };
   for (const Category &category : categories) {
     if (category.actual > category.planned) {
@@ -93,14 +93,14 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
     }
   }
   uint64_t dynamic = 0;
-  if (!checkedAdd(actual.stateResidentBytes, actual.kvResidentBytes, dynamic) ||
-      !checkedAdd(categorized, actual.stateResidentBytes, categorized)) {
+  if (!checkedAdd(actual.stateAllocatedBytes, actual.kvAllocatedBytes, dynamic) ||
+      !checkedAdd(categorized, actual.stateAllocatedBytes, categorized)) {
     return fail(MemoryAuditError::ArithmeticOverflow,
                 "elastic memory sum overflowed", actual);
   }
   if (dynamic > budget.dynamicBudgetBytes) {
     return fail(MemoryAuditError::CategoryExceedsPlan,
-                "resident state and KV exceed the "
+                "allocated state and KV exceed the "
                 "unified dynamic budget",
                 actual);
   }

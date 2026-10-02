@@ -18,6 +18,29 @@ MODEL_IDS = (
 )
 
 
+def idle(
+    submitted=0,
+    completed=0,
+    cancelled=0,
+    failed=0,
+    reused=0,
+    prefill=0,
+    in_use_evictions=0,
+):
+    """An idle status with these request, cache, state and metric counters."""
+    return {
+        "requests": {
+            "submitted": submitted,
+            "completed": completed,
+            "cancelled": cancelled,
+            "failed": failed,
+        },
+        "cache": {"reused_tokens": reused, "lost_state_misses": 0},
+        "state": {"in_use_evictions": in_use_evictions},
+        "metrics": {"prefill_input_tokens": prefill},
+    }
+
+
 class AgentRunnerTests(unittest.TestCase):
     def test_pi_counts_only_successful_bash_results(self):
         for is_error in (False, True):
@@ -298,22 +321,8 @@ class AgentRunnerTests(unittest.TestCase):
                 process.poll.return_value = (
                     None if mode in ("monitor_error", "interrupt") else 0
                 )
-                before = {
-                    "requests": {
-                        "submitted": 0,
-                        "completed": 0,
-                        "cancelled": 0,
-                        "failed": 0,
-                    }
-                }
-                after = {
-                    "requests": {
-                        "submitted": 2,
-                        "completed": 1,
-                        "cancelled": 1,
-                        "failed": 0,
-                    }
-                }
+                before = idle()
+                after = idle(submitted=2, completed=1, cancelled=1)
 
                 # OpenCode's record of the turn: stopped, unless incomplete.
                 record = {
@@ -371,7 +380,6 @@ class AgentRunnerTests(unittest.TestCase):
                 "content": [{"type": "text", "text": "Done"}],
             },
         }
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for finished in (True, False):
             with (
                 self.subTest(finished=finished),
@@ -395,10 +403,7 @@ class AgentRunnerTests(unittest.TestCase):
                     mock.patch.object(
                         agent,
                         "idle_status",
-                        side_effect=[
-                            {"requests": idle},
-                            {"requests": {**idle, "submitted": 1, "completed": 1}},
-                        ],
+                        side_effect=[idle(), idle(submitted=1, completed=1)],
                     ),
                     mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
                     mock.patch.object(agent, "stop_process"),
@@ -414,6 +419,75 @@ class AgentRunnerTests(unittest.TestCase):
                         ):
                             runner.phase("test", "task")
                 self.assertEqual(runner.session, "pi-session")
+
+    def test_phase_requires_prefix_reuse_across_requests(self):
+        # Requests after a phase's first resend the conversation: with no
+        # prompt token reused, its replay points stopped working. Evicting a
+        # replay point an unfinished request holds is recorded, not gated.
+        for completed, reused, evictions, error in (
+            (3, 0, 0, "phase reused no cached prompt tokens across 3 requests"),
+            (3, 64, 0, None),
+            (1, 0, 0, None),
+            (3, 64, 2, None),
+        ):
+            with (
+                self.subTest(completed=completed, reused=reused, evictions=evictions),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.name, runner.session = "codex", None
+                runner.folder = runner.workspace = Path(directory)
+                runner.timeout, runner.phases = 10, []
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = 0
+
+                def launch(*args, **kwargs):
+                    for event in (
+                        {"type": "thread.started", "thread_id": "thread"},
+                        {"type": "turn.completed"},
+                    ):
+                        kwargs["stdout"].write(json.dumps(event) + "\n")
+                    return process
+
+                after = idle(
+                    submitted=completed,
+                    completed=completed,
+                    reused=reused,
+                    prefill=500,
+                    in_use_evictions=evictions,
+                )
+                output = io.StringIO()
+                with (
+                    mock.patch.object(runner, "argv", return_value=(["codex"], {})),
+                    mock.patch.object(
+                        agent, "idle_status", side_effect=[idle(prefill=100), after]
+                    ),
+                    mock.patch.object(agent.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(agent, "stop_process"),
+                    mock.patch.object(
+                        agent, "memory_sample", return_value={"pressure": 1}
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    if error is None:
+                        runner.phase("test", "task")
+                    else:
+                        with self.assertRaisesRegex(agent.AgentFailure, error):
+                            runner.phase("test", "task")
+                self.assertEqual(
+                    runner.phases[0]["reuse"],
+                    {
+                        "reused_tokens": reused,
+                        "prefill_input_tokens": 400,
+                        "lost_state_misses": 0,
+                        "in_use_evictions": evictions,
+                        "completed": completed,
+                    },
+                )
+                self.assertEqual(
+                    "codex/test: warning: 2 replay points" in output.getvalue(),
+                    bool(evictions),
+                )
 
     def test_hermes_runs_in_its_own_profile_of_the_developers_root(self):
         # A root of its own would be the bug the launcher avoids: Hermes would
@@ -457,7 +531,6 @@ class AgentRunnerTests(unittest.TestCase):
     def test_hermes_phase_without_a_session_record_reports_the_exit(self):
         # Hermes creates state.db with its first session; its absence is not
         # a sqlite error.
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for code in (1, 0):
             with (
                 self.subTest(exit_code=code),
@@ -473,9 +546,7 @@ class AgentRunnerTests(unittest.TestCase):
                 with (
                     mock.patch.object(runner, "argv", return_value=(["hermes"], {})),
                     mock.patch.object(
-                        agent,
-                        "idle_status",
-                        side_effect=[{"requests": idle}, {"requests": idle}],
+                        agent, "idle_status", side_effect=[idle(), idle()]
                     ),
                     mock.patch.object(agent.subprocess, "Popen", return_value=process),
                     mock.patch.object(agent, "stop_process"),
@@ -932,7 +1003,6 @@ class AgentRunnerTests(unittest.TestCase):
             "status": "completed",
         }
         earlier = turn(answer("Done"))
-        idle = {"submitted": 0, "completed": 0, "cancelled": 0, "failed": 0}
         for history, error in (
             ({"messages": [*earlier, *turn(compaction, answer("Again"))]}, None),
             # The prompt never reached OpenCode: the session's last turn is
@@ -962,10 +1032,7 @@ class AgentRunnerTests(unittest.TestCase):
                     mock.patch.object(
                         agent,
                         "idle_status",
-                        side_effect=[
-                            {"requests": idle},
-                            {"requests": {**idle, "submitted": 1, "completed": 1}},
-                        ],
+                        side_effect=[idle(), idle(submitted=1, completed=1)],
                     ),
                     mock.patch.object(agent.subprocess, "Popen", return_value=process),
                     mock.patch.object(agent, "stop_process"),

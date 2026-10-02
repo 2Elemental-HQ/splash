@@ -232,7 +232,6 @@ class TextCompletionTests(unittest.TestCase):
             "echo": False,
             "logprobs": None,
             "best_of": 1,
-            "repetition_penalty": 1,
         }
         for fields in (defaults, {key: None for key in defaults}, {"n": 1}):
             with self.subTest(fields=fields):
@@ -263,22 +262,24 @@ class TextCompletionTests(unittest.TestCase):
             temperature=0.7,
             top_p=0.5,
             top_k=5,
+            presence_penalty=1.5,
+            frequency_penalty=-0.5,
+            repetition_penalty=1.1,
+            min_p=0.25,
             seed=7,
             priority="foreground",
         )
         self.assertEqual(status, 200, response)
         request = runtime.requests[0]
         self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
-        self.assertAlmostEqual(request.sampling.temperature, 0.7)
-        self.assertEqual((request.sampling.top_p, request.sampling.top_k), (0.5, 5))
+        self.assertEqual(
+            request.sampling,
+            wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1, 0.25),
+        )
         self.assertEqual(request.seed, 7)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
-            ({"temperature": -1}, "invalid sampling parameters"),
-            ({"top_k": 33}, "invalid sampling parameters"),
-            ({"presence_penalty": 1}, "output transformation is not supported"),
-            ({"repetition_penalty": 1.1}, "output transformation is not supported"),
-            ({"logit_bias": {"1": 2}}, "output transformation is not supported"),
+            ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),

@@ -141,7 +141,7 @@ MemoryGovernor::MemoryGovernor(
     throw std::invalid_argument(
         "host available-memory provider must be present");
   }
-  if (observedResidentBytes(true) > limitBytes_) {
+  if (chargedBytes(true) > limitBytes_) {
     throw metal::MetalAllocationError(
         "existing Metal allocations exceed memory governor limit",
         metal::AllocationFailure::EngineBudget);
@@ -155,19 +155,16 @@ MemoryGovernor::MemoryGovernor(
 }
 
 uint64_t
-MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
+MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
   metal::MetalMemoryStats memory = refreshDevice
       ? backend_.refreshMemoryStats()
       : backend_.memoryStats();
   // The backend's buffers are charged in full, the rest of the device's
   // footprint only where it exceeds the untracked reserve.
-  uint64_t accounted = memory.allocatedBytes;
-  for (const uint64_t bytes :
-       {memory.sparseResidentBytes, untrackedReserveBytes_}) {
-    accounted = bytes <= std::numeric_limits<uint64_t>::max() - accounted
-        ? accounted + bytes
-        : std::numeric_limits<uint64_t>::max();
-  }
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  const uint64_t accounted = untrackedReserveBytes_ <= limit - memory.allocatedBytes
+      ? memory.allocatedBytes + untrackedReserveBytes_
+      : limit;
   return std::max(accounted, memory.deviceCurrentAllocatedBytes);
 }
 
@@ -198,7 +195,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
     throw std::invalid_argument("memory reservation must be positive");
   }
   std::lock_guard lock(mutex_);
-  uint64_t observed = observedResidentBytes(true);
+  uint64_t observed = chargedBytes(true);
   bool overflows =
       reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
   uint64_t requested =
@@ -208,26 +205,25 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  // Growth leaves the warning margin free above the host's reserve, except
-  // back to the serving footprint: that is what a request is served from,
-  // and a pressure pass that released it must not leave the server unable
-  // to start one while other applications hold the margin.
-  const bool withinServingFootprint =
-      !overflows && observed <= servingFootprintBytes_ &&
-      requested <= servingFootprintBytes_ - observed;
+  // Growth leaves the warning margin free above the host's reserve and waits
+  // for the recovery margin once the host has run short, unless a request
+  // in service needs it (setServing).
   const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
-  const uint64_t hostMargin = withinServingFootprint ? 0 : kHostWarningMarginBytes;
-  bool hostFits = requested <= hostRoom && hostRoom - requested >= hostMargin;
+  const bool hostRoomFits =
+      requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
-  if (engineFits && !hostFits)
+  if (engineFits && !serving_ && !hostRoomFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || (hostHeld() && !withinServingFootprint) ||
-      pressure == MemoryPressure::Critical) {
+  const bool hostRefuses = pressure == MemoryPressure::Critical ||
+                           (!serving_ && (!hostRoomFits || hostHeld()));
+  if (hostRefuses || !engineFits) {
+    // The host's refusal lifts with its pressure, the limit's only once
+    // memory is freed: a refusal they share is the host's.
     if (failure)
-      *failure = !engineFits ? metal::AllocationFailure::EngineBudget
-                            : metal::AllocationFailure::HostPressure;
+      *failure = hostRefuses ? metal::AllocationFailure::HostPressure
+                             : metal::AllocationFailure::EngineBudget;
     if (deniedReservations_ != std::numeric_limits<uint64_t>::max()) {
       ++deniedReservations_;
     }
@@ -247,22 +243,22 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
     try {
       allocate();
     } catch (const metal::MetalAllocationError &error) {
-      // Host headroom is an estimate; the driver can still deny placement.
+      // Host headroom is an estimate; the driver can still deny the allocation.
       return error.failure();
     }
     reservation->commit();
-    return true;
+    return {};
   };
+}
+
+void MemoryGovernor::setServing(bool serving) noexcept {
+  std::lock_guard lock(mutex_);
+  serving_ = serving;
 }
 
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   std::lock_guard lock(mutex_);
   systemPressure_ = pressure;
-}
-
-void MemoryGovernor::markServingFootprint() noexcept {
-  std::lock_guard lock(mutex_);
-  servingFootprintBytes_ = observedResidentBytes(true);
 }
 
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
@@ -274,7 +270,7 @@ void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
-  uint64_t observed = observedResidentBytes();
+  uint64_t observed = chargedBytes();
   uint64_t used = observed;
   if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
     used += reservedBytes_;
@@ -287,11 +283,9 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostAvailable, reservedBytes_);
   bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
       !hostHeld() && hostHeadroom >= kHostWarningMarginBytes;
-  bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
       limitBytes_,
       observed,
-      servingFootprintBytes_,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
@@ -301,7 +295,6 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       hostReserveBytes_,
       hostHeadroom,
       systemPressure_,
-      growthAllowed,
       hostGrowthAllowed,
   };
 }
@@ -343,23 +336,23 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {};
   }
   if (snapshot.pressure == MemoryPressure::Critical) {
-    return {.reclaimEmptyKvExtents = true,
+    return {.reclaim = true,
             .evictAllUnpinnedPrefixes = true,
             .targetBytes = std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
     return continued_.value_or(MemoryReclaimDirective{
-        .reclaimEmptyKvExtents = true, .keepServingFootprint = true});
+        .reclaim = true, .keepServingFootprint = true});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   continued_.reset();
 
   // Missing telemetry pauses allocation, but is not evidence that live
-  // cache must be discarded. Empty backing can still be returned.
+  // cache must be discarded. Empty extents can still be returned.
   if (!snapshot.hostMeasurementValid &&
       snapshot.systemPressure == MemoryPressure::Normal)
-    return {.reclaimEmptyKvExtents = true, .keepServingFootprint = true};
+    return {.reclaim = true, .keepServingFootprint = true};
 
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
@@ -367,7 +360,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return {.reclaimEmptyKvExtents = true,
+  return {.reclaim = true,
           .targetBytes = std::min(desired, kHostWarningMarginBytes),
           .keepResumePoint = !requestWaiting,
           .keepServingFootprint = true};

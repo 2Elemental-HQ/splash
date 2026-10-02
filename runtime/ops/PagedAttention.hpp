@@ -53,13 +53,12 @@ q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
 }
 
 // Default parameters; the verify plan sets both split counts for each lane
-// before dispatch.
+// and each layer's place in the extents before dispatch.
 [[nodiscard]] constexpr Q8VerifyAttentionParams
 q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
-                        uint32_t chunkStride, uint32_t pageTableEntries,
-                        uint32_t physicalPageCount) noexcept {
+                        uint32_t chunkStride, uint32_t pageTableEntries) noexcept {
   return {committedTokens, activeRows, chunkStride, pageTableEntries,
-          physicalPageCount, kQ8VerifySplits, kQ8VerifySplits, 0};
+          {}, kQ8VerifySplits, kQ8VerifySplits};
 }
 
 [[nodiscard]] constexpr std::string_view q8VerifyAttentionValidationError(
@@ -76,15 +75,11 @@ q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
   const uint64_t requiredPages = (visible + kPageTokens - 1) / kPageTokens;
   if (params.page_table_entries < requiredPages)
     return "page_table_too_short";
-  if (!params.physical_page_count)
-    return "physical_page_pool_empty";
   if (!params.split_count || params.split_count > kQ8VerifyMaximumSplits)
     return "split_count_invalid";
   if (params.slot_splits < params.split_count ||
       params.slot_splits > kQ8VerifyMaximumSplits)
     return "slot_splits_invalid";
-  if (params.reserved2)
-    return "reserved_fields_nonzero";
   return {};
 }
 
@@ -117,32 +112,7 @@ chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
     return "chunk_stride_invalid";
   if (params.page_table_entries < chunkedPrefillRequiredPages(params))
     return "page_table_too_short";
-  if (!params.physical_page_count)
-    return "physical_page_pool_empty";
-  if (params.reserved0 || params.reserved1 || params.reserved2)
-    return "reserved_fields_nonzero";
   return {};
-}
-
-[[nodiscard]] constexpr bool
-chunkedPrefillValid(const Q8ChunkedPrefillParams &params) noexcept {
-  return chunkedPrefillValidationError(params).empty();
-}
-
-// Call this once when preparing a request lane, not once per attention layer.
-// Cache is the sole page-table owner and structurally guarantees
-// unique leases; this ABI boundary only has to reject out-of-range indices.
-[[nodiscard]] inline bool
-chunkedPrefillPageTableInRange(const Q8ChunkedPrefillParams &params,
-                               std::span<const uint32_t> pageTable) {
-  const uint32_t pages = chunkedPrefillRequiredPages(params);
-  if (!chunkedPrefillValid(params) || pageTable.size() < pages)
-    return false;
-  for (uint32_t logical = 0; logical < pages; ++logical) {
-    if (pageTable[logical] >= params.physical_page_count)
-      return false;
-  }
-  return true;
 }
 
 } // namespace splash::kv
@@ -321,13 +291,13 @@ public:
                                      uint32_t lanes, LinearScratch scratch = {},
                                      LinearInput input = LinearInput::Plain);
 
+  // A lane's parameters; each layer's encoding adds the layer's place in
+  // the extents.
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
-                uint32_t chunkStride, std::span<const uint32_t> pageTable,
-                uint32_t physicalPageCount);
+                uint32_t chunkStride, uint32_t pageTableEntries);
 
-  static void addPrefillStore(metal::CommandGraph &graph,
-                              const kv::LayerStorage &layer,
+  static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
@@ -338,8 +308,7 @@ public:
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for
   // the command's largest sequence and configuration.
-  static void addPrefill(metal::CommandGraph &graph,
-                         const kv::LayerStorage &layer,
+  static void addPrefill(metal::CommandGraph &graph, SplashKvLayer layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,
                          metal::MetalBuffer statistics,
@@ -347,7 +316,7 @@ public:
                          const kv::Q8ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
   static void
-  addVerify(metal::CommandGraph &graph, const kv::LayerStorage &layer,
+  addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
             PagedVerifyBuffers buffers,
             std::span<const kv::Q8ChunkedPrefillParams> storeParams,
             std::span<const kv::Q8VerifyAttentionParams> attentionParams,

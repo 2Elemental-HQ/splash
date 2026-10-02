@@ -1,12 +1,12 @@
 #include "Q8PageFormatReference.hpp"
 #include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "TestModel.hpp"
 
 #import <Foundation/Foundation.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -99,7 +99,6 @@ std::string executionManifest(uint32_t draftRows = 8,
                               std::string_view extraGeometry = {}) {
   std::ostringstream out;
   out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
-      << R"("allocation_extent_target_bytes":134217728,)"
       << R"("draft_proposal_tokens":7,)"
       << "\"draft_query_rows\":" << draftRows << ','
       << R"("draft_sliding_window":2048,)"
@@ -212,7 +211,6 @@ DeviceCapabilities device() {
   result.maxThreadgroupMemoryBytes = 32 * 1024;
   result.maxThreadgroupWidth = 1024;
   result.hasUnifiedMemory = true;
-  result.supportsPlacementSparse = true;
   return result;
 }
 
@@ -227,15 +225,15 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   actual.targetWeightsBytes = budget.targetWeightsBytes;
   actual.draftWeightsBytes = budget.draftWeightsBytes;
   actual.visionWeightsBytes = budget.visionWeightsBytes;
-  actual.stateResidentBytes = budget.activeStateCellBytes;
+  actual.stateAllocatedBytes = budget.activeStateCellBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
-  actual.kvResidentBytes = budget.kvExtentBytes;
+  actual.kvAllocatedBytes = budget.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
       actual.visionWeightsBytes +
-      actual.stateResidentBytes + actual.sharedPrefillBytes +
-      actual.sharedDecodeBytes + actual.kvResidentBytes;
+      actual.stateAllocatedBytes + actual.sharedPrefillBytes +
+      actual.sharedDecodeBytes + actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
   // Model warmup estimates add the pipeline and runtime reserves.
@@ -244,31 +242,6 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
                                     budget.runtimeOverheadReserveBytes;
   return actual;
 }
-
-class Backing final : public KvBacking {
-public:
-  explicit Backing(uint32_t pages) : resident_(pages, true) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    resident_.at(page) = true;
-    return true;
-  }
-  bool releaseBackingForPage(uint32_t page) override {
-    const bool resident = resident_.at(page);
-    resident_.at(page) = false;
-    return resident;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    return page - page % 4;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
-  }
-private:
-  std::vector<bool> resident_;
-};
 
 class State final : public CompositeState {
 public:
@@ -308,6 +281,7 @@ public:
                                      : decode(plan, items),
                                  completion);
   }
+  uint64_t snapshotBytes() const noexcept override { return 64; }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return std::make_shared<State>();
   }
@@ -366,7 +340,7 @@ class Harness final {
 public:
   Harness(const EngineMemoryPlan &plan, int failingStep = -1,
           int throwingStep = -1, bool failReadyWrite = false)
-      : backing_(16), pool_(backing_),
+      : backing_(16, 4096, 4), pool_(backing_, 16),
         resources_(pool_, CacheNamespace{}),
         executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
                   throwingStep),
@@ -378,7 +352,9 @@ public:
               }
               output_.insert(output_.end(), bytes.begin(), bytes.end());
             },
-            [] { return std::string("{\"schema_version\":5}"); }) {}
+            [] { return std::string("{\"schema_version\":5}"); }) {
+    backing_.commandInFlight = [this] { return loop_.commandInFlight(); };
+  }
 
   Executor &executor() noexcept { return executor_; }
   engine::NativeRuntime &loop() noexcept { return loop_; }
@@ -391,7 +367,7 @@ private:
     return config;
   }
 
-  Backing backing_;
+  test::TestKvStorage backing_;
   KvPool pool_;
   engine::Cache resources_;
   Executor executor_;
@@ -456,7 +432,7 @@ void requireReadyWithoutReducingConcurrency(
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
   const auto complete = memoryPlan().breakdown();
   for (uint32_t width : {1U, 2U, 3U}) {
-    // Enough for the requested resident cells and one KV extent, with less
+    // Enough for the requested resident cells and the KV runway, with less
     // than one extra cell of headroom. This is a valid single-lane plan.
     const uint64_t ceiling = complete.minimumRequiredBytes +
                             (width - 1) * complete.activeStateCellBytes +

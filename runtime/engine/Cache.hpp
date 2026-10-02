@@ -2,6 +2,7 @@
 
 #include "engine/KvCache.hpp"
 #include "engine/KvPool.hpp"
+#include "engine/KvTier.hpp"
 #include "engine/StateCache.hpp"
 #include "model/Model.hpp"
 #include "model/SlotFile.hpp"
@@ -68,7 +69,7 @@ struct KvTierSnapshot final {
   uint64_t writtenBytes = 0;
   uint64_t demotions = 0;
   uint64_t demotionFailures = 0;
-  // Demotions the ring had no room for; the leaf stayed and the requester
+  // Demotions the tier had no room for; the leaf stayed and the requester
   // waited.
   uint64_t demotionsRefused = 0;
   uint64_t restores = 0;
@@ -86,22 +87,35 @@ struct CacheSnapshot final {
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
   uint32_t activeRequests = 0;
+  // The longest emptying of one extent by moving its pages, re-pointing the
+  // cached blocks and requests on them included.
+  double extentCompactMaxMilliseconds = 0.0;
+};
+
+enum class TokenAdmissionFailure : uint8_t {
+  None,
+  // The pool could not grow by an extent; allocationFailure says why.
+  Denied,
+  // A transfer in flight (a KV demotion, a KV restore or the one state write)
+  // holds what the request needs; retry when it lands.
+  Pending,
 };
 
 struct TokenAdmission final {
-  KvPageAcquireFailure failure = KvPageAcquireFailure::None;
+  TokenAdmissionFailure failure = TokenAdmissionFailure::None;
   uint32_t additionalPages = 0;
   uint32_t availablePages = 0;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
 
   [[nodiscard]] bool granted() const noexcept {
-    return failure == KvPageAcquireFailure::None;
+    return failure == TokenAdmissionFailure::None;
   }
 };
 
 struct PageTableView final {
   std::span<const uint32_t> pages;
   uint64_t revision = 0;
+  uint32_t firstChanged = 0;
 };
 
 struct CacheReclaimResult final {
@@ -113,21 +127,48 @@ struct CacheReclaimResult final {
   bool pending = false;
 };
 
-enum class CacheReclaimMode { ReuseBacking, ReleaseBacking };
+enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
+
+// The highest class a reclaim step may take (the class rule). Ordinary:
+// checkpoints, ordinary states and KV, for work a resident lane holds
+// back anyway (a start beside one: Engine's inService is false). InUse:
+// after all of those, the states unfinished requests use and the KV they
+// restore through, for running work (a resident lane, or a start that no
+// resident lane precedes) and for pressure passes.
+enum class ReclaimClass : uint8_t { Ordinary, InUse };
+
+// Whether the caller can wait for memory a step leaves to come back.
+// CanWait (growth and pressure passes): a state the write in flight blocks
+// stays (pending), and a KV leaf a state needs is written first; its page
+// returns when the copy lands. Immediate (a snapshot between commands):
+// a state the write in flight blocks is dropped, and only leaves whose page
+// frees now go, dropped through their disk copy or erased when nothing
+// depends on them; a leaf that needs a demotion is passed over.
+enum class ReclaimTiming : uint8_t { CanWait, Immediate };
+
+// What one step of room for a state's snapshot gave: a recycled state's
+// buffers, which the snapshot takes as they are, or the bytes of a released
+// extent, which the snapshot has to allocate and which may be fewer than a
+// state needs.
+struct StateRoom final {
+  bool made = false;
+  uint64_t extentBytes = 0;
+  explicit operator bool() const noexcept { return made; }
+};
 
 // KV restores a request waits for before it can run.
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
-// A state in RAM always sits on a resident KV block: reclaimKvLeaf frees or
-// drops the state before the block's page, and endRequest, pollTransfers and
-// freeDiskSpace leave such a block its page.
+// A state in RAM always sits on a resident KV block: reclaim takes the state
+// before the block's page, and endRequest, pollTransfers and freeDiskSpace
+// leave such a block its page.
 class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
   // the states' file can run on it without the tier.
-  Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier = nullptr,
+  Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
@@ -136,10 +177,11 @@ public:
     completionNotifier_ = std::move(notifier);
   }
   // Consumes finished transfers: a written state or KV page frees its RAM, a
-  // restored block becomes usable, and restores waiting for staging start.
+  // restored block becomes usable, and restores the tier had no room for
+  // start.
   [[nodiscard]] bool pollTransfers();
   void discardState(uint64_t block, const CompositeState *state) {
-    states_.invalidate(block, state);
+    states_.discardState(block, state);
   }
   void beginRequest(uint64_t requestId);
   void endRequest(uint64_t requestId);
@@ -166,6 +208,9 @@ public:
 
   [[nodiscard]] TokenAdmission ensureTokens(uint64_t requestId,
                                             uint64_t tokenCount);
+  // The request's page list. Its revision moves on every change of the
+  // list, and the list differs from the one at revision - 1 from
+  // firstChanged on.
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
 
   // Canonicalizes every newly complete Page32 block. Duplicate content swaps
@@ -187,61 +232,111 @@ public:
   // False when the tier cannot take the state now; nothing is published then.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
+  // The request holding the handle is unfinished and its conversation
+  // resumes from the state at this block: see StateCache::useState.
+  [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
-  // One cache reclaimer for memory growth and pressure warnings. After empty
-  // backing, disposable checkpoints are reclaimed first. Ordinary states and
-  // resident KV leaves share one oldest-first access order. A chosen state
-  // keeps its disk copy when it has one, is written when the tier admits it
-  // and dropped otherwise; its RAM is free when the call returns. A chosen
-  // KV leaf frees its page at once when a disk copy exists, is dropped when
-  // nothing depends on it, and is otherwise written first: its page returns
-  // when the copy has landed, which ensureTokens() reports as Pending so
-  // callers wait instead of evicting more. A full disk quota replaces the
-  // oldest redundant copy of either kind, then the oldest copy that is the
-  // only one.
-  // Active requests and pinned restores are never selected. Physical release
-  // is paced by the backing: while an earlier release is still being torn
-  // down, the pass evicts only until an extent is empty and stops there; the
-  // caller retries, releasing that extent, once releaseDeferred() clears.
-  // keepResumePoint stops short of the newest state publication. A shrink
-  // that no request is waiting for gains the one cell that publication holds
-  // and costs the next request a replay of its whole prompt, because a
-  // hybrid model cannot resume from cached KV without the recurrent state.
-  // Empty backing, older publications and state-free KV are still reclaimed.
-  // keepRunway leaves one empty extent resident, for the next request.
-  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
-                                      bool keepResumePoint = false,
-                                      bool keepRunway = false);
+  // One cache reclaimer for memory growth and pressure warnings. Free pages
+  // return first: empty extents, then the free pages scattered over the
+  // others once they cover the extent that holds the fewest pages, whose
+  // pages move to them (compactExtent). Only then is anything evicted:
+  // disposable checkpoints first, then ordinary states and resident KV
+  // leaves, which share one oldest-first access order. States that
+  // unfinished requests use and the KV they restore through follow in their
+  // own such order, once no transfer in flight can return what is needed
+  // first. A chosen state keeps its disk copy when it has one, is written
+  // when the tier admits it and dropped otherwise; its RAM is free when the
+  // call returns. A chosen KV leaf frees its page at once when a disk copy
+  // exists, is dropped when nothing depends on it, and is otherwise written
+  // first: its page returns when the copy has landed, which ensureTokens()
+  // reports as Pending so callers wait instead of evicting more. A full disk
+  // quota replaces the oldest redundant copy of either kind, then the oldest
+  // copy that is the only one. The only copies of states in use, and the KV
+  // they restore through, make room only for a copy that is itself in use.
+  // Active requests and pinned restores are never selected. A pass releases
+  // every extent it empties. keepResumePoint stops short of the resume
+  // point: the newest ordinary publication (else checkpoint); states in use
+  // are protected by their class. A shrink that no request is waiting for
+  // gains the one cell that publication holds and costs the next request a
+  // replay of its whole prompt, because a hybrid model cannot resume from
+  // cached KV without the recurrent state. Empty extents, older publications
+  // and state-free KV are still reclaimed. keepRunway leaves one empty extent
+  // allocated, for the next request.
+  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes,
+                                      bool keepResumePoint, bool keepRunway);
+  // Evicts every unpinned entry, in reclaimCache's order, and releases every
+  // empty extent, the runway too. Only then does it move pages, those that
+  // requests and pins still hold, so that nothing is copied and then evicted.
+  [[nodiscard]] uint64_t evictAll();
   // reclaimCache's stop rule: releasedBytes and the pages whose copies are
-  // being written meet targetBytes. A pass with evictAll has no target.
-  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
-                                bool evictAll) const noexcept;
+  // being written meet targetBytes.
+  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes,
+                                uint64_t targetBytes) const noexcept;
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine.
   [[nodiscard]] bool transfersInFlight() const noexcept;
-  // One bounded reclaim step for an allocation retry. Progress is distinct
-  // from physical bytes because evicting a KV reference can make a resident
-  // page reusable without immediately emptying its extent.
-  [[nodiscard]] CacheReclaimResult reclaimOne(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
-      bool keepResumePoint = false, bool keepRunway = false);
-  // Recycles exactly one unpinned state, preferring checkpoints, for a
-  // required state publication; the disk tier keeps it when it admits it.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
-  // Empty resident backing exists but the previous release is still in
-  // flight; more reclaim work becomes possible without evicting anything.
-  [[nodiscard]] bool releaseDeferred() const noexcept;
-  // Includes the last unmap, even when no empty extent remains to reclaim.
-  [[nodiscard]] bool releasePending() const noexcept;
-  [[nodiscard]] uint64_t releaseGeneration() const noexcept;
-  // Startup cleanup only: unmap unused backing without evicting cache data,
-  // keeping one runway extent. Waits for each paced release.
-  void releaseUnusedKvBacking();
+  // One bounded reclaim step for an allocation retry: one empty extent, one
+  // extent emptied of its pages, one state or one KV leaf, so a denied
+  // allocation frees only what it needs. Progress is distinct from released
+  // bytes because evicting a KV reference can make a page reusable without
+  // emptying its extent, and the extent a step empties may be the runway
+  // it keeps. The step takes nothing of a class above upTo: with Ordinary,
+  // once only what is in use is left, it makes no progress, and reports
+  // pending while a transfer is in flight.
+  [[nodiscard]] CacheReclaimResult reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
+                                              bool keepResumePoint = false,
+                                              bool keepRunway = false);
+  // The reclaim step for a KV admission the pool denied: evicts in
+  // reclaimOne(KeepExtents, upTo)'s order until the free pages and the pages
+  // whose demotion is in flight cover `pages` (the admission's
+  // additionalPages), until an evicted state has returned memory (the retry
+  // may then grow the pool), or until nothing more of the class can go; one
+  // step instead of a retry per page.
+  [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, ReclaimClass upTo);
+  // The most pages reclaimForPages(pages, upTo) can leave free: every
+  // allocated page no request holds, but with Ordinary not the idle KV that
+  // states in use restore through.
+  [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo) const;
+  // One step of room for the snapshot of a state to publish at forBlock,
+  // taking nothing of a higher class than that publication; the disk tier
+  // keeps a state it admits. An optional publication (checkpointsOnly) takes
+  // one checkpoint, an ordinary one a checkpoint, else its oldest ordinary
+  // state. A publication in use takes what reclaimOne() takes, in its order,
+  // but only what frees memory now (ReclaimTiming::Immediate): the snapshot
+  // follows at once, since the lane's state moves on with its next command.
+  // That is an extent of free pages, a checkpoint, the oldest ordinary state
+  // or KV leaf, and last the oldest state in use, which is never dropped for
+  // a busy write slot: while the write in flight holds it, nothing goes. KV
+  // frees memory only as an extent it empties, released before the call
+  // returns, so KV goes only while evicting it can empty one
+  // (extentWithinReach); otherwise the oldest ordinary state goes before the
+  // state in use. Like every release, that needs no command in flight; the
+  // engine publishes a lane's states between commands. After a step that
+  // gave extent bytes the caller steps again while its snapshot does not fit
+  // and the bytes given are less than one snapshot; after a step that gave a
+  // state it does not, so a snapshot denied for another reason costs one
+  // state or one snapshot's worth of extents at most. While the engine may
+  // not grow (`growth` false) an extent's bytes are of no use to a snapshot:
+  // extents and KV stay, and a publication in use takes states alone, like
+  // every other.
+  [[nodiscard]] StateRoom reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth);
+  // Recycles one unpinned state, preferring checkpoints, for a lane that
+  // takes the state's buffers, taking nothing of a class above upTo. For
+  // running work (InUse) a state in use goes once no other state is left and
+  // no transfer in flight can return what is needed first; a start that a
+  // resident lane holds back (Ordinary) takes nothing in use. A state the
+  // tier could take once the write in flight has finished stays and is
+  // reported pending, as in reclaimOne. evictableStates(upTo) are those it
+  // can take.
+  [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
+  [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
+    return states_.evictableStates(upTo == ReclaimClass::InUse);
+  }
   [[nodiscard]] CacheSnapshot snapshot() const;
 
 private:
@@ -253,16 +348,19 @@ private:
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;
     uint64_t pageTableRevision = 0;
+    uint32_t firstChangedPage = 0;
     uint32_t pendingRestores = 0;
     bool restoreFailed = false;
   };
+  // Records a change of the request's page list from index first on.
+  static void pagesChanged(Request &active, uint32_t first) noexcept;
   struct Demotion final {
     uint64_t block = 0;
-    std::unique_ptr<model::KvTransfer> transfer;
+    std::unique_ptr<KvTransfer> transfer;
   };
   struct Restore final {
-    // Null until the tier has staging for it.
-    std::unique_ptr<model::KvTransfer> transfer;
+    // Null until the tier has room for it.
+    std::unique_ptr<KvTransfer> transfer;
     std::vector<uint64_t> waiters;
   };
 
@@ -277,41 +375,55 @@ private:
   // same thing: a transfer in flight holds what this needs, and it comes
   // back when the transfer lands. Only transfersInFlight() may report it:
   // a caller told to wait for nothing would wait for ever.
-  enum class Shortfall : uint8_t { Covered, Pending, Exhausted };
-  enum class Eviction : uint8_t {
-    Evicted,
-    // Every remaining leaf waits for the tier to take it.
-    Pending,
-    None,
-  };
   enum class LeafReclaim : uint8_t {
     Started,
-    // The ring, the quota or the state write's staging buffer is held by
-    // transfers in flight.
+    // The tier's room, the quota or the state write's staging buffer is held
+    // by transfers in flight.
     Pending,
     // reclaimKvLeaf: the leaf stays for now and scans move on to the next
-    // one, because a state on it is in use, a disk subtree depends on it
-    // and the tier has no room that a transfer in flight will free, or a
-    // disk subtree below it cannot drop yet (in use, in transfer, or a
-    // state write in flight). demoteKv: the leaf cannot be written, and may
+    // one, because a state on it is pinned, a disk subtree depends on it
+    // and the tier has no room that a transfer in flight will free, a disk
+    // subtree below it cannot drop yet (active, in transfer, or a state
+    // write in flight), or the leaf needs a demotion an Immediate caller
+    // cannot wait for. demoteKv: the leaf cannot be written, and may
     // go without a copy, because the tier takes no writes, has no such
     // room, or making room took the states the leaf was kept for.
     Impossible,
   };
 
+  // What one reclaim step gave up: a state, its RAM free at once, or a KV
+  // leaf, whose memory returns with the extent it leaves empty.
+  struct Victim final {
+    bool kv = false;
+    uint64_t reclaimedBytes = 0;
+  };
+
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
-  [[nodiscard]] Shortfall makeLogicalPages(uint32_t count);
-  [[nodiscard]] Eviction evictOneKvBlock();
-  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
+  // One eviction: checkpoints first, then the shared recency order, then,
+  // up to InUse, what is in use.
+  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint);
+  // Reclaims a chosen state; with waitForWrite only the write in flight may
+  // keep it.
+  [[nodiscard]] StateEviction reclaimState(uint64_t block, bool waitForWrite);
+  // Gives up the oldest of one class's states and resident KV leaves, as
+  // the timing allows. A state whose write must wait for the one in flight
+  // stays when the caller can wait, and is dropped otherwise; a KV leaf that
+  // cannot go now (reclaimKvLeaf) stays. The other kind may still give.
+  // Nothing once all stay.
+  [[nodiscard]] std::optional<Victim> reclaimOldest(bool inUse, bool keepResumePoint,
+                                                    ReclaimTiming timing);
+  // Oldest resident KV leaf after `after` whose state, if any, is not in RAM,
+  // and whose KV a state in use needs exactly when inUse.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after,
+                                                                   bool inUse) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
   // cannot take it right now. A leaf that a disk subtree depends on is
   // dropped only once a failed write has closed the tier, together with
-  // that subtree.
-  [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block);
+  // that subtree. Immediate passes over a leaf that needs a demotion.
+  [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block, ReclaimTiming timing);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
   // A failed write closes the tier; existing copies stay readable.
   [[nodiscard]] bool kvTierWritable() const noexcept { return tier_ && tier_->writable(); }
@@ -320,40 +432,65 @@ private:
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {
     return states_.contains(block) || kv_.stateBelow(block);
   }
-  // Erases the disk-only subtree below a resident leaf and the states on it;
-  // false, erasing nothing, while a block of it is in transfer or in use (a
-  // lookup holding a state uses its block) or a state write is in flight.
+  // The same for a state in use: such KV is in use too.
+  [[nodiscard]] bool kvNeededByStateInUse(uint64_t block) const {
+    return (states_.inUse(block) && states_.contains(block)) || kv_.stateInUseBelow(block);
+  }
+  // Erases the disk-only subtree below a resident leaf and the states on it,
+  // in use or not; false, erasing nothing, while a block of it is in transfer
+  // or active (a lookup holding a state keeps its block active) or a state
+  // write is in flight.
   [[nodiscard]] bool dropDiskSubtree(uint64_t block);
   // Nothing below a block whose read failed matches any more. Once none of
-  // it is in transfer or in use, it is erased with the states on it, and
-  // the poisoned block leaves with its last user.
+  // it is in transfer or active, it is erased with the states on it, in use
+  // or not, and the poisoned block leaves with its last user.
   void dropPoisoned();
-  // A slot for a new KV copy, replacing older copies while the quota is full.
-  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> acquireDiskSlot();
-  // Gives up one disk copy: the oldest redundant one, KV or state, else the
-  // oldest that is the only copy, never the KV of a state in RAM. False when
-  // the disk holds nothing to give.
-  [[nodiscard]] bool freeDiskSpace();
+  // A slot for a new KV copy, replacing older copies while the quota is full;
+  // inUse when a state in use needs the copy.
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(bool inUse);
+  // Gives up one disk copy for a new copy, in use or not: the oldest
+  // redundant one, KV or state, else the oldest that is the only copy, never
+  // the KV of a state in RAM. The only copy of a state in use, and the KV it
+  // restores through, go only for a copy in use, and after every other.
+  // False when the disk holds nothing the new copy may displace.
+  [[nodiscard]] bool freeDiskSpace(bool inUse);
   void startRestore(uint64_t block);
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
-  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway);
+  [[nodiscard]] uint64_t
+  reclaimEmptyExtents(bool keepRunway,
+                      uint32_t limit = std::numeric_limits<uint32_t>::max());
+  // Evicting ordinary KV may empty an extent: the pages Ordinary may reuse
+  // (reusablePages), less those whose demotion is in flight, cover one. That
+  // counts the leaves that need a demotion too, which an Immediate step
+  // passes over while the tier takes writes.
+  [[nodiscard]] bool extentWithinReach() const;
+  // Returns one extent of free pages: an empty one, or the one compactExtent
+  // empties; progress with zero bytes when the extent emptied is the runway
+  // kept. No progress when the free pages fill none.
+  [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
+  // Empties one extent that still holds pages (KvPool::compactExtent); the
+  // blocks and requests on its pages follow them. A page a transfer reads or
+  // writes stays where it is until the transfer has landed. False when the
+  // free pages cover no extent.
+  [[nodiscard]] bool compactExtent();
 
   KvPool &pool_;
-  model::KvTier *tier_;
+  KvTier *tier_;
   std::shared_ptr<const model::DiskBudget> diskBudget_;
   CacheRecency recency_;
   KvCache kv_;
   StateCache states_;
-  std::function<bool()> makeRoom_;
+  DiskRoom makeRoom_;
   std::unordered_map<uint64_t, Request> requests_;
   std::vector<Demotion> demotions_;
-  // Block IDs increase from parent to child. Refill staging in that order so
+  // Block IDs increase from parent to child. Restores start in that order so
   // cancellation can discard an unread suffix without stranding its parents.
   std::map<uint64_t, Restore> restores_;
   // Blocks whose read failed, until they have left.
   std::vector<uint64_t> poisoned_;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
+  double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };
 

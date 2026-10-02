@@ -250,9 +250,14 @@ inline double RuntimeMetrics::percentile(const std::deque<double> &samples,
 class MemoryStatusReporter final {
 public:
   [[nodiscard]] std::string update(const ResourceWaitSnapshot &wait,
-                                    bool growthAllowed);
+                                    bool hostGrowthAllowed);
 private:
   unsigned state_ = 0;
+};
+
+// The native loop's own timing, which its transport measures.
+struct NativeLoopTiming {
+  double maxTickMilliseconds = 0.0;
 };
 
 // Single source for /status and native protocol status events.
@@ -264,6 +269,7 @@ private:
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason = {},
-    const ResourceWaitSnapshot &resourceWait = {});
+    const ResourceWaitSnapshot &resourceWait = {},
+    const NativeLoopTiming &loop = {});
 
 } // namespace splash::engine

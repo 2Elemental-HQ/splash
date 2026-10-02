@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace splash::engine {
@@ -131,6 +132,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   if (!nextBlockId_ || nextBlockId_ == std::numeric_limits<uint64_t>::max()) {
     throw std::overflow_error("KV cache block ids exhausted");
   }
+  if (blockOnPage_[physicalPage])
+    throw std::logic_error("KV cache page already holds a block");
 
   Block entry;
   entry.id = nextBlockId_;
@@ -159,6 +162,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   }
   const uint64_t id = nextBlockId_++;
   ++residentBlocks_;
+  blockOnPage_[physicalPage] = id;
   Block &placed = block(id);
   if (parentBlock) {
     Block &parent = block(parentBlock);
@@ -238,7 +242,7 @@ uint32_t KvCache::chainLength(uint64_t blockId) const {
 
 uint32_t KvCache::page(uint64_t blockId) const { return block(blockId).page; }
 
-std::shared_ptr<model::KvDiskSlot> KvCache::slot(uint64_t blockId) const {
+std::shared_ptr<KvDiskSlot> KvCache::slot(uint64_t blockId) const {
   return block(blockId).slot;
 }
 
@@ -247,7 +251,8 @@ bool KvCache::hasDiskChildren(uint64_t blockId) const {
   return entry.children > entry.residentChildren;
 }
 
-void KvCache::countState(uint64_t blockId, bool added) noexcept {
+template <typename Count>
+void KvCache::countAbove(uint64_t blockId, const Count &count) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end())
     std::terminate();
@@ -255,16 +260,54 @@ void KvCache::countState(uint64_t blockId, bool added) noexcept {
     const auto parent = blocks_.find(above);
     if (parent == blocks_.end())
       std::terminate();
-    added ? ++parent->second.statesBelow : --parent->second.statesBelow;
+    count(parent->second);
     above = parent->second.parent;
   }
 }
 
+void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
+  countAbove(blockId, [&](Block &entry) {
+    added ? ++entry.statesBelow : --entry.statesBelow;
+    if (inUse)
+      added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+  });
+}
+
+void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
+  countAbove(blockId, [&](Block &entry) {
+    added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+  });
+}
+
 bool KvCache::stateBelow(uint64_t blockId) const { return block(blockId).statesBelow > 0; }
+
+bool KvCache::stateInUseBelow(uint64_t blockId) const {
+  return block(blockId).statesInUseBelow > 0;
+}
 
 void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
+
+uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
+  std::unordered_set<uint64_t> visited;
+  uint32_t pages = 0;
+  for (uint64_t blockId : blocks) {
+    while (blockId && visited.insert(blockId).second) {
+      const Block &entry = block(blockId);
+      if (entry.page != noPage) {
+        // The request holding this page holds every page above it too.
+        if (pool_.activeReferences(entry.page))
+          break;
+        if (!entry.transferring)
+          ++pages;
+      }
+      // A disk-only block holds no page; the walk goes on above it.
+      blockId = entry.parent;
+    }
+  }
+  return pages;
+}
 
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
@@ -284,7 +327,7 @@ void KvCache::setTransferring(uint64_t blockId, bool transferring) {
   reindex(entry);
 }
 
-void KvCache::setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot) {
+void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
   Block &entry = block(blockId);
   if (!slot && entry.page == noPage)
     throw std::logic_error("a disk-only KV cache block is erased, not stripped");
@@ -292,10 +335,28 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot)
   reindex(entry);
 }
 
-void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot) noexcept {
+void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept {
   if (static_cast<bool>(entry.slot) != static_cast<bool>(slot))
     slot ? ++diskBlocks_ : --diskBlocks_;
   entry.slot = std::move(slot);
+}
+
+void KvCache::followPages(const KvPageMoves &moves) noexcept {
+  // Destinations lie in other extents and were free, so no block is on one.
+  for (uint32_t offset = 0; offset < moves.destinations.size(); ++offset) {
+    const uint32_t from = moves.firstPage + offset;
+    const uint32_t to = moves.destinations[offset];
+    if (to == from)
+      continue;
+    const uint64_t id = std::exchange(blockOnPage_[from], 0);
+    if (!id)
+      continue;
+    const auto found = blocks_.find(id);
+    if (found == blocks_.end())
+      std::terminate();
+    found->second.page = to;
+    blockOnPage_[to] = id;
+  }
 }
 
 bool KvCache::abandonRestore(uint64_t blockId) {
@@ -315,6 +376,7 @@ void KvCache::dropPage(uint64_t blockId) {
     throw std::logic_error("KV cache block is still in use");
   const uint32_t page = entry.page;
   entry.page = noPage;
+  blockOnPage_[page] = 0;
   --residentBlocks_;
   reindex(entry);
   if (entry.parent) {
@@ -343,8 +405,11 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
     throw std::out_of_range("KV cache physical page is out of range");
   if (entry.parent && block(entry.parent).page == noPage)
     throw std::logic_error("KV cache parent block has no page");
+  if (blockOnPage_[page])
+    throw std::logic_error("KV cache page already holds a block");
   pool_.retainPage(page, true);
   entry.page = page;
+  blockOnPage_[page] = blockId;
   ++residentBlocks_;
   reindex(entry);
   if (entry.parent) {
@@ -372,8 +437,11 @@ KvCache::evictionCandidate(uint64_t after) const {
 }
 
 std::optional<CacheEvictionCandidate>
-KvCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskLeaves_.oldest();
+KvCache::diskCandidate(bool duplicate, uint64_t after) const {
+  const RecencyOrder &order = duplicate ? duplicates_ : diskLeaves_;
+  if (!after)
+    return order.oldest();
+  return order.next({after, block(after).lastUsed});
 }
 
 std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
@@ -418,8 +486,10 @@ void KvCache::erase(uint64_t blockId) {
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
-  if (page != noPage)
+  if (page != noPage) {
+    blockOnPage_[page] = 0;
     --residentBlocks_;
+  }
   if (disk)
     --diskBlocks_;
   if (parentId) {

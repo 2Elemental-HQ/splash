@@ -4,7 +4,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
-#include "model/KvPageTier.hpp"
+#include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryAudit.hpp"
@@ -21,6 +21,8 @@
 #include <string_view>
 
 namespace splash::engine {
+
+struct EngineConfig;
 
 enum class RuntimeResourceStage {
   Configuration,
@@ -143,9 +145,12 @@ private:
   std::string budgetDescription_;
 };
 
-// Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> logical KV pool -> state -> KV backing -> governor ->
-// model package -> Metal backend.
+// Owns every process-wide native resource exactly once. Members go in
+// reverse declaration order: Cache -> KV pool -> KV disk tier -> state
+// storage -> KV page storage -> governor -> model package -> Metal backend.
+// The KV disk tier must go before the KV page storage: its IO worker reads
+// and writes pages in place in the extents, and its destructor waits for
+// every transfer in flight.
 class RuntimeResources final {
 public:
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
@@ -164,9 +169,6 @@ public:
   }
   [[nodiscard]] MemoryGovernor &memoryGovernor() noexcept {
     return *memoryGovernor_;
-  }
-  [[nodiscard]] model::StateStorage &stateStorage() noexcept {
-    return *stateStorage_;
   }
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
@@ -202,7 +204,7 @@ private:
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
-                   std::unique_ptr<model::KvPageTier> kvTier,
+                   std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
                    uint32_t maximumImagePatches,
@@ -217,11 +219,16 @@ private:
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::StateStorage> stateStorage_;
-  std::unique_ptr<model::KvPageTier> kvTier_;
+  std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;
   std::optional<uint64_t> hostAvailableAtStart_;
 };
+
+// Connects an engine to the governor that admits its memory: the engine asks
+// it whether the host pauses growth, and marks the allocations a request in
+// service makes. Every engine that runs against a governor connects through it.
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

@@ -30,7 +30,9 @@ upgrading.
 
 An engine that fails is restarted at once, and failed restarts back off from
 1 to 16 seconds. Meanwhile generation requests get 503 `engine_recovering`,
-whose message names the last failure.
+whose message names the last failure. An engine whose loop stops answering
+while requests are pending is failed after 30 seconds and restarted the same
+way.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -502,13 +504,49 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, one KV extent and any disk tier
-KV staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable, and
-`WeightFile` keeps its buffer resident (`MetalBackend::keepResident`): the
-weights stay wired between requests until 10 minutes pass without a command,
-and the next command wires them again. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+pipeline and runtime reserves, one state cell, the KV runway and any disk tier
+state staging, exceed the hard budget, so a model that can never fit is not
+prepared. File backing does not make Metal-resident pages reclaimable.
+Every buffer the backend allocates or wraps belongs to one residency set
+attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
+extents, state cells and draft rings, and scratch alike stay wired between
+requests until 10 minutes pass without a command, and the next command wires
+them again. Memory returns to macOS when the engine releases it, never because
+macOS compressed or dropped an idle buffer. macOS page cache, driver
+allocations and other applications still affect memory pressure and swap.
+
+KV pages live in extents: ordinary shared Metal buffers of one size per pool,
+between half and one and a half times 128 MiB, in which every tensor region of
+each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
+budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+when it needs one of its pages. When it is built it allocates the runway, the
+extents of the first 64 pages, which startup warmup runs on; nothing but the
+pool allocates or releases an extent. An extent whose last page is free stays
+allocated until a reclaim releases it, at once and only between commands: memory
+pressure, an admission the budget denies, the publication of a replay point in
+use, or startup cleanup. Kernels reach a page through the GPU address in its
+request's page table, so no command binds KV; the residency set makes extents
+resident for every command. The host reaches the same memory
+(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
+returns free pages before it evicts anything: an empty extent as it is, and the
+free pages scattered over the others as soon as they cover the extent that holds
+the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
+The blocks and requests on those pages follow them, a page a disk transfer reads
+or writes stays where it is, and a pass that evicts everything copies only what
+is left afterwards. Every extent a pass empties is released, except that a
+warning pass, like startup cleanup, keeps one empty extent as the runway the next
+request starts from.
+`/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
+those requests and the cache hold (`pages_active`, `pages_cache`) and those
+nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
+(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
+(`extent_allocations`, `extent_releases`) and those emptied by moving pages
+(`extent_compactions`, `pages_moved`), and the longest allocation, release and
+emptying of one (`extent_allocate_max_ms`, `extent_release_max_ms`,
+`extent_compact_max_ms`); the last includes re-pointing the cached blocks and
+requests on the moved pages. The counts and the longest allocation include the
+runway allocated at startup, before serving begins; how long a whole pass holds
+the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -730,10 +768,29 @@ output requirements in their own messages.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 
-`/status.admission` distinguishes memory and concurrency waits, reports suspended
-requests, recovery draining and the oldest current wait age. Memory transitions
-also appear in the console. Warning pressure can pause growth while `/ready`
-remains healthy for work that fits existing allocations.
+`/status.admission` distinguishes memory and concurrency waits, counts the
+requests held back behind one refused memory (`held_behind_refusal`, the
+refused request included while a pass defers it; during recovery, the suspended
+ones) and those waiting for a disk restore (`restoring`), reports suspended
+requests, recovery draining and the oldest current wait age, which for a request
+holding admission closed runs from when its wait began. Memory transitions
+also appear in the console. When macOS runs short of memory, growth that no
+request in service needs pauses and the cache gives memory back, a paced pass at
+a time, down to one lane's state buffers and one KV extent. A request in service
+keeps growing within `--max-memory`, first into cached pages no request holds.
+A new request waits while another is in service unless it can start from what
+the engine already holds, and with none in service it starts. A request whose
+start was refused memory, under host pressure or at `--max-memory`, holds back
+the requests that arrived after it until it starts, fails or is cancelled, so
+the lanes that finish leave their memory to it; a higher priority is not held
+back. It keeps holding them back while it waits for a prefix another lane is
+computing. After a suspension, suspended requests resume first, one at a time,
+higher priority first and then in the order they arrived; one refused memory
+holds back the suspended requests after it, and their resource waits do not
+run out while it does. Critical pressure evicts every unpinned cache entry and
+stops all growth. `/ready` stays healthy under warning pressure, and reports
+503 while macOS reports critical pressure; requests already running continue,
+and one that needs more memory is suspended until the pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and
@@ -757,10 +814,44 @@ special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
 `max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. `temperature`,
-`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+SGLang, or to what the context leaves when that is less. The sampling fields
+below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat, text completions and Responses sample with `temperature` (default 1.0,
+in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p`
+(0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
+`repetition_penalty` (1, positive); the defaults are Qwen's generation config,
+which sets no penalties, so its recommended `presence_penalty` of 1.5 for
+non-thinking use must be sent explicitly. Each field that is out of range
+returns 400 naming it. As in vLLM, a nonzero temperature below 0.01 samples at
+0.01, and the penalties rewrite the raw logits before temperature, for greedy
+requests too: repetition divides a positive logit and multiplies a negative
+one for every token of the prompt or of the output so far, and presence and
+frequency lower the logit of every output token by `presence_penalty` plus
+`frequency_penalty` times its count. Speculative decoding stays exact: each
+verified draft position counts the draft tokens before it, so a penalized
+request samples as it would without a draft. Splash does not implement
+`logit_bias`: a non-empty one returns 400; `null` and `{}` are accepted. Like
+vLLM and HF, repetition counts every prompt token: with the Qwen templates
+that includes the tool-call syntax every tool-enabled system prompt carries,
+earlier tool calls and reasoning, and the `<think>` markers of the generation
+prompt, so a `repetition_penalty` above 1 can delay tool calls and the end of
+reasoning and change names copied from the context. Anthropic Messages defines
+no penalties and no `min_p`.
+
+In vLLM's order, after temperature `min_p` first drops every token less
+likely than `min_p` times the most likely one, `top_k` then keeps the most
+likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
+`top_p` then the fewest of those whose probabilities, renormalized over them,
+sum past it. All three apply to the whole vocabulary, exactly, for the first
+token, the verified draft positions and their corrections alike: the sampler
+sums each row's softmax denominator, finds where its distribution ends
+without sorting the vocabulary, and draws over every token the distribution
+keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
+it is one more cut of the target distribution, which acceptance and
+correction read as they read the others, so sampling stays exact.
 
 Chat's `max_completion_tokens` or `max_tokens` and Responses'
 `max_output_tokens` bound a response's output. Omitted, the output may use
@@ -801,18 +892,21 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+| `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
 
-`GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
-require the API key when authentication is enabled. Consumers should tolerate
-missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat and text completion streams include token usage when
-the request sets `"stream_options":{"include_usage":true}`; their non-streaming
-responses always include usage. A proxy must consume these fields to display
-statistics.
+`GET /metrics` exposes the same counters in Prometheus text format.
+`splash_kv_free_allocated_pages` counts free pages of allocated extents, not
+remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Both
+endpoints require the API key when authentication is enabled. Consumers should
+tolerate missing native fields while the engine is unavailable, and counter
+resets after an engine restart. Chat and text completion streams include token
+usage when the request sets `"stream_options":{"include_usage":true}`; their
+non-streaming responses always include usage. A proxy must consume these fields
+to display statistics.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -850,6 +944,23 @@ cannot be replayed.
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
+
+Until the request ends, suspended or not, that replay point is in use, and so is
+the KV it restores through. Cache victims come in three classes: checkpoints,
+then ordinary states and KV, then what is in use. No work displaces anything of
+a class above its own. Memory for running requests takes what is in use after
+everything else. A start that a resident lane holds back takes nothing in use:
+it waits for that lane. A publication in use takes cached KV and states in the
+same order, then the oldest state in use; of the KV it takes only leaves whose
+page frees at once, and only while an extent can be emptied; the extent is
+released at once, and the snapshot follows. Other publications recycle only
+states, a disk copy in use may displace the oldest copy in use, and ordinary or
+optional work never displaces anything in use. Nothing in use is pinned, so
+running work that needs the memory still takes it once nothing else is left. A
+resumed lane that lost its prompt's replay point rebuilds it on the way.
+`/status` reports under `state` the replay points unfinished requests hold
+(`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
+
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold
 no active state cell or KV pages and return to ordinary admission when no useful
@@ -875,10 +986,13 @@ These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
 requests then resume first, each within its own resource wait. A resource
-wait's limit restarts whenever a lane submitted before the waiting request has
+wait's limit restarts whenever a lane submitted before the waiting request, or
+admitted before the request was first refused memory or was suspended, has
 work in flight, since that lane holds memory the request waits for until it
-finishes; lanes submitted after the request do not extend it. Readiness does
-not guarantee that a request-sized allocation fits.
+finishes; other lanes do not extend it. Readiness does not guarantee that a
+request-sized allocation fits. A request that cannot fit even alone, after
+every cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
+`--max-memory` and `--max-context`; retrying it fails the same way.
 
 ### Disk cache
 
@@ -896,16 +1010,22 @@ The estimate is conservative, since macOS compresses other applications further
 once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
-host staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them copy through a 128-page staging ring and are released
+staging buffer, freeing their RAM immediately. KV leaves needed by a state
+on them or below them are written straight from their extents and released
 after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. When staging is busy, admission waits for the
-transfer instead of evicting additional victims.
-Demotions may occupy half the ring and restores three quarters, leaving room
-for the other direction. Copies ride Metal commands, including a copy-only
-command when inference is idle.
+with any disk copies below them. A restored page is read straight into its
+extent. Either way the transfer runs on the file's IO worker beside whatever
+command the model runs: a cached page is never written by a command, and no
+command uses a page before its read has landed. At most 128 KV pages are in
+transfer at a time, demotions at most half of them and restores at most three
+quarters, since one worker serves both in order and a burst of either kind
+must leave the other its share. When the tier takes no more, admission waits
+for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
+When every state in RAM is in use and no cached KV is left to take, a replay
+point takes the slot of the oldest by writing that one out, and goes
+unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
 replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
@@ -919,19 +1039,21 @@ states remain usable even when there is no room to promote them into RAM cache.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
-both KV and states. A quota smaller than the working set can cause repeated
-reads and writes; it is not a write-rate limit. Each file retains its allocated
-high-water mark until shutdown, so filesystem space can exceed the live-slot
-quota. Closing the server releases both files.
+both KV and states. Sole copies of states in use, and the KV they restore
+through, make room only for a copy that is itself in use, and last; an ordinary
+state that finds no other room is dropped. A quota smaller than the working set
+can cause repeated reads and writes; it is not a write-rate limit. Each file
+retains its allocated high-water mark until shutdown, so filesystem space can
+exceed the live-slot quota. Closing the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
-pages that the GPU copies through, is Metal memory within `--max-memory`: about
-42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
-The memory plan sets it aside whenever the flag is set, even if the tier then
-fails to start, so the KV pool and the advertised context shrink by it.
-The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
-memory outside `--max-memory`.
-A quota too small for one state leaves the tier disabled.
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
+whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
+the slot (a state's staging buffer and lane buffers) move directly, everything
+else through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
+The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is a
+buffer of the backend's like every other: resident, and set aside by the memory
+plan within `--max-memory` when the tier starts. A quota too small for one
+state leaves the tier disabled and sets nothing aside.
 A failed write disables further writes to that file. Failed KV writes retain
 RAM pages; failed state writes invalidate the disk copy. A failed read
 invalidates its cached data, allowing lookup to fall back to the surviving
@@ -1085,6 +1207,12 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
+
+Each phase's record keeps what its requests reused of the cache (`reuse`).
+Every request after a phase's first resends the conversation, so a phase other
+than the cancellation phase (`cancel`) that completed two or more requests and
+reused no cached prompt token fails. Replay points of unfinished requests
+evicted during a phase only print a warning.
 
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:

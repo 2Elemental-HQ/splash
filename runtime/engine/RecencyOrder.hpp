@@ -67,9 +67,13 @@ public:
     return CacheEvictionCandidate{position->second, position->first};
   }
 
-  [[nodiscard]] uint64_t newestId() const noexcept {
-    return order_.empty() ? 0 : order_.rbegin()->second;
+  [[nodiscard]] std::optional<CacheEvictionCandidate> newest() const noexcept {
+    if (order_.empty())
+      return std::nullopt;
+    return CacheEvictionCandidate{order_.rbegin()->second, order_.rbegin()->first};
   }
+
+  [[nodiscard]] size_t size() const noexcept { return order_.size(); }
 
 private:
   std::set<std::pair<uint64_t, uint64_t>> order_;

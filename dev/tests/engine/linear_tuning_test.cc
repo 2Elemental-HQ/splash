@@ -122,7 +122,7 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
     require(bytes == linearTuningFixtureBytes(backend.capabilities(), workload),
             "admission size differs from planning helper");
     allocate();
-    return true;
+    return metal::AllocationResult{};
   };
   auto assertStopped = [&](const LinearTuningResult &result, bool failure) {
     require(!result.complete && result.choice.configuration == baseline &&
@@ -154,11 +154,13 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
     denied = true;
     require(bytes == linearTuningFixtureBytes(backend.capabilities(), workload),
             "denied admission requested wrong bytes");
-    return false;
+    return metal::AllocationFailure::EngineBudget;
   }, input), false);
   require(denied, "allocation denial not exercised");
-  assertStopped(tuneLinear(backend, [](uint64_t, const auto &) { return true; }, input), true);
-  assertStopped(tuneLinear(backend, [](uint64_t, const auto &) -> bool {
+  assertStopped(tuneLinear(backend, [](uint64_t, const auto &) {
+    return metal::AllocationResult{};
+  }, input), true);
+  assertStopped(tuneLinear(backend, [](uint64_t, const auto &) -> metal::AllocationResult {
     throw metal::MetalAllocationError("test admission capacity failure");
   }, input), true);
   // Denial must not leave physical backing behind. This deliberate contract
@@ -166,7 +168,7 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   const auto allocated = backend.memoryStats().allocatedBytes;
   assertStopped(tuneLinear(backend, [](uint64_t, const auto &allocate) {
     allocate();
-    return false;
+    return metal::AllocationFailure::EngineBudget;
   }, input), true);
   require(backend.memoryStats().allocatedBytes == allocated,
           "invalid admission contract leaked the temporary fixture");
@@ -204,7 +206,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
     allocate();
     require(backend.memoryStats().allocatedBytes - allocated == bytes,
             "fixture physical bytes differ from admission");
-    return true;
+    return metal::AllocationResult{};
   }, input, options);
   if (result.failure) std::rethrow_exception(result.failure);
   require(result.complete && admissions == 1, "bounded sweep incomplete or allocated twice");
@@ -253,7 +255,10 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
   const auto plans = Linear(backend.capabilities()).candidates(workload);
   require(plans.size() > 1, "interruption fixture has no alternative");
-  const auto admit = [](uint64_t, const auto &allocate) { allocate(); return true; };
+  const auto admit = [](uint64_t, const auto &allocate) {
+    allocate();
+    return metal::AllocationResult{};
+  };
   MeasurementOptions options;
   options.maximumWallSeconds = 30;
   for (bool pressure : {false, true}) {
@@ -300,7 +305,7 @@ void gpuEveryRepresentative(metal::MetalBackend &backend,
   scales[0] = 0x7fc1;
   const auto before = backend.submissionCount();
   const auto result = tuneLinear(backend, [](uint64_t, const auto &allocate) {
-    allocate(); return true;
+    allocate(); return metal::AllocationResult{};
   }, input);
   scales[0] = saved;
   require(!result.complete && result.failure && result.measurements.empty() &&

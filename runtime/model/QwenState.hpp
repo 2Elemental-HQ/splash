@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -94,7 +93,7 @@ struct QwenCacheSlot final {
 
 // Free buffers available for reuse: a lane takes two cells and a ring, a
 // cached state one of each. Both return them here; idle buffers are released
-// only by explicit reclaim.
+// only by reclaim.
 struct QwenBufferPool final {
   std::vector<std::shared_ptr<QwenGdnCell>> cells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
@@ -102,15 +101,17 @@ struct QwenBufferPool final {
   bool open = true;
 };
 
-// One host copy of a state on its way to disk. The write reads this copy,
-// so the state's own buffers return to the pool as soon as it is taken.
+// One copy of a state on its way to disk, in a buffer of the backend's like
+// every other: resident, and set aside by the memory plan. The write reads
+// this copy, so the state's own buffers return to the pool as soon as it is
+// taken.
 struct StateStaging final {
-  struct Free {
-    void operator()(void *memory) const noexcept { std::free(memory); }
-  };
-  std::unique_ptr<std::byte, Free> bytes;
-  uint64_t size = 0;
+  metal::MetalBuffer buffer;
   bool busy = false;
+
+  [[nodiscard]] std::span<std::byte> bytes() const {
+    return {static_cast<std::byte *>(buffer.contents()), buffer.sizeBytes()};
+  }
 };
 
 // An immutable composite snapshot owns a private copy of the state that
@@ -163,7 +164,7 @@ private:
   friend class QwenStateStorage;
 };
 
-// Live cells retain stable backing; only idle buffers may be reclaimed.
+// Live cells keep their buffers; only idle buffers may be reclaimed.
 class QwenStateStorage final : public model::StateStorage {
 public:
   // The GDN cells a lane holds, with one draft ring.
@@ -181,30 +182,37 @@ public:
   [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t slot) const;
   [[nodiscard]] const QwenSlotMetadata &metadata(uint32_t slot) const;
 
-  // Activation reuses pooled buffers and admits any missing allocations.
-  // It clears parity-zero GDN state and resets draft logical lengths; later
-  // transitions overwrite the remaining data. Refusals retain their cause.
-  // Release returns the lane's buffers to the pool.
-  [[nodiscard]] metal::AllocationResult tryActivateSlot(uint32_t slot, uint64_t requestId);
+  // Activation takes pooled buffers and asks the governor once for all the
+  // pool lacks, together with `extraBytes` for what else the request's start
+  // allocates (`allocateExtra`, run first in the same admission). A start is
+  // only useful whole, so a refusal allocates nothing, leaves the pool as it
+  // was and retains its cause. Activation clears parity-zero GDN state and
+  // resets draft logical lengths; later transitions overwrite the remaining
+  // data. Release returns the lane's buffers to the pool.
+  [[nodiscard]] metal::AllocationResult
+  tryActivateSlot(uint32_t slot, uint64_t requestId, uint64_t extraBytes = 0,
+                  const std::function<void()> &allocateExtra = {});
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
-  // Returns pooled buffers beyond the kept counts to macOS. Active lanes and
+  // Returns one pooled buffer to macOS, a cell before a ring, keeping one
+  // lane's cells and ring when keepLane: what a reclaim step for a denied
+  // allocation releases. Zero when none is left to give. Active lanes and
   // cached states are never moved or reclaimed.
-  [[nodiscard]] uint64_t releaseIdle(uint32_t keepCells,
-                                     uint32_t keepRings) noexcept override;
+  [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
-  // What activating a slot allocates: the GDN cells and the draft ring the
-  // idle pool lacks, since a slot takes pooled buffers first.
-  [[nodiscard]] uint64_t activationBytes() const noexcept;
+  // What activating a slot lacks in the idle pool, in cached states: each
+  // holds one GDN cell and one draft ring, a lane two cells and a ring.
+  [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
   // Hot-path metadata operations; neither performs a buffer copy.
   void updateLengths(uint32_t slot, QwenLogicalLengths lengths);
   void swapParity(uint32_t slot);
 
   // Copies committed state into a pooled or newly admitted cache slot while
-  // the lane retains its own cells. Returns nullptr on capacity pressure;
-  // dropping a cached state makes its slot available for retry.
+  // the lane retains its own cells. Returns nullptr on capacity pressure,
+  // with nothing allocated; dropping a cached state makes its slot available
+  // for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
@@ -225,6 +233,9 @@ public:
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
     return allocations_->bytes.load(std::memory_order_relaxed);
   }
+  [[nodiscard]] uint64_t stagingBytes() const noexcept override {
+    return staging_ ? staging_->buffer.sizeBytes() : 0;
+  }
   [[nodiscard]] uint64_t actualSlotBytes(uint32_t slot) const;
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
@@ -241,16 +252,18 @@ private:
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
   static void requireAssigned(const Slot &slot);
-  [[nodiscard]] metal::AllocationResult allocateSlot(uint32_t index);
-  [[nodiscard]] std::shared_ptr<QwenGdnCell> acquireCell(std::string_view label);
-  [[nodiscard]] std::shared_ptr<DFlashDraftRing>
-  acquireRing(std::string_view label);
-  [[nodiscard]] std::shared_ptr<QwenGdnCell>
-  allocateGdnCell(std::string_view label,
-                    metal::AllocationFailure *failure = nullptr);
-  [[nodiscard]] std::shared_ptr<DFlashDraftRing>
-  allocateDraftRing(std::string_view label,
-                    metal::AllocationFailure *failure = nullptr);
+  // `cells` GDN cells and a draft ring: the pool's buffers, and one
+  // admission for everything the pool lacks and for the caller's extra. A
+  // refusal allocates nothing and takes nothing from the pool.
+  struct Buffers final {
+    std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
+    std::shared_ptr<DFlashDraftRing> draft;
+  };
+  [[nodiscard]] metal::AllocationResult
+  acquire(uint32_t cells, std::string_view label, Buffers &buffers,
+          uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
+  // The bytes of the cells and the ring the pool lacks of that.
+  [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
   static void refreshViews(Slot &slot);
   void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>

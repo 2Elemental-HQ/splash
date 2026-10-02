@@ -15,9 +15,7 @@ from typing import TypeAlias
 
 PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
-STATUS_SCHEMA_VERSION = 5
-# Largest top-k the native sampler keeps as candidates.
-MAX_TOP_K = 32
+STATUS_SCHEMA_VERSION = 6
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.
@@ -29,7 +27,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -41,7 +39,6 @@ _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBIIQQQ")
 _ERROR = struct.Struct("<BBQII")
-_CAPACITY_EXHAUSTED = struct.Struct("<QIIQ")
 _STATUS_JSON = struct.Struct("<QI")
 
 assert (
@@ -50,7 +47,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 72
+assert _REQUEST.size == 88
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -72,7 +69,6 @@ class FrameType(IntEnum):
     MASK_REQUEST = 0x0103
     DONE = 0x0104
     ERROR = 0x0105
-    CAPACITY_EXHAUSTED = 0x0106
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
 
@@ -187,9 +183,18 @@ _REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
 
 @dataclass(slots=True, frozen=True)
 class SamplingParameters:
+    """The defaults are greedy selection with nothing changing the logits,
+    which score requests require. A top_k of 0, or one past the vocabulary,
+    keeps every token; the default penalties change nothing, and a min_p of
+    0 drops no token."""
+
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = 0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_p: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -351,14 +356,6 @@ class ErrorEvent:
 
 
 @dataclass(slots=True, frozen=True)
-class CapacityExhaustedEvent:
-    request_id: int
-    required_kv_pages: int
-    available_kv_pages: int
-    retry_after_micros: int
-
-
-@dataclass(slots=True, frozen=True)
 class StatusJsonEvent:
     correlation_id: int
     schema_version: int
@@ -377,7 +374,6 @@ Message: TypeAlias = (
     | MaskRequestEvent
     | DoneEvent
     | ErrorEvent
-    | CapacityExhaustedEvent
     | StatusJsonEvent
 )
 
@@ -442,6 +438,19 @@ def _float32(value: object, label: str) -> float:
         return struct.unpack("<f", struct.pack("<f", value))[0]
     except (OverflowError, struct.error) as error:
         raise ValueError(f"{label} must be a float32 value") from error
+
+
+def _sampling_values(sampling: SamplingParameters) -> tuple:
+    """The sampling block as the frame carries it, in its wire order."""
+    return (
+        _float32(sampling.temperature, "temperature"),
+        _float32(sampling.top_p, "top_p"),
+        _u32(sampling.top_k, "top_k"),
+        _float32(sampling.presence_penalty, "presence_penalty"),
+        _float32(sampling.frequency_penalty, "frequency_penalty"),
+        _float32(sampling.repetition_penalty, "repetition_penalty"),
+        _float32(sampling.min_p, "min_p"),
+    )
 
 
 def _enum_value(value: object, enum_type: type[IntEnum], label: str) -> IntEnum:
@@ -562,8 +571,6 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
                 _ERROR.size,
                 _ERROR.size + limits.max_error_string_bytes * 2,
             )
-        case FrameType.CAPACITY_EXHAUSTED:
-            bounds = (_CAPACITY_EXHAUSTED.size, _CAPACITY_EXHAUSTED.size)
         case FrameType.STATUS_JSON:
             bounds = (
                 _STATUS_JSON.size,
@@ -775,22 +782,29 @@ def _request_issue(
             request_id,
         )
     try:
-        temperature = _float32(request.sampling.temperature, "temperature")
-        top_p = _float32(request.sampling.top_p, "top_p")
-        top_k = _u32(request.sampling.top_k, "top_k")
+        sampling = _sampling_values(request.sampling)
+        temperature, top_p, _, presence, frequency, repetition, min_p = sampling
         if (
             not math.isfinite(temperature)
             or temperature < 0.0
             or not math.isfinite(top_p)
             or not 0.0 < top_p <= 1.0
-            or top_k > MAX_TOP_K
-            or (temperature > 0.0 and not top_k)
+            or not 0.0 <= min_p <= 1.0
         ):
             raise ValueError(
-                "sampling requires temperature>=0, top_p in (0,1], and "
-                "top_k in [1,32] when sampling is enabled"
+                "sampling requires temperature>=0, top_p in (0,1] and min_p in [0,1]"
             )
-        if scores and (temperature != 0.0 or top_p != 1.0 or top_k):
+        if (
+            not abs(presence) <= 2.0
+            or not abs(frequency) <= 2.0
+            or not math.isfinite(repetition)
+            or repetition <= 0.0
+        ):
+            raise ValueError(
+                "sampling requires presence and frequency penalties in "
+                "[-2,2] and a positive repetition penalty"
+            )
+        if scores and sampling != _sampling_values(SamplingParameters()):
             raise ValueError("score requests require default greedy sampling")
     except (AttributeError, ValueError) as error:
         return _issue(
@@ -1093,28 +1107,6 @@ def _error_issue(
     return None
 
 
-def _capacity_issue(
-    event: CapacityExhaustedEvent,
-    failure: FailureClass,
-) -> ProtocolIssue | None:
-    request_id = event.request_id if type(event.request_id) is int else 0
-    try:
-        request_id = _u64(event.request_id, "capacity request id")
-        if not request_id:
-            raise ValueError("capacity event request id must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_REQUEST_ID, str(error), request_id)
-    try:
-        required = _u32(event.required_kv_pages, "required KV pages")
-        _u32(event.available_kv_pages, "available KV pages")
-        _u64(event.retry_after_micros, "retry delay")
-        if not required:
-            raise ValueError("capacity event required page count must be non-zero")
-    except ValueError as error:
-        return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
-    return None
-
-
 def _status_issue(
     event: StatusJsonEvent,
     limits: ProtocolLimits,
@@ -1159,8 +1151,7 @@ def _encode_message(
         _raise_issue(_request_issue(message, limits))
         prompt = _words(message.prompt_tokens, "prompt tokens")
         scores = _words(message.score_tokens, "score tokens")
-        top_p = _float32(message.sampling.top_p, "top_p")
-        temperature = _float32(message.sampling.temperature, "temperature")
+        sampling = _sampling_values(message.sampling)
         payload = (
             _REQUEST.pack(
                 message.request_id,
@@ -1172,9 +1163,7 @@ def _encode_message(
                 message.logical_max_output_tokens,
                 len(prompt),
                 len(message.image_spans),
-                temperature,
-                top_p,
-                message.sampling.top_k,
+                *sampling,
                 message.seed,
                 message.return_progress,
                 len(scores),
@@ -1296,15 +1285,6 @@ def _encode_message(
             + message.message
         )
         frame_type = FrameType.ERROR
-    elif isinstance(message, CapacityExhaustedEvent):
-        _raise_issue(_capacity_issue(message, FailureClass.ENGINE_UNHEALTHY))
-        payload = _CAPACITY_EXHAUSTED.pack(
-            message.request_id,
-            message.required_kv_pages,
-            message.available_kv_pages,
-            message.retry_after_micros,
-        )
-        frame_type = FrameType.CAPACITY_EXHAUSTED
     elif isinstance(message, StatusJsonEvent):
         _raise_issue(_status_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
         payload = (
@@ -1459,6 +1439,10 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         temperature,
         top_p,
         top_k,
+        presence_penalty,
+        frequency_penalty,
+        repetition_penalty,
+        min_p,
         seed,
         return_progress,
         score_count,
@@ -1528,7 +1512,15 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         remaining_deadline,
         max_output,
         prompt,
-        SamplingParameters(temperature, top_p, top_k),
+        SamplingParameters(
+            temperature,
+            top_p,
+            top_k,
+            presence_penalty,
+            frequency_penalty,
+            repetition_penalty,
+            min_p,
+        ),
         seed,
         _decode_enum(
             cohort,
@@ -1713,10 +1705,6 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
             payload[message_start:],
         )
         _raise_issue(_error_issue(message, limits, FailureClass.PROTOCOL_FATAL))
-        return message
-    if frame_type is FrameType.CAPACITY_EXHAUSTED:
-        message = CapacityExhaustedEvent(*_CAPACITY_EXHAUSTED.unpack(payload))
-        _raise_issue(_capacity_issue(message, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.STATUS_JSON:
         correlation_id, schema = _STATUS_JSON.unpack_from(payload)

@@ -6,12 +6,23 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
+
+// A slot is its payload rounded up to the alignment of uncached IO.
+static_assert(SlotFile::slotBytesFor(1) == SlotFile::kAlignmentBytes &&
+              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes) == SlotFile::kAlignmentBytes &&
+              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes + 1) ==
+                  2 * SlotFile::kAlignmentBytes);
 
 static void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
@@ -50,9 +61,13 @@ static void testFailedWriteStopsWriting() {
       require(file.writtenBytes() == size + size / 2 && file.readBytes() == 0,
               "IO counters lost a partial write or counted an invalid read");
       require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
-      require(!file.writable() &&
-                  throws<std::logic_error>([&] { static_cast<void>(file.write(partial, {source}, {})); }),
+      require(!file.writable() && file.write(partial, {source}, {}) == nullptr,
               "storage failure did not stop further writes");
+      // A closed file still rejects a write that does not fit its slots.
+      std::vector<std::byte> oversized(size + 1);
+      require(throws<std::invalid_argument>(
+                  [&] { static_cast<void>(file.write(partial, {oversized}, {})); }),
+              "a closed file absorbed a write of more than a slot");
       require(file.read(complete, {output}, {})->wait() && output.front() == std::byte{1},
               "complete slot became unreadable after a storage failure");
       require(file.readBytes() == size, "successful read bytes were not counted");
@@ -67,9 +82,157 @@ static void testFailedWriteStopsWriting() {
           "file failure/integrity test failed");
 }
 
+// Callers' memory need not be aligned or fill a slot: spans of any size and
+// alignment, from a few bytes to more than one of the worker's chunks, move
+// through the worker's own buffer. A write zeros the slot past its spans,
+// and a read may take less than was written, scattered differently.
+static void testScatteredSpans() {
+  // Three of the worker's 1 MiB chunks, the last one partial.
+  constexpr size_t size = (2 << 20) + 3 * SlotFile::kAlignmentBytes;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  std::vector<std::byte> source(size);
+  for (size_t index = 0; index < source.size(); ++index)
+    source[index] = static_cast<std::byte>(index * 131 + 7);
+  // Odd addresses and lengths, an empty span, and one span across the first
+  // chunk's end, adding up to less than a slot.
+  const std::span<const std::byte> bytes(source);
+  const std::vector<std::span<const std::byte>> spans{
+      bytes.subspan(1, 7), bytes.subspan(4099, 0), bytes.subspan(4099, (1 << 20) + 12345),
+      bytes.subspan(33, 999'983)};
+  std::vector<std::byte> expected;
+  for (auto span : spans) expected.insert(expected.end(), span.begin(), span.end());
+  require(expected.size() < size, "the scattered spans fill the slot");
+  expected.resize(size);
+  require(file.write(slot, spans, {})->wait() && file.writtenBytes() == size,
+          "a scattered write failed or did not store the whole slot");
+
+  // The whole slot through one unaligned span: the spans in order, zeros after.
+  std::vector<std::byte> whole(size + 1);
+  require(file.read(slot, {std::span(whole).subspan(1)}, {})->wait() &&
+              std::equal(expected.begin(), expected.end(), whole.begin() + 1),
+          "a scattered write did not store its spans in order with zeros after");
+  // Less than was written, across the first chunk's end into odd addresses:
+  // the read takes the two chunks its spans reach and nothing around them.
+  std::vector<std::byte> head(3 * 4096 + 3), tail((1 << 20) + 5);
+  const uint64_t readBefore = file.readBytes();
+  require(file.read(slot, {std::span(head).subspan(3), std::span(tail).subspan(5)}, {})->wait() &&
+              file.readBytes() - readBefore == 2 << 20,
+          "a partial read failed or did not take exactly the chunks it needs");
+  require(std::all_of(head.begin(), head.begin() + 3, [](std::byte b) { return b == std::byte{0}; }) &&
+              std::all_of(tail.begin(), tail.begin() + 5, [](std::byte b) { return b == std::byte{0}; }) &&
+              std::equal(head.begin() + 3, head.end(), expected.begin()) &&
+              std::equal(tail.begin() + 5, tail.end(), expected.begin() + (head.size() - 3)),
+          "a partial read returned the wrong bytes or wrote outside its spans");
+}
+
+// Spans of the given sizes, carved from `storage`: each starts at an address
+// aligned like slot offsets, as a Metal buffer does, or where `aligned` is
+// false one byte past one.
+using Shape = std::vector<std::pair<size_t, bool>>;
+static std::vector<std::span<std::byte>> placeSpans(std::vector<std::byte> &storage,
+                                                    const Shape &shape) {
+  constexpr size_t unit = SlotFile::kAlignmentBytes;
+  const auto room = [](size_t bytes) { return (bytes + 1 + unit - 1) / unit * unit; };
+  size_t total = unit;
+  for (const auto &[bytes, aligned] : shape) total += room(bytes);
+  storage.assign(total, std::byte{0});
+  void *base = storage.data();
+  size_t space = storage.size();
+  auto *cursor = static_cast<std::byte *>(std::align(unit, total - unit, base, space));
+  std::vector<std::span<std::byte>> spans;
+  for (const auto &[bytes, aligned] : shape) {
+    spans.emplace_back(cursor + (aligned ? 0 : 1), bytes);
+    cursor += room(bytes);
+  }
+  return spans;
+}
+
+// A run of at least one chunk of aligned memory moves straight between the
+// memory and the file; the rest of the spans, and a run the slot would hold
+// at an unaligned offset, move through the worker's buffer. Either way a
+// write stores the spans in order with zeros after them, counts the slot
+// once, and a read brings them back into spans of any shape.
+static void testAlignedRunsMoveDirectly() {
+  constexpr size_t chunk = 1 << 20;
+  constexpr size_t size = 3 * chunk;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  const std::vector<Shape> shapes{
+      // Two chunks straight, and the run's last half chunk through the buffer.
+      {{5 * chunk / 2, true}},
+      // The last run starts at an unaligned offset of the slot.
+      {{3 * chunk / 2, true}, {100, false}, {chunk, true}},
+      // The buffer takes only the alignment units before a run, so the run
+      // starts at an aligned offset of the slot.
+      {{3 * SlotFile::kAlignmentBytes, false}, {5 * chunk / 4, true}},
+  };
+  uint32_t state = 1;
+  for (const Shape &shape : shapes) {
+    std::vector<std::byte> sourceMemory;
+    const auto sources = placeSpans(sourceMemory, shape);
+    std::vector<std::byte> expected;
+    for (const auto span : sources) {
+      for (std::byte &value : span) {
+        state = state * 1664525u + 1013904223u;
+        value = static_cast<std::byte>(state >> 24);
+      }
+      expected.insert(expected.end(), span.begin(), span.end());
+    }
+    expected.resize(size);
+    const uint64_t writtenBefore = file.writtenBytes();
+    require(file.write(slot, {sources.begin(), sources.end()}, {})->wait() &&
+                file.writtenBytes() - writtenBefore == size,
+            "a write of aligned runs failed or did not store the slot exactly once");
+
+    // The whole slot into one unaligned span, all of it through the buffer.
+    std::vector<std::byte> wholeMemory;
+    const auto whole = placeSpans(wholeMemory, {{size, false}}).front();
+    require(file.read(slot, {whole}, {})->wait() &&
+                std::equal(expected.begin(), expected.end(), whole.begin()),
+            "aligned runs did not land in order with zeros after them");
+    // Back into spans of the same shape, the aligned runs straight.
+    std::vector<std::byte> destinationMemory;
+    const auto destinations = placeSpans(destinationMemory, shape);
+    require(file.read(slot, destinations, {})->wait(), "a read into aligned runs failed");
+    for (size_t index = 0; index < sources.size(); ++index) {
+      require(std::equal(sources[index].begin(), sources[index].end(),
+                         destinations[index].begin()),
+              "a read into aligned runs returned the wrong bytes");
+    }
+  }
+}
+
+// A queued write of aligned runs, cancelled behind a parked worker, fails and
+// leaves its slot unreadable. The worker sees the cancellation before the
+// write's first chunk, so this covers a queued direct write only, not one
+// cancelled between two of its chunks.
+static void testCancelledDirectWrite() {
+  constexpr size_t size = 3 << 20;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  std::vector<std::byte> memory;
+  const auto source = placeSpans(memory, {{size, true}}).front();
+  require(file.write(slot, {source}, {})->wait(), "the first write of aligned runs failed");
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  std::vector<std::byte> output(size);
+  auto hold = file.read(slot, {output}, [&] { reached.set_value(); released.wait(); });
+  reached.get_future().wait();
+  auto cancelled = file.write(slot, {source}, {});
+  cancelled->cancel();
+  release.set_value();
+  require(hold->wait() && !cancelled->wait(), "a cancelled write of aligned runs succeeded");
+  require(file.writable() && !file.read(slot, {output}, {})->wait(),
+          "a cancelled write of aligned runs left its slot readable or closed the file");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
+    testScatteredSpans();
+    testAlignedRunsMoveDirectly();
+    testCancelledDirectWrite();
     constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
     SlotFile file(size, size * 2 + 1);
     require(file.slotBytes() == size && file.capacityBytes() == size * 2 + 1 &&
@@ -130,9 +293,15 @@ int main() {
             "quota below one slot was accepted");
     require(throws<std::invalid_argument>([&] { SlotFile(size + 1, 4 * size); }),
             "unaligned slot size was accepted");
+    std::vector<std::byte> oversized(size + 1);
     require(throws<std::invalid_argument>(
-                [&] { static_cast<void>(file.read(reused, {std::span(restored).first(1)}, {})); }),
-            "invalid slot shape was accepted");
+                [&] { static_cast<void>(file.read(reused, {oversized}, {})); }) &&
+                throws<std::invalid_argument>([&] {
+                  static_cast<void>(file.write(
+                      reused, {std::span<const std::byte>(source), std::span<const std::byte>(oversized).first(1)},
+                      {}));
+                }),
+            "a transfer of more than a slot was accepted");
     {
       // Two files of different slot sizes draw on one budget.
       auto budget = std::make_shared<DiskBudget>(4 * size);

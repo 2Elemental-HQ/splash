@@ -404,13 +404,17 @@ int main(int argc, char **argv) {
           engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
-        return state.pressure != engine::MemoryPressure::Normal || !state.growthAllowed ||
+        return state.pressure != engine::MemoryPressure::Normal ||
+               !state.hostGrowthAllowed || !state.headroomBytes ||
                NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious;
       };
       const MeasurementStop stop = [] { return interrupted != 0; };
       const auto governed = governor.allocationAdmission();
-      const metal::AllocationAdmission admit = [&](uint64_t bytes, const auto &allocate) {
-        return !interrupted && !underPressure() && governed(bytes, allocate);
+      const metal::AllocationAdmission admit =
+          [&](uint64_t bytes, const auto &allocate) -> metal::AllocationResult {
+        if (interrupted || underPressure())
+          return metal::AllocationFailure::HostPressure;
+        return governed(bytes, allocate);
       };
 
       const auto descriptor = model::inspectModelPackage(modelRoot);

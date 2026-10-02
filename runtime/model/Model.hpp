@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
@@ -45,6 +46,20 @@ struct SamplingParameters final {
   float topP = 1.0F;
   uint32_t topK = 0;
   uint64_t seed = 0;
+  // The sampling penalties, applied before greedy and sampled selection alike:
+  // repetition scales the logits of prompt and output tokens, presence and
+  // frequency lower those of output tokens. The defaults change nothing.
+  float presencePenalty = 0.0F;
+  float frequencyPenalty = 0.0F;
+  float repetitionPenalty = 1.0F;
+  // Sampling drops the tokens less likely than minP times the most likely
+  // one, before top-k and top-p; 0 drops none.
+  float minP = 0.0F;
+
+  [[nodiscard]] bool penalized() const noexcept {
+    return presencePenalty != 0.0F || frequencyPenalty != 0.0F ||
+           repetitionPenalty != 1.0F;
+  }
 };
 
 // Immutable view of the fields a model needs to activate a sequence.  Engine
@@ -205,7 +220,10 @@ struct ModelBatchItem final {
   uint32_t promptOffset = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
+  // pageTableRevision names the page list and is nonzero; the list equals
+  // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
+  uint32_t pageTableFirstChanged = 0;
   std::span<const uint32_t> inputTokens{};
 };
 
@@ -281,6 +299,10 @@ struct ModelCapabilities final {
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
+  // KV pages startup warmup runs on, from page 0: the runway the engine's KV
+  // pool allocates when it is built.
+  static constexpr uint32_t warmupKvPages =
+      (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
@@ -311,61 +333,9 @@ class StateStorage {
 public:
   virtual ~StateStorage() = default;
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
-  // Frees pooled idle buffers beyond the counts kept warm and returns the
-  // bytes released. Active lanes and cached states are never touched.
-  [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept = 0;
-};
-
-// One slot of the disk tier holding a KV page; releasing the last handle
-// frees the slot.
-class KvDiskSlot {
-public:
-  virtual ~KvDiskSlot() = default;
-};
-
-// One KV page moving between its pool page and the disk tier. The copy rides
-// the next command; ready() then means the write has finished (demotion) or
-// the page holds the data (restore), and finish() reports success. The page
-// stays valid throughout, so a failed demotion loses nothing.
-class KvTransfer {
-public:
-  virtual ~KvTransfer() = default;
-  [[nodiscard]] virtual bool ready() const noexcept = 0;
-  [[nodiscard]] virtual bool finish() = 0;
-};
-
-// The disk tier for KV pages as the engine drives it. A queued copy moves
-// only inside a Metal command, so every command the model submits for a
-// batch carries the copies queued so far, each command of a multi-command
-// ticket included, and a batch with no work of its own still submits one
-// while copies are queued. The engine adds a copy-only command
-// (Model::submitTransfers) only when no batch runs, so while the model is
-// busy its own commands keep the copies moving.
-class KvTier {
-public:
-  virtual ~KvTier() = default;
-  [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
-  // False once a write has failed; existing copies stay readable.
-  [[nodiscard]] virtual bool writable() const noexcept = 0;
-  // Engine-thread admission probe, before replacing any disk copies.
-  [[nodiscard]] virtual bool canDemote() const noexcept = 0;
-  // Null when the disk quota is full.
-  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
-  // Null when no demotion staging is available; the caller waits while
-  // transfers are in flight.
-  [[nodiscard]] virtual std::unique_ptr<KvTransfer>
-  demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
-         std::function<void()> completion) = 0;
-  // Null when no staging is free; the caller retries later.
-  [[nodiscard]] virtual std::unique_ptr<KvTransfer>
-  restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
-          std::function<void()> completion) = 0;
-  // Copies waiting for a command; the engine submits one when the model is
-  // idle.
-  [[nodiscard]] virtual bool copiesQueued() const noexcept = 0;
-  // Engine-thread bookkeeping after commands and IO complete.
-  virtual void poll() = 0;
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  [[nodiscard]] virtual uint64_t stagingBytes() const noexcept = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,
@@ -400,7 +370,7 @@ struct ModelMemoryActual final {
 };
 
 struct ModelTelemetry final {
-  uint64_t stateResidentBytes = 0;
+  uint64_t stateAllocatedBytes = 0;
   uint32_t warmIdleStateCells = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
@@ -471,10 +441,9 @@ class Model {
 public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
-  [[nodiscard]] virtual bool needsHealthCheck() const noexcept { return false; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
-  // Safe-point preemption releases execution backing, retaining only the
-  // request's host-side sampling/constraint continuation. Resume replays the
+  // Safe-point preemption returns the request's state buffers, retaining
+  // only its host-side sampling/constraint continuation. Resume replays the
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
@@ -494,16 +463,14 @@ public:
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
-  // A command carrying only queued KV copies, for an idle model; null when
-  // nothing is queued. Its ticket yields no step results.
-  [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
-  submitTransfers(std::function<void()>) { return nullptr; }
   // Copies the request's committed state at its current page-aligned
   // boundary into a cache slot. Returns nullptr when no slot is free and the
   // governor denies a new one; the caller may release a cached state and
   // retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
+  // The bytes one lane's state snapshot allocates.
+  [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
@@ -513,6 +480,10 @@ public:
   // quota cannot admit another state: the caller may free quota and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
+  // The cached states whose buffers a lane's activation would still have to
+  // allocate: each one evicted returns to the pool what a lane takes. Zero
+  // when the pool holds a lane's buffers.
+  [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
   // Releases one unit of idle model state (an unused buffer, then caches
   // that can be rebuilt) and returns its bytes; zero when nothing is idle.
   // A denied allocation retries between calls, so it frees only what it

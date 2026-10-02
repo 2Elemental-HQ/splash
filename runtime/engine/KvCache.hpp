@@ -2,6 +2,7 @@
 
 #include "engine/CacheRecency.hpp"
 #include "engine/KvPool.hpp"
+#include "engine/KvTier.hpp"
 #include "engine/RecencyOrder.hpp"
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
@@ -82,7 +83,8 @@ public:
   };
 
   KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
-      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency) {}
+      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency),
+        blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -111,29 +113,41 @@ public:
   // Tiers. A block in transfer is moving between them and is neither
   // evicted nor replaced until the transfer is cleared.
   [[nodiscard]] uint32_t page(uint64_t blockId) const;
-  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> slot(uint64_t blockId) const;
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
-  // StateCache counts each of its entries in and out: a state restores
-  // through the KV of every block above its own.
-  void countState(uint64_t blockId, bool added) noexcept;
+  // StateCache counts each of its entries in and out, and each entry while
+  // an unfinished request uses it: a state restores through the KV of every
+  // block above its own.
+  void countState(uint64_t blockId, bool added, bool inUse) noexcept;
+  void countStateInUse(uint64_t blockId, bool added) noexcept;
   // A state sits below the block. Without one, the disk-only blocks below
   // it are never read again.
   [[nodiscard]] bool stateBelow(uint64_t blockId) const;
+  // A state an unfinished request uses sits below the block.
+  [[nodiscard]] bool stateInUseBelow(uint64_t blockId) const;
   // StateCache notes each ordinary publication or reuse of a state at this
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
+  // The resident pages, on the chains of these blocks (each block and every
+  // block above it), that no request holds and no transfer moves; each
+  // counts once. A request holds every page of its chain, so a chain's
+  // count stops at the first page one holds.
+  [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
   // Resident, without resident children or users: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
   [[nodiscard]] bool transferring(uint64_t blockId) const;
   void setTransferring(uint64_t blockId, bool transferring);
   // Publishes the block's disk copy; a resident block may drop it with null.
-  void setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot);
+  void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.
   void dropPage(uint64_t blockId);
   // Gives a disk-only block a page whose content follows, by restore or from
   // the request that recomputed it. The parent must be resident.
   void adoptPage(uint64_t blockId, uint32_t page);
+  // The pool moved pages: the block on each of them, if any, names the page
+  // it moved to. It visits only the moved pages.
+  void followPages(const KvPageMoves &moves) noexcept;
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
   // A restore that failed: the block matches nothing any more and leaves
@@ -146,11 +160,11 @@ public:
   evictionCandidate(uint64_t after = 0) const;
   // Oldest unused holder of a disk copy to replace: with duplicate, a
   // resident block whose copy is redundant; otherwise a disk-only block
-  // without children.
+  // without children. Pass the previous candidate to continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  diskCandidate(bool duplicate) const noexcept;
+  diskCandidate(bool duplicate, uint64_t after = 0) const;
   // The blocks below a block, each after its children, visiting only that
-  // subtree; empty when one of them is in transfer or in use. Below a
+  // subtree; empty when one of them is in transfer or active. Below a
   // resident leaf they are disk-only; below a poisoned block some may be
   // resident.
   [[nodiscard]] std::vector<uint64_t> subtree(uint64_t blockId) const;
@@ -173,10 +187,11 @@ private:
     std::array<uint32_t, pageTokens> tokens{};
     ImageIdentity images;
     uint32_t page = noPage;
-    std::shared_ptr<model::KvDiskSlot> slot;
+    std::shared_ptr<KvDiskSlot> slot;
     uint32_t children = 0;
     uint32_t residentChildren = 0;
     uint32_t statesBelow = 0;
+    uint32_t statesInUseBelow = 0;
     uint32_t activeUsers = 0;
     uint32_t depth = 0;
     uint64_t lastUsed = 0;
@@ -195,8 +210,11 @@ private:
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
   void unlink(Block &entry) noexcept;
-  void giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot) noexcept;
+  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
+  // Applies count to every block above this one.
+  template <typename Count>
+  void countAbove(uint64_t blockId, const Count &count) noexcept;
   // A poisoned block leaves as soon as nothing refers to it.
   void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
@@ -204,6 +222,10 @@ private:
   CacheNamespace cacheNamespace_;
   CacheRecency &recency_;
   std::unordered_map<uint64_t, Block> blocks_;
+  // The resident block on each page, 0 for none. A resident block owns its
+  // page: a writer whose block already exists moves onto that block's page,
+  // or keeps its own while the block is in transfer.
+  std::vector<uint64_t> blockOnPage_;
   std::unordered_multimap<uint64_t, uint64_t> index_;
   uint64_t nextBlockId_ = 1;
   // Any graph change invalidates previews, including a newly matched block.

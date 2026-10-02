@@ -59,13 +59,10 @@ struct ModelPackage final {
   }
 };
 
-// Model execution resources; physical memory admission remains governed by
-// the engine through admitAllocation.
-class KvPageTier;
-
+// Model execution resources. What a request's start allocates is admitted
+// by the engine through the state storage.
 struct RuntimeContext final {
   metal::MetalBackend &backend;
-  metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
   kv::PageStorage &kvPages;
   StateStorage &stateStorage;
@@ -73,7 +70,6 @@ struct RuntimeContext final {
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  KvPageTier *kvTier = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

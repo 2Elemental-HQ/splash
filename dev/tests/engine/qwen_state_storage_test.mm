@@ -12,9 +12,11 @@
 #include <iostream>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -25,6 +27,7 @@ namespace {
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
 constexpr model::DraftStateLayout kDraftState{5, 8, 2'048, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
+constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -81,6 +84,15 @@ std::vector<std::vector<uint8_t>> stateImage(const model::QwenSlotBuffers &buffe
   return image;
 }
 
+// Every pooled buffer the storage returns to macOS, one reclaim step at a
+// time, as the engine releases them.
+uint64_t releaseAllIdle(model::QwenStateStorage &storage, bool keepLane) {
+  uint64_t released = 0;
+  while (const uint64_t buffer = storage.releaseOneIdle(keepLane))
+    released += buffer;
+  return released;
+}
+
 template <typename Ticket> bool finishWhenReady(Ticket &ticket) {
   while (!ticket.ready()) std::this_thread::yield();
   return ticket.finish();
@@ -113,7 +125,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 2048, 4}};
-  auto file = std::make_shared<model::SlotFile>(layout.cachedBytes(), 3 * layout.cachedBytes());
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  auto file = std::make_shared<model::SlotFile>(slotBytes, 3 * slotBytes);
   model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
   require(static_cast<bool>(storage.tryActivateSlot(0, 1)), "fault source activation failed");
   storage.updateLengths(0, {4096, 2048, 2048, 0});
@@ -159,7 +172,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
               "offload did not recover after allocation failures");
       return;
     }
-    require(file->usedBytes() == layout.cachedBytes(),
+    require(file->usedBytes() == slotBytes,
             "failed offload leaked its disk quota");
   }
   throw std::runtime_error("offload allocation failure sweep never reached success");
@@ -169,7 +182,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
   require(static_cast<bool>(storage.tryActivateSlot(0, 123)), "disk source activation failed");
   const auto &buffers = storage.buffers(0);
   // Every byte of the state travels through the file; markers alone would
@@ -193,7 +206,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   source.reset();
   require(storage.idleCells() == 1 && storage.idleRings() == 1,
           "demotion did not return the source buffers at once");
-  static_cast<void>(storage.releaseIdle(0, 0));
+  releaseAllIdle(storage, false);
   require(finishWhenReady(*write), "disk write failed");
   write.reset();
   const auto beforeRestore = storage.actualAllocatedBytes();
@@ -252,7 +265,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
   require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateSlot(0, 321)), "lane activation failed");
   const auto &buffers = storage.buffers(0);
@@ -308,6 +321,50 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   storage.releaseSlot(0, 321);
 }
 
+// A state need not fill its slot: the write zeros the slot past it and the
+// read leaves the rest, in a slot one alignment unit larger than an aligned
+// state and in the rounded-up slot of a state that is not aligned.
+void testStateSmallerThanSlot(metal::MetalBackend &backend) {
+  constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
+  constexpr model::CompositeStateLayout aligned{target, {1, 1, 2048, 4}};
+  constexpr model::CompositeStateLayout unaligned{target, {1, 1, 2048, 1}};
+  constexpr uint64_t unit = model::SlotFile::kAlignmentBytes;
+  static_assert(aligned.cachedBytes() % unit == 0 && unaligned.cachedBytes() % unit != 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  for (const auto &[layout, slotBytes] :
+       {std::pair{aligned, aligned.cachedBytes() + unit},
+        std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
+    model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout,
+                                    std::make_shared<model::SlotFile>(slotBytes, slotBytes));
+    require(static_cast<bool>(storage.tryActivateSlot(0, 77)), "lane activation failed");
+    const auto &buffers = storage.buffers(0);
+    fill(buffers.gdn[0].stateBase, 31);
+    for (size_t layer = 0; layer < buffers.draft.size(); ++layer) {
+      fill(buffers.draft[layer].keys, 32 + 2 * layer);
+      fill(buffers.draft[layer].values, 33 + 2 * layer);
+    }
+    const auto images = stateImage(buffers, 0);
+    storage.updateLengths(0, {4096, 2048, 2048, 0});
+    auto write = storage.snapshotToDisk(0, {});
+    require(write && finishWhenReady(*write), "a state did not reach a larger slot");
+    auto disk = write->state();
+    write.reset();
+
+    fill(buffers.gdn[0].stateBase, 34);
+    for (const auto &layer : buffers.draft) {
+      fill(layer.keys, 35);
+      fill(layer.values, 36);
+    }
+    storage.updateLengths(0, {});
+    auto read = storage.beginRestore(0, *disk, true, {}, [] {});
+    require(read && finishWhenReady(*read) && stateImage(buffers, 0) == images,
+            "a state did not come back exactly from a larger slot");
+    read.reset();
+    disk.reset();
+    storage.releaseSlot(0, 77);
+  }
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -318,26 +375,30 @@ void run(const std::string &metallib) {
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
+  testStateSmallerThanSlot(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-  // Switched off to prove that a pooled cache slot needs no new admission.
+  // Switched off to prove that a pooled cache slot needs no new admission;
+  // the count is of the admissions granted.
   bool admitNewAllocations = true;
-  auto admitState = [&governor, &admitNewAllocations](
-                        uint64_t bytes,
-                        const std::function<void()> &allocate) {
+  uint32_t admissions = 0;
+  auto admitState = [&governor, &admitNewAllocations, &admissions](
+                        uint64_t bytes, const std::function<void()> &allocate)
+      -> metal::AllocationResult {
     if (!admitNewAllocations)
-      return false;
+      return metal::AllocationFailure::EngineBudget;
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)
-      return false;
+      return metal::AllocationFailure::EngineBudget;
     allocate();
     reservation->commit();
-    return true;
+    ++admissions;
+    return {};
   };
   constexpr kv::Layout kvLayout{16, 4, 256};
   kv::PageStorage pageStorage(backend, governor.allocationAdmission(),
-                                kvLayout,
-                                kvLayout.sparseMappingBatchPages());
+                              kvLayout, kvLayout.extentAlignmentPages(),
+                              kvLayout.extentAlignmentPages());
   uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
   uint64_t observedStorageActual = 0;
   uint64_t observedSlotActual = 0;
@@ -504,7 +565,7 @@ void run(const std::string &metallib) {
     require(!storage.metadata(0).assigned && storage.metadata(0).requestId == 0,
             "cancellation did not release metadata");
     require(storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.actualSlotBytes(0) == 0,
+                storage.actualSlotBytes(0) == 0 && storage.statesToActivate() == 0,
             "released lane buffers did not return to the pool");
     requireThrows<std::logic_error>([&] { storage.swapParity(0); },
                                     "unassigned slot accepted a parity update");
@@ -542,7 +603,7 @@ void run(const std::string &metallib) {
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     const uint64_t releasedSlotBytes = storage.actualSlotBytes(0);
     storage.releaseSlot(0, 303);
-    require(storage.releaseIdle(0, 0) == releasedSlotBytes,
+    require(releaseAllIdle(storage, false) == releasedSlotBytes,
             "recomputation preemption retained active backing");
     require(!storage.metadata(0).assigned && storage.actualSlotBytes(0) == 0 &&
                 storage.actualAllocatedBytes() == beforeSuspend - releasedSlotBytes,
@@ -556,8 +617,8 @@ void run(const std::string &metallib) {
 
     // Dropping a cached state returns its buffers to the storage's pool rather
     // than freeing them: accounting stays flat, and the next publication takes
-    // the pooled buffers without a governor admission. Only releaseIdle
-    // returns pooled bytes to macOS.
+    // the pooled buffers without a governor admission. Only releasing idle
+    // buffers returns pooled bytes to macOS.
     const uint64_t beforeDrop = storage.actualAllocatedBytes();
     const uint64_t backendBeforeDrop = backend.memoryStats().allocatedBytes;
     prefix.reset();
@@ -592,10 +653,10 @@ void run(const std::string &metallib) {
     pooled.reset();
     require(storage.actualAllocatedBytes() == beforeDrop,
             "second dropped cached state was freed instead of pooled");
-    require(storage.releaseIdle(0, 0) == observedPrefixActual &&
+    require(releaseAllIdle(storage, false) == observedPrefixActual &&
                 storage.actualAllocatedBytes() ==
                     beforeDrop - observedPrefixActual,
-            "releaseIdle did not free the pooled cache slot");
+            "releasing idle buffers did not free the pooled cache slot");
     require(storage.metadata(0).assigned && storage.metadata(1).assigned &&
                 storage.actualSlotBytes(0) == observedSlotActual &&
                 storage.actualSlotBytes(1) == observedSlotActual,
@@ -616,16 +677,71 @@ void run(const std::string &metallib) {
     require(storage.idleCells() == 5 && storage.idleRings() == 3,
             "dropped cached state did not return its buffers to the pool");
     // Releasing down to one lane's worth keeps two cells and one ring warm.
-    require(storage.releaseIdle(2, 1) ==
+    require(releaseAllIdle(storage, true) ==
                 observedSlotActual + observedPrefixActual &&
                 storage.idleCells() == 2 && storage.idleRings() == 1,
             "partial idle release did not keep the requested buffers");
-    require(storage.releaseIdle(0, 0) == observedSlotActual,
+    require(releaseAllIdle(storage, false) == observedSlotActual,
             "idle lane buffers were not reclaimed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reclaimed buffers remain pooled");
-    require(storage.actualAllocatedBytes() == 0,
+    require(storage.actualAllocatedBytes() == 0 && storage.statesToActivate() == 2,
             "reclaimed state cells remain accounted");
+
+    // An activation asks the governor once for everything the pool lacks:
+    // a refusal allocates nothing and leaves the pool as it was.
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 505) && !storage.metadata(0).assigned &&
+                storage.actualAllocatedBytes() == 0 &&
+                storage.statesToActivate() == 2,
+            "a denied activation allocated part of its lane");
+    admitNewAllocations = true;
+    uint32_t admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 505)) &&
+                admissions == admitted + 1 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "an activation asked the governor for its buffers one by one");
+    // With one cell and the ring in the pool the lane lacks a cell: a refusal
+    // leaves both pooled, and the retry is admitted that cell alone.
+    storage.releaseSlot(0, 505);
+    require(storage.releaseOneIdle(false) != 0 && storage.idleCells() == 1 &&
+                storage.idleRings() == 1 && storage.statesToActivate() == 1,
+            "fixture pool does not hold one cell and the ring");
+    const uint64_t pooledBytes = storage.actualAllocatedBytes();
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 506) && storage.idleCells() == 1 &&
+                storage.idleRings() == 1 &&
+                storage.actualAllocatedBytes() == pooledBytes,
+            "a denied activation took or dropped the pooled buffers");
+    admitNewAllocations = true;
+    admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 506)) &&
+                admissions == admitted + 1 && storage.idleCells() == 0 &&
+                storage.idleRings() == 0 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "the retry did not take the pooled buffers and one admission for the rest");
+    storage.releaseSlot(0, 506);
+    require(releaseAllIdle(storage, false) == observedSlotActual &&
+                storage.actualAllocatedBytes() == 0,
+            "the lane's buffers were not reclaimed");
+    // What else a request's start allocates joins the lane's admission: one
+    // call for both, and a refusal builds neither.
+    bool extraBuilt = false;
+    const auto buildExtra = [&] { extraBuilt = true; };
+    admitNewAllocations = false;
+    require(!storage.tryActivateSlot(0, 507, 4096, buildExtra) && !extraBuilt &&
+                storage.actualAllocatedBytes() == 0,
+            "a refused start built what came with its lane");
+    admitNewAllocations = true;
+    admitted = admissions;
+    require(static_cast<bool>(storage.tryActivateSlot(0, 507, 4096, buildExtra)) &&
+                extraBuilt && admissions == admitted + 1 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "a start was not admitted in one piece");
+    storage.releaseSlot(0, 507);
+    require(releaseAllIdle(storage, false) == observedSlotActual &&
+                storage.actualAllocatedBytes() == 0,
+            "the started lane's buffers were not reclaimed");
   }
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state slots remained in actual allocation count");

@@ -40,8 +40,8 @@ std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
 }
 
 void testImageIdentityKeysBlocks() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(2, false);
@@ -84,8 +84,8 @@ void testImageIdentityKeysBlocks() {
 }
 
 void testExactChainedBlocksAndPhysicalOwnership() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(4, false);
@@ -161,8 +161,8 @@ void testExactChainedBlocksAndPhysicalOwnership() {
 }
 
 void testErasedLeafParentInheritsRecency() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(4, false);
@@ -201,8 +201,8 @@ void testErasedLeafParentInheritsRecency() {
 }
 
 void testInputValidation() {
-  test::TestKvBacking backing(2, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(2, 100, 1);
+  KvPool pool(storage, 2);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(1, false);
@@ -225,8 +225,8 @@ void testInputValidation() {
 
 void testCandidateOrderThroughChurn() {
   constexpr uint32_t count = 256;
-  test::TestKvBacking backing(count, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(count, 100, 1);
+  KvPool pool(storage, count);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(count, false);
@@ -315,8 +315,8 @@ void testCandidateOrderThroughChurn() {
 // while one of them is in use.
 void testSubtreeThroughChurn() {
   constexpr uint32_t steps = 1000;
-  test::TestKvBacking backing(1, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(steps, 100, 1);
+  KvPool pool(storage, steps);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   struct Reference {
@@ -333,9 +333,11 @@ void testSubtreeThroughChurn() {
     switch (random() % 5) {
     case 0:
     case 1: {
-      // Every block shares page 0: only the shape of the tree matters here.
+      // A resident block owns its page, so each block takes the next one;
+      // only the shape of the tree matters here.
       const uint64_t parent = live ? pick : 0;
-      const auto result = cache.insert(parent, page(step + 1), 0);
+      const auto result =
+          cache.insert(parent, page(step + 1), static_cast<uint32_t>(inserted));
       require(result.inserted && result.id == ++inserted, "unexpected test block identity");
       blocks[result.id] = {parent, true};
       break;
@@ -401,13 +403,13 @@ void testHashCollisionStillRequiresExactTokens() {
           "KV block matching trusted a colliding index hash");
 }
 
-struct FakeSlot final : model::KvDiskSlot {};
+struct FakeSlot final : engine::KvDiskSlot {};
 
 // A resident block gains a disk copy, gives up its page, and takes a page
 // back; the orders and the parent follow each step.
 void testDiskTierTransitions() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(4, false);
@@ -500,8 +502,8 @@ void testDiskTierTransitions() {
 // poisoned block matches nothing, leaves with its last user, and takes a
 // poisoned parent with it once the subtree is gone.
 void testDiskOnlyAdoptionAndPoison() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 100, 1);
+  KvPool pool(storage, 8);
   CacheRecency recency;
   KvCache cache(pool, cacheNamespace(), recency);
   auto acquired = pool.acquirePages(4, false);

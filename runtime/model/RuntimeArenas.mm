@@ -237,17 +237,18 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(r * geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
-  put(DecodeTensor::TargetTopPartialIds, samplingWorkspace.partialIdsBytes);
-  put(DecodeTensor::TargetTopPartialValues, samplingWorkspace.partialValuesBytes);
-  put(DecodeTensor::TargetTopIds, samplingWorkspace.topIdsBytes);
-  put(DecodeTensor::TargetTopProbs, samplingWorkspace.topProbabilitiesBytes);
+  put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
+  put(DecodeTensor::TargetVocabularyRows, samplingWorkspace.vocabularyRowsBytes);
+  put(DecodeTensor::TargetVocabularyRanges,
+      samplingWorkspace.vocabularyRangesBytes);
+  put(DecodeTensor::TargetVocabularyArrivals,
+      samplingWorkspace.vocabularyArrivalsBytes);
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
       bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
                          geometry.maskWords()));
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
-  put(DecodeTensor::NextAnchor, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
   for (uint32_t index = 0; index < 2; ++index) {
@@ -278,7 +279,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
-  put(DecodeTensor::PageTable, bytesFor<uint32_t>(kMaximumPageTableEntries));
+  put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
+  put(DecodeTensor::PenaltyState,
+      bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::VerifyPackedBase,
       uint64_t{geometry.target.stateLayout.layers} *
           gdnPackedStride(geometry));

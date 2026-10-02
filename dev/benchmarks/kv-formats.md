@@ -10,9 +10,9 @@ choice, not a general speed improvement.
 - One `kv::Layout` supplies allocation, admission, cache identity, and attention
   planning. Format is part of execution-policy keys and the prefix-cache
   namespace, so policies and cached blocks cannot cross formats.
-- `PageStorage` owns both formats. BF16 has no scale allocations or bindings.
-  Sparse mapping still respects 64 KiB alignment; physical backing extents
-  target about 128 MiB. Logical prefix blocks remain 32 tokens.
+- `PageStorage` owns both formats. BF16 extents have no scale regions. Every
+  region of an extent starts 64 KiB aligned, and extents target about 128 MiB.
+  Logical prefix blocks remain 32 tokens.
 - The shared Metal page loop specializes on the stored element type. BF16 stores
   preserve source bits and attention omits quantization scales at compile time.
   INT8 entry points, argument order, arithmetic, and dispatch policies remain.
@@ -54,7 +54,8 @@ power condition.
   matched the retained main run on the same input token-for-token.
 
 The benchmark tools accept `--kv-format int8|bf16`. `attention-sweep` accepts
-`--compare-metallib BASELINE` and checks exact output equality;
+`--compare-metallib BASELINE` and checks exact output equality (the baseline
+must be built from a tree with `residency_kick`, which every backend loads);
 `paged-attention-plan METALLIB --long` runs the long independent references.
 
 ## Combined serving validation with PR #92

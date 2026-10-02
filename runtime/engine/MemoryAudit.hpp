@@ -28,12 +28,13 @@ struct ActualMemoryReport {
     uint64_t visionWeightsBytes = 0;
     // Unique physical GDN/draft allocations across active lanes, cached
     // states and idle pooled buffers.
-    uint64_t stateResidentBytes = 0;
+    uint64_t stateAllocatedBytes = 0;
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
-    uint64_t kvResidentBytes = 0;
-    // The disk tier's KV staging ring and copy table; zero without the tier.
-    uint64_t kvStagingBytes = 0;
+    uint64_t kvAllocatedBytes = 0;
+    // The buffer state writes to the disk tier stage through; zero without
+    // the tier.
+    uint64_t stateStagingBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;

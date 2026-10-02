@@ -89,9 +89,7 @@ class Job:
     prompt_tokens: list
     max_new_tokens: int
     seed: int
-    temperature: float
-    top_p: float
-    top_k: int
+    sampling: wire.SamplingParameters
     deadline: float
     priority: int = REQUEST_PRIORITIES["normal"]
     stop_sequences: tuple[str, ...] = ()
@@ -493,7 +491,7 @@ class NativeBackend:
         if job.constraint is not None:
             cohort = wire.Cohort.CONSTRAINED
             constraint = wire.ConstraintMode.TOKEN_MASK
-        elif job.temperature > 0:
+        elif job.sampling.temperature > 0:
             cohort = wire.Cohort.SAMPLING
             constraint = wire.ConstraintMode.NONE
         else:
@@ -504,9 +502,7 @@ class NativeBackend:
             logical_max_output_tokens=job.max_new_tokens,
             deadline=self._deadline(job),
             priority=priority,
-            sampling=wire.SamplingParameters(
-                float(job.temperature), float(job.top_p), job.top_k
-            ),
+            sampling=job.sampling,
             seed=job.seed,
             cohort=cohort,
             constraint=constraint,
@@ -779,6 +775,14 @@ class NativeBackend:
             message = error.message_bytes.decode("utf-8", "replace")
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
+            if code == "capacity_exhausted":
+                return APIError(
+                    400,
+                    "the request does not fit in the memory this server may use, even "
+                    "after every cached prefix was evicted; restart the server with a "
+                    f"larger --max-memory or a smaller --max-context ({message})",
+                    code,
+                )
             request_codes = {
                 "integer_overflow",
                 "invalid_cohort_constraint",
@@ -791,8 +795,6 @@ class NativeBackend:
             }
             status = 503 if error.retryable else 400 if code in request_codes else 500
             return APIError(status, message, code)
-        if isinstance(error, engine_runtime.CapacityExhausted):
-            return APIError(503, str(error), "capacity_exhausted")
         if isinstance(error, engine_runtime.MaskComputationFailed):
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")

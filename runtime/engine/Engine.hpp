@@ -11,6 +11,8 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -31,15 +33,27 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
-  // Host growth admission, supplied by the runtime governor. Queried only on
-  // failed allocation and, after a suspension the pause caused, while
-  // resident lanes drain; never on the ordinary decode path.
+  // Host growth admission, supplied by the runtime governor. Queried only
+  // while resident lanes drain after a suspension; allocation reads the
+  // cause of a refusal instead.
   std::function<bool()> growthPaused;
+  // Marks the allocations that follow as memory a request in service needs,
+  // which the pause does not hold back, and clears the mark
+  // (MemoryGovernor::setServing).
+  std::function<void(bool)> serving;
 };
 
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
+  // Requests that admission holds back behind the first one refused memory,
+  // whatever they wait for themselves, and that request itself while a pass
+  // keeps it out of its memory wait. During recovery only suspended
+  // requests are admitted, and only they count.
+  uint32_t heldBehindRefusal = 0;
+  // Requests admitted into a restore of their prefix from disk, waiting for
+  // its reads rather than for memory.
+  uint32_t restoring = 0;
   uint32_t suspended = 0;
   double oldestWaitMilliseconds = 0.0;
   bool draining = false;
@@ -98,19 +112,17 @@ public:
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
-  // Runs only at a command-completion safe point. Reclaim order follows
-  // ownership and preserves reusable prefixes for as long as possible: idle
-  // model state, unused KV backing, disposable checkpoints, then ordinary
-  // state/KV in LRU order.
-  // Live command buffers are never eviction candidates. Physical KV release
-  // is paced one extent at a time; reclaimDeferred() reports that the pass
-  // stopped behind an in-flight release and should run again shortly. The
-  // result says whether the directive's target is met, waits for transfers
-  // or a release in flight, or finds nothing left to reclaim.
+  // Runs only between commands: throws std::logic_error while a command is
+  // in flight. Returns idle model state first, then reclaims the cache:
+  // Cache::evictAll() under critical pressure, else Cache::reclaimCache,
+  // whose contract (Cache.hpp) gives the order; then returns the buffers
+  // evicted states parked. A warning pass keeps one lane's pooled buffers
+  // and one empty extent (keepServingFootprint).
+  // Live command buffers are never eviction candidates. A pass first collects
+  // the transfers that landed, so one that continues a reclaim they held back
+  // takes what they freed. The result says whether the directive's target is
+  // met, waits for transfers in flight, or finds nothing left to reclaim.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
-  [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return cache_.releaseDeferred();
-  }
 
 private:
   struct Failure final {
@@ -124,9 +136,14 @@ private:
     // What refused the memory at the latest attempt.
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
+    // The admissions counted when the request was first refused memory, and
+    // again when it is suspended: the lanes admitted up to then hold memory
+    // it waits for. A wait for a lane does not record it.
+    std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
-    // The latest tick at which a lane submitted before the request had work
-    // in flight; the limit restarts from it.
+    // The latest tick at which a lane submitted before the request, or one
+    // that admittedBefore counts, had work in flight; the limit restarts from
+    // it.
     double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
@@ -145,6 +162,10 @@ private:
     // Its place in submission order. Earlier requests' lanes hold memory it
     // may wait for, so their work restarts its resource wait's limit.
     uint64_t sequence = 0;
+    // The admissions counted when admit() last gave it a state cell
+    // (admissions_). Lanes admitted before a request was refused memory or
+    // suspended restart its wait's limit too.
+    uint64_t admission = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
@@ -153,11 +174,21 @@ private:
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
+    // The latest attempt to start it was refused memory. Until it starts,
+    // nothing that comes after it in admission order is admitted, in
+    // ordinary admission or among suspended requests during recovery
+    // (admitQueued); a pass that does not schedule it or a prefix wait
+    // leaves it in place.
+    bool refusedMemory = false;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // The block of the prompt's replay boundary, where the conversation's
+    // next turn resumes: its state is in use from the moment the request
+    // reaches, reuses or restores it until the request ends, suspended or not.
+    StateUse replayPoint;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -179,7 +210,6 @@ private:
     std::optional<Restore> restore;
   };
 
-  // An empty plan carries only KV copies for the disk tier.
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;
@@ -203,6 +233,9 @@ private:
   // only its prompt, before the prompt's generation prompt.
   [[nodiscard]] static uint32_t
   replayStateBoundary(const Request &request) noexcept;
+  // replayStateBoundary while the lane replays only its prompt.
+  [[nodiscard]] static uint32_t
+  promptReplayBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
@@ -223,11 +256,16 @@ private:
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
-  [[nodiscard]] CacheReclaimResult reclaimForGrowth(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
-  [[nodiscard]] bool reclaimIdleState() noexcept;
-  [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
-      const TokenAdmission &admission);
+  // The reclaim steps for a lane's state and for KV pages the engine's limit
+  // refused. Idle memory of the kind refused stays for it to reuse; idle
+  // memory of the other kind is released first. Each takes cache up to the
+  // class allocate() derives from inService.
+  [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
+  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
+  [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
+  [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
+      const TokenAdmission &admission, ReclaimClass upTo);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
@@ -235,27 +273,34 @@ private:
     // On its way back: pages whose copies are being written, or a reclaim
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
-    // Still moving: a release or a reclaim in progress, or a budget that
-    // can recover. Waiting or yielding beats failing.
-    bool retryable = false;
   };
-  struct KvAdmission {
-    TokenAdmission allocation;
+  // An allocation's last attempt, and what the engine knows about the memory
+  // it could not get.
+  template <class Admission> struct Allocation final {
+    Admission admission;
     Denial denial;
   };
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
-  // with nothing left to reclaim; while other lanes hold memory, growth is
-  // paused or the budget may recover, a running lane yields its memory and
-  // a lane being admitted waits.
+  // with nothing left to reclaim; while other lanes hold memory or the host
+  // refuses it, a running lane yields its memory and a lane being admitted
+  // waits.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // Runs one page admission, reclaiming cache between attempts while that
-  // makes progress.
-  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
-  [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
-                                      uint64_t generation, bool reclaimed) const;
+  // Runs one allocation of a lane's state or of KV pages, reclaiming between
+  // attempts while that makes progress. A request in service is running
+  // work and reclaims up to what is in use; one that a resident lane holds
+  // back takes nothing in use and waits for that lane. A refusal from the
+  // host reuses what the engine holds; when that gives nothing, a request in
+  // service retries as one (EngineConfig::serving), which only the engine's
+  // limit and critical pressure refuse. A refusal from the engine's limit
+  // reclaims cache; when that gives nothing, fallback may let go of what the
+  // request itself pins, and the reclaim goes on.
+  template <class Attempt>
+  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
+                              const std::function<bool()> &fallback = {})
+      -> Allocation<std::invoke_result_t<Attempt &>>;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);
@@ -269,10 +314,15 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
+  // Waiting for scheduling or for a prefix does not consume the memory
+  // wait limit, so the wait's record is reset. A request that holds
+  // admission closed (Request::refusedMemory) keeps when its wait began and
+  // which lanes were admitted before it was refused.
+  void deferWait(Request &request) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
-  // limit restarts whenever a lane submitted before the request has work in
-  // flight.
+  // limit restarts whenever a lane submitted before the request, or one
+  // ResourceWait::admittedBefore counts, has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
@@ -280,7 +330,9 @@ private:
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, Failure failure);
-  void finishCapacity(Request &request, const TokenAdmission &admission);
+  void finishCapacity(Request &request, std::string_view what,
+                      metal::AllocationFailure failure,
+                      std::string_view detail = {});
   void release(Request &request);
   void sweepTerminal();
 
@@ -294,8 +346,13 @@ private:
   // memory is still short (growth is paused or allocationFailed_), up to the
   // drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
+  // Admission recovers from a suspension: only suspended requests start.
+  [[nodiscard]] bool anySuspended() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  // The state cells admit() has obtained so far, including those it gave
+  // back when the attempt's pages were refused (Request::admission).
+  uint64_t admissions_ = 0;
   uint64_t resourceEpoch_ = 1;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.

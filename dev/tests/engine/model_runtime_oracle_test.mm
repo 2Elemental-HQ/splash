@@ -4,6 +4,7 @@
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -21,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 using namespace splash;
@@ -190,6 +192,29 @@ void beginCold(model::Runtime &runtime, const EngineRequest &request,
   runtime.beginColdRequest(request.modelView(), slot);
 }
 
+// Gives an item the revision of its page list the way the engine's cache
+// does: a request's revision moves whenever its list differs from the last
+// one it named, which it keeps below the first page that differs. Growing
+// tables then take the runtime's incremental page-table writes.
+ModelBatchItem withRevision(ModelBatchItem item) {
+  struct Named final {
+    uint64_t revision = 0;
+    uint32_t firstChanged = 0;
+    std::vector<uint32_t> pages;
+  };
+  static std::unordered_map<uint64_t, Named> named;
+  Named &last = named[item.requestId];
+  if (!last.revision || !std::ranges::equal(last.pages, item.pageTable)) {
+    last.firstChanged = static_cast<uint32_t>(
+        std::ranges::mismatch(last.pages, item.pageTable).in1 - last.pages.begin());
+    ++last.revision;
+    last.pages.assign(item.pageTable.begin(), item.pageTable.end());
+  }
+  item.pageTableRevision = last.revision;
+  item.pageTableFirstChanged = last.firstChanged;
+  return item;
+}
+
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
                          const std::shared_ptr<const CompositeState> &state) {
@@ -210,8 +235,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
                  cohort,
                  {{requestId, tokenCount}},
                  DecodeStage::Regular};
-  ModelBatchItem item{requestId,    slot,       logicalPosition,
-                         promptOffset, tokenCount, pageTable};
+  ModelBatchItem item = withRevision(
+      {requestId, slot, logicalPosition, promptOffset, tokenCount, pageTable});
   item.inputTokens = inputTokens;
   auto ticket = executor.submit(
       plan, std::span<const ModelBatchItem>(&item, 1), {});
@@ -248,7 +273,8 @@ decodeOne(model::Runtime &executor, uint64_t requestId, uint32_t slot,
           uint64_t logicalPosition, const std::vector<uint32_t> &pageTable,
           BatchCohort cohort, DecodeStage decodeStage = DecodeStage::Regular) {
   BatchPlan plan{WorkKind::Decode, cohort, {{requestId, 0}}, decodeStage};
-  ModelBatchItem item{requestId, slot, logicalPosition, 0, 0, pageTable};
+  ModelBatchItem item =
+      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable});
   auto result =
       executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
   require(result.size() == 1 && result[0].requestId == requestId,
@@ -307,8 +333,8 @@ beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      DecodeStage decodeStage) {
   BatchPlan plan{WorkKind::Decode, BatchCohort::Constrained,
                  {{requestId, 0}}, decodeStage};
-  const std::array items{ModelBatchItem{
-      requestId, slot, logicalPosition, 0, 0, pageTable}};
+  const std::array items{
+      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable})};
   return beginMaskedDecode(executor, plan, items);
 }
 
@@ -415,9 +441,9 @@ void requireAtomicImageAdmission(model::Runtime &executor,
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
   image.imagePixels.resize(image.images.front().pixelBytes());
-  // At the budget the engine retries a denied admission after each reclaim
-  // step. With no encoder and an empty state pool, a request whose lane does
-  // not fit is refused before its encoder arena or image buffers are built.
+  // At the budget the engine retries a denied start after each reclaim
+  // step. A start is one admission, so a request whose lane does not fit is
+  // refused before its encoder arena or image buffers are built.
   {
     const ImageSpan &span = image.images.front();
     const uint64_t attemptBytes =
@@ -483,6 +509,10 @@ void requireAtomicImageAdmission(model::Runtime &executor,
       require(executor.begin(text.modelView()).granted(),
               "image resume setup failed");
       executor.suspend(text.id);
+      // The suspended lane's buffers go back: what a reclaim finds after a
+      // failed start below is then that start's own.
+      while (executor.reclaimIdleState(false)) {
+      }
     }
     for (bool sharedVision : {false, true}) {
       EngineRequest keeper = image;
@@ -491,32 +521,30 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         require(executor.begin(keeper.modelView()).granted(),
                 "shared vision setup failed");
       const uint64_t before = backend.memoryStats().allocatedBytes;
-      // The check of the whole attempt, fresh vision, image pixels/embeddings,
-      // two GDN cells, draft ring. With an existing encoder, the check and
-      // the last four allocations remain.
-      for (int boundary = 0; boundary < (sharedVision ? 5 : 6); ++boundary) {
-        for (bool throwing : {false, true}) {
-          fault = {boundary, throwing};
-          bool threw = false;
-          try {
-            const StateAdmission admission = resume
-                ? executor.resume(image.modelView())
-                : executor.begin(image.modelView());
-            require(!admission.granted() &&
-                        admission.failure == StateFailure::MemoryPressure,
-                    "image allocation denial was not retryable");
-          } catch (const std::runtime_error &error) {
-            require(std::string(error.what()) == "injected image allocation",
-                    "unexpected image admission exception");
-            threw = true;
-          }
-          fault = {};
-          require(threw == throwing, "image admission exception was lost");
-          require(backend.memoryStats().allocatedBytes == before,
-                  "failed image admission retained or removed shared buffers");
-          require(executor.reclaimIdleState(false) == 0,
-                  "failed image admission created false reclamation progress");
+      // The start is one admission, of the encoder when none exists, the
+      // image pixels and embeddings and the lane's cells and ring: it is
+      // refused, or fails after it allocated them all.
+      for (bool throwing : {false, true}) {
+        fault = {0, throwing};
+        bool threw = false;
+        try {
+          const StateAdmission admission = resume
+              ? executor.resume(image.modelView())
+              : executor.begin(image.modelView());
+          require(!admission.granted() &&
+                      admission.failure == StateFailure::MemoryPressure,
+                  "image allocation denial was not retryable");
+        } catch (const std::runtime_error &error) {
+          require(std::string(error.what()) == "injected image allocation",
+                  "unexpected image admission exception");
+          threw = true;
         }
+        fault = {};
+        require(threw == throwing, "image admission exception was lost");
+        require(backend.memoryStats().allocatedBytes == before,
+                "failed image admission retained or removed shared buffers");
+        require(executor.reclaimIdleState(false) == 0,
+                "failed image admission created false reclamation progress");
       }
       if (sharedVision) {
         executor.end(keeper.id);
@@ -588,7 +616,8 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
 
   // Free only pooled state, keeping the image cache. A cache-only request
   // must fit a fresh state cell without recreating the reclaimed encoder.
-  static_cast<void>(states.releaseIdle(0, 0));
+  while (states.releaseOneIdle(false)) {
+  }
   const uint64_t stateBytes = model.stateLayout().activeCellBytes();
   require(stateBytes < encoderBytes, "image budget fixture cannot deny the encoder");
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
@@ -603,34 +632,31 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
           "cached image required more than its fresh request state");
 
   // A mixed hit/miss must keep the cached rows while admitting new resources.
-  // Fail at the check of the whole attempt, the encoder, image buffers and
-  // first state cell, including an exception after allocation, and leave both
-  // the cache and live request intact. Only the admitted attempt counts its
-  // cache hit as a reuse.
+  // Fail the start's admission, by refusal and by an exception after it
+  // allocated, and leave both the cache and live request intact. Only the
+  // admitted attempt counts its cache hit as a reuse.
   EngineRequest mixed = request;
   mixed.id = 97;
   mixed.images.push_back({80, 16, 8, 8, 157, 439});
   mixed.imagePixels.resize(2 * request.imagePixels.size());
   const uint64_t beforeMixed = backend.memoryStats().allocatedBytes;
   const uint64_t reusedBeforeMixed = executor.telemetry().imageEmbeddingReuses;
-  for (int boundary : {0, 1, 2, 3}) {
-    for (bool throwing : {false, true}) {
-      fault = {boundary, throwing};
-      bool threw = false;
-      try {
-        const StateAdmission denied = executor.begin(mixed.modelView());
-        require(!denied.granted() && denied.failure == StateFailure::MemoryPressure,
-                "mixed image allocation denial was not retryable");
-      } catch (const std::runtime_error &error) {
-        require(std::string(error.what()) == "injected image allocation",
-                "unexpected mixed image admission exception");
-        threw = true;
-      }
-      fault = {};
-      require(threw == throwing &&
-                  backend.memoryStats().allocatedBytes == beforeMixed,
-              "mixed image admission changed preexisting buffers on failure");
+  for (bool throwing : {false, true}) {
+    fault = {0, throwing};
+    bool threw = false;
+    try {
+      const StateAdmission denied = executor.begin(mixed.modelView());
+      require(!denied.granted() && denied.failure == StateFailure::MemoryPressure,
+              "mixed image allocation denial was not retryable");
+    } catch (const std::runtime_error &error) {
+      require(std::string(error.what()) == "injected image allocation",
+              "unexpected mixed image admission exception");
+      threw = true;
     }
+    fault = {};
+    require(threw == throwing &&
+                backend.memoryStats().allocatedBytes == beforeMixed,
+            "mixed image admission changed preexisting buffers on failure");
   }
   const ImageSpan &miss = mixed.images.back();
   const uint64_t missingImageBytes = miss.pixelBytes() +
@@ -866,10 +892,12 @@ int main(int argc, char **argv) {
     EngineMemoryPlan memoryPlan =
         requireEngineMemoryPlan(backend.capabilities(), profile);
 
-    // The pool is a whole number of sparse-mapping batches: the 4-head layout
-    // maps 128 pages at a time, the 2-head layout 256 (64 KiB tiles).
-    const uint32_t pageCount =
-        std::max(128U, model.targetKvLayout(format).sparseMappingBatchPages());
+    // A pool of 128 pages, or the smallest extent if larger, in whole extents
+    // of the size the memory plan would pick for it.
+    const kv::Layout kvLayout = model.targetKvLayout(format);
+    const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
+    const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
+    const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
@@ -889,44 +917,39 @@ int main(int argc, char **argv) {
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
         [admit = governed, &allocationFault, &backend](
-            uint64_t bytes, const std::function<void()> &allocate) {
+            uint64_t bytes, const std::function<void()> &allocate)
+            -> metal::AllocationResult {
           if (bytes > allocationFault.remainingBytes)
-            return false;
+            return metal::AllocationFailure::EngineBudget;
           if (allocationFault.remaining == 0) {
             if (allocationFault.throwAfterAllocation) {
               require(static_cast<bool>(admit(bytes, allocate)),
                       "test allocation unexpectedly exceeded real budget");
               throw std::runtime_error("injected image allocation");
             }
-            return false;
+            return metal::AllocationFailure::EngineBudget;
           }
           if (allocationFault.remaining > 0)
             --allocationFault.remaining;
-          // Only allocations spend the budget: the runtime's check of a
-          // whole image attempt allocates nothing.
+          // An admission spends what it allocates.
           const uint64_t before = backend.memoryStats().allocatedBytes;
-          if (!admit(bytes, allocate))
-            return false;
+          if (const metal::AllocationResult result = admit(bytes, allocate); !result)
+            return result;
           allocationFault.remainingBytes -=
               backend.memoryStats().allocatedBytes - before;
-          return true;
+          return {};
         };
-    metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
-    kv::PageStorage pages(
-        backend,
-        [&governed, &kvAdmissionFailure](
-            uint64_t bytes, const std::function<void()> &allocate)
-            -> metal::AllocationResult {
-          if (kvAdmissionFailure != metal::AllocationFailure::None)
-            return kvAdmissionFailure;
-          return governed(bytes, allocate);
-        },
-        model.targetKvLayout(format), pageCount);
+    kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
+    // The oracle's requests address pages directly, without a pool, so every
+    // extent is allocated up front.
+    for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+      require(static_cast<bool>(pages.allocateExtent(extent)),
+              "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout());
     model::RuntimeContext context{
-        backend, admission, model, pages, states, operators,
+        backend, model, pages, states, operators,
         ops::kMaximumImagePatches, budget.pipelineReserveBytes,
         budget.runtimeOverheadReserveBytes};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
@@ -947,39 +970,31 @@ int main(int argc, char **argv) {
     }
     model::Runtime executor(context);
     arenaReservation->commit();
-    // Fault only physical KV admission, after actual state activation. This
-    // exercises Runtime::warmupPrefill's failure propagation and cleanup.
-    require(pages.releaseBackingForPage(0), "warmup refusal fixture was not resident");
-    pages.awaitRelease();
-    const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
-    for (auto failure : {metal::AllocationFailure::HostPressure,
-                         metal::AllocationFailure::EngineBudget,
-                         metal::AllocationFailure::DriverRejected}) {
-      kvAdmissionFailure = failure;
+    // Warmup runs on the KV runway and never allocates: without it, after
+    // actual state activation, warmupPrefill fails and cleans up.
+    pages.releaseExtent(0);
+    {
+      const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
       const uint64_t beforeCommands = backend.submissionCount();
       bool rejected = false;
       try {
         static_cast<void>(executor.warmupPrefill(1));
-      } catch (const metal::MetalAllocationError &error) {
-        rejected = error.failure() == failure &&
-            std::string(error.what()).find("KV page backing") != std::string::npos;
+      } catch (const std::logic_error &error) {
+        rejected = std::string(error.what()).find("runway") != std::string::npos;
       }
       require(rejected && !states.metadata(0).assigned &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
-                  backend.submissionCount() == beforeCommands &&
-                  pages.residentPages() == 0,
-              "real warmup lost its KV refusal cause or executed/leaked work");
+                  backend.submissionCount() == beforeCommands,
+              "real warmup ran without its KV runway or executed/leaked work");
     }
-    kvAdmissionFailure = metal::AllocationFailure::None;
-    require(static_cast<bool>(pages.ensureResident(0)),
-            "warmup refusal fixture failed to recover KV admission");
-    static_cast<void>(states.releaseIdle(0, 0));
+    require(static_cast<bool>(pages.allocateExtent(0)),
+            "warmup runway fixture failed to recover its KV extent");
+    while (states.releaseOneIdle(false)) {
+    }
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
     if (model.descriptor.hasVision()) {
       requireAtomicImageAdmission(executor, backend, model, allocationFault);
-      for (uint32_t page : pageRange(120, 4))
-        require(static_cast<bool>(pages.ensureResident(page)), "image oracle KV backing is unavailable");
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
     } else {
@@ -1582,8 +1597,8 @@ int main(int argc, char **argv) {
                               {{42, 1}, {43, 1}},
                               DecodeStage::Regular};
     std::array<ModelBatchItem, 2> crossReplayItems{
-        ModelBatchItem{42, 0, 128, 128, 1, crossPages0},
-        ModelBatchItem{43, 1, 128, 128, 1, crossPages1}};
+        withRevision({42, 0, 128, 128, 1, crossPages0}),
+        withRevision({43, 1, 128, 128, 1, crossPages1})};
     const auto crossReplayToken =
         std::span<const uint32_t>(prompt129).subspan(128, 1);
     crossReplayItems[0].inputTokens = crossReplayToken;
@@ -1597,8 +1612,9 @@ int main(int argc, char **argv) {
                                BatchCohort::Constrained,
                                {{42, 0}, {43, 0}},
                                DecodeStage::RequestInitialMask};
-    std::vector<ModelBatchItem> crossItems{{42, 0, 129, 0, 0, crossPages0},
-                                              {43, 1, 129, 0, 0, crossPages1}};
+    std::vector<ModelBatchItem> crossItems{
+        withRevision({42, 0, 129, 0, 0, crossPages0}),
+        withRevision({43, 1, 129, 0, 0, crossPages1})};
     auto crossInitial = executor.decode(crossInitialPlan, crossItems);
     require(
         crossInitial.size() == 2 &&
@@ -1672,9 +1688,9 @@ int main(int argc, char **argv) {
                      {{b3Ids[0], 0}, {b3Ids[1], 0}, {b3Ids[2], 0}},
                      DecodeStage::Regular};
     std::array<ModelBatchItem, 3> b3Items{
-        ModelBatchItem{b3Ids[0], b3Slots[0], 1, 0, 0, b3Pages[0]},
-        ModelBatchItem{b3Ids[1], b3Slots[1], 1, 0, 0, b3Pages[1]},
-        ModelBatchItem{b3Ids[2], b3Slots[2], 1, 0, 0, b3Pages[2]}};
+        withRevision({b3Ids[0], b3Slots[0], 1, 0, 0, b3Pages[0]}),
+        withRevision({b3Ids[1], b3Slots[1], 1, 0, 0, b3Pages[1]}),
+        withRevision({b3Ids[2], b3Slots[2], 1, 0, 0, b3Pages[2]})};
     auto b3Decoded = executor.decode(b3Plan, b3Items);
     const model::ModelTelemetry b3Telemetry = executor.telemetry();
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
@@ -1705,8 +1721,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> equivalentItems;
     for (uint32_t lane = 0; lane < equivalentIds.size(); ++lane) {
       equivalentPlan.items.push_back({equivalentIds[lane], 0});
-      equivalentItems[lane] = {equivalentIds[lane],  lane, 1, 0, 0,
-                               equivalentPages[lane]};
+      equivalentItems[lane] =
+          withRevision({equivalentIds[lane], lane, 1, 0, 0, equivalentPages[lane]});
     }
     auto equivalentB4 = executor.decode(equivalentPlan, equivalentItems);
     for (uint64_t id : equivalentIds)
@@ -1800,8 +1816,8 @@ int main(int argc, char **argv) {
           raggedRequest(raggedIds[lane], lane),
           raggedSlots[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
-      raggedPrefillItems[lane] = {raggedIds[lane],  raggedSlots[lane], 0, 0,
-                                  raggedRows[lane], raggedPages[lane]};
+      raggedPrefillItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane], 0, 0,
+                                               raggedRows[lane], raggedPages[lane]});
       raggedPrefillItems[lane].inputTokens = raggedPrompts[lane];
     }
     const uint64_t beforeRaggedPrefill = backend.submissionCount();
@@ -1824,9 +1840,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> raggedDecodeItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       raggedDecodePlan.items.push_back({raggedIds[lane], 0});
-      raggedDecodeItems[lane] = {
-          raggedIds[lane],  raggedSlots[lane], raggedRows[lane], 0, 0,
-          raggedPages[lane]};
+      raggedDecodeItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane],
+                                              raggedRows[lane], 0, 0, raggedPages[lane]});
     }
     auto raggedDecoded = executor.decode(raggedDecodePlan, raggedDecodeItems);
     const model::ModelTelemetry raggedDecodeTelemetry =
@@ -1857,9 +1872,8 @@ int main(int argc, char **argv) {
           referenceSlots[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
-      raggedReferencePrefillItems[order] = {
-          referenceId, referenceSlots[order], 0,
-          0,           raggedRows[lane],      raggedPages[lane]};
+      raggedReferencePrefillItems[order] = withRevision(
+          {referenceId, referenceSlots[order], 0, 0, raggedRows[lane], raggedPages[lane]});
       raggedReferencePrefillItems[order].inputTokens = raggedPrompts[lane];
     }
     auto raggedReferencePrefill = executor.prefill(raggedReferencePrefillPlan,
@@ -1875,9 +1889,8 @@ int main(int argc, char **argv) {
       const uint32_t lane = raggedPermutation[order];
       const uint64_t referenceId = 104 + lane;
       raggedReferenceDecodePlan.items.push_back({referenceId, 0});
-      raggedReferenceDecodeItems[order] = {
-          referenceId, referenceSlots[order], raggedRows[lane], 0,
-          0,           raggedPages[lane]};
+      raggedReferenceDecodeItems[order] = withRevision(
+          {referenceId, referenceSlots[order], raggedRows[lane], 0, 0, raggedPages[lane]});
     }
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
@@ -1917,13 +1930,9 @@ int main(int argc, char **argv) {
                                      DecodeStage::Regular};
     std::array<ModelBatchItem, 4> productionB4ReplayItems;
     for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
-      productionB4ReplayItems[lane] = {
-          productionB4Ids[lane],
-          lane,
-          productionPrefix.size(),
-          static_cast<uint32_t>(productionPrefix.size()),
-          1,
-          productionB4Pages[lane]};
+      productionB4ReplayItems[lane] = withRevision(
+          {productionB4Ids[lane], lane, productionPrefix.size(),
+           static_cast<uint32_t>(productionPrefix.size()), 1, productionB4Pages[lane]});
       productionB4ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -1947,9 +1956,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 4> cycleItems;
       for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB4Ids[lane], 0});
-        cycleItems[lane] = {
-            productionB4Ids[lane],  lane, productionB4Lengths[lane], 0, 0,
-            productionB4Pages[lane]};
+        cycleItems[lane] = withRevision({productionB4Ids[lane], lane,
+                                         productionB4Lengths[lane], 0, 0,
+                                         productionB4Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 4, "production B4 width mismatch");
@@ -2006,13 +2015,9 @@ int main(int argc, char **argv) {
         DecodeStage::Regular};
     std::array<ModelBatchItem, 2> productionB2ReplayItems;
     for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
-      productionB2ReplayItems[lane] = {
-          productionB2Ids[lane],
-          productionB2Slots[lane],
-          productionPrefix.size(),
-          static_cast<uint32_t>(productionPrefix.size()),
-          1,
-          productionB2Pages[lane]};
+      productionB2ReplayItems[lane] = withRevision(
+          {productionB2Ids[lane], productionB2Slots[lane], productionPrefix.size(),
+           static_cast<uint32_t>(productionPrefix.size()), 1, productionB2Pages[lane]});
       productionB2ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -2035,12 +2040,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 2> cycleItems;
       for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB2Ids[lane], 0});
-        cycleItems[lane] = {productionB2Ids[lane],
-                            productionB2Slots[lane],
-                            productionB2Lengths[lane],
-                            0,
-                            0,
-                            productionB2Pages[lane]};
+        cycleItems[lane] = withRevision({productionB2Ids[lane], productionB2Slots[lane],
+                                         productionB2Lengths[lane], 0, 0,
+                                         productionB2Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 2, "production B2 width mismatch");
@@ -2141,30 +2143,54 @@ int main(int argc, char **argv) {
       std::vector<uint32_t> transcript;
       uint32_t pendingAnchorIndex = 0;
     };
-    const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode) {
+    // A sampling request keeps the tokens minP leaves it, the topK of those,
+    // all of them for 0, then its topP nucleus.
+    const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode,
+                                   ops::SamplingPenalties penalties = {},
+                                   uint32_t topK = 20, float topP = 0.95F,
+                                   uint32_t flags = 0, float minP = 0.0F) {
       const bool preempt = preemptionMode != 0;
       EngineRequest sequence = makeRequest(80, prompt129, 24, cohort);
-      if (cohort == BatchCohort::Sampling)
-        sequence.sampling = {0.8F, 0.95F, 20, 91199};
+      sequence.flags = flags;
+      if (cohort == BatchCohort::Sampling) {
+        sequence.sampling = {0.8F, topP, topK, 91199};
+        sequence.sampling.minP = minP;
+      }
       if (cohort == BatchCohort::Constrained)
         sequence.constraint = ConstraintMode::TokenMask;
+      sequence.sampling.presencePenalty = penalties.presence;
+      sequence.sampling.frequencyPenalty = penalties.frequency;
+      sequence.sampling.repetitionPenalty = penalties.repetition;
       beginCold(executor, sequence, 0);
       uint32_t slot = 0;
+      // A penalized request resumes in a slot other than lane 0, which it
+      // decodes in: its penalty words follow the slot, not the lane.
+      const auto resume = [&] {
+        std::optional<EngineRequest> holder;
+        if (penalties.active()) {
+          holder = makeRequest(81, {1}, 1);
+          beginCold(executor, *holder, 0);
+        }
+        StateAdmission admission = executor.resume(sequence.modelView());
+        if (holder)
+          executor.end(holder->id);
+        require(admission.granted() && (!holder || *admission.cell != 0),
+                "recompute admission failed");
+        return *admission.cell;
+      };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
         const StateSamples before = repeatDuringReplay
                                         ? sampleCommittedState(states, slot)
                                         : StateSamples{};
         executor.suspend(sequence.id);
-        require(states.actualAllocatedBytes() == 0,
-                "preempted request retained GDN/draft backing");
+        require(states.actualSlotBytes(slot) == 0,
+                "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
           executor.provideMask(sequence.id, singletonMasks(anchor));
         }
-        StateAdmission admission = executor.resume(sequence.modelView());
-        require(admission.granted(), "recompute admission failed");
-        slot = *admission.cell;
+        slot = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
         executor.setDraftContextPlan(
             sequence.id, planDraftContext(0, length, std::nullopt, {}));
@@ -2174,11 +2200,9 @@ int main(int argc, char **argv) {
                                    pageTable, cohort),
                       "interrupted state replay");
           executor.suspend(sequence.id);
-          require(states.actualAllocatedBytes() == 0,
-                  "repeated preemption retained state backing");
-          admission = executor.resume(sequence.modelView());
-          require(admission.granted(), "repeated recompute admission failed");
-          slot = *admission.cell;
+          require(states.actualSlotBytes(slot) == 0,
+                  "repeated preemption retained its state buffers");
+          slot = resume();
           executor.setDraftContextPlan(
               sequence.id, planDraftContext(0, length, std::nullopt, {}));
         }
@@ -2309,6 +2333,196 @@ int main(int argc, char **argv) {
                 << " reference_rows=" << reference.transcript.size()
                 << " resumed_rows=" << resumed.transcript.size()
                 << " preserved_prefix_rows=" << resumed.pendingAnchorIndex + 1 << '\n';
+    }
+
+    // Score probe of a greedy transcript: for every emitted token, a score
+    // request on the context before it returns the raw logits of every
+    // prompt and earlier output token and of the emitted one, the host
+    // applies the penalties with the counts of the tokens emitted before it,
+    // and the emitted token must be the best of them. The penalties only
+    // move tokens the context holds, so a count the runtime got wrong (in
+    // the prefill's first token, a verify row's draft prefix, or the words a
+    // resume rebuilds) shows up as an option that beats the emitted token by
+    // about the penalty. The score logits come from the prefill graph and
+    // most decisions from the verify graph, whose logits differ by a share of
+    // their size: on the 35B UD-Q4_K_M on Apple9, a prompt token's logit
+    // divided by the repetition ties a new token's at a repetition 1-2% lower
+    // in verify than in prefill (1.29-1.30 against 1.31-1.32). So the emitted
+    // token may trail by graphDrift of the values compared, well inside what
+    // a wrong count moves (presence here at least 1.5, repetition 1.3 at
+    // least 23% of the logit). Returns the largest amount it trails by beyond
+    // that.
+    constexpr float graphDrift = 0.03F;
+    const auto probeLoss = [&](const std::vector<uint32_t> &transcript,
+                               const ops::SamplingPenalties &penalties) {
+      float worst = 0.0F;
+      for (size_t position = 0; position < transcript.size(); ++position) {
+        std::vector<uint32_t> context = prompt129;
+        context.insert(context.end(), transcript.begin(),
+                       transcript.begin() + position);
+        std::vector<uint32_t> options = context;
+        options.push_back(transcript[position]);
+        std::sort(options.begin(), options.end());
+        options.erase(std::unique(options.begin(), options.end()), options.end());
+        require(options.size() >= model::ExecutionLimits::minimumScoreOptions &&
+                    options.size() <= model::ExecutionLimits::maximumScoreOptions,
+                "score probe options do not fit one score request");
+        EngineRequest score = makeRequest(90, context, 0);
+        score.scoreTokens = options;
+        beginCold(executor, score, 0);
+        const ModelStepResult scored =
+            prefillChunk(executor, score.id, 0, 0, 0, context, pageTable);
+        executor.end(score.id);
+        require(scored.scoreLogits.size() == options.size(),
+                "score probe returned the wrong logit count");
+        float best = -std::numeric_limits<float>::infinity();
+        float emitted = best;
+        for (size_t index = 0; index < options.size(); ++index) {
+          const uint32_t token = options[index];
+          const auto count = static_cast<uint32_t>(
+              std::count(transcript.begin(), transcript.begin() + position, token));
+          float value = scored.scoreLogits[index];
+          if (count || std::find(prompt129.begin(), prompt129.end(), token) !=
+                           prompt129.end())
+            value = value > 0.0F ? value / penalties.repetition
+                                 : value * penalties.repetition;
+          if (count)
+            value -= penalties.frequency * float(count) + penalties.presence;
+          best = std::max(best, value);
+          if (token == transcript[position])
+            emitted = value;
+        }
+        const float allowance =
+            graphDrift * std::max(std::abs(best), std::abs(emitted));
+        worst = std::max(worst, best - emitted - allowance);
+      }
+      return worst;
+    };
+
+    // Penalized requests keep every preemption guarantee above, and the
+    // score probe checks their decisions within the drift between score
+    // (prefill) and verify logits, and any further drift the unpenalized
+    // transcript shows.
+    // Negative presence and frequency favour the output's tokens by their
+    // counts, so the decisions they change follow the counts, a verify row's
+    // draft prefix included; presence 1.5 is Qwen's recommendation, and
+    // repetition also reads the prompt's tokens.
+    const PreemptionRun control = runPreemption(BatchCohort::Greedy, 0);
+    const float drift = probeLoss(control.transcript, {});
+    const float tolerance = std::max(2.0F * drift, 0.1F);
+    std::cout << "penalty_probe control_drift=" << drift
+              << " tolerance=" << tolerance << '\n';
+    bool penaltiesDecided = false;
+    for (const ops::SamplingPenalties penalties :
+         {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
+          ops::SamplingPenalties{1.0F, 1.5F, 0.0F},
+          ops::SamplingPenalties{1.3F, 1.5F, 0.0F}}) {
+      const auto reference = runPreemption(BatchCohort::Greedy, 0, penalties);
+      const auto promptResumed = runPreemption(BatchCohort::Greedy, 1, penalties);
+      require(promptResumed.transcript == reference.transcript,
+              "prompt recomputation changed a penalized transcript");
+      const auto resumed = runPreemption(BatchCohort::Greedy, 2, penalties);
+      require(resumed.transcript.size() > resumed.pendingAnchorIndex &&
+                  reference.transcript.size() > resumed.pendingAnchorIndex &&
+                  std::equal(resumed.transcript.begin(),
+                             resumed.transcript.begin() +
+                                 resumed.pendingAnchorIndex + 1,
+                             reference.transcript.begin()),
+              "preemption changed penalized history or its pending anchor");
+      const float referenceLoss = probeLoss(reference.transcript, penalties);
+      const float resumedLoss = probeLoss(resumed.transcript, penalties);
+      penaltiesDecided |= reference.transcript != control.transcript;
+      std::cout << "penalty_probe presence=" << penalties.presence
+                << " frequency=" << penalties.frequency
+                << " repetition=" << penalties.repetition
+                << " changed=" << (reference.transcript != control.transcript)
+                << " reference_loss=" << referenceLoss
+                << " resumed_loss=" << resumedLoss << '\n';
+      require(referenceLoss <= tolerance && resumedLoss <= tolerance,
+              "a penalized token is not the best of its penalized logits");
+    }
+    require(penaltiesDecided, "no penalty changed a decision to probe");
+    // Sampled lanes with presence and frequency repeat under a fixed seed;
+    // a constrained lane with repetition keeps its masked continuation.
+    {
+      const ops::SamplingPenalties sampled{1.0F, 1.5F, 0.5F};
+      const auto reference = runPreemption(BatchCohort::Sampling, 0, sampled);
+      require(runPreemption(BatchCohort::Sampling, 1, sampled).transcript ==
+                  reference.transcript,
+              "prompt recomputation changed a penalized sampled transcript");
+      const auto resumed = runPreemption(BatchCohort::Sampling, 2, sampled);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  runPreemption(BatchCohort::Sampling, 2, sampled).transcript ==
+                      resumed.transcript,
+              "penalized sampled recomputation is not deterministic");
+      const ops::SamplingPenalties repetition{1.3F, 0.0F, 0.0F};
+      const auto masked = runPreemption(BatchCohort::Constrained, 0, repetition);
+      require(runPreemption(BatchCohort::Constrained, 1, repetition).transcript ==
+                  masked.transcript,
+              "prompt recomputation changed a penalized constrained transcript");
+      const auto maskedResumed =
+          runPreemption(BatchCohort::Constrained, 2, repetition);
+      require(std::equal(maskedResumed.transcript.begin(),
+                         maskedResumed.transcript.begin() +
+                             maskedResumed.pendingAnchorIndex + 1,
+                         masked.transcript.begin()),
+              "preemption changed penalized constrained history");
+    }
+    // Sampled requests whose top_k keeps every token keep the preemption
+    // guarantees and repeat under a fixed seed, at top_p 0.95 and 1. They
+    // ignore the stop tokens: a row that keeps every token can draw one, the
+    // first row too (the 35B UD-Q4_K_M at top_p 1 does under this seed),
+    // which would end the request at its prompt.
+    for (const float topP : {0.95F, 1.0F}) {
+      const auto run = [&](uint32_t preemptionMode) {
+        return runPreemption(BatchCohort::Sampling, preemptionMode, {}, 0, topP,
+                             RequestIgnoreEndOfSequence);
+      };
+      const auto reference = run(0);
+      require(run(1).transcript == reference.transcript,
+              "prompt recomputation changed a top_k -1 transcript");
+      const auto resumed = run(2);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  run(2).transcript == resumed.transcript,
+              "top_k -1 recomputation is not deterministic");
+      std::cout << "top_k -1 top_p=" << topP
+                << " transcript_equal=" << (resumed.transcript == reference.transcript)
+                << " rows=" << reference.transcript.size() << '\n';
+    }
+    // Sampled requests that min_p alone cuts (top_k and top_p keep every
+    // token) keep the preemption guarantees and repeat under a fixed seed. At
+    // min_p 1 each row keeps its most likely token only, so the request
+    // selects what a greedy one does, draft tokens and corrections included.
+    {
+      const auto run = [&](uint32_t preemptionMode, float minP) {
+        return runPreemption(BatchCohort::Sampling, preemptionMode, {}, 0, 1.0F,
+                             RequestIgnoreEndOfSequence, minP);
+      };
+      const auto reference = run(0, 0.1F);
+      require(run(1, 0.1F).transcript == reference.transcript,
+              "prompt recomputation changed a min_p transcript");
+      const auto resumed = run(2, 0.1F);
+      require(std::equal(resumed.transcript.begin(),
+                         resumed.transcript.begin() +
+                             resumed.pendingAnchorIndex + 1,
+                         reference.transcript.begin()) &&
+                  run(2, 0.1F).transcript == resumed.transcript,
+              "min_p recomputation is not deterministic");
+      const auto greedy = runPreemption(BatchCohort::Greedy, 0, {}, 20, 0.95F,
+                                        RequestIgnoreEndOfSequence);
+      const auto heaviest = run(0, 1.0F);
+      require(heaviest.transcript == greedy.transcript,
+              "min_p 1 did not select each row's most likely token");
+      std::cout << "min_p 0.1 transcript_equal="
+                << (resumed.transcript == reference.transcript)
+                << " rows=" << reference.transcript.size()
+                << " min_p 1 greedy_rows=" << greedy.transcript.size() << '\n';
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
