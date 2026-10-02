@@ -96,7 +96,7 @@ whole-model A/B results, unchanged correctness/state-restoration behavior,
 and acceptable speculative acceptance and memory use. Check both models,
 short/long prompts and batch widths 1–4. Preserve the baseline when evidence
 is mixed. For the family-only MoE rule, separately compare four/eight groups
-on the missing hardware; the existing MoE tuner does not vary that rule.
+on the missing hardware; the tuner measures no MoE plan.
 
 ## Convergence validation (2026-09-21)
 

@@ -10,7 +10,6 @@
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "tuning/LinearTuning.hpp"
-#include "tuning/MoeTuning.hpp"
 #include "tuning/TuningWorkloads.hpp"
 
 #import <Foundation/Foundation.h>
@@ -148,36 +147,18 @@ std::string_view name(LinearSimdgroups groups) {
   }
   unnamed();
 }
-std::string_view name(MoePhase phase) {
-  switch (phase) {
-    ENUMERATOR_NAME(MoePhase::Prefill);
-    ENUMERATOR_NAME(MoePhase::Decode);
-  }
-  unnamed();
-}
 #undef ENUMERATOR_NAME
-std::string name(MoeExpertTile tile) {
-  return "MoeExpertTile::M" + std::to_string(static_cast<uint32_t>(tile));
-}
 
 std::string describe(const LinearConfig &c) {
   std::ostringstream out;
   out << "{" << name(c.tile) << ", " << c.groups << ", " << name(c.simdgroups) << ", " << c.splits << "}";
   return out.str();
 }
-std::string describe(const MoeConfig &c) { return "{" + name(c.expertTile) + "}"; }
 
 std::string describe(const LinearWorkload &w) {
   std::ostringstream out;
   out << "{{" << w.matrix.outputSize << ", " << w.matrix.inputSize << "}, " << w.rows << ", "
       << name(w.phase) << ", " << name(w.epilogue) << "}";
-  return out.str();
-}
-std::string describe(const MoeWorkload &w) {
-  const auto &s = w.shape;
-  std::ostringstream out;
-  out << "{{" << s.hiddenSize << ", " << s.experts << ", " << s.expertsPerToken << ", "
-      << s.expertIntermediateSize << "}, " << w.rows << ", " << name(w.phase) << "}";
   return out.str();
 }
 
@@ -202,22 +183,16 @@ std::string evidence(std::span<const MeasurementResult> measurements,
   return "";
 }
 
-template <class Plans, class Config>
-std::optional<CandidateId> candidateOf(const Plans &plans, const Config &config) {
-  for (size_t index = 0; index < plans.size(); ++index) {
-    if constexpr (requires { plans[index].configuration(); }) {
-      if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
-    } else {
-      if (plans[index] == config) return CandidateId{uint32_t(index)};
-    }
-  }
+std::optional<CandidateId> candidateOf(std::span<const LinearPlan> plans, const LinearConfig &config) {
+  for (size_t index = 0; index < plans.size(); ++index)
+    if (plans[index].configuration() == config) return CandidateId{uint32_t(index)};
   return std::nullopt;
 }
 
-void outcome(std::string_view family, const std::string &workload, bool complete,
-             bool changed, const std::string &chosen, const std::string &proof,
+void outcome(const std::string &workload, bool complete, bool changed,
+             const std::string &chosen, const std::string &proof,
              std::exception_ptr failure) {
-  std::cout << "  " << std::left << std::setw(18) << family << workload << "\n    ";
+  std::cout << "  " << workload << "\n    ";
   if (failure) {
     try { std::rethrow_exception(failure); }
     catch (const std::exception &error) { std::cout << "FAILED: " << error.what(); }
@@ -383,22 +358,14 @@ int main(int argc, char **argv) {
                      "only the draft's projections are measured\n";
       std::cout << '\n';
 
-      auto account = [&](bool complete, bool didChange, std::exception_ptr failure) {
-        ++measured;
-        changed += complete && didChange;
-        incomplete += !complete && !failure;
-        failed += bool(failure);
-        if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
-      };
-
       const Linear linear(device);
-      for (const auto &input : workloads.linear) {
+      for (const auto &input : workloads) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
         const auto baseline = linear.plan(input.workload).configuration();
         const bool didChange = result.complete && result.choice.configuration != baseline;
         if (didChange) choices.linear.push_back(result.choice);
-        outcome("linear", describe(input.workload), result.complete, didChange,
+        outcome(describe(input.workload), result.complete, didChange,
                 describe(result.choice.configuration),
                 evidence(result.measurements,
                          candidateOf(linear.candidates(input.workload), result.choice.configuration)),
@@ -424,20 +391,11 @@ int main(int argc, char **argv) {
           std::cout << "      default " << describe(baseline) << '\n';
           for (const auto &row : rows) std::cout << "      " << row.second << '\n';
         }
-        account(result.complete, didChange, result.failure);
-      }
-      for (const auto &input : workloads.moe) {
-        if (interrupted) break;
-        const auto result = tuneMoe(backend, admit, input, options.measurement, underPressure, stop);
-        const auto candidates = ExecutionPlans(backend.capabilities()).moeCandidates(input.workload);
-        const MoeConfig baseline = candidates.front().configuration();
-        const bool didChange = result.complete && result.choice.configuration != baseline;
-        if (didChange) choices.moe.push_back(result.choice);
-        outcome("moe", describe(input.workload), result.complete, didChange,
-                describe(result.choice.configuration),
-                evidence(result.measurements, candidateOf(candidates, result.choice.configuration)),
-                result.failure);
-        account(result.complete, didChange, result.failure);
+        ++measured;
+        changed += didChange;
+        incomplete += !result.complete && !result.failure;
+        failed += bool(result.failure);
+        if (!backend.healthy()) throw std::runtime_error("Metal backend became unhealthy");
       }
 
       std::cout << "\nmeasured " << measured << " keys: " << changed << " changed, "
@@ -453,9 +411,6 @@ int main(int argc, char **argv) {
                 << "// matters, change the rules in runtime/ops, not a table.\n";
       for (const auto &c : choices.linear)
         std::cout << "choices.linear.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.moe)
-        std::cout << "choices.moe.push_back({" << describe(c.workload) << ", "
                   << describe(c.configuration) << "});\n";
       if (choices.empty()) std::cout << "// (no entry: every measured key kept its default)\n";
 

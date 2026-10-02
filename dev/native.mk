@@ -23,7 +23,6 @@ TUNING_SOURCES := \
 	dev/tuning/Tuning.cpp \
 	dev/tuning/Measurement.cpp \
 	dev/tuning/LinearTuning.cpp \
-	dev/tuning/MoeTuning.cpp \
 	dev/tuning/TuningWorkloads.cpp
 # Control-plane tests compile the runtime sources they check: their sanitizer
 # builds cannot use the unsanitized engine library, and none links a framework.
@@ -104,7 +103,6 @@ TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_LINEAR_TUNING := $(ENGINE_TEST_BUILD)/linear-tuning
-TEST_MOE_TUNING := $(ENGINE_TEST_BUILD)/moe-tuning
 TEST_TUNING_WORKLOADS := $(ENGINE_TEST_BUILD)/tuning-workloads
 TUNE_KERNELS := $(ENGINE_TEST_BUILD)/tune-kernels
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
@@ -146,7 +144,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_C
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_TUNING_WORKLOADS) \
-	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_MOE_TUNING) \
+	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) \
 	$(TEST_OPERATOR_TUNING) \
 	$(TEST_OPERATOR_MEASUREMENT) \
 	$(TEST_EXECUTION_PLANS) \
@@ -177,7 +175,6 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_LINEAR_TUNING) \
-	$(TEST_MOE_TUNING) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -441,11 +438,6 @@ $(TEST_LINEAR_TUNING): dev/tests/engine/linear_tuning_test.cc $(TUNING_SOURCES) 
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_MOE_TUNING): dev/tests/engine/moe_tuning_test.mm $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
-
 $(TEST_TUNING_WORKLOADS): dev/tests/engine/tuning_workloads_test.cpp $(TUNING_SOURCES) \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
@@ -617,7 +609,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
 	$(TEST_LINEAR_TUNING) --cpu
-	$(TEST_MOE_TUNING) --cpu
 	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
 	/bin/sh dev/tests/tune_kernels_cli.sh $(TUNE_KERNELS)
 	$(TEST_OPERATOR_WORKSPACE)
@@ -653,7 +644,6 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_MOE_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(TEST_LINEAR_PLAN) --capabilities $(LIB)

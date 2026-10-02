@@ -5,33 +5,15 @@
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 
-#include <array>
-#include <compare>
 #include <span>
 #include <vector>
 
 namespace splash::ops {
 
-struct MoeWorkload final {
-  MoeShape shape;
-  // Physical rows in both phases: decode uses 8, 16, 24 or 32.
-  uint32_t rows = 0;
-  MoePhase phase = MoePhase::Decode;
-  auto operator<=>(const MoeWorkload &) const = default;
-};
-
-struct MoeChoice final {
-  MoeWorkload workload;
-  MoeConfig configuration;
-};
-
 struct OperatorChoices final {
   std::vector<LinearChoice> linear;
-  std::vector<MoeChoice> moe;
 
-  [[nodiscard]] bool empty() const noexcept {
-    return linear.empty() && moe.empty();
-  }
+  [[nodiscard]] bool empty() const noexcept { return linear.empty(); }
 };
 
 // One runtime owns this object; production models borrow it. Installation is
@@ -56,10 +38,6 @@ public:
       DraftAttentionShape shape, uint32_t lanes) const;
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;
   [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
-  // Shipped baseline first, independent of installed choices. Every candidate
-  // uses the same device router and expert-tile policy as production lookups
-  // and encoding; a GGUF workload's two are its device plan.
-  [[nodiscard]] std::array<MoePlan, 2> moeCandidates(const MoeWorkload &workload) const;
 
   // Bounds include baseline and every matching installed key, not just the
   // currently requested row count. Packed decode arenas use a per-lane stride
@@ -77,8 +55,8 @@ public:
   [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
 
 private:
-  // The plan of `config` with the device's fields.
-  [[nodiscard]] MoePlan moePlan(const MoeWorkload &workload, MoeConfig config) const;
+  // The device's configuration of a MoE plan of `rows` rows in `phase`.
+  [[nodiscard]] MoeConfig moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const;
 
   Linear linear_;
   Linear baselineLinear_;

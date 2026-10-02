@@ -1,6 +1,6 @@
 // Sparse MoE against a CPU reference with real Q4 expert weights: routing,
 // expert grouping (including partially filled tiles), the grouped gate/up and
-// down tiles, and the combine, for every operator-owned M8/M32 plan and the
+// down tiles, and the combine, for the M8 decode and M32 prefill plans and the
 // Apple9 four-simdgroup decode tiles (bitwise against the shipped tile). Routing
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
@@ -90,14 +90,14 @@ private:
   uint64_t state_;
 };
 
-// The production candidates on a GPU of `family` whose core count is
-// unknown, so every plan keeps the shipped router threshold
-// (kMoeRouteWideRows): family 9 decodes with the four-simdgroup 8-row tiles,
-// other families with the shipped eight.
-std::array<MoePlan, 2> candidates(uint32_t family, MoeShape shape, uint32_t rows, MoePhase phase) {
+// The production plans of a GPU of `family` whose core count is unknown, so
+// every plan keeps the shipped router threshold (kMoeRouteWideRows): family 9
+// decodes with the four-simdgroup 8-row tiles, other families with the
+// shipped eight.
+ExecutionPlans plans(uint32_t family) {
   splash::DeviceCapabilities device;
   device.appleGpuFamily = family;
-  return ExecutionPlans(device).moeCandidates({shape, rows, phase});
+  return ExecutionPlans(device);
 }
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
@@ -512,7 +512,7 @@ void checkPlan(const MoePlan &plan) {
                                                         rows * kStorageN * sizeof(float)) &&
               w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
               w.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes && w.groupedSumsBytes == 0,
-          "candidate workspace disagrees with independent geometry bound");
+          "plan workspace disagrees with independent geometry bound");
 }
 
 void planBounds() {
@@ -529,52 +529,40 @@ void planBounds() {
           "router tile selection ignores the configured threshold");
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
+    const ExecutionPlans shipped = plans(10);
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const auto plans = candidates(10, shape, rows, MoePhase::Prefill);
-      require(plans[0].configuration() == MoeConfig{MoeExpertTile::M32} &&
-                  plans[1].configuration() == MoeConfig{MoeExpertTile::M8},
-              "prefill candidates must preserve the shipped baseline first");
-      require(plans[0].splitExperts() && !plans[1].splitExperts(),
-              "only the M32 prefill plan runs the split expert passes");
-      for (const auto &plan : plans) {
-        require(plan.rows() == rows, "prefill candidate changed actual rows");
-        checkPlan(plan);
-      }
+      const MoePlan plan = shipped.moePrefill(shape, rows);
+      require(plan.configuration() == MoeConfig{MoeExpertTile::M32} && plan.splitExperts() &&
+                  plan.rows() == rows,
+              "prefill plans run the split 32-row expert passes over their actual rows");
+      checkPlan(plan);
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto plans = candidates(10, shape, lanes * 8, MoePhase::Decode);
-      require(plans[0].configuration() == MoeConfig{MoeExpertTile::M8} &&
-                  plans[1].configuration() == MoeConfig{MoeExpertTile::M32},
-              "decode candidates must preserve the shipped baseline first");
-      for (const auto &plan : plans) {
-        require(plan.rows() == lanes * 8, "decode candidate changed DFlash rows");
-        require(!plan.splitExperts(), "decode plans keep the fused expert tile");
-        checkPlan(plan);
-      }
+      const MoePlan plan = shipped.moeDecode(shape, lanes);
+      require(plan.configuration() == MoeConfig{MoeExpertTile::M8} && !plan.splitExperts() &&
+                  plan.rows() == lanes * 8,
+              "decode plans run the fused 8-row expert tile over the DFlash rows");
+      checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
-      // grid: same rows, tiles and scratch as the shipped candidates.
-      const auto narrow = candidates(9, shape, lanes * 8, MoePhase::Decode);
-      require(narrow[0].configuration() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
-                                              MoeExpertSimdgroups::Four} &&
-                  narrow[1].configuration() == MoeConfig{MoeExpertTile::M32, kMoeRouteWideRows,
-                                                  MoeExpertSimdgroups::Four},
-              "four-simdgroup decode candidates must carry the device tile policy");
-      for (size_t index = 0; index < narrow.size(); ++index) {
-        require(narrow[index].rows() == plans[index].rows() &&
-                    narrow[index].tileRows() == plans[index].tileRows() &&
-                    narrow[index].maximumTiles() == plans[index].maximumTiles() &&
-                    !narrow[index].splitExperts() &&
-                    narrow[index].workspace() == plans[index].workspace(),
-                "four-simdgroup tiles changed the plan geometry or workspace");
-        checkPlan(narrow[index]);
-      }
+      // grid: same rows, tiles and scratch as the shipped plan.
+      const MoePlan narrow = plans(9).moeDecode(shape, lanes);
+      require(narrow.configuration() == MoeConfig{MoeExpertTile::M8, kMoeRouteWideRows,
+                                                  MoeExpertSimdgroups::Four} &&
+                  narrow.rows() == plan.rows() && narrow.tileRows() == plan.tileRows() &&
+                  narrow.maximumTiles() == plan.maximumTiles() && !narrow.splitExperts() &&
+                  narrow.workspace() == plan.workspace(),
+              "four-simdgroup tiles changed the plan geometry or workspace");
     }
-    rejects([&] { (void)candidates(10, shape, 0, MoePhase::Prefill); }, "zero prefill");
-    rejects([&] { (void)candidates(10, shape, 2049, MoePhase::Prefill); }, "large prefill");
-    rejects([&] { (void)candidates(10, shape, 0, MoePhase::Decode); }, "zero batch");
-    rejects([&] { (void)candidates(10, shape, 40, MoePhase::Decode); }, "large batch");
+    rejects([&] { (void)shipped.moePrefill(shape, 0); }, "zero prefill");
+    rejects([&] { (void)shipped.moePrefill(shape, 2049); }, "large prefill");
+    rejects([&] { (void)shipped.moeDecode(shape, 0); }, "zero batch");
+    rejects([&] { (void)shipped.moeDecode(shape, 5); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
             "uncompiled expert tile");
+    rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
+            "affine 8-row prefill tile");
+    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
+            "affine 32-row decode tile");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
                                                   static_cast<MoeExpertSimdgroups>(6)}); },
             "uncompiled expert simdgroups");
@@ -596,7 +584,6 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   // Two router dispatches, grouping, gather, the expert passes and combine.
   require(dispatches.size() == 5 + expertPasses,
           "MoE plan must encode the entire operator");
-  const bool m8 = plan.configuration().expertTile == MoeExpertTile::M8;
   const auto route =
       splash::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
@@ -628,13 +615,11 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   } else {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
-    const bool four = m8 && plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
+    const bool four = plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
     const std::string gateUp = four ? "moe_expert_gate_up_q4_m8_n128_sg4"
-                               : m8 ? "moe_expert_gate_up_q4_m8"
-                                    : "moe_expert_gate_up_q4_m32";
+                                    : "moe_expert_gate_up_q4_m8";
     const std::string down = four ? "moe_expert_down_q4_m8_n256_sg4"
-                             : m8 ? "moe_expert_down_q4_m8"
-                                  : "moe_expert_down_q4_m32";
+                                  : "moe_expert_down_q4_m8";
     require(dispatches[experts].pipelineName == gateUp &&
                 dispatches[experts + 1].pipelineName == down,
             "fused MoE plan chose inconsistent expert pipelines");
@@ -666,7 +651,10 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
 
 void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   const uint64_t submissions = BackendInstrumentation::submittedCommands(backend);
-  for (const auto &plan : candidates(10, fixture.shape, 33, MoePhase::Prefill)) {
+  const ExecutionPlans shipped = plans(10);
+  // The split prefill passes and the fused decode tile.
+  for (const MoePlan &plan : {shipped.moePrefill(fixture.shape, 33),
+                              shipped.moeDecode(fixture.shape, 4)}) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
       CommandGraph graph;
@@ -732,8 +720,8 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       require(graph.empty(), "invalid row buffer partially encoded MoE");
     }
   }
-  const auto smallTiles = MoE::prefillPlan(fixture.shape, 33, {MoeExpertTile::M8});
-  const auto largeTiles = MoE::prefillPlan(fixture.shape, 33, {MoeExpertTile::M32});
+  const auto smallTiles = shipped.moeDecode(fixture.shape, 4);
+  const auto largeTiles = shipped.moePrefill(fixture.shape, 33);
   allocateScratch(backend, fixture, smallTiles);
   CommandGraph graph;
   rejects([&] { MoE::add(graph, fixture.buffers, fixture.weights, largeTiles); },
@@ -883,32 +871,23 @@ void run(const std::string &metallibPath) {
         fail(label + " " + routingLabel + ": outputs differ from the shipped tile");
       }
     };
+    const ExecutionPlans shipped = plans(10), narrow = plans(9);
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto shipped = candidates(10, fixture.shape, lanes * 8, MoePhase::Decode);
       const std::string label = "decode B" + std::to_string(lanes);
-      const auto baseline = execute(shipped[0], label);
-      requireEqual(execute(shipped[1], label), baseline, label + " M32");
+      const auto baseline = execute(shipped.moeDecode(fixture.shape, lanes), label);
       // The Apple9 four-simdgroup tiles (gate/up N128, down N256, 128
       // threads) must reproduce the shipped N128 x 8 tile bit for bit: each
       // output element sums its quant groups in the same order, so no
-      // tolerance is granted. The M32 candidate carries the device policy
-      // but keeps its eight-simdgroup tiles.
-      const auto narrow = candidates(9, fixture.shape, lanes * 8, MoePhase::Decode);
-      requireEqual(execute(narrow[0], label + " sg4"), baseline,
-                   label + " four-simdgroup M8");
-      requireEqual(execute(narrow[1], label + " sg4"), baseline,
-                   label + " four-simdgroup M32");
+      // tolerance is granted.
+      requireEqual(execute(narrow.moeDecode(fixture.shape, lanes), label + " sg4"), baseline,
+                   label + " four-simdgroup");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
     // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
     // wide router tile threshold.
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
-                          255U, 256U, 263U, 511U, 512U, kMaximumRows}) {
-      const auto shipped = candidates(10, fixture.shape, rows, MoePhase::Prefill);
-      const std::string label = "prefill rows=" + std::to_string(rows);
-      const auto baseline = execute(shipped[0], label);
-      requireEqual(execute(shipped[1], label), baseline, label);
-    }
+                          255U, 256U, 263U, 511U, 512U, kMaximumRows})
+      (void)execute(shipped.moePrefill(fixture.shape, rows), "prefill rows=" + std::to_string(rows));
   }
   std::cout << "moe_metal_test: PASS cases=" << cases
             << " wall_seconds=" << wallSeconds << '\n';

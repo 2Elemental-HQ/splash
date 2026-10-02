@@ -1,4 +1,3 @@
-#include "Checked.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -65,46 +64,6 @@ model::ModelPackage package() {
   result.target = std::move(target);
   result.draft.layout = draft;
   return result;
-}
-
-void checkPackage(const model::ModelPackage &package, uint32_t family) {
-  DeviceCapabilities device;
-  device.appleGpuFamily = family;
-  ops::ExecutionPlans baseline(device);
-  const auto before = model::plannedRuntimeMemory(device, package, baseline, kv::Format::Int8);
-  const auto geometry = std::visit([](const auto &weights) {
-    return model::qwenTargetGeometry(weights);
-  }, package.target);
-  ops::OperatorChoices choices;
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
-    choices.moe.push_back({{geometry.moeShape(), 24, ops::MoePhase::Decode},
-                           {ops::MoeExpertTile::M32}});
-  ops::ExecutionPlans selected(device);
-  selected.install(choices);
-  const auto after = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
-
-  uint64_t decodeGrowth = 0;
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe) {
-    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
-    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
-    for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      decodeGrowth += alignUp(model::kLaneCount * (newMoe.*field.bytes)) -
-                      alignUp(model::kLaneCount * (oldMoe.*field.bytes));
-    require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
-  }
-  require(after.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes + decodeGrowth,
-          "runtime decode allocation does not use all selected width bounds");
-  require(after.laneStatePlannedAllocatedBytes ==
-              before.laneStatePlannedAllocatedBytes,
-          "kernel selection changed the lane state");
-  selected.install({});
-  const auto reset = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
-  require(reset.sharedPrefillPlannedAllocatedBytes ==
-              before.sharedPrefillPlannedAllocatedBytes &&
-              reset.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes,
-          "reset left stale selected workspace");
 }
 
 void checkMixedLayouts() {
@@ -264,10 +223,6 @@ int main() {
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U, 11U}) {
-      checkPackage(dense, family);
-      checkPackage(sparse, family);
-    }
     checkLaneScratch(dense);
     checkLaneScratch(sparse);
     std::cout << "model execution plans: PASS (two paired geometries)\n";

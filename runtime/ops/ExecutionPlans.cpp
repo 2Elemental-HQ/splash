@@ -13,19 +13,6 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 static_assert(kMaximumLanes == 4);
 
-// The shipped configuration of a MoE workload's phase, the first candidate.
-MoeConfig baselineMoeConfig(MoePhase phase) noexcept {
-  return (phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates()).front();
-}
-
-// The operator plan of `config` for a MoE workload's phase and physical rows.
-MoePlan phasePlan(const MoeWorkload &workload, const MoeConfig &config) {
-  if (workload.phase == MoePhase::Prefill) return MoE::prefillPlan(workload.shape, workload.rows, config);
-  if (workload.phase != MoePhase::Decode || !workload.rows || workload.rows % kDecodeRows)
-    throw std::invalid_argument("invalid MoE phase or physical rows");
-  return MoE::decodePlan(workload.shape, workload.rows / kDecodeRows, config);
-}
-
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
              const std::array<uint64_t Workspace::*, N> &fields,
@@ -49,15 +36,6 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
   Linear nextLinear = baselineLinear_;
   nextLinear.setChoices(pending.linear);
-  for (const auto &choice : pending.moe) {
-    const auto &w = choice.workload;
-    if (w.shape.weightLayout == WeightLayout::Block32)
-      throw std::invalid_argument("block MoE plans are not tuned");
-    // The choice's own configuration: an invalid device field fails install
-    // although moePlan replaces it.
-    (void)phasePlan(w, choice.configuration);
-  }
-  sortUniqueChoices(pending.moe);
   // All potentially throwing work is above. No partial table install can
   // affect a production lookup if validation or allocation fails.
   std::swap(linear_, nextLinear);
@@ -81,46 +59,32 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-// The device's fields of a MoE plan: the router threshold, the 8-row tile
-// simdgroups and, for a GGUF plan, which is not tuned, its tiles.
-MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) const {
-  const MoeShape shape = workload.shape;
-  const bool prefill = workload.phase == MoePhase::Prefill;
+// The router threshold, the expert tile, the simdgroups of a decode plan's
+// 8-row tiles and, for a GGUF plan, its tiles.
+MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
+  const bool prefill = phase == MoePhase::Prefill;
+  MoeConfig config;
   config.routeWideRows = moeRouteWideRows_;
-  // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
-  // prefill chunk's much larger expert grid keeps the shipped tile.
-  config.m8Simdgroups = prefill ? MoeExpertSimdgroups::Eight : moeDecodeSimdgroups_;
+  config.expertTile = prefill ? MoeExpertTile::M32 : MoeExpertTile::M8;
+  if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups_;
   if (shape.weightLayout == WeightLayout::Block32) {
     const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
-    config.expertTile = prefill ? moeGgufPrefillTile(shape, workload.rows, tile) : MoeExpertTile::M8;
+    if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     config.ggufTile = tile;
-    config.ggufRouterTile = linear_.ggufFloatTile(workload.rows, shape.experts);
+    config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
   }
-  return phasePlan(workload, config);
+  return config;
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
-  const MoeWorkload workload{shape, rows, MoePhase::Prefill};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Prefill)));
+  return MoE::prefillPlan(shape, rows, moeConfig(shape, rows, MoePhase::Prefill));
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
-  // Validate before multiplying an untrusted width into a physical-row key.
+  // Validate before multiplying an untrusted width into the plan's rows.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
-  const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Decode)));
-}
-
-std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
-  // GGUF plans are not tuned: both candidates are the device's plan.
-  if (workload.shape.weightLayout == WeightLayout::Block32) {
-    const MoePlan plan = moePlan(workload, {});
-    return {plan, plan};
-  }
-  const std::array<MoeConfig, 2> configs =
-      workload.phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates();
-  return {moePlan(workload, configs[0]), moePlan(workload, configs[1])};
+  return MoE::decodePlan(shape, lanes, moeConfig(shape, lanes * kDecodeRows, MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -146,21 +110,15 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
   auto bound = moePrefill(shape, maximumRows).workspace();
-  for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    include(bound, moePlan({shape, rows, MoePhase::Prefill}, baselineMoeConfig(MoePhase::Prefill)).workspace(),
-            kMoeWorkspaceFields);
+  for (uint32_t rows = 1; rows <= maximumRows; ++rows)
     include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
-  }
   return bound;
 }
 
 MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   MoeWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-    include(bound, moePlan(workload, baselineMoeConfig(MoePhase::Decode)).workspace(), kMoeWorkspaceFields, lanes);
+  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
     include(bound, moeDecode(shape, lanes).workspace(), kMoeWorkspaceFields, lanes);
-  }
   return bound;
 }
 

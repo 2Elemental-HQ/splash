@@ -592,12 +592,12 @@ kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
       table, sums, width, group, simd_lane, simd_group);
 }
 
-// One expert tile: Rows grouped rows times TileN output columns, read through
+// One expert tile: 8 grouped rows times TileN output columns, read through
 // the same Q4 tile as the dense projections. The expert's weights stream once
-// per tile instead of once per route. Decode plans and the M8 prefill plan
-// run this fused gate/up tile; the M32 prefill plan runs the split N256
-// passes in prefill/moe.metal. The threadgroup is Simdgroups * 32 threads.
-template <ushort Rows, bool GateUp, ushort TileN = 128, ushort Simdgroups = 8>
+// per tile instead of once per route. Decode plans run this fused gate/up
+// tile; prefill plans run the split N256 passes in prefill/moe.metal. The
+// threadgroup is Simdgroups * 32 threads.
+template <bool GateUp, ushort TileN = 128, ushort Simdgroups = 8>
 inline void moe_expert_tile(device bfloat *grouped_input,
                             device const MoeTileDescriptor *tiles,
                             device const uint *tile_count,
@@ -620,22 +620,13 @@ inline void moe_expert_tile(device bfloat *grouped_input,
                          params.expert_stride_bytes_1, params.output_size,
                          params.input_size);
   }
-  device bfloat *input = grouped_input + ulong(group.y) * Rows * params.input_size;
-  device bfloat *tile_output =
-      output + ulong(group.y) * Rows * params.output_size;
-  if constexpr (Rows == 8) {
-    q4_mpp_tile<TileN, GateUp, false, 256, false, Simdgroups>(
-        input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-        slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-        params.output_size, params.input_size, input_sums, group.x * TileN,
-        simd_lane, simd_group);
-  } else {
-    q4_mpp_tile_batched<Rows, TileN, GateUp, false, 256, false, Simdgroups>(
-        input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
-        slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
-        params.output_size, params.input_size, input_sums, group.x * TileN,
-        simd_lane, simd_group);
-  }
+  device bfloat *input = grouped_input + ulong(group.y) * 8 * params.input_size;
+  device bfloat *tile_output = output + ulong(group.y) * 8 * params.output_size;
+  q4_mpp_tile<TileN, GateUp, false, 256, false, Simdgroups>(
+      input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
+      slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
+      params.output_size, params.input_size, input_sums, group.x * TileN,
+      simd_lane, simd_group);
 }
 
 kernel void moe_expert_gate_up_q4_m8(
@@ -652,28 +643,9 @@ kernel void moe_expert_gate_up_q4_m8(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float input_sums[64];
-  moe_expert_tile<8, true>(grouped_input, tiles, tile_count, gate_packed,
-                           up_packed, shared_gate, shared_up, output, params,
-                           group, input_sums, simd_lane, simd_group);
-}
-
-kernel void moe_expert_gate_up_q4_m32(
-    device bfloat *grouped_input [[buffer(0)]],
-    device const MoeTileDescriptor *tiles [[buffer(1)]],
-    device const uint *tile_count [[buffer(2)]],
-    device uchar *gate_packed [[buffer(3)]],
-    device uchar *up_packed [[buffer(4)]],
-    device uchar *shared_gate [[buffer(5)]],
-    device uchar *shared_up [[buffer(6)]],
-    device bfloat *output [[buffer(7)]],
-    constant MoeExpertParams &params [[buffer(8)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float input_sums[256];
-  moe_expert_tile<32, true>(grouped_input, tiles, tile_count, gate_packed,
-                            up_packed, shared_gate, shared_up, output, params,
-                            group, input_sums, simd_lane, simd_group);
+  moe_expert_tile<true>(grouped_input, tiles, tile_count, gate_packed,
+                        up_packed, shared_gate, shared_up, output, params,
+                        group, input_sums, simd_lane, simd_group);
 }
 
 kernel void moe_expert_down_q4_m8(
@@ -688,26 +660,9 @@ kernel void moe_expert_down_q4_m8(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float input_sums[64];
-  moe_expert_tile<8, false>(grouped_input, tiles, tile_count, down_packed,
-                            down_packed, shared_down, shared_down, output,
-                            params, group, input_sums, simd_lane, simd_group);
-}
-
-kernel void moe_expert_down_q4_m32(
-    device bfloat *grouped_input [[buffer(0)]],
-    device const MoeTileDescriptor *tiles [[buffer(1)]],
-    device const uint *tile_count [[buffer(2)]],
-    device uchar *down_packed [[buffer(3)]],
-    device uchar *shared_down [[buffer(4)]],
-    device bfloat *output [[buffer(5)]],
-    constant MoeExpertParams &params [[buffer(6)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float input_sums[256];
-  moe_expert_tile<32, false>(grouped_input, tiles, tile_count, down_packed,
-                             down_packed, shared_down, shared_down, output,
-                             params, group, input_sums, simd_lane, simd_group);
+  moe_expert_tile<false>(grouped_input, tiles, tile_count, down_packed,
+                         down_packed, shared_down, shared_down, output,
+                         params, group, input_sums, simd_lane, simd_group);
 }
 
 // Four-simdgroup 8-row tiles for Apple9 decode plans: gate/up at N128 and
@@ -736,10 +691,10 @@ kernel void moe_expert_gate_up_q4_m8_n128_sg4(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float input_sums[64];
-  moe_expert_tile<8, true, 128, 4>(grouped_input, tiles, tile_count,
-                                   gate_packed, up_packed, shared_gate,
-                                   shared_up, output, params, group,
-                                   input_sums, simd_lane, simd_group);
+  moe_expert_tile<true, 128, 4>(grouped_input, tiles, tile_count,
+                                gate_packed, up_packed, shared_gate,
+                                shared_up, output, params, group,
+                                input_sums, simd_lane, simd_group);
 }
 
 kernel void moe_expert_down_q4_m8_n256_sg4(
@@ -754,10 +709,10 @@ kernel void moe_expert_down_q4_m8_n256_sg4(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float input_sums[64];
-  moe_expert_tile<8, false, 256, 4>(grouped_input, tiles, tile_count,
-                                    down_packed, down_packed, shared_down,
-                                    shared_down, output, params, group,
-                                    input_sums, simd_lane, simd_group);
+  moe_expert_tile<false, 256, 4>(grouped_input, tiles, tile_count,
+                                 down_packed, down_packed, shared_down,
+                                 shared_down, output, params, group,
+                                 input_sums, simd_lane, simd_group);
 }
 
 kernel void moe_combine(
