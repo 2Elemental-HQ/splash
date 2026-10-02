@@ -86,11 +86,11 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // cell and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config,
                       const TemporaryModelRoot &root) {
-  const kv::Layout kvLayout = config.model.targetKvLayout;
-  return root.packageBytes + model::kPipelineReserveBytes +
-         model::kRuntimeOverheadReserveBytes +
-         config.model.stateLayout.activeCellBytes() +
-         kvRunwayPages(kvLayout.minimumExtentPages()) * kvLayout.bytesPerModelPage();
+  return minimumRequiredBytes(root.packageBytes + model::kPipelineReserveBytes +
+                                  model::kRuntimeOverheadReserveBytes,
+                              config.model.stateLayout.activeCellBytes(),
+                              config.model.targetKvLayout)
+      .value();
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

@@ -26,6 +26,12 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
          extentPages * extentPages;
 }
 
+// What one request needs at the least: the fixed bytes, one active state cell
+// and the KV runway in the layout's smallest extents; nullopt on overflow.
+[[nodiscard]] std::optional<uint64_t>
+minimumRequiredBytes(uint64_t fixedBytes, uint64_t activeStateCellBytes,
+                     const kv::Layout &layout) noexcept;
+
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.

@@ -64,6 +64,20 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
 
 } // namespace
 
+std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
+                                             uint64_t activeStateCellBytes,
+                                             const kv::Layout &layout) noexcept {
+  uint64_t runwayBytes = 0;
+  uint64_t dynamicBytes = 0;
+  uint64_t result = 0;
+  if (!checkedMultiply(layout.bytesPerModelPage(),
+                       kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
+      !checkedAdd(activeStateCellBytes, runwayBytes, dynamicBytes) ||
+      !checkedAdd(fixedBytes, dynamicBytes, result))
+    return std::nullopt;
+  return result;
+}
+
 std::string_view budgetErrorCodeName(BudgetErrorCode code) {
   switch (code) {
   case BudgetErrorCode::None:
@@ -318,21 +332,17 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
-  // The minimum holds one state cell and the KV runway: the whole smallest
-  // extents holding the pages warmup runs on.
-  uint64_t runwayBytes = 0;
-  if (!checkedMultiply(breakdown.kvPageBytes,
-                       kvRunwayPages(model.targetKvLayout.minimumExtentPages()),
-                       runwayBytes) ||
-      !checkedAdd(breakdown.activeStateCellBytes, runwayBytes,
-                  breakdown.minimumDynamicBytes) ||
-      !checkedAdd(breakdown.fixedRuntimeBytes, breakdown.minimumDynamicBytes,
-                  breakdown.minimumRequiredBytes)) {
+  const std::optional<uint64_t> required =
+      minimumRequiredBytes(breakdown.fixedRuntimeBytes,
+                           breakdown.activeStateCellBytes, model.targetKvLayout);
+  if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
                     "minimum elastic runtime footprint overflows uint64",
                     std::move(breakdown))};
   }
+  breakdown.minimumRequiredBytes = *required;
+  breakdown.minimumDynamicBytes = *required - breakdown.fixedRuntimeBytes;
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =

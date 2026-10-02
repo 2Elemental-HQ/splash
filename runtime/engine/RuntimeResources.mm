@@ -285,17 +285,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     // below adds the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
-    uint64_t requiredBytes = 0;
+    uint64_t fixedBytes = 0;
     for (const uint64_t bytes :
          {model::preparedModelWeightBytes(config.modelRoot, config.model),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
-          config.model.stateLayout.activeCellBytes(),
-          kvRunwayPages(kvLayout.minimumExtentPages()) *
-              kvLayout.bytesPerModelPage(),
           stateStagingBytes}) {
-      if (!checkedAdd(requiredBytes, bytes, requiredBytes))
-        requiredBytes = std::numeric_limits<uint64_t>::max();
+      if (!checkedAdd(fixedBytes, bytes, fixedBytes))
+        fixedBytes = std::numeric_limits<uint64_t>::max();
     }
+    const uint64_t requiredBytes =
+        minimumRequiredBytes(fixedBytes,
+                             config.model.stateLayout.activeCellBytes(), kvLayout)
+            .value_or(std::numeric_limits<uint64_t>::max());
     if (requiredBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,

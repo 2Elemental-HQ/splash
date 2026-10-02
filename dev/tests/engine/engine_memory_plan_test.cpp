@@ -117,6 +117,23 @@ void testMinimumHoldsTheWarmupRunway() {
           "a budget short of the warmup runway was accepted");
 }
 
+// The pre-load fit check and the plan share one minimum: the fixed bytes,
+// one state cell and the KV runway.
+void testMinimumRequiredBytesIsThePlans() {
+  for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    ModelMemoryProfile profile = model();
+    profile.targetKvLayout.format = format;
+    const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
+    const EngineMemoryBreakdown &budget = plan.breakdown();
+    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.activeStateCellBytes,
+                                 profile.targetKvLayout) == budget.minimumRequiredBytes,
+            "the minimum differs from the plan's");
+  }
+  require(!minimumRequiredBytes(std::numeric_limits<uint64_t>::max(), 1,
+                                model().targetKvLayout),
+          "an overflowing minimum was not refused");
+}
+
 void testUserCeilingAndFailure() {
   EngineMemoryPlan automatic = test::requireMemoryPlan(device(), model());
   const uint64_t ceiling =
@@ -330,6 +347,7 @@ int main() {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
     testMinimumHoldsTheWarmupRunway();
+    testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
     testReservesAreTheModelConstants();
