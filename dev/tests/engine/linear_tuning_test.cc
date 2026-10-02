@@ -228,11 +228,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
   require(backend.memoryStats().allocatedBytes == allocated, "fixture allocation leaked");
   for (size_t i = 0; i < projections.size(); ++i)
     require(fingerprint(projections[i]) == weightsBefore[i], "tuning modified supplied projection");
-  std::vector<WorkloadMeasurements> gpu, wall;
-  gpu.reserve(result.measurements.size());
-  wall.reserve(result.measurements.size());
   std::vector<CandidateMeasurements> gpuCandidates, wallCandidates;
-  constexpr WorkloadId id{0};
   for (size_t i = 0; i < result.measurements.size(); ++i) {
     const auto &measurement = result.measurements[i];
     require(measurement.candidate == CandidateId{uint32_t(i + 1)} &&
@@ -244,13 +240,11 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
       require(measurement.gpuPairs[pair].first == measurementOrder(pair) &&
           measurement.wallPairs[pair].first == measurementOrder(pair),
           "baseline/candidate order did not alternate");
-    gpu.push_back({id, measurement.rawGpuSamples()});
-    wall.push_back({id, measurement.rawWallSamples()});
-    gpuCandidates.push_back({measurement.candidate, {&gpu.back(), 1}});
-    wallCandidates.push_back({measurement.candidate, {&wall.back(), 1}});
+    gpuCandidates.push_back({measurement.candidate, measurement.rawGpuSamples()});
+    wallCandidates.push_back({measurement.candidate, measurement.rawWallSamples()});
   }
-  const auto gpuWinner = selectCandidate(gpuCandidates, {&id, 1}, options.policy);
-  const auto wallWinner = selectCandidate(wallCandidates, {&id, 1}, options.policy);
+  const auto gpuWinner = selectCandidate(gpuCandidates, options.policy);
+  const auto wallWinner = selectCandidate(wallCandidates, options.policy);
   const bool agreed = gpuWinner.verdict == SelectionVerdict::Selected &&
       wallWinner.verdict == SelectionVerdict::Selected && gpuWinner.candidate == wallWinner.candidate;
   require(result.configuration ==
@@ -428,19 +422,17 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   // Candidate ID changes order/accounting only: both calls encode exactly the
   // same 16 complete baseline operators. This is a diagnostic, not a synthetic
   // performance win or a replacement for a whole-model A/B.
-  const auto measurement = measureWorkload({1}, {0}, [&](CandidateId) {
+  const auto measurement = measureWorkload({1}, [&](CandidateId) {
     return invoke(baseline, 0, 16);
   }, options);
   if (measurement.failure) std::rethrow_exception(measurement.failure);
   require(measurement.pairCount == options.samplePairs &&
       (measurement.status == MeasurementStatus::Completed ||
        measurement.status == MeasurementStatus::Rejected), "baseline self-comparison was interrupted");
-  const WorkloadMeasurements gpu{{0}, measurement.rawGpuSamples()};
-  const WorkloadMeasurements wall{{0}, measurement.rawWallSamples()};
-  const CandidateMeasurements gpuCandidate{{1}, {&gpu, 1}}, wallCandidate{{1}, {&wall, 1}};
-  constexpr WorkloadId required{0};
-  const auto gpuSelection = selectCandidate({&gpuCandidate, 1}, {&required, 1}, options.policy);
-  const auto wallSelection = selectCandidate({&wallCandidate, 1}, {&required, 1}, options.policy);
+  const CandidateMeasurements gpuCandidate{{1}, measurement.rawGpuSamples()},
+      wallCandidate{{1}, measurement.rawWallSamples()};
+  const auto gpuSelection = selectCandidate({&gpuCandidate, 1}, options.policy);
+  const auto wallSelection = selectCandidate({&wallCandidate, 1}, options.policy);
   const bool jointSelection = gpuSelection.verdict == SelectionVerdict::Selected &&
       wallSelection.verdict == SelectionVerdict::Selected;
   std::cout << "Linear self-comparison repetitions=16 representatives=" << projections.size()

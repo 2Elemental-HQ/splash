@@ -377,13 +377,12 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     }
 
     result.measurements.reserve(plans.size() - 1);
-    constexpr WorkloadId workloadId{0};
     for (size_t i = 1; i < plans.size(); ++i) {
       if (!control()) return result;
       auto remaining = options;
       remaining.maximumWallSeconds = options.maximumWallSeconds - elapsed();
       result.measurements.push_back(measureWorkload(
-          CandidateId{uint32_t(i)}, workloadId,
+          CandidateId{uint32_t(i)},
           [&](CandidateId candidate) { return run(candidate, 0, result.repetitions); },
           remaining, shouldStop));
       const auto &measurement = result.measurements.back();
@@ -394,23 +393,18 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       }
     }
     if (!control()) return result;
-    std::vector<WorkloadMeasurements> gpuWorkloads, wallWorkloads;
     std::vector<CandidateMeasurements> gpuCandidates, wallCandidates;
-    gpuWorkloads.reserve(result.measurements.size());
-    wallWorkloads.reserve(result.measurements.size());
     gpuCandidates.reserve(result.measurements.size());
     wallCandidates.reserve(result.measurements.size());
     for (const auto &measurement : result.measurements) {
       // Every record here finished the full sample count. Evaluate the metrics
       // independently, including a candidate rejected by the other metric;
       // otherwise filtering could disguise disagreement between their winners.
-      gpuWorkloads.push_back({workloadId, measurement.rawGpuSamples()});
-      wallWorkloads.push_back({workloadId, measurement.rawWallSamples()});
-      gpuCandidates.push_back({measurement.candidate, {&gpuWorkloads.back(), 1}});
-      wallCandidates.push_back({measurement.candidate, {&wallWorkloads.back(), 1}});
+      gpuCandidates.push_back({measurement.candidate, measurement.rawGpuSamples()});
+      wallCandidates.push_back({measurement.candidate, measurement.rawWallSamples()});
     }
-    const auto gpu = selectCandidate(gpuCandidates, {&workloadId, 1}, options.policy);
-    const auto wall = selectCandidate(wallCandidates, {&workloadId, 1}, options.policy);
+    const auto gpu = selectCandidate(gpuCandidates, options.policy);
+    const auto wall = selectCandidate(wallCandidates, options.policy);
     if (gpu.verdict == SelectionVerdict::Selected &&
         wall.verdict == SelectionVerdict::Selected && gpu.candidate == wall.candidate)
       result.configuration = plans.at(gpu.candidate.value).configuration();

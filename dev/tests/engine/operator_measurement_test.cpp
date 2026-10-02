@@ -15,7 +15,6 @@ namespace {
 using namespace splash::ops::tuning;
 
 constexpr CandidateId kCandidate{7};
-constexpr WorkloadId kWorkload{19};
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -46,14 +45,14 @@ void diagnosticNames() {
 
 void completeRun() {
   std::vector<CandidateId> invocations;
-  const auto result = measureWorkload(kCandidate, kWorkload,
+  const auto result = measureWorkload(kCandidate,
       [&](CandidateId candidate) {
         invocations.push_back(candidate);
         return stableTiming(candidate);
       });
   require(result.status == MeasurementStatus::Completed &&
-              result.candidate == kCandidate && result.workload == kWorkload &&
-              result.pairCount == 12 && result.warmup.attemptedCalls == 4 &&
+              result.candidate == kCandidate && result.pairCount == 12 &&
+              result.warmup.attemptedCalls == 4 &&
               result.warmup.returnedCalls == 4 &&
               result.measurement.attemptedCalls == 24 &&
               result.measurement.returnedCalls == 24 && !result.failure,
@@ -85,17 +84,15 @@ void completeRun() {
               result.rawGpuSamples().size() == 12 &&
               result.rawWallSamples().size() == 12,
           "valid measurement did not expose its complete raw samples");
-  const std::array workloads{WorkloadMeasurements{result.workload, result.rawGpuSamples()}};
-  const std::array candidates{CandidateMeasurements{kCandidate, workloads}};
-  const std::array required{kWorkload};
-  require(selectCandidate(candidates, required).candidate == kCandidate,
+  const std::array candidates{CandidateMeasurements{kCandidate, result.rawGpuSamples()}};
+  require(selectCandidate(candidates).candidate == kCandidate,
           "measurement result did not integrate with candidate selection");
 
   MeasurementOptions maximum;
   maximum.warmupPairs = kMaximumWarmupPairs;
   maximum.samplePairs = kMaxPairedSamples;
   maximum.policy.minimumPairs = 64;
-  const auto bounded = measureWorkload(kCandidate, kWorkload, stableTiming, maximum);
+  const auto bounded = measureWorkload(kCandidate, stableTiming, maximum);
   require(bounded.status == MeasurementStatus::Completed &&
               bounded.warmup.returnedCalls == 8 &&
               bounded.measurement.returnedCalls == 128 && bounded.pairCount == 64,
@@ -104,7 +101,7 @@ void completeRun() {
 
 void warmupsAndQualification() {
   size_t calls = 0;
-  auto result = measureWorkload(kCandidate, kWorkload,
+  auto result = measureWorkload(kCandidate,
       [&](CandidateId candidate) {
         ++calls;
         return calls <= 4 ? RunTiming{double(calls * 20), double(calls * 30), false}
@@ -114,21 +111,19 @@ void warmupsAndQualification() {
               result.gpuAssessment.conservativeGain == 0.125,
           "warmup variation contaminated measured pairs");
 
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
                            [](CandidateId) { return RunTiming{1, 2, false}; });
   require(result.status == MeasurementStatus::Completed &&
               result.gpuAssessment.verdict == TimingVerdict::Stable &&
               result.wallAssessment.verdict == TimingVerdict::Stable,
-          "stable neutral workload could not participate in aggregate selection");
-  const std::array workloads{WorkloadMeasurements{result.workload, result.rawWallSamples()}};
-  const std::array candidates{CandidateMeasurements{kCandidate, workloads}};
-  const std::array required{kWorkload};
-  require(selectCandidate(candidates, required).candidate == kBaseline,
+          "stable neutral workload was rejected before selection");
+  const std::array candidates{CandidateMeasurements{kCandidate, result.rawWallSamples()}};
+  require(selectCandidate(candidates).candidate == kBaseline,
           "neutral measurement alone displaced baseline");
 
   for (const bool noisyGpu : {false, true}) {
     calls = 0;
-    result = measureWorkload(kCandidate, kWorkload,
+    result = measureWorkload(kCandidate,
         [&](CandidateId candidate) {
           const size_t call = calls++;
           auto timing = stableTiming(candidate);
@@ -147,7 +142,7 @@ void warmupsAndQualification() {
                     TimingVerdict::Noisy,
             "one noisy metric did not invalidate the entire workload");
   }
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [](CandidateId candidate) {
         auto timing = stableTiming(candidate);
         if (candidate == kCandidate)
@@ -163,7 +158,7 @@ void warmupsAndQualification() {
 void pressureAndInvalidTiming() {
   for (const size_t pressuredCall : {1U, 2U, 5U, 6U}) {
     size_t calls = 0;
-    const auto result = measureWorkload(kCandidate, kWorkload,
+    const auto result = measureWorkload(kCandidate,
         [&](CandidateId candidate) {
           auto timing = stableTiming(candidate);
           timing.underPressure = ++calls == pressuredCall;
@@ -181,7 +176,7 @@ void pressureAndInvalidTiming() {
                               std::numeric_limits<double>::infinity(),
                               std::numeric_limits<double>::quiet_NaN()}) {
       size_t calls = 0;
-      const auto result = measureWorkload(kCandidate, kWorkload,
+      const auto result = measureWorkload(kCandidate,
           [&](CandidateId candidate) {
             auto timing = stableTiming(candidate);
             if (++calls == 6) {
@@ -204,7 +199,7 @@ void pressureAndInvalidTiming() {
 
 void cancellationAndFailures() {
   size_t calls = 0;
-  auto result = measureWorkload(kCandidate, kWorkload,
+  auto result = measureWorkload(kCandidate,
       [&](CandidateId candidate) { ++calls; return stableTiming(candidate); }, {},
       [] { return true; });
   require(result.status == MeasurementStatus::Cancelled && calls == 0 &&
@@ -213,7 +208,7 @@ void cancellationAndFailures() {
 
   MeasurementOptions options;
   options.samplePairs = 13;
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [&](CandidateId candidate) { ++calls; return stableTiming(candidate); }, options,
       [&] { return calls == 29; });
   require(result.status == MeasurementStatus::Cancelled && calls == 29 &&
@@ -223,14 +218,14 @@ void cancellationAndFailures() {
           "interrupted unmatched run was fabricated into an eligible pair");
 
   calls = 0;
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [&](CandidateId candidate) { ++calls; return stableTiming(candidate); }, {},
       [&] { return calls == 28; });
   require(result.status == MeasurementStatus::Cancelled && result.pairCount == 12,
           "cancellation after the final return lost raw pairs or stayed eligible");
 
   calls = 0;
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [&](CandidateId candidate) {
         if (++calls == 29)
           throw std::runtime_error("production execution failed");
@@ -247,7 +242,7 @@ void cancellationAndFailures() {
             "original production failure detail was lost");
   }
   calls = 0;
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [&](CandidateId candidate) { ++calls; return stableTiming(candidate); }, {},
       [&] {
         if (calls == 6)
@@ -271,27 +266,27 @@ void boundsAndDeadline() {
   invalid[2].samplePairs = 11;
   invalid[3].samplePairs = 65;
   invalid[4].policy.minimumPairs = 13;
-  invalid[5].policy.minimumMeanImprovement = 0;
+  invalid[5].policy.minimumImprovement = 0;
   invalid[6].maximumWallSeconds = -1;
   invalid[7].maximumWallSeconds = std::numeric_limits<double>::infinity();
   for (const auto &options : invalid)
-    require(measureWorkload(kCandidate, kWorkload, run, options).status ==
+    require(measureWorkload(kCandidate, run, options).status ==
                 MeasurementStatus::InvalidInput && calls == 0,
             "invalid measurement bounds invoked the production callback");
-  require(measureWorkload(kBaseline, kWorkload, run).status ==
+  require(measureWorkload(kBaseline, run).status ==
               MeasurementStatus::InvalidInput &&
-              measureWorkload(kCandidate, kWorkload, {}).status ==
+              measureWorkload(kCandidate, {}).status ==
                   MeasurementStatus::InvalidInput && calls == 0,
           "missing callback or baseline-as-candidate was accepted");
 
   MeasurementOptions deadline;
   deadline.maximumWallSeconds = 0;
-  auto result = measureWorkload(kCandidate, kWorkload, run, deadline);
+  auto result = measureWorkload(kCandidate, run, deadline);
   require(result.status == MeasurementStatus::BudgetExceeded && calls == 0,
           "expired deadline started a workload");
   deadline.maximumWallSeconds = 0.01;
   bool returned = false;
-  result = measureWorkload(kCandidate, kWorkload,
+  result = measureWorkload(kCandidate,
       [&](CandidateId candidate) {
         ++calls;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -321,7 +316,7 @@ void uncertainAcceptance() {
     const double scale = index < 2 || index - 2 < 8 ? 0.99 : 1.01;
     return RunTiming{scale, 2 * scale, false};
   };
-  auto rejected = measureWorkload(kCandidate, kWorkload, uncertainTiming);
+  auto rejected = measureWorkload(kCandidate, uncertainTiming);
   require(rejected.status == MeasurementStatus::Rejected &&
               rejected.gpuAssessment.verdict == TimingVerdict::Uncertain &&
               rejected.wallAssessment.verdict == TimingVerdict::Uncertain,
@@ -329,7 +324,7 @@ void uncertainAcceptance() {
   candidateCalls = 0;
   MeasurementOptions options;
   options.acceptUncertain = true;
-  auto accepted = measureWorkload(kCandidate, kWorkload, uncertainTiming, options);
+  auto accepted = measureWorkload(kCandidate, uncertainTiming, options);
   require(accepted.status == MeasurementStatus::Completed &&
               accepted.gpuAssessment.verdict == TimingVerdict::Uncertain &&
               accepted.wallAssessment.verdict == TimingVerdict::Uncertain &&
@@ -341,7 +336,7 @@ void uncertainAcceptance() {
   auto regressedTiming = [](CandidateId candidate) {
     return candidate == kBaseline ? RunTiming{1, 2, false} : RunTiming{1.02, 2.04, false};
   };
-  require(measureWorkload(kCandidate, kWorkload, regressedTiming, options).status ==
+  require(measureWorkload(kCandidate, regressedTiming, options).status ==
               MeasurementStatus::Rejected,
           "non-regression gate accepted a regression");
 }

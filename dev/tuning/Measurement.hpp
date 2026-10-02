@@ -79,7 +79,6 @@ struct MeasurementAccounting final {
 
 struct MeasurementResult final {
   CandidateId candidate;
-  WorkloadId workload;
   MeasurementStatus status = MeasurementStatus::InvalidInput;
   MeasurementAccounting warmup;
   MeasurementAccounting measurement;
@@ -108,11 +107,10 @@ struct MeasurementResult final {
 // and cancellation are checked between synchronous calls, never by interrupting
 // an active command. A callback must return before its deadline can be observed.
 // Both timing metrics must pass the existing noise/non-regression policy;
-// meaningful aggregate improvement remains selectCandidate's responsibility.
+// meaningful improvement remains selectCandidate's responsibility.
 // This function does not encode work, change execution policy or persist data.
 [[nodiscard]] MeasurementResult
-measureWorkload(CandidateId candidate, WorkloadId workload,
-                const MeasurementRun &run,
+measureWorkload(CandidateId candidate, const MeasurementRun &run,
                 const MeasurementOptions &options = {},
                 const MeasurementStop &shouldStop = {});
 
