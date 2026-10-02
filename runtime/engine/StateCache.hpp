@@ -184,13 +184,13 @@ public:
   }
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
   // regardless of recency. Without checkpoints, the oldest ordinary state.
-  // Never a state in use.
+  // Never a state in use. keepResumePoint withholds the resume point: the
+  // newest ordinary publication, else the newest checkpoint.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(bool keepResumePoint = false, bool checkpoints = true) const noexcept;
-  // Oldest RAM copy of a state in use; keepResumePoint withholds the resume
-  // point as above.
-  [[nodiscard]] std::optional<CacheEvictionCandidate>
-  inUseCandidate(bool keepResumePoint = false) const noexcept;
+  // Oldest RAM copy of a state in use. The resume point is never in use:
+  // the class of a state in use protects it.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> inUseCandidate() const noexcept;
   // Frees an unpinned RAM copy: for nothing when a disk copy exists, by
   // writing one when the tier takes it (makeRoom frees quota on its behalf),
   // by dropping the state otherwise. The RAM is free when the call returns.

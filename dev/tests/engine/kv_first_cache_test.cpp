@@ -3037,10 +3037,12 @@ void testKvInUseFollowsItsState() {
           "the KV of a state that left stayed in use");
 }
 
-// The resume-point floor keeps what it kept before states could be in use:
-// the newest ordinary publication, in use or not. A newer finished point is
-// kept over an older one in use, and states in use still go after the rest.
-void testKeepResumePointKeepsTheNewestPublication() {
+// The resume-point floor keeps the newest ordinary publication: a newer
+// finished point is kept over an older one in use, and states in use still
+// go after the rest. A state in use is never the resume point, even when it
+// is newer than every ordinary one: its class protects it, and a speculative
+// shrink takes it before the ordinary point.
+void testKeepResumePointKeepsTheNewestOrdinaryPublication() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   CacheFixture fixture;
   fixture.publish(0);
@@ -3061,15 +3063,18 @@ void testKeepResumePointKeepsTheNewestPublication() {
           "the state in use outranked the newer resume point");
   require(!fixture.cache.reclaimOne(reuse, true).madeProgress && held(2),
           "the speculative shrink took the resume point");
-  // A state in use newer than every ordinary one is the resume point.
+  // A state in use newer than every ordinary one goes; the ordinary point
+  // stays.
   CacheFixture newer;
   newer.publish(0);
   StateUse newest = newer.cache.useState(newer.blocks[2]);
   newer.publish(2);
   static_cast<void>(newer.cache.reclaimCache(std::numeric_limits<uint64_t>::max(), true, false));
-  require(newer.cache.snapshot().stateCache.entries == 1 &&
-              newer.cache.stateResident(newer.blocks[2]),
-          "the speculative shrink did not keep the newest publication in use");
+  const auto states = newer.cache.snapshot().stateCache;
+  require(states.entries == 1 && states.inUseEvictions == 1 &&
+              newer.cache.stateResident(newer.blocks[0]) &&
+              !newer.cache.stateResident(newer.blocks[2]),
+          "the speculative shrink kept a state in use over the newest ordinary publication");
 }
 
 // A state in use is reusable: a checkpoint there becomes ordinary, and one
@@ -3449,7 +3454,7 @@ int main() {
     testKvAStateInUseNeedsGoesLast();
     testStateUsesAreCountedPerBlock();
     testKvInUseFollowsItsState();
-    testKeepResumePointKeepsTheNewestPublication();
+    testKeepResumePointKeepsTheNewestOrdinaryPublication();
     testStatesInUseAreOrdinary();
     testInUseWaitsForTransfersInFlight();
     testLaneTakesStatesInUseLast();

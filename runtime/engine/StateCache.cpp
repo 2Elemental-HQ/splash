@@ -250,13 +250,11 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
 }
 
 uint64_t StateCache::resumePoint() const noexcept {
-  // Checkpoints can survive cancellation but remain disposable. Speculative
-  // protection keeps the newest ordinary publication, in use or not, and a
-  // checkpoint only without one.
+  // Speculative protection keeps the newest ordinary publication, such as
+  // the point of a request that just finished, and a checkpoint only without
+  // one: checkpoints can survive cancellation but remain disposable. A state
+  // in use needs no such protection; its class already puts it last.
   std::optional<CacheEvictionCandidate> newest = ordinary_.newest();
-  const auto used = inUse_.newest();
-  if (used && (!newest || used->lastUsed > newest->lastUsed))
-    newest = used;
   if (!newest)
     newest = checkpoints_.newest();
   return newest ? newest->id : 0;
@@ -277,12 +275,8 @@ StateCache::evictionCandidate(bool keepResumePoint, bool checkpoints) const noex
   return std::nullopt;
 }
 
-std::optional<CacheEvictionCandidate>
-StateCache::inUseCandidate(bool keepResumePoint) const noexcept {
-  const auto oldest = inUse_.oldest();
-  if (oldest && keepResumePoint && oldest->id == resumePoint())
-    return std::nullopt;
-  return oldest;
+std::optional<CacheEvictionCandidate> StateCache::inUseCandidate() const noexcept {
+  return inUse_.oldest();
 }
 
 std::optional<CacheEvictionCandidate>

@@ -408,8 +408,7 @@ StateEviction Cache::reclaimState(uint64_t block, bool waitForWrite) {
 std::optional<Cache::Victim> Cache::reclaimOldest(bool inUse, bool keepResumePoint,
                                                   bool waitForWrite) {
   std::optional<CacheEvictionCandidate> state =
-      inUse ? states_.inUseCandidate(keepResumePoint)
-            : states_.evictionCandidate(keepResumePoint, false);
+      inUse ? states_.inUseCandidate() : states_.evictionCandidate(keepResumePoint, false);
   std::optional<CacheEvictionCandidate> kv = oldestKvLeaf(0, inUse);
   bool kvOpen = true;
   while (state || (kvOpen && kv)) {

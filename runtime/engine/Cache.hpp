@@ -242,13 +242,14 @@ public:
   // copy that is the only one. The only copies of states in use, and the KV
   // they restore through, make room only for a copy that is itself in use.
   // Active requests and pinned restores are never selected. A pass releases
-  // every extent it empties. keepResumePoint stops short of the newest state
-  // publication. A shrink that no request is waiting for gains the one cell
-  // that publication holds and costs the next request a replay of its whole
-  // prompt, because a hybrid model cannot resume from cached KV without the
-  // recurrent state. Empty extents, older publications and state-free KV are
-  // still reclaimed. keepRunway leaves one empty extent allocated, for the
-  // next request.
+  // every extent it empties. keepResumePoint stops short of the resume
+  // point: the newest ordinary publication (else checkpoint); states in use
+  // are protected by their class. A shrink that no request is waiting for
+  // gains the one cell that publication holds and costs the next request a
+  // replay of its whole prompt, because a hybrid model cannot resume from
+  // cached KV without the recurrent state. Empty extents, older publications
+  // and state-free KV are still reclaimed. keepRunway leaves one empty extent
+  // allocated, for the next request.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes,
                                       bool keepResumePoint, bool keepRunway);
   // Evicts every unpinned entry, in reclaimCache's order, and releases every
