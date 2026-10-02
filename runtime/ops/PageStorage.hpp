@@ -12,15 +12,18 @@
 namespace splash::kv {
 
 // Storage for paged KV in extents: ordinary shared Metal buffers of
-// extentPages pages each, allocated when the pool needs one of their pages and
-// released when the last of them is free. Inside an extent every attention
-// layer has a region that holds the keys of all its pages, then their key
-// scales, values and value scales (abi/KvExtent.h). Kernels reach a page
-// through its entry in a request's GPU page table, and the backend's
-// residency set keeps every extent resident for every command; the host
-// reaches the same bytes through the page's spans(). Active requests may
-// overwrite slots at or beyond their logical commit index. Cached KV blocks
-// reference only fully committed pages, which are immutable while shared.
+// extentPages pages each, which KvPool alone allocates and releases: its
+// runway when it is built, then an extent when it needs one of its pages.
+// An extent whose pages are all free stays allocated until a reclaim pass
+// between commands releases it (Cache::reclaimCache); the cleanup after
+// startup warmup keeps one. Inside an extent every attention layer has a
+// region that holds the keys of all its pages, then their key scales, values
+// and value scales (abi/KvExtent.h). Kernels reach a page through its entry
+// in a request's GPU page table, and the backend's residency set keeps every
+// extent resident for every command; the host reaches the same bytes through
+// the page's spans(). Active requests may overwrite slots at or beyond their
+// logical commit index. Cached KV blocks reference only fully committed
+// pages, which are immutable while shared.
 class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a

@@ -516,18 +516,18 @@ macOS compressed or dropped an idle buffer. macOS page cache, driver
 allocations and other applications still affect memory pressure and swap.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
-between half and one and a half times 128 MiB, with a 64 KiB-aligned region per
-attention layer, sized to leave the fewest of the budget's pages unused
-(`Layout::extentPagesFor`). The pool allocates an extent when it needs one of
-its pages. When it is built it allocates the runway, the extents of the first
-64 pages, which startup warmup runs on; nothing but the pool allocates or
-releases an extent. An extent whose last page is free stays allocated until a
-reclaim releases it, at once and only between commands: memory pressure, an
-admission the budget denies, or startup cleanup. Kernels reach a page through
-the GPU address in its request's page table, so no command binds KV; the
-residency set makes extents resident for every command. The host reaches the
-same memory (`PageStorage::spans`), which is how the disk tier moves pages. A
-reclaim pass releases every extent that is empty or that its evictions empty.
+between half and one and a half times 128 MiB, in which every tensor region of
+each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
+budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+when it needs one of its pages. When it is built it allocates the runway, the
+extents of the first 64 pages, which startup warmup runs on; nothing but the
+pool allocates or releases an extent. An extent whose last page is free stays
+allocated until a reclaim releases it, at once and only between commands: memory
+pressure, an admission the budget denies, or startup cleanup. Kernels reach a
+page through the GPU address in its request's page table, so no command binds
+KV; the residency set makes extents resident for every command. The host reaches
+the same memory (`PageStorage::spans`), which is how the disk tier moves pages.
+A reclaim pass releases every extent that is empty or that its evictions empty.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents

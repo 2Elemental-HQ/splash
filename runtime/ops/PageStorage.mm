@@ -20,8 +20,9 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     if (!layout_.valid()) {
         throw std::invalid_argument("KV page storage layout is invalid");
     }
-    // Page entries carry the index in an extent in their low bits; kernels
-    // address an extent's regions with 32-bit offsets.
+    // Page entries carry the index in an extent in their low bits, and
+    // SplashKvLayer places a layer's region with a 32-bit offset, so an
+    // extent stays below 4 GiB.
     if (!extentPages_ || extentPages_ % layout_.extentAlignmentPages() ||
         extentPages_ > SPLASH_KV_PAGE_INDEX_MASK ||
         extentBytes() > std::numeric_limits<uint32_t>::max() ||
