@@ -290,12 +290,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
       memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
                        config.nativeLoop.engine.maxContext)) {
-    logKernelStartup("The ", *hostAvailable / kMiB,
-                     " MiB this Mac had available at startup may not hold a ",
-                     config.nativeLoop.engine.maxContext,
-                     "-token request; one that runs out of memory is suspended"
-                     " and replays its prompt. --max-cache-disk SIZE keeps its"
-                     " progress and cached prefixes on SSD.");
+    logStartup("The ", *hostAvailable / kMiB,
+               " MiB this Mac had available at startup may not hold a ",
+               config.nativeLoop.engine.maxContext,
+               "-token request; one that runs out of memory is suspended"
+               " and replays its prompt. --max-cache-disk SIZE keeps its"
+               " progress and cached prefixes on SSD.");
   }
   // The parser and engine consume the same resolved ceiling. In automatic
   // mode these limits cannot be known until resource planning has measured

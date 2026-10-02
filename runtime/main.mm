@@ -427,11 +427,14 @@ int runNative(const NativeArguments &arguments) {
   case engine::NativeProcessExit::EngineFailure:
     writeStderrLine(
         "error: native transport stopped after an engine failure (" +
-        bootstrap->nativeLoop().engineFailure() + ")");
+        (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
+                                     : transport.failure()) +
+        ")");
     break;
   case engine::NativeProcessExit::IoFailure:
     writeStderrLine(
-        "error: native transport stopped after an I/O failure");
+        "error: native transport stopped after an I/O failure (" +
+        transport.failure() + ")");
     break;
   }
   return static_cast<int>(exit);

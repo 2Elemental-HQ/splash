@@ -454,14 +454,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         return false;
       }
     };
-    logKernelStartup("Kernel policy for GPU family ", device.appleGpuFamily,
-                     " with ", device.gpuCoreCount, " cores.");
+    logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
+               " with ", device.gpuCoreCount, " cores.");
     if (config.operatorChoices && !config.operatorChoices->empty()) {
       if (adoptChoices(*config.operatorChoices))
-        logKernelStartup("Installed supplied kernel choices.");
+        logStartup("Installed supplied kernel choices.");
       else
-        logKernelStartup("Supplied kernel choices rejected (", rejected,
-                         "); using the kernel policy.");
+        logStartup("Supplied kernel choices rejected (", rejected,
+                   "); using the kernel policy.");
     }
 
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
@@ -479,7 +479,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
       } catch (const std::exception &error) {
         diskBudget.reset();
-        logKernelStartup("Cache disk tier disabled (", error.what(), ").");
+        logStartup("Cache disk tier disabled (", error.what(), ").");
       }
     }
     std::unique_ptr<model::StateStorage> stateStorage = model::createStateStorage(
@@ -493,14 +493,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         const uint64_t slotBytes = model::KvPageTier::slotBytesFor(*kvPages);
         kvTier = std::make_unique<model::KvPageTier>(
             *backend, *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logKernelStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
-                         " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
-                         stateBytes / kMiB, " MiB; KV pages stage through ",
-                         kvStagingBytes / kMiB, " MiB of Metal memory",
-                         stateFile ? ", states through host memory." : ".");
+        logStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,
+                   " MiB for KV pages of ", slotBytes / 1024, " KiB and states of ",
+                   stateBytes / kMiB, " MiB; KV pages stage through ",
+                   kvStagingBytes / kMiB, " MiB of Metal memory",
+                   stateFile ? ", states through host memory." : ".");
       } catch (const std::exception &error) {
-        logKernelStartup("Cache disk KV storage disabled; state storage remains enabled (",
-                         error.what(), ").");
+        logStartup("Cache disk KV storage disabled; state storage remains enabled (",
+                   error.what(), ").");
       }
     }
     auto kvPool = std::make_unique<KvPool>(*kvPages);

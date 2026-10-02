@@ -14,9 +14,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 using namespace splash;
@@ -267,8 +269,8 @@ void testShutdownRequestAndControlContinuation() {
   }
 }
 
-// The loop records the longest stretch it spent without reading its input,
-// a control pass and a tick, and keeps it as later stretches are shorter.
+// The loop records its longest control pass and tick, and keeps it as later
+// ones are shorter.
 void testLoopRecordsItsLongestTick() {
   Harness harness;
   require(harness.transport.maxTickMilliseconds() == 0.0,
@@ -288,7 +290,7 @@ void testLoopRecordsItsLongestTick() {
   require(harness.transport.run(harness.loop) == engine::NativeProcessExit::CleanEof,
           "control-driven shutdown did not end the loop cleanly");
   require(recorded >= 40.0 && harness.transport.maxTickMilliseconds() >= recorded,
-          "the loop did not keep its longest stretch without reading input");
+          "the loop did not keep its longest control pass and tick");
 }
 
 // With no input and no command in flight, the loop sleeps until the
@@ -421,7 +423,7 @@ void testQueueBoundStopsTheWriter() {
       awaitStatus(harness.pipes.output[0], 10, std::chrono::seconds(5));
   harness.transport.requestShutdown();
   const auto exit = finish(loop);
-  // One read past the bound and a full pipe may be in flight.
+  // A full pipe may be in flight beyond the bound.
   require(accepted >= kBound && accepted <= kBound + 256 * 1024,
           "the reader did not queue up to its bound and then stop the writer");
   require(written == input.size() && answered &&
@@ -505,6 +507,9 @@ void testInputEndsAfterItsBytes() {
     require(harness.transport.run(harness.loop) == engine::NativeProcessExit::IoFailure &&
                 awaitStatus(harness.pipes.output[0], 11, std::chrono::seconds(1)),
             "a read error overtook the bytes before it");
+    require(harness.transport.failure().find(std::strerror(ECONNRESET)) !=
+                std::string::npos,
+            "the transport did not report the read error that ended it");
   }
   close(client);
   close(listener);

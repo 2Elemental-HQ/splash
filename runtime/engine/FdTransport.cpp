@@ -1,5 +1,6 @@
 #include "engine/FdTransport.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -7,6 +8,8 @@
 #include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <mutex>
 #include <optional>
@@ -66,16 +69,16 @@ NativeProcessExit loopFailure(const NativeRuntime &loop) {
 
 } // namespace
 
-struct FdTransport::CompletionWake {
-  int readFd = -1;
-  int writeFd = -1;
+struct FdTransport::LoopWake {
+  int readFd;
+  int writeFd;
   std::atomic<bool> controlPending{false};
   std::atomic<bool> shutdownRequested{false};
 
-  CompletionWake() {
+  LoopWake() {
     int descriptors[2];
     if (pipe(descriptors) < 0)
-      throwIo("pipe(completion wake)");
+      throwIo("pipe(loop wake)");
     readFd = descriptors[0];
     writeFd = descriptors[1];
     auto makeNonBlocking = [&](int fd) {
@@ -84,26 +87,22 @@ struct FdTransport::CompletionWake {
         int saved = errno;
         close(readFd);
         close(writeFd);
-        readFd = -1;
-        writeFd = -1;
         errno = saved;
-        throwIo("fcntl(completion wake)");
+        throwIo("fcntl(loop wake)");
       }
     };
     makeNonBlocking(readFd);
     makeNonBlocking(writeFd);
   }
 
-  ~CompletionWake() {
-    if (readFd >= 0)
-      close(readFd);
-    if (writeFd >= 0)
-      close(writeFd);
+  ~LoopWake() {
+    close(readFd);
+    close(writeFd);
   }
 
   void notify() const noexcept {
     constexpr uint8_t byte = 1;
-    while (writeFd >= 0) {
+    while (true) {
       ssize_t written = write(writeFd, &byte, sizeof(byte));
       if (written > 0 ||
           (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
@@ -126,7 +125,7 @@ struct FdTransport::CompletionWake {
 
   void drain() const noexcept {
     std::array<uint8_t, 64> bytes{};
-    while (readFd >= 0) {
+    while (true) {
       ssize_t count = read(readFd, bytes.data(), bytes.size());
       if (count > 0)
         continue;
@@ -144,13 +143,14 @@ struct FdTransport::CompletionWake {
 class FdTransport::InputReader final {
 public:
   struct Input final {
-    std::vector<uint8_t> bytes;
-    // Set once the input has ended after these bytes: 0 at its end,
+    // What each read returned, in order.
+    std::deque<std::vector<uint8_t>> chunks;
+    // Set once the input has ended after these chunks: 0 at its end,
     // otherwise the error that ended reading.
     std::optional<int> end;
   };
 
-  InputReader(int fd, size_t queueBytes, std::shared_ptr<CompletionWake> wake)
+  InputReader(int fd, size_t queueBytes, std::shared_ptr<LoopWake> wake)
       : fd_(fd), queueBytes_(queueBytes), wake_(std::move(wake)) {
     int descriptors[2];
     if (pipe(descriptors) < 0)
@@ -189,7 +189,8 @@ public:
     Input input;
     {
       std::lock_guard lock(mutex_);
-      input.bytes.swap(queue_);
+      input.chunks.swap(chunks_);
+      queuedBytes_ = 0;
       input.end = end_;
     }
     room_.notify_all();
@@ -199,13 +200,15 @@ public:
 private:
   void read() noexcept {
     try {
-      std::vector<uint8_t> chunk(64 * 1024);
+      std::vector<uint8_t> buffer(64 * 1024);
       while (true) {
+        size_t room = 0;
         {
           std::unique_lock lock(mutex_);
-          room_.wait(lock, [&] { return stopping_ || queue_.size() < queueBytes_; });
+          room_.wait(lock, [&] { return stopping_ || queuedBytes_ < queueBytes_; });
           if (stopping_)
             return;
+          room = queueBytes_ - queuedBytes_;
         }
         std::array<pollfd, 2> descriptors{pollfd{fd_, POLLIN, 0},
                                           pollfd{stopRead_, POLLIN, 0}};
@@ -220,11 +223,16 @@ private:
           return finish(EBADF);
         if (!descriptors[0].revents)
           continue;
-        const ssize_t count = ::read(fd_, chunk.data(), chunk.size());
+        // Only take() changes the room meanwhile, and only to more, so the
+        // queue never passes its bound.
+        const ssize_t count =
+            ::read(fd_, buffer.data(), std::min(buffer.size(), room));
         if (count > 0) {
+          std::vector<uint8_t> chunk(buffer.begin(), buffer.begin() + count);
           {
             std::lock_guard lock(mutex_);
-            queue_.insert(queue_.end(), chunk.begin(), chunk.begin() + count);
+            queuedBytes_ += chunk.size();
+            chunks_.push_back(std::move(chunk));
           }
           wake_->notify();
           continue;
@@ -249,12 +257,13 @@ private:
 
   int fd_ = -1;
   size_t queueBytes_ = 0;
-  std::shared_ptr<CompletionWake> wake_;
+  std::shared_ptr<LoopWake> wake_;
   int stopRead_ = -1;
   int stopWrite_ = -1;
   std::mutex mutex_;
   std::condition_variable room_;
-  std::vector<uint8_t> queue_;
+  std::deque<std::vector<uint8_t>> chunks_;
+  size_t queuedBytes_ = 0;
   std::optional<int> end_;
   bool stopping_ = false;
   std::thread thread_;
@@ -262,7 +271,7 @@ private:
 
 FdTransport::FdTransport(int inputFd, int outputFd, size_t inputQueueBytes)
     : inputFd_(inputFd), outputFd_(outputFd), inputQueueBytes_(inputQueueBytes),
-      completionWake_(std::make_shared<CompletionWake>()) {
+      wake_(std::make_shared<LoopWake>()) {
   if (inputFd_ < 0 || outputFd_ < 0) {
     throw std::invalid_argument("native transport requires valid fds");
   }
@@ -275,7 +284,7 @@ NativeRuntime::ByteSink FdTransport::outputSink() {
 }
 
 std::function<void()> FdTransport::controlNotifier() {
-  std::shared_ptr<CompletionWake> wake = completionWake_;
+  std::shared_ptr<LoopWake> wake = wake_;
   return [wake] { wake->notifyControl(); };
 }
 
@@ -284,8 +293,11 @@ void FdTransport::setControlHandler(ControlHandler handler) {
 }
 
 NativeProcessExit FdTransport::run(NativeRuntime &loop) {
-  std::shared_ptr<CompletionWake> completionWake = completionWake_;
-  loop.setCompletionNotifier([completionWake] { completionWake->notify(); });
+  std::shared_ptr<LoopWake> wake = wake_;
+  loop.setCompletionNotifier([wake] { wake->notify(); });
+  // Nonblocking so that a read after a spurious readiness returns EAGAIN and
+  // the reader goes back to poll, where its stop pipe can end it; without it
+  // ~InputReader could wait forever in read().
   int originalFlags = fcntl(inputFd_, F_GETFL);
   if (originalFlags < 0)
     throwIo("fcntl(F_GETFL)");
@@ -294,67 +306,80 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
   }
   RestoreFdFlags restore(inputFd_, originalFlags);
   // Stopped and joined on every way out of run(), before the flags return.
-  InputReader reader(inputFd_, inputQueueBytes_, completionWake);
+  InputReader reader(inputFd_, inputQueueBytes_, wake);
   bool deferredControl = false;
 
   while (!loop.connectionMustClose()) {
     if (shutdownRequested())
       return NativeProcessExit::CleanEof;
-    const InputReader::Input input = reader.take();
-    if (!input.bytes.empty() && !loop.receive(input.bytes))
-      return loopFailure(loop);
-    if (input.end) {
-      if (*input.end)
-        return NativeProcessExit::IoFailure;
-      return loop.finishInput() ? NativeProcessExit::CleanEof
-                                : loopFailure(loop);
-    }
+    {
+      InputReader::Input input = reader.take();
+      for (; !input.chunks.empty(); input.chunks.pop_front())
+        if (!loop.receive(input.chunks.front()))
+          return loopFailure(loop);
+      if (input.end) {
+        if (*input.end == ENOMEM) {
+          failure_ = "the native input reader ran out of memory";
+          return NativeProcessExit::EngineFailure;
+        }
+        if (*input.end) {
+          failure_ = "read(native input): " +
+                     std::string(std::strerror(*input.end));
+          return NativeProcessExit::IoFailure;
+        }
+        return loop.finishInput() ? NativeProcessExit::CleanEof
+                                  : loopFailure(loop);
+      }
+    } // What was taken is freed before control, tick and poll.
 
-    const auto inputRead = std::chrono::steady_clock::now();
-    deferredControl = completionWake->takeControl() || deferredControl;
+    const auto stepStarted = std::chrono::steady_clock::now();
+    deferredControl = wake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
     }
 
     const bool progressed = loop.tick();
     const double tickMilliseconds = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - inputRead).count();
-    if (tickMilliseconds > maxTickMilliseconds_.load(std::memory_order_relaxed))
-      maxTickMilliseconds_.store(tickMilliseconds, std::memory_order_relaxed);
+        std::chrono::steady_clock::now() - stepStarted).count();
+    if (tickMilliseconds > maxTickMilliseconds_)
+      maxTickMilliseconds_ = tickMilliseconds;
     if (progressed)
       continue;
     if (loop.connectionMustClose())
       return loopFailure(loop);
 
-    // The reader wakes the loop through the completion pipe as well.
-    pollfd descriptor{completionWake->readFd, POLLIN, 0};
+    // Input, completions, control notifications and shutdown all wake the
+    // loop through this pipe.
+    pollfd descriptor{wake->readFd, POLLIN, 0};
     int result;
     do {
       result = poll(&descriptor, 1, pollTimeout(loop, deferredControl));
-    } while (result < 0 && errno == EINTR && !shutdownRequested());
-    if (result < 0 && errno == EINTR)
-      return NativeProcessExit::CleanEof;
-    if (result < 0)
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      failure_ = "poll(loop wake): " + std::string(std::strerror(errno));
       return NativeProcessExit::IoFailure;
+    }
     if (descriptor.revents & POLLIN)
-      completionWake->drain();
-    // A zero result is a deadline or resource-retry wake-up; tick() at the
-    // top of the next iteration performs the transition.
+      wake->drain();
+    // A zero result is a deadline, health-check or control-retry wake; the
+    // next iteration takes input, runs control and ticks.
   }
   return loopFailure(loop);
 }
 
 bool FdTransport::shutdownRequested() const noexcept {
-  return completionWake_->shutdownRequested.load(std::memory_order_acquire);
+  return wake_->shutdownRequested.load(std::memory_order_acquire);
 }
 
 double FdTransport::maxTickMilliseconds() const noexcept {
-  return maxTickMilliseconds_.load(std::memory_order_relaxed);
+  return maxTickMilliseconds_;
 }
 
+const std::string &FdTransport::failure() const noexcept { return failure_; }
+
 void FdTransport::requestShutdown() noexcept {
-  completionWake_->shutdownRequested.store(true, std::memory_order_release);
-  completionWake_->notify();
+  wake_->shutdownRequested.store(true, std::memory_order_release);
+  wake_->notify();
 }
 
 void FdTransport::writeAll(std::span<const uint8_t> bytes) const {

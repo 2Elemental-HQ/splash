@@ -3,11 +3,11 @@
 #include "engine/NativeRuntime.hpp"
 #include "engine/Protocol.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace splash::engine {
 
@@ -28,10 +28,10 @@ enum class NativeProcessExit : int {
 // after that command drains.
 class FdTransport final {
 public:
-  // The reader queues at most this much input the loop has not taken: one
-  // frame of the largest size the protocol accepts, so it can take a whole
-  // request of any size while the loop runs. Past it the reader stops
-  // reading, and the pipe stops the writer, until the loop catches up.
+  // The reader stops reading once this much input waits for the loop: one
+  // frame of the largest size the protocol accepts, so the reader can take a
+  // whole request of any size while the loop runs. Until the loop takes it,
+  // the pipe stops the writer.
   static constexpr size_t kInputQueueBytes =
       protocol::kFrameHeaderBytes + protocol::kAbsoluteMaxFramePayloadBytes;
 
@@ -53,22 +53,27 @@ public:
   // It does not wait for in-flight GPU work; the process owner bounds teardown.
   void requestShutdown() noexcept;
   [[nodiscard]] bool shutdownRequested() const noexcept;
-  // The longest one control pass and one tick of run() have taken. The
-  // reader keeps reading input meanwhile, so the server's limit on a write
-  // that makes no progress for 5 s judges only whether the process reads.
+  // The longest one control pass and one tick of run() have taken. Read on
+  // the loop thread (status). The reader keeps reading input meanwhile, so
+  // the server's limit on a write that makes no progress for 5 s judges only
+  // whether the process reads.
   [[nodiscard]] double maxTickMilliseconds() const noexcept;
+  // Why run() ended with IoFailure, or with EngineFailure when the input
+  // reader ran out of memory; empty when the loop chose the exit.
+  [[nodiscard]] const std::string &failure() const noexcept;
 
 private:
-  struct CompletionWake;
+  struct LoopWake;
   class InputReader;
   void writeAll(std::span<const uint8_t> bytes) const;
 
   int inputFd_ = -1;
   int outputFd_ = -1;
   size_t inputQueueBytes_ = 0;
-  std::shared_ptr<CompletionWake> completionWake_;
+  std::shared_ptr<LoopWake> wake_;
   ControlHandler controlHandler_;
-  std::atomic<double> maxTickMilliseconds_{0.0};
+  double maxTickMilliseconds_ = 0.0;
+  std::string failure_;
 };
 
 } // namespace splash::engine
