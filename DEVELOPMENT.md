@@ -959,8 +959,10 @@ reads and writes; it is not a write-rate limit. Each file retains its allocated
 high-water mark until shutdown, so filesystem space can exceed the live-slot
 quota. Closing the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range
-moved through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
+whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
+the slot (a state's staging buffer and lane buffers) move directly, everything
+else through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
 The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is a
 buffer of the backend's like every other: resident, and set aside by the memory
 plan within `--max-memory` when the tier starts. A quota too small for one

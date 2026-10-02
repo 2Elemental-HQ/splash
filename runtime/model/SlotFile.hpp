@@ -54,8 +54,11 @@ private:
 // Scratch storage of fixed-size slots in an unlinked temporary file, served
 // by one IO worker in submission order and bounded by a disk budget. Callers
 // own the memory an operation moves and keep it alive until the operation is
-// ready. That memory may have any size and alignment: the worker moves every
-// slot through an aligned buffer of its own, so the file sees only aligned
+// ready. That memory may have any size and alignment. Whole 1 MiB chunks of
+// a span that start at an aligned offset of the slot, in memory aligned
+// like slot offsets, move straight between memory and the file; everything
+// else, such as the rest of a span short of a chunk, moves through an
+// aligned buffer of the worker's own, so the file sees only aligned
 // transfers. A slot is readable only after one complete write; a failed or
 // cancelled write leaves it unreadable, and after a failed write the file
 // accepts no further writes. So that a file-size limit fails a write rather
@@ -145,7 +148,8 @@ public:
       std::function<void()> completion);
 
 private:
-  // Runs on the worker, moving the slot through the worker's buffer.
+  // Runs on the worker, moving the slot straight or through the worker's
+  // buffer.
   using Run = std::function<bool(std::span<std::byte>, const std::atomic<bool> &)>;
   struct Work {
     std::shared_ptr<Operation> operation;
@@ -159,8 +163,8 @@ private:
                                                   std::function<void()> completion);
   void run();
   std::shared_ptr<Backing> backing_;
-  // The worker's own, aligned for uncached IO: every transfer of the file
-  // moves through it, one chunk at a time.
+  // The worker's own, aligned for uncached IO: every chunk that does not
+  // move straight between memory and the file goes through it.
   std::unique_ptr<std::byte, Free> buffer_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;

@@ -67,36 +67,75 @@ uint64_t totalBytes(const std::vector<Span> &spans) {
   return total;
 }
 
+// Memory the file can move straight: at least one chunk at an aligned
+// address.
+template <typename Span>
+bool direct(Span span) noexcept {
+  return span.size() >= kChunkBytes &&
+         reinterpret_cast<std::uintptr_t>(span.data()) % SlotFile::kAlignmentBytes == 0;
+}
+
 // Walks the spans of an operation in order, one piece at a time.
 template <typename Span>
 class Pieces final {
 public:
-  explicit Pieces(const std::vector<Span> &spans) : spans_(spans), left_(totalBytes(spans)) {}
+  explicit Pieces(const std::vector<Span> &spans) : spans_(spans), left_(totalBytes(spans)) {
+    settle();
+  }
   [[nodiscard]] bool done() const noexcept { return !left_; }
+  // The rest of the current span when it is memory the file can move
+  // straight; empty otherwise.
+  [[nodiscard]] Span directRun() const noexcept {
+    if (span_ == spans_.size()) return {};
+    const Span rest = spans_[span_].subspan(offset_);
+    return direct(rest) ? rest : Span{};
+  }
+  // The length of the next chunk through the buffer: `limit`, or the bytes
+  // before a later span the file can move straight when they are fewer and
+  // a whole number of alignment units, so that span starts at an aligned
+  // offset of the slot.
+  [[nodiscard]] size_t gatherBytes(size_t limit) const noexcept {
+    if (span_ == spans_.size()) return limit;
+    size_t before = spans_[span_].size() - offset_;
+    for (size_t index = span_ + 1; index < spans_.size() && before < limit; ++index) {
+      if (direct(spans_[index]) && before % SlotFile::kAlignmentBytes == 0) return before;
+      before += spans_[index].size();
+    }
+    return limit;
+  }
   // The next piece of at most `bytes` bytes; empty once every span is done.
   Span next(size_t bytes) {
+    if (span_ == spans_.size()) return {};
+    const Span piece = spans_[span_].subspan(offset_, std::min(bytes, spans_[span_].size() - offset_));
+    skip(piece.size());
+    return piece;
+  }
+  // Moves past `bytes` bytes of the current span.
+  void skip(size_t bytes) noexcept {
+    offset_ += bytes;
+    left_ -= bytes;
+    settle();
+  }
+
+private:
+  // Moves past every span that is done, so the current one has bytes left.
+  void settle() noexcept {
     while (span_ < spans_.size() && offset_ == spans_[span_].size()) {
       ++span_;
       offset_ = 0;
     }
-    if (span_ == spans_.size()) return {};
-    const Span piece = spans_[span_].subspan(offset_, std::min(bytes, spans_[span_].size() - offset_));
-    offset_ += piece.size();
-    left_ -= piece.size();
-    return piece;
   }
 
-private:
   const std::vector<Span> &spans_;
   uint64_t left_;
   size_t span_ = 0;
   size_t offset_ = 0;
 };
 
-// Moves one chunk of the worker's buffer through io(data, bytes, offset),
-// continuing a short transfer where it stopped.
-template <typename Io>
-bool moveChunk(std::span<std::byte> chunk, off_t offset, Io io) {
+// Moves one chunk through io(data, bytes, offset), continuing a short
+// transfer where it stopped.
+template <typename Span, typename Io>
+bool moveChunk(Span chunk, off_t offset, Io io) {
   while (!chunk.empty()) {
     const ssize_t count = io(chunk.data(), chunk.size(), offset);
     if (count < 0 && errno == EINTR) continue;
@@ -256,9 +295,9 @@ void SlotFile::run() {
 
 // A write gathers its spans into the worker's buffer one chunk at a time and
 // zeros the slot past them; a read moves the chunks its spans reach and
-// scatters each into them, ignoring the slot past them. Every pwrite and
-// pread is an aligned range of the slot, and cancellation is noticed before
-// each chunk.
+// scatters each into them, ignoring the slot past them. A chunk of a span
+// the file can move straight skips the buffer. Every pwrite and pread is an
+// aligned range of the slot, and cancellation is noticed before each chunk.
 std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
     std::function<void()> completion) {
@@ -270,7 +309,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
                                                    const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
-    const auto store = [&backing](std::byte *data, size_t bytes, off_t offset) {
+    const auto store = [&backing](const std::byte *data, size_t bytes, off_t offset) {
       const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
       if (count > 0)
         backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
@@ -280,14 +319,22 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     Pieces pieces(source);
     for (uint64_t done = 0; done < backing.slotBytes;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
-      const auto chunk = buffer.first(std::min<uint64_t>(buffer.size(), backing.slotBytes - done));
-      size_t filled = 0;
-      for (auto piece = pieces.next(chunk.size()); !piece.empty();
-           piece = pieces.next(chunk.size() - filled)) {
-        std::memcpy(chunk.data() + filled, piece.data(), piece.size());
-        filled += piece.size();
+      std::span<const std::byte> chunk = pieces.directRun();
+      if (!chunk.empty()) {
+        chunk = chunk.first(kChunkBytes);
+        pieces.skip(kChunkBytes);
+      } else {
+        const auto gathered = buffer.first(
+            pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
+        size_t filled = 0;
+        for (auto piece = pieces.next(gathered.size()); !piece.empty();
+             piece = pieces.next(gathered.size() - filled)) {
+          std::memcpy(gathered.data() + filled, piece.data(), piece.size());
+          filled += piece.size();
+        }
+        std::memset(gathered.data() + filled, 0, gathered.size() - filled);
+        chunk = gathered;
       }
-      std::memset(chunk.data() + filled, 0, chunk.size() - filled);
       if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
         backing.failed.store(true, std::memory_order_relaxed);
         return false;
@@ -318,8 +365,16 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     Pieces pieces(destination);
     for (uint64_t done = 0; !pieces.done();) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
-      const auto chunk = buffer.first(std::min<uint64_t>(buffer.size(), backing.slotBytes - done));
-      if (!moveChunk(chunk, start + static_cast<off_t>(done), load)) return false;
+      const off_t offset = start + static_cast<off_t>(done);
+      if (const auto run = pieces.directRun(); !run.empty()) {
+        if (!moveChunk(run.first(kChunkBytes), offset, load)) return false;
+        pieces.skip(kChunkBytes);
+        done += kChunkBytes;
+        continue;
+      }
+      const auto chunk = buffer.first(
+          pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
+      if (!moveChunk(chunk, offset, load)) return false;
       size_t used = 0;
       for (auto piece = pieces.next(chunk.size()); !piece.empty();
            piece = pieces.next(chunk.size() - used)) {

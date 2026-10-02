@@ -6,8 +6,13 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 using splash::model::DiskBudget;
@@ -121,10 +126,113 @@ static void testScatteredSpans() {
           "a partial read returned the wrong bytes or wrote outside its spans");
 }
 
+// Spans of the given sizes, carved from `storage`: each starts at an address
+// aligned like slot offsets, as a Metal buffer does, or where `aligned` is
+// false one byte past one.
+using Shape = std::vector<std::pair<size_t, bool>>;
+static std::vector<std::span<std::byte>> placeSpans(std::vector<std::byte> &storage,
+                                                    const Shape &shape) {
+  constexpr size_t unit = SlotFile::kAlignmentBytes;
+  const auto room = [](size_t bytes) { return (bytes + 1 + unit - 1) / unit * unit; };
+  size_t total = unit;
+  for (const auto &[bytes, aligned] : shape) total += room(bytes);
+  storage.assign(total, std::byte{0});
+  void *base = storage.data();
+  size_t space = storage.size();
+  auto *cursor = static_cast<std::byte *>(std::align(unit, total - unit, base, space));
+  std::vector<std::span<std::byte>> spans;
+  for (const auto &[bytes, aligned] : shape) {
+    spans.emplace_back(cursor + (aligned ? 0 : 1), bytes);
+    cursor += room(bytes);
+  }
+  return spans;
+}
+
+// A run of at least one chunk of aligned memory moves straight between the
+// memory and the file; the rest of the spans, and a run the slot would hold
+// at an unaligned offset, move through the worker's buffer. Either way a
+// write stores the spans in order with zeros after them, counts the slot
+// once, and a read brings them back into spans of any shape.
+static void testAlignedRunsMoveDirectly() {
+  constexpr size_t chunk = 1 << 20;
+  constexpr size_t size = 3 * chunk;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  const std::vector<Shape> shapes{
+      // Two chunks straight, and the run's last half chunk through the buffer.
+      {{5 * chunk / 2, true}},
+      // The last run starts at an unaligned offset of the slot.
+      {{3 * chunk / 2, true}, {100, false}, {chunk, true}},
+      // The buffer takes only the alignment units before a run, so the run
+      // starts at an aligned offset of the slot.
+      {{3 * SlotFile::kAlignmentBytes, false}, {5 * chunk / 4, true}},
+  };
+  uint32_t state = 1;
+  for (const Shape &shape : shapes) {
+    std::vector<std::byte> sourceMemory;
+    const auto sources = placeSpans(sourceMemory, shape);
+    std::vector<std::byte> expected;
+    for (const auto span : sources) {
+      for (std::byte &value : span) {
+        state = state * 1664525u + 1013904223u;
+        value = static_cast<std::byte>(state >> 24);
+      }
+      expected.insert(expected.end(), span.begin(), span.end());
+    }
+    expected.resize(size);
+    const uint64_t writtenBefore = file.writtenBytes();
+    require(file.write(slot, {sources.begin(), sources.end()}, {})->wait() &&
+                file.writtenBytes() - writtenBefore == size,
+            "a write of aligned runs failed or did not store the slot exactly once");
+
+    // The whole slot into one unaligned span, all of it through the buffer.
+    std::vector<std::byte> wholeMemory;
+    const auto whole = placeSpans(wholeMemory, {{size, false}}).front();
+    require(file.read(slot, {whole}, {})->wait() &&
+                std::equal(expected.begin(), expected.end(), whole.begin()),
+            "aligned runs did not land in order with zeros after them");
+    // Back into spans of the same shape, the aligned runs straight.
+    std::vector<std::byte> destinationMemory;
+    const auto destinations = placeSpans(destinationMemory, shape);
+    require(file.read(slot, destinations, {})->wait(), "a read into aligned runs failed");
+    for (size_t index = 0; index < sources.size(); ++index) {
+      require(std::equal(sources[index].begin(), sources[index].end(),
+                         destinations[index].begin()),
+              "a read into aligned runs returned the wrong bytes");
+    }
+  }
+}
+
+// A queued write of aligned runs, cancelled behind a parked worker, fails and
+// leaves its slot unreadable. The worker sees the cancellation before the
+// write's first chunk, so this covers a queued direct write only, not one
+// cancelled between two of its chunks.
+static void testCancelledDirectWrite() {
+  constexpr size_t size = 3 << 20;
+  SlotFile file(size, size);
+  auto slot = file.acquire();
+  std::vector<std::byte> memory;
+  const auto source = placeSpans(memory, {{size, true}}).front();
+  require(file.write(slot, {source}, {})->wait(), "the first write of aligned runs failed");
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  std::vector<std::byte> output(size);
+  auto hold = file.read(slot, {output}, [&] { reached.set_value(); released.wait(); });
+  reached.get_future().wait();
+  auto cancelled = file.write(slot, {source}, {});
+  cancelled->cancel();
+  release.set_value();
+  require(hold->wait() && !cancelled->wait(), "a cancelled write of aligned runs succeeded");
+  require(file.writable() && !file.read(slot, {output}, {})->wait(),
+          "a cancelled write of aligned runs left its slot readable or closed the file");
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
     testScatteredSpans();
+    testAlignedRunsMoveDirectly();
+    testCancelledDirectWrite();
     constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
     SlotFile file(size, size * 2 + 1);
     require(file.slotBytes() == size && file.capacityBytes() == size * 2 + 1 &&
