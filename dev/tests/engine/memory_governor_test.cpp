@@ -226,14 +226,20 @@ void testHostRefusalStartsReclaim() {
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   const uint64_t stateCell = 350'224'384;
-  std::optional<uint64_t> available = hostReserve + kGiB + 200 * kMiB;
+  std::optional<uint64_t> available = hostReserve + 64 * kGiB;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve,
                           [&available] { return available; });
   metal::AllocationFailure failure;
   require(!governor.tryReserve(40 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::EngineBudget &&
-              governor.snapshot().pressure == MemoryPressure::Normal,
+              failure == metal::AllocationFailure::EngineBudget,
           "an engine budget refusal was taken for host pressure");
+  // The host refuses the same probe once it has 1.2 GiB of room, and that
+  // is the cause reported; a probe beyond the limit holds no host pressure.
+  available = hostReserve + kGiB + 200 * kMiB;
+  require(!governor.tryReserve(40 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Normal,
+          "a refusal the host shares was reported as the engine's");
   require(!governor.tryReserve(stateCell, &failure) &&
               failure == metal::AllocationFailure::HostPressure,
           "a request beyond the host headroom was admitted");
@@ -251,6 +257,31 @@ void testHostRefusalStartsReclaim() {
   require(governor.tryReserve(stateCell).has_value() &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "the waiting request did not fit after the reclaim");
+}
+
+// A refusal the host shares with the engine's limit is the host's: it lifts
+// with the host's pressure, the limit's only once memory is freed. For a
+// request in service the host refuses only under critical pressure.
+void testHostRefusalComesBeforeTheEngineLimit() {
+  metal::statistics = {};
+  metal::statistics.allocatedBytes = 14 * kGiB;
+  metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
+  metal::AllocationFailure failure;
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure,
+          "a refusal the host shares was reported as the engine's");
+  governor.setServing(true);
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::EngineBudget,
+          "the host's margins refused a request in service");
+  governor.setPressure(MemoryPressure::Critical);
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure,
+          "critical pressure was reported as the engine's limit");
 }
 
 // The paced passes up to the next measurement continue what transfers held
@@ -372,6 +403,7 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testHostRefusalStartsReclaim();
+    testHostRefusalComesBeforeTheEngineLimit();
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
     testRequestInServiceGrowsThroughHostPressure();

@@ -2159,15 +2159,26 @@ void testSuspendedRequestWaitsForTheHostBesideOneInService() {
 // it has hit the capacity, at once and not after a wait for the host.
 void testEngineLimitBindsThroughTheHostPause() {
   test::TestKvStorage storage(16, 4096, 4);
-  storage.budgetPages = 8;
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
   bool paused = false;
+  bool serving = false;
   EngineConfig config;
   config.growthPaused = [&] { return paused; };
+  config.serving = [&](bool value) { serving = value; };
+  // As the governor does, the host refuses first unless a request in service
+  // needs the pages, then the engine's limit of two extents.
+  storage.growthAllowed = [&](uint32_t) {
+    if (paused && !serving) {
+      storage.allocationFailure = metal::AllocationFailure::HostPressure;
+      return false;
+    }
+    storage.allocationFailure = metal::AllocationFailure::EngineBudget;
+    return pool.snapshot().pagesAllocated < 8;
+  };
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   auto value = request(1, std::vector<uint32_t>(65, 1));

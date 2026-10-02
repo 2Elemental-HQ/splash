@@ -209,18 +209,21 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
   // for the recovery margin once the host has run short, unless a request
   // in service needs it (setServing).
   const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
-  bool hostFits = serving_ || (requested <= hostRoom &&
-                               hostRoom - requested >= kHostWarningMarginBytes);
+  const bool hostRoomFits =
+      requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
-  if (engineFits && !hostFits)
+  if (engineFits && !serving_ && !hostRoomFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || (hostHeld() && !serving_) ||
-      pressure == MemoryPressure::Critical) {
+  const bool hostRefuses = pressure == MemoryPressure::Critical ||
+                           (!serving_ && (!hostRoomFits || hostHeld()));
+  if (hostRefuses || !engineFits) {
+    // The host's refusal lifts with its pressure, the limit's only once
+    // memory is freed: a refusal they share is the host's.
     if (failure)
-      *failure = !engineFits ? metal::AllocationFailure::EngineBudget
-                            : metal::AllocationFailure::HostPressure;
+      *failure = hostRefuses ? metal::AllocationFailure::HostPressure
+                             : metal::AllocationFailure::EngineBudget;
     if (deniedReservations_ != std::numeric_limits<uint64_t>::max()) {
       ++deniedReservations_;
     }

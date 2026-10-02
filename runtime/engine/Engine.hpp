@@ -11,6 +11,8 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -31,9 +33,9 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
-  // Host growth admission, supplied by the runtime governor. Queried only on
-  // failed allocation and, after a suspension, while resident lanes drain;
-  // never on the ordinary decode path.
+  // Host growth admission, supplied by the runtime governor. Queried only
+  // while resident lanes drain after a suspension; allocation reads the
+  // cause of a refusal instead.
   std::function<bool()> growthPaused;
   // Marks the allocations that follow as memory a request in service needs,
   // which the pause does not hold back, and clears the mark
@@ -222,9 +224,9 @@ private:
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
-  // The reclaim steps for a lane's state and for KV pages the governor
-  // denied. Idle memory of the kind denied stays for it to reuse; idle memory
-  // of the other kind is released first.
+  // The reclaim steps for a lane's state and for KV pages the engine's limit
+  // refused. Idle memory of the kind refused stays for it to reuse; idle
+  // memory of the other kind is released first.
   [[nodiscard]] CacheReclaimResult reclaimForState();
   [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
@@ -239,8 +241,10 @@ private:
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
   };
-  struct KvAdmission {
-    TokenAdmission allocation;
+  // An allocation's last attempt, and what the engine knows about the memory
+  // it could not get.
+  template <class Admission> struct Allocation final {
+    Admission admission;
     Denial denial;
   };
   // What a lane does about memory it could not get. Pending memory returns
@@ -251,12 +255,17 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // Runs one page admission, reclaiming cache between attempts while that
-  // makes progress. While host pressure pauses growth the request reuses
-  // what the engine holds; when that gives nothing, a request in service
-  // grows as it would without the pause.
-  [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt,
-                                    bool inService);
+  // Runs one allocation of a lane's state or of KV pages, reclaiming between
+  // attempts while that makes progress. A refusal from the host reuses what
+  // the engine holds; when that gives nothing, a request in service retries
+  // as one (EngineConfig::serving), which only the engine's limit and
+  // critical pressure refuse. A refusal from the engine's limit reclaims
+  // cache; when that gives nothing, fallback may let go of what the request
+  // itself pins, and the reclaim goes on.
+  template <class Attempt>
+  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
+                              const std::function<bool()> &fallback = {})
+      -> Allocation<std::invoke_result_t<Attempt &>>;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);
@@ -281,7 +290,9 @@ private:
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, Failure failure);
-  void finishCapacity(Request &request, const TokenAdmission &admission);
+  void finishCapacity(Request &request, std::string_view what,
+                      metal::AllocationFailure failure,
+                      std::string_view detail = {});
   void release(Request &request);
   void sweepTerminal();
 

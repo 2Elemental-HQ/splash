@@ -87,7 +87,8 @@ struct MemoryGovernorSnapshot {
   MemoryPressure systemPressure = MemoryPressure::Normal;
   // Whether the host has room for growth that no request in service needs.
   // tryReserve still grants what such a request needs while this is false,
-  // short of critical pressure.
+  // short of critical pressure. Allocation need not ask: tryReserve names
+  // the host as the cause of every refusal the host shares.
   bool hostGrowthAllowed = true;
 };
 
@@ -183,6 +184,12 @@ public:
                  HostAvailableMemoryProvider hostAvailableMemory,
                  uint64_t untrackedReserveBytes = 0);
 
+  // Reserves bytes under the limit and the host's headroom, or refuses them
+  // with the cause: HostPressure when the host refuses, whether or not the
+  // limit does too, and EngineBudget when only the limit does. The host
+  // refuses under critical pressure and, unless a request in service needs
+  // the bytes (setServing), inside the warning margin or while it holds for
+  // the recovery margin.
   [[nodiscard]] std::optional<Reservation> tryReserve(
       uint64_t bytes, metal::AllocationFailure *failure = nullptr);
   // Low-level storage/model components receive only this transactional
