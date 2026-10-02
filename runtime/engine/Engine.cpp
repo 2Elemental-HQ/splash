@@ -1667,7 +1667,8 @@ void Engine::release(Request &active) {
     active.suspended = false;
     signalResourceProgress();
   }
-  // Every end comes here; this request's use of its replay point ends.
+  // Every end comes here; this request's use of its replay point ends,
+  // after endRequest, so that the point is stamped newer than its KV tail.
   active.replayPoint.reset();
 }
 

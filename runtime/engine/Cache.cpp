@@ -31,10 +31,6 @@ void Cache::endRequest(uint64_t requestId) {
     pool_.releasePage(page, false);
   if (!active.cachedBlocks.empty())
     kv_.releaseActive(active.cachedBlocks.back());
-  // Refresh used states within their class. Ordinary states remain newer
-  // than the finished KV tail; checkpoints retain their lower priority.
-  for (uint64_t block : active.cachedBlocks)
-    states_.touch(block);
   if (active.pendingRestores) {
     for (auto &[_, restore] : restores_)
       std::erase(restore.waiters, requestId);

@@ -122,14 +122,6 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   return true;
 }
 
-void StateCache::touch(uint64_t kvBlock) noexcept {
-  auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || found->second.pins)
-    return;
-  found->second.lastUsed = recency_.next();
-  reindex(kvBlock, found->second);
-}
-
 StateUse StateCache::useState(uint64_t kvBlock) {
   if (!kv_.contains(kvBlock)) {
     throw std::invalid_argument("composite state KV block is unknown");
@@ -137,7 +129,8 @@ StateUse StateCache::useState(uint64_t kvBlock) {
   uint32_t &uses = uses_[kvBlock];
   if (uses == std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("composite state use count overflowed");
-  // Recency is left as it is: the class alone keeps the state.
+  // Recency is set when the last use ends (unuse): until then the class
+  // alone keeps the state.
   if (!uses++) {
     if (auto found = entries_.find(kvBlock); found != entries_.end()) {
       kv_.countStateInUse(kvBlock, true);
@@ -158,6 +151,10 @@ void StateCache::unuse(uint64_t kvBlock) noexcept {
   // The block may have left after its state; a state never outlives it.
   if (auto entry = entries_.find(kvBlock); entry != entries_.end()) {
     kv_.countStateInUse(kvBlock, false);
+    // The conversation resumes here next: the point becomes the newest of
+    // its class, newer than the finished KV tail endRequest released.
+    if (!entry->second.pins)
+      entry->second.lastUsed = recency_.next();
     reindex(kvBlock, entry->second);
   }
 }

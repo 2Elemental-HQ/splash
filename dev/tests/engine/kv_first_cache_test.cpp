@@ -3121,6 +3121,38 @@ void testKvInUseFollowsItsState() {
           "the KV of a state that left stayed in use");
 }
 
+// A finished request stamps only the replay point its conversation resumes
+// from, when its use ends: the older points on its chain keep their age and
+// go before another conversation's newer state.
+void testEndRequestStampsOnlyTheReplayPoint() {
+  CacheFixture fixture(nullptr, true);
+  fixture.storage.budgetPages = 5;
+  fixture.publish(0);
+  const uint64_t other = cacheChain(fixture.cache, 2, 1).second[0];
+  fixture.cache.publishCompositeState(other, std::make_shared<TestState>(100));
+  StateUse use = fixture.cache.useState(fixture.blocks[2]);
+  fixture.publish(2);
+  fixture.cache.endRequest(1);
+  use.reset();
+  const auto resident = [&](uint64_t block) { return fixture.cache.stateResident(block); };
+  // Dead KV goes between them: each step here ends with one state fewer.
+  const auto evictState = [&] {
+    const uint32_t entries = fixture.cache.snapshot().stateCache.entries;
+    while (fixture.cache.snapshot().stateCache.entries == entries)
+      require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
+                  .madeProgress,
+              "the cache could not be reclaimed");
+  };
+  evictState();
+  require(!resident(fixture.blocks[0]) && resident(other) && resident(fixture.blocks[2]),
+          "the finished request's older point did not go first");
+  evictState();
+  require(!resident(other) && resident(fixture.blocks[2]),
+          "the replay point went before another conversation's older state");
+  evictState();
+  require(fixture.cache.snapshot().stateCache.entries == 0, "the replay point did not go last");
+}
+
 // The resume-point floor keeps the newest ordinary publication: a newer
 // finished point is kept over an older one in use, and states in use still
 // go after the rest. A state in use is never the resume point, even when it
@@ -3701,6 +3733,7 @@ int main() {
     testKvAStateInUseNeedsGoesLast();
     testStateUsesAreCountedPerBlock();
     testKvInUseFollowsItsState();
+    testEndRequestStampsOnlyTheReplayPoint();
     testKeepResumePointKeepsTheNewestOrdinaryPublication();
     testStatesInUseAreOrdinary();
     testInUseWaitsForTransfersInFlight();

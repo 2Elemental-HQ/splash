@@ -175,15 +175,14 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
-  // Refreshes recency. No-op when absent or pinned.
-  void touch(uint64_t kvBlock) noexcept;
   // An unfinished request's conversation resumes from the state at this
   // block, published or yet to be. Until the handle is released that state
   // is in use, and so is the KV it restores through: the candidates below
   // offer states in use apart, and the cache gives them up after everything
   // else and only to running work or to a copy that is itself in use.
   // Requests sharing the block each hold a handle. A state in use is
-  // reusable, so a checkpoint there becomes ordinary.
+  // reusable, so a checkpoint there becomes ordinary. Recency is set when
+  // the last use ends (unuse): the conversation resumes there next.
   [[nodiscard]] StateUse useState(uint64_t kvBlock);
   [[nodiscard]] bool inUse(uint64_t kvBlock) const noexcept {
     return uses_.contains(kvBlock);

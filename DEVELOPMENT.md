@@ -973,22 +973,23 @@ its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
 
 Until the request ends, suspended or not, that replay point is in use, and so is
-the KV it restores through. Cache victims come in three classes: checkpoints,
-then ordinary states and KV (first the KV no state restores through, which saves
-no prefill), then what is in use. No work displaces anything of a class above
-its own. Memory for running requests takes what is in use after everything
-else. A start that a resident lane holds back takes nothing in use: it waits for
-that lane. Nor does the lane that yields first when no lane's growth fits, such
-as one just started beside a decoding lane: its own suspension pays for the
-memory, and while other lanes fit it waits for them, resident. A publication in
-use takes cached KV and states in the same order, then the oldest state in use;
-of the KV it takes only leaves whose page frees at once, and only while an
-extent can be emptied; the extent is released at once, and the snapshot follows.
-Other publications recycle only states, a disk copy in use may displace the
-oldest copy in use, and ordinary or optional work never displaces anything in
-use. Nothing in use is pinned, so running work that needs the memory still takes
-it once nothing else is left. A resumed lane that lost its prompt's replay point
-rebuilds it on the way.
+the KV it restores through. When the last request using it ends, the point
+becomes the newest ordinary state; the older points on its chain keep their age.
+Cache victims come in three classes: checkpoints, then ordinary states and KV
+(first the KV no state restores through, which saves no prefill), then what is
+in use. No work displaces anything of a class above its own. Memory for running
+requests takes what is in use after everything else. A start that a resident
+lane holds back takes nothing in use: it waits for that lane. Nor does the lane
+that yields first when no lane's growth fits, such as one just started beside a
+decoding lane: its own suspension pays for the memory, and while other lanes fit
+it waits for them, resident. A publication in use takes cached KV and states in
+the same order, then the oldest state in use; of the KV it takes only leaves
+whose page frees at once, and only while an extent can be emptied; the extent is
+released at once, and the snapshot follows. Other publications recycle only
+states, a disk copy in use may displace the oldest copy in use, and ordinary or
+optional work never displaces anything in use. Nothing in use is pinned, so
+running work that needs the memory still takes it once nothing else is left. A
+resumed lane that lost its prompt's replay point rebuilds it on the way.
 `/status` reports under `state` the replay points unfinished requests hold
 (`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 
