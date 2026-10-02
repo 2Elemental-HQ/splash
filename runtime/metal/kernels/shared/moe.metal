@@ -679,16 +679,11 @@ kernel void moe_expert_down_q4_m8(
 
 // Four-simdgroup 8-row tiles for Apple9 decode plans: gate/up at N128 and
 // down at N256, 128 threads per threadgroup, the same buffers as the m8
-// kernels above and a {output_size / TileN, tiles} grid. Family 9 has no
-// per-core matrix unit, and a decode expert grid leaves it latency-bound at
-// low occupancy, where halving the simdgroups per tile pays. Measured on a
-// 40-core Apple9 GPU at the 35B shape (H=2048, E=256, top_k=8, I=512), ms
-// per layer at rows 8/16/24/32 against the eight-simdgroup tiles: gate/up
-// 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
-// 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
-// stays within noise of the shipped tiles (<= 1.07x) and keeps them. Every
-// output element sums its quant groups in the same order at either width or
-// simdgroup count, so the outputs are bit-identical to the tiles above.
+// kernels above and a {output_size / TileN, tiles} grid. Which devices run
+// them, and the measurements behind that, is ops::moeDecodeSimdgroups
+// (runtime/ops/MoE.hpp). Every output element sums its quant groups in the
+// same order at either width or simdgroup count, so the outputs are
+// bit-identical to the tiles above.
 kernel void moe_expert_gate_up_q4_m8_n128_sg4(
     device bfloat *grouped_input [[buffer(0)]],
     device const MoeTileDescriptor *tiles [[buffer(1)]],
