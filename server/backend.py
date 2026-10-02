@@ -533,7 +533,7 @@ class NativeBackend:
                         ),
                     )
                 )
-                return True
+                return
             self.active[job.request_id] = state
         try:
             recovery_attempt = 0
@@ -566,13 +566,6 @@ class NativeBackend:
                 cancel = state.detached or self.closing or job.cancelled.is_set()
             if cancel:
                 call.cancel()
-            return True
-        except engine_runtime.PendingLimitExceeded:
-            with self.lock:
-                reject = not state.detached and not state.terminal_enqueued
-                if reject:
-                    self._detach_locked(state)
-            return not reject
         except Exception as error:
             with self.lock:
                 deliver = not state.detached and not state.terminal_enqueued
@@ -580,7 +573,6 @@ class NativeBackend:
                     self._detach_locked(state)
             if deliver:
                 job.events.put(("error", self._api_error(error)))
-            return True
 
     def _detach_locked(self, state):
         state.detach()
@@ -749,6 +741,12 @@ class NativeBackend:
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")
             return APIError(400, str(error), "constraint_error")
+        if isinstance(error, engine_runtime.PendingLimitExceeded):
+            # The native pending limit is --queue-size, the HTTP request
+            # gate's capacity, so only a race with the gate reaches it, as
+            # when a cancelled request still holds its native slot: an
+            # overload like the gate's own, retried the same way.
+            return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
             error, (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed)
         ):

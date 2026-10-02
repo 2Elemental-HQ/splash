@@ -7111,7 +7111,11 @@ class ServerTest(unittest.TestCase):
                     harness.request("POST", "/v1/chat/completions", self.body())[0], 500
                 )
         self._wait_for_http_active(harness.server.requests, 0)
-        with mock.patch.object(harness.backend, "submit", return_value=False):
+        with mock.patch.object(
+            harness.backend.runtime,
+            "submit",
+            side_effect=api.engine_runtime.PendingLimitExceeded("full"),
+        ):
             self.assertEqual(
                 harness.request("POST", "/v1/chat/completions", self.body())[0], 503
             )
@@ -7467,7 +7471,7 @@ class ServerTest(unittest.TestCase):
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime, queue_size=1)
         head, _, _ = harness.app.prepare(self.body(timeout=2))
-        self.assertTrue(harness.backend.submit(head))
+        harness.backend.submit(head)
         self.assertTrue(blocking.started.wait(1))
 
         connection = http.client.HTTPConnection(

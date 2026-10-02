@@ -195,14 +195,6 @@ def _normalize_path(raw_path):
     return normalized
 
 
-def _queue_full():
-    """The answer when the native pending limit refuses a submission. That
-    limit is --queue-size, the HTTP request gate's capacity, so only a race
-    with the gate reaches it, as when a cancelled request still holds its
-    native slot: an overload like the gate's own, retried the same way."""
-    return APIError(503, "request queue is full", "frontend_overloaded")
-
-
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     methods = "GET, HEAD, POST, DELETE, OPTIONS"
@@ -682,8 +674,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 remaining_request_time(deadline)
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
-                if not self.app.backend.submit(job):
-                    raise _queue_full()
+                self.app.backend.submit(job)
                 submitted = True
                 self._judgment_complete(job, row)
                 return
@@ -744,8 +735,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
-            if not self.app.backend.submit(job):
-                raise _queue_full()
+            self.app.backend.submit(job)
             submitted = True
             if anthropic and stream:
                 self._anthropic_stream(job, thinking, has_tools)
@@ -844,8 +834,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # One admitted job per HTTP request preserves the existing
                 # queue bound and lets later questions reuse the state prefix.
                 active_job = job
-                if not self.app.backend.submit(job):
-                    raise _queue_full()
+                self.app.backend.submit(job)
                 result = None
                 while result is None:
                     kind, value = self._next_event(job)

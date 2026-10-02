@@ -298,7 +298,11 @@ class HttpBodyBudgetTests(unittest.TestCase):
                     harness.request("POST", "/v1/chat/completions", body)[0], status
                 )
             self.wait_bytes(harness, 0)
-        with mock.patch.object(harness.backend, "submit", return_value=False):
+        with mock.patch.object(
+            harness.backend.runtime,
+            "submit",
+            side_effect=api.engine_runtime.PendingLimitExceeded("full"),
+        ):
             self.assertEqual(
                 harness.request("POST", "/v1/chat/completions", body)[0], 503
             )

@@ -349,7 +349,7 @@ class ServerRecoveryTests(unittest.TestCase):
         self.addCleanup(backend.close)
         job = make_job()
         with mock.patch.object(backend_api, "print_status") as console:
-            self.assertTrue(backend.submit(job))
+            backend.submit(job)
             factory.processes[0].stdin.wait_for(wire.RequestFrame)
             factory.processes[0].close_stdout()
             kind, error = job.events.get(timeout=1)

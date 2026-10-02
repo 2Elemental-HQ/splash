@@ -239,7 +239,7 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint, temperature=0.6)
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         request = runtime.calls[0].request
         frame = request.frame
         self.assertEqual(frame.prompt_tokens, (11, 12, 13, 14))
@@ -293,7 +293,7 @@ class NativeBackendContractTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         frame = runtime.calls[0].request.frame
         self.assertEqual(frame.prompt_tokens, (31, 32, 33))
         self.assertEqual(frame.logical_max_output_tokens, 19)
@@ -315,7 +315,7 @@ class NativeBackendContractTests(unittest.TestCase):
         job.generation_prompt_tokens = 2
         job.flags = wire.RequestFlag.IGNORE_END_OF_SEQUENCE
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         process = factory.processes[0]
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(frame.priority, wire.RequestPriority.FOREGROUND)
@@ -365,7 +365,7 @@ class NativeBackendContractTests(unittest.TestCase):
             backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
         )
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(frame.absolute_deadline_unix_micros, runtime._MAX_U64)
 
@@ -381,7 +381,7 @@ class NativeBackendContractTests(unittest.TestCase):
         job.sampling = wire.SamplingParameters()
         job.score_tokens = (101, 202, 303)
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         process = factory.processes[0]
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(frame.score_tokens, (101, 202, 303))
@@ -415,7 +415,7 @@ class NativeBackendContractTests(unittest.TestCase):
         constraint = FakeConstraint(words_per_mask=2)
         job = make_job(405, constraint=constraint)
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         process = factory.processes[0]
         request = process.stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
@@ -446,7 +446,7 @@ class NativeBackendContractTests(unittest.TestCase):
         constraint = FakeConstraint()
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         call.emit(wire.StartEvent(call.request_id, 2, 2))
@@ -477,7 +477,7 @@ class NativeBackendContractTests(unittest.TestCase):
         job.image_owner.append(images.PreparedImage(2, 2, b"abcd", 0, 0))
         self.assertEqual(cache.stats()["request_bytes"], 4)
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         process = factory.processes[0]
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
         process.send(wire.StartEvent(frame.request_id, 0, 0))
@@ -501,7 +501,7 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(FakeRuntime("complete_inline"))
         job = make_job()
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         self.assertEqual(self.terminal(job)[0], "done")
         self.assertFalse(transport.active)
 
@@ -509,7 +509,7 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(FakeRuntime("complete_then_raise"))
         job = make_job()
 
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         kind, error = self.terminal(job)
         self.assertEqual(kind, "error")
         self.assertEqual(error.status, 503)
@@ -524,7 +524,7 @@ class NativeBackendContractTests(unittest.TestCase):
         job = make_job()
 
         with mock.patch.object(backend_api, "NATIVE_RECOVERY_GRACE_SECONDS", 0):
-            self.assertTrue(transport.submit(job))
+            transport.submit(job)
         self.assertEqual(runtime_client.submit_attempts, 2)
         self.assertEqual(len(runtime_client.calls), 1)
         runtime_client.calls[0].complete(result=success_result(runtime_client.calls[0]))
@@ -537,7 +537,7 @@ class NativeBackendContractTests(unittest.TestCase):
         job = make_job()
 
         with mock.patch.object(backend_api, "NATIVE_RECOVERY_GRACE_SECONDS", 0):
-            self.assertTrue(transport.submit(job))
+            transport.submit(job)
         self.assertEqual(runtime_client.submit_attempts, 2)
         kind, error = self.terminal(job)
         self.assertEqual(kind, "error")
@@ -552,9 +552,14 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(FakeRuntime("pending_limit"))
         job = make_job()
 
-        self.assertFalse(transport.submit(job))
+        self.assertIsNone(transport.submit(job))
         self.assertFalse(transport.active)
-        self.assertTrue(job.events.empty())
+        kind, error = self.terminal(job)
+        self.assertEqual(kind, "error")
+        self.assertEqual(
+            (error.status, error.message, error.code),
+            (503, "request queue is full", "frontend_overloaded"),
+        )
 
     def test_constraint_callback_error_cancels_and_maps_to_bad_request(self):
         constraint = FakeConstraint(
@@ -562,7 +567,7 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
@@ -582,7 +587,7 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
@@ -599,7 +604,7 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
@@ -624,7 +629,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_cancel_is_idempotent_and_preserves_timeout_flag(self):
         transport, runtime = self.make_transport()
         job = make_job()
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         transport.cancel(job, timed_out=True)
@@ -637,10 +642,7 @@ class NativeBackendContractTests(unittest.TestCase):
         runtime = FakeRuntime("block_after_call")
         transport, _runtime = self.make_transport(runtime)
         job = make_job()
-        submitted = []
-        thread = threading.Thread(
-            target=lambda: submitted.append(transport.submit(job))
-        )
+        thread = threading.Thread(target=transport.submit, args=(job,))
         thread.start()
         self.assertTrue(runtime.submit_entered.wait(1.0))
 
@@ -649,7 +651,6 @@ class NativeBackendContractTests(unittest.TestCase):
         thread.join(1.0)
 
         self.assertFalse(thread.is_alive())
-        self.assertEqual(submitted, [True])
         self.assertEqual(runtime.calls[0].cancel_writes, 1)
         self.assertTrue(job.timed_out)
 
@@ -675,7 +676,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_close_drains_runtime_terminal_before_stopping_finalizer(self):
         transport, _runtime = self.make_transport()
         job = make_job()
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
 
         transport.close()
 
@@ -689,7 +690,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_close_owns_terminal_even_when_native_cancel_wins_race(self):
         transport, runtime = self.make_transport()
         job = make_job()
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
         call = runtime.calls[0]
 
         # The fake native side completes successfully as soon as close starts.
@@ -713,7 +714,7 @@ class NativeBackendContractTests(unittest.TestCase):
         runtime = FakeRuntime(complete_on_close=False)
         transport, _runtime = self.make_transport(runtime)
         job = make_job()
-        self.assertTrue(transport.submit(job))
+        transport.submit(job)
 
         transport.close()
 

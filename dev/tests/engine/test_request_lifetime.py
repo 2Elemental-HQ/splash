@@ -82,7 +82,7 @@ class RequestLifetimeTests(unittest.TestCase):
                         raise RuntimeError("event callback failed")
 
                     backend._on_event = fail_event
-                self.assertTrue(backend.submit(job))
+                backend.submit(job)
                 call = backend.active[job.request_id].call
                 if outcome in ("complete", "runtime_callback_error"):
                     send_success(process, call, tokens=(4,))
@@ -140,16 +140,16 @@ class RequestLifetimeTests(unittest.TestCase):
                 job, cache, owner = self.job()
                 if outcome == "expired":
                     job.deadline = time.monotonic() - 1
-                    self.assertTrue(backend.submit(job))
+                    backend.submit(job)
                 elif outcome == "closed":
                     backend.close()
-                    self.assertTrue(backend.submit(job))
+                    backend.submit(job)
                 elif outcome == "full":
                     slots = backend.runtime._admission_slots
                     for _ in range(backend.runtime.pending_limit):
                         self.assertTrue(slots.acquire(blocking=False))
                     try:
-                        self.assertFalse(backend.submit(job))
+                        backend.submit(job)
                     finally:
                         for _ in range(backend.runtime.pending_limit):
                             slots.release()
@@ -163,11 +163,10 @@ class RequestLifetimeTests(unittest.TestCase):
                         "_write_bytes",
                         new=fail_write,
                     ):
-                        self.assertTrue(backend.submit(job))
-                if outcome != "full":
-                    kind, error = self.terminal(job)
-                    self.assertEqual(kind, "error")
-                    self.assertIsNone(error.__traceback__)
+                        backend.submit(job)
+                kind, error = self.terminal(job)
+                self.assertEqual(kind, "error")
+                self.assertIsNone(error.__traceback__)
                 del job
                 self.assert_released(cache, owner)
                 self.assertFalse(backend.active)
@@ -180,7 +179,7 @@ class RequestLifetimeTests(unittest.TestCase):
         job.prompt_tokens = [101] * 258
         job.image_spans = (span,)
         job.image_pixels = pixels
-        self.assertTrue(backend.submit(job))
+        backend.submit(job)
         process.stdin.wait_for(wire.RequestFrame)
 
         self.assertEqual(job.image_pixels, b"")
@@ -215,7 +214,7 @@ class RequestLifetimeTests(unittest.TestCase):
 
         job, cache, owner = self.job()
         job.constraint = Constraint()
-        self.assertTrue(backend.submit(job))
+        backend.submit(job)
         call = backend.active[job.request_id].call
         process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
@@ -273,7 +272,7 @@ class RequestLifetimeTests(unittest.TestCase):
 
         job, cache, owner = self.job()
         job.constraint = Constraint()
-        self.assertTrue(backend.submit(job))
+        backend.submit(job)
         call = backend.active[job.request_id].call
         process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.TokensEvent(call.request_id, 0, (4,)))
