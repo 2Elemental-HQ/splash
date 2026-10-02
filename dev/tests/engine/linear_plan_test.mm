@@ -880,8 +880,10 @@ void ggufPlans() {
   rejects([&] { (void)Linear::plan(gguf, {LinearTile::N128, 40}); });
   rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .groups = 80, .splits = 8}); });
   rejects([&] { (void)Linear::plan(gguf, {.tile = LinearTile::GgufStaged, .splits = 3}); });
-  // The arena bound is the single-tensor plan, which fused and gate/up plans share.
-  require(linear.decodeScratchSize(gguf).partials == single.scratchSize().partials,
+  // The arena bound is the single-tensor plan of the 32-row tile, which fused
+  // and gate/up plans share.
+  const ProjectionShape downShape{5120, 17408, WeightLayout::Block32};
+  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from three of its
   // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
@@ -931,8 +933,10 @@ void ggufPlans() {
   require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
   LinearWorkload registerDown = down;
   registerDown.weightLayout = WeightLayout::Block32;
-  require(m3.decodeScratchSize(registerDown).partials ==
-              m3.plan(down, blockProjection(5120, 17408, 1)).scratchSize().partials,
+  const LinearScratchSize bound = m3.decodeScratchSize(downShape);
+  require(bound.partials ==
+              m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
+                  .scratchSize().partials,
           "Apple9 GGUF decode scratch bound");
   // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
   // holds the lanes' rows unpadded, and Q2_K from two lanes. A projection
@@ -970,8 +974,6 @@ void ggufPlans() {
                                           blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XS));
     const LinearPlan registerPlan = m3.plan({down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual},
                                             blockProjection(5120, 17408, 1));
-    const LinearScratchSize bound = m3.decodeScratchSize(
-        {down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual, WeightLayout::Block32});
     for (const LinearScratchSize size : {stagedDown.scratchSize(), registerPlan.scratchSize()})
       require(bound.input >= size.input && bound.sums >= size.sums && bound.partials >= size.partials &&
                   bound.counters >= size.counters,
@@ -1017,6 +1019,19 @@ void ggufPlans() {
   rejects([&] { (void)Linear::plan(registerDown, {.tile = LinearTile::GgufPrefill}); });
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .groups = 80}); });
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 2}); });
+}
+
+// A rotated projection's scratch holds the bf16 rotated rows of a full decode
+// batch (32 rows) in decode and of the token budget (2048) in prefill; an
+// unrotated one's holds none.
+void scratchBoundsRotated() {
+  const Linear linear = gpu(10, 16);
+  for (const bool rotated : {false, true}) {
+    const ProjectionShape shape{5120, 17408, WeightLayout::Block32, rotated};
+    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+                linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
+            "rotated scratch bounds");
+  }
 }
 
 // The GGUF decode split rules are per-core laws, checked at every core count
@@ -1070,8 +1085,8 @@ void ggufCoreLaws() {
                 require(plan(linear, 2 * n, 8).configuration().splits <= s,
                         "GGUF split count rises with the width");
               }
-              LinearWorkload w{{n, k}, 32, LinearPhase::Decode, epilogue, WeightLayout::Block32};
-              const LinearScratchSize bound = linear.decodeScratchSize(w), need = linear.plan(w, p).scratchSize();
+              const LinearScratchSize bound = linear.decodeScratchSize({n, k, WeightLayout::Block32}),
+                                      need = linear.plan({{n, k}, 32, LinearPhase::Decode, epilogue}, p).scratchSize();
               require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
                           bound.counters >= need.counters,
                       "GGUF decode arena bound below a plan");
@@ -1727,6 +1742,7 @@ int main(int argc, char **argv) {
     baselinePlans();
     affinePolicyLaws();
     ggufPlans();
+    scratchBoundsRotated();
     ggufCoreLaws();
     const std::set<std::string_view> plainKernels = floatOutputPlans();
     apple10AffineCoreLaws();

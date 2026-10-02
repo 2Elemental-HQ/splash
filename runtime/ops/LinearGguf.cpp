@@ -15,9 +15,6 @@
 namespace splash::ops {
 namespace {
 
-// The staged decode tiles hold at most a full decode batch; prefill chunks of
-// up to this many rows run them (Linear::ggufBaseline).
-constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The segments one fused decode dispatch runs.
 constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 
@@ -244,15 +241,6 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
       ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
                           uint64_t{n / tileColumns()} * sizeof(uint32_t)}
       : LinearScratchSize{};
-}
-
-LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
-  LinearScratchSize bound;
-  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-      bound.include(
-          plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout}).scratchSize());
-  return bound;
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {

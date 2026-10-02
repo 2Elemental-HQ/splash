@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -59,6 +60,9 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 enum class LinearTile : uint8_t {
   N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufPrefill, GgufRegister
 };
+// The decode tiles hold at most a full decode batch; GGUF prefill chunks of up
+// to this many rows run the staged tile (Linear::ggufBaseline).
+inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
 // register tiles build from grid lookups beside their matrix operations
@@ -108,7 +112,7 @@ struct LinearScratch final {
   metal::MetalBuffer partials;
   metal::MetalBuffer counters;
   // The bf16 input rows a rotated projection's quantized segments read
-  // (ProjectionShape::rotated): rotatedBytes() of its plan.
+  // (ProjectionShape::rotated), sized by decode/prefillScratchSize(shape).rotated.
   metal::MetalBuffer rotated{};
 };
 struct LinearScratchSize final {
@@ -124,11 +128,6 @@ struct LinearScratchSize final {
     return *this;
   }
 };
-// LinearScratch::rotated bytes of a rotated projection's plan of storageRows
-// rows of `width` inputs.
-[[nodiscard]] constexpr uint64_t rotatedBytes(uint32_t width, uint64_t storageRows) noexcept {
-  return uint64_t{width} * storageRows * 2;
-}
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
 // X^T table with fp32 row sums in LinearScratch that a producer can emit
@@ -239,10 +238,13 @@ public:
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
-  [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
+  // The scratch of every decode plan of a projection of `shape`: each lane
+  // count, the None, Residual and GateUp epilogues and every tile the device
+  // may run them on, and the rotated rows of a full decode batch.
+  [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the GGUF
-  // decode tiles (LinearGguf.cpp).
+  // staged tile (LinearGguf.cpp), and the rotated rows of a full chunk.
   [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).

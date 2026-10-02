@@ -81,6 +81,9 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
+// LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
+constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return uint64_t{width} * rows * 2; }
+
 // The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
 // plain and residual projections, all matrix row tiles, and the one-lane
 // Paired256 (plain) tile.
@@ -514,9 +517,31 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
 }
 
-LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
-  if (w.weightLayout == WeightLayout::Block32) return ggufDecodeScratchSize(w);
-  return plan(w).scratchSize();
+LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
+  LinearScratchSize bound;
+  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+      LinearWorkload w = decode({shape.outputSize, shape.inputSize}, lanes, epilogue);
+      w.weightLayout = shape.layout;
+      bound.include(shape.layout == WeightLayout::Block32 ? ggufDecodeScratchSize(w) : plan(w).scratchSize());
+    }
+  // Decode plans store at most every lane's rows.
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  return bound;
+}
+
+LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
+  LinearScratchSize bound;
+  // Prefill plans take split scratch only in chunks of up to a decode batch,
+  // which a GGUF projection runs on the staged tile (LinearGguf.cpp).
+  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout})
+                        .scratchSize());
+  // Every prefill plan stores at most the token budget.
+  static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
+  return bound;
 }
 
 

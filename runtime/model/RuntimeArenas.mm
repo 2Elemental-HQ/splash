@@ -115,13 +115,13 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kPackedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters of the largest prefill plan.
+  // The split partials and counters and the rotated rows of the largest
+  // prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
-    // A chunk's plans store at most kPrefillRows rows (whole 128-row tiles).
-    if (projection.rotated) put(PrefillTensor::LinearRotated, ops::rotatedBytes(projection.inputSize, kPrefillRows));
+    put(PrefillTensor::LinearRotated, linear.rotated);
   }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
@@ -323,31 +323,17 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
 
 ops::LinearScratchSize DecodeArena::linearScratchSize(
     const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
-  const auto &t = geometry.target;
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  const auto include = [&](ops::LinearMatrix matrix, ops::WeightLayout weightLayout) {
-    if (!matrix.outputSize || !matrix.inputSize) return;
-    for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
-      for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                            ops::LinearEpilogue::GateUp}) {
-        result.include(operators.linear().decodeScratchSize(
-            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, weightLayout}));
-      }
-    }
-  };
-  // Includes the vocabulary head shared with the draft. Decode plans store at
-  // most every lane's rows.
-  for (const auto &p : t.decodeProjections) {
-    include({p.outputSize, p.inputSize}, p.layout);
-    if (p.rotated) result.rotated = std::max(result.rotated, ops::rotatedBytes(p.inputSize, kLaneCount * kDecodeRows));
-  }
-  for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
+  // Includes the vocabulary head shared with the draft, whose own
+  // projections are affine.
+  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
-    include(matrix, ops::WeightLayout::Affine64);
+    result.include(operators.linear().decodeScratchSize(shape));
   return result;
 }
 
