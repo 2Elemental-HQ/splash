@@ -2830,8 +2830,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().activeCellBytes(),
           plannedPrefillBytes(geometry, operators),
-          plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
-          kRuntimeOverheadReserveBytes};
+          plannedDecodeBytes(geometry, operators)};
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

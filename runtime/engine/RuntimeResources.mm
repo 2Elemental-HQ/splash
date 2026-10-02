@@ -168,8 +168,7 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
 
 RuntimeResources::RuntimeResources(
     std::unique_ptr<metal::MetalBackend> backend, model::ModelPackage model,
-    ops::ExecutionPlans operators,
-    EngineMemoryPlan memoryPlan, model::ModelMemoryPlan modelMemoryPlan,
+    ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
@@ -180,7 +179,6 @@ RuntimeResources::RuntimeResources(
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
-      modelMemoryPlan_(std::move(modelMemoryPlan)),
       cacheIdentity_(std::move(cacheIdentity)),
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
@@ -339,13 +337,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   // One selection owner is used both before allocation and during encoding.
   // The engine lends it to model execution without inspecting kernel choices.
   ops::ExecutionPlans operators(device);
-  model::ModelMemoryPlan modelMemoryPlan;
   auto prepareMemory = [&]() -> EngineMemoryPlan {
+    model::ModelMemoryPlan modelMemoryPlan;
     try {
       modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
-      if (auto error = modelMemoryPlan.validationError()) {
-        throw std::invalid_argument(*error);
-      }
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -357,11 +352,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         package.targetActualAllocatedBytes(),
         package.draft.actualAllocatedBytes,
         package.vision.actualAllocatedBytes,
-        modelMemoryPlan.activeStateCellPlannedAllocatedBytes,
-        modelMemoryPlan.sharedPrefillPlannedAllocatedBytes,
-        modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
-        modelMemoryPlan.pipelineReserveBytes,
-        modelMemoryPlan.runtimeOverheadReserveBytes,
+        modelMemoryPlan,
         stateStagingBytes,
     };
 
@@ -397,7 +388,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   try {
     const auto baselineMemoryPlan = memoryPlan;
-    const auto baselineModelMemoryPlan = modelMemoryPlan;
     const EngineMemoryBreakdown &baselineBudget = baselineMemoryPlan.breakdown();
     const uint64_t runtimeReserve =
         baselineBudget.pipelineReserveBytes + baselineBudget.runtimeOverheadReserveBytes;
@@ -426,7 +416,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         // selected scratch keeps the operator defaults, never a partial table.
         rejected = error.what();
         operators.install({});
-        modelMemoryPlan = baselineModelMemoryPlan;
         memoryPlan = baselineMemoryPlan;
         return false;
       }
@@ -488,8 +477,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
         std::move(backend), std::move(package), std::move(operators),
-        std::move(memoryPlan),
-        std::move(modelMemoryPlan), std::move(cacheIdentity),
+        std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
         hostAvailableAtStart));

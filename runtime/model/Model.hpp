@@ -324,23 +324,13 @@ struct ModelMemoryPlan final {
   uint64_t activeStateCellPlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
-
-  [[nodiscard]] std::optional<std::string> validationError() const {
-    if (!activeStateCellPlannedAllocatedBytes)
-      return "active_state_cell_planned_allocated_bytes_required";
-    if (!sharedPrefillPlannedAllocatedBytes)
-      return "shared_prefill_planned_allocated_bytes_required";
-    if (!sharedDecodePlannedAllocatedBytes)
-      return "shared_decode_planned_allocated_bytes_required";
-    if (!pipelineReserveBytes)
-      return "pipeline_reserve_required";
-    if (!runtimeOverheadReserveBytes)
-      return "runtime_overhead_reserve_required";
-    return std::nullopt;
-  }
 };
+
+// Fixed reserves the memory plan carries beside the planned arenas: Metal
+// pipeline objects and encoder scratch, and the process's own runtime
+// overhead. Startup counts them before a model loads.
+inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
+inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
 struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;

@@ -225,8 +225,6 @@ int main(int argc, char **argv) {
       model::ModelPackage model =
           model::loadModelPackage(backend, root, model::inspectModelPackage(root));
       ops::ExecutionPlans operators(backend.capabilities());
-      model::ModelMemoryPlan executorPlan =
-          model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
@@ -252,8 +250,7 @@ int main(int argc, char **argv) {
                                       model.stateLayout());
       model::RuntimeContext context{
           backend, model, pages, states, operators,
-          executorPlan.pipelineReserveBytes,
-          executorPlan.runtimeOverheadReserveBytes};
+          model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes};
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",

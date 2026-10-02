@@ -96,12 +96,6 @@ loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
 
-// Fixed reserves the memory plan carries beside the planned arenas: Metal
-// pipeline objects and encoder scratch, and the process's own runtime
-// overhead. Startup counts them before a model loads.
-inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
-inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
-
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,

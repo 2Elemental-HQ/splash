@@ -1478,11 +1478,7 @@ int main(int argc, char **argv) {
         model.targetActualAllocatedBytes(),
         model.draft.actualAllocatedBytes,
         model.vision.actualAllocatedBytes,
-        model.stateLayout().activeCellBytes(),
-        executorPlan.sharedPrefillPlannedAllocatedBytes,
-        executorPlan.sharedDecodePlannedAllocatedBytes,
-        executorPlan.pipelineReserveBytes,
-        executorPlan.runtimeOverheadReserveBytes};
+        executorPlan, 0};
     ModelMemoryProfile profile{
         model.name(), model.maximumContextTokens(),
         model.targetKvLayout(format), footprint};

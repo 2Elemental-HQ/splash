@@ -289,17 +289,14 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
-    const model::ModelMemoryPlan &modelMemory =
-        resources->modelMemoryPlan();
-    if (modelMemory.sharedDecodePlannedAllocatedBytes >
-        std::numeric_limits<uint64_t>::max() -
-            modelMemory.sharedPrefillPlannedAllocatedBytes) {
+    const auto &budget = resources->memoryPlan().breakdown();
+    if (budget.sharedDecodeBytes >
+        std::numeric_limits<uint64_t>::max() - budget.sharedPrefillBytes) {
       throw std::overflow_error(
           "modelRuntime shared allocation reservation overflows");
     }
     const uint64_t modelBytes =
-        modelMemory.sharedPrefillPlannedAllocatedBytes +
-        modelMemory.sharedDecodePlannedAllocatedBytes;
+        budget.sharedPrefillBytes + budget.sharedDecodeBytes;
     metal::AllocationFailure failure;
     auto reservation = resources->memoryGovernor().tryReserve(modelBytes, &failure);
     if (!reservation) {

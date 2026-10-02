@@ -14,8 +14,7 @@ modelMemoryFootprint(uint64_t targetWeightsBytes,
                      uint64_t draftWeightsBytes,
                      uint64_t visionWeightsBytes) {
   return {targetWeightsBytes, draftWeightsBytes, visionWeightsBytes,
-          350'224'384, 734'396'416,
-          160'669'696, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
+          {350'224'384, 734'396'416, 160'669'696}, 0};
 }
 
 [[nodiscard]] inline engine::ModelMemoryProfile

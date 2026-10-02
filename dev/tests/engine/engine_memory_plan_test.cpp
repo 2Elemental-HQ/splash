@@ -178,6 +178,24 @@ void testDiskTierStateStagingIsBudgeted() {
           "a plan without the disk tier reported state staging");
 }
 
+// The pipeline and runtime reserves are the model constants rather than part
+// of a model's plan, and a model's plan without one of its arenas is refused.
+void testReservesAreTheModelConstants() {
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
+  require(plan.breakdown().pipelineReserveBytes == model::kPipelineReserveBytes &&
+              plan.breakdown().runtimeOverheadReserveBytes ==
+                  model::kRuntimeOverheadReserveBytes,
+          "the plan's reserves are not the model constants");
+  ModelMemoryProfile withoutDecode = model();
+  withoutDecode.footprint.runtime.sharedDecodePlannedAllocatedBytes = 0;
+  const EngineMemoryPlanResult refused =
+      evaluateEngineMemoryPlan(device(), withoutDecode);
+  require(!refused.plan &&
+              refused.status.code == BudgetErrorCode::InvalidModelSpec &&
+              refused.status.message == "shared_decode_bytes_required",
+          "a model plan without its decode arena was accepted");
+}
+
 void testHardBudgetBoundaries() {
   require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB) == 11 * kGiB &&
               EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 8 * kGiB) ==
@@ -314,6 +332,7 @@ int main() {
     testMinimumHoldsTheWarmupRunway();
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
+    testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
     testContextTokensWithin();
     testModelProvidedKvGeometry();

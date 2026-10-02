@@ -150,10 +150,6 @@ public:
   [[nodiscard]] const EngineMemoryPlan &memoryPlan() const noexcept {
     return memoryPlan_;
   }
-  [[nodiscard]] const model::ModelMemoryPlan &
-  modelMemoryPlan() const noexcept {
-    return modelMemoryPlan_;
-  }
   [[nodiscard]] MemoryGovernor &memoryGovernor() noexcept {
     return *memoryGovernor_;
   }
@@ -186,7 +182,6 @@ private:
   RuntimeResources(std::unique_ptr<metal::MetalBackend> backend,
                    model::ModelPackage model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
-                   model::ModelMemoryPlan modelMemoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::PageStorage> kvPages,
@@ -200,7 +195,6 @@ private:
   model::ModelPackage model_;
   ops::ExecutionPlans operators_;
   EngineMemoryPlan memoryPlan_;
-  model::ModelMemoryPlan modelMemoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::PageStorage> kvPages_;

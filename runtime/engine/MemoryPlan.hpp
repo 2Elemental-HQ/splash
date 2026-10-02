@@ -33,11 +33,7 @@ struct ModelMemoryFootprint final {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint64_t activeStateCellBytes = 0;
-  uint64_t sharedPrefillBytes = 0;
-  uint64_t sharedDecodeBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
+  model::ModelMemoryPlan runtime;
   // The buffer a state's write to the disk tier stages through, set aside
   // when the tier's state file opened (a quota that holds one state); zero
   // otherwise.

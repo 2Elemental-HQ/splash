@@ -123,10 +123,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
               before.sharedDecodePlannedAllocatedBytes + decodeGrowth,
           "runtime decode allocation does not use all selected width bounds");
   require(after.activeStateCellPlannedAllocatedBytes ==
-              before.activeStateCellPlannedAllocatedBytes &&
-              after.pipelineReserveBytes == before.pipelineReserveBytes &&
-              after.runtimeOverheadReserveBytes == before.runtimeOverheadReserveBytes,
-          "kernel selection changed state or unrelated memory reserves");
+              before.activeStateCellPlannedAllocatedBytes,
+          "kernel selection changed the state cell");
   require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
                   .configuration().groups == 80,
           "paired draft did not use the same selection owner");

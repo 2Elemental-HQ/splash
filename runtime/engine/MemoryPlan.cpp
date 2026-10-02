@@ -50,12 +50,14 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
       << "\"vision_weights_bytes\":" << model.footprint.visionWeightsBytes << ','
       << "\"active_state_cell_bytes\":"
-      << model.footprint.activeStateCellBytes << ','
-      << "\"shared_prefill_bytes\":" << model.footprint.sharedPrefillBytes << ','
-      << "\"shared_decode_bytes\":" << model.footprint.sharedDecodeBytes << ','
-      << "\"pipeline_reserve_bytes\":" << model.footprint.pipelineReserveBytes
-      << ',' << "\"runtime_overhead_reserve_bytes\":"
-      << model.footprint.runtimeOverheadReserveBytes << ','
+      << model.footprint.runtime.activeStateCellPlannedAllocatedBytes << ','
+      << "\"shared_prefill_bytes\":"
+      << model.footprint.runtime.sharedPrefillPlannedAllocatedBytes << ','
+      << "\"shared_decode_bytes\":"
+      << model.footprint.runtime.sharedDecodePlannedAllocatedBytes << ','
+      << "\"pipeline_reserve_bytes\":" << model::kPipelineReserveBytes << ','
+      << "\"runtime_overhead_reserve_bytes\":"
+      << model::kRuntimeOverheadReserveBytes << ','
       << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
   return out.str();
 }
@@ -107,14 +109,14 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
-  if (!footprint.activeStateCellBytes) {
+  if (!footprint.runtime.activeStateCellPlannedAllocatedBytes) {
     return "active_state_cell_bytes_required";
   }
-  if (!footprint.sharedPrefillBytes) return "shared_prefill_bytes_required";
-  if (!footprint.sharedDecodeBytes) return "shared_decode_bytes_required";
-  if (!footprint.pipelineReserveBytes) return "pipeline_reserve_required";
-  if (!footprint.runtimeOverheadReserveBytes) {
-    return "runtime_overhead_reserve_required";
+  if (!footprint.runtime.sharedPrefillPlannedAllocatedBytes) {
+    return "shared_prefill_bytes_required";
+  }
+  if (!footprint.runtime.sharedDecodePlannedAllocatedBytes) {
+    return "shared_decode_bytes_required";
   }
   try {
     static_cast<void>(fixedRuntimeBytes());
@@ -128,9 +130,11 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
   uint64_t result = 0;
   for (uint64_t value : {
            footprint.targetWeightsBytes, footprint.draftWeightsBytes,
-           footprint.visionWeightsBytes, footprint.sharedPrefillBytes,
-           footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
-           footprint.runtimeOverheadReserveBytes, footprint.stateStagingBytes}) {
+           footprint.visionWeightsBytes,
+           footprint.runtime.sharedPrefillPlannedAllocatedBytes,
+           footprint.runtime.sharedDecodePlannedAllocatedBytes,
+           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
+           footprint.stateStagingBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -277,12 +281,14 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.targetWeightsBytes = model.footprint.targetWeightsBytes;
   breakdown.draftWeightsBytes = model.footprint.draftWeightsBytes;
   breakdown.visionWeightsBytes = model.footprint.visionWeightsBytes;
-  breakdown.activeStateCellBytes = model.footprint.activeStateCellBytes;
-  breakdown.sharedPrefillBytes = model.footprint.sharedPrefillBytes;
-  breakdown.sharedDecodeBytes = model.footprint.sharedDecodeBytes;
-  breakdown.pipelineReserveBytes = model.footprint.pipelineReserveBytes;
-  breakdown.runtimeOverheadReserveBytes =
-      model.footprint.runtimeOverheadReserveBytes;
+  breakdown.activeStateCellBytes =
+      model.footprint.runtime.activeStateCellPlannedAllocatedBytes;
+  breakdown.sharedPrefillBytes =
+      model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
+  breakdown.sharedDecodeBytes =
+      model.footprint.runtime.sharedDecodePlannedAllocatedBytes;
+  breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
+  breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
