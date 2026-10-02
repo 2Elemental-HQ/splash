@@ -12,28 +12,6 @@
 
 namespace splash::ops {
 
-struct AttentionShape final {
-  uint32_t queryHeads = 0;
-  uint32_t kvHeads = 0;
-  uint32_t headDimension = 0;
-  kv::Format format = kv::Format::Int8;
-  auto operator<=>(const AttentionShape &) const = default;
-};
-
-// A startup-selected precompiled configuration applies only to this exact row
-// count. Histories are calibrated empirically, not encoded into serving keys.
-struct PrefillAttentionPolicy final {
-  AttentionShape shape;
-  uint32_t rows = SPLASH_PREFILL_TOKEN_BUDGET;
-  auto operator<=>(const PrefillAttentionPolicy &) const = default;
-};
-
-struct VerifyAttentionPolicy final {
-  AttentionShape shape;
-  uint32_t lanes = 0;
-  auto operator<=>(const VerifyAttentionPolicy &) const = default;
-};
-
 struct DraftAttentionWorkload final {
   DraftAttentionShape shape;
   uint32_t lanes = 0;
@@ -48,14 +26,6 @@ struct MoeWorkload final {
   auto operator<=>(const MoeWorkload &) const = default;
 };
 
-struct PrefillAttentionChoice final {
-  PrefillAttentionPolicy workload;
-  PrefillAttentionConfig configuration;
-};
-struct VerifyAttentionChoice final {
-  VerifyAttentionPolicy workload;
-  VerifyAttentionConfig configuration;
-};
 struct DraftAttentionChoice final {
   DraftAttentionWorkload workload;
   DraftAttentionConfiguration configuration;
@@ -67,14 +37,11 @@ struct MoeChoice final {
 
 struct OperatorChoices final {
   std::vector<LinearChoice> linear;
-  std::vector<PrefillAttentionChoice> prefillAttention;
-  std::vector<VerifyAttentionChoice> verifyAttention;
   std::vector<DraftAttentionChoice> draftAttention;
   std::vector<MoeChoice> moe;
 
   [[nodiscard]] bool empty() const noexcept {
-    return linear.empty() && prefillAttention.empty() && verifyAttention.empty() &&
-           draftAttention.empty() && moe.empty();
+    return linear.empty() && draftAttention.empty() && moe.empty();
   }
 };
 

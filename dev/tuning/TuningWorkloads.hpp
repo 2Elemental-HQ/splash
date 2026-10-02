@@ -23,7 +23,6 @@ namespace splash::model {
 struct TuningWorkloads final {
   std::vector<ops::tuning::LinearTuningInput> linear;
   std::vector<ops::tuning::MoeTuningInput> moe;
-  ops::AttentionShape targetAttention;
   ops::DraftAttentionShape draftAttention;
 };
 

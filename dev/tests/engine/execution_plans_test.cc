@@ -20,8 +20,13 @@ template <typename Function> void rejects(Function function) {
   require(rejected, "invalid operator choice or lookup was accepted");
 }
 
+// The target attention shapes: query heads over a KV layout.
+struct AttentionShape final {
+  uint32_t queryHeads;
+  kv::Layout layout;
+};
 constexpr std::array attentionShapes{
-    AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}};
+    AttentionShape{24, {1, 4, 256}}, AttentionShape{16, {1, 2, 256}}};
 constexpr std::array draftShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
@@ -45,9 +50,6 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
 
-kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
-  return {layers, shape.kvHeads, shape.headDimension, shape.format};
-}
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
   value.appleGpuFamily = family;
@@ -96,40 +98,21 @@ void baselinePlans() {
                   "empty choices changed prefill baseline");
         }
     }
-    for (auto shape : attentionShapes) {
-      const auto memory = plans.prefillAttentionWorkspace(2048, shape.queryHeads,
-                                                         layout(shape));
-      equalWorkspace(memory, PagedAttention::prefillWorkspace(
-                                 2048, shape.queryHeads, layout(shape)),
-                     attentionFields);
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
-        const auto selected = plans.prefillAttention(rows, shape.queryHeads,
-                                                     layout(shape), 2049);
-        const auto expected = PagedAttention::prefillPlan(rows, shape.queryHeads,
-                                                         layout(shape), 2049);
-        require(selected.configuration == expected.configuration &&
-                    selected.sameExecutionAs(expected),
-                "empty choices changed attention baseline");
-        covers(memory, selected.workspace, 1, attentionFields);
-      }
-      const auto stride = plans.verifyAttentionWorkspacePerLane(shape.queryHeads,
-                                                                layout(shape));
-      equalWorkspace(stride,
-                     PagedAttention::verifyWorkspace(1, shape.queryHeads, layout(shape)),
-                     attentionFields);
+    for (const auto &[queryHeads, kvLayout] : attentionShapes) {
+      const auto memory = plans.prefillAttentionWorkspace(2048, queryHeads, kvLayout);
+      for (uint32_t rows = 1; rows <= 2048; ++rows)
+        covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout, 2049).workspace, 1,
+               attentionFields);
+      const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
-        const auto selected = plans.verifyAttention(lanes, shape.queryHeads,
-                                                    layout(shape), histories);
+        const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout, histories);
         require(selected.splits == 32, "verify baseline changed");
-        require(selected.configuration == VerifyAttentionConfig{},
-                "verify baseline changed with GPU family");
         covers(stride, selected.workspace, lanes, attentionFields);
       }
       {
         const std::array<uint32_t, 4> deep{131072, 0, 0, 0};
-        const auto scaled = plans.verifyAttention(1, shape.queryHeads,
-                                                  layout(shape), deep);
+        const auto scaled = plans.verifyAttention(1, queryHeads, kvLayout, deep);
         require(scaled.splits == kv::kQ8VerifyMaximumSplits &&
                     scaled.laneSplits[0] == scaled.splits,
                 "verify splits did not scale with history");
@@ -325,34 +308,6 @@ void allCandidates() {
       }
     }
   }
-  for (auto shape : attentionShapes) {
-    for (uint32_t rows : {1U, 9U, 17U, 2048U}) {
-      for (auto config : PagedAttention::prefillCandidates()) {
-        OperatorChoices choices;
-        choices.prefillAttention.push_back({{shape, rows}, config});
-        plans.install(choices);
-        const auto selected = plans.prefillAttention(rows, shape.queryHeads,
-                                                     layout(shape), 2049);
-        require(selected.configuration == config, "prefill candidate not selected");
-        covers(plans.prefillAttentionWorkspace(2048, shape.queryHeads, layout(shape)),
-               selected.workspace, 1, attentionFields);
-      }
-    }
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      std::array<uint32_t, 4> histories{};
-      for (uint32_t lane = 0; lane < lanes; ++lane) histories[lane] = 31 + lane;
-      for (auto config : PagedAttention::verifyCandidates()) {
-        OperatorChoices choices;
-        choices.verifyAttention.push_back({{shape, lanes}, config});
-        plans.install(choices);
-        const auto selected = plans.verifyAttention(lanes, shape.queryHeads,
-                                                    layout(shape), histories);
-        require(selected.configuration == config, "verify candidate not selected");
-        covers(plans.verifyAttentionWorkspacePerLane(shape.queryHeads, layout(shape)),
-               selected.workspace, lanes, attentionFields);
-      }
-    }
-  }
   for (auto shape : draftShapes)
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       for (auto config : DraftAttention::candidates(shape)) {
@@ -392,10 +347,6 @@ OperatorChoices mixedChoices() {
   OperatorChoices choices;
   choices.linear.push_back({{matrices[0], 8, LinearPhase::Decode,
                               LinearEpilogue::GateUp}, {LinearTile::N256, 60}});
-  choices.prefillAttention.push_back({{attentionShapes[0]},
-                                      {PrefillSplitMultiplier::Two}});
-  choices.verifyAttention.push_back({{attentionShapes[0], 3},
-                                     {VerifySplitCount::One}});
   choices.draftAttention.push_back({{draftShapes[0], 3}, {32}});
   choices.moe.push_back({{routedShape, 24, MoePhase::Decode}, {MoeExpertTile::M32}});
   choices.moe.push_back({{routedShape, 9, MoePhase::Prefill}, {MoeExpertTile::M8}});
@@ -405,15 +356,6 @@ OperatorChoices mixedChoices() {
 void requireMixed(const ExecutionPlans &plans) {
   require(plans.linear().plan(mixedChoices().linear[0].workload).configuration() ==
               LinearConfig{LinearTile::N256, 60}, "linear table was partially replaced");
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049).configuration.splitMultiplier ==
-              PrefillSplitMultiplier::Two,
-          "prefill table was partially replaced");
-  const std::array<uint32_t, 3> histories{31, 32, 2049};
-  const auto verify = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(verify.configuration.splitCount == VerifySplitCount::One &&
-              verify.laneSplits[0] == 1 &&
-              verify.laneSplits[2] == kv::q8VerifyAttentionSplits(1, 2049, 8),
-          "verify table was partially replaced");
   require(plans.draftAttention(draftShapes[0], 3).configuration().groups == 32,
           "draft table was partially replaced");
   require(plans.moeDecode(routedShape, 3).tileRows() == 32 &&
@@ -423,73 +365,13 @@ void requireMixed(const ExecutionPlans &plans) {
 
 void policyKeysAndBounds() {
   ExecutionPlans plans(device());
-  auto choices = mixedChoices();
-  // Deliberately unsorted: each shape has an exact 2048-row selection.
-  choices.prefillAttention.push_back({{attentionShapes[1]},
-                                      {PrefillSplitMultiplier::Two}});
-  plans.install(choices);
+  plans.install(mixedChoices());
   requireMixed(plans);
-  const kv::Layout bf16{1, 4, 256, kv::Format::BFloat16};
-  const std::array<uint32_t, 3> bf16Histories{31, 32, 2049};
-  require(plans.prefillAttention(2048, 24, bf16, 2049).configuration ==
-              PrefillAttentionConfig{} &&
-              plans.verifyAttention(3, 24, bf16, bf16Histories).configuration ==
-              VerifyAttentionConfig{},
-          "INT8 calibration leaked into the BF16 policy");
-  require(!plans.prefillAttention(2048, 24, bf16, 2049).sameExecutionAs(
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049)),
-          "different cache formats aliased the same execution plan");
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0)),
-          "layer count leaked into one-layer plan identity");
-  for (uint32_t history : {1U, 31U, 32U, 33U, 2047U, 2048U, 2050U, 131079U})
-    require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), history).configuration.splitMultiplier ==
-                PrefillSplitMultiplier::Two,
-            "prefill policy was restricted to sampled exact histories");
-  equalWorkspace(plans.prefillAttentionWorkspace(17, 24, layout(attentionShapes[0])),
-                 PagedAttention::prefillWorkspace(17, 24, layout(attentionShapes[0])),
-                 attentionFields);
-  for (const auto shape : attentionShapes)
-    for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const auto selected = plans.prefillAttention(rows, shape.queryHeads, layout(shape), 131079);
-      const auto bound = plans.prefillAttentionWorkspace(rows, shape.queryHeads, layout(shape));
-      covers(bound, selected.workspace, 1, attentionFields);
-      const auto baseline = PagedAttention::prefillPlan(rows, shape.queryHeads, layout(shape), 131079);
-      if (rows < 2048) {
-        require(selected.configuration == PrefillAttentionConfig{} &&
-                    selected.sameExecutionAs(baseline),
-                "fixed-chunk attention selection changed shorter or ragged rows");
-        equalWorkspace(bound, PagedAttention::prefillWorkspace(rows, shape.queryHeads, layout(shape)),
-                       attentionFields);
-      } else {
-        require(selected.configuration.splitMultiplier == PrefillSplitMultiplier::Two &&
-                    !selected.sameExecutionAs(baseline),
-                "fixed-chunk attention selection did not reach its exact row key");
-        equalWorkspace(bound, PagedAttention::prefillWorkspace(
-                                  rows, shape.queryHeads, layout(shape),
-                                  {PrefillSplitMultiplier::Two}),
-                       attentionFields);
-        require(bound.partialsBytes >= selected.workspace.partialsBytes &&
-                    bound.statisticsBytes >= selected.workspace.statisticsBytes,
-                "fixed-chunk arena omitted selected scratch or its baseline fallback");
-      }
-    }
   std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
-  const auto padded = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(padded.configuration.splitCount == VerifySplitCount::One &&
-              padded.laneSplits[3] == 0 &&
-              padded.splits == kv::q8VerifyAttentionSplits(1, 2049, 8),
+  const auto padded = plans.verifyAttention(3, 24, attentionShapes[0].layout, histories);
+  require(padded.laneSplits[3] == 0 && padded.splits == kv::q8VerifyAttentionSplits(2049, 8),
           "padded inactive lookup history was not ignored");
-  std::swap(histories[0], histories[1]);
-  const auto swapped = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(swapped.configuration.splitCount == VerifySplitCount::One &&
-              swapped.splits == padded.splits,
-          "verify policy did not apply to a mixed lane order");
-  require(plans.verifyAttention(2, 24, layout(attentionShapes[0]), histories).splits == 32,
-          "choice extrapolated to another packed width");
-  require(plans.verifyAttention(3, 16, layout(attentionShapes[1]), histories).splits == 32,
-          "choice extrapolated to another GQA shape");
-  const auto verify = plans.verifyAttentionWorkspacePerLane(24, layout(attentionShapes[0]));
+  const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
                   uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
@@ -515,8 +397,7 @@ void policyKeysAndBounds() {
           "draft choice leaked across width or shape");
   plans.install({});
   require(plans.moeDecode(routedShape, 3).tileRows() == 8 &&
-              plans.draftAttention(draftShapes[0], 3).configuration() == DraftAttentionConfiguration{} &&
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0).configuration == PrefillAttentionConfig{},
+              plans.draftAttention(draftShapes[0], 3).configuration() == DraftAttentionConfiguration{},
           "empty install did not reset all tables");
 }
 
@@ -535,16 +416,6 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups::Four; });
   invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups(6); });
   invalid([](auto &c) { c.linear[0].workload.rows = 9; });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.splitMultiplier = PrefillSplitMultiplier(0); });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.splitMultiplier = PrefillSplitMultiplier(3); });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
-  invalid([](auto &c) { c.prefillAttention[0].workload.shape.queryHeads = 32; });
-  invalid([](auto &c) { c.prefillAttention[0].workload.rows = 0; });
-  invalid([](auto &c) { c.prefillAttention[0].workload.rows = 2049; });
-  invalid([](auto &c) { c.verifyAttention[0].configuration.splitCount = VerifySplitCount(0); });
-  invalid([](auto &c) { c.verifyAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
-  invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 5; });
-  invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 0; });
   invalid([](auto &c) { c.draftAttention[0].configuration.groups = 1; });
   invalid([](auto &c) { c.draftAttention[0].workload.shape.dynamicSize = 256; });
   invalid([](auto &c) { c.draftAttention[0].workload.lanes = 0; });
@@ -555,15 +426,13 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.moe[0].workload.phase = MoePhase(255); });
   invalid([](auto &c) { c.moe[0].workload.shape.expertsPerToken = 257; });
   invalid([](auto &c) { c.linear.push_back(c.linear[0]); });
-  invalid([](auto &c) { c.prefillAttention.push_back(c.prefillAttention[0]); });
-  invalid([](auto &c) { c.verifyAttention.push_back(c.verifyAttention[0]); });
   invalid([](auto &c) { c.draftAttention.push_back(c.draftAttention[0]); });
   invalid([](auto &c) { c.moe.push_back(c.moe[0]); });
 }
 
 void invalidLookupsAndContextEdges() {
-  ExecutionPlans plans(device());
-  const auto kvLayout = layout(attentionShapes[0]);
+  const ExecutionPlans plans(device());
+  const auto kvLayout = attentionShapes[0].layout;
   const std::array<uint32_t, 4> histories{0, 1, 2, 3};
   rejects([&] { (void)plans.verifyAttention(0, 24, kvLayout, histories); });
   rejects([&] { (void)plans.verifyAttention(UINT32_MAX, 24, kvLayout, histories); });
@@ -578,12 +447,6 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
   rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
-  OperatorChoices choices;
-  choices.prefillAttention.push_back({{attentionShapes[0]},
-                                      {PrefillSplitMultiplier::Two}});
-  choices.verifyAttention.push_back({{attentionShapes[0], 1},
-                                     {VerifySplitCount::One}});
-  plans.install(choices);
   const auto finalPrefill = plans.prefillAttention(
       1, 24, kvLayout, kv::kMaximumPhysicalTokens - 1);
   require(finalPrefill.rows == 1 &&
@@ -592,8 +455,7 @@ void invalidLookupsAndContextEdges() {
           "valid final physical token was rejected");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
-  require(finalVerify.configuration.splitCount == VerifySplitCount::One &&
-              finalVerify.splits == kv::kQ8VerifyMaximumSplits,
+  require(finalVerify.splits == kv::kQ8VerifyMaximumSplits,
           "valid final physical verify rows were rejected");
   ++edge[0];
   rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });

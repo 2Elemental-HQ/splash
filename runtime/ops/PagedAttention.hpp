@@ -38,18 +38,17 @@ static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits)
 static_assert(kQ8VerifyPagesPerSplit >= 1);
 
 // One lane's verify split count: one split per kQ8VerifyPagesPerSplit
-// visible pages, never fewer than the configured base and never more than
-// the maximum the partial workspace is sized for. It depends only on the
-// lane's own history, so batching never changes a lane's arithmetic.
+// visible pages, never fewer than kQ8VerifySplits and never more than the
+// maximum the partial workspace is sized for. It depends only on the lane's
+// own history, so batching never changes a lane's arithmetic.
 [[nodiscard]] constexpr uint32_t
-q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
-                        uint32_t activeRows) noexcept {
+q8VerifyAttentionSplits(uint32_t committedTokens, uint32_t activeRows) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + activeRows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
       (pages + kQ8VerifyPagesPerSplit - 1) / kQ8VerifyPagesPerSplit;
   return static_cast<uint32_t>(std::min<uint64_t>(
-      std::max<uint64_t>(baseSplits, scaled), kQ8VerifyMaximumSplits));
+      std::max<uint64_t>(kQ8VerifySplits, scaled), kQ8VerifyMaximumSplits));
 }
 
 // Default parameters; the verify plan sets both split counts for each lane
@@ -124,36 +123,11 @@ struct AttentionWorkspace final {
   uint64_t statisticsBytes = 0;
 };
 
-// Both kernels use one full-K QK multiply. Only the key-scale placement differs.
-enum class AttentionScalePlacement : uint8_t { Softmax = 0, Cooperative = 1 };
-
-// One preserves the shipped row-dependent split count; Two offers additional
-// history parallelism with an explicitly larger scratch bound.
-enum class PrefillSplitMultiplier : uint32_t { One = 1, Two = 2 };
-struct PrefillAttentionConfig final {
-  PrefillSplitMultiplier splitMultiplier = PrefillSplitMultiplier::One;
-  AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
-  bool operator==(const PrefillAttentionConfig &) const = default;
-};
-
-enum class VerifySplitCount : uint32_t {
-  One = 1,
-  Eight = 8,
-  Sixteen = 16,
-  ThirtyTwo = 32
-};
-struct VerifyAttentionConfig final {
-  VerifySplitCount splitCount = VerifySplitCount::ThirtyTwo;
-  AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
-  bool operator==(const VerifyAttentionConfig &) const = default;
-};
-
 // Immutable factory-built plans are shared by allocation, measurement and
 // encoding. Each prefill uses one split dispatch followed by one reduction.
 // Callers cannot replace a dispatch or reduce its scratch bound.
 struct PrefillAttentionPlan final {
   const kv::Format format;
-  const PrefillAttentionConfig configuration;
   const uint32_t rows;
   const uint32_t historyTokens;
   const uint32_t splits;
@@ -163,18 +137,14 @@ struct PrefillAttentionPlan final {
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
 
-  // Policy provenance is irrelevant when its resolved execution is identical.
-  [[nodiscard]] bool sameExecutionAs(const PrefillAttentionPlan &other) const noexcept;
-
 private:
   friend class PagedAttention;
-  PrefillAttentionPlan(PrefillAttentionConfig configuration, uint32_t rows,
-                       uint32_t historyTokens, uint32_t splits,
+  PrefillAttentionPlan(uint32_t rows, uint32_t historyTokens, uint32_t splits,
                        AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        kv::Format format)
-      : format(format), configuration(configuration), rows(rows), historyTokens(historyTokens),
+      : format(format), rows(rows), historyTokens(historyTokens),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups) {}
@@ -182,7 +152,6 @@ private:
 
 struct VerifyAttentionPlan final {
   const kv::Format format;
-  const VerifyAttentionConfig configuration;
   const uint32_t lanes;
   // Each lane's history-scaled split count; splits is their maximum, the
   // split grid and the slot stride of every lane's partials. The workspace
@@ -195,22 +164,19 @@ struct VerifyAttentionPlan final {
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
 
-  // Compare resolved execution, including each lane's history partition.
-  [[nodiscard]] bool sameExecutionAs(const VerifyAttentionPlan &other) const noexcept;
-
 private:
   friend class PagedAttention;
   const std::string_view storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
-  VerifyAttentionPlan(VerifyAttentionConfig configuration, uint32_t lanes,
+  VerifyAttentionPlan(uint32_t lanes,
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads, kv::Format format)
-      : format(format), configuration(configuration), lanes(lanes), laneSplits(laneSplits),
+      : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
@@ -232,19 +198,14 @@ struct PagedVerifyBuffers final {
 // semantics.
 class PagedAttention final {
 public:
-  [[nodiscard]] static std::span<const PrefillAttentionConfig>
-  prefillCandidates() noexcept;
-  [[nodiscard]] static std::span<const VerifyAttentionConfig>
-  verifyCandidates() noexcept;
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-              uint32_t historyTokens, PrefillAttentionConfig configuration = {});
+              uint32_t historyTokens);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // sized to the batch width or to the maximum width with inactive lanes zero.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens,
-             VerifyAttentionConfig configuration = {});
+             std::span<const uint32_t> historyTokens);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -252,11 +213,9 @@ public:
   // the maximum split count.
   [[nodiscard]] static AttentionWorkspace
   prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
-                   kv::Layout layout,
-                   PrefillAttentionConfig configuration = {});
+                   kv::Layout layout);
   [[nodiscard]] static AttentionWorkspace
-  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-                  VerifyAttentionConfig configuration = {});
+  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout);
 
   static void
   addPrefillProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
@@ -305,8 +264,8 @@ public:
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
-  // prefillWorkspace() bounds every legal history for
-  // the command's largest sequence and configuration.
+  // prefillWorkspace() bounds every legal history for the command's largest
+  // sequence.
   static void addPrefill(metal::CommandGraph &graph, SplashKvLayer layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,

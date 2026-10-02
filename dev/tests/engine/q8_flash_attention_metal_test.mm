@@ -68,12 +68,9 @@ void testContract() {
   scaled.slot_splits = scaled.split_count - 1;
   require(q8VerifyAttentionValidationError(scaled) == "slot_splits_invalid",
           "slot stride below the lane's split count was accepted");
-  require(q8VerifyAttentionSplits(kQ8VerifySplits, 0, 8) == kQ8VerifySplits &&
-              q8VerifyAttentionSplits(kQ8VerifySplits, 16 * 1024, 8) ==
-                  kQ8VerifySplits + 1 &&
-              q8VerifyAttentionSplits(kQ8VerifySplits, 131072, 8) ==
-                  kQ8VerifyMaximumSplits &&
-              q8VerifyAttentionSplits(1, 0, 8) == 1,
+  require(q8VerifyAttentionSplits(0, 8) == kQ8VerifySplits &&
+              q8VerifyAttentionSplits(16 * 1024, 8) == kQ8VerifySplits + 1 &&
+              q8VerifyAttentionSplits(131072, 8) == kQ8VerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
   ++finalCycle.committed_tokens;
   require(q8VerifyAttentionValidationError(finalCycle) ==
@@ -354,7 +351,7 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
   return output;
 }
 
-// One scale placement of one geometry, with the shared reduction.
+// The split and reduce of one geometry.
 struct Pipelines {
   std::string splitName;
   id<MTLComputePipelineState> split;
@@ -362,11 +359,9 @@ struct Pipelines {
 };
 
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
-                        Shape shape, bool cooperativeScale) {
-  const std::string variant =
-      std::string(cooperativeScale ? "_cooperative_scale" : "") + shape.suffix;
+                        Shape shape) {
   Pipelines result;
-  result.splitName = "verify_attention_q8_split" + variant;
+  result.splitName = std::string("verify_attention_q8_split") + shape.suffix;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
       device, library, std::string("verify_attention_q8_reduce") + shape.suffix);
@@ -375,7 +370,7 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
   require(scratch == makePipeline(device, library,
-                                  "prefill_attention_q8_split" + variant)
+                                  std::string("prefill_attention_q8_split") + shape.suffix)
                          .staticThreadgroupMemoryLength,
           "verify tile left the shared score/probability footprint");
   return result;
@@ -537,7 +532,7 @@ void checkOutput(const Case &data, uint32_t width,
 // Independent submissions of the same graph, and of the same pages in another
 // extent layout, must preserve all outputs and scratch results. Report the
 // first differing element before failing.
-void requireIdentical(const Pipelines &placement, const Case &data,
+void requireIdentical(const Pipelines &pipelines, const Case &data,
                       uint32_t width, const Dispatch &first,
                       const Dispatch &repeat, const char *repeated) {
   struct Buffer {
@@ -575,7 +570,7 @@ void requireIdentical(const Pipelines &placement, const Case &data,
       differing += left[i] != right[i];
     differing += std::max(left.size(), right.size()) - std::min(left.size(), right.size());
     std::cout << repeated << " differs from the first submission: pipeline="
-              << placement.splitName << " kv_heads=" << data.shape.kvHeads
+              << pipelines.splitName << " kv_heads=" << data.shape.kvHeads
               << " group=" << data.shape.queryHeadsPerKvHead
               << " committed=" << data.params.committed_tokens
               << " active_rows=" << data.params.active_rows
@@ -589,11 +584,11 @@ void requireIdentical(const Pipelines &placement, const Case &data,
   }
 }
 
-// Keep the CPU reference gates for both scale placements and verify that a
-// second independent submission, and the same pages in one extent, produce
-// identical output and scratch.
+// Keep the CPU reference gates and verify that a second independent
+// submission, and the same pages in one extent, produce identical output and
+// scratch.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
-             const std::array<Pipelines, 2> &pipelines, Shape shape,
+             const Pipelines &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
              bool qualityGate = true, uint32_t splits = kQ8VerifySplits) {
   require(width >= 1 && width <= 4, "invalid verify batch width");
@@ -602,21 +597,19 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Case oneExtent = oneExtentCopy(device, data);
   const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
-  for (const Pipelines &placement : pipelines) {
-    const Dispatch first =
-        dispatch(device, queue, placement.split, placement.reduce, data, width);
-    checkOutput(data, width, expectedQ8, expectedBf16, first.output,
-                qualityGate, placement.splitName);
-    const Dispatch repeat =
-        dispatch(device, queue, placement.split, placement.reduce, data, width);
-    checkOutput(data, width, expectedQ8, expectedBf16, repeat.output,
-                qualityGate, placement.splitName + "_repeat");
-    requireIdentical(placement, data, width, first, repeat, "verify repeat");
-    requireIdentical(placement, data, width, first,
-                     dispatch(device, queue, placement.split, placement.reduce,
-                              oneExtent, width),
-                     "verify over one extent");
-  }
+  const Dispatch first =
+      dispatch(device, queue, pipelines.split, pipelines.reduce, data, width);
+  checkOutput(data, width, expectedQ8, expectedBf16, first.output,
+              qualityGate, pipelines.splitName);
+  const Dispatch repeat =
+      dispatch(device, queue, pipelines.split, pipelines.reduce, data, width);
+  checkOutput(data, width, expectedQ8, expectedBf16, repeat.output,
+              qualityGate, pipelines.splitName + "_repeat");
+  requireIdentical(pipelines, data, width, first, repeat, "verify repeat");
+  requireIdentical(pipelines, data, width, first,
+                   dispatch(device, queue, pipelines.split, pipelines.reduce,
+                            oneExtent, width),
+                   "verify over one extent");
 }
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
@@ -733,9 +726,7 @@ void run(const char *libraryPath) {
     for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U})
       for (uint32_t activeRows : {1U, 8U})
         checkReduce(device, queue, library, shape, splits, activeRows);
-    const std::array<Pipelines, 2> pipelines{
-        makePipelines(device, library, shape, false),
-        makePipelines(device, library, shape, true)};
+    const Pipelines pipelines = makePipelines(device, library, shape);
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
     runCase(device, queue, pipelines, shape, 0, 8, 4);

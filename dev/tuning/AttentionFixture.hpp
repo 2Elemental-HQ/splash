@@ -3,7 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
-#include "ops/ExecutionPlans.hpp"
+#include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -19,11 +19,19 @@
 #include <utility>
 #include <vector>
 
-// The paged-attention fixture the attention tuner and attention-sweep time:
-// deterministic Page32 history of every lane in the extents of a pool, one
-// chunk of rows per lane with its queries, and the production store and
-// attention graph over them.
+// The paged-attention fixture attention-sweep times: deterministic Page32
+// history of every lane in the extents of a pool, one chunk of rows per lane
+// with its queries, and the production store and attention graph over them.
 namespace splash::ops::tuning {
+
+// The target attention layer a fixture holds: its query and KV heads and its
+// cache format.
+struct AttentionShape final {
+  uint32_t queryHeads = 0;
+  uint32_t kvHeads = 0;
+  uint32_t headDimension = 0;
+  kv::Format format = kv::Format::Int8;
+};
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
 // poolLayers attention layers, in extents of extentPages pages.

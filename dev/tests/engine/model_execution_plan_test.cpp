@@ -75,12 +75,7 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   const auto geometry = std::visit([](const auto &weights) {
     return model::qwenTargetGeometry(weights);
   }, package.target);
-  const ops::AttentionShape attention{geometry.attentionQueryHeads,
-                                      geometry.attentionKvHeads,
-                                      geometry.attentionHeadDimension};
   ops::OperatorChoices choices;
-  choices.prefillAttention.push_back(
-      {{attention}, {ops::PrefillSplitMultiplier::Two}});
   choices.draftAttention.push_back(
       {{package.draft.layout.attentionShape(), 3}, {80}});
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
@@ -89,27 +84,6 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   ops::ExecutionPlans selected(device);
   selected.install(choices);
   const auto after = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
-  const auto prefillBefore = baseline.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const auto prefillAfter = selected.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const uint64_t prefillGrowth =
-      alignUp(prefillAfter.partialsBytes) - alignUp(prefillBefore.partialsBytes) +
-      alignUp(prefillAfter.statisticsBytes) - alignUp(prefillBefore.statisticsBytes);
-  // The selected split count and the fallback baseline share an arena whose
-  // governed bound includes the larger candidate's exact scratch requirement.
-  require(prefillGrowth > 0 &&
-              after.sharedPrefillPlannedAllocatedBytes ==
-                  before.sharedPrefillPlannedAllocatedBytes + prefillGrowth,
-          "runtime prefill allocation lost the selected split workspace bound");
-  const auto selectedPrefill = selected.prefillAttention(
-      2048, attention.queryHeads, geometry.kvLayout, 131072);
-  require(selectedPrefill.configuration.splitMultiplier == ops::PrefillSplitMultiplier::Two &&
-              selectedPrefill.workspace.partialsBytes ==
-                  2 * baseline.prefillAttention(2048, attention.queryHeads,
-                                             geometry.kvLayout, 131072)
-                      .workspace.partialsBytes,
-          "runtime did not install the selected prefill split plan");
 
   uint64_t decodeGrowth = 0;
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe) {

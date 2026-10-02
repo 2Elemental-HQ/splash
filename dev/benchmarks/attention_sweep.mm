@@ -3,9 +3,9 @@
 // verify batch (8 rows per lane, one and four lanes). Each case builds the same
 // store + attention graph the executor encodes, reports the fused GPU time of
 // the whole graph and, with each dispatch submitted as its own command, the GPU
-// time of each pipeline over the attention tuner's deterministic synthetic
-// history (tuning/AttentionFixture.hpp). These are kernel timings, not a
-// correctness oracle (the tuning tests are). The KV sits in extents of the size
+// time of each pipeline over the deterministic synthetic history of
+// tuning/AttentionFixture.hpp. These are kernel timings, not a correctness
+// oracle (the attention kernel tests are). The KV sits in extents of the size
 // the memory plan picks for the model, or of --extent-pages pages, which must
 // hold whole alignment units of every swept shape; the swept layer is the
 // second of two so that its region starts past the first one's, and each case
@@ -23,7 +23,7 @@
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "ops/ExecutionPlans.hpp"
+#include "ops/PagedAttention.hpp"
 #include "tuning/AttentionFixture.hpp"
 
 #include <algorithm>
@@ -48,6 +48,7 @@ using namespace splash::ops;
 
 using tuning::AttentionFixture;
 using tuning::AttentionFixturePlan;
+using tuning::AttentionShape;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
@@ -64,7 +65,7 @@ AttentionShape shapeOf(const std::string &shape, kv::Format format) {
 }
 
 // The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
-// after `history` tokens, with scratch for the default configuration.
+// after `history` tokens, with their plan's scratch.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                               uint32_t history, uint32_t extentPages) {
   const kv::Layout layout{1, shape.kvHeads, shape.headDimension, shape.format};

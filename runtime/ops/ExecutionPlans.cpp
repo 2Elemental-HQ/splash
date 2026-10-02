@@ -13,31 +13,6 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 static_assert(kMaximumLanes == 4);
 
-AttentionShape attentionShape(uint32_t queryHeads, kv::Layout layout) {
-  return {queryHeads, layout.kvHeads, layout.headDimension, layout.format};
-}
-kv::Layout attentionLayout(AttentionShape shape) {
-  // Layer count affects the persistent cache, not one layer's execution key.
-  return {1, shape.kvHeads, shape.headDimension, shape.format};
-}
-
-void validateHistory(uint32_t history, uint32_t rows) {
-  if (uint64_t{history} + rows > kv::kMaximumPhysicalTokens)
-    throw std::invalid_argument("attention choice history exceeds context");
-}
-VerifyAttentionPolicy verifyKey(uint32_t lanes, uint32_t queryHeads,
-                                 kv::Layout layout,
-                                 std::span<const uint32_t> histories) {
-  if (!lanes || lanes > kMaximumLanes ||
-      (histories.size() != lanes && histories.size() != kMaximumLanes))
-    throw std::invalid_argument("invalid verify attention history vector");
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    validateHistory(histories[lane], kDecodeRows);
-  return {attentionShape(queryHeads, layout), lanes};
-}
-
-constexpr std::array attentionFields{
-    &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
 constexpr std::array draftFields{
     &DraftAttentionWorkspace::convolutionBytes,
     &DraftAttentionWorkspace::qkvBytes,
@@ -81,19 +56,6 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
   Linear nextLinear = baselineLinear_;
   nextLinear.setChoices(pending.linear);
-  for (const auto &choice : pending.prefillAttention) {
-    const auto &w = choice.workload;
-    (void)PagedAttention::prefillPlan(w.rows, w.shape.queryHeads,
-                                    attentionLayout(w.shape), 0,
-                                    choice.configuration);
-  }
-  for (const auto &choice : pending.verifyAttention) {
-    const auto &w = choice.workload;
-    const std::array<uint32_t, kMaximumLanes> histories{};
-    (void)PagedAttention::verifyPlan(w.lanes, w.shape.queryHeads,
-                                   attentionLayout(w.shape), histories,
-                                   choice.configuration);
-  }
   for (const auto &choice : pending.draftAttention)
     (void)DraftAttention::plan(choice.workload.shape, choice.workload.lanes,
                                choice.configuration);
@@ -105,8 +67,6 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
     // although moePlan replaces it.
     (void)phasePlan(w, choice.configuration);
   }
-  sortUniqueChoices(pending.prefillAttention);
-  sortUniqueChoices(pending.verifyAttention);
   sortUniqueChoices(pending.draftAttention);
   sortUniqueChoices(pending.moe);
   // All potentially throwing work is above. No partial table install can
@@ -118,21 +78,13 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout,
     uint32_t historyTokens) const {
-  validateHistory(historyTokens, rows);
-  const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
-  return PagedAttention::prefillPlan(
-      rows, queryHeads, layout, historyTokens,
-      chosenConfiguration(choices_.prefillAttention, workload,
-                       PrefillAttentionConfig{}));
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens) const {
-  const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
-  return PagedAttention::verifyPlan(
-      lanes, queryHeads, layout, historyTokens,
-      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -188,33 +140,13 @@ std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
     uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const {
-  auto bound = PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
-  const auto shape = attentionShape(queryHeads, layout);
-  for (const auto &choice : choices_.prefillAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape && w.rows <= maximumRows)
-      include(bound, PagedAttention::prefillWorkspace(
-                         w.rows, queryHeads, layout, choice.configuration),
-              attentionFields);
-  }
-  return bound;
+  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
 }
 
+// The verify bound is linear in the lanes: one lane's is every width's share.
 AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
     uint32_t queryHeads, kv::Layout layout) const {
-  AttentionWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, PagedAttention::verifyWorkspace(lanes, queryHeads, layout),
-            attentionFields, lanes);
-  const auto shape = attentionShape(queryHeads, layout);
-  for (const auto &choice : choices_.verifyAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape)
-      include(bound, PagedAttention::verifyWorkspace(
-                         w.lanes, queryHeads, layout, choice.configuration),
-              attentionFields, w.lanes);
-  }
-  return bound;
+  return PagedAttention::verifyWorkspace(1, queryHeads, layout);
 }
 
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(

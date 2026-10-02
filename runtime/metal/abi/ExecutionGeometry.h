@@ -23,8 +23,8 @@
 // and with it the rounding, is the same on every machine and lane count.
 #define SPLASH_DRAFT_ATTENTION_SPLITS 4u
 // Verify attention runs one split per this many visible Page32 blocks, at
-// least the configured split count and at most the maximum that sizes the
-// partial workspace (ops::q8VerifyAttentionSplits).
+// least SPLASH_VERIFY_ATTENTION_SPLITS and at most the maximum that sizes the
+// partial workspace (kv::q8VerifyAttentionSplits).
 #define SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT 16u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u

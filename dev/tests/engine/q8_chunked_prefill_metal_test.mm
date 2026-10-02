@@ -200,8 +200,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   result.output = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   const auto workspace = splash::ops::PagedAttention::prefillWorkspace(
-      chunk, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      {splash::ops::PrefillSplitMultiplier::Two});
+      chunk, kQueryHeads, {1, kKvHeads, kHeadDimension});
   result.partials = makeBuffer(device, workspace.partialsBytes);
   result.statistics = makeBuffer(device, workspace.statisticsBytes);
   return result;
@@ -289,11 +288,10 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
 
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
-                     splash::ops::PrefillAttentionConfig config = {},
                      const Q8PrefillAttentionParams *overrideParams = nullptr) {
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      data.params.committed_tokens, config);
+      data.params.committed_tokens);
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
@@ -571,12 +569,12 @@ void testAttentionGeometries(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 // Keep the logical query, stored Q8 representation and causal row fixed while
-// checking each split multiplier and unaligned host chunk against a bounded
-// scalar Q8 oracle. Different partitionings can legitimately round differently.
-void testChunkAndSplitReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                               id<MTLComputePipelineState> store,
-                               const AttentionPipelines &attention) {
-  using namespace splash::ops;
+// checking each unaligned host chunk, and with it each chunk's split count,
+// against a bounded scalar Q8 oracle. Different partitionings can legitimately
+// round differently.
+void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                        id<MTLComputePipelineState> store,
+                        const AttentionPipelines &attention) {
   constexpr uint32_t history = 4093, rows = 2048;
   Case data = makeCase(device, history, rows, rows);
   fillHistory(data);
@@ -587,112 +585,107 @@ void testChunkAndSplitReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
     referenceHeads[2 * kvHead] = kvHead * kQueryHeadsPerKvHead;
     referenceHeads[2 * kvHead + 1] = (kvHead + 1) * kQueryHeadsPerKvHead - 1;
   }
-  for (const auto config :
-       {PrefillAttentionConfig{PrefillSplitMultiplier::One},
-        PrefillAttentionConfig{PrefillSplitMultiplier::Two}})
-    for (std::span<const uint32_t> chunks :
-         {std::span<const uint32_t>(whole), std::span<const uint32_t>(fragmented)}) {
-      uint32_t offset = 0;
-      for (uint32_t chunk : chunks) {
-        data.params.committed_tokens = history + offset;
-        data.params.chunk_tokens = chunk;
-        fillCurrent(data, 0, offset);
-        std::memset(data.output.contents, 0xff, data.output.length);
-        id<MTLCommandBuffer> command = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        encodeStore(encoder, store, data);
-        encodeAttention(encoder, attention, data, config);
-        [encoder endEncoding];
-        finish(command);
-        const auto referenceRows = chunkReferenceRows(data);
-        validateAttention(data, referenceRows, referenceHeads);
-        const auto *output = static_cast<const BFloat16Bits *>(data.output.contents);
-        const std::vector<BFloat16Bits> first(
-            output, output + data.output.length / sizeof(BFloat16Bits));
-        const auto validateCoverage = [&] {
-          for (uint32_t head = 0; head < kQueryHeads; ++head)
-            for (uint32_t row = 0; row < rows; ++row)
-              for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-                const auto value = output[attentionIndex(rows, head, row, dimension)];
-                if (row < chunk) {
-                  require(std::isfinite(bfloat16ToFloat(value)), "chunked output is nonfinite");
-                } else {
-                  require(value == 0xffff, "prefill split overwrote an inactive output row");
-                }
-              }
-        };
-        validateCoverage();
-        std::memset(data.output.contents, 0xff, data.output.length);
-        command = [queue commandBuffer];
-        encoder = [command computeCommandEncoder];
-        encodeAttention(encoder, attention, data, config);
-        [encoder endEncoding];
-        finish(command);
-        validateCoverage();
-        size_t differences = 0;
-        float maximumError = 0;
-        uint32_t worstRow = 0, worstHead = 0;
-        double dot = 0, firstSquared = 0, repeatedSquared = 0;
+  for (std::span<const uint32_t> chunks :
+       {std::span<const uint32_t>(whole), std::span<const uint32_t>(fragmented)}) {
+    uint32_t offset = 0;
+    for (uint32_t chunk : chunks) {
+      data.params.committed_tokens = history + offset;
+      data.params.chunk_tokens = chunk;
+      fillCurrent(data, 0, offset);
+      std::memset(data.output.contents, 0xff, data.output.length);
+      id<MTLCommandBuffer> command = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+      encodeStore(encoder, store, data);
+      encodeAttention(encoder, attention, data);
+      [encoder endEncoding];
+      finish(command);
+      const auto referenceRows = chunkReferenceRows(data);
+      validateAttention(data, referenceRows, referenceHeads);
+      const auto *output = static_cast<const BFloat16Bits *>(data.output.contents);
+      const std::vector<BFloat16Bits> first(
+          output, output + data.output.length / sizeof(BFloat16Bits));
+      const auto validateCoverage = [&] {
         for (uint32_t head = 0; head < kQueryHeads; ++head)
-          for (uint32_t row = 0; row < chunk; ++row)
+          for (uint32_t row = 0; row < rows; ++row)
             for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-              const auto index = attentionIndex(rows, head, row, dimension);
-              const float left = bfloat16ToFloat(first[index]);
-              const float right = bfloat16ToFloat(output[index]);
-              differences += first[index] != output[index];
-              if (const float error = std::abs(left - right); error > maximumError) {
-                maximumError = error;
-                worstRow = row;
-                worstHead = head;
+              const auto value = output[attentionIndex(rows, head, row, dimension)];
+              if (row < chunk) {
+                require(std::isfinite(bfloat16ToFloat(value)), "chunked output is nonfinite");
+              } else {
+                require(value == 0xffff, "prefill split overwrote an inactive output row");
               }
-              dot += double(left) * right;
-              firstSquared += double(left) * left;
-              repeatedSquared += double(right) * right;
             }
-        const double cosine = dot / std::sqrt(firstSquared * repeatedSquared);
-        require(maximumError < 0.035f && cosine > 0.999,
-                "repeated attention exceeds numerical tolerance");
-        if (differences) {
-          std::cout << "attention repeat: history=" << data.params.committed_tokens
-                    << " chunk=" << chunk << " split_multiplier="
-                    << static_cast<uint32_t>(config.splitMultiplier)
-                    << " differences=" << differences
-                    << " maximum_absolute_error=" << maximumError
-                    << " cosine=" << cosine << '\n';
-          // Expand the independent reference sample to include the worst
-          // difference. Keep its aggregate cosine domain: a near-zero vector
-          // alone can have low cosine despite negligible absolute error.
-          std::vector<uint32_t> checkedRows(referenceRows);
-          std::vector<uint32_t> checkedHeads(referenceHeads.begin(), referenceHeads.end());
-          checkedRows.push_back(worstRow);
-          checkedHeads.push_back(worstHead);
-          for (auto *indices : {&checkedRows, &checkedHeads}) {
-            std::sort(indices->begin(), indices->end());
-            indices->erase(std::unique(indices->begin(), indices->end()), indices->end());
+      };
+      validateCoverage();
+      std::memset(data.output.contents, 0xff, data.output.length);
+      command = [queue commandBuffer];
+      encoder = [command computeCommandEncoder];
+      encodeAttention(encoder, attention, data);
+      [encoder endEncoding];
+      finish(command);
+      validateCoverage();
+      size_t differences = 0;
+      float maximumError = 0;
+      uint32_t worstRow = 0, worstHead = 0;
+      double dot = 0, firstSquared = 0, repeatedSquared = 0;
+      for (uint32_t head = 0; head < kQueryHeads; ++head)
+        for (uint32_t row = 0; row < chunk; ++row)
+          for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+            const auto index = attentionIndex(rows, head, row, dimension);
+            const float left = bfloat16ToFloat(first[index]);
+            const float right = bfloat16ToFloat(output[index]);
+            differences += first[index] != output[index];
+            if (const float error = std::abs(left - right); error > maximumError) {
+              maximumError = error;
+              worstRow = row;
+              worstHead = head;
+            }
+            dot += double(left) * right;
+            firstSquared += double(left) * left;
+            repeatedSquared += double(right) * right;
           }
-          validateAttention(data, checkedRows, checkedHeads);
+      const double cosine = dot / std::sqrt(firstSquared * repeatedSquared);
+      require(maximumError < 0.035f && cosine > 0.999,
+              "repeated attention exceeds numerical tolerance");
+      if (differences) {
+        std::cout << "attention repeat: history=" << data.params.committed_tokens
+                  << " chunk=" << chunk << " differences=" << differences
+                  << " maximum_absolute_error=" << maximumError
+                  << " cosine=" << cosine << '\n';
+        // Expand the independent reference sample to include the worst
+        // difference. Keep its aggregate cosine domain: a near-zero vector
+        // alone can have low cosine despite negligible absolute error.
+        std::vector<uint32_t> checkedRows(referenceRows);
+        std::vector<uint32_t> checkedHeads(referenceHeads.begin(), referenceHeads.end());
+        checkedRows.push_back(worstRow);
+        checkedHeads.push_back(worstHead);
+        for (auto *indices : {&checkedRows, &checkedHeads}) {
+          std::sort(indices->begin(), indices->end());
+          indices->erase(std::unique(indices->begin(), indices->end()), indices->end());
         }
-        offset += chunk;
+        validateAttention(data, checkedRows, checkedHeads);
       }
-      require(offset == rows, "chunk reference test changed total logical rows");
-      // Pages no table leases, and the other layer of every page, must keep
-      // their zeros through the direct stores.
-      const HostKvExtents &pages = *data.pool->pages;
-      for (uint32_t page = 0; page < pages.pageCount(); ++page) {
-        const bool leased = std::find(data.pageTable.begin(), data.pageTable.end(),
-                                      page) != data.pageTable.end();
-        for (uint32_t layer = 0; layer <= kLayer; ++layer)
-          for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
-            if (leased && layer == kLayer) continue;
-            const auto *bytes = pages.slab<const uint8_t>(layer, tensor, page);
-            const uint64_t pageBytes =
-                tensor % 2 ? kKeyScaleBytesPerLayerPage : kKeyDataBytesPerLayerPage;
-            require(std::all_of(bytes, bytes + pageBytes,
-                                [](uint8_t value) { return value == 0; }),
-                    "an unleased Q8 page or another layer was overwritten");
-          }
-      }
+      offset += chunk;
     }
+    require(offset == rows, "chunk reference test changed total logical rows");
+    // Pages no table leases, and the other layer of every page, must keep
+    // their zeros through the direct stores.
+    const HostKvExtents &pages = *data.pool->pages;
+    for (uint32_t page = 0; page < pages.pageCount(); ++page) {
+      const bool leased = std::find(data.pageTable.begin(), data.pageTable.end(),
+                                    page) != data.pageTable.end();
+      for (uint32_t layer = 0; layer <= kLayer; ++layer)
+        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
+          if (leased && layer == kLayer) continue;
+          const auto *bytes = pages.slab<const uint8_t>(layer, tensor, page);
+          const uint64_t pageBytes =
+              tensor % 2 ? kKeyScaleBytesPerLayerPage : kKeyDataBytesPerLayerPage;
+          require(std::all_of(bytes, bytes + pageBytes,
+                              [](uint8_t value) { return value == 0; }),
+                  "an unleased Q8 page or another layer was overwritten");
+        }
+    }
+  }
 }
 
 void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
@@ -714,7 +707,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
       std::memset(buffer.contents, 0xa5, buffer.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    encodeAttention(encoder, attention, data, {}, &params);
+    encodeAttention(encoder, attention, data, &params);
     [encoder endEncoding];
     finish(command);
     for (id<MTLBuffer> buffer : {data.partials, data.statistics, data.output}) {
@@ -919,7 +912,7 @@ void run(const char *libraryPath) {
   testContract();
   testAttentionAndDirectStore(device, queue, store, attention);
   testAttentionGeometries(device, queue, store, attention);
-  testChunkAndSplitReference(device, queue, store, attention);
+  testChunkReference(device, queue, store, attention);
   testInvalidAttentionParams(device, queue, attention);
   testCommitIndexOverwrite(device, queue, store);
   testBatchedVerifyStore(device, queue, verifyStore);

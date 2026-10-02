@@ -29,34 +29,28 @@ void attention() {
   using namespace splash;
   for (const uint32_t queryHeads : {16U, 24U}) {
     const kv::Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
-    for (const auto config : ops::PagedAttention::prefillCandidates()) {
-      uint32_t maximumSlots = 0;
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
-        // Split counts decrease as the M8 tile count grows, so a shorter
-        // request can need more scratch than the exact requested row count.
-        const uint32_t tiles = (rows + 7) / 8;
-        const uint32_t splits = std::min(
-            32U, static_cast<uint32_t>(config.splitMultiplier) *
-                     std::clamp(32U / tiles, 1U, 32U));
-        maximumSlots = std::max(maximumSlots, tiles * splits);
-        const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout, config);
-        require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
-                "prefill partial workspace differs from the maximum over actual row counts");
-        require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
-                "prefill statistics workspace differs from the maximum over actual row counts");
-        for (uint32_t history : {0U, 4095U, 4096U, 131072U, kv::kMaximumPhysicalTokens - rows}) {
-          const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history, config);
-          require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                      workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-                  "prefill workspace omitted actual rows at a valid context boundary");
-        }
+    uint32_t maximumSlots = 0;
+    for (uint32_t rows = 1; rows <= 2048; ++rows) {
+      // Split counts decrease as the M8 tile count grows, so a shorter
+      // request can need more scratch than the exact requested row count.
+      const uint32_t tiles = (rows + 7) / 8;
+      const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+      maximumSlots = std::max(maximumSlots, tiles * splits);
+      const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
+      require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
+              "prefill partial workspace differs from the maximum over actual row counts");
+      require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
+              "prefill statistics workspace differs from the maximum over actual row counts");
+      for (uint32_t history : {0U, 4095U, 4096U, 131072U, kv::kMaximumPhysicalTokens - rows}) {
+        const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history);
+        require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
+                    workspace.statisticsBytes >= plan.workspace.statisticsBytes,
+                "prefill workspace omitted actual rows at a valid context boundary");
       }
-      const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout, config);
-      const uint64_t expectedMiB = (queryHeads == 24 ? 48U : 32U) *
-                                  static_cast<uint32_t>(config.splitMultiplier);
-      require(maximum.partialsBytes == expectedMiB * 1024 * 1024,
-              "2048-row prefill partial workspace changed");
     }
+    const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
+    require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
+            "2048-row prefill partial workspace changed");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace =
           ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);

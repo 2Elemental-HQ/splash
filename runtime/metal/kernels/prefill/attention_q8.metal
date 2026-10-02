@@ -4,7 +4,7 @@
 // (splash_paged_attention_tile) over eight query rows of one KV head.
 
 // Prefill split: KV heads vary first, then query tiles, then history splits.
-template <uint KVHeads, uint QueryHeadsPerKVHead, bool ScaleInSoftmax, typename CacheElement>
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
 inline void splash_prefill_attention_split_phase(
     device bfloat *queries, device float *partials,
     device float *statistics, device const SplashKvPage *page_table,
@@ -27,8 +27,7 @@ inline void splash_prefill_attention_split_phase(
                       QueryHeadsPerKVHead * D;
   ulong slot = (ulong(tile) * KVHeads + kv_head) * params.split_count + split;
   splash_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
-                              SPLASH_PREFILL_ATTENTION_TILE_ROWS, ScaleInSoftmax,
-                              CacheElement>(
+                              SPLASH_PREFILL_ATTENTION_TILE_ROWS, CacheElement>(
       queries + tile_offset, page_table, params.kv, kv_head,
       params.committed_tokens + tile_start, active_rows, params.split_count, split,
       partials, statistics, slot, scores, probabilities, row_max, row_sum,
@@ -64,7 +63,7 @@ inline void splash_q8_prefill_attention_reduce_phase(
       thread_index);
 }
 
-#define Q8_PREFILL_SPLIT(Name, Heads, Group, ScaleInSoftmax, CacheElement)     \
+#define Q8_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -81,22 +80,17 @@ inline void splash_q8_prefill_attention_reduce_phase(
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic_uint rescale;                                           \
-    splash_prefill_attention_split_phase<Heads, Group, ScaleInSoftmax,         \
-                                         CacheElement>(                        \
+    splash_prefill_attention_split_phase<Heads, Group, CacheElement>(          \
         queries, partials, statistics, page_table, params, scores,             \
         probabilities, row_max, row_sum, previous_scale, &rescale, group,      \
         thread_index);                                                         \
   }
 
-Q8_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, true, int8_t)
-Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale,
-                4, 6, false, int8_t)
-Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, true, int8_t)
-Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale_kv2_g8,
-                2, 8, false, int8_t)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, int8_t)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
-Q8_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, true, bfloat)
-Q8_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, true, bfloat)
+Q8_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
+Q8_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
 #undef Q8_PREFILL_SPLIT
 
 kernel void prefill_attention_q8_reduce(

@@ -112,9 +112,6 @@ TuningWorkloads collectTuningWorkloads(
   TuningWorkloads result;
   std::visit([&](const auto &target) {
     const auto geometry = qwenTargetGeometry(target);
-    result.targetAttention = {geometry.attentionQueryHeads,
-                              geometry.attentionKvHeads,
-                              geometry.attentionHeadDimension};
     if (target.layers.empty())
       throw std::invalid_argument("operator probes require target layers");
     for (const auto &layer : target.layers) {

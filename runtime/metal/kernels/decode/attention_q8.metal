@@ -86,27 +86,23 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   if (!tile.active)                                                            \
     return;
 
-#define Q8_VERIFY_SPLIT(Name, Heads, Group, ScaleInSoftmax, CacheElement)      \
+#define Q8_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                      \
   Q8_VERIFY_SPLIT_SIGNATURE(Name) {                                            \
     Q8_VERIFY_SCRATCH(Group)                                                   \
     Q8_VERIFY_TILE_AT(Heads, Group)                                            \
     splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
-                                ScaleInSoftmax, CacheElement>(                 \
+                                CacheElement>(                                 \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
         tile.committed_tokens, tile.active_rows, tile.splits, tile.split,      \
         partials, statistics, tile.slot, scores, probabilities, row_max,       \
         row_sum, previous_scale, &rescale, thread_index);                      \
   }
 
-Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, true, int8_t)
-Q8_VERIFY_SPLIT(verify_attention_q8_split_cooperative_scale,
-                       4, 6, false, int8_t)
-Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, true, int8_t)
-Q8_VERIFY_SPLIT(
-    verify_attention_q8_split_cooperative_scale_kv2_g8, 2, 8, false, int8_t)
+Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
+Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
-Q8_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, true, bfloat)
-Q8_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, true, bfloat)
+Q8_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
+Q8_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
 #undef Q8_VERIFY_SPLIT
 #undef Q8_VERIFY_TILE_AT
 #undef Q8_VERIFY_SCRATCH

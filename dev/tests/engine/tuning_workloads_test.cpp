@@ -204,10 +204,7 @@ void checkPair(ModelPackage package, bool sparse) {
   const auto geometry = std::visit([](const auto &weights) {
     return qwenTargetGeometry(weights);
   }, package.target);
-  require(inventory.targetAttention == AttentionShape{
-              geometry.attentionQueryHeads, geometry.attentionKvHeads,
-              geometry.attentionHeadDimension} &&
-              inventory.draftAttention == package.draft.layout.attentionShape(),
+  require(inventory.draftAttention == package.draft.layout.attentionShape(),
           "attention geometry was inferred from a model-name preset");
   std::set<MoeWorkload> actualMoe;
   for (const auto &input : inventory.moe) {
@@ -239,7 +236,6 @@ void checkPair(ModelPackage package, bool sparse) {
   package.draft.layers.push_back(package.draft.layers.front());
   const auto renamed = collectTuningWorkloads(package, prefill, decode);
   require(linearKeys(renamed) == keys &&
-              renamed.targetAttention == inventory.targetAttention &&
               renamed.draftAttention == inventory.draftAttention,
           "dedup depends on layer count or model/weight names");
   std::set<MoeWorkload> renamedMoe;

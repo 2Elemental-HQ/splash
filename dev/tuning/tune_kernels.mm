@@ -9,7 +9,6 @@
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
-#include "tuning/AttentionTuning.hpp"
 #include "tuning/DraftAttentionTuning.hpp"
 #include "tuning/LinearTuning.hpp"
 #include "tuning/MoeTuning.hpp"
@@ -46,7 +45,7 @@ using namespace splash::ops::tuning;
 constexpr std::string_view kUsage =
     "usage: tune-kernels METALLIB MODEL_ROOT [--seconds PER_KEY] [--pairs N]\n"
     "                    [--confirm [PAIRS]] [--candidates]\n"
-    "  --seconds  wall budget per operator key (default 10; attention gets 4x)\n"
+    "  --seconds  wall budget per operator key (default 10)\n"
     "  --pairs    paired samples per candidate, 12..64 (default 12)\n"
     "  --confirm  also time the complete prefill/decode graphs, defaults vs\n"
     "             winners, with PAIRS pairs each (default 12, the minimum)\n"
@@ -150,23 +149,6 @@ std::string_view name(LinearSimdgroups groups) {
   }
   unnamed();
 }
-std::string_view name(AttentionScalePlacement placement) {
-  switch (placement) {
-    ENUMERATOR_NAME(AttentionScalePlacement::Softmax);
-    ENUMERATOR_NAME(AttentionScalePlacement::Cooperative);
-  }
-  unnamed();
-}
-std::string_view name(PrefillSplitMultiplier value) {
-  switch (value) {
-    ENUMERATOR_NAME(PrefillSplitMultiplier::One);
-    ENUMERATOR_NAME(PrefillSplitMultiplier::Two);
-  }
-  unnamed();
-}
-std::string name(VerifySplitCount value) {
-  return "VerifySplitCount(" + std::to_string(static_cast<uint32_t>(value)) + ")";
-}
 std::string_view name(MoePhase phase) {
   switch (phase) {
     ENUMERATOR_NAME(MoePhase::Prefill);
@@ -184,33 +166,16 @@ std::string describe(const LinearConfig &c) {
   out << "{" << name(c.tile) << ", " << c.groups << ", " << name(c.simdgroups) << ", " << c.splits << "}";
   return out.str();
 }
-std::string describe(const PrefillAttentionConfig &c) {
-  return "{" + std::string(name(c.splitMultiplier)) + ", " + std::string(name(c.scalePlacement)) + "}";
-}
-std::string describe(const VerifyAttentionConfig &c) {
-  return "{" + name(c.splitCount) + ", " + std::string(name(c.scalePlacement)) + "}";
-}
 std::string describe(const DraftAttentionConfiguration &c) {
   return "{" + (c.groups ? std::to_string(c.groups) : std::string("full")) + "}";
 }
 std::string describe(const MoeConfig &c) { return "{" + name(c.expertTile) + "}"; }
 
-std::string describe(const AttentionShape &s) {
-  std::ostringstream out;
-  out << "{" << s.queryHeads << ", " << s.kvHeads << ", " << s.headDimension << "}";
-  return out.str();
-}
 std::string describe(const LinearWorkload &w) {
   std::ostringstream out;
   out << "{{" << w.matrix.outputSize << ", " << w.matrix.inputSize << "}, " << w.rows << ", "
       << name(w.phase) << ", " << name(w.epilogue) << "}";
   return out.str();
-}
-std::string describe(const PrefillAttentionPolicy &w) {
-  return "{" + describe(w.shape) + ", " + std::to_string(w.rows) + "}";
-}
-std::string describe(const VerifyAttentionPolicy &w) {
-  return "{" + describe(w.shape) + ", " + std::to_string(w.lanes) + "}";
 }
 std::string describe(const DraftAttentionWorkload &w) {
   const auto &s = w.shape;
@@ -422,17 +387,14 @@ int main(int argc, char **argv) {
                 << device.appleGpuFamily << "), model " << package->name() << ", build "
                 << SPLASH_BUILD_ID << "\n  " << options.measurement.samplePairs
                 << " pairs per candidate, " << options.measurement.maximumWallSeconds
-                << " s per key (attention " << options.measurement.maximumWallSeconds * 4
-                << " s per policy)\n";
+                << " s per key\n";
       // The workloads keep only Affine64 weights, and a GGUF source prepares
       // every target projection and expert as Block32.
       if (descriptor.targetSource == model::TargetSource::Gguf)
         std::cout << "  GGUF target: its projections and experts follow the device policy; "
-                     "only attention and the draft are measured\n";
+                     "only the draft is measured\n";
       std::cout << '\n';
 
-      MeasurementOptions attention = options.measurement;
-      attention.maximumWallSeconds = options.measurement.maximumWallSeconds * 4;
       auto account = [&](bool complete, bool didChange, std::exception_ptr failure) {
         ++measured;
         changed += complete && didChange;
@@ -442,7 +404,6 @@ int main(int argc, char **argv) {
       };
 
       const Linear linear(device);
-      const auto verifyBaseline = VerifyAttentionConfig{};
       for (const auto &input : workloads.linear) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
@@ -475,35 +436,6 @@ int main(int argc, char **argv) {
           std::cout << "      default " << describe(baseline) << '\n';
           for (const auto &row : rows) std::cout << "      " << row.second << '\n';
         }
-        account(result.complete, didChange, result.failure);
-      }
-      if (!interrupted) {
-        const PrefillAttentionPolicy policy{workloads.targetAttention};
-        const auto result = tunePrefillAttentionPolicy(backend, admit, policy, attention, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != PrefillAttentionConfig{};
-        if (didChange) choices.prefillAttention.push_back(result.choice);
-        std::string proof;
-        for (const auto &probe : result.probes)
-          proof += "\n      history " + std::to_string(probe.choice.workload.historyTokens) +
-                   evidence(probe.measurements,
-                            candidateOf(PagedAttention::prefillCandidates(), result.choice.configuration));
-        outcome("prefill attention", describe(policy), result.complete, didChange,
-                describe(result.choice.configuration), proof, result.failure);
-        account(result.complete, didChange, result.failure);
-      }
-      for (uint32_t width : kDecodeProbeWidths) {
-        if (interrupted) break;
-        const VerifyAttentionPolicy policy{workloads.targetAttention, width};
-        const auto result = tuneVerifyAttentionPolicy(backend, admit, policy, attention, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != verifyBaseline;
-        if (didChange) choices.verifyAttention.push_back(result.choice);
-        std::string proof;
-        for (const auto &probe : result.probes)
-          proof += "\n      probe" + evidence(probe.measurements,
-                       candidateOf(verifyAttentionTuningCandidates(verifyBaseline),
-                                   result.choice.configuration));
-        outcome("verify attention", describe(policy), result.complete, didChange,
-                describe(result.choice.configuration), proof, result.failure);
         account(result.complete, didChange, result.failure);
       }
       for (uint32_t width : kDecodeProbeWidths) {
@@ -546,12 +478,6 @@ int main(int argc, char **argv) {
                 << "// matters, change the rules in runtime/ops, not a table.\n";
       for (const auto &c : choices.linear)
         std::cout << "choices.linear.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.prefillAttention)
-        std::cout << "choices.prefillAttention.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.verifyAttention)
-        std::cout << "choices.verifyAttention.push_back({" << describe(c.workload) << ", "
                   << describe(c.configuration) << "});\n";
       for (const auto &c : choices.draftAttention)
         std::cout << "choices.draftAttention.push_back({" << describe(c.workload) << ", "

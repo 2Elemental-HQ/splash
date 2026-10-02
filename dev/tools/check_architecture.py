@@ -19,9 +19,7 @@ OPERATOR_WORKSPACE_POLICY = re.compile(
     r"Q4DecodeKind|Q4DecodeShape|Q4PrefillShape|kQ4PrefillTileRows|"
     r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
     r"attentionGroups|addPrefill128|LinearTile|LinearConfig|LinearSimdgroups|"
-    r"PrefillSplitMultiplier|PrefillAttentionConfig|VerifySplitCount|"
-    r"VerifyAttentionConfig|AttentionScalePlacement|MoeExpertTile|"
-    r"MoeExpertSimdgroups|MoeConfig|"
+    r"MoeExpertTile|MoeExpertSimdgroups|MoeConfig|"
     r"DraftAttentionConfiguration|selectorShards)\b"
 )
 

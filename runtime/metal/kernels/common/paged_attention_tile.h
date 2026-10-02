@@ -84,8 +84,7 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool ScaleInSoftmax,
-          bool Quantized>
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized>
 inline void splash_attention_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -117,7 +116,7 @@ inline void splash_attention_page_softmax(
   float score[TokensPerLane];
   {
     float4 low = scores4[0], high = scores4[1];
-    if constexpr (Quantized && ScaleInSoftmax) {
+    if constexpr (Quantized) {
       low *= key_scales[vector];
       high *= key_scales[vector + 1];
     }
@@ -184,7 +183,7 @@ inline void splash_attention_page_softmax(
 // Three barriers per page order the score store, the softmax and the
 // probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          bool ScaleInSoftmax, typename CacheElement>
+          typename CacheElement>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -222,8 +221,8 @@ inline void splash_paged_attention_tile(
   auto q0 = qt.slice<D, M>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
-  // QK writes a complete page score tile; PV accumulates the running output.
-  // Key scaling is a precompiled placement choice; both use the same QK/PV.
+  // QK writes a complete page score tile, the softmax applies an INT8 page's
+  // key scales and PV accumulates the running output.
   constexpr auto qk_descriptor =
       matmul2d_descriptor(M, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
@@ -258,23 +257,11 @@ inline void splash_paged_attention_tile(
     // One full-dimension product initializes the score CT through MPP.
     auto ks = kt.template slice<D, N>(0, 0);
     qk.run(q0, ks, page_scores);
-    if constexpr (Quantized && !ScaleInSoftmax) {
-      const bool scores_full =
-          uint(page_scores.get_capacity()) * (8u * 32u) == uint(M) * N;
-#pragma unroll
-      for (ushort index = 0; index < page_scores.get_capacity(); ++index) {
-        if (!scores_full && !page_scores.is_valid_element(index))
-          continue;
-        const auto coordinates = page_scores.get_multidimensional_index(index);
-        page_scores[index] *= key_scales[coordinates[0]];
-      }
-    }
     page_scores.store(st.slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile,
-                             ScaleInSoftmax, Quantized>(
+    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Quantized>(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
