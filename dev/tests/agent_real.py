@@ -616,7 +616,7 @@ class ClientRun:
                 )
             ]
 
-    def phase(self, label, prompt, cancel=False):
+    def phase(self, label, prompt, cancel=False, may_compact=False):
         before = idle_status()
         previous_message = 0
         if self.name == "hermes" and self.session:
@@ -830,17 +830,26 @@ class ClientRun:
                     raise AgentFailure(
                         "OpenCode did not finish its user turn with assistant text"
                     )
-            # Every request after a phase's first resends the conversation, so
-            # a working replay point always reuses some of it.
-            if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
-                raise AgentFailure(
-                    "phase reused no cached prompt tokens across "
-                    f"{reuse['completed']} requests"
-                )
+            # A phase that may compact is judged once its caller knows
+            # whether it did.
+            if not may_compact:
+                self.require_reuse()
         print(
             f"{self.name}/{label}: completed ({row['wall_seconds']:.1f}s)", flush=True
         )
         return parsed
+
+    def require_reuse(self):
+        """Fails the last phase when two or more of its requests completed and
+        none reused a cached prompt token. Every request after a phase's
+        first resends the conversation, so a working replay point always
+        reuses some of it."""
+        reuse = self.phases[-1]["reuse"]
+        if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
+            raise AgentFailure(
+                "phase reused no cached prompt tokens across "
+                f"{reuse['completed']} requests"
+            )
 
     def compaction(self):
         if self.name == "hermes":
@@ -951,8 +960,17 @@ class ClientRun:
         for wave in range(first_wave, first_wave + 20):
             if compact:
                 break
-            self.phase(f"reference-{wave:02}", reference.replace("BATCH_ID", str(wave)))
+            self.phase(
+                f"reference-{wave:02}",
+                reference.replace("BATCH_ID", str(wave)),
+                may_compact=True,
+            )
             compact = self.compaction()
+            # The wave that compacts resends no conversation: its summary
+            # request and the request after it share only the system prompt
+            # and tools.
+            if not compact:
+                self.require_reuse()
         if not compact:
             raise AgentFailure("no genuine automatic compaction observed")
         self.phase(

@@ -492,6 +492,39 @@ class AgentRunnerTests(unittest.TestCase):
                     bool(evictions),
                 )
 
+    def test_only_the_wave_that_compacts_may_reuse_no_cached_prompt(self):
+        # Its summary request and the request after it share only the system
+        # prompt and tools; any other reference wave resends the conversation.
+        for compactions, error in (
+            ([[], []], "phase reused no cached prompt tokens across 2 requests"),
+            ([[], [{"auto": True}]], None),
+        ):
+            with (
+                self.subTest(compacts=bool(compactions[-1])),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = agent.ClientRun.__new__(agent.ClientRun)
+                runner.folder, runner.phases = Path(directory), []
+
+                def phase(label, prompt, cancel=False, may_compact=False):
+                    runner.phases.append(
+                        {"phase": label, "reuse": {"completed": 2, "reused_tokens": 0}}
+                    )
+
+                with (
+                    mock.patch.object(runner, "compaction", side_effect=compactions),
+                    mock.patch.object(runner, "phase", side_effect=phase) as waves,
+                    mock.patch.object(
+                        runner, "check_artifact", return_value={"oracle": "pass"}
+                    ),
+                ):
+                    if error is None:
+                        runner.finish("BATCH_ID", [])
+                    else:
+                        with self.assertRaisesRegex(agent.AgentFailure, error):
+                            runner.finish("BATCH_ID", [])
+                self.assertEqual(waves.call_args_list[0].kwargs, {"may_compact": True})
+
     def test_hermes_runs_in_its_own_profile_of_the_developers_root(self):
         # A root of its own would be the bug the launcher avoids: Hermes would
         # install its tools there and point the developer's hermes command at
