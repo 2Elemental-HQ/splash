@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -112,29 +111,17 @@ public:
   };
 
   // The budget holds at least one slot: a smaller quota is a configuration
-  // error. Files sharing a budget compete for its bytes.
-  SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-           const std::filesystem::path &directory = std::filesystem::temp_directory_path());
-  // A file with a budget of its own.
-  SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
-           const std::filesystem::path &directory = std::filesystem::temp_directory_path());
+  // error. Files sharing a budget compete for its bytes. The file goes to
+  // the temporary directory.
+  SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget);
   ~SlotFile();
   SlotFile(const SlotFile &) = delete;
   SlotFile &operator=(const SlotFile &) = delete;
   // Null when the budget is exhausted.
   [[nodiscard]] std::shared_ptr<Slot> acquire();
   [[nodiscard]] uint64_t slotBytes() const noexcept;
-  // The shared budget's capacity and use.
-  [[nodiscard]] uint64_t capacityBytes() const noexcept;
-  [[nodiscard]] uint64_t usedBytes() const noexcept;
-  [[nodiscard]] uint64_t readBytes() const noexcept;
-  [[nodiscard]] uint64_t writtenBytes() const noexcept;
   // False once a write has failed; complete slots stay readable.
   [[nodiscard]] bool writable() const noexcept;
-  // True when the worker holds nothing: no operation queued and none running.
-  // Owners drain their own operations; tests use this to check that none is
-  // left.
-  [[nodiscard]] bool idle() const;
   // The spans total at most one slot and stay valid until the operation is
   // ready. A write stores them in order from the start of the slot and zeros
   // the rest; a read fills them from the start of the slot. A write is null
@@ -166,10 +153,9 @@ private:
   // The worker's own, aligned for uncached IO: every chunk that does not
   // move straight between memory and the file goes through it.
   std::unique_ptr<std::byte, Free> buffer_;
-  mutable std::mutex mutex_;
+  std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Work> work_;
-  bool running_ = false;
   bool stopping_ = false;
   std::thread worker_;
 };

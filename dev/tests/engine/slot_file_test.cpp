@@ -44,7 +44,8 @@ static void testFailedWriteStopsWriting() {
       // The engine starts with the default disposition, which kills the
       // process on a write past the limit, so the file has to change it.
       signal(SIGXFSZ, SIG_DFL);
-      SlotFile file(size, 2 * size);
+      auto budget = std::make_shared<DiskBudget>(2 * size);
+      SlotFile file(size, budget);
       auto complete = file.acquire();
       auto partial = file.acquire();
       std::vector<std::byte> source(size, std::byte{1}), output(size);
@@ -58,7 +59,7 @@ static void testFailedWriteStopsWriting() {
       std::fill(source.begin(), source.end(), std::byte{2});
       require(!file.write(partial, {source}, {})->wait(), "partial write reported success");
       require(!file.read(partial, {output}, {})->wait(), "partially written slot was readable");
-      require(file.writtenBytes() == size + size / 2 && file.readBytes() == 0,
+      require(budget->writtenBytes() == size + size / 2 && budget->readBytes() == 0,
               "IO counters lost a partial write or counted an invalid read");
       require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
       require(!file.writable() && file.write(partial, {source}, {}) == nullptr,
@@ -70,7 +71,7 @@ static void testFailedWriteStopsWriting() {
               "a closed file absorbed a write of more than a slot");
       require(file.read(complete, {output}, {})->wait() && output.front() == std::byte{1},
               "complete slot became unreadable after a storage failure");
-      require(file.readBytes() == size, "successful read bytes were not counted");
+      require(budget->readBytes() == size, "successful read bytes were not counted");
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';
       result = 1;
@@ -89,7 +90,8 @@ static void testFailedWriteStopsWriting() {
 static void testScatteredSpans() {
   // Three of the worker's 1 MiB chunks, the last one partial.
   constexpr size_t size = (2 << 20) + 3 * SlotFile::kAlignmentBytes;
-  SlotFile file(size, size);
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget);
   auto slot = file.acquire();
   std::vector<std::byte> source(size);
   for (size_t index = 0; index < source.size(); ++index)
@@ -104,7 +106,7 @@ static void testScatteredSpans() {
   for (auto span : spans) expected.insert(expected.end(), span.begin(), span.end());
   require(expected.size() < size, "the scattered spans fill the slot");
   expected.resize(size);
-  require(file.write(slot, spans, {})->wait() && file.writtenBytes() == size,
+  require(file.write(slot, spans, {})->wait() && budget->writtenBytes() == size,
           "a scattered write failed or did not store the whole slot");
 
   // The whole slot through one unaligned span: the spans in order, zeros after.
@@ -115,9 +117,9 @@ static void testScatteredSpans() {
   // Less than was written, across the first chunk's end into odd addresses:
   // the read takes the two chunks its spans reach and nothing around them.
   std::vector<std::byte> head(3 * 4096 + 3), tail((1 << 20) + 5);
-  const uint64_t readBefore = file.readBytes();
+  const uint64_t readBefore = budget->readBytes();
   require(file.read(slot, {std::span(head).subspan(3), std::span(tail).subspan(5)}, {})->wait() &&
-              file.readBytes() - readBefore == 2 << 20,
+              budget->readBytes() - readBefore == 2 << 20,
           "a partial read failed or did not take exactly the chunks it needs");
   require(std::all_of(head.begin(), head.begin() + 3, [](std::byte b) { return b == std::byte{0}; }) &&
               std::all_of(tail.begin(), tail.begin() + 5, [](std::byte b) { return b == std::byte{0}; }) &&
@@ -156,7 +158,8 @@ static std::vector<std::span<std::byte>> placeSpans(std::vector<std::byte> &stor
 static void testAlignedRunsMoveDirectly() {
   constexpr size_t chunk = 1 << 20;
   constexpr size_t size = 3 * chunk;
-  SlotFile file(size, size);
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget);
   auto slot = file.acquire();
   const std::vector<Shape> shapes{
       // Two chunks straight, and the run's last half chunk through the buffer.
@@ -180,9 +183,9 @@ static void testAlignedRunsMoveDirectly() {
       expected.insert(expected.end(), span.begin(), span.end());
     }
     expected.resize(size);
-    const uint64_t writtenBefore = file.writtenBytes();
+    const uint64_t writtenBefore = budget->writtenBytes();
     require(file.write(slot, {sources.begin(), sources.end()}, {})->wait() &&
-                file.writtenBytes() - writtenBefore == size,
+                budget->writtenBytes() - writtenBefore == size,
             "a write of aligned runs failed or did not store the slot exactly once");
 
     // The whole slot into one unaligned span, all of it through the buffer.
@@ -209,7 +212,7 @@ static void testAlignedRunsMoveDirectly() {
 // cancelled between two of its chunks.
 static void testCancelledDirectWrite() {
   constexpr size_t size = 3 << 20;
-  SlotFile file(size, size);
+  SlotFile file(size, std::make_shared<DiskBudget>(size));
   auto slot = file.acquire();
   std::vector<std::byte> memory;
   const auto source = placeSpans(memory, {{size, true}}).front();
@@ -234,13 +237,13 @@ int main() {
     testAlignedRunsMoveDirectly();
     testCancelledDirectWrite();
     constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
-    SlotFile file(size, size * 2 + 1);
-    require(file.slotBytes() == size && file.capacityBytes() == size * 2 + 1 &&
-                file.usedBytes() == 0,
-            "file did not report its quota");
+    auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
+    SlotFile file(size, budget);
+    require(file.slotBytes() == size && budget->usedBytes() == 0,
+            "file did not report its slot size or took quota");
     auto first = file.acquire();
     auto second = file.acquire();
-    require(first && second && file.usedBytes() == size * 2 && !file.acquire(),
+    require(first && second && budget->usedBytes() == size * 2 && !file.acquire(),
             "a partial slot of the quota was granted");
     std::vector<std::byte> source(size, std::byte{0xa5}), restored(size);
     auto write = file.write(first, {std::span(source).first(128), std::span(source).subspan(128)}, {});
@@ -248,7 +251,7 @@ int main() {
     require(file.read(first, {restored}, {})->wait() && restored == source,
             "slot did not roundtrip across IO spans");
     require(!file.read(second, {restored}, {})->wait(), "unwritten slot was readable");
-    require(file.idle(), "a file with every operation finished called itself busy");
+    require(write->ready(), "a write that finished did not report ready");
 
     // Park the worker in a completion so the queue behind it is deterministic:
     // a queued write, a cancelled read and a cancelled overwrite behind it.
@@ -263,11 +266,13 @@ int main() {
     cancelled->cancel();
     auto cancelledWrite = file.write(first, {later}, {});
     cancelledWrite->cancel();
-    require(!file.idle(), "a file with queued work called itself idle");
+    require(!write->ready() && !cancelled->ready() && !cancelledWrite->ready(),
+            "an operation queued behind a parked worker reported ready");
     release.set_value();
     require(hold->wait() && write->wait() && !cancelled->wait() && !cancelledWrite->wait(),
             "queued operations misreported");
-    require(file.idle(), "the queue drained but the file still held work");
+    require(hold->ready() && write->ready() && cancelled->ready() && cancelledWrite->ready(),
+            "the queue drained but an operation did not report ready");
     require(untouched.front() == std::byte{0} && untouched.back() == std::byte{0},
             "cancelled queued read touched destination");
     require(file.read(second, {restored}, {})->wait() && restored == later,
@@ -289,9 +294,11 @@ int main() {
     auto reused = file.acquire();
     second = file.acquire();
     require(reused && second && !file.acquire(), "released quota was not reusable");
-    require(throws<std::invalid_argument>([&] { SlotFile(size, size - 1); }),
+    require(throws<std::invalid_argument>(
+                [&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); }),
             "quota below one slot was accepted");
-    require(throws<std::invalid_argument>([&] { SlotFile(size + 1, 4 * size); }),
+    require(throws<std::invalid_argument>(
+                [&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); }),
             "unaligned slot size was accepted");
     std::vector<std::byte> oversized(size + 1);
     require(throws<std::invalid_argument>(
@@ -304,30 +311,26 @@ int main() {
             "a transfer of more than a slot was accepted");
     {
       // Two files of different slot sizes draw on one budget.
-      auto budget = std::make_shared<DiskBudget>(4 * size);
-      SlotFile small(size, budget);
-      SlotFile large(2 * size, budget);
-      require(small.capacityBytes() == 4 * size && large.capacityBytes() == 4 * size &&
-                  small.usedBytes() == 0,
-              "files did not report the shared budget");
+      auto shared = std::make_shared<DiskBudget>(4 * size);
+      SlotFile small(size, shared);
+      SlotFile large(2 * size, shared);
       auto one = large.acquire();
       auto two = small.acquire();
-      require(one && two && small.usedBytes() == 3 * size && !large.acquire(),
+      require(one && two && shared->usedBytes() == 3 * size && !large.acquire(),
               "the shared budget did not bound the second file");
       std::vector<std::byte> largePayload(2 * size, std::byte{3});
       require(large.write(one, {largePayload}, {})->wait() &&
                   small.write(two, {source}, {})->wait(), "shared IO writes failed");
-      require(small.writtenBytes() == 3 * size && large.writtenBytes() == 3 * size &&
-                  budget->writtenBytes() == 3 * size,
+      require(shared->writtenBytes() == 3 * size,
               "shared IO counters did not include both slot files");
       auto three = small.acquire();
-      require(three && !small.acquire() && budget->usedBytes() == 4 * size,
+      require(three && !small.acquire() && shared->usedBytes() == 4 * size,
               "the last slot of the budget was not granted exactly once");
       one.reset();
-      require(budget->usedBytes() == 2 * size && large.acquire() && !small.acquire(),
+      require(shared->usedBytes() == 2 * size && large.acquire() && !small.acquire(),
               "a released slot did not return its bytes to the budget");
       require(throws<std::invalid_argument>(
-                  [&] { SlotFile(8 * size, budget); }),
+                  [&] { SlotFile(8 * size, shared); }),
               "a file whose slot exceeds the shared budget was accepted");
     }
     std::cout << "Slot file tests passed\n";

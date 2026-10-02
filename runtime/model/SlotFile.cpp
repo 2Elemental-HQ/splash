@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -147,12 +148,7 @@ bool moveChunk(Span chunk, off_t offset, Io io) {
 }
 } // namespace
 
-SlotFile::SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
-                   const std::filesystem::path &directory)
-    : SlotFile(slotBytes, std::make_shared<DiskBudget>(capacityBytes), directory) {}
-
-SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-                   const std::filesystem::path &directory)
+SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
     : backing_(std::make_shared<Backing>()) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
@@ -174,7 +170,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
   struct sigaction fileSize {};
   if (::sigaction(SIGXFSZ, nullptr, &fileSize) == 0 && fileSize.sa_handler == SIG_DFL)
     std::signal(SIGXFSZ, SIG_IGN);
-  std::string name = (directory / "splash-cache-XXXXXX").string();
+  std::string name = (std::filesystem::temp_directory_path() / "splash-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)
     throw std::system_error(errno, std::generic_category(), "create slot file");
@@ -228,21 +224,8 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
 
 uint64_t SlotFile::slotBytes() const noexcept { return backing_->slotBytes; }
 
-uint64_t SlotFile::capacityBytes() const noexcept {
-  return backing_->budget->capacityBytes();
-}
-
-uint64_t SlotFile::usedBytes() const noexcept { return backing_->budget->usedBytes(); }
-uint64_t SlotFile::readBytes() const noexcept { return backing_->budget->readBytes(); }
-uint64_t SlotFile::writtenBytes() const noexcept { return backing_->budget->writtenBytes(); }
-
 bool SlotFile::writable() const noexcept {
   return !backing_->failed.load(std::memory_order_relaxed);
-}
-
-bool SlotFile::idle() const {
-  std::lock_guard lock(mutex_);
-  return work_.empty() && !running_;
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
@@ -267,18 +250,14 @@ void SlotFile::run() {
       if (work_.empty()) return;
       work = std::move(work_.front());
       work_.pop_front();
-      running_ = true;
     }
     bool success = false;
     try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
     catch (...) { success = false; }
+    // Drop the operation's captures (its slot and the memory it moves)
+    // before it reports, so a waiter wakes to a worker that holds nothing of
+    // it.
     work.run = {};
-    // Idle before the operation reports, so whoever wakes on it sees a worker
-    // that has let go of the memory it moved.
-    {
-      std::lock_guard lock(mutex_);
-      running_ = false;
-    }
     {
       std::lock_guard lock(work.operation->mutex_);
       work.operation->success_ = success;

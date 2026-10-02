@@ -126,7 +126,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 2048, 4}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
-  auto file = std::make_shared<model::SlotFile>(slotBytes, 3 * slotBytes);
+  auto budget = std::make_shared<model::DiskBudget>(3 * slotBytes);
+  auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
   model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
   require(static_cast<bool>(storage.tryActivateSlot(0, 1)), "fault source activation failed");
   storage.updateLengths(0, {4096, 2048, 2048, 0});
@@ -161,10 +162,10 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
     });
     const bool returned = attempt.wait_for(std::chrono::milliseconds(100)) ==
                           std::future_status::ready;
-    const bool pending = !file->idle();
+    // The offload's slot is still held: its write waits behind the barrier.
+    const bool pending = budget->usedBytes() > slotBytes;
     release.set_value();
     auto result = attempt.get();
-    while (!file->idle()) std::this_thread::yield();
     require(!(result.failed && returned && pending),
             "allocation failure released staging before the submitted write drained");
     if (!result.failed) {
@@ -172,7 +173,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
               "offload did not recover after allocation failures");
       return;
     }
-    require(file->usedBytes() == slotBytes,
+    require(budget->usedBytes() == slotBytes,
             "failed offload leaked its disk quota");
   }
   throw std::runtime_error("offload allocation failure sweep never reached success");
@@ -182,7 +183,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
+      std::make_shared<model::SlotFile>(kStateSlotBytes,
+                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
   require(static_cast<bool>(storage.tryActivateSlot(0, 123)), "disk source activation failed");
   const auto &buffers = storage.buffers(0);
   // Every byte of the state travels through the file; markers alone would
@@ -265,7 +267,8 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
+      std::make_shared<model::SlotFile>(kStateSlotBytes,
+                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
   require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateSlot(0, 321)), "lane activation failed");
   const auto &buffers = storage.buffers(0);
@@ -335,7 +338,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
        {std::pair{aligned, aligned.cachedBytes() + unit},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
     model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout,
-                                    std::make_shared<model::SlotFile>(slotBytes, slotBytes));
+                                    std::make_shared<model::SlotFile>(
+                                        slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
     require(static_cast<bool>(storage.tryActivateSlot(0, 77)), "lane activation failed");
     const auto &buffers = storage.buffers(0);
     fill(buffers.gdn[0].stateBase, 31);
