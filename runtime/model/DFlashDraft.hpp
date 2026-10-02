@@ -64,8 +64,7 @@ struct DFlashDraftLayout final {
   uint32_t kvHeads = 8;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, ExecutionLimits::draftContextTokens,
-            attentionHeadDimension};
+    return {layers, kvHeads, attentionHeadDimension};
   }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,

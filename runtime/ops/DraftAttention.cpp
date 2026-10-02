@@ -19,12 +19,9 @@ constexpr std::array kConfigurations{DraftAttentionConfiguration{},
                                       DraftAttentionConfiguration{60},
                                       DraftAttentionConfiguration{80}};
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
-// The live ring tiles of one (lane, KV head) are dealt round-robin to this
-// many groups, the last of which also attends the eight current rows. Fixed
-// rather than derived from the GPU so the combine order, and with it the
-// rounding, is the same on every machine and lane count. Each split leaves a
-// 32-row x (128 + max + sum) fp32 partial behind the grouped queries.
-constexpr uint32_t kSplits = 4;
+// Each split leaves a 32-row x (128 + max + sum) fp32 partial behind the
+// grouped queries.
+constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
 constexpr uint32_t kAttentionRows = 32;
 constexpr uint64_t kPartialBytes =
     uint64_t{kAttentionRows} * (128 + 2) * sizeof(float);
@@ -203,12 +200,11 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
 
 void DraftAttention::addDecode(
     metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-    std::span<const uint32_t> cacheLengths, uint32_t cacheStride,
-    const DraftAttentionPlan &plan) {
+    std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan) {
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
-  if (cacheLengths.size() != kMaximumLanes || cacheStride != kWindow ||
+  if (cacheLengths.size() != kMaximumLanes ||
       buffers.persistentKeys.size() != kMaximumLanes ||
       buffers.persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft attention geometry");
@@ -221,7 +217,7 @@ void DraftAttention::addDecode(
     requireBuffer(buffers.persistentKeys[lane], ringBytes(shape));
     requireBuffer(buffers.persistentValues[lane], ringBytes(shape));
   }
-  DraftAttentionBatchParams params{cacheStride, kSplits, lanes, {}};
+  DraftAttentionBatchParams params{kWindow, lanes, {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};
@@ -256,15 +252,15 @@ void DraftAttention::addContextPrefill(
     metal::CommandGraph &graph, metal::MetalBuffer contextKv,
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
     metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-    metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-    uint32_t startPosition, DraftAttentionShape shape) {
+    metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
+    DraftAttentionShape shape) {
   static_cast<void>(kernelShape(shape));
-  if (!tokens || cacheStride != kWindow)
+  if (!tokens)
     throw std::invalid_argument("invalid draft context prefill geometry");
   requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, tokens, shape);
   requireBuffer(keys, ringBytes(shape));
   requireBuffer(values, ringBytes(shape));
-  const DraftContextParams params{tokens, cacheStride, startPosition};
+  const DraftContextParams params{tokens, startPosition};
   graph.add("prefill_draft_context_kv",
             {std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
@@ -278,11 +274,11 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentKeys,
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
-    std::span<const uint32_t> startPositions, uint32_t cacheStride,
-    DraftAttentionShape shape, uint32_t lanes) {
+    std::span<const uint32_t> startPositions, DraftAttentionShape shape,
+    uint32_t lanes) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
-  if (startPositions.size() != kMaximumLanes || cacheStride != kWindow ||
+  if (startPositions.size() != kMaximumLanes ||
       persistentKeys.size() != kMaximumLanes ||
       persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft context commit geometry");
@@ -294,7 +290,7 @@ void DraftAttention::addContextCommit(
     requireBuffer(persistentKeys[lane], ringBytes(shape));
     requireBuffer(persistentValues[lane], ringBytes(shape));
   }
-  DraftContextBatchParams params{cacheStride, lanes, {}};
+  DraftContextBatchParams params{lanes, {}};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
   std::vector<metal::MetalBuffer> bindings{
@@ -304,7 +300,7 @@ void DraftAttention::addContextCommit(
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
   graph.add("draft_context_kv_commit", std::move(bindings), params,
-            {uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS * shape.kvHeads, 1,
+            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
              1});
 }
 

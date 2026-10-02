@@ -8,8 +8,8 @@
 inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
-    device bfloat *keys, device bfloat *values,
-    DraftContextParams params, uint active_tokens, uint task,
+    device bfloat *keys, device bfloat *values, uint start_position,
+    uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
   constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
@@ -18,14 +18,12 @@ inline void draft_context_kv_phase(
   if (row >= active_tokens)
     return;
   uint head_index = task % KVHeads;
-  uint position = params.start_position + row;
+  uint position = start_position + row;
   uint slot = position % Window;
   device const bfloat *source =
       context_kv + ulong(row) * RowWidth + head_index * HeadDim;
-  device bfloat *key =
-      keys + (ulong(head_index) * params.cache_stride + slot) * HeadDim;
-  device bfloat *value =
-      values + ulong(head_index) * HeadDim * params.cache_stride + slot;
+  device bfloat *key = keys + (ulong(head_index) * Window + slot) * HeadDim;
+  device bfloat *value = values + ulong(head_index) * HeadDim * Window + slot;
 
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
   float square_sum = simd_sum(element * element);
@@ -42,8 +40,7 @@ inline void draft_context_kv_phase(
   if (thread_index < HeadDim) {
     normalized[thread_index] =
         bfloat(element * reductions[0] * float(k_norm[thread_index]));
-    value[ulong(thread_index) * params.cache_stride] =
-        source[KWidth + thread_index];
+    value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < HeadDim / 2) {

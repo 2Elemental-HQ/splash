@@ -135,16 +135,14 @@ kernel void draft_context_kv_commit(
                               ? values0
                               : (batch == 1 ? values1
                                             : (batch == 2 ? values2 : values3));
-  DraftContextParams lane_params{Rows, params.cache_stride,
-                                  params.start_position[batch]};
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
   draft_context_kv_phase(
       context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
-      min(retained[batch], Rows), task, thread_index, lane, simd_group,
-      reductions, normalized);
+      rope_sin + ulong(batch) * RopeLaneStride, keys, values,
+      params.start_position[batch], min(retained[batch], Rows), task,
+      thread_index, lane, simd_group, reductions, normalized);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one
@@ -158,13 +156,13 @@ kernel void draft_context_kv_commit(
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
-    device float *partial, uint cache_stride, uint cache_length, uint split,
-    uint splits, threadgroup float *score_storage,
-    threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, uint thread_index, uint lane,
-    uint simd_group) {
+    device float *partial, uint value_stride, uint cache_length, uint split,
+    threadgroup float *score_storage, threadgroup float *row_max,
+    threadgroup float *row_sum, threadgroup float *previous_scale,
+    uint thread_index, uint lane, uint simd_group) {
   constexpr ushort M = 32, N = 128, D = 128, TileK = 64;
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
+                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
   uint common_start =
       cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
   uint old_count = cache_length - common_start;
@@ -180,7 +178,7 @@ inline void draft_attention_split_phase(
   // A split with no tile that is not the last one has nothing to add: it
   // leaves only row maxima of -inf, which the reduce skips, instead of
   // loading Q and storing a zero accumulator at short contexts.
-  if (split >= live_tiles && split + 1 != splits) {
+  if (split >= live_tiles && split + 1 != Splits) {
     if (thread_index < M)
       partial[M * D + thread_index] = -INFINITY;
     return;
@@ -193,7 +191,7 @@ inline void draft_attention_split_phase(
   auto pt = tensor(score_storage, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = pt.slice<TileK, M>(0, 0);
   auto first_v = tensor(values, dextents<int, 2>{N, D},
-                        array<int, 2>{1, int(cache_stride)});
+                        array<int, 2>{1, int(value_stride)});
   auto first_v0 = first_v.slice<TileK, D>(0, 0);
   constexpr auto pv_descriptor =
       matmul2d_descriptor(M, D, TileK, false, true, false);
@@ -208,7 +206,7 @@ inline void draft_attention_split_phase(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint tile = split; tile < live_tiles; tile += splits) {
+  for (uint tile = split; tile < live_tiles; tile += Splits) {
     uint slot = (tile < wrapped ? tile : resume + tile - wrapped) * N;
     auto kt =
         tensor(keys + slot * D, dextents<int, 2>{D, N}, array<int, 2>{1, D});
@@ -276,7 +274,7 @@ inline void draft_attention_split_phase(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     auto vt = tensor(values + slot, dextents<int, 2>{N, D},
-                     array<int, 2>{1, int(cache_stride)});
+                     array<int, 2>{1, int(value_stride)});
     auto v0 = vt.slice<TileK, D>(0, 0);
     auto partial_output =
         pv.template get_destination_cooperative_tensor<decltype(p0),
@@ -301,7 +299,7 @@ inline void draft_attention_split_phase(
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  if (split + 1 == splits) {
+  if (split + 1 == Splits) {
     // Persistent query K/V contains exactly eight rows.  The K=16 padding
     // required by the MPP value product exists only in threadgroup memory.
     constexpr ushort CurrentN = Rows;
@@ -405,20 +403,21 @@ inline void draft_attention_split_phase(
 // normalized bf16 rows, so the result does not depend on which split
 // finished first or on how many lanes ran.
 inline void draft_attention_reduce_phase(device const float *partials,
-                                         device bfloat *output, uint splits,
+                                         device bfloat *output,
                                          uint thread_index) {
-  constexpr uint M = 32, D = 128, Stride = M * D + 2 * M;
+  constexpr uint M = 32, D = 128, Stride = M * D + 2 * M,
+                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
   constexpr uint Chunk = D / 8;
   uint row = thread_index / 8;
   uint dim = (thread_index % 8) * Chunk;
   float maximum = -INFINITY;
-  for (uint split = 0; split < splits; ++split)
+  for (uint split = 0; split < Splits; ++split)
     maximum = max(maximum, partials[split * Stride + M * D + row]);
   float total = 0.0f;
   float accumulated[Chunk];
   for (uint i = 0; i < Chunk; ++i)
     accumulated[i] = 0.0f;
-  for (uint split = 0; split < splits; ++split) {
+  for (uint split = 0; split < Splits; ++split) {
     device const float *partial = partials + split * Stride;
     float split_max = partial[M * D + row];
     // A split with no visible key contributes nothing rather than
@@ -551,6 +550,7 @@ kernel void draft_attention_bf16_split(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = 4096;
   constexpr ulong HeadDim = 128;
+  constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   if (batch >= params.lanes)
@@ -564,17 +564,17 @@ kernel void draft_attention_bf16_split(
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
-      ((batch * KVHeads + group.x) * params.splits + group.z) * PartialFloats;
+      ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) *
+          PartialFloats;
   threadgroup float workspace[AttentionM * AttentionN + 3 * AttentionM];
   draft_attention_split_phase(
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
-      keys + group.x * params.cache_stride * HeadDim,
-      values + group.x * params.cache_stride * HeadDim,
+      keys + group.x * Window * HeadDim, values + group.x * Window * HeadDim,
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
-      partials, params.cache_stride, params.cache_length[batch], group.z,
-      params.splits, workspace, workspace + AttentionM * AttentionN,
+      partials, params.value_stride, params.cache_length[batch], group.z,
+      workspace, workspace + AttentionM * AttentionN,
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);
@@ -596,11 +596,12 @@ kernel void draft_attention_bf16_reduce(
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
-      (batch * KVHeads + group.x) * params.splits * PartialFloats;
+      (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
+          PartialFloats;
   draft_attention_reduce_phase(
       partials,
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
-      params.splits, thread_index);
+      thread_index);
 }
 
 kernel void draft_attention_reorder(

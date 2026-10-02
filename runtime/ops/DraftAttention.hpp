@@ -119,10 +119,10 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
-  static void addDecode(
-      metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-      std::span<const uint32_t> cacheLengths, uint32_t cacheStride,
-      const DraftAttentionPlan &plan);
+  static void addDecode(metal::CommandGraph &graph,
+                        DraftDecodeAttentionBuffers buffers,
+                        std::span<const uint32_t> cacheLengths,
+                        const DraftAttentionPlan &plan);
   static void addReorder(metal::CommandGraph &graph,
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,
@@ -134,8 +134,8 @@ public:
       metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-      metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+      metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
+      DraftAttentionShape shape);
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
@@ -143,8 +143,8 @@ public:
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, uint32_t cacheStride,
-      DraftAttentionShape shape, uint32_t lanes);
+      std::span<const uint32_t> startPositions, DraftAttentionShape shape,
+      uint32_t lanes);
 };
 
 } // namespace splash::ops

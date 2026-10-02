@@ -151,8 +151,7 @@ void DFlashDraft::addContextPrefill(
           backend_.view(buffers.ropeSin, ropeOffset,
                         uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
           span.ring[layer].keys, span.ring[layer].values, span.rows,
-          layout.stateLayout().tokens, span.startPosition,
-          layout.attentionShape());
+          span.startPosition, layout.attentionShape());
     }
   }
 }
@@ -204,7 +203,7 @@ void DFlashDraft::addDecode(
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
          buffers.queryValues},
-        cacheLengths, layout.stateLayout().tokens, attentionPlan);
+        cacheLengths, attentionPlan);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
     operators_.linear().addDecodeBatch(graph,
@@ -285,8 +284,7 @@ void DFlashDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.stateLayout().tokens, layout.attentionShape(),
-        lanes);
+        startPositions, layout.attentionShape(), lanes);
   }
 }
 

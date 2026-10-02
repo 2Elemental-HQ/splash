@@ -7,6 +7,7 @@
 // bounds, the window mask, empty splits and the empty-row softmax guard are
 // all exercised.
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/DraftAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -36,7 +37,7 @@ constexpr uint32_t kWindow = 2048;
 constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
-constexpr uint32_t kSplits = 4;
+constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
@@ -187,7 +188,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
     std::memcpy(queries.contents(), input.data(), input.size() * 2);
     CommandGraph graph;
     DraftAttention::addDecode(graph,
-        {queries, keys, values, queryKeys, queryValues}, cacheLengths, kWindow,
+        {queries, keys, values, queryKeys, queryValues}, cacheLengths,
         DraftAttention::plan(shape, lanes, configuration));
     const auto dispatches = graph.dispatches();
     require(dispatches.size() == 2 &&
@@ -430,12 +431,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   rejects([&] {
     DraftAttention::addDecode(invalid,
         {queries, emptyRings, emptyRings, queryKeys, queryValues}, lengths,
-        kWindow, baselinePlan);
-  });
-  rejects([&] {
-    DraftAttention::addDecode(invalid,
-        {queries, emptyRings, emptyRings, queryKeys, queryValues}, lengths,
-        kWindow - 1, baselinePlan);
+        baselinePlan);
   });
   require(invalid.empty(), "invalid draft request partially encoded a graph");
 }
@@ -446,7 +442,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // [head][dim][slot]); every other slot keeps its bits. The prefill writes
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read, and
-// the host rejects another ring stride or a buffer below its rows.
+// the host rejects a buffer below its rows.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
@@ -532,8 +528,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   const MetalBuffer keys = ring(), values = ring();
   CommandGraph prefill;
   DraftAttention::addContextPrefill(prefill, kv, keyNorm, ropeCos, ropeSin,
-                                    keys, values, kTokens, kWindow, kStart,
-                                    shape);
+                                    keys, values, kTokens, kStart, shape);
   static_cast<void>(backend.submitCommand(prefill.dispatches()));
   check(keys, values, static_cast<const uint16_t *>(kv.contents()),
         static_cast<const float *>(ropeCos.contents()),
@@ -559,7 +554,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
-                                   kWindow, shape, kCommitLanes);
+                                   shape, kCommitLanes);
   static_cast<void>(backend.submitCommand(commit.dispatches()));
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -576,31 +571,26 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   };
   CommandGraph invalid;
   const auto prefillWith = [&](const MetalBuffer &q, const MetalBuffer &sines,
-                               const MetalBuffer &k, uint32_t stride) {
+                               const MetalBuffer &k) {
     DraftAttention::addContextPrefill(invalid, q, keyNorm, ropeCos, sines, k,
-                                      values, kTokens, stride, kStart, shape);
+                                      values, kTokens, kStart, shape);
   };
-  // A ring of another stride: head h's upper slots would land in head h + 1
-  // and the last head's past the ring.
-  const MetalBuffer halfRing = backend.view(keys, 0, keys.sizeBytes() / 2);
-  rejects([&] { prefillWith(kv, ropeSin, halfRing, kWindow / 2); });
-  rejects([&] { prefillWith(kv, ropeSin, shorter(keys), kWindow); });
-  rejects([&] { prefillWith(shorter(kv), ropeSin, keys, kWindow); });
-  rejects([&] { prefillWith(kv, shorter(ropeSin), keys, kWindow); });
+  rejects([&] { prefillWith(kv, ropeSin, shorter(keys)); });
+  rejects([&] { prefillWith(shorter(kv), ropeSin, keys); });
+  rejects([&] { prefillWith(kv, shorter(ropeSin), keys); });
   // The last lane's values ring.
   const MetalBuffer lastRing = laneValues[kCommitLanes - 1];
   const auto commitWith = [&](const MetalBuffer &q, const MetalBuffer &counts,
-                              const MetalBuffer &last, uint32_t stride) {
+                              const MetalBuffer &last) {
     std::array<MetalBuffer, kLanes> rings = laneValues;
     rings[kCommitLanes - 1] = last;
     DraftAttention::addContextCommit(invalid, q, keyNorm, laneCos, laneSin,
-                                     laneKeys, rings, counts, starts, stride,
-                                     shape, kCommitLanes);
+                                     laneKeys, rings, counts, starts, shape,
+                                     kCommitLanes);
   };
-  rejects([&] { commitWith(laneKv, retainedCounts, lastRing, kWindow / 2); });
-  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing), kWindow); });
-  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing, kWindow); });
-  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing, kWindow); });
+  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing)); });
+  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing); });
+  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing); });
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
 }

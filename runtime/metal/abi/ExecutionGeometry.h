@@ -17,6 +17,11 @@
 #define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
 #define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
 #define SPLASH_VERIFY_ATTENTION_SPLITS 32u
+// Draft attention deals the live ring tiles of one (lane, KV head)
+// round-robin to this many groups, the last of which also attends the eight
+// current rows. Fixed rather than derived from the GPU so the combine order,
+// and with it the rounding, is the same on every machine and lane count.
+#define SPLASH_DRAFT_ATTENTION_SPLITS 4u
 // Verify attention runs one split per this many visible Page32 blocks, at
 // least the configured split count and at most the maximum that sizes the
 // partial workspace (ops::q8VerifyAttentionSplits).

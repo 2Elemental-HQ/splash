@@ -166,7 +166,7 @@ public:
          get(Tensor::QueryKeys), get(Tensor::QueryValues)}, plan);
     DraftAttention::addDecode(graph,
         {get(Tensor::Grouped), keys_, values_, get(Tensor::QueryKeys),
-         get(Tensor::QueryValues)}, histories[history], kWindow, plan);
+         get(Tensor::QueryValues)}, histories[history], plan);
     DraftAttention::addReorder(graph, get(Tensor::Grouped), get(Tensor::Packed), plan);
     convolution(Tensor::Input1, Tensor::Dynamic0, Tensor::Weights0, Tensor::Residual0,
                   Tensor::Convolution1, DraftConvolutionStage::Residual);

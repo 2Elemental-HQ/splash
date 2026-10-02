@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Checked.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 
 #include <cstdint>
 
@@ -47,19 +48,21 @@ struct GdnStateLayout final {
   bool operator==(const GdnStateLayout &) const = default;
 };
 
+// One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
+// one for the values of every draft layer.
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
   uint32_t layers = 0;
   uint32_t kvHeads = 0;
-  uint32_t tokens = 0;
   uint32_t headDimension = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && tokens && headDimension;
+    return layers && kvHeads && headDimension;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * tokens * headDimension * bfloat16Bytes;
+    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
+           bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
     return uint64_t{layers} * 2 * tensorBytes();
