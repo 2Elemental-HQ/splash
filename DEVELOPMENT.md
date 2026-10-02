@@ -530,7 +530,7 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, the KV runway and any disk tier
+pipeline and runtime reserves, one lane's state, the KV runway and any disk tier
 state staging, exceed the hard budget, so a model that can never fit is not
 prepared. File backing does not make Metal-resident pages reclaimable.
 Every buffer the backend allocates or wraps belongs to one residency set
@@ -1010,9 +1010,9 @@ way; the point its generated history reaches is a disposable checkpoint.
 
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, including one whose prefix is still being restored from disk, then enter
-through the ordinary cache restore path. Waiting requests hold no active state
-cell or KV pages and return to ordinary admission when no useful producer
-remains. Late arrivals can extend the plan at complete state boundaries.
+through the ordinary cache restore path. Waiting requests hold no lane or KV
+pages and return to ordinary admission when no useful producer remains. Late
+arrivals can extend the plan at complete state boundaries.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 

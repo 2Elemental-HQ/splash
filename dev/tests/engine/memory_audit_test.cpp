@@ -44,7 +44,7 @@ ActualMemoryReport report(const EngineMemoryPlan &memoryPlan,
   result.targetWeightsBytes = b.targetWeightsBytes;
   result.draftWeightsBytes = b.draftWeightsBytes;
   result.visionWeightsBytes = b.visionWeightsBytes;
-  result.stateAllocatedBytes = b.activeStateCellBytes * 3;
+  result.stateAllocatedBytes = b.laneStateBytes * 3;
   result.sharedPrefillBytes = b.sharedPrefillBytes;
   result.sharedDecodeBytes = b.sharedDecodeBytes;
   result.kvAllocatedBytes = b.kvExtentBytes;
@@ -181,7 +181,7 @@ void testDevicePeakDeviationExcludesReserves() {
       ActualMemoryReport actual;
       actual.targetWeightsBytes = b.targetWeightsBytes;
       actual.draftWeightsBytes = b.draftWeightsBytes;
-      actual.stateAllocatedBytes = 4 * b.activeStateCellBytes;
+      actual.stateAllocatedBytes = 4 * b.laneStateBytes;
       actual.sharedPrefillBytes = b.sharedPrefillBytes;
       actual.sharedDecodeBytes = b.sharedDecodeBytes;
       actual.kvAllocatedBytes = b.kvExtentBytes;

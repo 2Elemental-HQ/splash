@@ -283,7 +283,7 @@ def metrics_dict(result):
         "status": cache_info.status,
         "matched_tokens": cache_info.matched_tokens,
         "capacity": cache_info.capacity,
-        "slot": cache_info.slot if cache_info.slot >= 0 else None,
+        "lane": cache_info.lane if cache_info.lane >= 0 else None,
     }
     metrics = {
         "prefill": {"tokens": result.prefill_tokens},

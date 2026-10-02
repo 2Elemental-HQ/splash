@@ -122,9 +122,9 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   require(after.sharedDecodePlannedAllocatedBytes ==
               before.sharedDecodePlannedAllocatedBytes + decodeGrowth,
           "runtime decode allocation does not use all selected width bounds");
-  require(after.activeStateCellPlannedAllocatedBytes ==
-              before.activeStateCellPlannedAllocatedBytes,
-          "kernel selection changed the state cell");
+  require(after.laneStatePlannedAllocatedBytes ==
+              before.laneStatePlannedAllocatedBytes,
+          "kernel selection changed the lane state");
   require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
                   .configuration().groups == 80,
           "paired draft did not use the same selection owner");

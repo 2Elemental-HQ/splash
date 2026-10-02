@@ -26,10 +26,10 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
          extentPages * extentPages;
 }
 
-// What one request needs at the least: the fixed bytes, one active state cell
-// and the KV runway in the layout's smallest extents; nullopt on overflow.
+// What one request needs at the least: the fixed bytes, one lane's state and
+// the KV runway in the layout's smallest extents; nullopt on overflow.
 [[nodiscard]] std::optional<uint64_t>
-minimumRequiredBytes(uint64_t fixedBytes, uint64_t activeStateCellBytes,
+minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
                      const kv::Layout &layout) noexcept;
 
 // Inputs that the memory planner needs from a loaded model. Model tensor and
@@ -116,7 +116,7 @@ struct EngineMemoryBreakdown {
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
   uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
-  uint64_t activeStateCellBytes = 0;
+  uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
@@ -124,8 +124,8 @@ struct EngineMemoryBreakdown {
   uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
-  // All active state cells, cached composite states, and KV extents grow
-  // from this one governor-controlled byte budget; none is preallocated.
+  // All lanes' state, cached composite states, and KV extents grow from this
+  // one governor-controlled byte budget; none is preallocated.
   uint64_t dynamicBudgetBytes = 0;
 
   uint32_t kvPageTokens = 0;
@@ -135,10 +135,10 @@ struct EngineMemoryBreakdown {
   // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
   uint64_t kvExtentBytes = 0;
-  // One request's KV capacity: the whole extents its KV can use within the
-  // budget beside one state cell. The pool's page ids cover more
-  // (RuntimeResources sizes them by the hard budget). Request context and
-  // four-lane execution are independent policy limits.
+  // One request's KV capacity: the whole extents of the budget's pages left
+  // after one lane's state. The pool's page ids cover more (RuntimeResources
+  // sizes them by the hard budget). Request context and four-lane execution
+  // are independent policy limits.
   uint32_t kvCapacityPages = 0;
   uint64_t kvCapacityBytes = 0;
   uint64_t kvCapacityTokens = 0;

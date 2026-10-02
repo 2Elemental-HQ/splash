@@ -93,7 +93,7 @@ void testAdmissionRespectsContendedBudgetAndDecodePriority() {
   scheduler.submit(request(5, 1, false, RequestPriority::Foreground));
   scheduler.resourcesReady(5, 1);
   require(scheduler.prefillAdmissionOrder(candidates).empty(),
-          "lower-priority prefill reserved cells ahead of runnable foreground decode");
+          "lower-priority prefill reserved lanes ahead of runnable foreground decode");
   scheduler.cancel(5);
   require(!scheduler.prefillAdmissionOrder(candidates).empty(),
           "prefill admission did not resume after foreground decode left");

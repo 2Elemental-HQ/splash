@@ -222,7 +222,7 @@ enum class CacheDisposition : uint8_t {
 struct StartEvent {
   uint64_t requestId = 0;
   CacheDisposition cacheDisposition = CacheDisposition::Miss;
-  int32_t slotIndex = -1;
+  int32_t lane = -1;
   uint32_t matchedPromptTokens = 0;
   uint32_t capacityTokens = 0;
 

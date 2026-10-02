@@ -171,8 +171,8 @@ private:
 class Executor final : public model::Model {
 public:
   explicit Executor(
-      uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth)
-      : maximumCells(maximumCells) {}
+      uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
+      : maximumLanes(maximumLanes) {}
 
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
@@ -185,7 +185,7 @@ public:
       --deniedBegins;
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
-    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [lane](const auto &entry) {
             return entry.second.resident && entry.second.lane == lane;
@@ -216,7 +216,7 @@ public:
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
-    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [&](const auto &candidate) {
             return candidate.first != id && candidate.second.resident &&
@@ -502,7 +502,7 @@ public:
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   bool resumeDenied = false;
-  uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth;
+  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;
   std::function<void()> snapshotObserver;
   std::function<bool()> snapshotRoom;
@@ -679,7 +679,7 @@ void testConcurrentColdPrefixesComputeOnce() {
   }
   static_cast<void>(engine.tick(0));
   require(model.requests.size() == 1,
-          "shared cold prefix allocated redundant active state cells");
+          "shared cold prefix allocated redundant lanes");
   runUntilIdle(engine);
   require(model.prefillRows == 160 + 4 * 33 && model.restored == 3 * 160,
           "concurrent cold requests recomputed their shared prefix");
@@ -810,7 +810,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
     require(model.beginAttempts == 1 && events.outputs[2].empty() &&
                 events.outputs[1] == std::vector<uint32_t>{42} &&
                 engine.snapshot().scheduler.waitingPrefix == 0,
-            "expired prefix waiter allocated a cell or interrupted its producer");
+            "expired prefix waiter allocated a lane or interrupted its producer");
     require(!cancelled || events.usage.at(2) == std::pair<uint32_t, uint32_t>{193, 0},
             "a request cancelled before it started reported other usage");
   }
@@ -1078,7 +1078,7 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   runUntilIdle(engine);
 
   // The second request restores the first publication without reserving a
-  // redundant state cell or capturing the same state again.
+  // redundant lane or capturing the same state again.
   const auto snapshot = engine.snapshot();
   require(executor.snapshotAttempts == 1 && executor.snapshots == 1,
           "duplicate state publication performed a second snapshot capture");
@@ -1733,7 +1733,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
           "cancellation leaked active resources or dropped committed KV");
 }
 
-void testActiveCellGrowthReclaimsCachedStateAndRetries() {
+void testLaneStateGrowthReclaimsCachedStateAndRetries() {
   for (bool hostPressure : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
@@ -1766,7 +1766,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
     const auto after = resources.snapshot();
     require(executor.beginAttempts == attempts + 2 &&
                 events.completedCount == 2,
-            "active-cell growth did not reclaim memory and retry");
+            "lane state growth did not reclaim memory and retry");
     if (hostPressure) {
       require(executor.reclaimedIdleStateBytes == 350'224'384 &&
                   !storage.growthBlocked &&
@@ -1775,7 +1775,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
               "host-pressure state admission evicted cache or ignored idle memory");
     } else {
       require(after.stateCache.entries == 0,
-              "active-cell growth did not reclaim cached state");
+              "lane state growth did not reclaim cached state");
     }
   }
 }
@@ -2104,11 +2104,11 @@ void testPressureReclaimFollowsTheChain() {
           "reclaim went past its target");
 }
 
-// A request starts only in a free state cell. While every cell is resident,
-// a waiting request is recorded as a concurrency wait without another cache
+// A request starts only in a free lane. While every lane is resident, a
+// waiting request is recorded as a concurrency wait without another cache
 // probe or admission attempt, and, as after a failed attempt, a memory wait
 // it was in no longer counts against the resource wait limit.
-void testFullStateCellsSkipAdmissionAttempts() {
+void testFullLanesSkipAdmissionAttempts() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool);
@@ -2116,7 +2116,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
   executor.decodeFinishes = false;
   // The first pass starts the three short prompts and tries request 5, the
   // fourth of its batch, which meets pressure. Request 4 arrived before it
-  // with a long prompt, so it is not held back and takes the last cell.
+  // with a long prompt, so it is not held back and takes the last lane.
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 4; };
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
@@ -2139,24 +2139,24 @@ void testFullStateCellsSkipAdmissionAttempts() {
     static_cast<void>(engine.tick(now));
   require(executor.requests.size() == 4 && executor.requests.contains(4) &&
               executor.beginAttempts == 5,
-          "fixture did not make every state cell resident");
+          "fixture did not make every lane resident");
 
   for (double now : {200.0, 201.0, 1200.0, 1201.0})
     static_cast<void>(engine.tick(now));
   const auto waiting = engine.resourceWaitSnapshot(1201);
   require(executor.beginAttempts == 5 && events.failedCount == 0 &&
               waiting.concurrency == 1 && waiting.memory == 0,
-          "full state cells retried admission or kept the memory wait limit");
+          "full lanes retried admission or kept the memory wait limit");
   engine.cancel(1);
   require(engine.tick(1202) && executor.beginAttempts == 6 &&
               events.startIds.back() == 5,
-          "a released state cell did not admit the waiting request");
+          "a released lane did not admit the waiting request");
   for (uint64_t id : {2, 3, 4, 5})
     engine.cancel(id);
   for (double now = 1203; now < 1220 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && resources.snapshot().activeRequests == 0,
-          "full state cell fixture leaked its lanes");
+          "full-lane fixture leaked its lanes");
 }
 
 void testConcurrencyLimitDoesNotEvictCache() {
@@ -2187,7 +2187,7 @@ void testConcurrencyLimitDoesNotEvictCache() {
   const auto saturated = resources.snapshot();
   require(saturated.stateCache.entries == cached.stateCache.entries &&
               saturated.stateCache.evictions == cached.stateCache.evictions,
-          "active-cell saturation was mistaken for memory pressure");
+          "lane saturation was mistaken for memory pressure");
 
   engine.cancel(23);
   engine.cancel(24);
@@ -2763,7 +2763,7 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     double now = 1;
-    // Lanes in every cell: both requests wait for one until they are
+    // Occupants in every lane: both requests wait for one until they are
     // cancelled.
     const uint64_t occupants = lanesFull ? model::ExecutionLimits::maximumBatchWidth : 0;
     for (uint64_t id = 1; id <= occupants; ++id) {
@@ -3204,7 +3204,7 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
     engine.submit(request(id, std::vector<uint32_t>(8193, id)));
   require(engine.tick(1) && engine.tick(2) &&
               executor.requests.size() == 1 && executor.prefillRows == 2048,
-          "long prefills reserved cells without executable work");
+          "long prefills reserved lanes without executable work");
   engine.submit(request(5, std::vector<uint32_t>(65, 5)));
   require(engine.tick(3) && executor.requests.contains(5) &&
               executor.requests.at(5).position > 0 && events.completedCount == 0,
@@ -3760,17 +3760,17 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     require(engine.tick(1) && engine.tick(2) &&
                 executor.requests.at(48).position == 2048 &&
                 !executor.requests.contains(49),
-            "unstarted prefill reserved a cell before it had scheduled work");
+            "unstarted prefill reserved a lane before it had scheduled work");
     require(engine.tick(3) && executor.requests.at(48).resident,
             "KV growth discarded completed prefill");
     if (priority == RequestPriority::Normal) {
       // The final prefill slice admits a peer into its remaining row budget;
-      // if that cell prevents KV growth, the unstarted peer must yield.
+      // if that lane prevents KV growth, the unstarted peer must yield.
       require(executor.suspensions == 1 && !executor.requests.at(49).resident,
               "KV growth did not yield the unstarted peer");
     } else {
       require(executor.suspensions == 0 && !executor.requests.contains(49),
-              "lower-priority work reserved a cell before its dispatch");
+              "lower-priority work reserved a lane before its dispatch");
     }
     runUntilIdle(engine);
     require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -5077,7 +5077,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   require(executor.diskReads == 1 && executor.prefillRows == 128 &&
               engine.snapshot().resourceResumptions == 0,
           "resumption did not wait for its disk state");
-  // The read fails and the host refuses the retry its cell; the pressure
+  // The read fails and the host refuses the retry its lane; the pressure
   // controller's pass then empties the cache and releases the KV extents.
   // Afterwards one extent (128 tokens) can come back: room for replay to
   // start, not for the dispatch that suspended the request.
@@ -5400,7 +5400,7 @@ void testHigherPriorityArrivalIsNotHeldByRecovery() {
 // has done the least, without a drain, and starts in its place; once it has
 // finished, the suspended lane resumes. An arrival of the residents' own
 // priority suspends nothing and waits for a lane.
-void testForegroundArrivalPreemptsWhenCellsAreFull() {
+void testForegroundArrivalPreemptsWhenLanesAreFull() {
   for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
@@ -5482,9 +5482,10 @@ void testRefusedHigherPriorityStartPreemptsLowerResident() {
 
 // Background lanes hold three lanes and a Normal producer the fourth, with
 // a junction three commands in for a Normal request that shares its prefix.
-// While the request waits for that prefix it takes no lane: the lane it
-// suspended would resume into the cell first and replay for nothing. Once
-// the junction has landed, it takes a Background lane and starts from it.
+// While the request waits for that prefix it takes no lane: the request it
+// suspended would resume into the freed lane first and replay for nothing.
+// Once the junction has landed, it takes a Background lane and starts from
+// it.
 void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -8937,7 +8938,7 @@ int main() {
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
-    testActiveCellGrowthReclaimsCachedStateAndRetries();
+    testLaneStateGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
@@ -8947,7 +8948,7 @@ int main() {
     testWarningReclaimCountsOnlyWhatReachesTheHost();
     testWarningReclaimWakesARefusedStart();
     testPressureReclaimFollowsTheChain();
-    testFullStateCellsSkipAdmissionAttempts();
+    testFullLanesSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
@@ -8995,7 +8996,7 @@ int main() {
     testRecoveryDrainEndsWithItsCause();
     testRecoveryDrainEndsWhenAResidentReleasesMemory();
     testHigherPriorityArrivalIsNotHeldByRecovery();
-    testForegroundArrivalPreemptsWhenCellsAreFull();
+    testForegroundArrivalPreemptsWhenLanesAreFull();
     testRefusedHigherPriorityStartPreemptsLowerResident();
     testPrefixWaiterTakesNoLaneUntilThePrefixLands();
     testRequestBelowARunningPriorityTakesNoLane();

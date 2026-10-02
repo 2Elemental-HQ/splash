@@ -46,7 +46,7 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   actual.targetWeightsBytes = b.targetWeightsBytes;
   actual.draftWeightsBytes = b.draftWeightsBytes;
   actual.visionWeightsBytes = b.visionWeightsBytes;
-  actual.stateAllocatedBytes = b.activeStateCellBytes;
+  actual.stateAllocatedBytes = b.laneStateBytes;
   actual.sharedPrefillBytes = b.sharedPrefillBytes;
   actual.sharedDecodeBytes = b.sharedDecodeBytes;
   actual.kvAllocatedBytes = b.kvExtentBytes;

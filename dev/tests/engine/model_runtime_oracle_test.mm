@@ -474,7 +474,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         span.pixelBytes() +
         uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
-        model.stateLayout().activeCellBytes();
+        model.stateLayout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
     const StateAdmission denied = executor.begin(image.modelView());
     const uint64_t unspent = fault.remainingBytes;
@@ -634,10 +634,10 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   executor.end(request.id);
 
   // Free only pooled state, keeping the image cache. A cache-only request
-  // must fit a fresh state cell without recreating the reclaimed encoder.
+  // must fit a fresh lane's state without recreating the reclaimed encoder.
   while (states.releaseOneIdle(false)) {
   }
-  const uint64_t stateBytes = model.stateLayout().activeCellBytes();
+  const uint64_t stateBytes = model.stateLayout().laneBytes();
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
   request.id = 96;
   fault.remainingBytes = stateBytes;
@@ -745,7 +745,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
               backend.memoryStats().allocatedBytes ==
                   originalBytes + singleImageBytes,
           "repeated placements allocated multiple image buffers");
-  const uint32_t lane = *admitted.cell;
+  const uint32_t lane = *admitted.lane;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
   executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
@@ -774,7 +774,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   require(executor.telemetry().imageEncodes == encodes + 2,
           "prefix restore discarded data for a later image placement");
   compareCommittedSamples(
-      expected, sampleCommittedState(backend, states, *restored.cell), true);
+      expected, sampleCommittedState(backend, states, *restored.lane), true);
   executor.end(request.id);
   checkpoint.reset();
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -808,8 +808,8 @@ void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
 // decode beside a healthy lane, which commits and keeps decoding, at the end
 // of a prefill, and in a constrained request's first selection from its final
 // hidden. The failed lanes emit nothing and the backend stays healthy. The
-// state cells they return to the pool are cleared or overwritten before a
-// lane reads them again.
+// GDN cells they return to the pool are cleared or overwritten before a lane
+// reads them again.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                                          const kv::PageStorage &pages,
                                          const model::QwenStateStorage &states,
@@ -1066,7 +1066,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     require(admission.granted() && !started.imageRowsBytes && !started.visionArenaBytes &&
                 started.imageEmbeddingReuses == reuses &&
                 backend.memoryStats().allocatedBytes ==
-                    before + model.stateLayout().activeCellBytes(),
+                    before + model.stateLayout().laneBytes(),
             "a start staged an image its restored prefix covers");
     if (id == 115) {
       bool refused = false;
@@ -1108,7 +1108,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
-  const uint64_t laneBytes = model.stateLayout().activeCellBytes();
+  const uint64_t laneBytes = model.stateLayout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
     return span.pixelBytes() +
            uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
@@ -2780,9 +2780,9 @@ int main(int argc, char **argv) {
         StateAdmission admission = executor.resume(sequence.modelView());
         if (holder)
           executor.end(holder->id);
-        require(admission.granted() && (!holder || *admission.cell != 0),
+        require(admission.granted() && (!holder || *admission.lane != 0),
                 "recompute admission failed");
-        return *admission.cell;
+        return *admission.lane;
       };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {

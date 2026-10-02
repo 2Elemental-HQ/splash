@@ -397,7 +397,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(
                 streamed[call.request_id], [1000 + index, 2000 + index, 3000 + index]
             )
-            self.assertEqual(result.start.slot_index, index)
+            self.assertEqual(result.start.lane, index)
         self.assertTrue(callbacks_complete.wait(1.0))
         self.assertEqual(callbacks, [call.request_id for call in reverse_calls])
         for call in calls:

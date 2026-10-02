@@ -174,13 +174,13 @@ void testAdvertisedContextIsGrantable() {
     for (const uint64_t untracked :
          {uint64_t{0}, 64 * kMiB, 150 * kMiB, 300 * kMiB, reserves,
           reserves + 256 * kMiB}) {
-      // After warmup the weights, the arenas and the request's state cell
+      // After warmup the weights, the arenas and the request's lane state
       // are the backend's buffers; Metal holds the untracked bytes besides.
       test::metalStatistics() = {};
       test::metalStatistics().allocatedBytes =
           budget.targetWeightsBytes + budget.draftWeightsBytes +
           budget.visionWeightsBytes + budget.sharedPrefillBytes +
-          budget.sharedDecodeBytes + budget.activeStateCellBytes;
+          budget.sharedDecodeBytes + budget.laneStateBytes;
       test::metalStatistics().deviceCurrentAllocatedBytes =
           test::metalStatistics().allocatedBytes + untracked;
       metal::MetalBackend backend("unused");
@@ -217,7 +217,7 @@ void testHostRefusalStartsReclaim() {
   test::metalStatistics().deviceCurrentAllocatedBytes = 20 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
-  const uint64_t stateCell = 350'224'384;
+  const uint64_t laneState = 350'224'384;
   std::optional<uint64_t> available = hostReserve + 64 * kGiB;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve,
                           [&available] { return available; });
@@ -231,7 +231,7 @@ void testHostRefusalStartsReclaim() {
   require(!shared && shared.failure == metal::AllocationFailure::HostPressure &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "a refusal the host shares was reported as the engine's");
-  const metal::AllocationResult beyondHost = admit(governor, stateCell);
+  const metal::AllocationResult beyondHost = admit(governor, laneState);
   require(!beyondHost && beyondHost.failure == metal::AllocationFailure::HostPressure,
           "a request beyond the host headroom was admitted");
   const MemoryGovernorSnapshot refused = governor.snapshot();
@@ -244,7 +244,7 @@ void testHostRefusalStartsReclaim() {
           "a request-sized host refusal did not start the paced reclaim");
   // The reclaim reaches the recovery margin, and the request fits.
   *available += directive->targetBytes;
-  require(static_cast<bool>(admit(governor, stateCell)) &&
+  require(static_cast<bool>(admit(governor, laneState)) &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "the waiting request did not fit after the reclaim");
 }

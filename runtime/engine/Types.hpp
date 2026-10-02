@@ -111,7 +111,7 @@ public:
   virtual void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t,
                               uint32_t, uint32_t, double) = 0;
   virtual void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-                       uint32_t matchedTokens, uint32_t stateSlot) = 0;
+                       uint32_t matchedTokens, uint32_t lane) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,

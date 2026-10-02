@@ -74,7 +74,7 @@ struct QwenLaneMetadata final {
 class QwenStateStorage;
 
 // One GDN cell plus one draft ring: the buffers a cached state occupies.
-struct QwenCacheSlot final {
+struct QwenCachedBuffers final {
   std::shared_ptr<QwenGdnCell> gdn;
   std::shared_ptr<DFlashDraftRing> draft;
 };
@@ -124,8 +124,9 @@ public:
   offload(std::function<void()> completion) const override;
 
 private:
-  QwenCompositeState(std::shared_ptr<QwenBufferPool> pool, QwenCacheSlot slot,
-                     CompositeStateLayout layout, QwenLogicalLengths lengths,
+  QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
+                     QwenCachedBuffers buffers, CompositeStateLayout layout,
+                     QwenLogicalLengths lengths,
                      std::shared_ptr<SlotFile> file,
                      std::shared_ptr<StateStaging> staging);
   QwenCompositeState(CompositeStateLayout layout, QwenLogicalLengths lengths,
@@ -143,7 +144,7 @@ private:
         std::function<void()> completion);
 
   std::shared_ptr<QwenBufferPool> pool_;
-  QwenCacheSlot slot_;
+  QwenCachedBuffers buffers_;
   CompositeStateLayout layout_;
   QwenLogicalLengths lengths_;
   std::shared_ptr<SlotFile> file_;
@@ -156,9 +157,6 @@ private:
 // Live cells keep their buffers; only idle buffers may be reclaimed.
 class QwenStateStorage final {
 public:
-  // The GDN cells a lane holds, with one draft ring.
-  static constexpr uint32_t kLaneCells = 2;
-
   // The file, when given, holds one state per slot and shares the cache's
   // disk budget.
   QwenStateStorage(metal::MetalBackend &backend,
@@ -243,7 +241,9 @@ public:
 
 private:
   struct Buffers final {
-    std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
+    std::array<std::shared_ptr<QwenGdnCell>,
+               CompositeStateLayout::kLaneGdnCells>
+        gdn;
     std::shared_ptr<DFlashDraftRing> draft;
   };
   struct Lane final {

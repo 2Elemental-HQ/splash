@@ -372,11 +372,11 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
 }
 
 void NativeRuntime::started(uint64_t requestId, EngineCacheStatus cacheStatus,
-                            uint32_t matchedTokens, uint32_t stateSlot) {
+                            uint32_t matchedTokens, uint32_t lane) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   telemetry.startedMilliseconds = clocks_.monotonicMilliseconds();
   send(protocol::StartEvent{requestId, mapCacheDisposition(cacheStatus),
-                            static_cast<int32_t>(stateSlot), matchedTokens,
+                            static_cast<int32_t>(lane), matchedTokens,
                             config_.engine.maxContext});
 }
 

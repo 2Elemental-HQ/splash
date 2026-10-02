@@ -177,8 +177,8 @@ class CompositeState {
 public:
   virtual ~CompositeState() = default;
   // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  // the lane's state; dropping the reference returns its buffers to the
+  // model's pool, and idle-state reclaim frees them.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
@@ -269,7 +269,7 @@ struct BatchPlan final {
 enum class StateFailure : uint8_t { None, ConcurrencyLimit, MemoryPressure };
 
 struct StateAdmission final {
-  std::optional<uint32_t> cell;
+  std::optional<uint32_t> lane;
   StateFailure failure = StateFailure::None;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
   // On a refused start: what the attempt matched (cached image rows, the
@@ -277,7 +277,7 @@ struct StateAdmission final {
   // retries, so the retry finds them.
   std::shared_ptr<const void> held{};
 
-  [[nodiscard]] bool granted() const noexcept { return cell.has_value(); }
+  [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
 struct ModelBatchItem final {
@@ -400,7 +400,7 @@ struct StateAllocationTracker final {
 // not cache or scheduler state. The engine consumes these values without
 // knowing the target or draft architecture that produced them.
 struct ModelMemoryPlan final {
-  uint64_t activeStateCellPlannedAllocatedBytes = 0;
+  uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
 };
@@ -528,9 +528,9 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
   // Copies the request's committed state at its current page-aligned
-  // boundary into a cache slot. Returns nullptr when no slot is free and the
-  // governor denies a new one; the caller may release a cached state and
-  // retry.
+  // boundary into the cached state's buffers. Returns nullptr when the pool
+  // has none free and the governor denies new ones; the caller may release a
+  // cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
   // The bytes one lane's state snapshot allocates.
@@ -539,9 +539,10 @@ public:
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
-  // boundary to the disk tier from the lane's own buffers, for a state no
-  // cache slot can hold; the ticket carries its disk copy. Null when the
-  // quota cannot admit another state: the caller may free quota and retry.
+  // boundary to the disk tier from the lane's own buffers, for a state the
+  // pool has no cached state's buffers for; the ticket carries its disk copy.
+  // Null when the quota cannot admit another state: the caller may free quota
+  // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
   // The cached states whose buffers a lane's activation would still have to

@@ -120,7 +120,7 @@ private:
   bool send(protocol::Message message);
 
   void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-               uint32_t matchedTokens, uint32_t stateSlot) override;
+               uint32_t matchedTokens, uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
                       uint32_t acceptedDraftTokens,

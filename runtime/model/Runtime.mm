@@ -536,7 +536,7 @@ struct Runtime::Impl {
   // or not. Images the restored prefix covers are left out: only their
   // spans are kept. At the budget the engine retries a denied start after
   // each reclaim step, and a denial builds nothing, so no encoder arena,
-  // image buffer or state cell is built and dropped every time. The refusal
+  // image buffer or lane state is built and dropped every time. The refusal
   // keeps its cause and holds what it matched, so the reclaim before the
   // retry spares it; a grant hands the request's images to `images` and
   // counts the rows it shares as reuses, each once.
@@ -1880,7 +1880,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
   if (const StateAdmission admission = beginAt(request, stateLane); !admission.granted()) {
     throw metal::MetalAllocationError(
-        std::string("unable to allocate sequence state cell: ") +
+        std::string("unable to allocate a lane's state: ") +
             metal::allocationFailureName(admission.allocationFailure),
         admission.allocationFailure);
   }
@@ -1930,7 +1930,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     return impl_->activate(request, lane, images);
   });
   if (admission.granted()) {
-    entry.stateLane = *admission.cell;
+    entry.stateLane = *admission.lane;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.images = std::move(images);
@@ -2739,7 +2739,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
-  return {package.stateLayout().activeCellBytes(),
+  return {package.stateLayout().laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};
 }

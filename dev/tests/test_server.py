@@ -1311,7 +1311,7 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("batch", response["metrics"])
         self.assertEqual(
             response["metrics"]["cache"],
-            {"status": "hit", "matched_tokens": 1, "capacity": 8192, "slot": 0},
+            {"status": "hit", "matched_tokens": 1, "capacity": 8192, "lane": 0},
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].seed, 7)

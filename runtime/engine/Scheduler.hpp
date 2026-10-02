@@ -88,7 +88,7 @@ public:
 
   [[nodiscard]] bool expireDeadlines(double nowMilliseconds);
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // Preview the dispatch row budget before allocating new resident cells.
+  // Preview the dispatch row budget before allocating new lanes.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates) const;
   // The highest priority among requests that prefill or decode. A waiting

@@ -40,8 +40,8 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << model.footprint.targetWeightsBytes << ','
       << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
       << "\"vision_weights_bytes\":" << model.footprint.visionWeightsBytes << ','
-      << "\"active_state_cell_bytes\":"
-      << model.footprint.runtime.activeStateCellPlannedAllocatedBytes << ','
+      << "\"lane_state_bytes\":"
+      << model.footprint.runtime.laneStatePlannedAllocatedBytes << ','
       << "\"shared_prefill_bytes\":"
       << model.footprint.runtime.sharedPrefillPlannedAllocatedBytes << ','
       << "\"shared_decode_bytes\":"
@@ -56,14 +56,14 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
 } // namespace
 
 std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
-                                             uint64_t activeStateCellBytes,
+                                             uint64_t laneStateBytes,
                                              const kv::Layout &layout) noexcept {
   uint64_t runwayBytes = 0;
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
   if (!checkedMultiply(layout.bytesPerModelPage(),
                        kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
-      !checkedAdd(activeStateCellBytes, runwayBytes, dynamicBytes) ||
+      !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
     return std::nullopt;
   return result;
@@ -114,8 +114,8 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
-  if (!footprint.runtime.activeStateCellPlannedAllocatedBytes) {
-    return "active_state_cell_bytes_required";
+  if (!footprint.runtime.laneStatePlannedAllocatedBytes) {
+    return "lane_state_bytes_required";
   }
   if (!footprint.runtime.sharedPrefillPlannedAllocatedBytes) {
     return "shared_prefill_bytes_required";
@@ -159,7 +159,7 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"draft_weights_bytes\":" << draftWeightsBytes << ','
       << "\"vision_weights_bytes\":" << visionWeightsBytes << ','
       << "\"maximum_batch_width\":" << maximumBatchWidth << ','
-      << "\"active_state_cell_bytes\":" << activeStateCellBytes << ','
+      << "\"lane_state_bytes\":" << laneStateBytes << ','
       << "\"shared_prefill_bytes\":" << sharedPrefillBytes << ','
       << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
@@ -196,7 +196,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "draft weights: " << bytesAndMiB(draftWeightsBytes) << '\n'
       << "vision weights: " << bytesAndMiB(visionWeightsBytes) << '\n'
       << "maximum DFlash batch width: " << maximumBatchWidth << '\n'
-      << "active state cell: " << bytesAndMiB(activeStateCellBytes) << '\n'
+      << "lane state: " << bytesAndMiB(laneStateBytes) << '\n'
       << "shared prefill: " << bytesAndMiB(sharedPrefillBytes) << '\n'
       << "shared decode: " << bytesAndMiB(sharedDecodeBytes) << '\n'
       << "pipeline reserve: " << bytesAndMiB(pipelineReserveBytes) << '\n'
@@ -286,8 +286,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.targetWeightsBytes = model.footprint.targetWeightsBytes;
   breakdown.draftWeightsBytes = model.footprint.draftWeightsBytes;
   breakdown.visionWeightsBytes = model.footprint.visionWeightsBytes;
-  breakdown.activeStateCellBytes =
-      model.footprint.runtime.activeStateCellPlannedAllocatedBytes;
+  breakdown.laneStateBytes =
+      model.footprint.runtime.laneStatePlannedAllocatedBytes;
   breakdown.sharedPrefillBytes =
       model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
   breakdown.sharedDecodeBytes =
@@ -327,7 +327,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
           : 0;
   const std::optional<uint64_t> required =
       minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.activeStateCellBytes, model.targetKvLayout);
+                           breakdown.laneStateBytes, model.targetKvLayout);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
@@ -339,8 +339,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > breakdown.activeStateCellBytes
-          ? breakdown.dynamicBudgetBytes - breakdown.activeStateCellBytes
+      breakdown.dynamicBudgetBytes > breakdown.laneStateBytes
+          ? breakdown.dynamicBudgetBytes - breakdown.laneStateBytes
           : 0;
   const uint64_t budgetPages =
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
@@ -371,7 +371,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
         std::nullopt,
         failure(
             BudgetErrorCode::KvPoolDoesNotFit,
-            "hard budget cannot fit one active state cell and the KV runway",
+            "hard budget cannot fit one lane's state and the KV runway",
             std::move(breakdown))};
   }
 

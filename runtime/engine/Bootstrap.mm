@@ -196,7 +196,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
       model::ExecutionLimits::maximumBatchWidth,
       (budget.dynamicBudgetBytes -
        kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
-          budget.activeStateCellBytes));
+          budget.laneStateBytes));
   for (uint32_t width = 1;
        width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
     if (width > affordableWidth ||

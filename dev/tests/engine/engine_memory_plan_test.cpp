@@ -36,9 +36,9 @@ ModelMemoryProfile model() {
   return test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
 }
 
-// The pages the budget holds for one request's KV beside its state cell.
+// The pages the budget holds for one request's KV beside one lane's state.
 uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
-  return (budget.dynamicBudgetBytes - budget.activeStateCellBytes) / budget.kvPageBytes;
+  return (budget.dynamicBudgetBytes - budget.laneStateBytes) / budget.kvPageBytes;
 }
 
 void testUnifiedElasticBudget() {
@@ -53,7 +53,7 @@ void testUnifiedElasticBudget() {
               budget.hardBudgetBytes - budget.fixedRuntimeBytes,
           "state and KV do not share one dynamic budget");
   require(budget.minimumDynamicBytes ==
-                  budget.activeStateCellBytes + budget.kvExtentBytes &&
+                  budget.laneStateBytes + budget.kvExtentBytes &&
               budget.minimumRequiredBytes ==
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus the KV runway is incorrect");
@@ -114,7 +114,7 @@ void testMinimumHoldsTheWarmupRunway() {
   const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
   const auto &budget = plan.breakdown();
   require(budget.minimumDynamicBytes ==
-              budget.activeStateCellBytes + 64 * budget.kvPageBytes,
+              budget.laneStateBytes + 64 * budget.kvPageBytes,
           "the minimum does not hold the warmup runway");
   const auto refused =
       evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1);
@@ -123,14 +123,14 @@ void testMinimumHoldsTheWarmupRunway() {
 }
 
 // The pre-load fit check and the plan share one minimum: the fixed bytes,
-// one state cell and the KV runway.
+// one lane's state and the KV runway.
 void testMinimumRequiredBytesIsThePlans() {
   for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
     ModelMemoryProfile profile = model();
     profile.targetKvLayout.format = format;
     const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
     const EngineMemoryBreakdown &budget = plan.breakdown();
-    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.activeStateCellBytes,
+    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.laneStateBytes,
                                  profile.targetKvLayout) == budget.minimumRequiredBytes,
             "the minimum differs from the plan's");
   }
@@ -171,7 +171,7 @@ void testDiskTierStateStagingIsBudgeted() {
   const EngineMemoryPlan with = test::requireMemoryPlan(device(), tiered);
   const auto &budget = with.breakdown();
   require(without.breakdown().fixedRuntimeBytes + staging +
-                  budget.activeStateCellBytes + budget.kvCapacityBytes <=
+                  budget.laneStateBytes + budget.kvCapacityBytes <=
               budget.hardBudgetBytes,
           "the advertised context cannot be allocated beside the state staging buffer");
   require(with.maximumContextTokens() < without.maximumContextTokens(),
@@ -280,7 +280,7 @@ void testExtentSizeFollowsThePool() {
   const auto planFor = [&](uint64_t pages) {
     return evaluateEngineMemoryPlan(
         device(), compact,
-        reference.fixedRuntimeBytes + reference.activeStateCellBytes +
+        reference.fixedRuntimeBytes + reference.laneStateBytes +
             pages * reference.kvPageBytes);
   };
   for (const auto [pages, extent] :
@@ -295,7 +295,7 @@ void testExtentSizeFollowsThePool() {
   const auto tooSmall = planFor(255);
   require(!tooSmall.plan && tooSmall.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
               tooSmall.status.breakdown.minimumDynamicBytes ==
-                  reference.activeStateCellBytes + 256 * 332'800,
+                  reference.laneStateBytes + 256 * 332'800,
           "a budget below the smallest extent was accepted");
 }
 

@@ -458,10 +458,10 @@ std::optional<ProtocolIssue> validateStart(const StartEvent &event,
     return makeIssue(failureClass, IssueCode::InvalidEnumValue, event.requestId,
                      "start cache disposition is invalid");
   }
-  if (event.slotIndex < -1 || !event.capacityTokens ||
+  if (event.lane < -1 || !event.capacityTokens ||
       event.matchedPromptTokens > event.capacityTokens) {
     return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
-                     "start event capacity or slot is invalid");
+                     "start event capacity or lane is invalid");
   }
   return std::nullopt;
 }
@@ -695,7 +695,7 @@ ProtocolResult<Frame> encodeStart(const StartEvent &event) {
   Writer writer(kStartFixedBytes);
   writer.u64(event.requestId);
   writer.u8(static_cast<uint8_t>(event.cacheDisposition));
-  writer.u32(static_cast<uint32_t>(event.slotIndex));
+  writer.u32(static_cast<uint32_t>(event.lane));
   writer.u32(event.matchedPromptTokens);
   writer.u32(event.capacityTokens);
   return success(Frame{FrameType::Start, writer.take()});
@@ -968,16 +968,16 @@ ProtocolResult<Message> decodeStart(const Frame &frame) {
   Reader reader(frame.payload);
   StartEvent event;
   uint8_t disposition = 0;
-  uint32_t slot = 0;
+  uint32_t lane = 0;
   if (!reader.u64(event.requestId) || !reader.u8(disposition) ||
-      !reader.u32(slot) || !reader.u32(event.matchedPromptTokens) ||
+      !reader.u32(lane) || !reader.u32(event.matchedPromptTokens) ||
       !reader.u32(event.capacityTokens) || reader.remaining()) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "start payload has an invalid length"));
   }
   event.cacheDisposition = static_cast<CacheDisposition>(disposition);
-  event.slotIndex = std::bit_cast<int32_t>(slot);
+  event.lane = std::bit_cast<int32_t>(lane);
   if (auto issue = validateStart(event, FailureClass::ProtocolFatal)) {
     return failure<Message>(std::move(*issue));
   }

@@ -289,7 +289,7 @@ class CacheDisposition(IntEnum):
 class StartEvent:
     request_id: int
     cache_disposition: CacheDisposition
-    slot_index: int
+    lane: int
     matched_prompt_tokens: int
     capacity_tokens: int
 
@@ -941,11 +941,11 @@ def _start_issue(event: StartEvent, failure: FailureClass) -> ProtocolIssue | No
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
     try:
-        slot = _i32(event.slot_index, "slot index")
+        lane = _i32(event.lane, "lane")
         matched = _u32(event.matched_prompt_tokens, "matched prompt tokens")
         capacity = _u32(event.capacity_tokens, "capacity tokens")
-        if slot < -1 or not capacity or matched > capacity:
-            raise ValueError("start event capacity or slot is invalid")
+        if lane < -1 or not capacity or matched > capacity:
+            raise ValueError("start event capacity or lane is invalid")
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
     return None
@@ -1244,7 +1244,7 @@ def _encode_message(
         payload = _START.pack(
             message.request_id,
             int(message.cache_disposition),
-            message.slot_index,
+            message.lane,
             message.matched_prompt_tokens,
             message.capacity_tokens,
         )
@@ -1605,7 +1605,7 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         _raise_issue(_ready_issue(message, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.START:
-        request_id, disposition, slot, matched, capacity = _START.unpack(payload)
+        request_id, disposition, lane, matched, capacity = _START.unpack(payload)
         message = StartEvent(
             request_id,
             _decode_enum(
@@ -1615,7 +1615,7 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
                 FailureClass.PROTOCOL_FATAL,
                 request_id,
             ),
-            slot,
+            lane,
             matched,
             capacity,
         )

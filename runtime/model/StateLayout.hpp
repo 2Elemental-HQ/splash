@@ -71,14 +71,17 @@ struct DraftStateLayout final {
 };
 
 struct CompositeStateLayout final {
+  // The GDN cells a lane holds, with one draft ring.
+  static constexpr uint32_t kLaneGdnCells = 2;
+
   GdnStateLayout target;
   DraftStateLayout draft;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return target.valid() && draft.valid();
   }
-  [[nodiscard]] constexpr uint64_t activeCellBytes() const noexcept {
-    return 2 * target.cellBytes() + draft.ringBytes();
+  [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
+    return kLaneGdnCells * target.cellBytes() + draft.ringBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
     return target.cellBytes() + draft.ringBytes();

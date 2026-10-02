@@ -64,7 +64,7 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     capacity: int = 0
-    slot: int = -1
+    lane: int = -1
 
 
 @dataclass
@@ -634,7 +634,7 @@ class NativeBackend:
                     self._CACHE_NAMES[event.cache_disposition],
                     event.matched_prompt_tokens,
                     event.capacity_tokens,
-                    event.slot_index,
+                    event.lane,
                 )
                 with self.lock:
                     job.cache = cache
