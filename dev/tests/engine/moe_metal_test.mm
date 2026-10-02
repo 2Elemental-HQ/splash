@@ -327,6 +327,21 @@ const char *configureRouting(Fixture &fixture, Routing distribution) {
   return "invalid";
 }
 
+// The rows a tile's matmul reads (moe_matmul_rows,
+// kernels/common/moe_expert_slab.h): the smallest of 8, 16 and the tile's
+// rows that holds its live rows.
+uint32_t matmulRows(uint32_t liveRows, uint32_t tileRows) {
+  return std::min(tileRows, liveRows <= 8 ? 8u : liveRows <= 16 ? 16u : tileRows);
+}
+
+// The byte every grouped route and grouped input holds before a run.
+constexpr uint8_t kCanary = 0xa5;
+
+bool untouched(const void *data, uint64_t bytes) {
+  const auto *begin = static_cast<const uint8_t *>(data);
+  return std::all_of(begin, begin + bytes, [](uint8_t byte) { return byte == kCanary; });
+}
+
 void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
            const std::string &label) {
   const auto *selected =
@@ -360,13 +375,28 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
     expectedTiles += (count + tileRows - 1) / tileRows;
   require(*tileCount == expectedTiles,
           label + ": tile count differs from per-expert occupancy");
+  const auto *groupedInput = static_cast<const uint8_t *>(
+      fixture.buffers.scratch.groupedInput.contents());
+  const uint64_t inputRowBytes = uint64_t{kHidden} * kBFloat16Bytes;
+  const uint64_t scoresBytes = uint64_t{rows} * kStorageN * sizeof(float);
   for (uint32_t tile = 0; tile < *tileCount; ++tile) {
     const uint32_t liveRows = tiles[tile * 2 + 1];
     require(liveRows > 0 && liveRows <= tileRows,
             label + ": invalid tile live row count");
-    for (uint32_t row = liveRows; row < tileRows; ++row)
+    const uint32_t matmul = matmulRows(liveRows, tileRows);
+    for (uint32_t row = liveRows; row < matmul; ++row)
       require(groupedRoutes[tile * tileRows + row] == UINT32_MAX,
-              label + ": partial tile padding is not marked empty");
+              label + ": padding a tile's matmul reads is not marked empty");
+    // Neither the grouping nor the gather writes the rows past the matmul's,
+    // so they keep the canary, except where the router's scores, which come
+    // first in the grouped input, overwrote it.
+    for (uint32_t row = matmul; row < tileRows; ++row) {
+      const uint64_t grouped = uint64_t{tile} * tileRows + row;
+      require(untouched(groupedRoutes + grouped, sizeof(uint32_t)) &&
+                  (grouped * inputRowBytes < scoresBytes ||
+                   untouched(groupedInput + grouped * inputRowBytes, inputRowBytes)),
+              label + ": grouping or gather wrote past a tile's matmul rows");
+    }
   }
 
   for (uint32_t row = 0; row < rows; ++row) {
@@ -830,6 +860,9 @@ void run(const std::string &metallibPath) {
       checkEncoding(graph, plan);
       std::memset(fixture.buffers.output.contents(), 0,
                   fixture.buffers.output.sizeBytes());
+      for (const MetalBuffer *buffer : {&fixture.buffers.scratch.groupedRoutes,
+                                        &fixture.buffers.scratch.groupedInput})
+        std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
       wallSeconds += backend.submitCommand(graph.dispatches()).wallSeconds;
       check(fixture, plan.rows(), plan.tileRows(), label + " " + routingLabel +
             " M" + std::to_string(plan.tileRows()));

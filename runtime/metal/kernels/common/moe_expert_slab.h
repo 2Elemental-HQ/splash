@@ -3,18 +3,25 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/QuantFormat.h"
 
-// A grouped expert tile of Max rows (kernels/shared/moe.metal) holds its
-// live rows first, then padding. Calls run(integral_constant<ushort, R>{})
-// with the rows R of the matmul an expert pass runs on `rows` live rows: the
-// smallest of 8, 16 and Max that holds them.
+// A grouped expert tile of tile_rows rows (kernels/shared/moe.metal) holds
+// `rows` live rows first, then padding. Every expert pass runs the matmul of
+// the smallest of 8, 16 and tile_rows rows that holds the live rows, and the
+// grouping and the gather fill exactly those rows: no kernel reads past them.
+inline uint moe_matmul_rows(uint rows, uint tile_rows) {
+  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
+}
+
+// Runs the pass `run` on the matmul rows of a Max-row tile:
+// run(integral_constant<ushort, R>{}) for R = moe_matmul_rows(rows, Max).
 template <ushort Max, typename Run>
 inline void moe_live_rows(uint rows, Run run) {
+  const uint matmul = moe_matmul_rows(rows, Max);
   if constexpr (8 < Max) {
-    if (rows <= 8)
+    if (matmul == 8)
       return run(integral_constant<ushort, 8>{});
   }
   if constexpr (16 < Max) {
-    if (rows <= 16)
+    if (matmul == 16)
       return run(integral_constant<ushort, 16>{});
   }
   run(integral_constant<ushort, Max>{});

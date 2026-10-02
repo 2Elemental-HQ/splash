@@ -420,10 +420,11 @@ kernel void moe_route_select_f32(
 }
 
 // Sorts one command's routes by expert. Tile t covers grouped rows
-// [t * tile_rows, (t + 1) * tile_rows) of a single expert; rows past that
-// expert's last route carry the route ~0u. One threadgroup covers all routes
-// and thread e owns expert e's count, offsets and tile descriptors. The shared
-// expert's tiles follow the routed tiles and hold every row in order.
+// [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
+// that expert's last route that its last tile's matmul reads
+// (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
+// and thread e owns expert e's count, offsets and tile descriptors. The
+// shared expert's tiles follow the routed tiles and hold every row in order.
 kernel void moe_group_routes(
     device const uint *selected [[buffer(0)]],
     device MoeTileDescriptor *tiles [[buffer(1)]],
@@ -469,9 +470,13 @@ kernel void moe_group_routes(
     tiles[tile_offset + tile] = MoeTileDescriptor{
         thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
   }
-  for (uint row = tile_offset * params.tile_rows + count;
-       row < (tile_offset + expert_tiles) * params.tile_rows; ++row) {
-    grouped_routes[row] = ~0u;
+  if (expert_tiles) {
+    const uint last = tile_offset + expert_tiles - 1;
+    const uint live = count - (expert_tiles - 1) * params.tile_rows;
+    for (uint row = tile_offset * params.tile_rows + count;
+         row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
+         ++row)
+      grouped_routes[row] = ~0u;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Experts) {
@@ -488,13 +493,16 @@ kernel void moe_group_routes(
   const uint shared_tiles =
       (params.rows + params.tile_rows - 1) / params.tile_rows;
   const uint shared_base = routed_tiles * params.tile_rows;
+  const uint shared_rows =
+      (shared_tiles - 1) * params.tile_rows +
+      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
+                      params.tile_rows);
   for (uint tile = thread_index; tile < shared_tiles; tile += Experts) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
         min(params.tile_rows, params.rows - tile * params.tile_rows)};
   }
-  for (uint row = thread_index; row < shared_tiles * params.tile_rows;
-       row += Experts) {
+  for (uint row = thread_index; row < shared_rows; row += Experts) {
     if (row < params.rows) {
       uint route = row * routes_per_row + params.top_k;
       grouped_routes[shared_base + row] = route;
@@ -507,19 +515,22 @@ kernel void moe_group_routes(
     *tile_count = routed_tiles + shared_tiles;
 }
 
-// Copies each grouped row's input so every expert tile is a dense matrix;
-// padding rows are zero and their outputs are never read.
+// Copies each grouped row's input so every expert tile is a dense matrix,
+// over the rows its matmul reads (moe_matmul_rows): padding rows among them
+// are zero and their outputs are never read.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
-                            device const uint *tile_count [[buffer(2)]],
-                            device bfloat *grouped_input [[buffer(3)]],
-                            constant MoeGatherParams &params [[buffer(4)]],
+                            device const MoeTileDescriptor *tiles [[buffer(2)]],
+                            device const uint *tile_count [[buffer(3)]],
+                            device bfloat *grouped_input [[buffer(4)]],
+                            constant MoeGatherParams &params [[buffer(5)]],
                             uint2 group [[threadgroup_position_in_grid]],
                             uint thread_index [[thread_index_in_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
   uint column = group.y * 256 + thread_index;
-  for (uint local = 0; local < params.tile_rows; ++local) {
+  const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
+  for (uint local = 0; local < rows; ++local) {
     uint row = group.x * params.tile_rows + local;
     uint route = grouped_routes[row];
     grouped_input[ulong(row) * params.input_size + column] =

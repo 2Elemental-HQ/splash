@@ -324,8 +324,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               gather, {tiles, shape.hiddenSize / 256, 1});
   else
     graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput},
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
   if (block)
     addGgufExperts(graph, scratch, weights.blocks(), plan);
