@@ -181,12 +181,15 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   restores.push_back(tier.restore(empty, 1, {}));
   restores.push_back(tier.restore(written[1], 2, {}));
   require(restores[0] && restores[1] && restores[2], "a restore within the share was refused");
-  require(!tier.restore(written[0], 3, {}), "restores took more than three quarters of the bound");
+  require(!tier.canRestore() && !tier.restore(written[0], 3, {}),
+          "restores took more than three quarters of the bound");
   auto target = tier.acquireSlot();
   auto demotion = tier.demote(9, target, {});
   require(demotion != nullptr, "a burst of restores left no room for a demotion");
   require(!tier.canDemote() && !tier.demote(9, tier.acquireSlot(), {}),
           "the tier took more transfers than its bound");
+  runUntilReady(tier, *restores[0]);
+  require(tier.canRestore(), "a retired restore did not give its room back");
   for (auto &restore : restores) runUntilReady(tier, *restore);
   runUntilReady(tier, *demotion);
   require(restores[0]->finish() && !restores[1]->finish() && restores[2]->finish(),

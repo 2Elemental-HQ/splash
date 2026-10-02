@@ -37,6 +37,8 @@ public:
   [[nodiscard]] virtual bool writable() const noexcept = 0;
   // Engine-thread admission probe, before replacing any disk copies.
   [[nodiscard]] virtual bool canDemote() const noexcept = 0;
+  // Engine-thread admission probe, before building a restore's arguments.
+  [[nodiscard]] virtual bool canRestore() const noexcept = 0;
   // Null when the disk quota is full.
   [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot() = 0;
   // Starts writing the page. Null when the tier takes no more demotions for
@@ -45,7 +47,7 @@ public:
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
          std::function<void()> completion) = 0;
   // Starts reading the page. Null when the tier takes no more restores for
-  // now; the caller retries later.
+  // now (canRestore); the caller retries later.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;

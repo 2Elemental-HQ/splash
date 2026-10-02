@@ -35,6 +35,7 @@ public:
   [[nodiscard]] uint64_t slotBytes() const noexcept override;
   [[nodiscard]] bool writable() const noexcept override;
   [[nodiscard]] bool canDemote() const noexcept override;
+  [[nodiscard]] bool canRestore() const noexcept override;
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot() override;
   [[nodiscard]] std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,

@@ -676,8 +676,9 @@ KvRestoreStatus Cache::kvRestoreStatus(uint64_t requestId) const {
 void Cache::startRestore(uint64_t block) {
   kv_.setTransferring(block, true);
   Restore &restore = restores_[block];
-  restore.transfer =
-      tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
+  if (tier_->canRestore())
+    restore.transfer =
+        tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
 }
 
 void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
@@ -782,11 +783,18 @@ bool Cache::pollTransfers() {
   if (!tier_)
     return progressed;
   tier_->poll();
+  // Waiting restores start in block order and stop at the first the tier
+  // refuses: started ones stay a prefix of each chain, and a full tier is
+  // asked once per poll, not once per waiting block.
+  bool refused = false;
   for (auto entry = restores_.begin(); entry != restores_.end();) {
     auto &[block, restore] = *entry;
-    if (!restore.transfer)
-      restore.transfer =
-          tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
+    if (!restore.transfer && !refused) {
+      if (tier_->canRestore())
+        restore.transfer =
+            tier_->restore(kv_.slot(block), kv_.page(block), completionNotifier_);
+      refused = !restore.transfer;
+    }
     if (!restore.transfer || !restore.transfer->ready()) {
       ++entry;
       continue;

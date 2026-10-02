@@ -2704,6 +2704,55 @@ void testLargeSharedDiskRestore() {
               stats.kvTier.pendingPages == 0,
           "large shared restore retained a request, state pin, or transfer");
 }
+// Restores start in block order and stop at the first the tier refuses: a
+// poll that finds the tier full asks it once, not once per waiting block,
+// and each transfer that lands lets the next block start.
+void testRefusedRestoresStopAtTheFirstRefusal() {
+  constexpr uint32_t pages = 10;
+  constexpr uint32_t tokens = pages * KvCache::pageTokens;
+  test::TestKvStorage storage{pages, 100, 1};
+  KvPool pool{storage, pages};
+  test::TestKvTier tier;
+  tier.capacity = pages;
+  tier.transferLimit = 2;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  std::vector<uint32_t> prompt(tokens, 19);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, tokens).granted(), "the disk chain's admission failed");
+  const auto boundary = cache.publishCommittedBlocks(1, prompt, tokens);
+  cache.endRequest(1);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  cache.publishCompositeState(boundary, std::make_shared<TieredState>(control));
+  require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
+          "the chain's state demotion failed");
+  demoteLeaves(cache, tier, pages);
+  prompt.push_back(20);
+  auto lookup = cache.lookup(prompt);
+  cache.beginRequest(2);
+  require(admitRestore(cache, 2, lookup).granted() && tier.restoreCalls == 2,
+          "the restore asked the tier for more than it takes");
+  for (int poll = 0; poll < 3; ++poll)
+    static_cast<void>(cache.pollTransfers());
+  require(tier.restoreCalls == 2, "polls asked a full tier for every waiting block");
+  tier.transfers[tier.transfers.size() - 2]->ready = true;
+  static_cast<void>(cache.pollTransfers());
+  const std::span<const uint32_t> table = cache.pageTable(2).pages;
+  const std::vector<uint32_t> chain(table.begin(), table.end());
+  require(tier.restoreCalls == 3 &&
+              std::ranges::equal(tier.restoredPages, std::span(chain).first(3)),
+          "a landed restore did not start exactly the next block");
+  for (uint32_t i = 0; i < pages && cache.kvRestoreStatus(2) == KvRestoreStatus::Pending; ++i) {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(cache.kvRestoreStatus(2) == KvRestoreStatus::None &&
+              std::ranges::equal(tier.restoredPages, chain),
+          "the chain was not restored root first");
+  lookup = {};
+  cache.endRequest(2);
+}
+
 // Three prompts of three blocks on four-page extents: the first on pages 0
 // to 2, the second on pages 3 to 5 and the third on pages 6 to 8, so the
 // second and third lie across two extents each. Every page holds a value of
@@ -3957,6 +4006,7 @@ int main() {
     testInUsePublicationStartsNoDemotion();
     testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
     testLargeSharedDiskRestore();
+    testRefusedRestoresStopAtTheFirstRefusal();
     testReclaimForPagesCoversTheShortfall();
     testPageReuseTakesKvBeforeStates();
     testLookupKeepsADiskChainsResidentBoundaryWarm();

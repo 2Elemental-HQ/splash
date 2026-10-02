@@ -23,6 +23,7 @@ public:
   uint64_t slotBytes() const noexcept override { return 100; }
   bool writable() const noexcept override { return writableFile; }
   bool canDemote() const noexcept override { return writableFile && inFlight() < transferLimit; }
+  bool canRestore() const noexcept override { return inFlight() < transferLimit; }
   std::shared_ptr<engine::KvDiskSlot> acquireSlot() override {
     if (slots >= capacity) return {};
     return std::make_shared<Slot>(*this);
@@ -34,9 +35,11 @@ public:
     return start();
   }
   std::unique_ptr<engine::KvTransfer>
-  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t, std::function<void()>) override {
-    if (inFlight() >= transferLimit) return {};
+  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t page, std::function<void()>) override {
+    ++restoreCalls;
+    if (!canRestore()) return {};
     ++restores;
+    restoredPages.push_back(page);
     return start();
   }
   void poll() override {}
@@ -55,7 +58,10 @@ public:
   uint32_t capacity = 4;
   uint32_t transferLimit = 2;
   uint32_t demotions = 0;
+  // Restores started, every restore() call, and the pages of those started.
   uint32_t restores = 0;
+  uint32_t restoreCalls = 0;
+  std::vector<uint32_t> restoredPages;
   bool writableFile = true;
   std::vector<std::shared_ptr<Transfer>> transfers;
 
