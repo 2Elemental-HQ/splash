@@ -47,6 +47,21 @@ void completeDecode(engine::Scheduler &scheduler, bool finished = false,
   scheduler.complete(plan, results, wallMilliseconds, true);
 }
 
+// Prefills a constrained request's prompt, whose end waits for the mask of
+// its first token.
+void awaitFirstMask(engine::Scheduler &scheduler, uint64_t id) {
+  const BatchPlan prompt = *scheduler.next({});
+  require(prompt.kind == WorkKind::Prefill && prompt.width() == 1 &&
+              prompt.items[0].requestId == id,
+          "expected the constrained prompt");
+  scheduler.commit(prompt, {});
+  const std::array result{StepResult{id, prompt.items[0].tokenCount, false,
+                                     DecodeStage::ApplyInitialMask}};
+  scheduler.complete(prompt, result, 0.0, true);
+  require(scheduler.phase(id) == engine::Phase::WaitingMask,
+          "a constrained prompt did not wait for its first mask");
+}
+
 void testAdmissionSharesDispatchOrderAndBudget() {
   Scheduler scheduler(0.0);
   scheduler.submit(request(1, 8193));
@@ -105,11 +120,8 @@ void testHighestRunnablePriority() {
   Scheduler scheduler(0.0);
   require(!scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
   scheduler.submit(request(1, 1, true, RequestPriority::Foreground));
-  scheduler.resourcesReady(1, 1);
-  const BatchPlan initial = *scheduler.next({});
-  scheduler.commit(initial, {});
-  const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, result, 0.0, true);
+  scheduler.resourcesReady(1, 0);
+  awaitFirstMask(scheduler, 1);
   scheduler.submit(request(2, 1, false, RequestPriority::Background));
   scheduler.resourcesReady(2, 1);
   scheduler.submit(request(3, 100));
@@ -441,11 +453,8 @@ void testRejectedCommitCountsNothing() {
 void testConstrainedDecodeRemainsSeparate() {
   Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, true));
-  scheduler.resourcesReady(1, 1);
-  const BatchPlan initial = *scheduler.next({});
-  scheduler.commit(initial, {});
-  const std::array mask{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, mask, 0.0, true);
+  scheduler.resourcesReady(1, 0);
+  awaitFirstMask(scheduler, 1);
   scheduler.maskReady(1);
   completeDecode(scheduler);
   scheduler.submit(request(2, 1));
@@ -522,11 +531,8 @@ void testDecodeRepaysItsShareOfContendedPrefill() {
 void testMaskWaitAccruesNoDecodeDebt() {
   engine::Scheduler scheduler(0.5);
   scheduler.submit(request(1, 1, true));
-  scheduler.resourcesReady(1, 1);
-  const BatchPlan initial = *scheduler.next({});
-  scheduler.commit(initial, {});
-  const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(initial, result, 0.0, true);
+  scheduler.resourcesReady(1, 0);
+  awaitFirstMask(scheduler, 1);
   scheduler.submit(request(2, 20'000));
   scheduler.resourcesReady(2, 0);
   for (uint32_t command = 0; command < 3; ++command)
@@ -928,39 +934,36 @@ void testMaskStagesNeverMix() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, true));
   scheduler.submit(request(2, 1, true));
-  scheduler.resourcesReady(1, 1);
-  scheduler.resourcesReady(2, 1);
+  scheduler.resourcesReady(1, 0);
+  scheduler.resourcesReady(2, 0);
 
-  BatchPlan initialRequest = *scheduler.next({});
-  require(initialRequest.width() == 2 &&
-              initialRequest.decodeStage == DecodeStage::RequestInitialMask,
-          "initial mask requests did not form one compatible batch");
-  scheduler.commit(initialRequest, {});
-  const std::array initialResults{
-      StepResult{1, 0, false, DecodeStage::ApplyInitialMask},
-      StepResult{2, 0, false, DecodeStage::ApplyInitialMask},
+  BatchPlan prompts = *scheduler.next({});
+  require(prompts.kind == WorkKind::Prefill && prompts.width() == 2,
+          "constrained prompts did not form one prefill");
+  scheduler.commit(prompts, {});
+  const std::array promptResults{
+      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
   };
-  scheduler.complete(initialRequest, initialResults, 0.0, true);
+  scheduler.complete(prompts, promptResults, 0.0, true);
   scheduler.maskReady(1);
 
-  BatchPlan initialResume = *scheduler.next({});
-  require(initialResume.width() == 1 && initialResume.items[0].requestId == 1 &&
-              initialResume.decodeStage == DecodeStage::ApplyInitialMask,
-          "initial-mask continuation lost its executor stage");
-  scheduler.commit(initialResume, {});
-  // Draft, target forward, host-mask wait, and commit are one scheduler-owned
-  // model ticket. The scheduler therefore sees the next ordinary decode
-  // stage only after the entire constrained cycle completes.
-  const std::array initialResumeResult{
+  BatchPlan initialSelection = *scheduler.next({});
+  require(initialSelection.width() == 1 &&
+              initialSelection.items[0].requestId == 1 &&
+              initialSelection.decodeStage == DecodeStage::ApplyInitialMask,
+          "a ready first mask did not get its selection plan");
+  scheduler.commit(initialSelection, {});
+  const std::array initialSelectionResult{
       StepResult{1, 0, false, DecodeStage::Regular}};
-  scheduler.complete(initialResume, initialResumeResult, 0.0, true);
+  scheduler.complete(initialSelection, initialSelectionResult, 0.0, true);
 
   scheduler.maskReady(2);
   BatchPlan otherInitial = *scheduler.next({});
   require(otherInitial.width() == 1 &&
               otherInitial.items[0].requestId == 2 &&
               otherInitial.decodeStage == DecodeStage::ApplyInitialMask,
-          "initial-anchor selections were batched before classification");
+          "a first token's selection mixed with a drafting lane");
   scheduler.commit(otherInitial, {});
   const std::array otherInitialResult{
       StepResult{2, 0, true, DecodeStage::Regular}};
@@ -969,25 +972,42 @@ void testMaskStagesNeverMix() {
   BatchPlan verify = *scheduler.next({});
   require(verify.width() == 1 && verify.items[0].requestId == 1 &&
               verify.decodeStage == DecodeStage::Regular,
-          "completed constraint cycle mixed with an initial-mask continuation");
+          "a drafting lane mixed with a first token's selection");
   scheduler.commit(verify, {});
   const std::array verifyResult{
       StepResult{1, 0, true, DecodeStage::Regular}};
   scheduler.complete(verify, verifyResult, 0.0, true);
 }
 
+// The first tokens of constrained requests of one priority whose masks have
+// arrived are selected in one plan.
+void testInitialSelectionsBatch() {
+  engine::Scheduler scheduler(0.0);
+  for (uint64_t id : {1, 2}) {
+    scheduler.submit(request(id, 1, true));
+    scheduler.resourcesReady(id, 0);
+  }
+  const BatchPlan prompts = *scheduler.next({});
+  scheduler.commit(prompts, {});
+  const std::array promptResults{
+      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
+  };
+  scheduler.complete(prompts, promptResults, 0.0, true);
+  scheduler.maskReady(1);
+  scheduler.maskReady(2);
+  const BatchPlan selection = *scheduler.next({});
+  require(selection.kind == WorkKind::Decode && selection.width() == 2 &&
+              selection.decodeStage == DecodeStage::ApplyInitialMask &&
+              selection.constrained,
+          "first-token selections of one priority did not share a plan");
+}
+
 void testWaitingMaskExpiresAtRequestDeadline() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1, true));
-  scheduler.resourcesReady(1, 1);
-
-  const BatchPlan plan = *scheduler.next({});
-  scheduler.commit(plan, {});
-  const std::array result{
-      StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-  scheduler.complete(plan, result, 0.0, true);
-  require(scheduler.phase(1) == engine::Phase::WaitingMask,
-          "constrained request did not wait for its CPU mask");
+  scheduler.resourcesReady(1, 0);
+  awaitFirstMask(scheduler, 1);
   require(scheduler.expireDeadlines(10'000.0) &&
               scheduler.phase(1) == engine::Phase::Failed,
           "waiting mask survived its request deadline");
@@ -1008,12 +1028,8 @@ void testWaitingMaskBoundsPeerPrefill() {
     Scheduler scheduler(0.0);
     scheduler.observePrefill(2048, 4096.0);
     scheduler.submit(request(1, 1, true, priority));
-    scheduler.resourcesReady(1, 1);
-    const BatchPlan initial = *scheduler.next({});
-    scheduler.commit(initial, {});
-    const std::array result{
-        StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
-    scheduler.complete(initial, result, 0.0, true);
+    scheduler.resourcesReady(1, 0);
+    awaitFirstMask(scheduler, 1);
 
     scheduler.submit(request(2, 20'000));
     scheduler.resourcesReady(2, 0);
@@ -1038,7 +1054,7 @@ void testWaitingMaskBoundsPeerPrefill() {
   }
 }
 
-void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
+void testResourceSuspensionReplaysFromCache() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 4096));
   scheduler.resourcesReady(1, 0);
@@ -1069,28 +1085,31 @@ void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
   require(ended.phase(3) == engine::Phase::Cancelled && ended.suspended(3),
           "a cancelled request forgot it was suspended");
   ended.remove(3);
+}
 
-  engine::Scheduler decode(0.0);
-  decode.submit(request(2, 1, true));
-  decode.resourcesReady(2, 1);
-  auto initial = *decode.next({});
-  decode.commit(initial, {});
-  const std::array initialResult{
-      StepResult{2, 0, false, DecodeStage::ApplyInitialMask}};
-  decode.complete(initial, initialResult, 0.0, true);
-  decode.maskReady(2);
-  decode.suspendForResources(2);
-  decode.resumeFromResources(2, 32, 40);
-  const auto replay = *decode.next({});
+// A request suspended while it holds its first mask replays its history and
+// selects its first token under that mask, without asking for another: the
+// replay's prefill reports no mask wait.
+void testReplayKeepsHeldInitialMask() {
+  engine::Scheduler scheduler(0.0);
+  scheduler.submit(request(2, 1, true));
+  scheduler.resourcesReady(2, 0);
+  awaitFirstMask(scheduler, 2);
+  scheduler.maskReady(2);
+  scheduler.suspendForResources(2);
+  scheduler.resumeFromResources(2, 32, 40);
+  const auto replay = *scheduler.next({});
   require(replay.kind == WorkKind::Prefill &&
               replay.items[0].promptOffset == 32 &&
               replay.items[0].tokenCount == 8,
           "decode resume did not replay its committed token history");
-  completePrefill(decode, replay);
-  const auto continuation = *decode.next({});
+  completePrefill(scheduler, replay);
+  require(scheduler.phase(2) == engine::Phase::Decode,
+          "the replay waited for a second first mask");
+  const auto continuation = *scheduler.next({});
   require(continuation.kind == WorkKind::Decode &&
               continuation.decodeStage == DecodeStage::ApplyInitialMask,
-          "replay reset the consumer's existing decode/mask stage");
+          "the replay dropped the held first mask's selection");
 }
 
 } // namespace
@@ -1137,9 +1156,11 @@ int main() {
     testDecodeCommandContainsOnePriorityTier();
     testDecodeLanesRotate();
     testMaskStagesNeverMix();
+    testInitialSelectionsBatch();
     testWaitingMaskExpiresAtRequestDeadline();
     testWaitingMaskBoundsPeerPrefill();
-    testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage();
+    testResourceSuspensionReplaysFromCache();
+    testReplayKeepsHeldInitialMask();
     std::cout << "ragged scheduler tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

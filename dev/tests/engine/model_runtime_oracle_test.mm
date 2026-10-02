@@ -325,12 +325,11 @@ finishMaskedDecode(PendingMaskedDecode pending) {
 PendingMaskedDecode
 beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      uint64_t logicalPosition,
-                     const std::vector<uint32_t> &pageTable,
-                     DecodeStage decodeStage) {
+                     const std::vector<uint32_t> &pageTable) {
   BatchPlan plan{.kind = WorkKind::Decode,
                  .constrained = true,
                  .items = {{requestId, 0}},
-                 .decodeStage = decodeStage};
+                 .decodeStage = DecodeStage::Regular};
   const std::array items{withRevision({requestId, logicalPosition, 0, pageTable})};
   return beginMaskedDecode(executor, plan, items);
 }
@@ -877,25 +876,15 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   beginCold(executor, constrained, 0);
   prefillChunk(executor, 204, 0, std::span(prompt80).first(64), pagesC);
   poisonRecurrentState(backend, states, 0);
-  prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64), pagesC);
-  require(decodeOne(executor, 204, 80, pagesC, true,
-                    DecodeStage::RequestInitialMask)
+  require(prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64),
+                       pagesC)
                   .nextDecodeStage == DecodeStage::ApplyInitialMask,
-          "the non-finite constrained fixture did not request its mask");
+          "the non-finite constrained fixture did not ask for its first mask");
   provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
-  // A failed first selection leaves no anchor to verify, so its decode is
-  // complete at once; one that selected a token would wait for its next mask.
-  const BatchPlan apply{.kind = WorkKind::Decode,
-                        .constrained = true,
-                        .items = {{204, 0}},
-                        .decodeStage = DecodeStage::ApplyInitialMask};
-  const std::array applied{
-      withRevision({.requestId = 204, .logicalPosition = 80, .pageTable = pagesC})};
-  const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(apply, applied, {});
-  const std::vector<ModelStepResult> selected =
-      ticket->ready() ? ticket->wait() : std::vector<ModelStepResult>{};
-  require(selected.size() == 1 && !selected[0].failure.empty() &&
-              selected[0].outputTokens.empty(),
+  const ModelStepResult selected =
+      decodeOne(executor, 204, 80, pagesC, true,
+                DecodeStage::ApplyInitialMask);
+  require(!selected.failure.empty() && selected.outputTokens.empty(),
           "a constrained selection from a non-finite hidden did not fail its lane");
   executor.end(204);
   clearPages(pages, pagesC);
@@ -1849,12 +1838,9 @@ int main(int argc, char **argv) {
     EngineRequest constrainedShort = makeRequest(56, prompt8, 1);
     constrainedShort.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrainedShort, 0);
-    prefillChunk(executor, 56, 0, prompt8, constrainedPages);
-    ModelStepResult microInitialMask =
-        decodeOne(executor, 56, prompt8.size(), constrainedPages, true,
-                  DecodeStage::RequestInitialMask);
-    require(microInitialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
-            "constrained short prefill did not preserve mask handshake");
+    require(prefillChunk(executor, 56, 0, prompt8, constrainedPages)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
+            "constrained short prefill did not ask for its first mask");
     const std::array<uint32_t, 1> forcedMicroToken{106};
     provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
@@ -1907,18 +1893,17 @@ int main(int argc, char **argv) {
       beginCold(executor, replayRequest, 1);
       restoreActivePrefix(executor, replayId, prompt129.size(), 128,
                           promptSnapshot);
-      prefillChunk(executor, replayId, 128,
-                   std::span<const uint32_t>(prompt129).subspan(128, 1),
-                   replayPages);
-      const auto initial = decodeOne(executor, replayId, 129, replayPages, true,
-                                     DecodeStage::RequestInitialMask);
-      require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+      require(prefillChunk(executor, replayId, 128,
+                           std::span<const uint32_t>(prompt129).subspan(128, 1),
+                           replayPages)
+                      .nextDecodeStage == DecodeStage::ApplyInitialMask,
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(firstAnchor));
-      auto pending = beginMaskedDecodeOne(executor, replayId, 129,
-                                          replayPages,
-                                          DecodeStage::ApplyInitialMask);
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+                                  DecodeStage::ApplyInitialMask));
+      auto pending =
+          beginMaskedDecodeOne(executor, replayId, 129, replayPages);
       require(pending.maskRequests.size() == 1 &&
                   pending.maskRequests[0].simulationTokens.size() == 8,
               "replay proposals were not exposed");
@@ -2053,13 +2038,10 @@ int main(int argc, char **argv) {
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
     restoreActivePrefix(executor, 40, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 40, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult initialMask =
-        decodeOne(executor, 40, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(initialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 40, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "initial constrained anchor did not request empty simulation");
     const uint32_t anchorA = 100;
     std::array<uint32_t, 1> initialTokens{anchorA};
@@ -2067,9 +2049,18 @@ int main(int argc, char **argv) {
     require(initialWords.size() == kMaskWords,
             "empty simulation did not produce exactly one mask row");
     provideMask(executor, 40, initialWords);
+    // The first token's selection drafts nothing and, with budget left,
+    // emits nothing: the first cycle emits it.
+    const ModelStepResult anchorSelection =
+        decodeOne(executor, 40, 129, pageTable, true,
+                  DecodeStage::ApplyInitialMask);
+    require(anchorSelection.outputTokens.empty() &&
+                anchorSelection.draftedTokens == 0 &&
+                anchorSelection.nextDecodeStage == DecodeStage::Regular,
+            "the first token's selection drafted or emitted a token");
 
-    PendingMaskedDecode verify = beginMaskedDecodeOne(
-        executor, 40, 129, pageTable, DecodeStage::ApplyInitialMask);
+    PendingMaskedDecode verify =
+        beginMaskedDecodeOne(executor, 40, 129, pageTable);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
                 verify.maskRequests[0].simulationTokens.size() == 8 &&
@@ -2106,19 +2097,18 @@ int main(int argc, char **argv) {
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
     restoreActivePrefix(executor, 44, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 44, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult perfectInitial =
-        decodeOne(executor, 44, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(perfectInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 44, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "perfect constrained accounting skipped its initial mask");
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
     provideMask(executor, 44, singletonMasks(perfectInitialTokens));
-    PendingMaskedDecode perfectPending = beginMaskedDecodeOne(
-        executor, 44, 129, pageTable, DecodeStage::ApplyInitialMask);
+    static_cast<void>(decodeOne(executor, 44, 129, pageTable, true,
+                                DecodeStage::ApplyInitialMask));
+    PendingMaskedDecode perfectPending =
+        beginMaskedDecodeOne(executor, 44, 129, pageTable);
     require(perfectPending.maskRequests.size() == 1 &&
                 perfectPending.maskRequests[0].simulationTokens.size() == 8,
             "perfect constraint did not overlap its mask request");
@@ -2152,13 +2142,10 @@ int main(int argc, char **argv) {
     alternateConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, alternateConstraint, 0);
     restoreActivePrefix(executor, 41, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 41, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult alternateInitial =
-        decodeOne(executor, 41, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(alternateInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 41, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "second exact constrained hit skipped initial mask");
     const uint32_t anchorC = 105;
     std::array<uint32_t, 1> alternateTokens{anchorC};
@@ -2176,9 +2163,9 @@ int main(int argc, char **argv) {
 
     // A B2 constrained cycle keeps both lanes reserved while host grammar
     // work overlaps the target forward. No proposal/logit state is copied to
-    // a different arena lane between draft and commit. Each lane applies its
-    // initial mask in a plan of its own, as the scheduler issues them; the
-    // B2 cycle continues both.
+    // a different arena lane between draft and commit. One B2 plan selects
+    // both lanes' first tokens under their masks; each lane's first cycle
+    // runs alone and the B2 cycle continues both.
     EngineRequest crossLane0 = makeRequest(42, prompt129, 3);
     crossLane0.constraint = ConstraintMode::TokenMask;
     crossLane0.sampling = {
@@ -2207,42 +2194,35 @@ int main(int argc, char **argv) {
     auto crossReplay = executor.prefill(crossReplayPlan, crossReplayItems);
     require(crossReplay.size() == 2 &&
                 crossReplay[0].consumedPromptTokens == 1 &&
-                crossReplay[1].consumedPromptTokens == 1,
+                crossReplay[1].consumedPromptTokens == 1 &&
+                crossReplay[0].nextDecodeStage ==
+                    DecodeStage::ApplyInitialMask &&
+                crossReplay[1].nextDecodeStage ==
+                    DecodeStage::ApplyInitialMask,
             "B2 recurrent restore did not replay one complete token");
-    BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
-                               .constrained = true,
-                               .items = {{42, 0}, {43, 0}},
-                               .decodeStage = DecodeStage::RequestInitialMask};
-    std::vector<ModelBatchItem> crossItems{
-        withRevision({.requestId = 42, .logicalPosition = 129, .pageTable = crossPages0}),
-        withRevision({.requestId = 43, .logicalPosition = 129, .pageTable = crossPages1})};
-    auto crossInitial = executor.decode(crossInitialPlan, crossItems);
-    require(
-        crossInitial.size() == 2 &&
-            crossInitial[0].nextDecodeStage == DecodeStage::ApplyInitialMask &&
-            crossInitial[1].nextDecodeStage == DecodeStage::ApplyInitialMask,
-        "B2 constrained initial masks are not empty simulations");
     const std::array<uint32_t, 2> crossAnchors{110, 111};
     provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
     provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
-    // Applying an initial mask can end a request or start drafting it, so a
-    // plan applies one: a wider one is refused before any lane changes.
-    crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
-    bool widePlanRejected = false;
-    try {
-      static_cast<void>(executor.decode(crossInitialPlan, crossItems));
-    } catch (const std::invalid_argument &) {
-      widePlanRejected = true;
-    }
-    require(widePlanRejected, "a B2 plan applied two initial masks");
-    // Each lane's initial cycle keeps its anchor; the masked successor that
+    const BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
+                                     .constrained = true,
+                                     .items = {{42, 0}, {43, 0}},
+                                     .decodeStage = DecodeStage::ApplyInitialMask};
+    const std::vector<ModelBatchItem> crossItems{
+        withRevision({.requestId = 42, .logicalPosition = 129, .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 129, .pageTable = crossPages1})};
+    const auto crossInitial = executor.decode(crossInitialPlan, crossItems);
+    require(crossInitial.size() == 2 && crossInitial[0].outputTokens.empty() &&
+                crossInitial[1].outputTokens.empty() &&
+                crossInitial[0].nextDecodeStage == DecodeStage::Regular &&
+                crossInitial[1].nextDecodeStage == DecodeStage::Regular,
+            "a B2 plan did not select both lanes' first tokens");
+    // Each lane's first cycle keeps its anchor; the masked successor that
     // rejects the second proposal becomes its next anchor.
     std::array<uint32_t, 2> crossNext{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const uint64_t id = 42 + lane;
       PendingMaskedDecode initial = beginMaskedDecodeOne(
-          executor, id, 129, lane ? crossPages1 : crossPages0,
-          DecodeStage::ApplyInitialMask);
+          executor, id, 129, lane ? crossPages1 : crossPages0);
       require(initial.maskRequests.size() == 1 &&
                   initial.maskRequests[0].simulationTokens.front() ==
                       crossAnchors[lane],
@@ -2959,32 +2939,39 @@ int main(int argc, char **argv) {
         }
         return replay.nextDecodeStage;
       };
+      DecodeStage stage = DecodeStage::Regular;
       if (preempt) {
         requireOpen(prefillChunk(executor, sequence.id, 0,
                                  std::span(sequence.prompt).first(32),
                                  pageTable),
                     "unfinished prefill before preemption");
-        static_cast<void>(rebuild(false));
+        stage = rebuild(false);
       } else {
-        requireOpen(prefillChunk(executor, sequence.id, 0,
-                                 sequence.prompt, pageTable),
-                    "preemption prompt");
+        const ModelStepResult promptEnd = prefillChunk(
+            executor, sequence.id, 0, sequence.prompt, pageTable);
+        requireOpen(promptEnd, "preemption prompt");
+        stage = promptEnd.nextDecodeStage;
       }
-      DecodeStage stage = DecodeStage::Regular;
+      require(stage == (constrained ? DecodeStage::ApplyInitialMask
+                                    : DecodeStage::Regular),
+              "the prompt's end misreported its first mask");
+      // Preempted at its prompt's end, a request replays without asking for
+      // its first mask again; a constrained one is given it meanwhile.
+      if (preempt)
+        require(rebuild(false, constrained) == DecodeStage::Regular,
+                "prompt-end preemption asked for the first mask again");
       if (constrained) {
-        stage = decodeOne(executor, sequence.id, sequence.prompt.size(),
-                          pageTable, true,
-                          DecodeStage::RequestInitialMask).nextDecodeStage;
-        require(stage == DecodeStage::ApplyInitialMask,
-                "preemption fixture did not request initial mask");
         if (!preempt) {
           const std::array<uint32_t, 1> anchor{100};
           provideMask(executor, sequence.id, singletonMasks(anchor));
         }
+        const ModelStepResult selected =
+            decodeOne(executor, sequence.id, sequence.prompt.size(), pageTable,
+                      true, DecodeStage::ApplyInitialMask);
+        require(selected.outputTokens.empty(),
+                "the first token's selection emitted a token with budget left");
+        stage = selected.nextDecodeStage;
       }
-      if (preempt)
-        require(rebuild(false, constrained) == stage,
-                "prompt-end preemption changed decode/mask stage");
       PreemptionRun run;
       auto &transcript = run.transcript;
       bool generationPreempted = false;
@@ -2992,7 +2979,7 @@ int main(int argc, char **argv) {
         ModelStepResult result;
         if (constrained) {
           auto pending = beginMaskedDecodeOne(
-              executor, sequence.id, sequence.prompt.size(), pageTable, stage);
+              executor, sequence.id, sequence.prompt.size(), pageTable);
           std::array<uint32_t, 9> forced;
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;

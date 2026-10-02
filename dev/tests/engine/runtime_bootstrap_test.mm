@@ -52,7 +52,7 @@ void testWarmupLaneComparisons() {
   requireDifferent([](auto &value) { value.step.outputTokens.pop_back(); });
   requireDifferent([](auto &value) { value.step.finished = true; });
   requireDifferent([](auto &value) {
-    value.step.nextDecodeStage = DecodeStage::RequestInitialMask;
+    value.step.nextDecodeStage = DecodeStage::ApplyInitialMask;
   });
   requireDifferent([](auto &value) { ++value.step.draftedTokens; });
   requireDifferent([](auto &value) { ++value.step.acceptedDraftTokens; });

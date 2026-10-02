@@ -64,7 +64,8 @@ public:
         requests_.emplace(
             request.id,
             Active{slot, static_cast<uint32_t>(request.prompt.size()),
-                   {request.scoreTokens.begin(), request.scoreTokens.end()}});
+                   {request.scoreTokens.begin(), request.scoreTokens.end()},
+                   request.constraint == ConstraintMode::TokenMask});
         return {slot, StateFailure::None};
       }
     }
@@ -107,9 +108,13 @@ public:
           }
         }
       }
+      // A constrained prompt's end asks for the first token's mask.
+      const bool awaitsMask =
+          found != requests_.end() && found->second.constrained && last;
       results.push_back({item.requestId, item.tokenCount, {}, scoring && last,
-                         DecodeStage::Regular, 0, 0, 0, std::move(logits),
-                         std::move(failure)});
+                         awaitsMask ? DecodeStage::ApplyInitialMask
+                                    : DecodeStage::Regular,
+                         0, 0, 0, std::move(logits), std::move(failure)});
     }
     return results;
   }
@@ -117,11 +122,10 @@ public:
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
-      // A constrained request asks for its initial mask before any token.
-      if (plan.constrained &&
-          plan.decodeStage == DecodeStage::RequestInitialMask) {
-        results.push_back({item.requestId, 0, {}, false,
-                           DecodeStage::ApplyInitialMask, 0, 0});
+      // The first token's selection under the mask emits nothing here.
+      if (plan.decodeStage == DecodeStage::ApplyInitialMask) {
+        results.push_back(
+            {item.requestId, 0, {}, false, DecodeStage::Regular, 0, 0});
         continue;
       }
       results.push_back({item.requestId,
@@ -173,6 +177,7 @@ private:
     uint32_t slot = 0;
     uint32_t promptTokens = 0;
     std::vector<uint32_t> scoreTokens;
+    bool constrained = false;
   };
   std::unordered_map<uint64_t, Active> requests_;
   uint32_t restored_ = 0;

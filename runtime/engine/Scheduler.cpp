@@ -43,9 +43,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
-  request.decodeStage = request.spec.constrained
-                            ? DecodeStage::RequestInitialMask
-                            : DecodeStage::Regular;
+  request.decodeStage = DecodeStage::Regular;
   request.phase =
       processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
 }
@@ -383,19 +381,13 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   plan.kind = WorkKind::Decode;
   plan.constrained = ready.front()->spec.constrained;
   plan.decodeStage = decodeStage;
-  // Applying the initial mask can terminate a request or start drafting.
-  // Classify that branch one request at a time; regular decode can batch.
-  const uint32_t maximumWidth =
-      decodeStage == DecodeStage::ApplyInitialMask
-          ? 1
-          : model::ExecutionLimits::maximumBatchWidth;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
         request->spec.constrained != plan.constrained ||
         request->decodeStage != decodeStage)
       continue;
     plan.items.push_back({request->spec.id, 0, 0});
-    if (plan.width() == maximumWidth)
+    if (plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
   }
   return plan;
@@ -477,17 +469,21 @@ void Scheduler::complete(const BatchPlan &plan,
           request.promptProcessed == *request.prefillBoundary) {
         request.prefillBoundary.reset();
       }
-      // A stop token or a one-token budget is selected by prefill itself.
-      request.phase = result.finished ? Phase::Completed
-                      : request.promptProcessed == request.spec.prefillTokens
-                          ? Phase::Decode
-                          : Phase::Prefill;
+      // A stop token or a one-token budget is selected by prefill itself; a
+      // constrained prompt waits for the mask its first token needs.
+      if (result.finished) {
+        request.phase = Phase::Completed;
+      } else if (request.promptProcessed != request.spec.prefillTokens) {
+        request.phase = Phase::Prefill;
+      } else if (waitsForMask(result.nextDecodeStage)) {
+        request.decodeStage = result.nextDecodeStage;
+        request.phase = Phase::WaitingMask;
+      } else {
+        request.phase = Phase::Decode;
+      }
     } else {
       request.decodeStage = result.nextDecodeStage;
-      request.phase = result.finished ? Phase::Completed
-                      : waitsForMask(result.nextDecodeStage)
-                          ? Phase::WaitingMask
-                          : Phase::Decode;
+      request.phase = result.finished ? Phase::Completed : Phase::Decode;
     }
   }
   if (representativePrefillTiming && plan.kind == WorkKind::Prefill) {

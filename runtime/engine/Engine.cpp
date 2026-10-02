@@ -1650,7 +1650,7 @@ void Engine::apply(const BatchPlan &plan,
     }
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
                                 complete, result.nextDecodeStage});
-    if (plan.kind == WorkKind::Decode && waitsForMask(result.nextDecodeStage)) {
+    if (waitsForMask(result.nextDecodeStage)) {
       events_.maskRequested(active.request.id, {});
       active.maskRequestedMilliseconds = now;
     }
