@@ -214,7 +214,7 @@ RuntimeResources::RuntimeResources(
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
-    std::unique_ptr<model::StateStorage> stateStorage,
+    std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::optional<uint64_t> hostAvailableAtStart)
@@ -492,11 +492,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         *backend, memoryGovernor->allocationAdmission(), package.targetKvLayout(config.kvFormat),
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
-    std::unique_ptr<model::StateStorage> stateStorage = model::createStateStorage(
-        *backend, memoryGovernor->allocationAdmission(), package, stateFile);
-    if (!stateStorage) {
-      throw std::runtime_error("model factory returned no state storage");
-    }
+    auto stateStorage = std::make_unique<model::QwenStateStorage>(
+        *backend, memoryGovernor->allocationAdmission(), package.stateLayout(),
+        stateFile);
     std::unique_ptr<KvPageTier> kvTier;
     if (diskBudget) {
       try {
@@ -577,7 +575,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
-  report.stateStagingBytes = stateStorage_->stagingBytes();
+  report.stateStagingBytes = modelMemory.stateStagingBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

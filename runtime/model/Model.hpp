@@ -312,18 +312,9 @@ static_assert(ExecutionLimits::targetVerifyRows ==
 
 // Shared accounting for model-owned state allocations.  Target and draft
 // implementations may allocate from separate physical pools while the engine
-// observes one byte total through StateStorage.
+// observes one byte total through ModelMemoryActual::stateActualAllocatedBytes.
 struct StateAllocationTracker final {
   std::atomic<uint64_t> bytes{0};
-};
-
-class StateStorage {
-public:
-  virtual ~StateStorage() = default;
-  [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
-  // The buffer a state's write to the disk tier stages through; zero without
-  // a tier.
-  [[nodiscard]] virtual uint64_t stagingBytes() const noexcept = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,
@@ -355,6 +346,9 @@ struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;
   uint64_t sharedPrefillActualAllocatedBytes = 0;
   uint64_t sharedDecodeActualAllocatedBytes = 0;
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  uint64_t stateStagingBytes = 0;
 };
 
 struct ModelTelemetry final {

@@ -148,15 +148,6 @@ void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
   }
 }
 
-QwenStateStorage &requireQwenStateStorage(StateStorage &storage) {
-  auto *qwen = dynamic_cast<QwenStateStorage *>(&storage);
-  if (!qwen) {
-    throw std::invalid_argument(
-        "Qwen runtime requires Qwen composite state storage");
-  }
-  return *qwen;
-}
-
 // The lane a start's admission gave it, or the cause of its refusal.
 StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult &result) {
   if (result)
@@ -329,7 +320,7 @@ struct Runtime::Impl {
         geometry(RuntimeGeometry::from(value.package, value.kvPages.layout().format)),
         operators(value.operators),
         kvPages(value.kvPages),
-        states(requireQwenStateStorage(value.stateStorage)),
+        states(value.stateStorage),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
         sampling(geometry.target.vocabularySize),
@@ -2811,7 +2802,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
   return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes(),
-          impl_->decodeArena->bytes()};
+          impl_->decodeArena->bytes(), impl_->states.stagingBytes()};
 }
 
 ModelTelemetry Runtime::telemetry() const noexcept {
@@ -2841,15 +2832,6 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
           kRuntimeOverheadReserveBytes};
-}
-
-std::unique_ptr<StateStorage>
-createStateStorage(metal::MetalBackend &backend,
-                   metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package, std::shared_ptr<SlotFile> file) {
-  requireCompatibleModelPackage(package);
-  return std::make_unique<QwenStateStorage>(
-      backend, std::move(admitAllocation), package.stateLayout(), std::move(file));
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

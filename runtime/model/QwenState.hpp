@@ -154,17 +154,19 @@ private:
 };
 
 // Live cells keep their buffers; only idle buffers may be reclaimed.
-class QwenStateStorage final : public model::StateStorage {
+class QwenStateStorage final {
 public:
   // The GDN cells a lane holds, with one draft ring.
   static constexpr uint32_t kLaneCells = 2;
 
+  // The file, when given, holds one state per slot and shares the cache's
+  // disk budget.
   QwenStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
                    CompositeStateLayout layout,
                    std::shared_ptr<SlotFile> file = nullptr);
 
-  ~QwenStateStorage() override;
+  ~QwenStateStorage();
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
@@ -229,10 +231,12 @@ public:
       uint32_t lane, const CompositeState &state, bool restoreDraftState,
       std::function<void()> completion, std::function<void()> committed);
 
-  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
+  [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept {
     return allocations_->bytes.load(std::memory_order_relaxed);
   }
-  [[nodiscard]] uint64_t stagingBytes() const noexcept override {
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  [[nodiscard]] uint64_t stagingBytes() const noexcept {
     return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }

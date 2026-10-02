@@ -1421,7 +1421,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     weights.layout = std::get<Layout>(originalTarget);
   }, package.target);
   package.descriptor.target = originalTarget;
-  auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
+  const model::QwenStateStorage &states = context.stateStorage;
   for (uint32_t lane = 0; lane < 4; ++lane)
     require(!states.metadata(lane).assigned(),
             "EOS warmup left an active state lane");
