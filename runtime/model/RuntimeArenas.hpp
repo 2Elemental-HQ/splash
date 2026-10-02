@@ -314,7 +314,6 @@ constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
   return isGdnLayerTensor(tensor) || isAttentionLayerTensor(tensor);
 }
 
-[[nodiscard]] uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept;
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators);
@@ -323,6 +322,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
+[[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
+                                          const ops::ExecutionPlans &operators);
 
 class DecodeArena final {
 public:
@@ -376,8 +377,7 @@ public:
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
-    bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),
-                        linearSize.bytes(), "Q4 decode scratch");
+    bytes_ = plannedDecodeBytes(geometry_, operators);
   }
 
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
@@ -440,15 +440,7 @@ public:
     if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
         !isGdnLayerTensor(base))
       throw std::out_of_range("invalid batched GDN layer");
-    const uint32_t index = static_cast<uint32_t>(base);
-    // Each GDN tensor holds one stride per layer per lane; the planner sized
-    // it as layers x stride, so the stride is recovered here, not supplied.
-    const uint64_t stride = sizes_[index] / layers;
-    const uint64_t relative = uint64_t{gdnLayer} * kLaneCount * stride;
-    const uint64_t bytes = uint64_t{lanes} * stride;
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched GDN layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    return layerBatchSlice(base, layers, gdnLayer, lanes);
   }
 
   [[nodiscard]] metal::MetalBuffer gdnStorage(DecodeTensor base) const {
@@ -461,25 +453,28 @@ public:
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,
                                                 uint32_t attentionLayer,
                                                 uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount ||
-        attentionLayer >= geometry_.target.kvLayout.attentionLayers ||
+    const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
+    if (!lanes || lanes > kLaneCount || attentionLayer >= layers ||
         !isAttentionLayerTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
-    const uint32_t index = static_cast<uint32_t>(base);
-    const uint64_t relative =
-        uint64_t{attentionLayer} * kLaneCount *
-        decodeChunkLayerBytes(geometry_);
-    const uint64_t bytes =
-        uint64_t{lanes} * decodeChunkLayerBytes(geometry_);
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched attention layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    return layerBatchSlice(base, layers, attentionLayer, lanes);
   }
 
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
+  // A layer-major tensor holds one stride per lane for each of its `layers`
+  // layers, layer by layer; the planner sized it as layers x stride, so the
+  // stride is recovered here, not supplied.
+  [[nodiscard]] metal::MetalBuffer layerBatchSlice(DecodeTensor base, uint32_t layers,
+                                                   uint32_t layer, uint32_t lanes) const {
+    const uint32_t index = static_cast<uint32_t>(base);
+    const uint64_t stride = sizes_[index] / layers;
+    return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
+                         uint64_t{lanes} * stride);
+  }
+
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
   metal::MetalBuffer base_;
@@ -490,8 +485,5 @@ private:
   ops::LinearScratch linearScratch_;
   uint64_t bytes_ = 0;
 };
-
-[[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
-                                          const ops::ExecutionPlans &operators);
 
 } // namespace splash::model

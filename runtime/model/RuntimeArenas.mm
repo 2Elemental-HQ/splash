@@ -156,7 +156,7 @@ static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
                             geometry.target.gdnValueHeads);
 }
-uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
+static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                             kTileRows *
                             geometry.target.attentionHeadDimension);
