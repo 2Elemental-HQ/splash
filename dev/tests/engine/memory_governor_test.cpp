@@ -1,3 +1,4 @@
+#include "TestMetalMemory.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
@@ -9,25 +10,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-
-// The governor reads nothing from the backend but its memory statistics, so
-// this stand-in lets the tests set them without a GPU.
-namespace splash::metal {
-namespace {
-MetalMemoryStats statistics;
-} // namespace
-
-struct MetalBackend::Impl {};
-MetalBackend::MetalBackend(std::string, double, double)
-    : impl_(std::make_unique<Impl>()) {}
-MetalBackend::~MetalBackend() = default;
-MetalMemoryStats MetalBackend::memoryStats() const noexcept {
-  return statistics;
-}
-MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
-  return statistics;
-}
-} // namespace splash::metal
 
 using namespace splash;
 using namespace splash::engine;
@@ -48,8 +30,8 @@ metal::AllocationResult admit(MemoryGovernor &governor, uint64_t bytes,
 
 // Charges bytes to the backend, as an allocation does.
 void allocate(uint64_t bytes) {
-  metal::statistics.allocatedBytes += bytes;
-  metal::statistics.deviceCurrentAllocatedBytes += bytes;
+  test::metalStatistics().allocatedBytes += bytes;
+  test::metalStatistics().deviceCurrentAllocatedBytes += bytes;
 }
 
 // Available host memory is what macOS can hand out without swapping: free
@@ -194,13 +176,13 @@ void testAdvertisedContextIsGrantable() {
           reserves + 256 * kMiB}) {
       // After warmup the weights, the arenas and the request's state cell
       // are the backend's buffers; Metal holds the untracked bytes besides.
-      metal::statistics = {};
-      metal::statistics.allocatedBytes =
+      test::metalStatistics() = {};
+      test::metalStatistics().allocatedBytes =
           budget.targetWeightsBytes + budget.draftWeightsBytes +
           budget.visionWeightsBytes + budget.sharedPrefillBytes +
           budget.sharedDecodeBytes + budget.activeStateCellBytes;
-      metal::statistics.deviceCurrentAllocatedBytes =
-          metal::statistics.allocatedBytes + untracked;
+      test::metalStatistics().deviceCurrentAllocatedBytes =
+          test::metalStatistics().allocatedBytes + untracked;
       metal::MetalBackend backend("unused");
       // Configured as RuntimeResources configures it.
       MemoryGovernor governor(
@@ -213,7 +195,7 @@ void testAdvertisedContextIsGrantable() {
                                   std::to_string(granted) + " of " +
                                   std::to_string(budget.kvCapacityPages) +
                                   " KV pages";
-      require(metal::statistics.deviceCurrentAllocatedBytes <=
+      require(test::metalStatistics().deviceCurrentAllocatedBytes <=
                   budget.hardBudgetBytes,
               context + ", beyond the hard budget");
       if (untracked <= reserves)
@@ -230,9 +212,9 @@ void testAdvertisedContextIsGrantable() {
 // while the idle headroom still clears it. Its refusal must start the paced
 // reclaim it waits for, after which it fits.
 void testHostRefusalStartsReclaim() {
-  metal::statistics = {};
-  metal::statistics.allocatedBytes = 20 * kGiB;
-  metal::statistics.deviceCurrentAllocatedBytes = 20 * kGiB;
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 20 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 20 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   const uint64_t stateCell = 350'224'384;
@@ -271,9 +253,9 @@ void testHostRefusalStartsReclaim() {
 // with the host's pressure, the limit's only once memory is freed. For a
 // request in service the host refuses only under critical pressure.
 void testHostRefusalComesBeforeTheEngineLimit() {
-  metal::statistics = {};
-  metal::statistics.allocatedBytes = 14 * kGiB;
-  metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 14 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
@@ -327,9 +309,9 @@ void testPolicyContinuesHeldBackTarget() {
 // and a request beyond it holds no other. A pass that finds memory again, or
 // a new episode of host pressure, brings the hold back.
 void testExhaustedReclaimWaivesTheHold() {
-  metal::statistics = {};
-  metal::statistics.allocatedBytes = 12 * kGiB;
-  metal::statistics.deviceCurrentAllocatedBytes = 12 * kGiB;
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
@@ -364,9 +346,9 @@ void testExhaustedReclaimWaivesTheHold() {
 // already has. Only the engine's limit and critical pressure refuse it, and
 // without the mark the margins apply as before.
 void testRequestInServiceGrowsThroughHostPressure() {
-  metal::statistics = {};
-  metal::statistics.allocatedBytes = 14 * kGiB;
-  metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 14 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;

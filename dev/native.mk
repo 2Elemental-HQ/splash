@@ -320,6 +320,7 @@ $(TEST_PROTOCOL_TEST): runtime/engine/Protocol.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
+		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 

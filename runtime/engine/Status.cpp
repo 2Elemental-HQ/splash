@@ -29,28 +29,6 @@ void appendBatch(std::ostringstream &out,
 
 } // namespace
 
-std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool hostGrowthAllowed) {
-  const unsigned state = (!hostGrowthAllowed ? 1u : 0u) |
-                         (wait.memory ? 2u : 0u) |
-                         (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u) |
-                         (wait.heldBehindRefusal ? 16u : 0u);
-  if (state == state_)
-    return {};
-  state_ = state;
-  if (!state)
-    return "Memory: growth available; resource wait cleared";
-  std::ostringstream out;
-  out << "Memory: growth " << (hostGrowthAllowed ? "available" : "paused")
-      << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
-  if (wait.heldBehindRefusal)
-    out << "; held=" << wait.heldBehindRefusal;
-  if (wait.draining)
-    out << "; waiting for resident requests to finish";
-  return out.str();
-}
-
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
     const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,

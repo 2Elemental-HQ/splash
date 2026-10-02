@@ -118,12 +118,29 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                                    std::unique_ptr<NativeRuntime> nativeLoop,
                                    RuntimeBootstrapReport report)
     : resources_(std::move(resources)), model_(std::move(modelRuntime)),
-      nativeLoop_(std::move(nativeLoop)), report_(std::move(report)) {}
+      nativeLoop_(std::move(nativeLoop)),
+      memoryControl_(resources_->memoryGovernor(), resources_->backend(),
+                     *nativeLoop_),
+      report_(std::move(report)) {}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
   // Refuse new commands before the loop, the model and the resources they
   // reach are destroyed.
   resources_->backend().stop();
+}
+
+std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
+                                         const NativeLoopTiming &loop) {
+  // Status can arrive during GPU work; allocation/command boundaries and
+  // the safe-point pressure monitor already refresh the cached sample.
+  metal::MetalBackend &backend = resources_->backend();
+  const bool healthy = backend.healthy();
+  return runtimeStatusJson(
+      resources_->memoryPlan(), nativeLoop_->snapshot(), backend.memoryStats(),
+      report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
+      resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
+      healthy, healthy ? std::string{} : backend.unhealthyReason(),
+      nativeLoop_->resourceWaitSnapshot(), loop);
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(

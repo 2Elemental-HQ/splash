@@ -84,6 +84,9 @@ public:
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
   }
+  [[nodiscard]] double monotonicMilliseconds() const {
+    return clocks_.monotonicMilliseconds();
+  }
   [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {
     return core_.reclaimMemory(directive);

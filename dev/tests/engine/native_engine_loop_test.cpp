@@ -1,7 +1,9 @@
 #include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestMetalMemory.hpp"
 #include "engine/Cache.hpp"
+#include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
 
@@ -1552,6 +1554,91 @@ void testConstrainedMaskExchange() {
   }
 }
 
+// Between commands the control pass runs what the host's pressure asks for:
+// a paced pass toward the recovery margin, which keeps the resume point and
+// the empty runway extent; nothing once the host recovers; and under critical
+// pressure every cache entry and extent. None waits for a transfer.
+void testControlPassReclaimsUnderHostPressure() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool);
+  Executor executor;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor, [](std::span<const uint8_t>) {},
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  loop.announceReady();
+  // Two finished requests with different prompts leave two replay states.
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    for (uint32_t &token : input.promptTokens)
+      token += static_cast<uint32_t>(100 * id);
+    auto wire = protocol::serializeMessage(protocol::Message{input});
+    require(wire && loop.receive(*wire.value), "control pass request failed");
+    runUntilIdle(loop);
+  }
+  require(resources.snapshot().stateCache.entries == 2,
+          "the fixture did not cache two replay states");
+
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  std::optional<uint64_t> available = hostReserve + kHostWarningMarginBytes / 2;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
+                          [&available] { return available; });
+  MemoryControl control(governor, backend, loop);
+  require(!control.run(MemoryPressure::Normal), "a paced pass waited for a transfer");
+  const auto paced = resources.snapshot();
+  require(paced.stateCache.entries == 1 && paced.stateCache.evictions == 1 &&
+              paced.pool.reclaimableBytes == 4 * 4096,
+          "host pressure did not evict toward its target, keeping the resume "
+          "point and the runway extent");
+
+  available = hostReserve + kHostRecoveryMarginBytes + kHostWarningMarginBytes;
+  const uint64_t releases = pool.snapshot().extentReleases;
+  // The host's recovery lifts the pressure, so no pass runs: the untargeted
+  // pass the settle window would otherwise run finds nothing to take either.
+  require(!control.run(MemoryPressure::Normal) &&
+              governor.snapshot().pressure == MemoryPressure::Normal &&
+              resources.snapshot().stateCache.entries == 1 &&
+              pool.snapshot().extentReleases == releases,
+          "a recovered host still reclaimed");
+
+  require(!control.run(MemoryPressure::Critical), "a critical pass waited for a transfer");
+  const auto critical = resources.snapshot();
+  require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
+              critical.pool.pagesAllocated == 0,
+          "critical pressure did not empty the cache and release every extent");
+}
+
+// The reporter logs a change in what requests wait for, never a retry or the
+// depth of a queue.
+void testMemoryStatusReporterLogsTransitionsOnly() {
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                            .restoring = 1, .suspended = 1,
+                            .oldestWaitMilliseconds = 1250.0, .draining = true};
+  MemoryStatusReporter reporter;
+  require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");
+  require(!reporter.update(wait, false).empty(), "pressure transition was silent");
+  ++wait.memory;
+  wait.oldestWaitMilliseconds += 1000;
+  require(reporter.update(wait, false).empty(), "pressure retries flooded the log");
+  wait = {};
+  wait.concurrency = 4;
+  require(!reporter.update(wait, true).empty(), "end of memory wait was silent");
+  require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
+  // The refused request is deferred for scheduling, out of the memory
+  // count, while it still holds the others back.
+  wait.heldBehindRefusal = 2;
+  const std::string held = reporter.update(wait, true);
+  require(held.find("held=2") != std::string::npos &&
+              held.find("cleared") == std::string::npos,
+          "requests held behind a refusal were reported as no wait");
+}
+
 } // namespace
 
 int main() {
@@ -1580,6 +1667,8 @@ int main() {
     testCancelledScoreReturnsEmptyLogits();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
+    testControlPassReclaimsUnderHostPressure();
+    testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

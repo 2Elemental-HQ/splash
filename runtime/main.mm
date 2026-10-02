@@ -1,5 +1,4 @@
 #include "StderrLine.hpp"
-#include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/Status.hpp"
@@ -21,7 +20,6 @@
 #include <filesystem>
 #include <limits.h>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -331,20 +329,9 @@ int runNative(const NativeArguments &arguments) {
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
   engine::RuntimeMetrics metrics;
   engine::RuntimeBootstrap *published = nullptr;
-  auto statusProvider = [&]() -> std::string {
-    engine::RuntimeResources &resources = published->resources();
-    // Status can arrive during GPU work; allocation/command boundaries and
-    // the safe-point pressure monitor already refresh the cached sample.
-    metal::MetalBackend &backend = resources.backend();
-    bool healthy = backend.healthy();
-    return engine::runtimeStatusJson(
-        resources.memoryPlan(), published->nativeLoop().snapshot(),
-        backend.memoryStats(), published->report().warmup,
-        published->report().memoryAudit, metrics.snapshot(),
-        published->modelRuntime().telemetry(), resources.cacheIdentity(),
-        resources.memoryGovernor().snapshot(), healthy,
-        healthy ? std::string{} : backend.unhealthyReason(),
-        published->nativeLoop().resourceWaitSnapshot(),
+  auto statusProvider = [&] {
+    return published->statusJson(
+        metrics.snapshot(),
         engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
@@ -387,40 +374,8 @@ int runNative(const NativeArguments &arguments) {
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
   published = bootstrap.get();
 
-  transport.setControlHandler([&pressureMonitor, published,
-                               memoryReporter = engine::MemoryStatusReporter{},
-                               pressurePolicy =
-                                   engine::MemoryPressurePolicy{}]() mutable {
-    engine::MemoryPressure pressure = pressureMonitor.pressure();
-    engine::RuntimeResources &resources = published->resources();
-    engine::MemoryGovernor &governor = resources.memoryGovernor();
-    governor.setPressure(pressure);
-    const double now = std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now().time_since_epoch())
-                           .count();
-    static_cast<void>(resources.backend().refreshMemoryStats());
-    const auto memory = governor.snapshot();
-    const engine::ResourceWaitSnapshot wait =
-        published->nativeLoop().resourceWaitSnapshot();
-    const std::string diagnostic =
-        memoryReporter.update(wait, memory.hostGrowthAllowed);
-    if (!diagnostic.empty())
-      writeStderrLine(diagnostic);
-    // Requests held back by a refusal wait for memory too, the refused one
-    // included while a pass defers it.
-    const std::optional<engine::MemoryReclaimDirective> directive =
-        pressurePolicy.update(memory, now,
-                              wait.memory || wait.suspended ||
-                                  wait.heldBehindRefusal);
-    if (!directive)
-      return false;
-    const engine::MemoryReclaimResult reclaim =
-        published->nativeLoop().reclaimMemory(*directive);
-    pressurePolicy.reclaimed(*directive, reclaim);
-    governor.reclaimed(reclaim.outcome);
-    static_cast<void>(resources.backend().refreshMemoryStats());
-    // What transfers held back continues at the next command-free point.
-    return reclaim.outcome == engine::ReclaimOutcome::Pending;
+  transport.setControlHandler([&pressureMonitor, published] {
+    return published->controlPass(pressureMonitor.pressure());
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {

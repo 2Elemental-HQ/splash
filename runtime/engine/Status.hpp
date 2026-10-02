@@ -228,15 +228,6 @@ inline double RuntimeMetrics::percentile(const std::deque<double> &samples,
   return sorted[std::min(index, sorted.size() - 1)];
 }
 
-// Emits only transitions; retry counts and queue depth do not produce logs.
-class MemoryStatusReporter final {
-public:
-  [[nodiscard]] std::string update(const ResourceWaitSnapshot &wait,
-                                    bool hostGrowthAllowed);
-private:
-  unsigned state_ = 0;
-};
-
 // The native loop's own timing, which its transport measures.
 struct NativeLoopTiming {
   double maxTickMilliseconds = 0.0;
@@ -250,8 +241,7 @@ struct NativeLoopTiming {
     const model::ModelTelemetry &executorTelemetry,
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason = {},
-    const ResourceWaitSnapshot &resourceWait = {},
-    const NativeLoopTiming &loop = {});
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop);
 
 } // namespace splash::engine

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
@@ -135,6 +136,16 @@ public:
         return report_;
     }
 
+    // The memory control pass the transport runs at a command-free point
+    // (MemoryControl::run).
+    [[nodiscard]] bool controlPass(MemoryPressure pressure) {
+        return memoryControl_.run(pressure);
+    }
+    // The status document, with the metrics and the loop timing the
+    // transport keeps.
+    [[nodiscard]] std::string statusJson(const RuntimeMetricsSnapshot &metrics,
+                                         const NativeLoopTiming &loop);
+
 private:
     RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                      std::unique_ptr<model::RuntimeModel> modelRuntime,
@@ -145,6 +156,7 @@ private:
     std::unique_ptr<RuntimeResources> resources_;
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
+    MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
 };
 
