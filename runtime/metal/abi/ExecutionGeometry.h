@@ -30,7 +30,16 @@
 // Groups that share such a row's draw, each over its own slice of the
 // vocabulary, so the eight rows of a lane spread over the GPU's cores.
 #define SPLASH_TARGET_VOCABULARY_GROUPS 8u
+// The ranges of the vocabulary such a row's draw sums: one per simdgroup of
+// the row's groups.
+#define SPLASH_TARGET_VOCABULARY_RANGES                                    \
+  (SPLASH_TARGET_VOCABULARY_GROUPS * (SPLASH_TARGET_VOCABULARY_THREADS / 32u))
 #define SPLASH_DRAFT_SAMPLING_SHARDS 8u
+// Candidates the draft selector keeps per proposal position; acceptance and
+// the sampled draw read them.
+#define SPLASH_DRAFT_CANDIDATES 16u
+// The rank of the draft selector's codebooks.
+#define SPLASH_DRAFT_SELECTOR_RANK 256u
 // Rows of one value head's recurrent state a prefill GDN scan threadgroup
 // carries through the chunk: four simdgroups whose lanes each own sixteen key
 // columns of one row. The thread count follows from the rows: 128 columns /

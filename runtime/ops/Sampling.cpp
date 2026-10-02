@@ -15,9 +15,6 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kTargetShards = SPLASH_TARGET_SAMPLING_SHARDS;
 constexpr uint32_t kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
 constexpr uint32_t kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
-// A sampled row's draw sums one range per simdgroup of the row's groups.
-constexpr uint32_t kVocabularyRanges =
-    kVocabularyGroups * kVocabularyThreads / 32;
 
 // A sampled lane keeps its topK most likely tokens, and every token for 0 or
 // a topK past the vocabulary (top-k disabled).
@@ -26,7 +23,6 @@ uint32_t effectiveTopK(const SamplingPolicy &policy,
   return policy.topK && policy.topK < vocabulary ? policy.topK : vocabulary;
 }
 constexpr uint32_t kDraftShards = SPLASH_DRAFT_SAMPLING_SHARDS;
-constexpr uint32_t kDraftCandidates = 16;
 // Each position's group scores its 16 x 16 edge table eight edges per
 // simdgroup task; eight simdgroups balance the seven-group B1 dispatch
 // against the 28 groups of B4 (wider groups speed up B1 and slow down B4).
@@ -49,17 +45,18 @@ SamplingWorkspace Sampling::workspace(uint32_t rows) {
           shards * sizeof(uint32_t),
           shards * sizeof(TargetShardMass),
           uint64_t{rows} * sizeof(TargetVocabularyRow),
-          uint64_t{rows} * kVocabularyRanges * sizeof(TargetVocabularyRange),
+          uint64_t{rows} * SPLASH_TARGET_VOCABULARY_RANGES *
+              sizeof(TargetVocabularyRange),
           uint64_t{rows} * sizeof(uint32_t)};
 }
 
 DraftSelectorWorkspace Sampling::draftWorkspace(uint32_t positions) {
   if (!positions)
     throw std::invalid_argument("invalid draft selector workspace position count");
-  const uint64_t candidates = uint64_t{positions} * kDraftCandidates;
+  const uint64_t candidates = uint64_t{positions} * SPLASH_DRAFT_CANDIDATES;
   // The partial values are followed by each position's 16 x 16 edge table.
   return {candidates * kDraftShards * sizeof(uint32_t),
-          candidates * (kDraftShards + kDraftCandidates) * sizeof(float),
+          candidates * (kDraftShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
           candidates * sizeof(uint32_t), candidates * sizeof(float),
           candidates * sizeof(float)};
 }

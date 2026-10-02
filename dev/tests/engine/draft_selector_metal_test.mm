@@ -33,8 +33,8 @@ using namespace splash::ops;
 
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-constexpr uint32_t kCandidates = 16;
-constexpr uint32_t kRank = 256;
+constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 
 void require(bool condition, const char *message) {

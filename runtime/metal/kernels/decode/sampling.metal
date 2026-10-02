@@ -169,10 +169,9 @@ kernel void decode_sample_mass_sharded_batch(
 constant constexpr uint kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
 constant constexpr uint kVocabularySimdgroups = kVocabularyThreads / 32;
 constant constexpr uint kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
-// The draw's ranges of the vocabulary, one per simdgroup of the row's
-// groups; the last group loads them one per thread.
-constant constexpr uint kVocabularyRanges =
-    kVocabularyGroups * kVocabularySimdgroups;
+// The draw's ranges of the vocabulary; the last group loads them one per
+// thread.
+constant constexpr uint kVocabularyRanges = SPLASH_TARGET_VOCABULARY_RANGES;
 static_assert(kVocabularyRanges <= kVocabularyThreads,
               "a group holds one draw range per thread");
 // Pivots per pass: each pass splits a bracket sixteen ways. In logit order
@@ -180,7 +179,7 @@ static_assert(kVocabularyRanges <= kVocabularyThreads,
 // scale (place_pivots).
 constant constexpr uint kPivots = 15;
 constant constexpr uint kKeyPivots = 4;
-constant constexpr uint kDraftCandidates = 16;
+constant constexpr uint kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 
 // The order of the logits as an unsigned key: a larger logit has a larger
 // key, and -0 and +0, which compare equal, share one. Every logit's key is
@@ -1020,7 +1019,8 @@ kernel void draft_select_top16_sharded(
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint K = 16, VectorTokens = 4, ChunkVectors = 16;
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint VectorTokens = 4, ChunkVectors = 16;
   uint batch = group / (Positions * Shards);
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
@@ -1145,7 +1145,8 @@ inline void top16_merge_shards(device const uint *partial_ids,
                                device const float *partial_values,
                                uint row, uint lane, thread float &value,
                                thread uint &token) {
-  constexpr uint K = 16, Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint Entries = Shards * K / 32;
   uint origin = row * Shards * K + lane * Entries;
   float values[Entries];
@@ -1190,8 +1191,8 @@ kernel void draft_select_edges(
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = 16;
-  constexpr uint Rank = 256;
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
   uint batch = row / Positions;
   uint position = row % Positions;
   if (batch >= params.lanes)
@@ -1278,7 +1279,7 @@ kernel void draft_select_dflash(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr ulong Candidates = 16;
+  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
   candidates += batch * Positions * Candidates;
   unary += batch * Positions * Candidates;
   device const float *tables = partial_values +
@@ -1373,8 +1374,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
   uint accepted = 0;
   while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
     uint token = draft_tokens[accepted];
-    float q = sparse_lookup(draft_ids + accepted * 16,
-                            draft_probs + accepted * 16, 16, token);
+    float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
+                            draft_probs + accepted * kDraftCandidates,
+                            kDraftCandidates, token);
     float p = target_rows[accepted].draft_probability;
     if (!(uniforms[accepted + SPLASH_TARGET_VERIFY_ROWS] * q < p))
       break;
@@ -1560,8 +1562,8 @@ kernel void decode_accept_dflash(
   if (params.sampling_mask & (1u << batch)) {
     accept_sampled_lane(
         lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * 16,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * 16,
+        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
+        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
         uniforms + batch * 2 * SPLASH_TARGET_VERIFY_ROWS, lane_target,
         retained[batch], next_anchor[batch], accepted_count[batch],

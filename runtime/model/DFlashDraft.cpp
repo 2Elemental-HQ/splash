@@ -17,9 +17,9 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.kvHeads) {
     throw WeightStoreError("DFlash draft layout contains a zero dimension");
   }
-  if (layout.selectorRank != 256) {
-    throw WeightStoreError(
-        "draft selector kernels are compiled for rank 256");
+  if (layout.selectorRank != SPLASH_DRAFT_SELECTOR_RANK) {
+    throw WeightStoreError("draft selector kernels are compiled for rank " +
+                           std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
   }
   validateQ4Layout(layout.dynamicSize, layout.hiddenSize);
   validateQ4Layout(layout.qkvSize, layout.hiddenSize);

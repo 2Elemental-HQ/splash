@@ -52,7 +52,7 @@ using namespace splash::ops;
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDraftCandidates = 16;
+constexpr uint32_t kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
 constexpr std::array<uint32_t, 2> kStopTokens{1, 2};
