@@ -316,27 +316,29 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
 // one; then one victim at a time in the shared recency order, states and
 // resident KV leaves alike.
 
-uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
-                             bool keepResumePoint, bool keepRunway) {
+uint64_t Cache::reclaimCache(uint64_t targetBytes, bool keepResumePoint,
+                             bool keepRunway) {
   uint64_t released = reclaimEmptyExtents(keepRunway);
-  if (evictAll) {
-    // Everything unpinned goes before anything moves.
-    for (CacheReclaimResult evicted = evictOne(keepResumePoint);
-         evicted.madeProgress; evicted = evictOne(keepResumePoint))
-      released += evicted.reclaimedBytes;
-    do {
-      released += reclaimEmptyExtents(keepRunway);
-    } while (compactExtent());
-    return released;
-  }
   // Pages whose copies are being written count toward the target.
-  while (!reclaimMet(released, targetBytes, false)) {
+  while (!reclaimMet(released, targetBytes)) {
     const CacheReclaimResult result = reclaimOne(
         CacheReclaimMode::ReleaseExtents, keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
   }
+  return released;
+}
+
+uint64_t Cache::evictAll() {
+  uint64_t released = reclaimEmptyExtents(false);
+  // Everything unpinned goes before anything moves.
+  for (CacheReclaimResult evicted = evictOne(false); evicted.madeProgress;
+       evicted = evictOne(false))
+    released += evicted.reclaimedBytes;
+  do {
+    released += reclaimEmptyExtents(false);
+  } while (compactExtent());
   return released;
 }
 
@@ -540,9 +542,9 @@ uint64_t Cache::pendingBytes() const noexcept {
   return uint64_t{pendingPages()} * pool_.bytesPerPage();
 }
 
-bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
-                       bool evictAll) const noexcept {
-  return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
+bool Cache::reclaimMet(uint64_t releasedBytes,
+                       uint64_t targetBytes) const noexcept {
+  return releasedBytes + pendingBytes() >= targetBytes;
 }
 
 

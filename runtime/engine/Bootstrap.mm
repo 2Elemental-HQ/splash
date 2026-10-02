@@ -382,7 +382,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         // and one empty KV extent. No cache data is evicted.
         while (modelPointer->reclaimIdleState(true)) {
         }
-        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, false, true));
+        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, true));
         resourcesPointer->memoryGovernor().markServingFootprint();
         return report;
       },

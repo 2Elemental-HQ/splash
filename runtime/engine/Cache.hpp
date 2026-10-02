@@ -223,22 +223,23 @@ public:
   // oldest redundant copy of either kind, then the oldest copy that is the
   // only one.
   // Active requests and pinned restores are never selected. A pass releases
-  // every extent it empties; one that evicts everything moves pages only
-  // once it has, so that nothing is copied and then evicted.
-  // keepResumePoint stops short of the newest state
+  // every extent it empties. keepResumePoint stops short of the newest state
   // publication. A shrink that no request is waiting for gains the one cell
   // that publication holds and costs the next request a replay of its whole
   // prompt, because a hybrid model cannot resume from cached KV without the
   // recurrent state. Empty extents, older publications and state-free KV are
   // still reclaimed. keepRunway leaves one empty extent allocated, for the
   // next request.
-  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
-                                      bool keepResumePoint = false,
-                                      bool keepRunway = false);
+  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes,
+                                      bool keepResumePoint, bool keepRunway);
+  // Evicts every unpinned entry, in reclaimCache's order, and releases every
+  // empty extent, the runway too. Only then does it move pages, those that
+  // requests and pins still hold, so that nothing is copied and then evicted.
+  [[nodiscard]] uint64_t evictAll();
   // reclaimCache's stop rule: releasedBytes and the pages whose copies are
-  // being written meet targetBytes. A pass with evictAll has no target.
-  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
-                                bool evictAll) const noexcept;
+  // being written meet targetBytes.
+  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes,
+                                uint64_t targetBytes) const noexcept;
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine.
   [[nodiscard]] bool transfersInFlight() const noexcept;

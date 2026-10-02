@@ -17,7 +17,6 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -465,8 +464,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 // One reclaim pass evicts every unpinned entry and releases the extents it
 // empties.
 void evictAllCache(engine::Cache &resources) {
-  static_cast<void>(
-      resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
+  static_cast<void>(resources.evictAll());
   const engine::CacheSnapshot snapshot = resources.snapshot();
   if (snapshot.stateCache.entries || snapshot.kvCache.blocks)
     throw std::logic_error("native benchmark cache did not drain");
@@ -475,7 +473,7 @@ void evictAllCache(engine::Cache &resources) {
 void evictAllCompositeState(engine::Cache &resources) {
   while (resources.snapshot().stateCache.entries) {
     const engine::CacheSnapshot before = resources.snapshot();
-    static_cast<void>(resources.reclaimCache(1, false));
+    static_cast<void>(resources.reclaimCache(1, false, false));
     const engine::CacheSnapshot after = resources.snapshot();
     if (after.stateCache.entries >= before.stateCache.entries &&
         after.pool.allocatedBytes >= before.pool.allocatedBytes) {

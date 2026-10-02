@@ -861,7 +861,7 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
               events.starts[0].first == EngineCacheStatus::Miss,
           "cold request reported a cache hit");
 
-  require(resources.reclaimCache(1, false) != 0,
+  require(resources.reclaimCache(1, false, false) != 0,
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
@@ -1131,7 +1131,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimCache(1, false, false) != 0,
             "test could not leave a KV-only shared prefix");
   }
 
@@ -1169,7 +1169,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(7, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimCache(1, false, false) != 0,
             "test could not remove the old composite state");
   }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
@@ -1235,7 +1235,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine.submit(request(9, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimCache(1, false, false) != 0,
             "test could not remove the old composite state");
   }
 

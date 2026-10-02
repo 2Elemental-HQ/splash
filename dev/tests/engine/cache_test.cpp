@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -86,11 +85,11 @@ void testKvDeeperThanStateAndDependencyEviction() {
               lookup.junctionBoundary() == 96,
           "dense KV did not expose the lazy state junction");
   lookup.state.reset();
-  require(resources.reclaimCache(1, false) >= 100,
+  require(resources.reclaimCache(1, false, false) >= 100,
           "unreferenced composite state was not reclaimed first");
   require(resources.snapshot().kvCache.blocks == 2,
           "LRU reclaim did not remove the older fragmented KV leaf first");
-  require(resources.reclaimCache(1, false) != 0,
+  require(resources.reclaimCache(1, false, false) != 0,
           "KV was not reclaimed after cached state");
   require(resources.snapshot().stateCache.entries == 0,
           "composite state outlived its KV dependency");
@@ -139,7 +138,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   resources.beginRequest(2);
   require(!resources.ensureTokens(2, 1).granted(),
           "growth bypassed engine-coordinated reclaim");
-  require(resources.reclaimCache(1, false) != 0 &&
+  require(resources.reclaimCache(1, false, false) != 0 &&
               resources.ensureTokens(2, 1).granted(),
           "explicit reclaim did not release the cached KV extent");
   const auto snapshot = resources.snapshot();
@@ -191,7 +190,7 @@ void testReplacementKeepsTheExtentItEmpties() {
               pool.snapshot().extentAllocations == 1 && storage.releasedExtents == 0,
           "replacement allocated the reusable extent again");
   resources.endRequest(2);
-  require(resources.reclaimCache(0, false) == 4 * 4096 &&
+  require(resources.reclaimCache(0, false, false) == 4 * 4096 &&
               storage.allocatedPages() == 0 && storage.releasedExtents == 1,
           "zero-target shrink did not release the empty extent");
 }
@@ -218,13 +217,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
               resources.snapshot().kvCache.blocks == 1,
           "release setup geometry changed");
 
-  require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false) ==
+  require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false, false) ==
                   uint64_t{empty} * 4 * 4096 &&
               storage.releasedExtents == empty &&
               resources.snapshot().pool.reclaimableExtents == 0 &&
               resources.snapshot().kvCache.blocks == 1,
           "a pass did not release every empty extent before evicting");
-  require(resources.reclaimCache(1ULL << 40, false) == 4 * 4096 &&
+  require(resources.reclaimCache(1ULL << 40, false, false) == 4 * 4096 &&
               storage.releasedExtents == empty + 1 &&
               storage.allocatedPages() == 0 &&
               resources.snapshot().kvCache.blocks == 0,
@@ -252,8 +251,7 @@ void testReleaseTimeCoversOneExtent() {
   require(resources.snapshot().pool.reclaimableExtents == 0 &&
               resources.snapshot().kvCache.blocks == 4 * extents,
           "release time setup geometry changed");
-  static_cast<void>(
-      resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
+  static_cast<void>(resources.evictAll());
   // The pool's timer runs around one release: no less than the storage saw
   // its longest release take, and less than all of them took together. No
   // bound in milliseconds holds on a loaded machine.

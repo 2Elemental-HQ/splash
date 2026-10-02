@@ -470,7 +470,7 @@ void testByteLruAndPins() {
   // Keep the only KV leaf state-backed so this assertion isolates state LRU;
   // state-free KV leaves otherwise participate in the same global order.
   fixture.publish(3, 150);
-  require(fixture.cache.reclaimCache(1, false) == 150,
+  require(fixture.cache.reclaimCache(1, false, false) == 150,
           "state LRU did not evict one unpinned entry");
   auto missingMiddle = fixture.lookup(65);
   auto newest = fixture.lookup(97);
@@ -481,7 +481,7 @@ void testByteLruAndPins() {
   missingMiddle.state.reset();
   pinned.state.reset();
   newest.state.reset();
-  require(fixture.cache.reclaimCache(1, false) == 150,
+  require(fixture.cache.reclaimCache(1, false, false) == 150,
           "released state pins did not restore LRU eligibility");
 }
 
@@ -493,7 +493,7 @@ void testSpeculativeReclaimKeepsTheResumePoint() {
   fixture.publish(0, 100);
   fixture.publish(2, 100);
   const uint64_t everything = std::numeric_limits<uint64_t>::max();
-  static_cast<void>(fixture.cache.reclaimCache(everything, false, true));
+  static_cast<void>(fixture.cache.reclaimCache(everything, true, false));
   require(fixture.cache.snapshot().stateCache.entries == 1,
           "an unbounded speculative shrink did not stop at the resume point");
   // The chain the kept publication needs survives with it: its own KV block
@@ -529,9 +529,9 @@ void testCheckpointDoesNotOutrankTheResumePoint() {
 void testKvEvictionInvalidatesStateFirst() {
   CacheFixture fixture;
   fixture.publish(3);
-  require(fixture.cache.reclaimCache(1, false) == 100,
+  require(fixture.cache.reclaimCache(1, false, false) == 100,
           "state was not reclaimed before its KV block");
-  require(fixture.cache.reclaimCache(1, false) != 0 &&
+  require(fixture.cache.reclaimCache(1, false, false) != 0 &&
               fixture.cache.lookup(fixture.prompt).kvBoundary == 96,
           "KV leaf eviction did not remove the dependent prefix");
 
@@ -540,7 +540,7 @@ void testKvEvictionInvalidatesStateFirst() {
   auto lease = pinnedFixture.lookup(97);
   require(lease.state.has_value(), "replacement state pin failed");
   static_cast<void>(pinnedFixture.cache.reclaimCache(
-      std::numeric_limits<uint64_t>::max(), false));
+      std::numeric_limits<uint64_t>::max(), false, false));
   require(pinnedFixture.cache.snapshot().kvCache.blocks == 3 &&
               pinnedFixture.cache.snapshot().stateCache.entries == 1,
           "pinned composite state did not protect its KV dependency");
@@ -581,7 +581,7 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
               probed.stateCache.misses == before.stateCache.misses &&
               probed.stateCache.deduplicatedPublications == 1,
           "publication probe polluted restore hit/miss accounting");
-  require(fixture.cache.reclaimCache(1, false) == 200,
+  require(fixture.cache.reclaimCache(1, false, false) == 200,
           "publication probe did not promote the existing state in LRU");
 }
 
@@ -2233,10 +2233,10 @@ void testReclaimCacheCountsPendingPages() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimCache(100, false) == 100 && tier.demotions == 0,
+  require(fixture.cache.reclaimCache(100, false, false) == 100 && tier.demotions == 0,
           "the state's RAM did not satisfy the first target");
   require(fixture.cache.pollTransfers(), "state write was not consumed");
-  require(fixture.cache.reclaimCache(100, false) == 0 && tier.demotions == 1 &&
+  require(fixture.cache.reclaimCache(100, false, false) == 0 && tier.demotions == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 4,
           "reclaim wrote more than the target while a page was on its way back");
 }
@@ -2670,7 +2670,7 @@ void testCompactionLeavesTheRunway() {
   // A pass with a target keeps one empty extent and returns the others.
   ExtentFixture spare;
   spare.evictFirstPrompt();
-  require(spare.cache.reclaimCache(400, false, false, true) == 400 &&
+  require(spare.cache.reclaimCache(400, false, true) == 400 &&
               spare.storage.copies.size() == 1 &&
               spare.cache.snapshot().pool.pagesAllocated == 12 &&
               spare.cache.snapshot().pool.reclaimableExtents == 1 &&
@@ -2692,7 +2692,7 @@ void testEvictAllGathersWhatRequestsHold() {
   fixture.evictFirstPrompt();
   // Three extents (1200) and the two states (200); the third prompt's pages
   // are gone before extent 0's page moves into their place.
-  require(cache.reclaimCache(std::numeric_limits<uint64_t>::max(), true) == 1400 &&
+  require(cache.evictAll() == 1400 &&
               fixture.storage.copies.size() == 1 &&
               fixture.storage.copies[0].from == 3 &&
               fixture.storage.copies[0].to / 4 == 1,
