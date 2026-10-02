@@ -103,7 +103,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const uint32_t pageB = extent;
   require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
               pages.isAllocated(pageB),
-          "test pages were not mapped");
+          "test pages were not allocated");
   const uint64_t payload = pages.bytesPerPage();
   const uint64_t slotBytes = SlotFile::slotBytesFor(payload);
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));

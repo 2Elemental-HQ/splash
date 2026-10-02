@@ -73,7 +73,7 @@ class MethodReplacement final {
 public:
     MethodReplacement(id object, SEL selector, IMP replacement) {
         method_ = class_getInstanceMethod(object_getClass(object), selector);
-        require(method_ != nullptr, "probe fault method is missing");
+        require(method_ != nullptr, "replacement method is missing");
         original = method_setImplementation(method_, replacement);
     }
     ~MethodReplacement() { method_setImplementation(method_, original); }

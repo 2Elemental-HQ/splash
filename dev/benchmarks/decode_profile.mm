@@ -246,7 +246,7 @@ int main(int argc, char **argv) {
                             pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
         if (!pages.allocateExtent(extent))
-          throw std::runtime_error("could not back the KV pages");
+          throw std::runtime_error("could not allocate the KV extents");
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
