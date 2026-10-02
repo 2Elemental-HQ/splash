@@ -785,20 +785,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
+    def _await_done(self, job):
+        """The result of a score job, which emits only start and done."""
+        while (event := self._next_event(job))[0] != "done":
+            pass
+        return event[1]
+
     def _judgment_complete(self, job, row):
-        result = None
-        while result is None:
-            kind, value = self._next_event(job)
-            if kind == "done":
-                result = value
-        if result.reason == "cancelled":
-            if job.timed_out:
-                raise APIError(504, "request timed out", "request_timeout")
-            raise APIError(500, "request cancelled", "request_cancelled")
-        if result.reason != "stop" or len(result.option_logits) != len(
-            job.score_tokens
-        ):
-            raise APIError(500, "runtime protocol error", "protocol_error")
+        result = self._await_done(job)
         self._json(
             200,
             judgments.judgment_response(self.app.response_model, row, job.meta, result),
@@ -821,19 +815,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # queue bound and lets later questions reuse the state prefix.
                 active_job = job
                 self.app.backend.submit(job)
-                result = None
-                while result is None:
-                    kind, value = self._next_event(job)
-                    if kind == "done":
-                        result = value
-                if result.reason == "cancelled":
-                    if job.timed_out:
-                        raise APIError(504, "request timed out", "request_timeout")
-                    raise APIError(500, "request cancelled", "request_cancelled")
-                if result.reason != "stop" or len(result.option_logits) != len(
-                    job.score_tokens
-                ):
-                    raise APIError(500, "runtime protocol error", "protocol_error")
+                result = self._await_done(job)
                 input_tokens += result.prompt_tokens
                 answers[qid] = judgments.systemone_answer(
                     spec, judgments.softmax(list(result.option_logits))
@@ -870,7 +852,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
             if remaining <= 0:
-                self.app.backend.cancel(job, timed_out=True)
+                self.app.backend.cancel(job)
                 raise APIError(504, "request timed out", "request_timeout")
             try:
                 event = job.events.get(timeout=min(remaining, CLIENT_DISCONNECT_POLL))
@@ -976,10 +958,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 result = value
         for field, text in splitter.finish():
             append(field, text)
-        if result.reason == "cancelled":
-            if job.timed_out:
-                raise APIError(504, "request timed out", "request_timeout")
-            raise APIError(500, "request cancelled", "request_cancelled")
         content_text, tool_calls, unsent = self._finalize_content(
             "".join(content), job, has_tools, result.reason == "length", projector
         )

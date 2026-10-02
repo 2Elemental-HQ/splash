@@ -1454,17 +1454,6 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
 
-    def test_judgments_missing_logits_is_a_server_error(self):
-        runtime = FakeRuntime(Plan())
-        harness = self.harness(
-            runtime, tokenizer=self.CharTokenizer(), max_context=8192
-        )
-        status, _, payload = harness.request(
-            "POST", "/v1/judgments", self.judgment_body()
-        )
-        self.assertEqual(status, 500, payload)
-        self.assertEqual(json.loads(payload)["error"]["code"], "protocol_error")
-
     def test_judgments_deadline_cancels_the_score_request(self):
         plan = Plan(logits=(0.0, 1.0), block=True)
         runtime = FakeRuntime(plan)

@@ -628,16 +628,15 @@ class NativeBackendContractTests(unittest.TestCase):
         constraint.finish()
         self.assertEqual(matcher.consumed, [(7, 8), (9,)])
 
-    def test_cancel_is_idempotent_and_preserves_timeout_flag(self):
+    def test_cancel_is_idempotent(self):
         transport, runtime = self.make_transport()
         job = make_job()
         transport.submit(job)
         call = runtime.calls[0]
 
-        transport.cancel(job, timed_out=True)
+        transport.cancel(job)
         transport.cancel(job)
         self.assertTrue(job.cancelled.is_set())
-        self.assertTrue(job.timed_out)
         self.assertEqual(call.cancel_writes, 1)
 
     def test_cancel_during_submit_is_sent_when_call_becomes_available(self):
@@ -648,13 +647,12 @@ class NativeBackendContractTests(unittest.TestCase):
         thread.start()
         self.assertTrue(runtime.submit_entered.wait(1.0))
 
-        transport.cancel(job, timed_out=True)
+        transport.cancel(job)
         runtime.release_submit.set()
         thread.join(1.0)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(runtime.calls[0].cancel_writes, 1)
-        self.assertTrue(job.timed_out)
 
     def test_close_can_own_terminal_while_submit_is_still_returning(self):
         runtime = FakeRuntime("block_after_call")

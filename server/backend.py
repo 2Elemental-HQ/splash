@@ -100,7 +100,6 @@ class Job:
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
-    timed_out: bool = False
     tool_policy: ToolPolicy | None = None
     response_validator: object | None = None
     response_format: dict | None = None
@@ -707,10 +706,9 @@ class NativeBackend:
                 job.constraint.commit(event.tokens)
             state.streamer.put_tokens(event.tokens)
 
-    def cancel(self, job, timed_out=False):
+    def cancel(self, job):
         call = None
         with self.lock:
-            job.timed_out |= timed_out
             job.cancelled.set()
             state = self.active.get(job.request_id)
             if state is not None:
