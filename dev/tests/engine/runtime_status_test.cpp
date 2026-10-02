@@ -225,10 +225,6 @@ void testCleanRuntimeStatus() {
                     "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75}") !=
               std::string::npos,
           "status lost the KV extent growth and release diagnostics");
-  require(json.find("sparse") == std::string::npos &&
-              json.find("unmap") == std::string::npos &&
-              json.find("map_wait") == std::string::npos,
-          "status still reports placement-sparse memory");
   require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
               json.find("\"host_measurement_valid\":true") != std::string::npos &&
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=

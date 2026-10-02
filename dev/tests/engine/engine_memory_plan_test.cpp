@@ -88,7 +88,7 @@ void testBf16BudgetAndStatus() {
           "BF16 planning did not use its payload size and its pool's extent size");
   require(budget.kvCapacityBytes <= budget.dynamicBudgetBytes &&
               budget.kvCapacityPages < int8.breakdown().kvCapacityPages,
-          "BF16 virtual capacity exceeded the shared budget");
+          "BF16 KV capacity exceeded the shared budget");
   const auto json = bf16.toStatusJson();
   require(json.find("\"kv_format\":\"bf16\"") != std::string::npos &&
               json.find("\"kv_scale_value_bytes\":0") != std::string::npos &&
@@ -96,7 +96,7 @@ void testBf16BudgetAndStatus() {
           "BF16 memory status reported INT8 scales or pages");
   const uint64_t minimum = budget.minimumRequiredBytes;
   require(!evaluateEngineMemoryPlan(device(), profile, minimum - 1).plan,
-          "BF16 startup admitted less than its minimum resident footprint");
+          "BF16 startup admitted less than its minimum footprint");
 }
 
 // The minimum holds the KV runway, the whole smallest extents that hold the

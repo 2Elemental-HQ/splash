@@ -135,8 +135,10 @@ struct EngineMemoryBreakdown {
   // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
   uint64_t kvExtentBytes = 0;
-  // The pool: the whole extents one request's KV can use within the budget.
-  // Request context and four-lane execution are independent policy limits.
+  // One request's KV capacity: the whole extents its KV can use within the
+  // budget beside one state cell. The pool's page ids cover more
+  // (RuntimeResources sizes them by the hard budget). Request context and
+  // four-lane execution are independent policy limits.
   uint32_t kvCapacityPages = 0;
   uint64_t kvCapacityBytes = 0;
   uint64_t kvCapacityTokens = 0;
@@ -166,9 +168,9 @@ public:
   [[nodiscard]] const EngineMemoryBreakdown &breakdown() const noexcept {
     return breakdown_;
   }
-  // Stable per-request ceiling advertised by the runtime. The physical KV
-  // pool is shared dynamically, but one admitted request is never promised
-  // more than either the model supports or the complete pool can hold.
+  // Stable per-request ceiling advertised by the runtime: never more than the
+  // model supports or one request's KV capacity holds (less the speculative
+  // scratch); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // The ceiling this plan would advertise with at most memoryBytes, within
   // its configured limit; zero when one request cannot fit there.

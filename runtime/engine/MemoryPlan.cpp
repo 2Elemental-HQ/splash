@@ -200,8 +200,8 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(kvPageBytes) << '\n'
       << "KV extent: " << kvExtentPages << " pages, "
       << bytesAndMiB(kvExtentBytes) << '\n'
-      << "KV pool: " << kvCapacityPages << " pages / " << kvCapacityTokens
-      << " tokens\n"
+      << "KV capacity of one request: " << kvCapacityPages << " pages / "
+      << kvCapacityTokens << " tokens\n"
       << "minimum dynamic runtime: " << bytesAndMiB(minimumDynamicBytes) << '\n'
       << "minimum required: " << bytesAndMiB(minimumRequiredBytes) << '\n'
       << "deficit: " << bytesAndMiB(deficitBytes);
@@ -238,13 +238,13 @@ EngineMemoryPlan::EngineMemoryPlan(DeviceCapabilities device,
       breakdown_(std::move(breakdown)) {}
 
 uint32_t EngineMemoryPlan::maximumContextTokens() const noexcept {
-  const uint64_t physicalCapacity = breakdown_.kvCapacityTokens;
-  const uint64_t logicalCapacity =
-      physicalCapacity > model::ExecutionLimits::speculativeScratchTokens
-          ? physicalCapacity - model::ExecutionLimits::speculativeScratchTokens
+  const uint64_t kvTokens = breakdown_.kvCapacityTokens;
+  const uint64_t contextTokens =
+      kvTokens > model::ExecutionLimits::speculativeScratchTokens
+          ? kvTokens - model::ExecutionLimits::speculativeScratchTokens
           : 0;
   return static_cast<uint32_t>(
-      std::min<uint64_t>(model_.maximumContextTokens, logicalCapacity));
+      std::min<uint64_t>(model_.maximumContextTokens, contextTokens));
 }
 
 uint32_t EngineMemoryPlan::contextTokensWithin(uint64_t memoryBytes) const {
@@ -327,8 +327,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     "minimum elastic runtime footprint overflows uint64",
                     std::move(breakdown))};
   }
-  // Page ids stay 32-bit. The pool is the whole extents of the size that
-  // leaves the fewest of the budget's pages unused.
+  // Page ids stay 32-bit. One request's KV capacity is the whole extents of
+  // the size that leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =
       breakdown.dynamicBudgetBytes > breakdown.activeStateCellBytes
           ? breakdown.dynamicBudgetBytes - breakdown.activeStateCellBytes
@@ -349,7 +349,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       !checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages,
                        breakdown.kvCapacityTokens)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
-                                  "KV pool capacity overflows uint64",
+                                  "KV capacity overflows uint64",
                                   std::move(breakdown))};
   }
   if (!breakdown.kvExtentPages ||
