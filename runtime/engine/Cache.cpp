@@ -7,6 +7,17 @@
 #include <utility>
 
 namespace splash::engine {
+namespace {
+
+// The spans that can still overlap the block at blockBegin or a later one:
+// sorted and disjoint, a span that ends before a block ends before every
+// later block too.
+std::span<const ImageSpan> spansFrom(std::span<const ImageSpan> images, uint64_t blockBegin) {
+  const auto ended = [&](const ImageSpan &span) { return span.end() <= blockBegin; };
+  return {std::partition_point(images.begin(), images.end(), ended), images.end()};
+}
+
+} // namespace
 
 Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
@@ -61,6 +72,7 @@ size_t Cache::extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_
   for (size_t index = blocks.size(); index < maximumBlocks; ++index) {
     const size_t begin = index * KvCache::pageTokens;
     const uint64_t parent = blocks.empty() ? 0 : blocks.back();
+    images = spansFrom(images, begin);
     ++hashed;
     auto match = kv_.find(parent, prompt.subspan(begin, KvCache::pageTokens),
                           blockImageIdentity(begin, KvCache::pageTokens, images));
@@ -186,6 +198,7 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     const uint32_t logical = static_cast<uint32_t>(active.cachedBlocks.size());
     const uint64_t parent = logical ? active.cachedBlocks.back() : 0;
     const uint32_t begin = logical * KvCache::pageTokens;
+    images = spansFrom(images, begin);
     auto inserted =
         kv_.insert(parent, exactTokens.subspan(begin, KvCache::pageTokens),
                    active.pages[logical],

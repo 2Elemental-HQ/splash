@@ -571,14 +571,24 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
       static_cast<uint32_t>(end - a.begin()),
       std::min(replayStateBoundary(left), replayStateBoundary(right)));
   boundary -= boundary % KvCache::pageTokens;
-  if (!left.request.images.empty() || !right.request.images.empty()) {
-    for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
-      if (blockImageIdentity(offset, KvCache::pageTokens, left.request.images) !=
-          blockImageIdentity(offset, KvCache::pageTokens, right.request.images))
-        return offset;
-    }
-  }
-  return boundary;
+  // Blocks below the boundary have equal image identities exactly when the
+  // spans that start below it are equal; otherwise the first differing
+  // block holds the earliest start of the first unequal span.
+  const auto startingBelow = [&](const Request &value) {
+    const std::span<const ImageSpan> images = value.request.images;
+    const auto end = std::partition_point(
+        images.begin(), images.end(),
+        [&](const ImageSpan &span) { return span.offset < boundary; });
+    return std::span<const ImageSpan>(images.begin(), end);
+  };
+  const auto leftImages = startingBelow(left);
+  const auto rightImages = startingBelow(right);
+  const auto [leftUnequal, rightUnequal] = std::mismatch(
+      leftImages.begin(), leftImages.end(), rightImages.begin(), rightImages.end());
+  const uint32_t start =
+      std::min(leftUnequal == leftImages.end() ? boundary : leftUnequal->offset,
+               rightUnequal == rightImages.end() ? boundary : rightUnequal->offset);
+  return start - start % KvCache::pageTokens;
 }
 
 bool Engine::pendingSharedPrefill(const Request &active,

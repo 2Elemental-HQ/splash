@@ -21,7 +21,9 @@ ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
   ImageIdentity identity;
   const uint64_t blockEnd = blockBegin + blockTokens;
   for (const ImageSpan &span : spans) {
-    if (span.end() <= blockBegin || span.offset >= blockEnd)
+    if (span.offset >= blockEnd)
+      break;
+    if (span.end() <= blockBegin)
       continue;
     // Two independently seeded chains fold the content digest, the grid, and
     // the block's alignment inside the span into 128 bits.

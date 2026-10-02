@@ -1319,6 +1319,48 @@ void testImageSpansKeyPrefixIdentity() {
           "image request lifecycle did not complete cleanly");
 }
 
+// Two token-identical prompts share their prefix up to the block that holds
+// the start of the first image on which they differ: the later one waits for
+// the junction there and resumes from it.
+void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
+  const ImageSpan a{40, 16, 8, 8, 0x1111, 0x2222};
+  const ImageSpan b{200, 16, 8, 8, 0x3333, 0x4444};
+  const ImageSpan c{200, 16, 8, 8, 0x5555, 0x6666};
+  ImageSpan otherA = a;
+  otherA.digestLo ^= 1;
+  struct Shape {
+    std::vector<ImageSpan> producer;
+    std::vector<ImageSpan> waiter;
+    uint32_t shared = 0;
+  };
+  for (const Shape &shape : {Shape{{a, b}, {a, c}, 192}, Shape{{a}, {otherA}, 32}}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
+    const auto withImages = [](uint64_t id, const std::vector<ImageSpan> &images) {
+      EngineRequest result = request(id, std::vector<uint32_t>(289, 248056));
+      result.images = images;
+      for (const ImageSpan &image : images)
+        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(), 1);
+      return result;
+    };
+    engine.submit(withImages(1, shape.producer));
+    engine.submit(withImages(2, shape.waiter));
+    static_cast<void>(engine.tick(0));
+    require(model.requests.size() == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+            "the later request did not wait for the shared prefix");
+    runUntilIdle(engine);
+    require(events.starts.size() == 2 &&
+                events.starts[1] == std::pair{EngineCacheStatus::PrefixHit, shape.shared} &&
+                model.prefillRows == 289 + 289 - shape.shared && events.completedCount == 2,
+            "the shared prefix did not end at the block of the first different image");
+  }
+}
+
 // One prefill chunk that every caller's prompt shares, then 65 tokens of
 // `token`: the replay state lands at 2112. A prompt branching off a cached
 // one at the end of the chunk plans a junction there, a draft window past
@@ -8485,6 +8527,7 @@ int main() {
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
+    testSharedPrefillBoundaryStopsAtTheFirstDifferentImage();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLazyJunctionNeedsADraftWindowOfGain();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();

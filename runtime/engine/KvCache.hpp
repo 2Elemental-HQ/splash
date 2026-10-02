@@ -35,6 +35,7 @@ struct ImageIdentity final {
   bool operator==(const ImageIdentity &) const = default;
 };
 
+// The spans are sorted by offset and disjoint, as Engine::submit requires.
 [[nodiscard]] ImageIdentity
 blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                    std::span<const ImageSpan> spans) noexcept;

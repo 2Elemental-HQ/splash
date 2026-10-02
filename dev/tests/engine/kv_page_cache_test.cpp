@@ -66,6 +66,14 @@ void testImageIdentityKeysBlocks() {
   const std::array<ImageSpan, 1> laterSpans{redLater};
   require(blockImageIdentity(32, 32, laterSpans) != redIdentity,
           "image identity ignores the block's alignment inside the image");
+  // Of sorted spans, only those that overlap the block make its identity:
+  // not those that end before it, nor those that start after it.
+  const ImageSpan first{0, 8, 4, 8, 0x5555, 0x6666};
+  const std::array<ImageSpan, 3> threeSpans{first, blue, redLater};
+  const std::array<ImageSpan, 1> firstSpan{first};
+  require(blockImageIdentity(32, 32, threeSpans) == blockImageIdentity(32, 32, laterSpans) &&
+              blockImageIdentity(0, 8, threeSpans) == blockImageIdentity(0, 8, firstSpan),
+          "a span outside the block changed its identity");
 
   const auto tokens = page(248056);
   auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);
