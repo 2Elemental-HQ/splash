@@ -769,7 +769,8 @@ Hidden thinking signatures use a persistent user key; imported encrypted thinkin
 preserves visible history without recovering the private reasoning.
 
 `/status.admission` distinguishes memory and concurrency waits, reports suspended
-requests, recovery draining and the oldest current wait age. Memory transitions
+requests, recovery draining and the oldest current wait age, which for a request
+holding admission closed runs from when its wait began. Memory transitions
 also appear in the console. When macOS runs short of memory, growth that no
 request in service needs pauses and the cache gives memory back, a paced pass at
 a time, down to one lane's state buffers and one KV extent. A request in service
@@ -948,13 +949,13 @@ These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
 requests then resume first, each within its own resource wait. A resource
-wait's limit restarts whenever a lane submitted before the waiting request has
+wait's limit restarts whenever a lane submitted before the waiting request, or
+admitted before the request was first refused memory or was suspended, has
 work in flight, since that lane holds memory the request waits for until it
-finishes; lanes submitted after the request do not extend it. Readiness does
-not guarantee that a request-sized allocation fits. A request that cannot fit
-even alone, after every cached prefix was evicted, fails with 400
-`capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
-fails the same way.
+finishes; other lanes do not extend it. Readiness does not guarantee that a
+request-sized allocation fits. A request that cannot fit even alone, after
+every cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
+`--max-memory` and `--max-context`; retrying it fails the same way.
 
 ### Disk cache
 

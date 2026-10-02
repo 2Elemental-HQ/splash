@@ -218,11 +218,16 @@ bool Engine::tick(double now) {
     progressed = true;
   }
   progressed = pollRestores(now) || progressed;
-  // The earliest submitted of the lanes with work in flight.
+  // The earliest submitted and the earliest admitted of the lanes with work
+  // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
+  uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
   if (pending_) {
-    for (const BatchItem &item : pending_->plan.items)
-      earliestWorking = std::min(earliestWorking, request(item.requestId).sequence);
+    for (const BatchItem &item : pending_->plan.items) {
+      const Request &working = request(item.requestId);
+      earliestWorking = std::min(earliestWorking, working.sequence);
+      earliestWorkingAdmission = std::min(earliestWorkingAdmission, working.admission);
+    }
   }
   const bool draining = drainingForRecovery();
   for (auto &[_, active] : requests_) {
@@ -232,9 +237,14 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    // A lane submitted earlier holds memory this request may wait for until
-    // it finishes; while it works, the wait's limit restarts.
-    if (active.sequence > earliestWorking)
+    // A lane submitted before the request, or admitted before it was refused
+    // memory or suspended, holds memory it may wait for until it finishes;
+    // while it works, the wait's limit restarts. Other lanes do not extend
+    // it: requests that keep arriving would otherwise hold it until its
+    // deadline.
+    const std::optional<uint64_t> &admittedBefore = active.resourceWait.admittedBefore;
+    if (active.sequence > earliestWorking ||
+        (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
       active.resourceWait.earlierLaneWorkMilliseconds = now;
     const double deadline = resourceDeadline(active);
     if (!active.finalized && deadline > 0.0 && now >= deadline) {
@@ -422,12 +432,12 @@ bool Engine::admitQueued(double now) {
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.stateCell.has_value();
       }) >= model::ExecutionLimits::maximumBatchWidth;
-  // Waiting for scheduling, or behind a request that was refused memory,
-  // does not consume the memory-retry deadline.
+  // A request this pass does not start, or that waits behind one refused
+  // memory, waits for scheduling.
   const auto queue = [&](uint64_t id) {
     Request &active = request(id);
     active.admissionProbe.reset();
-    active.resourceWait = {};
+    deferWait(active);
     scheduler_.deferAdmission(id);
   };
   // A request whose start was refused memory closes admission behind it
@@ -460,7 +470,7 @@ bool Engine::admitQueued(double now) {
     const uint32_t cached = active.admissionProbe->cachedTokens();
     if (pendingSharedPrefill(active, cached)) {
       active.admissionProbe.reset();
-      active.resourceWait = {};
+      deferWait(active);
       scheduler_.waitForPrefix(id);
       continue;
     }
@@ -570,7 +580,7 @@ bool Engine::admit(Request &active, double now) {
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
-    active.resourceWait = {};
+    deferWait(active);
     scheduler_.waitForPrefix(active.request.id);
     return false;
   }
@@ -611,6 +621,7 @@ bool Engine::admit(Request &active, double now) {
     cache_.beginRequest(active.request.id);
     resourcesStarted = true;
     active.stateCell = *state.admission.cell;
+    active.admission = ++admissions_;
     const uint32_t resumeBoundary = lookup.resumeBoundary();
     const uint64_t requestId = active.request.id;
     // The matched chain first, then the first work's pages for a lane that
@@ -789,6 +800,10 @@ void Engine::deferResourceRetry(Request &active, double now,
   auto &wait = active.resourceWait;
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
+  // Waiting for a lane is not waiting for memory: the lanes that count are
+  // those admitted before the first refusal of memory.
+  if (!wait.admittedBefore && reason != StateFailure::ConcurrencyLimit)
+    wait.admittedBefore = admissions_;
   const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
   wait.reason = reason;
   wait.allocationFailure = denial.allocationFailure;
@@ -801,13 +816,23 @@ void Engine::deferResourceRetry(Request &active, double now,
   wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
 }
 
+void Engine::deferWait(Request &active) noexcept {
+  ResourceWait kept;
+  if (active.refusedMemory) {
+    kept.startedMilliseconds = active.resourceWait.startedMilliseconds;
+    kept.admittedBefore = active.resourceWait.admittedBefore;
+  }
+  active.resourceWait = kept;
+}
+
 double Engine::resourceDeadline(const Request &active) const noexcept {
   const ResourceWait &wait = active.resourceWait;
   if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
     return 0.0;
-  // The limit restarts whenever a lane submitted before the request works,
-  // however long that takes. Later lanes do not extend it: requests that
-  // keep arriving would otherwise hold it until the request's deadline.
+  // The limit restarts whenever a lane submitted before the request, or
+  // admitted before it was refused memory or suspended, works, however long
+  // that takes. Other lanes do not extend it: requests that keep arriving
+  // would otherwise hold it until the request's deadline.
   return std::max(wait.deadlineMilliseconds,
                   wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
@@ -1355,6 +1380,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now, {.allocationFailure = failure});
+  // Without its lane it waits for the memory of every lane resident now,
+  // also those admitted while it waited to grow.
+  active.resourceWait.admittedBefore = admissions_;
   ++counters_.resourceSuspensions;
 }
 

@@ -128,9 +128,14 @@ private:
     // What refused the memory at the latest attempt.
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
+    // The admissions counted when the request was first refused memory, and
+    // again when it is suspended: the lanes admitted up to then hold memory
+    // it waits for. A wait for a lane does not record it.
+    std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
-    // The latest tick at which a lane submitted before the request had work
-    // in flight; the limit restarts from it.
+    // The latest tick at which a lane submitted before the request, or one
+    // that admittedBefore counts, had work in flight; the limit restarts from
+    // it.
     double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
@@ -149,6 +154,10 @@ private:
     // Its place in submission order. Earlier requests' lanes hold memory it
     // may wait for, so their work restarts its resource wait's limit.
     uint64_t sequence = 0;
+    // The admissions counted when admit() last gave it a state cell
+    // (admissions_). Lanes admitted before a request was refused memory or
+    // suspended restart its wait's limit too.
+    uint64_t admission = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
@@ -297,10 +306,15 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
+  // Waiting for scheduling or for a prefix does not consume the memory
+  // wait limit, so the wait's record is reset. A request that holds
+  // admission closed (Request::refusedMemory) keeps when its wait began and
+  // which lanes were admitted before it was refused.
+  void deferWait(Request &request) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
-  // limit restarts whenever a lane submitted before the request has work in
-  // flight.
+  // limit restarts whenever a lane submitted before the request, or one
+  // ResourceWait::admittedBefore counts, has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
@@ -326,6 +340,9 @@ private:
   [[nodiscard]] bool drainingForRecovery() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  // The state cells admit() has obtained so far, including those it gave
+  // back when the attempt's pages were refused (Request::admission).
+  uint64_t admissions_ = 0;
   uint64_t resourceEpoch_ = 1;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.

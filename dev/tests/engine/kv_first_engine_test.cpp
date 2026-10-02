@@ -2352,6 +2352,64 @@ void testLaterLanesDoNotExtendAResourceWait() {
   require(engine.idle() && executor.requests.empty(), "the resource wait leaked a request");
 }
 
+// The scheduler admits the shortest prompt first, so a request submitted
+// later can start in the pass that refuses an earlier one memory, also once
+// both have waited for a free lane. Admitted before the refusal, that lane
+// holds memory the wait is for: its work restarts the wait's limit, and the
+// limit runs out only once it is gone.
+void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
+  for (const bool lanesFull : {false, true}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 330; };
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 50;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    // Lanes in every cell: both requests wait for one until they are
+    // cancelled.
+    const uint64_t occupants = lanesFull ? model::ExecutionLimits::maximumBatchWidth : 0;
+    for (uint64_t id = 1; id <= occupants; ++id) {
+      auto occupant = request(id, {static_cast<uint32_t>(id)});
+      occupant.maxNewTokens = 1000;
+      engine.submit(std::move(occupant));
+    }
+    tickUntil(engine, now, [&] { return executor.requests.size() == occupants; },
+              "the occupying lanes did not start");
+    engine.submit(request(330, std::vector<uint32_t>(1025, 330)));
+    auto later = request(331, {331});
+    later.maxNewTokens = 1000;
+    engine.submit(std::move(later));
+    if (lanesFull) {
+      tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).concurrency == 2; },
+                "the requests did not wait for a lane");
+      for (uint64_t id = 1; id <= occupants; ++id)
+        engine.cancel(id);
+    }
+    tickUntil(engine, now, [&] { return executor.requests.contains(331); },
+              "the later request did not start");
+    require(!executor.requests.contains(330) && engine.resourceWaitSnapshot(now).memory == 1,
+            "the later request did not start in the pass that refused the first");
+    for (const double end = now + 300; now < end;)
+      static_cast<void>(engine.tick(now += 10));
+    require(events.failedCount == 0,
+            "a lane admitted before the refusal did not hold the wait open");
+    engine.cancel(331);
+    const double cancelledAt = now;
+    while (!events.failedCount && now < cancelledAt + 1000)
+      static_cast<void>(engine.tick(now += 10));
+    require(now <= cancelledAt + 70 &&
+                events.failures == std::vector<std::string>{"resource_timeout"},
+            "the wait did not expire once the lane admitted before it was gone");
+  }
+}
+
 void testSingletonHostPressureWaitRecoversOrTerminates() {
   for (uint32_t outcome = 0; outcome < 4; ++outcome) {
     test::TestKvStorage storage(32, 4096, 4);
@@ -6280,6 +6338,66 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
           "the lane did not run on its prefix after the command");
 }
 
+// A lane waits to grow into pages whose demotion is in flight, and a request
+// admitted meanwhile starts and decodes. Once the pages land the waiting
+// lane still lacks one and is suspended. The later lane was resident at its
+// suspension and holds memory its resume waits for: while it works, the
+// wait's limit restarts, and once it finishes the suspended lane resumes.
+void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
+  test::TestKvStorage storage(16, 4096, 4);
+  storage.budgetPages = 8;
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({.maxContext = 102400, .resourceWaitTimeoutMilliseconds = 50}, cache,
+                        executor, events);
+  guardReleases(storage, engine);
+  // Cached blocks under states on disk take the first extent, whose pages
+  // come back only once their copies are written.
+  for (uint64_t id = 900; id < 904; ++id) {
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    demoteState(cache, cache.publishCommittedBlocks(
+                           id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+    cache.endRequest(id);
+  }
+  // Request 1's first command needs seven of the eight pages; its last needs
+  // all eight.
+  engine.submit(request(1, std::vector<uint32_t>(225, 1)));
+  double now = 1;
+  static_cast<void>(engine.tick(now++));
+  require(executor.requests.contains(1) && tier.inFlight() != 0 && executor.prefillRows == 0,
+          "the lane did not wait for the pages being demoted");
+  // Request 2 takes two of the pages left free.
+  auto later = request(2, std::vector<uint32_t>(40, 2));
+  later.maxNewTokens = 1000;
+  engine.submit(std::move(later));
+  tickUntil(engine, now, [&] { return events.emitted != 0; },
+            "the later request did not run beside the waiting lane");
+  require(tier.inFlight() != 0 && executor.prefillRows == 40 && executor.suspensions == 0,
+          "the waiting lane ran or yielded before its pages landed");
+  for (uint32_t step = 0; step < 100 && !executor.suspensions; ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(now++));
+  }
+  require(executor.suspensions == 1 && executor.prefillRows == 40,
+          "the waiting lane was not suspended once the pages landed");
+  for (const double end = now + 400; now < end;) {
+    static_cast<void>(engine.tick(now += 10));
+    require(events.failedCount == 0 && engine.snapshot().resourceResumptions == 0,
+            "a lane resident at a suspension did not hold the wait open");
+  }
+  executor.decodeFinishes = true;
+  tickUntil(engine, now, [&] { return engine.idle(); }, "engine did not reach idle");
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              engine.snapshot().resourceResumptions == 1,
+          "the suspended lane did not resume once the lane beside it finished");
+}
+
 // A restoring lane whose pages are all held by a resident lane waits for
 // that lane instead of giving up its prefix or failing for capacity.
 void testRestoringLaneWaitsForResidentLanes() {
@@ -6912,6 +7030,7 @@ int main() {
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
     testLimitOutlivedByProgressDoesNotWakeTheLoop();
+    testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
@@ -6984,6 +7103,7 @@ int main() {
     testSingletonHostPressureWaitRecoversOrTerminates();
     testAdmissionWaitsOutEarlierLanes();
     testLaterLanesDoNotExtendAResourceWait();
+    testLaneAdmittedBeforeARefusalHoldsTheWaitOpen();
     testKvPressureNarrowsTheRealBatch();
     testKvGrowthReclaimsCachedStateWhenBudgetIsShared();
     testRequiredWorkDoesNotReserveAnExtraPage();
