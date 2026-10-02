@@ -1979,6 +1979,44 @@ void testRequestInServiceGrowsThroughTheHostPause() {
           "the paused request did not take the idle cached pages first");
 }
 
+// A lane short of pages under the pause keeps the pooled buffers the next
+// lane starts from. Releasing them would not let it grow: the host refuses
+// its ordinary attempt all the same, and it grows as a request in service.
+void testPausedPageShortfallKeepsTheLaneRunway() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  // The finished lane's buffers wait in the pool for the next one.
+  executor.pooledLaneBytes = 4096;
+  executor.decodeFinishes = false;
+  auto running = request(2, std::vector<uint32_t>(65, 2));
+  running.maxNewTokens = 400;
+  running.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(running));
+  double now = 1;
+  while (now < 100 && events.outputs[2].empty())
+    static_cast<void>(engine.tick(now++));
+  require(!events.outputs[2].empty(), "the request did not start decoding");
+
+  host.paused = true;
+  while (now < 2000 && events.completedCount < 2)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              !host.reusableAtGrowth.empty(),
+          "the request did not grow through the host pause");
+  require(executor.pooledLaneBytes == 4096 && executor.keptLane,
+          "a page shortfall under the pause released the next lane's buffers");
+}
+
 // With nothing in service, the first request starts through the pause: its
 // lane and its pages grow. A request that arrives beside it waits for the
 // host without evicting anything, and starts once the first has finished.
@@ -5959,6 +5997,7 @@ int main() {
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
     testRequestInServiceGrowsThroughTheHostPause();
+    testPausedPageShortfallKeepsTheLaneRunway();
     testFirstRequestStartsThroughTheHostPause();
     testRequestThatNeedsNoGrowthStartsUnderTheHostPause();
     testSuspendedRequestWaitsForTheHostBesideOneInService();

@@ -1243,8 +1243,11 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
 // otherwise it survives for later hits, and the request grows if it is in
 // service and waits if it is not. A reclaim that must wait for the transfer
 // in flight makes the request wait with it, as it does without the pause.
+// Idle model state goes first, but not the pooled buffers the next lane
+// starts from: they would not let this request grow, and the paced pass
+// keeps them for the next one.
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission) {
-  if (reclaimIdleState(false))
+  if (reclaimIdleState(true))
     return {true, 0};
   const KvPoolSnapshot pool = cache_.snapshot().pool;
   // Cached prefixes can also have active owners; those pages cannot be reused.
@@ -1253,14 +1256,8 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
     return {};
   const CacheReclaimResult reused =
       cache_.reclaimForPages(admission.additionalPages);
-  if (reused.madeProgress) {
-    // An evicted state parks its buffers in the model's pool; under pressure
-    // that memory goes back to the host now rather than waiting for the
-    // next background pass.
-    while (model_.reclaimIdleState(false)) {
-    }
+  if (reused.madeProgress)
     signalResourceProgress();
-  }
   return reused;
 }
 
