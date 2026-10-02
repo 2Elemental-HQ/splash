@@ -1311,6 +1311,69 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
   std::cout << "encoder_fits_its_images=PASS\n";
 }
 
+// A turn that ends in an image leaves its replay point inside it. The state
+// in RAM holds the image's rows: reclaim spares them while the state lives,
+// the next turn restores there and injects the last rows without the
+// encoder, and the hold ends with the state, leaving the rows an ordinary
+// cache entry.
+void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
+                                         metal::MetalBackend &backend) {
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+  const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
+  std::vector<uint32_t> prompt(128);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  // The image ends 8 rows past the page boundary at 64.
+  EngineRequest request = makeRequest(121, prompt, 1);
+  request.images = {{56, 16, 8, 8, 211, 499}};
+  request.imagePixels.resize(request.images.front().pixelBytes());
+  for (size_t index = 0; index < request.imagePixels.size(); ++index)
+    request.imagePixels[index] = static_cast<uint8_t>(index * 17 + 6);
+  const std::vector<uint32_t> pages = pageRange(120, 4);
+  const StateAdmission first = executor.begin(request.modelView());
+  require(first.granted(), "replay point image request was not admitted");
+  const std::array<uint32_t, 1> boundary{64};
+  executor.setDraftContextPlan(
+      request.id, planDraftContext(0, prompt.size(), std::nullopt, boundary));
+  prefillChunk(executor, request.id, *first.cell, 0, 0,
+               std::span<const uint32_t>(prompt).first(64), pages,
+               BatchCohort::Greedy, false);
+  std::shared_ptr<const CompositeState> replayPoint = executor.snapshot(request.id);
+  require(replayPoint != nullptr, "replay point snapshot failed");
+  executor.end(request.id);
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+  const model::ModelTelemetry held = executor.telemetry();
+  require(held.stateHeldImageBytes && held.imageRowsBytes == held.stateHeldImageBytes &&
+              !held.visionArenaBytes,
+          "reclaim took the image rows a replay point in RAM holds");
+
+  const uint64_t encodes = held.imageEncodes;
+  request.id = 122;
+  ModelRequest resumed = request.modelView();
+  resumed.restoredTokens = 64;
+  const StateAdmission next = executor.begin(resumed);
+  require(next.granted(), "the next turn was not admitted");
+  restoreActivePrefix(executor, request.id, prompt.size(), 64, replayPoint);
+  prefillChunk(executor, request.id, *next.cell, 64, 64,
+               std::span<const uint32_t>(prompt).subspan(64), pages,
+               BatchCohort::Greedy, true);
+  require(executor.telemetry().imageEncodes == encodes &&
+              !executor.telemetry().visionArenaBytes,
+          "resuming inside an image encoded it again");
+  executor.end(request.id);
+  replayPoint.reset();
+  require(!executor.telemetry().stateHeldImageBytes,
+          "the hold outlived the replay point");
+  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
+  }
+  require(!executor.telemetry().imageRowsBytes &&
+              backend.memoryStats().allocatedBytes == originalBytes,
+          "the rows outlived the replay point that held them");
+  std::cout << "replay_point_keeps_its_image_rows=PASS\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -1545,6 +1608,7 @@ int main(int argc, char **argv) {
       requireRefusedStartKeepsItsRows(executor, backend, model, allocationFault);
       requireReclaimTakesOneCacheUnit(executor, backend, model);
       requireEncoderFitsItsImages(executor, backend, model, allocationFault);
+      requireReplayPointKeepsItsImageRows(executor, backend);
     } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
@@ -1553,7 +1617,7 @@ int main(int argc, char **argv) {
       std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
                    " shared, suspended and injected rows, covered images, refused starts,"
-                   " one cache unit per reclaim)\n";
+                   " one cache unit per reclaim, replay point rows)\n";
       return 0;
     }
 

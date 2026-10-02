@@ -305,6 +305,17 @@ struct Runtime::Impl {
   static constexpr uint64_t kEmbeddingCacheBytes = 512ULL * 1024 * 1024;
   std::list<std::shared_ptr<ImageRows>> embeddingCache;
   uint64_t embeddingCacheBytes = 0;
+  // A state in RAM that resumes inside an image, with the rows it needs: its
+  // boundary lies less than a page before the image's end, so a restore
+  // there injects the image's last rows. The pointer the cache keeps owns
+  // both, so the rows go with the state's RAM copy, which the cache drops
+  // when it evicts the state or writes it to disk. Held rows and the
+  // embedding cache together keep at most kEmbeddingCacheBytes of rows.
+  struct HeldState final {
+    std::shared_ptr<const CompositeState> state;
+    std::shared_ptr<ImageRows> rows;
+  };
+  std::vector<std::weak_ptr<const HeldState>> stateHolds;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
@@ -404,7 +415,8 @@ struct Runtime::Impl {
   }
 
   // Keeps encoded rows for reuse as the most recently used, dropping the
-  // least recently used beyond the cache's bytes.
+  // least recently used while the rows kept for reuse exceed the cache's
+  // bytes.
   void retain(const std::shared_ptr<ImageRows> &rows) {
     if (rows->cached) {
       embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
@@ -416,8 +428,60 @@ struct Runtime::Impl {
     embeddingCache.push_front(rows);
     rows->cached = embeddingCache.begin();
     embeddingCacheBytes += bytes;
-    while (embeddingCacheBytes > kEmbeddingCacheBytes)
+    while (!embeddingCache.empty() &&
+           embeddingCacheBytes + heldRowsBytes(true) > kEmbeddingCacheBytes)
       static_cast<void>(uncache(std::prev(embeddingCache.end())));
+  }
+
+  // The bytes of the distinct rows states in RAM hold: all of them, or only
+  // those the embedding cache does not hold as well.
+  [[nodiscard]] uint64_t heldRowsBytes(bool uncachedOnly) const noexcept {
+    uint64_t bytes = 0;
+    for (auto hold = stateHolds.begin(); hold != stateHolds.end(); ++hold) {
+      const std::shared_ptr<const HeldState> held = hold->lock();
+      if (!held || (uncachedOnly && held->rows->cached))
+        continue;
+      const bool counted = std::any_of(
+          stateHolds.begin(), hold, [&](const std::weak_ptr<const HeldState> &earlier) {
+            const std::shared_ptr<const HeldState> other = earlier.lock();
+            return other && other->rows == held->rows;
+          });
+      if (!counted)
+        bytes += held->rows->embeddings.sizeBytes();
+    }
+    return bytes;
+  }
+
+  // A state in RAM whose boundary lies inside an image, less than a page
+  // before its end, holds the image's encoded rows, unless that would take
+  // the rows kept for reuse past the cache's bytes: the state returned owns
+  // them. Boundaries deeper inside an image keep only the embedding cache.
+  std::shared_ptr<const CompositeState>
+  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state) {
+    std::erase_if(stateHolds, [](const std::weak_ptr<const HeldState> &hold) {
+      return hold.expired();
+    });
+    const uint64_t boundary = states.metadata(entry.slot).lengths.targetTokens;
+    for (const ImageState &image : entry.images) {
+      // The chunk that ended at the boundary encoded the image it reached.
+      if (image.span.offset >= boundary || image.span.end() <= boundary)
+        continue;
+      if (image.span.end() - boundary >= kv::kPageTokens)
+        break;
+      const bool kept =
+          image.rows->cached ||
+          std::ranges::any_of(stateHolds, [&](const std::weak_ptr<const HeldState> &hold) {
+            const std::shared_ptr<const HeldState> held = hold.lock();
+            return held && held->rows == image.rows;
+          });
+      const uint64_t added = kept ? 0 : image.rows->embeddings.sizeBytes();
+      if (embeddingCacheBytes + heldRowsBytes(true) + added > kEmbeddingCacheBytes)
+        break;
+      auto held = std::make_shared<const HeldState>(HeldState{std::move(state), image.rows});
+      stateHolds.push_back(held);
+      return {held, held->state.get()};
+    }
+    return state;
   }
 
   // Drops one entry of the embedding cache and returns the bytes it held.
@@ -2480,7 +2544,11 @@ uint32_t Runtime::committedStateSlot(uint64_t requestId) {
 }
 
 std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
-  return impl_->states.snapshot(committedStateSlot(requestId));
+  std::shared_ptr<const CompositeState> state =
+      impl_->states.snapshot(committedStateSlot(requestId));
+  if (!state)
+    return state;
+  return impl_->holdStraddledRows(impl_->request(requestId), std::move(state));
 }
 
 uint64_t Runtime::snapshotBytes() const noexcept {
@@ -2906,6 +2974,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.warmIdleStateCells = impl_->states.idleCells();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
+  result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();

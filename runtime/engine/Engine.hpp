@@ -150,13 +150,14 @@ public:
   // (Cache::evictAll()). Otherwise it releases empty KV extents and reclaims
   // the cache one Cache::reclaimOne step at a time, in the order that step's
   // contract (Cache.hpp) gives, returning the buffers an evicted state handed
-  // back to the model's pool after each step. A pass counts only memory that
-  // leaves the engine: released KV extents, the caches and idle buffers the
-  // model returns; evicting a state frees nothing by itself. Pages whose
-  // copies are being written count toward the target. A warning pass keeps
-  // one lane's pooled buffers and one empty extent (keepServingFootprint).
-  // Requests waiting for memory retry after any step that freed some, kept
-  // or released.
+  // back to the model's pool after each step. While the target is still
+  // unmet, it then takes the image rows only evicted states held. A pass
+  // counts only memory that leaves the engine: released KV extents, the
+  // caches and idle buffers the model returns; evicting a state frees nothing
+  // by itself. Pages whose copies are being written count toward the target.
+  // A warning pass keeps one lane's pooled buffers and one empty extent
+  // (keepServingFootprint). Requests waiting for memory retry after any step
+  // that freed some, kept or released.
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is

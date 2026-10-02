@@ -1436,13 +1436,16 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   releaseIdle();
   // Caches the model can rebuild go only toward a byte target: a pass
   // without one keeps the embedding rows and the vision encoder.
-  while (targetUnmet()) {
-    const uint64_t cache =
-        model_.reclaimIdleState(keep, model::IdleMemory::BuffersThenCaches);
-    if (!cache)
-      break;
-    released += cache;
-  }
+  const auto reclaimModelCaches = [&] {
+    while (targetUnmet()) {
+      const uint64_t cache =
+          model_.reclaimIdleState(keep, model::IdleMemory::BuffersThenCaches);
+      if (!cache)
+        break;
+      released += cache;
+    }
+  };
+  reclaimModelCaches();
   if (directive.evictAllUnpinnedPrefixes) {
     const CacheReclaimResult evicted = cache_.evictAll();
     reclaimed = evicted.madeProgress;
@@ -1462,6 +1465,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
       releaseIdle();
     }
   }
+  // Image rows only an evicted state held are ordinary cache entries now.
+  reclaimModelCaches();
   if (released || reclaimed)
     signalResourceProgress();
   if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)

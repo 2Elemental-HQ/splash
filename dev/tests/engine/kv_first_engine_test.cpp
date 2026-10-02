@@ -39,6 +39,21 @@ public:
   uint64_t residentBytes() const noexcept override { return 0; }
 };
 
+// A state that holds rows its model can rebuild, as a replay point inside an
+// image holds that image's rows: once the cache drops the state, the rows
+// are one more of the model's cache units.
+class RowsHoldingState final : public CompositeState {
+public:
+  RowsHoldingState(std::vector<uint64_t> &cacheUnits, uint64_t rows)
+      : cacheUnits_(cacheUnits), rows_(rows) {}
+  ~RowsHoldingState() override { cacheUnits_.push_back(rows_); }
+  uint64_t bytes() const noexcept override { return 64; }
+
+private:
+  std::vector<uint64_t> &cacheUnits_;
+  uint64_t rows_;
+};
+
 struct OffloadControl {
   bool ready = false;
   bool released = false;
@@ -381,6 +396,8 @@ public:
     if (snapshotRoom && !snapshotRoom())
       return nullptr;
     ++snapshots;
+    if (stateHeldRows)
+      return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
     return std::make_shared<State>(evictedStateBytes);
   }
   // Without a cache slot the production model writes the lane's state to
@@ -518,6 +535,9 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
+  // Rows each state snapshotted from then on holds (RowsHoldingState); the
+  // executor must outlive the cache that keeps those states.
+  uint64_t stateHeldRows = 0;
   bool keptLane = false;
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
@@ -1868,6 +1888,30 @@ void testPressurePassKeepsCachesWithoutATarget() {
   require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
               targeted.releasedBytes >= 200,
           "a targeted pass did not stop taking caches at its target");
+}
+
+// Rows only a cached state held become a cache unit once a pass evicts that
+// state, and a pass whose target is still unmet takes them as well.
+void testPressurePassTakesTheRowsItsEvictionsLeave() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  Executor executor(1);
+  engine::Cache resources(pool, CacheNamespace{});
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.stateHeldRows = 100;
+  engine.submit(request(29, std::vector<uint32_t>(65, 29)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.entries == 1 && executor.cacheUnits.empty(),
+          "setup did not cache a state holding rows");
+  const MemoryReclaimResult critical =
+      engine.reclaimMemory({.reclaim = true,
+                            .evictAllUnpinnedPrefixes = true,
+                            .targetBytes = std::numeric_limits<uint64_t>::max()});
+  require(resources.snapshot().stateCache.entries == 0 && executor.cacheUnits.empty() &&
+              critical.releasedBytes >= 164,
+          "a critical pass left the rows of the state it evicted");
 }
 
 void testPressureReclaimRespectsStateLifetimes() {
@@ -8343,6 +8387,7 @@ int main() {
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
     testPressurePassKeepsCachesWithoutATarget();
+    testPressurePassTakesTheRowsItsEvictionsLeave();
     testWarningReclaimKeepsTheServingFootprint();
     testWarningReclaimCountsOnlyWhatReachesTheHost();
     testWarningReclaimWakesARefusedStart();

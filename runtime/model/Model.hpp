@@ -391,10 +391,12 @@ struct ModelTelemetry final {
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
   // The vision encoder's scratch while it exists, the encoded rows the
-  // embedding cache keeps for reuse, and every image's rows anything holds,
-  // each counted once.
+  // embedding cache keeps for reuse, those states in RAM hold to resume
+  // inside an image, and every image's rows anything holds, each counted
+  // once.
   uint64_t visionArenaBytes = 0;
   uint64_t embeddingCacheBytes = 0;
+  uint64_t stateHeldImageBytes = 0;
   uint64_t imageRowsBytes = 0;
   uint32_t lastDecodeWidth = 0;
   uint64_t lastDecodeFusedOperations = 0;

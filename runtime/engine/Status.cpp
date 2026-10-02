@@ -253,6 +253,7 @@ std::string runtimeStatusJson(
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
       << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
       << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
+      << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
       << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes
       << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
