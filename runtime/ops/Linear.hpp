@@ -279,19 +279,6 @@ public:
                           metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
                           uint32_t rows, LinearScratch scratch = {}) const;
 
-  PreparedInput addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                          metal::MetalBuffer output, LinearScratch scratch = {}) const;
-  PreparedInput addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-                               const Projection &projection, metal::MetalBuffer output, uint32_t lanes,
-                               LinearScratch scratch = {}, PreparedInput prepared = {}) const;
-  PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
-                               const Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
-                               uint32_t lanes, LinearScratch scratch = {}, PreparedInput prepared = {}) const;
-  PreparedInput addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input,
-                                 const Projection &projection, metal::MetalBuffer residual,
-                                 metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch = {},
-                                 PreparedInput prepared = {}) const;
-
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it
   // runs.

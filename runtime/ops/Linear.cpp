@@ -682,31 +682,5 @@ void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer
        .scratch = scratch},
       up, prefillPlan(up, rows, LinearEpilogue::UpWithGate));
 }
-PreparedInput Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                                metal::MetalBuffer output, LinearScratch scratch) const {
-  return add(graph, {.input = input, .output = output, .scratch = scratch}, p, decodePlan(p, 1));
-}
-PreparedInput Linear::addDecodeBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                                     metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch,
-                                     PreparedInput prepared) const {
-  return add(graph, {.input = input, .output = output, .scratch = scratch, .prepared = prepared}, p,
-             decodePlan(p, lanes));
-}
-PreparedInput Linear::addResidualBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                                       metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t lanes,
-                                       LinearScratch scratch, PreparedInput prepared) const {
-  return add(graph,
-             {.input = input, .output = output, .residual = residual, .scratch = scratch, .prepared = prepared},
-             p, decodePlan(p, lanes, LinearEpilogue::Residual));
-}
-PreparedInput Linear::addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
-                                     const Projection &up, metal::MetalBuffer gateScratch,
-                                     metal::MetalBuffer output, uint32_t lanes, LinearScratch scratch,
-                                     PreparedInput prepared) const {
-  return add(graph,
-             {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch,
-              .prepared = prepared},
-             up, decodePlan(up, lanes, LinearEpilogue::GateUp, &gate), &gate);
-}
 
 } // namespace splash::ops
