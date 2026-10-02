@@ -100,12 +100,13 @@ void baselinePlans() {
       const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
-        const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout, histories);
+        const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout,
+                                                    std::span(histories).first(lanes));
         require(selected.splits == 32, "verify baseline changed");
         covers(stride, selected.workspace, lanes, attentionFields);
       }
       {
-        const std::array<uint32_t, 4> deep{131072, 0, 0, 0};
+        const std::array<uint32_t, 1> deep{131072};
         const auto scaled = plans.verifyAttention(1, queryHeads, kvLayout, deep);
         require(scaled.splits == kv::kQ8VerifyMaximumSplits &&
                     scaled.laneSplits[0] == scaled.splits,
@@ -241,9 +242,11 @@ void ggufMoePlans() {
 void workspaceBounds() {
   const ExecutionPlans plans(device());
   const std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
-  const auto padded = plans.verifyAttention(3, 24, attentionShapes[0].layout, histories);
-  require(padded.laneSplits[3] == 0 && padded.splits == kv::q8VerifyAttentionSplits(2049, 8),
-          "padded inactive lookup history was not ignored");
+  rejects([&] { (void)plans.verifyAttention(3, 24, attentionShapes[0].layout, histories); });
+  const auto exact =
+      plans.verifyAttention(3, 24, attentionShapes[0].layout, std::span(histories).first(3));
+  require(exact.laneSplits[3] == 0 && exact.splits == kv::q8VerifyAttentionSplits(2049),
+          "verify policy did not resolve one history per lane");
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
                   uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 256 * 4 &&
@@ -275,7 +278,7 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.verifyAttention(0, 24, kvLayout, histories); });
   rejects([&] { (void)plans.verifyAttention(UINT32_MAX, 24, kvLayout, histories); });
   rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); });
-  rejects([&] { (void)plans.verifyAttention(1, 24, {}, histories); });
+  rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); });
   rejects([&] { (void)plans.prefillAttention(1, 24, {}); });
   rejects([&] { (void)plans.prefillAttentionWorkspace(0, 24, kvLayout); });
   rejects([&] { (void)plans.prefillAttentionWorkspace(UINT32_MAX, 24, kvLayout); });

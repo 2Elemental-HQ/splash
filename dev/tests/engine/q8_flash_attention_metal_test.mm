@@ -45,36 +45,17 @@ void require(bool condition, const char *message) {
 }
 
 void testContract() {
-  Q8VerifyAttentionParams finalCycle{
-      splash::kv::kMaximumLogicalTokens - 1,
-      splash::kv::kQ8VerifyMaximumRows,
-      32,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens,
-      {},
-      kQ8VerifySplits,
-      kQ8VerifySplits};
-  require(q8VerifyAttentionValidationError(finalCycle).empty(),
+  Q8ChunkedPrefillParams finalCycle{
+      splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
+      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
+  require(chunkedPrefillValidationError(finalCycle).empty(),
           "final fixed-eight verification rows exceeded physical KV scratch");
-  Q8VerifyAttentionParams scaled = finalCycle;
-  scaled.split_count = kQ8VerifyMaximumSplits;
-  scaled.slot_splits = kQ8VerifyMaximumSplits;
-  require(q8VerifyAttentionValidationError(scaled).empty(),
-          "maximum verify split count was rejected");
-  ++scaled.split_count;
-  ++scaled.slot_splits;
-  require(q8VerifyAttentionValidationError(scaled) == "split_count_invalid",
-          "split count above the workspace maximum was accepted");
-  scaled = finalCycle;
-  scaled.slot_splits = scaled.split_count - 1;
-  require(q8VerifyAttentionValidationError(scaled) == "slot_splits_invalid",
-          "slot stride below the lane's split count was accepted");
-  require(q8VerifyAttentionSplits(0, 8) == kQ8VerifySplits &&
-              q8VerifyAttentionSplits(16 * 1024, 8) == kQ8VerifySplits + 1 &&
-              q8VerifyAttentionSplits(131072, 8) == kQ8VerifyMaximumSplits,
+  require(q8VerifyAttentionSplits(0) == kQ8VerifySplits &&
+              q8VerifyAttentionSplits(16 * 1024) == kQ8VerifySplits + 1 &&
+              q8VerifyAttentionSplits(131072) == kQ8VerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
   ++finalCycle.committed_tokens;
-  require(q8VerifyAttentionValidationError(finalCycle) ==
-              "context_out_of_range",
+  require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its fixed seven-row allowance");
 }
 

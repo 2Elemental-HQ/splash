@@ -206,8 +206,6 @@ public:
       firstPage += plan_.pages[lane];
       tables_[lane] = buffer(AttentionFixturePlan::table(lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride, plan_.pages[lane], {}};
-      attention_[lane] = kv::q8VerifyAttentionParams(
-          plan_.histories[lane], kv::kQ8VerifyMaximumRows, plan_.stride, plan_.pages[lane]);
     }
     for (uint32_t lane = plan_.lanes; lane < AttentionFixturePlan::kMaximumLanes; ++lane)
       tables_[lane] = tables_[0];
@@ -291,8 +289,7 @@ public:
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
          buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
-        std::span(stores_).first(attention.lanes), std::span(attention_).first(attention.lanes),
-        attention);
+        std::span(stores_).first(attention.lanes), attention);
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }
@@ -336,7 +333,6 @@ private:
   std::array<std::vector<uint32_t>, AttentionFixturePlan::kMaximumLanes> pageIds_;
   std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables_{};
   std::array<kv::Q8ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> stores_{};
-  std::array<kv::Q8VerifyAttentionParams, AttentionFixturePlan::kMaximumLanes> attention_{};
 };
 
 } // namespace splash::ops::tuning

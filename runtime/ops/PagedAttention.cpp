@@ -104,8 +104,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
-  if (historyTokens.size() != lanes &&
-      historyTokens.size() != SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (historyTokens.size() != lanes)
     throw std::invalid_argument("invalid verify attention history vector");
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
@@ -114,8 +113,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
         kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
-    laneSplits[lane] = kv::q8VerifyAttentionSplits(historyTokens[lane],
-                                                   kv::kQ8VerifyMaximumRows);
+    laneSplits[lane] = kv::q8VerifyAttentionSplits(historyTokens[lane]);
     splits = std::max(splits, laneSplits[lane]);
   }
   return {lanes, laneSplits, splits,
@@ -311,16 +309,12 @@ void PagedAttention::addPrefill(
             params, plan.reduceGroups);
 }
 
-void PagedAttention::addVerify(
-    metal::CommandGraph &graph, SplashKvLayer layer,
-    PagedVerifyBuffers buffers,
-    std::span<const kv::Q8ChunkedPrefillParams> storeParams,
-    std::span<const kv::Q8VerifyAttentionParams> attentionParams,
-    const VerifyAttentionPlan &plan) {
-  const uint32_t lanes = plan.lanes;
+void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
+                               PagedVerifyBuffers buffers,
+                               std::span<const kv::Q8ChunkedPrefillParams> chunks,
+                               const VerifyAttentionPlan &plan) {
   constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-  if (storeParams.size() != lanes || attentionParams.size() != lanes ||
-      buffers.pageTables.size() != maximumLanes) {
+  if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
   }
   if (buffers.partials.sizeBytes() < plan.workspace.partialsBytes ||
@@ -328,32 +322,19 @@ void PagedAttention::addVerify(
     throw std::invalid_argument(
         "verify attention scratch is smaller than its bound");
   }
+  // prefillParams validated each chunk, and the plan scaled each lane's
+  // split count from the same committed history; every lane's partials use
+  // the plan-wide slot stride.
   std::array<kv::Q8ChunkedPrefillParams, maximumLanes> stores{};
   std::array<kv::Q8VerifyAttentionParams, maximumLanes> attention{};
-  std::copy(storeParams.begin(), storeParams.end(), stores.begin());
-  std::copy(attentionParams.begin(), attentionParams.end(), attention.begin());
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const auto storeError = kv::chunkedPrefillValidationError(stores[lane]);
-    const auto attentionError =
-        kv::q8VerifyAttentionValidationError(attention[lane]);
-    if (!storeError.empty() || !attentionError.empty() ||
-        stores[lane].chunk_tokens != kv::kQ8VerifyMaximumRows ||
-        stores[lane].committed_tokens != attention[lane].committed_tokens ||
-        stores[lane].chunk_stride != attention[lane].chunk_stride ||
-        stores[lane].page_table_entries != attention[lane].page_table_entries ||
-        stores[lane].chunk_stride != stores[0].chunk_stride)
-      throw std::invalid_argument("inconsistent paged verify lane parameters");
-    // The plan scaled each lane's split count from this same committed
-    // history; every lane's partials use the plan-wide slot stride.
-    attention[lane].split_count = plan.laneSplits[lane];
-    attention[lane].slot_splits = plan.splits;
-    if (attention[lane].split_count !=
-        kv::q8VerifyAttentionSplits(attention[lane].committed_tokens,
-                                    kv::kQ8VerifyMaximumRows))
-      throw std::invalid_argument("paged verify lane history does not match plan");
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
+    const kv::Q8ChunkedPrefillParams &chunk = chunks[lane];
+    stores[lane] = chunk;
+    stores[lane].kv = layer;
+    attention[lane] = {chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
+                       chunk.page_table_entries, layer, plan.laneSplits[lane],
+                       plan.splits};
   }
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    stores[lane].kv = attention[lane].kv = layer;
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],

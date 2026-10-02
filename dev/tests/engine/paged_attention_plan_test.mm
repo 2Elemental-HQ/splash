@@ -83,7 +83,7 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
 
 void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string geometrySuffix = layout.kvHeads == 4 ? "" : "_kv2_g8";
-  const std::array<uint32_t, 4> zeroHistory{};
+  const std::array<uint32_t, 1> zeroHistory{};
   const std::string prefillSplit = std::string(layout.format == kv::Format::Int8
       ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") + geometrySuffix;
   const std::string prefillReduce = "prefill_attention_q8_reduce" + geometrySuffix;
@@ -115,12 +115,13 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string verifyReduce = "verify_attention_q8_reduce" + geometrySuffix;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
-    const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories);
+    const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
+                                                      std::span(histories).first(lanes));
     require(plan.splitPipeline == verifySplit && plan.reducePipeline == verifyReduce,
             "verify plan runs the wrong pipelines");
     uint32_t maximum = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint32_t expected = kv::q8VerifyAttentionSplits(histories[lane], 8);
+      const uint32_t expected = kv::q8VerifyAttentionSplits(histories[lane]);
       require(plan.laneSplits[lane] == expected && expected >= kv::kQ8VerifySplits &&
                   expected <= kv::kQ8VerifyMaximumSplits,
               "verify lane split count does not follow its own history");
@@ -149,16 +150,14 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, two);
   });
   rejects([&] {
+    const std::array<uint32_t, 4> padded{};
+    (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, padded);
+  });
+  rejects([&] {
     const std::array<uint32_t, 1> beyond{kv::kMaximumPhysicalTokens};
     (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, beyond);
   });
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); });
-  kv::Q8VerifyAttentionParams params{0, 8, 32, 1, {}, 0, 0};
-  require(kv::q8VerifyAttentionValidationError(params) == "split_count_invalid",
-          "zero split count is not a supported configuration");
-  params = {0, 8, 32, 1, {}, 32, 16};
-  require(kv::q8VerifyAttentionValidationError(params) == "slot_splits_invalid",
-          "a slot stride below the split count is not a valid partition");
 }
 
 // The attention layer under test is the second of a pool's two, so its region
@@ -180,7 +179,6 @@ struct Case final {
   // Each lane's page ids, which its table holds as entries.
   std::array<std::vector<uint32_t>, 4> pages;
   std::array<kv::Q8ChunkedPrefillParams, 4> stores{};
-  std::array<kv::Q8VerifyAttentionParams, 4> attention{};
 
   uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                       uint32_t dimension) const {
@@ -250,7 +248,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                                             spread.extentPages * spread.extents, 1)
                       : HostKvExtents(backend, poolLayout, spread.extentPages,
                                             spread.extents),
-            {}, {}, {}, {}, {}, {}, {}, {}};
+            {}, {}, {}, {}, {}, {}, {}};
   data.layer = data.pool.layer(kLayer);
   data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride * 256 * 2);
   data.values = allocate(backend, data.keys.sizeBytes());
@@ -264,10 +262,6 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] = {historyLengths[lane], rows, data.stride,
                          pageCounts[lane], {}};
-    data.attention[lane] = {historyLengths[lane], rows, data.stride,
-                            pageCounts[lane], {}, 32, 32};
-    if (verify)
-      data.attention[lane].active_rows = std::array{8U, 1U, 3U, 7U}[lane];
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
       const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
@@ -332,8 +326,6 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
   selectedRows.erase(std::unique(selectedRows.begin(), selectedRows.end()), selectedRows.end());
   for (uint32_t lane = 0; lane < data.lanes; ++lane) {
     for (uint32_t row : selectedRows) {
-      if (row >= data.attention[lane].active_rows)
-        continue;
       for (uint32_t head : {0U, data.queryHeads - 1}) {
         const uint32_t kvHead = head / (data.queryHeads / data.layout.kvHeads);
         const uint32_t tokens = data.stores[lane].committed_tokens + row + 1;
@@ -474,9 +466,9 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     if constexpr (prefill)
       return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
     else {
-      std::array<uint32_t, 4> histories{};
+      std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
-        histories[lane] = data.attention[lane].committed_tokens;
+        histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
                                             histories);
     }
@@ -501,9 +493,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     } else {
       ops::PagedVerifyBuffers buffers{data.keys, data.values, data.queries,
                                       partialBuffer, statisticsBuffer, output, data.tables};
-      ops::PagedAttention::addVerify(
-          graph, data.layer, buffers, std::span(data.stores).first(plan.lanes),
-          std::span(data.attention).first(plan.lanes), plan);
+      ops::PagedAttention::addVerify(graph, data.layer, buffers,
+                                     std::span(data.stores).first(plan.lanes), plan);
     }
   };
   if (testBounds) {
@@ -577,13 +568,6 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
               "attention scratch/output write canary changed");
   }
   const auto *values = static_cast<const uint16_t *>(output.contents());
-  if constexpr (!prefill)
-    for (uint32_t lane = 0; lane < data.lanes; ++lane)
-      for (uint32_t row = data.attention[lane].active_rows; row < data.rows; ++row)
-        for (uint32_t head = 0; head < data.queryHeads; ++head)
-          for (uint32_t dimension = 0; dimension < 256; ++dimension)
-            require(values[data.queryIndex(lane, head, row, dimension)] == 0,
-                    "inactive verify rows were not zeroed");
   return {values, values + output.sizeBytes() / 2};
 }
 

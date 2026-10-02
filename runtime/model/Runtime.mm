@@ -1409,7 +1409,6 @@ struct Runtime::Impl {
     };
 
     std::array<Q8ChunkedPrefillParams, kLaneCount> q8{};
-    std::array<kv::Q8VerifyAttentionParams, kLaneCount> verify{};
     const uint32_t gdnLayers = geometry.target.stateLayout.layers;
     const uint32_t attentionLayers =
         geometry.target.kvLayout.attentionLayers;
@@ -1446,15 +1445,9 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
+    for (uint32_t lane = 0; lane < lanes; ++lane)
       q8[lane] = q8Params(items[lane].logicalPosition, kDecodeRows, kTileRows,
                           items[lane].pageTable);
-      verify[lane] = kv::q8VerifyAttentionParams(
-          q8[lane].committed_tokens, q8[lane].chunk_tokens,
-          q8[lane].chunk_stride, q8[lane].page_table_entries);
-      if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
-        throw std::invalid_argument("invalid batched KV verify geometry");
-    }
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
@@ -1479,8 +1472,7 @@ struct Runtime::Impl {
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
-                          std::span(q8).first(lanes),
-                          std::span(verify).first(lanes), lanes, stats);
+                          std::span(q8).first(lanes), lanes, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,

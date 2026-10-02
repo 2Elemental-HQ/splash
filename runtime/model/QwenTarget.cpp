@@ -217,8 +217,7 @@ struct QwenTarget::VerifyStep {
   metal::CommandGraph &graph;
   const QwenTargetVerifyBuffers &buffers;
   std::span<const SplashKvLayer> kvLayers;
-  std::span<const kv::Q8ChunkedPrefillParams> q8;
-  std::span<const kv::Q8VerifyAttentionParams> verify;
+  std::span<const kv::Q8ChunkedPrefillParams> chunks;
   uint32_t lanes;
   uint32_t rows;
   ops::LinearDispatchStats &stats;
@@ -388,11 +387,9 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
     std::span<const SplashKvLayer> kvLayers,
-    std::span<const kv::Q8ChunkedPrefillParams> q8,
-    std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
+    std::span<const kv::Q8ChunkedPrefillParams> chunks, uint32_t lanes,
     ops::LinearDispatchStats &stats) const {
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
-      q8.size() != lanes || verify.size() != lanes ||
+  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
       buffers.gdnMixed.size() != geometry_.stateLayout.layers ||
@@ -405,9 +402,10 @@ void QwenTarget::addVerify(
   const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> histories{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    histories[lane] = verify[lane].committed_tokens;
-  VerifyStep step{graph, buffers, kvLayers, q8, verify, lanes, rows, stats,
-                  operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout, histories)};
+    histories[lane] = chunks[lane].committed_tokens;
+  VerifyStep step{graph, buffers, kvLayers, chunks, lanes, rows, stats,
+                  operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
+                                             std::span(histories).first(lanes))};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
@@ -470,7 +468,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
                                   b.attentionStatistics, b.fullAttention, b.pageTables},
-                                 step.q8, step.verify, step.attention);
+                                 step.chunks, step.attention);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, tileRows, tileRows,
       geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, b.linearScratch,

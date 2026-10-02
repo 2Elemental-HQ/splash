@@ -287,8 +287,7 @@ public:
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> q8,
-      std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
+      std::span<const kv::Q8ChunkedPrefillParams> chunks, uint32_t lanes,
       ops::LinearDispatchStats &stats) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.

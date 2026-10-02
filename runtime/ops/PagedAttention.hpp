@@ -29,57 +29,28 @@ static_assert(std::is_standard_layout_v<Q8PrefillAttentionParams>);
 static_assert(std::is_trivially_copyable_v<Q8PrefillAttentionParams>);
 
 inline constexpr uint32_t kQ8VerifyMaximumRows = SPLASH_TARGET_VERIFY_ROWS;
-inline constexpr uint32_t kQ8VerifySplits = SPLASH_VERIFY_ATTENTION_SPLITS;
 inline constexpr uint32_t kQ8VerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
-inline constexpr uint32_t kQ8VerifyPagesPerSplit =
-    SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT;
-static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits);
-static_assert(kQ8VerifyPagesPerSplit >= 1);
+// Verify attention runs one split per kQ8VerifyPagesPerSplit visible Page32
+// blocks, at least kQ8VerifySplits and at most the maximum that sizes the
+// partial workspace (q8VerifyAttentionSplits).
+inline constexpr uint32_t kQ8VerifySplits = 32;
+inline constexpr uint32_t kQ8VerifyPagesPerSplit = 16;
+static_assert(kQ8VerifySplits <= kQ8VerifyMaximumSplits);
 
 // One lane's verify split count: one split per kQ8VerifyPagesPerSplit
-// visible pages, never fewer than kQ8VerifySplits and never more than the
-// maximum the partial workspace is sized for. It depends only on the lane's
-// own history, so batching never changes a lane's arithmetic.
+// pages its history and verify rows fill, never fewer than kQ8VerifySplits
+// and never more than the maximum the partial workspace is sized for. It
+// depends only on the lane's own history, so batching never changes a
+// lane's arithmetic.
 [[nodiscard]] constexpr uint32_t
-q8VerifyAttentionSplits(uint32_t committedTokens, uint32_t activeRows) noexcept {
-  const uint64_t visible = uint64_t{committedTokens} + activeRows;
+q8VerifyAttentionSplits(uint32_t committedTokens) noexcept {
+  const uint64_t visible = uint64_t{committedTokens} + kQ8VerifyMaximumRows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
       (pages + kQ8VerifyPagesPerSplit - 1) / kQ8VerifyPagesPerSplit;
   return static_cast<uint32_t>(std::min<uint64_t>(
       std::max<uint64_t>(kQ8VerifySplits, scaled), kQ8VerifyMaximumSplits));
-}
-
-// Default parameters; the verify plan sets both split counts for each lane
-// and each layer's place in the extents before dispatch.
-[[nodiscard]] constexpr Q8VerifyAttentionParams
-q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
-                        uint32_t chunkStride, uint32_t pageTableEntries) noexcept {
-  return {committedTokens, activeRows, chunkStride, pageTableEntries,
-          {}, kQ8VerifySplits, kQ8VerifySplits};
-}
-
-[[nodiscard]] constexpr std::string_view q8VerifyAttentionValidationError(
-    const Q8VerifyAttentionParams &params) noexcept {
-  if (!params.active_rows || params.active_rows > kQ8VerifyMaximumRows)
-    return "active_rows_out_of_range";
-  if (params.chunk_stride < params.active_rows ||
-      params.chunk_stride % kPageTokens)
-    return "chunk_stride_invalid";
-  const uint64_t visible =
-      uint64_t{params.committed_tokens} + params.active_rows;
-  if (visible > kMaximumPhysicalTokens)
-    return "context_out_of_range";
-  const uint64_t requiredPages = (visible + kPageTokens - 1) / kPageTokens;
-  if (params.page_table_entries < requiredPages)
-    return "page_table_too_short";
-  if (!params.split_count || params.split_count > kQ8VerifyMaximumSplits)
-    return "split_count_invalid";
-  if (params.slot_splits < params.split_count ||
-      params.slot_splits > kQ8VerifyMaximumSplits)
-    return "slot_splits_invalid";
-  return {};
 }
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows =
@@ -201,7 +172,7 @@ public:
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
   // historyTokens holds each lane's committed tokens before its verify rows,
-  // sized to the batch width or to the maximum width with inactive lanes zero.
+  // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens);
@@ -272,12 +243,12 @@ public:
                          metal::MetalBuffer pageTable,
                          const kv::Q8ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
-  static void
-  addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
-            PagedVerifyBuffers buffers,
-            std::span<const kv::Q8ChunkedPrefillParams> storeParams,
-            std::span<const kv::Q8VerifyAttentionParams> attentionParams,
-            const VerifyAttentionPlan &plan);
+  // Stores each lane's chunk (prefillParams, one per plan lane) and attends
+  // its verify rows with the plan's split counts.
+  static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
+                        PagedVerifyBuffers buffers,
+                        std::span<const kv::Q8ChunkedPrefillParams> chunks,
+                        const VerifyAttentionPlan &plan);
 };
 
 } // namespace splash::ops

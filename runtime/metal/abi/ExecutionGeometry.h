@@ -16,16 +16,11 @@
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u
 #define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
 #define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
-#define SPLASH_VERIFY_ATTENTION_SPLITS 32u
 // Draft attention deals the live ring tiles of one (lane, KV head)
 // round-robin to this many groups, the last of which also attends the eight
 // current rows. Fixed rather than derived from the GPU so the combine order,
 // and with it the rounding, is the same on every machine and lane count.
 #define SPLASH_DRAFT_ATTENTION_SPLITS 4u
-// Verify attention runs one split per this many visible Page32 blocks, at
-// least SPLASH_VERIFY_ATTENTION_SPLITS and at most the maximum that sizes the
-// partial workspace (kv::q8VerifyAttentionSplits).
-#define SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT 16u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole
