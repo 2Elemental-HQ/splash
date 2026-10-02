@@ -2,7 +2,6 @@
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
-#include "ops/PageStorage.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -401,10 +400,6 @@ void run(const std::string &metallib) {
       ++admissions;
     return result;
   };
-  constexpr kv::Layout kvLayout{16, 4, 256};
-  kv::PageStorage pageStorage(backend, governor.allocationAdmission(),
-                              kvLayout, kvLayout.extentAlignmentPages(),
-                              kvLayout.extentAlignmentPages());
   uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
   uint64_t observedStorageActual = 0;
   uint64_t observedLaneActual = 0;
