@@ -295,12 +295,12 @@ void testPublicationReleasesTheExtentItEmpties() {
   require(!resources.reclaimOneState(false, point, false) && storage.releasedExtents == 0 &&
               resources.snapshot().kvCache.blocks == 10,
           "a publication that cannot allocate released an extent or took KV");
-  StateRoom room = resources.reclaimOneState(false, point);
-  require(room && room.extent && storage.releasedExtents == 1 &&
+  StateRoom room = resources.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 1 &&
               resources.snapshot().kvCache.blocks == 10,
           "the publication did not release the empty extent first");
-  room = resources.reclaimOneState(false, point);
-  require(room && room.extent && storage.releasedExtents == 2 &&
+  room = resources.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 2 &&
               storage.allocatedPages() == 8 && resources.snapshot().kvCache.blocks == 8,
           "the publication took more KV than its extent or kept the extent it emptied");
   resources.endRequest(1);

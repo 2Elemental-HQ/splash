@@ -2306,6 +2306,10 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
   return impl_->states.snapshot(committedStateSlot(requestId));
 }
 
+uint64_t Runtime::snapshotBytes() const noexcept {
+  return impl_->states.layout().cachedBytes();
+}
+
 bool Runtime::canSnapshotToDisk() const noexcept {
   return impl_->states.canSnapshotToDisk();
 }

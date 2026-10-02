@@ -960,15 +960,20 @@ void Engine::publishReachedStateBoundaries(Request &active,
         // The command that reached this boundary is consumed and the next one
         // not yet submitted, so KV that empties an extent releases it now. A
         // recycled state hands over its buffers; an extent may hold less
-        // than a state, so room is made until the snapshot fits or nothing
-        // more of the class goes.
+        // than a state, so room is made until the snapshot fits, nothing
+        // more of the class goes, or the extents given cover one snapshot:
+        // a denial after that is not the budget's.
         if (!state) {
+          const bool growth = !growthPaused();
+          const uint64_t needed = model_.snapshotBytes();
+          uint64_t released = 0;
           StateRoom room;
           do {
-            room = cache_.reclaimOneState(checkpoint, block, !growthPaused());
+            room = cache_.reclaimOneState(checkpoint, block, growth);
+            released += room.extentBytes;
             if (room)
               state = model_.snapshot(active.request.id);
-          } while (!state && room.extent);
+          } while (!state && room.extentBytes && released < needed);
           if (state)
             ++counters_.recycledStatePublications;
         }

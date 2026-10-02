@@ -455,6 +455,8 @@ public:
   // retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
+  // The bytes one lane's state snapshot allocates.
+  [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
   // Whether the disk tier takes a state written from a lane: a tier exists
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
