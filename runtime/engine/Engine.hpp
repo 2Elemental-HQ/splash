@@ -167,9 +167,10 @@ private:
 
   struct Request final {
     struct StateBoundary final {
-      enum class Purpose : uint8_t { Checkpoint, Replay, Junction };
       uint32_t tokens = 0;
-      Purpose purpose = Purpose::Replay;
+      // A rolling checkpoint, the lane's own progress, retired when the next
+      // one lands; otherwise a state a later request resumes from.
+      bool disposable = false;
     };
 
     EngineRequest request;
@@ -264,6 +265,11 @@ private:
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  // Plans a state at `tokens`, past `after` and no later than the replay
+  // boundary, keeping the plan in order; a boundary planned both ways is
+  // reusable. True when it inserted one.
+  bool addStateBoundary(Request &request, uint32_t after, uint32_t tokens,
+                        bool disposable);
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;

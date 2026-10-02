@@ -865,70 +865,55 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     throw std::logic_error("request already has a composite-state plan");
   }
 
-  // The replay state is the last one planned: a lazy junction past it would
-  // lie inside the generation prompt, which a later request may not share.
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
-  const auto addCandidate = [&](uint32_t tokens,
-                                Request::StateBoundary::Purpose purpose) {
-    if (tokens <= stateBoundary || tokens > latestReplayBoundary)
-      return;
-    for (size_t index = 0; index < active.stateBoundaries.size(); ++index) {
-      if (active.stateBoundaries[index].tokens != tokens)
-        continue;
-      if (purpose > active.stateBoundaries[index].purpose)
-        active.stateBoundaries[index].purpose = purpose;
-      return;
-    }
-    active.stateBoundaries.push_back({tokens, purpose});
-  };
-
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
   if (const uint32_t interval = config_.prefillCheckpointTokens) {
     for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
-         boundary < latestReplayBoundary; boundary += interval) {
-      addCandidate(static_cast<uint32_t>(boundary),
-                   Request::StateBoundary::Purpose::Checkpoint);
-    }
+         boundary < latestReplayBoundary; boundary += interval)
+      addStateBoundary(active, stateBoundary, static_cast<uint32_t>(boundary), true);
   }
-  addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
-  addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
+  addStateBoundary(active, stateBoundary, junctionBoundary, false);
+  addStateBoundary(active, stateBoundary, latestReplayBoundary, false);
   // A resumed lane below its prompt's replay point lost that state; it
   // rebuilds the one its conversation's next turn resumes from on the way.
-  addCandidate(promptReplayBoundary(active), Request::StateBoundary::Purpose::Replay);
-  std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
-            [](const Request::StateBoundary &left,
-               const Request::StateBoundary &right) {
-              return left.tokens < right.tokens;
-            });
+  addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false);
 
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
   return pendingDraftStatePlan(active, stateBoundary);
+}
+
+bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
+                              bool disposable) {
+  // A state past the replay boundary would lie inside the generation prompt,
+  // which a later request may not share.
+  if (tokens <= after || tokens > replayStateBoundary(active))
+    return false;
+  const auto found = std::lower_bound(
+      active.stateBoundaries.begin() + active.stateBoundaryCursor,
+      active.stateBoundaries.end(), tokens,
+      [](const Request::StateBoundary &point, uint32_t value) {
+        return point.tokens < value;
+      });
+  if (found != active.stateBoundaries.end() && found->tokens == tokens) {
+    found->disposable = found->disposable && disposable;
+    return false;
+  }
+  active.stateBoundaries.insert(found, {tokens, disposable});
+  return true;
 }
 
 bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   if (active.suspended || active.replaying)
     return false;
   bool changed = false;
-  const uint32_t replay = replayStateBoundary(active);
   for (const auto &[id, peer] : requests_) {
     if (id == active.request.id || peer.stateCell || peer.suspended ||
         peer.finalized || peer.pendingEnd ||
         peer.request.priority < active.request.priority)
       continue;
-    const uint32_t shared = sharedPrefillBoundary(active, peer);
-    if (shared <= after || shared >= replay)
-      continue;
-    auto found = std::lower_bound(
-        active.stateBoundaries.begin(), active.stateBoundaries.end(), shared,
-        [](const auto &point, uint32_t tokens) { return point.tokens < tokens; });
-    if (found == active.stateBoundaries.end() || found->tokens != shared) {
-      active.stateBoundaries.insert(
-          found, {shared, Request::StateBoundary::Purpose::Junction});
-      changed = true;
-    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
-      found->purpose = Request::StateBoundary::Purpose::Junction;
-    }
+    changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false) ||
+              changed;
   }
   return changed;
 }
@@ -986,26 +971,26 @@ void Engine::publishReachedStateBoundaries(Request &active,
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
-    const bool checkpoint =
-        objective.purpose == Request::StateBoundary::Purpose::Checkpoint;
-    const bool junction =
-        objective.purpose == Request::StateBoundary::Purpose::Junction;
+    const bool checkpoint = objective.disposable;
+    // The conversation's next turn resumes from the prompt's replay point. A
+    // rebuilt replay point counts as a replay-state publication, not a
+    // junction.
+    const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
     uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
-                         : junction ? counters_.junctionMaterializationFailures
-                                    : counters_.replayStatePublicationFailures;
+                         : replay   ? counters_.replayStatePublicationFailures
+                                    : counters_.junctionMaterializationFailures;
     uint64_t &publications = checkpoint ? counters_.checkpointPublications
-                             : junction ? counters_.junctionMaterializations
-                                        : counters_.replayStatePublications;
+                             : replay   ? counters_.replayStatePublications
+                                        : counters_.junctionMaterializations;
     // The scheduler ends a command exactly at an armed boundary
     // (Scheduler::planPrefill).
     if (objective.tokens != promptProcessed)
       throw std::logic_error("prefill crossed an armed state boundary");
     materialized = true;
     const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-    // The conversation's next turn resumes here, whatever this boundary's
-    // purpose: the state is in use before any of the ways below keeps it,
-    // so each of them makes room as work in use.
-    if (objective.tokens == promptReplayBoundary(active))
+    // The state is in use before any of the ways below keeps it, so each of
+    // them makes room as work in use.
+    if (replay)
       active.replayPoint = cache_.useState(block);
     if (cache_.reuseCompositeState(block, checkpoint)) {
       ++counters_.deduplicatedStatePublications;

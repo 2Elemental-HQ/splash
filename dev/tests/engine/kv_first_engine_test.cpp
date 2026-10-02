@@ -910,6 +910,44 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
   }
 }
 
+// A sibling's shared boundary on one of the producer's checkpoints makes that
+// checkpoint a state the sibling resumes from: it is published as a junction
+// and outlives the producer's later progress instead of rolling with it.
+void testSharedJunctionAtACheckpointIsReusable() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  // The producer checkpoints at 4096; the sibling shares its first 4100
+  // tokens.
+  std::vector<uint32_t> prompt(8193);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  auto producer = request(1, prompt);
+  // Admitted first, it plans the sibling's junction on its own checkpoint.
+  producer.priority = RequestPriority::Foreground;
+  engine.submit(std::move(producer));
+  std::vector<uint32_t> sibling(prompt.begin(), prompt.begin() + 4100);
+  sibling.resize(4200, 0);
+  engine.submit(request(2, sibling));
+  runUntilIdle(engine);
+  const auto counters = engine.snapshot();
+  require(events.starts.at(1) ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+              executor.restored == 4096,
+          "the sibling did not resume from the producer's shared boundary");
+  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 0 &&
+              counters.resources.stateCache.checkpointRetirements == 0 &&
+              counters.resources.stateCache.checkpointEntries == 0,
+          "the shared boundary was published as a rolling checkpoint");
+  std::vector<uint32_t> next(prompt.begin(), prompt.begin() + 4100);
+  next.resize(4140, 1);
+  require(resources.lookup(next).resumeBoundary() == 4096,
+          "the producer's later progress retired the shared junction");
+}
+
 void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
@@ -932,7 +970,10 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
           "capacity failure prevented subsequent service");
 }
 
-void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
+// A cold request publishes its replay state; once that state is gone, the
+// next request over the same prompt rebuilds it where the KV still matches,
+// as a replay state, and the one after resumes from it.
+void testColdPublishesReplayStateAndRebuildsALostOne() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
@@ -961,11 +1002,12 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
   runUntilIdle(engine);
   require(executor.restored == 0 && executor.prefillRows == 130 &&
               executor.snapshots == 2 &&
-              engine.snapshot().junctionMaterializations == 1,
-          "second request did not lazily materialize its proven KV junction");
+              engine.snapshot().replayStatePublications == 2 &&
+              engine.snapshot().junctionMaterializations == 0,
+          "second request did not rebuild the lost replay state");
   require(events.starts.size() == 2 &&
               events.starts[1].first == EngineCacheStatus::Miss,
-          "KV-only junction replay was reported as a state hit");
+          "KV-only replay was reported as a state hit");
 
   engine.submit(request(3, prompt));
   runUntilIdle(engine);
@@ -1297,7 +1339,8 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
           "latest-state denial did not recycle exactly one older state");
 
   // The junction state survived the recycle: the original prompt resumes
-  // from it, while the recycled prompt is back to a KV-only junction.
+  // from it, while the recycled prompt is back to KV without a state and
+  // publishes its replay state again.
   const uint32_t restored = executor.restored;
   prompt.resize(97);
   engine.submit(request(9, prompt));
@@ -1310,7 +1353,8 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(71, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
   require(events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().junctionMaterializations == 2,
+              engine.snapshot().replayStatePublications == 4 &&
+              engine.snapshot().junctionMaterializations == 1,
           "recycled state was not the older unrelated one");
 }
 
@@ -1410,27 +1454,28 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
               events.completedCount == 1,
           "latest replay-state denial was counted incorrectly");
 
-  // The first pass left a usable KV chain but no state. The second lookup is
-  // therefore a real lazy junction; its denied snapshot is counted as such
-  // while the request replays through the KV prefix normally.
+  // The first pass left a usable KV chain but no state. The second request
+  // plans its replay state there again; its denied snapshot is counted as a
+  // replay-state failure while the request replays through the KV prefix
+  // normally.
   engine.submit(request(4, prompt));
   runUntilIdle(engine);
   require(executor.snapshotAttempts == 2 && executor.snapshots == 0 &&
-              engine.snapshot().junctionMaterializationFailures == 1 &&
-              engine.snapshot().replayStatePublicationFailures == 1 &&
+              engine.snapshot().junctionMaterializationFailures == 0 &&
+              engine.snapshot().replayStatePublicationFailures == 2 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
               executor.prefillRows == 130 && events.completedCount == 2 &&
               events.failedCount == 0,
-          "denied lazy junction failed the request or was not counted");
+          "denied replay state failed the request or was not counted");
 
   // The denial is transient: the next lane over the same prefix lands it.
   executor.deniedSnapshots = 0;
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   require(executor.snapshots == 1 &&
-              engine.snapshot().junctionMaterializations == 1 &&
+              engine.snapshot().replayStatePublications == 1 &&
               resources.snapshot().stateCache.entries == 1,
-          "junction was not materialized once snapshots were possible");
+          "replay state was not published once snapshots were possible");
 }
 
 // A snapshot the model denies once at a replay boundary lands by recycling
@@ -1469,7 +1514,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
           "recycling changed the cached state footprint");
 
   // The surviving state belongs to the new lane: re-sending its prompt is a
-  // state hit, while the older prompt is back to a KV-only junction.
+  // state hit, while the older prompt is back to KV without a state.
   engine.submit(request(3, newer));
   runUntilIdle(engine);
   require(executor.restored == 64 &&
@@ -1481,7 +1526,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
   runUntilIdle(engine);
   require(executor.restored == 64 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().junctionMaterializations == 1,
+              engine.snapshot().replayStatePublications == 3,
           "recycled state was not the least recently used one");
 }
 
@@ -5744,8 +5789,10 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   resources.endRequest(470);
   engine.submit(request(471, prompt));
   runUntilIdle(engine);
+  // The junction at the prompt's end is its replay point.
   require(engine.snapshot().checkpointPublications == (prompt.size() / defaultCheckpointTokens) &&
-              engine.snapshot().junctionMaterializations == 1 &&
+              engine.snapshot().replayStatePublications == 1 &&
+              engine.snapshot().junctionMaterializations == 0 &&
               resources.snapshot().stateCache.entries == 1 &&
               resources.lookup(prompt).resumeBoundary() == 20000,
           "prompt-end junction left a superseded progress checkpoint resident");
@@ -5825,7 +5872,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
               events.failedCount == 0,
           "branch replayed before its latest checkpoint or failed completion");
   require(finished.checkpointPublications == 5 &&
-              finished.junctionMaterializations == 1 &&
+              finished.replayStatePublications == 1 &&
               finished.resources.stateCache.entries == 1 &&
               finished.resources.stateCache.checkpointEntries == 0 &&
               finished.resources.stateCache.checkpointRetirements == 5 &&
@@ -7706,6 +7753,7 @@ int main() {
     testSharedPrefillDoesNotBlockUnrelatedWork();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
+    testSharedJunctionAtACheckpointIsReusable();
     testSharedPrefillCapacityFailureDoesNotDeadlock();
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
@@ -7745,7 +7793,7 @@ int main() {
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
     testDecodeShareValidation();
-    testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
+    testColdPublishesReplayStateAndRebuildsALostOne();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testReplayStateEndsBeforeTheGenerationPrompt();
     testFollowUpResumesBeforeTheGenerationPrompt();
