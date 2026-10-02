@@ -58,7 +58,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   std::vector<PreparedWeight> prepared;
   if (vision) prepared.push_back(vision->weight());
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draftSource == DraftSource::Checkpoint) {
+  if (result.descriptor.draftFromCheckpoint()) {
     draft.emplace(backend, root / "draft", result.descriptor.draft, admitConversion);
     prepared.insert(prepared.end(), draft->weights().begin(), draft->weights().end());
   }
@@ -145,13 +145,13 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
         [](const auto &layout) { return PreparedImages<affine::Image>::bytes(affineTargetImages(layout)); },
         descriptor.target);
   }
-  if (descriptor.draftSource == DraftSource::Checkpoint)
+  if (descriptor.draftFromCheckpoint())
     bytes += PreparedImages<affine::Image>::bytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += preparedVisionBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
-    if (directory == "draft" && descriptor.draftSource != DraftSource::Packed) continue;
+    if (directory == "draft" && descriptor.draftFromCheckpoint()) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
       if (!entry.is_regular_file()) continue;

@@ -364,7 +364,6 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         throw std::invalid_argument("draft target capture layers do not match this model");
     }
   }, result.target);
-  result.draftSource = DraftSource::Checkpoint;
 
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
@@ -408,8 +407,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf) ||
-      name.empty() || !capabilities.vocabularySize ||
+  if (name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
