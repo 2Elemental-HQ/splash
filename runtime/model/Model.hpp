@@ -245,9 +245,11 @@ struct ModelStepResult final {
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
   // Set when the model computed an unusable result for this lane alone, such
-  // as a non-finite score logit. The engine fails that one request before it
-  // publishes cache state or emits output, and the rest of the batch stands.
-  // Broken invariants and GPU faults stay exceptions and remain engine-fatal.
+  // as a non-finite score logit or a selection outside the vocabulary (the
+  // sampling kernels' sentinel for a non-finite logit row). The engine fails
+  // that one request before it publishes cache state or emits output, and the
+  // rest of the batch stands. Broken invariants and GPU faults stay
+  // exceptions and remain engine-fatal.
   std::string failure{};
 
   bool operator==(const ModelStepResult &) const = default;

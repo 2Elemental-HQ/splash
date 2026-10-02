@@ -146,6 +146,8 @@ void prefill(model::Runtime &executor, Lane &lane,
         executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
     if (results.size() != 1 || results[0].consumedPromptTokens != count)
       throw std::runtime_error("prefill consumed the wrong row count");
+    if (!results[0].failure.empty())
+      throw std::runtime_error(results[0].failure);
     offset += count;
   }
   lane.position = prompt.size();
@@ -175,6 +177,8 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
   for (size_t index = 0; index < lanes.size(); ++index) {
+    if (!results[index].failure.empty())
+      throw std::runtime_error(results[index].failure);
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
     lanes[index].position += results[index].outputTokens.size() -

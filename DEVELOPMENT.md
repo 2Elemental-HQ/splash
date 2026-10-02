@@ -1194,12 +1194,13 @@ position. The final prefill chunk runs the target head but no sampling policy or
 DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
 reports zero decode time. Cancelled requests carry no logits.
 
-A non-finite score logit is a per-request failure, not an engine fault: the
-engine reports `model_result_invalid` for that request alone, before it
-publishes the failing step's cache state or any output, and the rest of the
-batch finishes normally. Prompt chunks that already succeeded keep the blocks
-they committed, exactly as they do for a cancelled request. GPU faults and
-broken engine invariants stay fatal and still mark the runtime unhealthy.
+A non-finite logit row is a per-request failure, not an engine fault: a score
+logit, or a token the sampling kernels could only select outside the
+vocabulary. The engine reports `model_result_invalid` for that request alone,
+before it publishes the failing step's cache state or any output, and the rest
+of the batch finishes normally. Prompt chunks that already succeeded keep the
+blocks they committed, exactly as they do for a cancelled request. GPU faults
+and broken engine invariants stay fatal and still mark the runtime unhealthy.
 
 ## Validate
 

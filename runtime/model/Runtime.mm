@@ -234,6 +234,9 @@ struct Runtime::Impl {
     bool verify = false;
     bool draftForMask = false;
     bool draftComputed = false;
+    // Why the lane's selection is unusable (invalidSelection), found before
+    // any lane commits.
+    std::string failure;
   };
 
   // What a lane's GPU table was last written from. Its entries stay valid
@@ -772,6 +775,19 @@ struct Runtime::Impl {
     entry.pendingToken = tokens.back();
   }
 
+  // A selection outside the vocabulary is the sampling kernels' sentinel for a
+  // non-finite logit row: a numerical outcome of this request, which it reports
+  // as its lane failure (ModelStepResult::failure) so the batch survives.
+  [[nodiscard]] std::string invalidSelection(std::span<const uint32_t> tokens) const {
+    const auto found = std::find_if(tokens.begin(), tokens.end(), [&](uint32_t token) {
+      return token >= geometry.target.vocabularySize;
+    });
+    if (found == tokens.end())
+      return {};
+    return "target selected out-of-vocabulary token " + std::to_string(*found) +
+           " from a non-finite logit row";
+  }
+
   void addInitialPolicySelection(CommandGraph &graph, Request &entry,
                                  uint32_t lane, uint32_t rowOffset) const {
     sampling.addInitial(graph, samplingPolicy(entry),
@@ -782,7 +798,8 @@ struct Runtime::Impl {
   }
 
   CommandTiming selectPendingFromFinalHidden(Request &entry, uint32_t lane,
-                                             std::span<const uint32_t> masks) {
+                                             std::span<const uint32_t> masks,
+                                             ModelStepResult &result) {
     if (entry.finalTargetHidden.size() != geometry.target.hiddenSize) {
       throw std::logic_error("request has no policy-neutral final hidden");
     }
@@ -809,10 +826,9 @@ struct Runtime::Impl {
     CommandTiming timing = backend.submitCommand(graph.dispatches());
     const uint32_t token = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
                                                "restored prefix next token");
-    if (token >= geometry.target.vocabularySize) {
-      throw std::runtime_error("target policy selected an invalid token");
-    }
-    commitSelected(entry, {&token, 1});
+    result.failure = invalidSelection({&token, 1});
+    if (result.failure.empty())
+      commitSelected(entry, {&token, 1});
     return timing;
   }
 
@@ -1513,15 +1529,15 @@ struct Runtime::Impl {
                                                 "GPU accepted draft count");
       if (!laneResult.retained || laneResult.retained > kDecodeRows)
         throw std::runtime_error("target policy produced invalid retention");
-      // The retained target tokens end with the next anchor.
+      if (laneResult.accepted > kDraftProposalTokens)
+        throw std::runtime_error(
+            "target accepted more than the draft proposed");
+      // The retained target tokens end with the next anchor. A non-finite
+      // target row can also accept a sentinel draft proposal as an interior
+      // token, so every retained token is checked.
       const uint32_t *targetTokens = contents<uint32_t>(
           d(DecodeTensor::OutputTokens), "target output tokens");
-      if (laneResult.accepted > kDraftProposalTokens ||
-          targetTokens[laneResult.retained - 1] >=
-              geometry.target.vocabularySize) {
-        throw std::runtime_error(
-            "target policy selected an invalid next anchor");
-      }
+      laneResult.failure = invalidSelection({targetTokens, laneResult.retained});
     }
 
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -1529,6 +1545,15 @@ struct Runtime::Impl {
       if (!laneResult.verify)
         continue;
       Request &entry = *laneResult.request;
+      if (!laneResult.failure.empty()) {
+        // The cycle's state and tokens are not committed; the engine ends
+        // the request.
+        entry.maskWords.clear();
+        entry.verifyMaskInFlight = false;
+        results[lane] = {.requestId = entry.id,
+                         .failure = std::move(laneResult.failure)};
+        continue;
+      }
       const uint32_t *targetTokens =
           contents<uint32_t>(decodeArena->get(lane, DecodeTensor::OutputTokens),
                              "target output tokens");
@@ -2088,8 +2113,25 @@ Runtime::prefillAsync(const BatchPlan &plan,
         entry.draftContextValid = true;
         entry.draftContextThrough = capture.absoluteEnd;
       }
+      const uint64_t nextLength = item.logicalPosition + item.tokenCount;
+      // The anchor this chunk selects when it completes a generation prompt.
+      std::optional<uint32_t> selected;
+      if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
+          entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
+        selected = *contents<uint32_t>(
+            impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
+            "prefill next token");
+        if (std::string failure = impl->invalidSelection({&*selected, 1});
+            !failure.empty()) {
+          // The chunk's state is not committed; the engine ends the
+          // request.
+          results.push_back({.requestId = entry.id,
+                             .consumedPromptTokens = item.tokenCount,
+                             .failure = std::move(failure)});
+          continue;
+        }
+      }
       impl->states.swapParity(entry.slot);
-      uint64_t nextLength = item.logicalPosition + item.tokenCount;
       QwenLogicalLengths lengths = impl->states.metadata(entry.slot).lengths;
       lengths.targetTokens = nextLength;
       for (const auto &capture : captures) {
@@ -2125,15 +2167,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
             result.scoreLogits.push_back(logit);
           }
           result.finished = true;
-        } else if (entry.constraint == ConstraintMode::None) {
-          const uint32_t token = *contents<uint32_t>(
-              impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
-              "prefill next token");
-          if (token >= impl->geometry.target.vocabularySize) {
-            throw std::runtime_error(
-                "prefill policy selected an invalid token");
-          }
-          impl->commitSelected(entry, {&token, 1});
+        } else if (selected) {
+          impl->commitSelected(entry, {&*selected, 1});
           impl->emitTerminalAnchor(entry, result);
         } else {
           const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
@@ -2204,14 +2239,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
           entry.pendingToken) {
         throw std::logic_error("initial anchor mask state is invalid");
       }
-      const CommandTiming selection =
-          impl_->selectPendingFromFinalHidden(entry, lane, entry.maskWords);
+      const CommandTiming selection = impl_->selectPendingFromFinalHidden(
+          entry, lane, entry.maskWords, results[lane]);
       priorTiming.gpuSeconds += selection.gpuSeconds;
       priorTiming.wallSeconds += selection.wallSeconds;
       entry.maskWords.clear();
       entry.decodeStage = DecodeStage::Regular;
       results[lane].nextDecodeStage = DecodeStage::Regular;
-      if (impl_->emitTerminalAnchor(entry, results[lane]))
+      // A failed selection leaves no anchor; the engine ends the request.
+      if (!results[lane].failure.empty() ||
+          impl_->emitTerminalAnchor(entry, results[lane]))
         continue;
     }
 
@@ -2457,6 +2494,14 @@ WarmupStepResult warmupResult(uint64_t estimatedPeakBytes, double wallSeconds,
   return {true, estimatedPeakBytes, std::move(detail), wallSeconds, {}};
 }
 
+// A warmup step whose lane failed (a non-finite logit row) fails the warmup
+// there, with the lane's reason.
+void requireLanesSucceeded(std::span<const ModelStepResult> results) {
+  for (const ModelStepResult &result : results)
+    if (!result.failure.empty())
+      throw std::runtime_error(result.failure);
+}
+
 // Warmup runs on the startup runway the engine's KV pool allocated
 // (ExecutionLimits::warmupKvPages); it never allocates KV.
 void requireRunwayPages(const kv::PageStorage &storage,
@@ -2520,6 +2565,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     const auto phaseStart = Clock::now();
     auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
     wallSeconds = std::chrono::duration<double>(Clock::now() - phaseStart).count();
+    requireLanesSucceeded(result);
     if (result.size() != 1 || result[0].consumedPromptTokens != rows) {
       throw std::runtime_error("prefill warmup result mismatch");
     }
@@ -2567,7 +2613,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       ModelBatchItem item =
           warmupItem(request.id, slotOrder[lane], 0, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
-      static_cast<void>(
+      requireLanesSucceeded(
           prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
       prepareWarmupDecode(request.id, warmupPrompt.back());
     }
@@ -2583,6 +2629,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     const auto phaseStart = Clock::now();
     auto decoded = decode(plan, items);
     wallSeconds = std::chrono::duration<double>(Clock::now() - phaseStart).count();
+    requireLanesSucceeded(decoded);
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
       const auto &lengths = impl_->states.metadata(slotOrder[lane]).lengths;
@@ -2653,7 +2700,7 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
                           DecodeStage::Regular};
     ModelBatchItem prefillItem = warmupItem(id, 0, 0, 0, 1, pages);
     prefillItem.inputTokens = request.prompt;
-    static_cast<void>(
+    requireLanesSucceeded(
         prefill(prefillPlan, std::span<const ModelBatchItem>(&prefillItem, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
     BatchPlan decodePlan{
@@ -2661,6 +2708,7 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
     ModelBatchItem decodeItem = warmupItem(id, 0, 1, 0, 0, pages);
     auto result =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
+    requireLanesSucceeded(result);
     const auto &lengths = impl_->states.metadata(0).lengths;
     if (result.size() != 1 || result[0].outputTokens.empty() ||
         !lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
@@ -2735,7 +2783,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
         warmupItem(id, 1, prefixTokens, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
-    static_cast<void>(
+    requireLanesSucceeded(
         prefill(suffixPlan, std::span<const ModelBatchItem>(&suffix, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
     const double continuationWallSeconds =
@@ -2746,6 +2794,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     ModelBatchItem decodeItem = warmupItem(id, 1, promptTokens, 0, 0, pages);
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
+    requireLanesSucceeded(decoded);
     const double historicalDecodeWallSeconds =
         impl_->counters.lastDecodeWallSeconds;
     wallSeconds += historicalDecodeWallSeconds;

@@ -1473,9 +1473,9 @@ void Engine::apply(const BatchPlan &plan,
           result.outputTokens.begin(), result.outputTokens.end(),
           [&](uint32_t token) { return token >= config_.vocabularySize; });
       if (outOfVocabulary != result.outputTokens.end()) {
-        // A token outside the vocabulary, such as the 0xffffffff the sampling
-        // kernels leave for a non-finite logit row, fails this lane like a
-        // model-reported result: before any output or cache publication.
+        // A model that emits a token outside the vocabulary without reporting
+        // it fails this lane the same way (the Qwen runtime reports its
+        // non-finite rows itself).
         active.failure = Failure{
             "model_result_invalid", "model emitted out-of-vocabulary token " +
                                         std::to_string(*outOfVocabulary)};
