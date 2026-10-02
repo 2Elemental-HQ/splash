@@ -86,7 +86,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::array<uint32_t, 1> zeroHistory{};
   const std::string prefillSplit = std::string(layout.format == kv::Format::Int8
       ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") + geometrySuffix;
-  const std::string prefillReduce = "prefill_attention_q8_reduce" + geometrySuffix;
+  const std::string prefillReduce = "prefill_attention_reduce" + geometrySuffix;
   checkPrefillSlotOrientation(queryHeads, layout);
   for (uint32_t rows = 1; rows <= 2048; ++rows) {
     const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
@@ -112,7 +112,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   }
   const std::string verifySplit = std::string(layout.format == kv::Format::Int8
       ? "verify_attention_q8_split" : "verify_attention_bf16_split") + geometrySuffix;
-  const std::string verifyReduce = "verify_attention_q8_reduce" + geometrySuffix;
+  const std::string verifyReduce = "verify_attention_reduce" + geometrySuffix;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
     const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
@@ -121,14 +121,14 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "verify plan runs the wrong pipelines");
     uint32_t maximum = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint32_t expected = kv::q8VerifyAttentionSplits(histories[lane]);
-      require(plan.laneSplits[lane] == expected && expected >= kv::kQ8VerifySplits &&
-                  expected <= kv::kQ8VerifyMaximumSplits,
+      const uint32_t expected = kv::verifyAttentionSplits(histories[lane]);
+      require(plan.laneSplits[lane] == expected && expected >= kv::kVerifySplits &&
+                  expected <= kv::kVerifyMaximumSplits,
               "verify lane split count does not follow its own history");
       maximum = std::max(maximum, expected);
     }
     const uint64_t fused =
-        uint64_t{lanes} * 8 * kv::kQ8VerifyMaximumSplits * queryHeads;
+        uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
     require(plan.splits == maximum &&
                 plan.workspace.partialsBytes == fused * 256 * 4 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
@@ -138,7 +138,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 plan.reduceGroups.z == lanes,
             "verify split/reduce/scratch disagree");
     require(plan.laneSplits[0] == 32 &&
-                (lanes < 4 || plan.laneSplits[3] == kv::kQ8VerifyMaximumSplits),
+                (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout); });
@@ -178,7 +178,7 @@ struct Case final {
   std::array<metal::MetalBuffer, 4> tables;
   // Each lane's page ids, which its table holds as entries.
   std::array<std::vector<uint32_t>, 4> pages;
-  std::array<kv::Q8ChunkedPrefillParams, 4> stores{};
+  std::array<kv::ChunkedPrefillParams, 4> stores{};
 
   uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                       uint32_t dimension) const {
@@ -533,9 +533,9 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
       require(dispatch.pipelineName == pipeline && dispatch.threadgroups.x == groups.x &&
                   dispatch.threadgroups.y == groups.y && dispatch.threadgroups.z == groups.z &&
                   dispatch.bytes.size() == 1 &&
-                  dispatch.bytes[0].sizeBytes == sizeof(kv::Q8PrefillAttentionParams),
+                  dispatch.bytes[0].sizeBytes == sizeof(kv::PrefillAttentionParams),
               "production prefill dispatch departed from its plan");
-      kv::Q8PrefillAttentionParams params;
+      kv::PrefillAttentionParams params;
       std::memcpy(&params, dispatch.bytes[0].data, sizeof(params));
       require(params.committed_tokens == data.stores[0].committed_tokens &&
                   params.rows == data.rows &&

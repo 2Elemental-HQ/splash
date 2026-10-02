@@ -1,4 +1,4 @@
-// Times Splash's production attention kernels on one layer of Page32 Q8 KV
+// Times Splash's production attention kernels on one layer of Page32 KV
 // across cache lengths, for the prefill chunk (2048 rows), and the DFlash
 // verify batch (8 rows per lane, one and four lanes). Each case builds the same
 // store + attention graph the executor encodes, reports the fused GPU time of

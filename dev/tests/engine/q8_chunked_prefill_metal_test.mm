@@ -32,7 +32,7 @@ constexpr std::string_view kChunkedPrefillStorePipeline =
 constexpr std::string_view kPrefillAttentionSplitPipeline =
     "prefill_attention_q8_split";
 constexpr std::string_view kPrefillAttentionReducePipeline =
-    "prefill_attention_q8_reduce";
+    "prefill_attention_reduce";
 struct AttentionPipelines {
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
@@ -150,7 +150,7 @@ struct Pool {
 };
 
 struct Case {
-  Q8ChunkedPrefillParams params;
+  ChunkedPrefillParams params;
   // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
@@ -288,14 +288,14 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
 
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
-                     const Q8PrefillAttentionParams *overrideParams = nullptr) {
+                     const PrefillAttentionParams *overrideParams = nullptr) {
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
-  const Q8PrefillAttentionParams params = overrideParams ? *overrideParams :
-      Q8PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
+  const PrefillAttentionParams params = overrideParams ? *overrideParams :
+      PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
                               data.params.kv, plan.splits};
   [encoder setComputePipelineState:pipelines.split];
@@ -456,8 +456,8 @@ std::vector<uint32_t> chunkReferenceRows(const Case &data) {
   // Both sides of a query-tile boundary and the first/last Page32 causal
   // boundaries in this chunk. Keep long-history scalar work bounded to nine
   // rows; the caller still checks every active output and inactive guard.
-  add(kQ8PrefillAttentionTileRows - 1);
-  add(kQ8PrefillAttentionTileRows);
+  add(kPrefillAttentionTileRows - 1);
+  add(kPrefillAttentionTileRows);
   const uint32_t firstPageEnd = kPageTokens - 1 - committed % kPageTokens;
   add(firstPageEnd);
   add(firstPageEnd + 1);
@@ -605,7 +605,7 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
           output, output + data.output.length / sizeof(BFloat16Bits));
       // The reduction writes every row of the chunk's query tiles, zeros
       // past the chunk, and nothing beyond them.
-      const uint32_t tiledRows = prefillAttentionTiles(chunk) * kQ8PrefillAttentionTileRows;
+      const uint32_t tiledRows = prefillAttentionTiles(chunk) * kPrefillAttentionTileRows;
       const auto validateCoverage = [&] {
         for (uint32_t head = 0; head < kQueryHeads; ++head)
           for (uint32_t row = 0; row < rows; ++row)
@@ -697,7 +697,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
   Case data = makeCase(device, 33, 17, 32);
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
-  const Q8PrefillAttentionParams valid{
+  const PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,
       data.params.kv, plan.splits};
@@ -746,7 +746,7 @@ void testCommitIndexOverwrite(id<MTLDevice> device,
 
   // The accepted rows 127..129 still contain variant 1. Temporarily express
   // their original command coordinates for the common row oracle.
-  Q8ChunkedPrefillParams secondParams = data.params;
+  ChunkedPrefillParams secondParams = data.params;
   data.params.committed_tokens = 127;
   data.params.chunk_tokens = 8;
   for (uint32_t token = 0; token < 3; ++token) {
@@ -778,7 +778,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const std::vector<uint32_t> ids =
       HostKvExtents::mixedPages(geometry, 2 * lanes, lanes);
 
-  std::array<Q8ChunkedPrefillParams, lanes> params{};
+  std::array<ChunkedPrefillParams, lanes> params{};
   std::array<std::array<uint32_t, 2>, lanes> tables{};
   std::array<id<MTLBuffer>, lanes> tableBuffers{};
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
@@ -864,14 +864,14 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 void testContract() {
-  static_assert(sizeof(Q8PrefillAttentionParams) == 28);
-  static_assert(offsetof(Q8PrefillAttentionParams, committed_tokens) == 0);
-  static_assert(offsetof(Q8PrefillAttentionParams, rows) == 4);
-  static_assert(offsetof(Q8PrefillAttentionParams, chunk_stride) == 8);
-  static_assert(offsetof(Q8PrefillAttentionParams, page_table_entries) == 12);
-  static_assert(offsetof(Q8PrefillAttentionParams, kv) == 16);
-  static_assert(offsetof(Q8PrefillAttentionParams, split_count) == 24);
-  Q8ChunkedPrefillParams params{129, 8, 32, 5, {}};
+  static_assert(sizeof(PrefillAttentionParams) == 28);
+  static_assert(offsetof(PrefillAttentionParams, committed_tokens) == 0);
+  static_assert(offsetof(PrefillAttentionParams, rows) == 4);
+  static_assert(offsetof(PrefillAttentionParams, chunk_stride) == 8);
+  static_assert(offsetof(PrefillAttentionParams, page_table_entries) == 12);
+  static_assert(offsetof(PrefillAttentionParams, kv) == 16);
+  static_assert(offsetof(PrefillAttentionParams, split_count) == 24);
+  ChunkedPrefillParams params{129, 8, 32, 5, {}};
   require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
@@ -880,9 +880,9 @@ void testContract() {
   require(chunkedPrefillValidationError(params) == "page_table_too_short",
           "short page table was accepted");
 
-  Q8ChunkedPrefillParams finalCycle{
+  ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1,
-      splash::kv::kQ8VerifyMaximumRows,
+      splash::kv::kVerifyRows,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,

@@ -217,7 +217,7 @@ struct QwenTarget::VerifyStep {
   metal::CommandGraph &graph;
   const QwenTargetVerifyBuffers &buffers;
   std::span<const SplashKvLayer> kvLayers;
-  std::span<const kv::Q8ChunkedPrefillParams> chunks;
+  std::span<const kv::ChunkedPrefillParams> chunks;
   uint32_t lanes;
   uint32_t rows;
   ops::LinearDispatchStats &stats;
@@ -348,10 +348,10 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
         f32(b.ropeCos, geometry_.rotaryPairs), f32(b.ropeSin, geometry_.rotaryPairs), queries, keys, values,
         sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
-                                         sequence.q8, geometry_.kvLayout);
+                                         sequence.chunk, geometry_.kvLayout);
     ops::PagedAttention::addPrefill(
         step.graph, step.kvLayers[layer], queries, attentionRows, b.attentionPartials, b.attentionStatistics,
-        sequence.pageTable, sequence.q8, step.attention[index]);
+        sequence.pageTable, sequence.chunk, step.attention[index]);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16(b.fullPacked, geometry_.packedFullWidth), attentionRows,
         u16(b.attentionHidden, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
@@ -386,7 +386,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
     std::span<const SplashKvLayer> kvLayers,
-    std::span<const kv::Q8ChunkedPrefillParams> chunks, uint32_t lanes,
+    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
     ops::LinearDispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||

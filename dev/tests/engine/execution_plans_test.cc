@@ -108,7 +108,7 @@ void baselinePlans() {
       {
         const std::array<uint32_t, 1> deep{131072};
         const auto scaled = plans.verifyAttention(1, queryHeads, kvLayout, deep);
-        require(scaled.splits == kv::kQ8VerifyMaximumSplits &&
+        require(scaled.splits == kv::kVerifyMaximumSplits &&
                     scaled.laneSplits[0] == scaled.splits,
                 "verify splits did not scale with history");
         covers(stride, scaled.workspace, 1, attentionFields);
@@ -245,13 +245,13 @@ void workspaceBounds() {
   rejects([&] { (void)plans.verifyAttention(3, 24, attentionShapes[0].layout, histories); });
   const auto exact =
       plans.verifyAttention(3, 24, attentionShapes[0].layout, std::span(histories).first(3));
-  require(exact.laneSplits[3] == 0 && exact.splits == kv::q8VerifyAttentionSplits(2049),
+  require(exact.laneSplits[3] == 0 && exact.splits == kv::verifyAttentionSplits(2049),
           "verify policy did not resolve one history per lane");
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
-                  uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 256 * 4 &&
+                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
-                  uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 2 * 4,
+                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
@@ -289,7 +289,7 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
-  require(finalVerify.splits == kv::kQ8VerifyMaximumSplits,
+  require(finalVerify.splits == kv::kVerifyMaximumSplits,
           "valid final physical verify rows were rejected");
   ++edge[0];
   rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });

@@ -142,8 +142,8 @@ class ArchitectureTests(unittest.TestCase):
         symbols = (
             "PrefillAttentionWave",
             "prefillAttentionTiles",
-            "kQ8VerifySplits",
-            "kQ8PrefillAttentionTileRows",
+            "kVerifySplits",
+            "kPrefillAttentionTileRows",
             "moeMaximumTiles",
             "kMoePrefillTileRows",
             "kMoeDecodeTileRows",

@@ -54,7 +54,7 @@ void attention() {
       const auto workspace =
           ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
       const uint64_t values =
-          uint64_t{lanes} * 8 * kv::kQ8VerifyMaximumSplits * queryHeads;
+          uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
       require(workspace.partialsBytes == values * 256 * 4,
               "verify partial workspace is not sized for the maximum split count");
       require(workspace.statisticsBytes == values * 2 * 4,

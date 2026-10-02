@@ -76,7 +76,7 @@ private:
   bool representativePrefillTiming_;
 };
 
-using kv::Q8ChunkedPrefillParams;
+using kv::ChunkedPrefillParams;
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
   return token == geometry.target.stopTokens[0] ||
@@ -978,9 +978,9 @@ struct Runtime::Impl {
                                                  std::move(finish));
   }
 
-  Q8ChunkedPrefillParams q8Params(uint64_t logicalPosition,
-                                  uint32_t chunkTokens, uint32_t chunkStride,
-                                  std::span<const uint32_t> pages) const {
+  ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
+                                   uint32_t chunkTokens, uint32_t chunkStride,
+                                   std::span<const uint32_t> pages) const {
     return ops::PagedAttention::prefillParams(
         logicalPosition, chunkTokens, chunkStride,
         static_cast<uint32_t>(pages.size()));
@@ -995,7 +995,7 @@ struct Runtime::Impl {
     uint64_t queryOffset = 0;
     uint64_t kvOffset = 0;
     uint32_t captureBegin = 0;
-    Q8ChunkedPrefillParams q8;
+    ChunkedPrefillParams chunk;
     MetalBuffer pageTable;
     DispatchDraftCapturePlan captures;
   };
@@ -1042,13 +1042,13 @@ struct Runtime::Impl {
       const uint32_t capturedRows = captureRows(captures);
       const uint32_t attentionStride =
           ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
-      const Q8ChunkedPrefillParams q8 =
-          q8Params(item.logicalPosition, item.tokenCount, attentionStride,
-                   item.pageTable);
+      const ChunkedPrefillParams chunk =
+          chunkParams(item.logicalPosition, item.tokenCount, attentionStride,
+                      item.pageTable);
       MetalBuffer pageTable = synchronizedPageTable(entry, item);
       batch.sequences.push_back({&entry, &item, lane, batch.rows,
                                  attentionStride, queryOffset, kvOffset,
-                                 batch.capturedRows, q8, std::move(pageTable),
+                                 batch.capturedRows, chunk, std::move(pageTable),
                                  std::move(captures)});
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
@@ -1164,7 +1164,7 @@ struct Runtime::Impl {
       destination.attentionStride = sequence.attentionStride;
       destination.queryOffset = sequence.queryOffset;
       destination.kvOffset = sequence.kvOffset;
-      destination.q8 = sequence.q8;
+      destination.chunk = sequence.chunk;
       destination.pageTable = sequence.pageTable;
       const uint32_t gdnLayers = geometry.target.stateLayout.layers;
       const uint64_t stateBegin = uint64_t{lane} * gdnLayers;
@@ -1408,7 +1408,7 @@ struct Runtime::Impl {
       return decodeArena->packed(tensor, storage);
     };
 
-    std::array<Q8ChunkedPrefillParams, kLaneCount> q8{};
+    std::array<ChunkedPrefillParams, kLaneCount> chunks{};
     const uint32_t gdnLayers = geometry.target.stateLayout.layers;
     const uint32_t attentionLayers =
         geometry.target.kvLayout.attentionLayers;
@@ -1446,7 +1446,7 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      q8[lane] = ops::PagedAttention::verifyParams(
+      chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
           static_cast<uint32_t>(items[lane].pageTable.size()));
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
@@ -1473,7 +1473,7 @@ struct Runtime::Impl {
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
-                          std::span(q8).first(lanes), lanes, stats);
+                          std::span(chunks).first(lanes), lanes, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,

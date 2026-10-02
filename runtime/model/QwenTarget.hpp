@@ -168,7 +168,7 @@ struct QwenTargetPrefillSequence final {
   uint32_t attentionStride = 0;
   uint64_t queryOffset = 0;
   uint64_t kvOffset = 0;
-  kv::Q8ChunkedPrefillParams q8;
+  kv::ChunkedPrefillParams chunk;
   metal::MetalBuffer pageTable;
   std::span<const metal::MetalBuffer> convolutionIn;
   std::span<const metal::MetalBuffer> convolutionOut;
@@ -287,7 +287,7 @@ public:
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> chunks, uint32_t lanes,
+      std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
       ops::LinearDispatchStats &stats) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.

@@ -29,7 +29,7 @@ static_assert(sizeof(FullDecodeBatchParams) == 4,
               "Full attention verify parameters are 4 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
-// into its final Q8 page slot before attention. Prefill and verify both read
+// into its final page slot before attention. Prefill and verify both read
 // all visible history from the same paged representation. Decode accepts rows
 // only by advancing committed_tokens; the next command overwrites rejected
 // slots. Page tables hold one SplashKvPage per logical page, and kv places the
@@ -43,11 +43,11 @@ struct SplashChunkedPrefillParams {
 };
 
 static_assert(sizeof(SplashChunkedPrefillParams) == 24,
-              "Q8 chunked store parameters are 24 bytes on both sides");
+              "Chunked store parameters are 24 bytes on both sides");
 
 // Prefill divides each query tile's visible Page32 history into balanced
 // splits. The same count and partition rule are used by split and reduce.
-struct SplashQ8PrefillAttentionParams {
+struct SplashPrefillAttentionParams {
   uint32_t committed_tokens;
   uint32_t rows;
   uint32_t chunk_stride;
@@ -56,12 +56,12 @@ struct SplashQ8PrefillAttentionParams {
   uint32_t split_count;
 };
 
-static_assert(sizeof(SplashQ8PrefillAttentionParams) == 28,
-              "Q8 prefill attention parameters are 28 bytes on both sides");
+static_assert(sizeof(SplashPrefillAttentionParams) == 28,
+              "Prefill attention parameters are 28 bytes on both sides");
 
 // A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
 // queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
-struct SplashQ8VerifyAttentionParams {
+struct SplashVerifyAttentionParams {
   uint32_t committed_tokens;
   uint32_t page_table_entries;
   SplashKvLayer kv;
@@ -71,5 +71,5 @@ struct SplashQ8VerifyAttentionParams {
   uint32_t slot_splits;
 };
 
-static_assert(sizeof(SplashQ8VerifyAttentionParams) == 24,
-              "Q8 verify attention parameters are 24 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 24,
+              "Verify attention parameters are 24 bytes on both sides");

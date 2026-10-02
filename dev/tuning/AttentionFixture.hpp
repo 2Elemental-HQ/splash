@@ -276,7 +276,7 @@ public:
   // One store and attention of the fixture's rows, encoded as the runtime
   // encodes them.
   void addGraph(metal::CommandGraph &graph, const PrefillAttentionPlan &attention) const {
-    const kv::Q8ChunkedPrefillParams chunk = PagedAttention::prefillParams(
+    const kv::ChunkedPrefillParams chunk = PagedAttention::prefillParams(
         plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
     PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
                                     buffer(Tensor::ChunkValues), tables_[0], chunk,
@@ -287,10 +287,10 @@ public:
   }
   // Each lane's rows are its verify rows, in the verify chunk stride.
   void addGraph(metal::CommandGraph &graph, const VerifyAttentionPlan &attention) const {
-    if (plan_.rows != kv::kQ8VerifyMaximumRows || plan_.stride != kv::kVerifyChunkStride)
+    if (plan_.rows != kv::kVerifyRows || plan_.stride != kv::kVerifyChunkStride)
       throw std::logic_error(
           "a verify fixture stages its lanes' verify rows in the verify chunk stride");
-    std::array<kv::Q8ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
+    std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
     for (uint32_t lane = 0; lane < attention.lanes; ++lane)
       chunks[lane] = PagedAttention::verifyParams(plan_.histories[lane], plan_.pages[lane]);
     PagedAttention::addVerify(

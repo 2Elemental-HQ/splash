@@ -124,10 +124,10 @@ TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
 TEST_Q8_KERNEL_SOURCES := \
-	runtime/metal/kernels/prefill/attention_q8.metal \
-	runtime/metal/kernels/decode/attention_q8.metal \
-	runtime/metal/kernels/prefill/attention_q8_store.metal \
-	runtime/metal/kernels/decode/attention_q8_store.metal
+	runtime/metal/kernels/prefill/paged_attention.metal \
+	runtime/metal/kernels/decode/paged_attention.metal \
+	runtime/metal/kernels/prefill/paged_attention_store.metal \
+	runtime/metal/kernels/decode/paged_attention_store.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.

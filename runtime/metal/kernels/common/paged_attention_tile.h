@@ -2,7 +2,7 @@
 
 #include "metal/abi/PagedAttention.h"
 #include "metal/kernels/common/kv_extent.h"
-#include "metal/kernels/common/q8_paging.h"
+#include "metal/kernels/common/kv_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 
@@ -25,28 +25,28 @@ constant uint SplashPrefillTileRows = SPLASH_PREFILL_ATTENTION_TILE_ROWS;
 constant uint SplashPrefillMaximumSplits =
     SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
 
-inline bool splash_q8_prefill_attention_contract_valid(
-    constant SplashQ8PrefillAttentionParams &params) {
+inline bool splash_prefill_attention_contract_valid(
+    constant SplashPrefillAttentionParams &params) {
   return params.rows > 0 && params.rows <= SPLASH_PREFILL_TOKEN_BUDGET &&
          params.chunk_stride >= params.rows &&
          params.chunk_stride <= SPLASH_PREFILL_TOKEN_BUDGET &&
          params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
          params.page_table_entries >=
              (params.committed_tokens + params.rows +
-              SplashQ8PageTokens - 1) /
-                 SplashQ8PageTokens &&
+              SplashKvPageTokens - 1) /
+                 SplashKvPageTokens &&
          params.kv.extent_pages > 0 && params.split_count > 0 &&
          params.split_count <= SplashPrefillMaximumSplits &&
          ulong(params.committed_tokens) + params.rows <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS);
 }
 
-inline bool splash_q8_verify_attention_contract_valid(
-    constant SplashQ8VerifyAttentionParams &params) {
+inline bool splash_verify_attention_contract_valid(
+    constant SplashVerifyAttentionParams &params) {
   return params.page_table_entries >=
              (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
-              SplashQ8PageTokens - 1) /
-                 SplashQ8PageTokens &&
+              SplashKvPageTokens - 1) /
+                 SplashKvPageTokens &&
          params.kv.extent_pages > 0 &&
          ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
@@ -59,7 +59,7 @@ inline bool splash_q8_verify_attention_contract_valid(
 // Split and reduce derive the same balanced partition of each query tile's
 // visible pages. Causal masking remains per query row inside each split.
 inline uint splash_attention_pages(uint visible_tokens) {
-  return (visible_tokens + SplashQ8PageTokens - 1) / SplashQ8PageTokens;
+  return (visible_tokens + SplashKvPageTokens - 1) / SplashKvPageTokens;
 }
 
 inline uint splash_attention_pages_per_split(uint pages, uint splits) {
@@ -89,7 +89,7 @@ inline void splash_attention_page_softmax(
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
     uint thread_index) {
-  constexpr uint N = SplashQ8PageTokens;
+  constexpr uint N = SplashKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = N / TokensPerLane;
@@ -190,8 +190,8 @@ inline void splash_paged_attention_tile(
     uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
-  constexpr ushort N = SplashQ8PageTokens;
-  constexpr ushort D = SplashQ8HeadDimension;
+  constexpr ushort N = SplashKvPageTokens;
+  constexpr ushort D = SplashKvHeadDimension;
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
   uint per_split = splash_attention_pages_per_split(pages, splits);
@@ -295,13 +295,13 @@ inline void splash_paged_attention_tile(
 // partials. A row past the tile's active rows is written as zeros; a
 // threadgroup owns one fused row, so it returns uniformly.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile>
-inline void splash_q8_attention_reduce_row_shared(
+inline void splash_attention_reduce_row(
     device const float *partials, device const float *statistics,
     device bfloat *tile_output, uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values) {
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
-  constexpr uint D = SplashQ8HeadDimension;
+  constexpr uint D = SplashKvHeadDimension;
   if (fused_row / QueryHeadsPerKVHead >= active_rows) {
     tile_output[fused_row * D + thread_index] = bfloat(0.0f);
     return;

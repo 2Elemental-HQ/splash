@@ -18,8 +18,8 @@ choice, not a general speed improvement.
 - The shared Metal page loop specializes on the stored element type. BF16 stores
   preserve source bits and attention omits quantization scales at compile time.
   INT8 entry points, argument order, arithmetic, and dispatch policies remain.
-  Both formats share the FP32 split reduction. Historical Q8 ABI names are kept
-  where the underlying geometry and argument structure have not changed.
+  Both formats share the FP32 split reduction. Format-generic code is named for
+  paged KV; only the INT8 entry points, quantization and scales say q8.
 - Status reports the selected format and its actual byte geometry.
 
 ## Validation on 2026-09-21

@@ -25,7 +25,7 @@ namespace {
 
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
-constexpr uint32_t kRows = kQ8VerifyMaximumRows;
+constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
 // The two production GQA geometries. The group size selects the kernel
@@ -46,14 +46,14 @@ void require(bool condition, const char *message) {
 }
 
 void testContract() {
-  Q8ChunkedPrefillParams finalCycle{
+  ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "final fixed-eight verification rows exceeded physical KV scratch");
-  require(q8VerifyAttentionSplits(0) == kQ8VerifySplits &&
-              q8VerifyAttentionSplits(16 * 1024) == kQ8VerifySplits + 1 &&
-              q8VerifyAttentionSplits(131072) == kQ8VerifyMaximumSplits,
+  require(verifyAttentionSplits(0) == kVerifySplits &&
+              verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
+              verifyAttentionSplits(131072) == kVerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
@@ -143,7 +143,7 @@ constexpr uint32_t kLayer = 1;
 // reduction, as one query tile of the parameters held here.
 struct Case {
   Shape shape;
-  Q8PrefillAttentionParams params;
+  PrefillAttentionParams params;
   // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
@@ -352,11 +352,11 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
   result.splitName = std::string("verify_attention_q8_split") + shape.suffix;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
-      device, library, std::string("verify_attention_q8_reduce") + shape.suffix);
+      device, library, std::string("verify_attention_reduce") + shape.suffix);
   result.prefillSplitName = std::string("prefill_attention_q8_split") + shape.suffix;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
-      device, library, std::string("prefill_attention_q8_reduce") + shape.suffix);
+      device, library, std::string("prefill_attention_reduce") + shape.suffix);
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
@@ -400,7 +400,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
   }
-  std::array<Q8VerifyAttentionParams, 4> params{};
+  std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
                data.params.kv, splits, splits});
   id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -412,7 +412,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t index = 3; index < 7; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   [encoder setBytes:params.data()
-              length:sizeof(Q8VerifyAttentionParams) * params.size()
+              length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:7];
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
@@ -424,7 +424,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:statistics offset:0 atIndex:1];
   [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:params.data()
-              length:sizeof(Q8VerifyAttentionParams) * params.size()
+              length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:3];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -613,7 +613,7 @@ void requireIdentical(const std::string &pipeline, const Case &data,
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const Pipelines &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
-             bool qualityGate = true, uint32_t splits = kQ8VerifySplits) {
+             bool qualityGate = true, uint32_t splits = kVerifySplits) {
   require(width >= 1 && width <= 4 &&
               (activeRows == kRows ||
                (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
@@ -727,13 +727,13 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const Q8VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits};
-    verify = reduce("verify_attention_q8_reduce", params);
+    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits};
+    verify = reduce("verify_attention_reduce", params);
     check(verify);
   }
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
-    const Q8PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits};
-    id<MTLBuffer> prefill = reduce("prefill_attention_q8_reduce", params);
+    const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits};
+    id<MTLBuffer> prefill = reduce("prefill_attention_reduce", params);
     check(prefill);
     if (verify)
       require(!std::memcmp(verify.contents, prefill.contents, verify.length),
@@ -777,7 +777,7 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 4'093, 8, 1, false, 64);
     runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65);
     runCase(device, queue, pipelines, shape, 4'093, 8, 2, false,
-            kQ8VerifyMaximumSplits);
+            kVerifyMaximumSplits);
     runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1);
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);

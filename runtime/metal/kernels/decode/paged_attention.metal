@@ -7,7 +7,7 @@
 // history split and group.z the lane, whose parameters select the page table
 // and the query tile. A threadgroup past its lane's split count, or whose
 // lane fails the contract, is inactive and does nothing.
-struct SplashQ8VerifyTile {
+struct SplashVerifyTile {
   device bfloat *queries;
   device const SplashKvPage *page_table;
   ulong slot;
@@ -19,18 +19,18 @@ struct SplashQ8VerifyTile {
 };
 
 template <uint KVHeads, uint QueryHeadsPerKVHead>
-inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
+inline SplashVerifyTile splash_verify_attention_tile_at(
     device bfloat *queries, device const SplashKvPage *page_table0,
     device const SplashKvPage *page_table1, device const SplashKvPage *page_table2,
     device const SplashKvPage *page_table3,
-    constant SplashQ8VerifyAttentionParams *params, uint3 group) {
-  constexpr uint D = SplashQ8HeadDimension;
-  SplashQ8VerifyTile tile{};
+    constant SplashVerifyAttentionParams *params, uint3 group) {
+  constexpr uint D = SplashKvHeadDimension;
+  SplashVerifyTile tile{};
   uint kv_head = group.x;
   uint split = group.y;
   uint batch = group.z;
-  constant SplashQ8VerifyAttentionParams &lane_params = params[batch];
-  if (!splash_q8_verify_attention_contract_valid(lane_params) ||
+  constant SplashVerifyAttentionParams &lane_params = params[batch];
+  if (!splash_verify_attention_contract_valid(lane_params) ||
       kv_head >= KVHeads || split >= lane_params.split_count)
     return tile;
   constexpr ulong group_stride =
@@ -54,7 +54,7 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
 // partition, with scratch for scores, probabilities and row statistics.
 // INT8 and BF16 entries share one signature: pages are reached through the
 // tables, so no entry binds KV storage.
-#define Q8_VERIFY_SPLIT_SIGNATURE(Name)                                        \
+#define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -63,13 +63,13 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
       device const SplashKvPage *page_table1 [[buffer(4)]],                    \
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
       device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      constant SplashQ8VerifyAttentionParams *params [[buffer(7)]],            \
+      constant SplashVerifyAttentionParams *params [[buffer(7)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
-#define Q8_VERIFY_SCRATCH(Group)                                               \
+#define PAGED_VERIFY_SCRATCH(Group)                                            \
   constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                        \
-  constexpr uint N = SplashQ8PageTokens;                                       \
+  constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
   alignas(16) threadgroup bfloat probabilities[M * N];                         \
   threadgroup float row_max[M];                                                \
@@ -77,18 +77,18 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   threadgroup float previous_scale[M];                                         \
   threadgroup atomic_uint rescale;
 
-#define Q8_VERIFY_TILE_AT(Heads, Group)                                        \
-  const SplashQ8VerifyTile tile =                                              \
-      splash_q8_verify_attention_tile_at<Heads, Group>(                        \
+#define PAGED_VERIFY_TILE_AT(Heads, Group)                                     \
+  const SplashVerifyTile tile =                                                \
+      splash_verify_attention_tile_at<Heads, Group>(                           \
           queries, page_table0, page_table1, page_table2, page_table3, params, \
           group);                                                              \
   if (!tile.active)                                                            \
     return;
 
-#define Q8_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                      \
-  Q8_VERIFY_SPLIT_SIGNATURE(Name) {                                            \
-    Q8_VERIFY_SCRATCH(Group)                                                   \
-    Q8_VERIFY_TILE_AT(Heads, Group)                                            \
+#define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                   \
+  PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
+    PAGED_VERIFY_SCRATCH(Group)                                                \
+    PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
     splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
                                 CacheElement>(                                 \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
@@ -97,34 +97,34 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
         row_max, row_sum, previous_scale, &rescale, thread_index);             \
   }
 
-Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
-Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
-Q8_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
-Q8_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
-#undef Q8_VERIFY_SPLIT
-#undef Q8_VERIFY_TILE_AT
-#undef Q8_VERIFY_SCRATCH
-#undef Q8_VERIFY_SPLIT_SIGNATURE
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+#undef PAGED_VERIFY_SPLIT
+#undef PAGED_VERIFY_TILE_AT
+#undef PAGED_VERIFY_SCRATCH
+#undef PAGED_VERIFY_SPLIT_SIGNATURE
 
 template <uint KVHeads, uint QueryHeadsPerKVHead>
-inline void splash_q8_verify_attention_reduce_phase(
+inline void splash_verify_attention_reduce_phase(
     device const float *partials, device const float *statistics,
     device bfloat *output,
-    constant SplashQ8VerifyAttentionParams *params, uint3 group,
+    constant SplashVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
   constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * QueryHeadsPerKVHead;
-  constexpr ushort D = SplashQ8HeadDimension;
+  constexpr ushort D = SplashKvHeadDimension;
   uint kv_head = group.x;
   uint fused_row = group.y;
   uint batch = group.z;
-  constant SplashQ8VerifyAttentionParams &lane_params = params[batch];
-  if (!splash_q8_verify_attention_contract_valid(lane_params) ||
+  constant SplashVerifyAttentionParams &lane_params = params[batch];
+  if (!splash_verify_attention_contract_valid(lane_params) ||
       kv_head >= KVHeads || fused_row >= M || thread_index >= D)
     return;
   constexpr ulong group_stride =
       ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
-  splash_q8_attention_reduce_row_shared<QueryHeadsPerKVHead,
+  splash_attention_reduce_row<QueryHeadsPerKVHead,
                                    SPLASH_TARGET_VERIFY_ROWS>(
       partials, statistics,
       output + (ulong(batch) * KVHeads + kv_head) * group_stride,
@@ -134,28 +134,28 @@ inline void splash_q8_verify_attention_reduce_phase(
       thread_index, weights, group_values);
 }
 
-kernel void verify_attention_q8_reduce(
+kernel void verify_attention_reduce(
     device const float *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
-    constant SplashQ8VerifyAttentionParams *params [[buffer(3)]],
+    constant SplashVerifyAttentionParams *params [[buffer(3)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float weights[SplashVerifyMaximumSplits];
   threadgroup float group_values[8];
-  splash_q8_verify_attention_reduce_phase<4, 6>(
+  splash_verify_attention_reduce_phase<4, 6>(
       partials, statistics, output, params, group, thread_index, weights, group_values);
 }
 
-kernel void verify_attention_q8_reduce_kv2_g8(
+kernel void verify_attention_reduce_kv2_g8(
     device const float *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
-    constant SplashQ8VerifyAttentionParams *params [[buffer(3)]],
+    constant SplashVerifyAttentionParams *params [[buffer(3)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float weights[SplashVerifyMaximumSplits];
   threadgroup float group_values[8];
-  splash_q8_verify_attention_reduce_phase<2, 8>(
+  splash_verify_attention_reduce_phase<2, 8>(
       partials, statistics, output, params, group, thread_index, weights, group_values);
 }

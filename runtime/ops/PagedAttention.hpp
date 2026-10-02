@@ -17,65 +17,65 @@
 namespace splash::kv {
 
 // Host aliases for the layouts shared with Metal; containers require these traits.
-using Q8ChunkedPrefillParams = ::SplashChunkedPrefillParams;
-using Q8VerifyAttentionParams = ::SplashQ8VerifyAttentionParams;
-using Q8PrefillAttentionParams = ::SplashQ8PrefillAttentionParams;
+using ChunkedPrefillParams = ::SplashChunkedPrefillParams;
+using VerifyAttentionParams = ::SplashVerifyAttentionParams;
+using PrefillAttentionParams = ::SplashPrefillAttentionParams;
 
-static_assert(std::is_standard_layout_v<Q8ChunkedPrefillParams>);
-static_assert(std::is_trivially_copyable_v<Q8ChunkedPrefillParams>);
-static_assert(std::is_standard_layout_v<Q8VerifyAttentionParams>);
-static_assert(std::is_trivially_copyable_v<Q8VerifyAttentionParams>);
-static_assert(std::is_standard_layout_v<Q8PrefillAttentionParams>);
-static_assert(std::is_trivially_copyable_v<Q8PrefillAttentionParams>);
+static_assert(std::is_standard_layout_v<ChunkedPrefillParams>);
+static_assert(std::is_trivially_copyable_v<ChunkedPrefillParams>);
+static_assert(std::is_standard_layout_v<VerifyAttentionParams>);
+static_assert(std::is_trivially_copyable_v<VerifyAttentionParams>);
+static_assert(std::is_standard_layout_v<PrefillAttentionParams>);
+static_assert(std::is_trivially_copyable_v<PrefillAttentionParams>);
 
-inline constexpr uint32_t kQ8VerifyMaximumRows = SPLASH_TARGET_VERIFY_ROWS;
-inline constexpr uint32_t kQ8VerifyMaximumSplits =
+inline constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kVerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
 // Rows per KV head (and per query group) of one lane's verify chunk
 // staging: one KV block, which holds the lane's verify rows.
 inline constexpr uint32_t kVerifyChunkStride = SPLASH_VERIFY_CHUNK_STRIDE;
-static_assert(kVerifyChunkStride >= kQ8VerifyMaximumRows &&
+static_assert(kVerifyChunkStride >= kVerifyRows &&
               kVerifyChunkStride % kPageTokens == 0);
-// Verify attention runs one split per kQ8VerifyPagesPerSplit visible Page32
-// blocks, at least kQ8VerifySplits and at most the maximum that sizes the
-// partial workspace (q8VerifyAttentionSplits).
-inline constexpr uint32_t kQ8VerifySplits = 32;
-inline constexpr uint32_t kQ8VerifyPagesPerSplit = 16;
-static_assert(kQ8VerifySplits <= kQ8VerifyMaximumSplits);
+// Verify attention runs one split per kVerifyPagesPerSplit visible Page32
+// blocks, at least kVerifySplits and at most the maximum that sizes the
+// partial workspace (verifyAttentionSplits).
+inline constexpr uint32_t kVerifySplits = 32;
+inline constexpr uint32_t kVerifyPagesPerSplit = 16;
+static_assert(kVerifySplits <= kVerifyMaximumSplits);
 
-// One lane's verify split count: one split per kQ8VerifyPagesPerSplit
-// pages its history and verify rows fill, never fewer than kQ8VerifySplits
+// One lane's verify split count: one split per kVerifyPagesPerSplit
+// pages its history and verify rows fill, never fewer than kVerifySplits
 // and never more than the maximum the partial workspace is sized for. It
 // depends only on the lane's own history, so batching never changes a
 // lane's arithmetic.
 [[nodiscard]] constexpr uint32_t
-q8VerifyAttentionSplits(uint32_t committedTokens) noexcept {
-  const uint64_t visible = uint64_t{committedTokens} + kQ8VerifyMaximumRows;
+verifyAttentionSplits(uint32_t committedTokens) noexcept {
+  const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
-      (pages + kQ8VerifyPagesPerSplit - 1) / kQ8VerifyPagesPerSplit;
+      (pages + kVerifyPagesPerSplit - 1) / kVerifyPagesPerSplit;
   return static_cast<uint32_t>(std::min<uint64_t>(
-      std::max<uint64_t>(kQ8VerifySplits, scaled), kQ8VerifyMaximumSplits));
+      std::max<uint64_t>(kVerifySplits, scaled), kVerifyMaximumSplits));
 }
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows =
     SPLASH_PREFILL_TOKEN_BUDGET;
-inline constexpr uint32_t kQ8PrefillAttentionTileRows =
+inline constexpr uint32_t kPrefillAttentionTileRows =
     SPLASH_PREFILL_ATTENTION_TILE_ROWS;
 
 [[nodiscard]] constexpr uint32_t
 prefillAttentionTiles(uint32_t rows) noexcept {
-  return (rows + kQ8PrefillAttentionTileRows - 1) / kQ8PrefillAttentionTileRows;
+  return (rows + kPrefillAttentionTileRows - 1) / kPrefillAttentionTileRows;
 }
 
 [[nodiscard]] constexpr uint32_t
-chunkedPrefillRequiredPages(const Q8ChunkedPrefillParams &params) noexcept {
+chunkedPrefillRequiredPages(const ChunkedPrefillParams &params) noexcept {
   return (params.committed_tokens + params.chunk_tokens + kPageTokens - 1) /
          kPageTokens;
 }
 
 [[nodiscard]] constexpr std::string_view
-chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
+chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
   if (!params.chunk_tokens || params.chunk_tokens > kChunkedPrefillMaximumRows)
     return "chunk_tokens_out_of_range";
   if (uint64_t{params.committed_tokens} + params.chunk_tokens >
@@ -167,9 +167,9 @@ struct PagedVerifyBuffers final {
   std::span<const metal::MetalBuffer> pageTables;
 };
 
-// Q8 target attention over paged history. Prefill and verify both read the
-// history one Page32 at a time; neither changes cache ownership or commit
-// semantics.
+// Target attention over paged INT8 or BF16 history. Prefill and verify both
+// read the history one Page32 at a time; neither changes cache ownership or
+// commit semantics.
 class PagedAttention final {
 public:
   // The kernels read a sequence's history from its chunk parameters, so a
@@ -223,19 +223,19 @@ public:
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.
-  [[nodiscard]] static kv::Q8ChunkedPrefillParams
+  [[nodiscard]] static kv::ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
                 uint32_t chunkStride, uint32_t pageTableEntries);
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
   // staging, the only parameters addVerify attends.
-  [[nodiscard]] static kv::Q8ChunkedPrefillParams
+  [[nodiscard]] static kv::ChunkedPrefillParams
   verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
-                              const kv::Q8ChunkedPrefillParams &params,
+                              const kv::ChunkedPrefillParams &params,
                               kv::Layout layout);
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
@@ -247,13 +247,13 @@ public:
                          metal::MetalBuffer partials,
                          metal::MetalBuffer statistics,
                          metal::MetalBuffer pageTable,
-                         const kv::Q8ChunkedPrefillParams &chunk,
+                         const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
-                        std::span<const kv::Q8ChunkedPrefillParams> chunks,
+                        std::span<const kv::ChunkedPrefillParams> chunks,
                         const VerifyAttentionPlan &plan);
 };
 

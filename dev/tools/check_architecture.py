@@ -14,7 +14,7 @@ SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".metal"}
 INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULTILINE)
 OPERATOR_WORKSPACE_POLICY = re.compile(
     r"\b(?:PrefillAttentionWave|prefillAttentionTiles|"
-    r"kQ8VerifySplits|kQ8PrefillAttentionTileRows|"
+    r"kVerifySplits|kPrefillAttentionTileRows|"
     r"moeMaximumTiles|kMoePrefillTileRows|kMoeDecodeTileRows|"
     r"Q4DecodeKind|Q4DecodeShape|Q4PrefillShape|kQ4PrefillTileRows|"
     r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
