@@ -105,9 +105,11 @@ public:
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
   // Runs only between commands: throws std::logic_error while a command is
-  // in flight. Reclaim order follows ownership and preserves reusable
-  // prefixes for as long as possible: idle model state, empty KV extents,
-  // disposable checkpoints, then ordinary state/KV in LRU order.
+  // in flight. Returns idle model state first, then reclaims the cache:
+  // Cache::evictAll() under critical pressure, else Cache::reclaimCache,
+  // whose contract (Cache.hpp) gives the order; then returns the buffers
+  // evicted states parked. A warning pass keeps one lane's pooled buffers
+  // and one empty extent (keepServingFootprint).
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is

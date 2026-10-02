@@ -533,7 +533,9 @@ free pages scattered over the others as soon as they cover the extent that holds
 the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
-is left afterwards. Every extent a pass empties is released.
+is left afterwards. Every extent a pass empties is released, except that a
+warning pass, like startup cleanup, keeps one empty extent as the runway the next
+request starts from.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
