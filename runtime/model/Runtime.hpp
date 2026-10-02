@@ -55,7 +55,6 @@ public:
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;
-  [[nodiscard]] WarmupStepResult warmupDraftVerifyCommit() override;
   [[nodiscard]] WarmupStepResult
   warmupCompositeStateRestore() override;
   [[nodiscard]] ModelMemoryActual

@@ -309,7 +309,6 @@ std::string runtimeStatusJson(
       {"decode_b2", warmup.decodeBatches[1]},
       {"decode_b3", warmup.decodeBatches[2]},
       {"decode_b4", warmup.decodeBatches[3]},
-      {"draft_verify_commit", warmup.draftVerifyCommit},
       {"composite_state_restore", warmup.compositeStateRestore},
   };
   out << "},\"warmup\":{";

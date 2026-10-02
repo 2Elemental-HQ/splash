@@ -2822,52 +2822,6 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   return result;
 }
 
-WarmupStepResult Runtime::warmupDraftVerifyCommit() {
-  // Verify that a further commit preserves equal target and draft lengths.
-  constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 120;
-  double wallSeconds = 0.0;
-  std::vector<uint32_t> warmupPrompt{1};
-  ModelRequest request;
-  request.id = id;
-  request.prompt = warmupPrompt;
-  request.maxNewTokens = 16;
-  beginColdRequest(request, 0);
-  try {
-    const std::vector<uint32_t> pages{9};
-    requireRunwayPages(impl_->kvPages, pages);
-    BatchPlan prefillPlan{WorkKind::Prefill,
-                          BatchCohort::Greedy,
-                          {{id, 1}},
-                          DecodeStage::Regular};
-    ModelBatchItem prefillItem = warmupItem(id, 0, 1, pages);
-    prefillItem.inputTokens = request.prompt;
-    requireLanesSucceeded(
-        prefill(prefillPlan, std::span<const ModelBatchItem>(&prefillItem, 1)));
-    prepareWarmupDecode(id, warmupPrompt.back());
-    BatchPlan decodePlan{
-        WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem = warmupItem(id, 1, 0, pages);
-    auto result =
-        decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
-    requireLanesSucceeded(result);
-    const auto &lengths = impl_->states.metadata(0).lengths;
-    if (result.size() != 1 || result[0].outputTokens.empty() ||
-        !lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
-        lengths.targetTokens <= 1 ||
-        lengths.targetTokens != 1 + result[0].outputTokens.size() -
-                                    result[0].outputTokensWithoutKv) {
-      throw std::runtime_error("draft/target commit length mismatch");
-    }
-    wallSeconds = impl_->counters.lastDecodeWallSeconds;
-    end(id);
-  } catch (...) {
-    end(id);
-    throw;
-  }
-  return warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
-                      "real draft verify acceptance and exact commit");
-}
-
 WarmupStepResult Runtime::warmupCompositeStateRestore() {
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 121;
   constexpr uint32_t prefixTokens = 2 * kv::kPageTokens;

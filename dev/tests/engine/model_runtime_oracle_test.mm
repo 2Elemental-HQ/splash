@@ -1395,9 +1395,8 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
                   executor.telemetry().lastDecodeWidth == width,
               "prefill EOS skipped the actual decode warmup");
     }
-    require(executor.warmupDraftVerifyCommit().completed &&
-                executor.warmupCompositeStateRestore().completed,
-            "prefill EOS broke commit/restore warmup");
+    require(executor.warmupCompositeStateRestore().completed,
+            "prefill EOS broke the restore warmup");
   }
   setStops(decodeStop);
   {

@@ -115,7 +115,6 @@ void testCleanRuntimeStatus() {
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   warmup.maximumPrefillDetail = "packed_rows=2048";
@@ -319,7 +318,6 @@ void testCurrentReadinessAndSimultaneousPeak() {
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   MemoryGovernorSnapshot governor;
@@ -380,14 +378,12 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
   require(!warmup.ready(), "unexecuted warmup was ready");
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   require(warmup.ready(), "complete warmup was not ready");
 
   for (WarmupStepStatus *required : {&warmup.maximumPrefill,
-                                    &warmup.decodeBatches[0],
-                                    &warmup.draftVerifyCommit}) {
+                                    &warmup.decodeBatches[0]}) {
     for (WarmupStepStatus state : {WarmupStepStatus::Pending,
                                   WarmupStepStatus::MemoryLimited}) {
       *required = state;
