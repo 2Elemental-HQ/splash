@@ -745,7 +745,9 @@ GGML directly and prints GGML's hashes.
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
 weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
 projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes and every K split, and marks the device policy's pick;
+decode tiles at one to four lanes and every K split, and marks the device policy's pick, or, with
+a trailing `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row
+prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
