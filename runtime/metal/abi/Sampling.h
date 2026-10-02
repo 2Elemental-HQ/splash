@@ -53,27 +53,23 @@ struct TargetShardMass {
 static_assert(sizeof(TargetShardMass) == 12,
               "Target shard masses are 12 bytes on both sides");
 
-// A sampled row's selection over the whole vocabulary. The search merges
-// its shards' masses into the row's largest admitted logit, softmax
-// denominator and admitted count, and records where its min-p/top-k/top-p
+// A sampled row's selection over the whole vocabulary. The search records
+// the row's largest admitted logit and where its min-p/top-k/top-p
 // distribution ends in the order of the logits (the key and id of its last
-// token, metal/kernels/decode/sampling.metal). The draw writes the target
-// probability of the row's draft token and the token it draws: for a verify
-// row with a draft token, the correction acceptance takes if it rejects that
-// token (a draw from the residual distribution); otherwise a draw from the
-// row's distribution.
+// token, metal/kernels/decode/sampling.metal). The draw writes a drafted
+// row's target probability of its draft token; the token it draws goes to
+// the output tokens: for a verify row with a draft token, the correction
+// acceptance takes if it rejects that token (a draw from the residual
+// distribution); otherwise a draw from the row's distribution.
 struct TargetVocabularyRow {
   float maximum;
-  float mass;
-  uint32_t admitted;
   uint32_t end_key;
   uint32_t end_last;
   float draft_probability;
-  uint32_t token;
 };
 
-static_assert(sizeof(TargetVocabularyRow) == 28,
-              "Target vocabulary rows are 28 bytes on both sides");
+static_assert(sizeof(TargetVocabularyRow) == 16,
+              "Target vocabulary rows are 16 bytes on both sides");
 
 // One range of the vocabulary in such a row's draw, which one simdgroup of
 // the row's groups sums: the kept weight of its tokens other than the

@@ -74,8 +74,9 @@ struct SamplingBuffers final {
   // Per shard of a sampled row, its share of the row's softmax denominator
   // (metal/abi/Sampling.h TargetShardMass).
   metal::MetalBuffer partialMasses;
-  // Per sampled row, where its distribution ends and its draw
-  // (TargetVocabularyRow); acceptance reads a verify row's.
+  // Per sampled row, where its distribution ends and, for a drafted row,
+  // its draft token's probability (TargetVocabularyRow), which acceptance
+  // reads.
   metal::MetalBuffer vocabularyRows;
   metal::MetalBuffer uniforms;
   metal::MetalBuffer constraintMasks;
@@ -154,9 +155,10 @@ public:
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, both among the tokens the lane
   // admits: the first token after a prompt from one lane's row at
-  // rowOffset, and every verify row of a batch, whose draft token's
-  // probability and correction acceptance reads from the vocabulary rows.
-  // Both run the same kernels (addSelection).
+  // rowOffset, and every verify row of a batch. Each row's token goes to
+  // the output tokens; acceptance reads a sampled verify row's draft token
+  // probability from the vocabulary rows. Both run the same kernels
+  // (addSelection).
   void addInitial(metal::CommandGraph &graph, const SamplingPolicy &policy,
                   SamplingBuffers buffers, uint32_t rowOffset,
                   uint32_t stopToken0, uint32_t stopToken1,

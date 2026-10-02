@@ -734,8 +734,8 @@ inline bool vocabulary_draw(
 
 // Where a sampled row's distribution ends: its shards' masses, merged in
 // shard order into the row's largest admitted logit, softmax denominator and
-// admitted count, then the search. The record keeps them with the end; the
-// draw reads the maximum and the end.
+// admitted count, then the search. The record keeps the maximum and the
+// end, which the draw reads.
 inline void search_row(TargetRow row, device const TargetShardMass *masses,
                        float min_p, uint top_k, float top_p,
                        device TargetVocabularyRow &record,
@@ -748,8 +748,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
                        scratch, thread_index, lane, simd_group);
   if (thread_index == 0)
-    record = {merged.maximum, merged.sum, merged.admitted, end.key, end.last,
-              0.0f, 0xffffffffu};
+    record = {merged.maximum, end.key, end.last, 0.0f};
 }
 
 // Where the distribution of each selected row of the sampled lanes ends, one
@@ -821,8 +820,8 @@ kernel void decode_sample_vocabulary_draw(
           token, draft_probability) &&
       thread_index == 0) {
     tokens[s] = token;
-    record.draft_probability = draft_probability;
-    record.token = token;
+    if (drafted)
+      record.draft_probability = draft_probability;
   }
 }
 
@@ -1295,9 +1294,11 @@ inline void finish_acceptance(device const uint *tokens, uint accepted,
   next_anchor = tokens[retained - 1];
 }
 
-// A sampled verify row carries its draft token's target probability and the
-// correction a rejection takes or, for the last row, its bonus token
-// (TargetVocabularyRow).
+// A sampled lane's verify rows carry their draft tokens' target
+// probabilities (TargetVocabularyRow), and its output tokens their draws:
+// the correction a rejection takes or, for the last row, the bonus token.
+// Acceptance overwrites the accepted rows with the draft tokens, so row
+// accepted keeps its draw.
 inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device const uint *draft_ids,
                                 device const float *draft_probs,
@@ -1320,7 +1321,6 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
     output_tokens[accepted] = token;
     ++accepted;
   }
-  output_tokens[accepted] = target_rows[accepted].token;
   finish_acceptance(output_tokens, accepted, params, retained, next_anchor,
                     accepted_count);
 }

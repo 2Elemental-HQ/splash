@@ -139,7 +139,7 @@ void sampling() {
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
                 workspace.partialMassesBytes == count * 16 * 12 &&
-                workspace.vocabularyRowsBytes == count * 28 &&
+                workspace.vocabularyRowsBytes == count * 16 &&
                 workspace.vocabularyRangesBytes == count * 256 * 8 &&
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");

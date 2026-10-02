@@ -7,7 +7,7 @@
 // selects from them, among the tokens each lane admits: a greedy row takes
 // its argmax, and a sampled row draws from its distribution over the whole
 // vocabulary (the tokens min_p leaves, the top-k of those, then top-p of
-// their renormalized mass). Its softmax denominator, its draft token's
+// their renormalized mass). Its largest logit, its draft token's
 // probability and its draw must match an evaluation of the same rules in
 // double: the draw must fall where the reference distribution's cumulative
 // sum in token order places the uniform. DFlash acceptance must accept and
@@ -228,8 +228,6 @@ struct Distribution final {
   std::vector<uint32_t> order;
   float maximum = 0.0F;
   double mass = 0.0;
-  double admittedMass = 0.0;
-  uint32_t admitted = 0;
   double margin = 1.0;
   double ambiguousMass = 0.0;
   std::vector<double> probabilities;
@@ -251,14 +249,11 @@ Distribution referenceDistribution(const float *row, uint32_t vocabulary,
   std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
     return row[a] > row[b] || (row[a] == row[b] && a < b);
   });
-  result.admitted = static_cast<uint32_t>(order.size());
   result.maximum = row[order.front()];
   const double maximum = result.maximum;
   const auto weight = [&](uint32_t token) {
     return std::exp((double(row[token]) - maximum) / policy.temperature);
   };
-  for (const uint32_t token : order)
-    result.admittedMass += weight(token);
   result.ambiguous.assign(vocabulary, false);
   if (policy.minP > 0.0F) {
     const double cut =
@@ -365,18 +360,15 @@ void requireArrivalsReturned(const Batch &batch, uint32_t row,
           label + ": the draw left its arrival count");
 }
 
-// What the search records of a sampled row: its largest admitted logit,
-// softmax denominator and admitted count.
-void requireDenominator(const TargetVocabularyRow &record,
-                        const Distribution &target, const std::string &label) {
-  require(record.maximum == target.maximum &&
-              record.admitted == target.admitted &&
-              std::fabs(record.mass - target.admittedMass) <=
-                  1e-5 * target.admittedMass,
-          label + ": the scan's softmax denominator differs");
+// What the search records of a sampled row besides its end: its largest
+// admitted logit.
+void requireMaximum(const TargetVocabularyRow &record,
+                    const Distribution &target, const std::string &label) {
+  require(record.maximum == target.maximum,
+          label + ": the scan's largest logit differs");
 }
 
-// One verify row of a sampled lane: its softmax denominator, the target
+// One verify row of a sampled lane: its largest logit, the target
 // probability of its draft token and the correction a rejection takes, or,
 // for the last row, the bonus token.
 void requireSampledRow(const Batch &batch, uint32_t index,
@@ -384,12 +376,13 @@ void requireSampledRow(const Batch &batch, uint32_t index,
   const uint32_t row = index % kRows;
   const TargetVocabularyRow &record = batch.record(index);
   requireArrivalsReturned(batch, index, label);
-  requireDenominator(record, target, label);
+  requireMaximum(record, target, label);
   const uint32_t lane = index / kRows;
   const float uniform = batch.uniforms()[lane * 2 * kRows + 2 * kRows - 1];
+  const uint32_t token = batch.outputTokens()[index];
   if (row == kPositions) {
-    requireDraw(record.token, target.probabilities, uniform,
-                target.ambiguousMass, label + " bonus");
+    requireDraw(token, target.probabilities, uniform, target.ambiguousMass,
+                label + " bonus");
     return;
   }
   const uint32_t draft = batch.inputTokens()[index + 1];
@@ -403,7 +396,7 @@ void requireSampledRow(const Batch &batch, uint32_t index,
               std::to_string(record.draft_probability) + " for " +
               std::to_string(expected));
   const uint64_t position = uint64_t{lane} * kPositions + row;
-  requireDraw(record.token,
+  requireDraw(token,
               residualWeights(
                   target,
                   static_cast<const uint32_t *>(
@@ -420,7 +413,7 @@ void requireSampledRow(const Batch &batch, uint32_t index,
 void requireInitialDraw(const Batch &batch, const Distribution &target,
                         const std::string &label) {
   requireArrivalsReturned(batch, 0, label);
-  requireDenominator(batch.record(0), target, label);
+  requireMaximum(batch.record(0), target, label);
   requireDraw(batch.outputTokens()[0], target.probabilities,
               batch.uniforms()[0], target.ambiguousMass, label);
 }
@@ -873,11 +866,8 @@ void extremes(MetalBackend &backend) {
                   label + ": greedy did not take the lowest saturated id");
           continue;
         }
-        const TargetVocabularyRow &record = batch.record(0);
-        require(record.maximum == limit &&
-                    record.admitted == (c.masked ? kSaturated : vocabulary) &&
-                    record.mass == float(kSaturated),
-                label + ": the saturated candidates' denominator differs");
+        require(batch.record(0).maximum == limit,
+                label + ": the saturated candidates' maximum differs");
         requireDraw(token, kept, uniform, 0.0, label);
       }
     }
@@ -1165,11 +1155,10 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
       require(std::memcmp(&batch.record(lane * kRows), &single.record(0),
                           single.buffers.vocabularyRows.sizeBytes()) == 0,
               "mixed verification changed sampled rows");
-    else
-      require(std::memcmp(batch.outputTokens() + lane * kRows,
-                          single.outputTokens(),
-                          single.buffers.outputTokens.sizeBytes()) == 0,
-              "mixed verification changed greedy tokens");
+    require(std::memcmp(batch.outputTokens() + lane * kRows,
+                        single.outputTokens(),
+                        single.buffers.outputTokens.sizeBytes()) == 0,
+            "mixed verification changed a lane's tokens");
   }
 }
 
@@ -1255,11 +1244,10 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               "batched target differs from masked CPU argmax");
       continue;
     }
-    const TargetVocabularyRow &record = batch.record(row);
-    require(record.token == id,
+    require(tokens[row] == id,
             "a sampled top-1 row drew other than its masked CPU argmax");
     if (row % kRows != kRows - 1)
-      require(record.draft_probability ==
+      require(batch.record(row).draft_probability ==
                   (batch.inputTokens()[row + 1] == id ? 1.0F : 0.0F),
               "a sampled top-1 row's draft probability is not one-hot");
   }
@@ -1364,12 +1352,12 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
                     "a greedy verify row mishandled the stop tokens");
             continue;
           }
-          const TargetVocabularyRow &record = batch.record(row);
-          require(row % kRows != 0 || (record.draft_probability > 0.0F) !=
-                                          policy.excludesStopTokens,
+          require(row % kRows != 0 ||
+                      (batch.record(row).draft_probability > 0.0F) !=
+                          policy.excludesStopTokens,
                   "a verify distribution mishandled the stop tokens");
           require(!policy.excludesStopTokens ||
-                      (record.token < vocabulary && !stop(record.token)),
+                      (tokens[row] < vocabulary && !stop(tokens[row])),
                   "an excluding verify row drew a stop token");
         }
         CommandGraph accept;
@@ -1736,10 +1724,8 @@ void overProposedResidual(MetalBackend &backend) {
     const auto value = [](const MetalBuffer &buffer) {
       return *static_cast<const uint32_t *>(buffer.contents());
     };
-    const uint32_t correctionToken = batch.record(0).token;
     require(value(acceptance.acceptedCounts) == 0 &&
-                batch.outputTokens()[0] == correctionToken &&
-                value(acceptance.nextAnchors) == correctionToken,
+                value(acceptance.nextAnchors) == batch.outputTokens()[0],
             label + ": acceptance did not take the correction as its anchor");
   }
 }
