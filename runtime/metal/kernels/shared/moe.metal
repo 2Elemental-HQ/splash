@@ -5,7 +5,8 @@
 
 // Routes group rows by expert so each tile streams its weights once. Each row
 // carries top_k routed experts plus the shared expert (id `experts`), weighted
-// by the sigmoid of its scalar gate. Experts use the StorageN=256 Q4 layout.
+// by the sigmoid of its scalar gate. Experts use the packed Q4 layout
+// (kQ4StorageColumns-column tiles).
 //
 // Routing first writes 256 fp32 scores per row, then sorts them. Q8 affine
 // terms accumulate per K slice, and slices sum in fixed order so both score
@@ -633,7 +634,7 @@ inline void moe_expert_tile(device bfloat *grouped_input,
   }
   device bfloat *input = grouped_input + ulong(group.y) * 8 * params.input_size;
   device bfloat *tile_output = output + ulong(group.y) * 8 * params.output_size;
-  q4_mpp_tile<TileN, GateUp, false, 256, false, Simdgroups>(
+  q4_mpp_tile<8, TileN, GateUp, false, false, Simdgroups>(
       input, slab_0.weights, slab_0.scales, slab_0.biases, tile_output,
       slab_1.weights, slab_1.scales, slab_1.biases, tile_output,
       params.output_size, params.input_size, input_sums, group.x * TileN,

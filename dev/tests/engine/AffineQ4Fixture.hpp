@@ -1,8 +1,8 @@
 #pragma once
 
 // Affine Q4 test weights in the layout the kernels read: per output and
-// 64-input group one parameter, in StorageN=256 order, with 32 bytes of
-// packed nibbles and a bf16 scale and bias. A packed slab of
+// 64-input group one parameter, in the packed 256-column storage order, with
+// 32 bytes of packed nibbles and a bf16 scale and bias. A packed slab of
 // model::q4PackedBytes holds the nibbles, then the scales, then the biases
 // (model::readAffineProjection). Shared by the Linear and MoE tests.
 

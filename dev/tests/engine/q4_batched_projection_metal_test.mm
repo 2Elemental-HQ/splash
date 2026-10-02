@@ -352,8 +352,9 @@ void run(const std::string &metallibPath) {
   }
   std::memset(reference.contents(), 0, reference.sizeBytes());
 
-  // Every Q4 projection has one StorageN=256 representation. These compute
-  // kernels consume it with TileN=128 for the four fixed DFlash batch widths.
+  // Every Q4 projection has one packed 256-column storage representation.
+  // These compute kernels consume it with TileN=128 for the four fixed DFlash
+  // batch widths.
   const Q4PersistentParams params{kOutput, kInput, kGroups};
   std::vector<ComputeDispatch> singles;
   std::memset(reference.contents(), 0, reference.sizeBytes());

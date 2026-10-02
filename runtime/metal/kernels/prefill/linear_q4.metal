@@ -51,12 +51,11 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
   matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   auto a0 = a.slice<64, TileM>(0, 0);
   uint quant_groups = input_size / 64;
-  constexpr ushort WeightTileN = 256; // weights are stored in 256-column tiles
-  uint tile = output_origin / WeightTileN;
-  uint tile_column = output_origin % WeightTileN;
+  uint tile = output_origin / kQ4StorageColumns;
+  uint tile_column = output_origin % kQ4StorageColumns;
   device uchar *tile_weights =
       weights +
-      (ulong(tile) * quant_groups * WeightTileN + tile_column) * 64 / 2;
+      (ulong(tile) * quant_groups * kQ4StorageColumns + tile_column) * 64 / 2;
   tensor<device uint4b_format, dextents<int, 2>, tensor_inline> first_b(
       tile_weights, dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
   auto b0 = first_b.slice<64, TileN>(0, 0);
@@ -86,7 +85,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
     uint input_origin = quant_group * 64;
     auto a_slice = a.slice<64, TileM>(input_origin, 0);
     device uchar *group_weights =
-        tile_weights + ulong(quant_group) * WeightTileN * 64 / 2;
+        tile_weights + ulong(quant_group) * kQ4StorageColumns * 64 / 2;
     tensor<device uint4b_format, dextents<int, 2>, tensor_inline> b(
         group_weights, dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
     auto b_slice = b.slice<64, TileN>(0, 0);
@@ -99,7 +98,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
       auto index = accumulated.get_multidimensional_index(i);
       uint row = index[1];
       ulong parameter =
-          (ulong(tile) * quant_groups + quant_group) * WeightTileN +
+          (ulong(tile) * quant_groups + quant_group) * kQ4StorageColumns +
           tile_column + index[0];
       float sum = StagedSums
           ? input_sums[(quant_group % PrefillSumBatch) * TileM + row]

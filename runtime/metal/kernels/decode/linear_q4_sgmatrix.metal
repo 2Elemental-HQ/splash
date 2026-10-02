@@ -2,14 +2,16 @@
 // lets the compiler reassociate, so the epilogue order below is fixed. Set
 // before the includes, so it also holds for their code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/q4_mpp_tiles.h"
 #include "metal/kernels/common/q4_sgmatrix.h"
 #include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
 
-// Packed Q4 stays in its shipped StorageN=256 layout. Each simdgroup computes
-// W X^T for 16 columns (8 for the two gate/up streams). The bfloat operand
-// 128+q is exact for every nibble; subtracting 128*sum(x) in fp32 recovers q*x.
-// This preserves the bf16 activation range without relying on half denormals.
+// Packed Q4 keeps its storage tiles of kQ4StorageColumns columns
+// (q4_mpp_tiles.h). Each simdgroup computes W X^T for 16 columns (8 for the
+// two gate/up streams). The bfloat operand 128+q is exact for every nibble;
+// subtracting 128*sum(x) in fp32 recovers q*x. This preserves the bf16
+// activation range without relying on half denormals.
 namespace q4sg {
 enum class Epilogue { Affine, Residual, GateUp };
 
@@ -44,14 +46,15 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
   const uint base = tg.x * tileN + sg * (gateUp ? 8 : 16);
-  const uint tile = base / 256;
-  const uint col0 = base % 256 + fm;
+  constexpr uint kGroupBytes = kQ4StorageColumns * 64 / 2;
+  const uint tile = base / kQ4StorageColumns;
+  const uint col0 = base % kQ4StorageColumns + fm;
   const uint col1 = gateUp ? col0 : col0 + 8;
-  device const uchar *tile0 = w0 + ulong(tile) * groups * 8192;
-  device const uchar *tile1 = w1 + ulong(tile) * groups * 8192;
+  device const uchar *tile0 = w0 + ulong(tile) * groups * kGroupBytes;
+  device const uchar *tile1 = w1 + ulong(tile) * groups * kGroupBytes;
   auto load = [&](uint g, thread uint2 (&w)[2]) __attribute__((always_inline)) {
-    w[0] = *reinterpret_cast<device const uint2 *>(tile0 + ulong(g) * 8192 + col0 * 32 + c * 8);
-    w[1] = *reinterpret_cast<device const uint2 *>(tile1 + ulong(g) * 8192 + col1 * 32 + c * 8);
+    w[0] = *reinterpret_cast<device const uint2 *>(tile0 + ulong(g) * kGroupBytes + col0 * 32 + c * 8);
+    w[1] = *reinterpret_cast<device const uint2 *>(tile1 + ulong(g) * kGroupBytes + col1 * 32 + c * 8);
   };
   float2 acc[2] = {float2(0), float2(0)};
   // Initialize every chain before the loop, including under GPU validation.
@@ -76,8 +79,8 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
         sgmatrix::mma_acc<bfloat>(dot[nf][j & 1], as_type<bfloat2>(pair), b);
       }
     }
-    const ulong prm0 = (ulong(tile) * groups + g) * 256 + col0;
-    const ulong prm1 = (ulong(tile) * groups + g) * 256 + col1;
+    const ulong prm0 = (ulong(tile) * groups + g) * kQ4StorageColumns + col0;
+    const ulong prm1 = (ulong(tile) * groups + g) * kQ4StorageColumns + col1;
     const float2 d0 = fma(-128.0f, sum, dot[0][0] + dot[0][1]);
     const float2 d1 = fma(-128.0f, sum, dot[1][0] + dot[1][1]);
     acc[0] = fma(d0, float(sc0[prm0]), acc[0]);

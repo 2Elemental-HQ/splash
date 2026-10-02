@@ -1247,8 +1247,9 @@ std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   return result;
 }
 
-// Scalar reference uses the actual StorageN=256 bytes and FP32 per-group
-// affine accumulation, including the BF16 boundary before each epilogue.
+// Scalar reference uses the actual packed 256-column storage bytes and FP32
+// per-group affine accumulation, including the BF16 boundary before each
+// epilogue.
 float affineReference(const Projection &p, const uint16_t *input,
                         uint32_t row, uint32_t column) {
   const auto *weights = static_cast<const uint8_t *>(p.affine().weights.contents());

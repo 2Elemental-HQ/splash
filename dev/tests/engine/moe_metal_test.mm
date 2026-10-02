@@ -65,7 +65,7 @@ constexpr uint32_t kRoutesPerRow = kTopK + 1;
 // Covers both router tiles: 8-row tiles below kMoeRouteWideRows and 32-row
 // tiles with a ragged 8-row tail above it.
 constexpr uint32_t kMaximumRows = 520;
-constexpr uint32_t kStorageN = 256;
+constexpr uint32_t kStorageColumns = 256;
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -108,9 +108,10 @@ MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
 
 float bf16(float value) { return float(__bf16(value)); }
 
-// One expert's Q4 slab in StorageN=256 order: [weights][scales][biases], the
-// parameter of output n and quant group g at (tile(n) * groups + g) * 256 +
-// n % 256 and its 64 nibbles right after the previous column's.
+// One expert's Q4 slab in the packed 256-column storage order:
+// [weights][scales][biases], the parameter of output n and quant group g at
+// (tile(n) * groups + g) * 256 + n % 256 and its 64 nibbles right after the
+// previous column's.
 struct ExpertSlab final {
   std::vector<uint8_t> nibbles; // [n][k] dequantized as q * scale + bias
   std::vector<float> scales;    // [parameter]
@@ -120,7 +121,7 @@ struct ExpertSlab final {
 
   [[nodiscard]] uint32_t parameter(uint32_t n, uint32_t g) const {
     const uint32_t groups = inputSize / 64;
-    return ((n / kStorageN) * groups + g) * kStorageN + n % kStorageN;
+    return ((n / kStorageColumns) * groups + g) * kStorageColumns + n % kStorageColumns;
   }
   [[nodiscard]] float weight(uint32_t n, uint32_t k) const {
     return nibbles[uint64_t{n} * inputSize + k];
@@ -188,11 +189,11 @@ float silu(float value) { return value / (1.0F + std::exp(-value)); }
 // routing distribution through the production router without CPU routing
 // injection. The shared gate remains a scalar bias-only Q8 projection.
 Q8Projection fixtureRouter(MetalBackend &backend, bool sharedGate) {
-  const uint64_t elements = uint64_t{kStorageN} * kHidden;
+  const uint64_t elements = uint64_t{kStorageColumns} * kHidden;
   Q8Projection projection{{shared(backend, elements, "moe-router-weights"),
                            shared(backend, elements / 32, "moe-router-scales"),
                            shared(backend, elements / 32, "moe-router-biases")},
-                          kStorageN, kHidden};
+                          kStorageColumns, kHidden};
   if (!sharedGate) {
     auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
     auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
@@ -204,9 +205,9 @@ Q8Projection fixtureRouter(MetalBackend &backend, bool sharedGate) {
   }
   auto *values = static_cast<__bf16 *>(projection.planes.biases.contents());
   for (uint32_t group = 0; group < kHidden / 64; ++group) {
-    for (uint32_t output = 0; output < kStorageN; ++output) {
+    for (uint32_t output = 0; output < kStorageColumns; ++output) {
       const float value = output ? 0.0F : 0.003F;
-      values[group * kStorageN + output] = __bf16(value);
+      values[group * kStorageColumns + output] = __bf16(value);
     }
   }
   return projection;
@@ -378,7 +379,7 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   const auto *groupedInput = static_cast<const uint8_t *>(
       fixture.buffers.scratch.groupedInput.contents());
   const uint64_t inputRowBytes = uint64_t{kHidden} * kBFloat16Bytes;
-  const uint64_t scoresBytes = uint64_t{rows} * kStorageN * sizeof(float);
+  const uint64_t scoresBytes = uint64_t{rows} * kStorageColumns * sizeof(float);
   for (uint32_t tile = 0; tile < *tileCount; ++tile) {
     const uint32_t liveRows = tiles[tile * 2 + 1];
     require(liveRows > 0 && liveRows <= tileRows,
@@ -519,7 +520,7 @@ template <class Function> void rejects(Function function, const char *label) {
 
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16. The grouped input first holds the router's fp32
-// scores, one StorageN row per token.
+// scores, one kStorageColumns row per token.
 void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
@@ -539,7 +540,7 @@ void checkPlan(const MoePlan &plan) {
               w.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
               w.routeRowsBytes == routes * sizeof(uint32_t) &&
               w.groupedInputBytes == std::max<uint64_t>(grouped * shape.hiddenSize * kBFloat16Bytes,
-                                                        rows * kStorageN * sizeof(float)) &&
+                                                        rows * kStorageColumns * sizeof(float)) &&
               w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
               w.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes && w.groupedSumsBytes == 0,
           "plan workspace disagrees with independent geometry bound");
@@ -672,7 +673,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
-              dispatches[0].threadgroups.y == kStorageN / route.experts &&
+              dispatches[0].threadgroups.y == kStorageColumns / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
               dispatches[3].threadgroups.x == plan.maximumTiles() && tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
@@ -764,11 +765,11 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
 // A dense random Q8 router: the routing fixture's one-weight experts cannot
 // expose accumulation-order differences between the scores tiles.
 Q8Projection randomRouter(MetalBackend &backend, Random &random) {
-  const uint64_t elements = uint64_t{kStorageN} * kHidden;
+  const uint64_t elements = uint64_t{kStorageColumns} * kHidden;
   Q8Projection projection{{shared(backend, elements, "dense-router-weights"),
                            shared(backend, elements / 32, "dense-router-scales"),
                            shared(backend, elements / 32, "dense-router-biases")},
-                          kStorageN, kHidden};
+                          kStorageColumns, kHidden};
   auto *weights = static_cast<uint8_t *>(projection.planes.weights.contents());
   auto *scales = static_cast<__bf16 *>(projection.planes.scales.contents());
   auto *biases = static_cast<__bf16 *>(projection.planes.biases.contents());
@@ -791,7 +792,7 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   const auto *weights = static_cast<const uint8_t *>(router.planes.weights.contents());
   const auto *scales = static_cast<const __bf16 *>(router.planes.scales.contents());
   const auto *biases = static_cast<const __bf16 *>(router.planes.biases.contents());
-  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageN * 4;
+  const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageColumns * 4;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
@@ -800,34 +801,34 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
     graph.add("moe_route_scores_q8_m8",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, narrow},
-              params, {(rows + 7) / 8, kStorageN / 32, 1});
+              params, {(rows + 7) / 8, kStorageColumns / 32, 1});
     graph.add("moe_route_scores_q8_m32",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, wide},
-              params, {(rows + 31) / 32, kStorageN / 128, 1});
+              params, {(rows + 31) / 32, kStorageColumns / 128, 1});
     (void)backend.submitCommand(graph.dispatches());
     const std::string label = "router tiles rows=" + std::to_string(rows);
     require(std::memcmp(narrow.contents(), wide.contents(),
-                        uint64_t{rows} * kStorageN * 4) == 0,
+                        uint64_t{rows} * kStorageColumns * 4) == 0,
             label + ": 8-row and 32-row tiles disagree");
     const auto *values = static_cast<const float *>(narrow.contents());
     for (uint32_t row = 0; row < rows; ++row) {
-      for (uint32_t expert = 0; expert < kStorageN; ++expert) {
+      for (uint32_t expert = 0; expert < kStorageColumns; ++expert) {
         double reference = 0;
         double magnitude = 0;
         for (uint32_t g = 0; g < kHidden / 64; ++g) {
-          const double scale = float(scales[g * kStorageN + expert]);
-          const double bias = float(biases[g * kStorageN + expert]);
+          const double scale = float(scales[g * kStorageColumns + expert]);
+          const double bias = float(biases[g * kStorageColumns + expert]);
           for (uint32_t k = g * 64; k < g * 64 + 64; ++k) {
             const double x = fixture.input[row][k];
             const double q =
-                weights[(uint64_t{g} * kStorageN + expert) * 64 + k % 64];
+                weights[(uint64_t{g} * kStorageColumns + expert) * 64 + k % 64];
             reference += x * (q * scale + bias);
             // The kernel sums the two affine terms apart.
             magnitude += std::abs(x) * (q * std::abs(scale) + std::abs(bias));
           }
         }
-        const float value = values[uint64_t{row} * kStorageN + expert];
+        const float value = values[uint64_t{row} * kStorageColumns + expert];
         require(std::isfinite(value) &&
                     std::abs(value - reference) <=
                         std::ldexp(magnitude * kHidden, -24),
