@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -26,6 +27,7 @@ namespace {
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
 constexpr model::DraftStateLayout kDraftState{5, 8, 2'048, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
+constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -114,7 +116,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 2048, 4}};
-  auto file = std::make_shared<model::SlotFile>(layout.cachedBytes(), 3 * layout.cachedBytes());
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  auto file = std::make_shared<model::SlotFile>(slotBytes, 3 * slotBytes);
   model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
   require(static_cast<bool>(storage.tryActivateSlot(0, 1)), "fault source activation failed");
   storage.updateLengths(0, {4096, 2048, 2048, 0});
@@ -160,7 +163,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
               "offload did not recover after allocation failures");
       return;
     }
-    require(file->usedBytes() == layout.cachedBytes(),
+    require(file->usedBytes() == slotBytes,
             "failed offload leaked its disk quota");
   }
   throw std::runtime_error("offload allocation failure sweep never reached success");
@@ -170,7 +173,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
   require(static_cast<bool>(storage.tryActivateSlot(0, 123)), "disk source activation failed");
   const auto &buffers = storage.buffers(0);
   // Every byte of the state travels through the file; markers alone would
@@ -253,7 +256,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
-      std::make_shared<model::SlotFile>(kStateLayout.cachedBytes(), kStateLayout.cachedBytes()));
+      std::make_shared<model::SlotFile>(kStateSlotBytes, kStateSlotBytes));
   require(storage.canSnapshotToDisk(), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateSlot(0, 321)), "lane activation failed");
   const auto &buffers = storage.buffers(0);
@@ -309,6 +312,50 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   storage.releaseSlot(0, 321);
 }
 
+// A state need not fill its slot: the write zeros the slot past it and the
+// read leaves the rest, in a slot one alignment unit larger than an aligned
+// state and in the rounded-up slot of a state that is not aligned.
+void testStateSmallerThanSlot(metal::MetalBackend &backend) {
+  constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
+  constexpr model::CompositeStateLayout aligned{target, {1, 1, 2048, 4}};
+  constexpr model::CompositeStateLayout unaligned{target, {1, 1, 2048, 1}};
+  constexpr uint64_t unit = model::SlotFile::kAlignmentBytes;
+  static_assert(aligned.cachedBytes() % unit == 0 && unaligned.cachedBytes() % unit != 0);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  for (const auto &[layout, slotBytes] :
+       {std::pair{aligned, aligned.cachedBytes() + unit},
+        std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
+    model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout,
+                                    std::make_shared<model::SlotFile>(slotBytes, slotBytes));
+    require(static_cast<bool>(storage.tryActivateSlot(0, 77)), "lane activation failed");
+    const auto &buffers = storage.buffers(0);
+    fill(buffers.gdn[0].stateBase, 31);
+    for (size_t layer = 0; layer < buffers.draft.size(); ++layer) {
+      fill(buffers.draft[layer].keys, 32 + 2 * layer);
+      fill(buffers.draft[layer].values, 33 + 2 * layer);
+    }
+    const auto images = stateImage(buffers, 0);
+    storage.updateLengths(0, {4096, 2048, 2048, 0});
+    auto write = storage.snapshotToDisk(0, {});
+    require(write && finishWhenReady(*write), "a state did not reach a larger slot");
+    auto disk = write->state();
+    write.reset();
+
+    fill(buffers.gdn[0].stateBase, 34);
+    for (const auto &layer : buffers.draft) {
+      fill(layer.keys, 35);
+      fill(layer.values, 36);
+    }
+    storage.updateLengths(0, {});
+    auto read = storage.beginRestore(0, *disk, true, {}, [] {});
+    require(read && finishWhenReady(*read) && stateImage(buffers, 0) == images,
+            "a state did not come back exactly from a larger slot");
+    read.reset();
+    disk.reset();
+    storage.releaseSlot(0, 77);
+  }
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -319,6 +366,7 @@ void run(const std::string &metallib) {
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
+  testStateSmallerThanSlot(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   // Switched off to prove that a pooled cache slot needs no new admission;

@@ -103,11 +103,8 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
               pages.isAllocated(pageB),
           "test pages were not mapped");
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
   const uint64_t payload = pages.bytesPerPage();
-  require(slotBytes >= payload && slotBytes < payload + SlotFile::kAlignmentBytes &&
-              slotBytes % SlotFile::kAlignmentBytes == 0,
-          "KV slot size is not the page rounded up for uncached IO");
+  const uint64_t slotBytes = SlotFile::slotBytesFor(payload);
   auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
   KvPageTier tier(pages, file);
   require(tier.slotBytes() == slotBytes, "tier reports another slot size");
@@ -167,7 +164,7 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, 8 * slotBytes);
   KvPageTier tier(pages, file, 4);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
@@ -219,7 +216,7 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
-  const uint64_t bytes = KvPageTier::slotBytesFor(pages);
+  const uint64_t bytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   for (bool restoring : {false, true}) {
     bool completed = false;
     for (int failure = 0; failure < 64; ++failure) {
@@ -262,7 +259,7 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, 4 * slotBytes);
   KvPageTier tier(pages, file);
   auto first = tier.acquireSlot();
@@ -302,7 +299,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
   KvPageTier tier(pages, file);
   constexpr uint32_t restored = 16, demoted = 25, neighbours = 8;
@@ -413,7 +410,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
-  const uint64_t slotBytes = KvPageTier::slotBytesFor(pages);
+  const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, 16 * slotBytes);
   {
     KvPageTier tier(pages, file, 16);

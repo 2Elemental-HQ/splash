@@ -26,9 +26,6 @@ public:
   };
   static constexpr uint32_t kDefaultTransfers = 128;
 
-  // Disk bytes per page: the page rounded up for uncached IO.
-  [[nodiscard]] static uint64_t slotBytesFor(const kv::PageStorage &pages) noexcept;
-
   KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
              uint32_t transfers = kDefaultTransfers);
   ~KvPageTier() override;
@@ -53,7 +50,6 @@ private:
 
   kv::PageStorage &pages_;
   std::shared_ptr<model::SlotFile> file_;
-  uint64_t slotBytes_;
   uint32_t transferLimit_;
   uint32_t demotionLimit_;
   uint32_t restoreLimit_;

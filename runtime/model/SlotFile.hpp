@@ -66,6 +66,10 @@ class SlotFile final {
 public:
   // Slot offsets and every transfer stay aligned to this for uncached IO.
   static constexpr uint64_t kAlignmentBytes = 16384;
+  // The slot that holds payloadBytes: writes zero the rest.
+  [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
+    return (payloadBytes + kAlignmentBytes - 1) / kAlignmentBytes * kAlignmentBytes;
+  }
 
   class Slot final {
   public:

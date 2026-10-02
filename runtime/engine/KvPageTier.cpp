@@ -34,17 +34,11 @@ std::shared_ptr<KvPageTier::DiskSlot> diskSlot(const std::shared_ptr<KvDiskSlot>
 }
 } // namespace
 
-uint64_t KvPageTier::slotBytesFor(const kv::PageStorage &pages) noexcept {
-  const uint64_t unit = model::SlotFile::kAlignmentBytes;
-  return (pages.bytesPerPage() + unit - 1) / unit * unit;
-}
-
 KvPageTier::KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
                        uint32_t transfers)
-    : pages_(pages), file_(std::move(file)), slotBytes_(slotBytesFor(pages)),
-      transferLimit_(transfers) {
-  if (!file_ || file_->slotBytes() != slotBytes_)
-    throw std::invalid_argument("KV slot file does not match the page size");
+    : pages_(pages), file_(std::move(file)), transferLimit_(transfers) {
+  if (!file_)
+    throw std::invalid_argument("KV tier needs a slot file");
   if (!transferLimit_)
     throw std::invalid_argument("KV tier needs room for one transfer");
   demotionLimit_ = std::max<uint32_t>(1, transferLimit_ / 2);
@@ -63,7 +57,7 @@ KvPageTier::~KvPageTier() {
     transfer->io->drain();
 }
 
-uint64_t KvPageTier::slotBytes() const noexcept { return slotBytes_; }
+uint64_t KvPageTier::slotBytes() const noexcept { return file_->slotBytes(); }
 
 bool KvPageTier::writable() const noexcept { return file_->writable(); }
 

@@ -303,7 +303,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   if (config.maximumCacheDiskBytes) {
     diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
     try {
-      stateFile = std::make_shared<model::SlotFile>(stateBytes, diskBudget);
+      stateFile = std::make_shared<model::SlotFile>(
+          model::SlotFile::slotBytesFor(stateBytes), diskBudget);
     } catch (const std::exception &error) {
       diskBudget.reset();
       logStartup("Cache disk tier disabled (", error.what(),
@@ -495,7 +496,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     std::unique_ptr<KvPageTier> kvTier;
     if (diskBudget) {
       try {
-        const uint64_t slotBytes = KvPageTier::slotBytesFor(*kvPages);
+        const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
         kvTier = std::make_unique<KvPageTier>(
             *kvPages, std::make_shared<model::SlotFile>(slotBytes, diskBudget));
         logStartup("Cache disk tier: ", config.maximumCacheDiskBytes / kMiB,

@@ -220,8 +220,6 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
       layout_.draft.tokens != ExecutionLimits::draftContextTokens) {
     throw std::invalid_argument("Qwen composite state layout is invalid");
   }
-  if (file && file->slotBytes() != layout_.cachedBytes())
-    throw std::invalid_argument("state file slots do not hold one state");
   if (file) {
     file_ = std::move(file);
     staging_ = std::make_shared<StateStaging>();

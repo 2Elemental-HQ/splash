@@ -13,6 +13,12 @@
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
 
+// A slot is its payload rounded up to the alignment of uncached IO.
+static_assert(SlotFile::slotBytesFor(1) == SlotFile::kAlignmentBytes &&
+              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes) == SlotFile::kAlignmentBytes &&
+              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes + 1) ==
+                  2 * SlotFile::kAlignmentBytes);
+
 static void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
 }
