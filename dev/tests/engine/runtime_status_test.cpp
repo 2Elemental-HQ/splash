@@ -128,9 +128,8 @@ void testCleanRuntimeStatus() {
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
   identity.buildId = "build";
-  identity.kvLayout = kv::makeLayoutGuard({16, 4, 256}, {});
-  identity.kvLayout.modelArtifactSha256.fill(0xbc);
-  identity.namespaceSha256 = std::string(64, 'd');
+  identity.kvLayout = kv::Layout{16, 4, 256};
+  identity.targetModelSha256 = std::string(64, 'b');
 
   metal::MetalMemoryStats metal;
   metal.allocatedBytes = 4 * kGiB;
@@ -190,11 +189,22 @@ void testCleanRuntimeStatus() {
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
           "the memory plan status omitted the disk tier's state staging");
-  require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
-              json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
+  const std::string kvIdentity =
+      "{\"target_model_sha256\":\"" + std::string(64, 'b') +
+      "\",\"format\":\"int8\",\"quantization\":\"symmetric_int8\","
+      "\"scale_type\":\"float32\",\"key_layout\":\"token_major\","
+      "\"value_layout\":\"dimension_major\"}";
+  require(json.find("\"kv\":" + kvIdentity) != std::string::npos &&
+              json.find("\"q8\":" + kvIdentity) != std::string::npos,
           "INT8 status lost its generic or legacy identity");
+  require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
+                    "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
+                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32}") !=
+                  std::string::npos &&
+              json.find("runtime_cache_namespace") == std::string::npos,
+          "status lost the cache identity or reported a cache namespace");
   auto bf16Identity = identity;
-  bf16Identity.kvLayout = kv::makeLayoutGuard({16, 4, 256, kv::Format::BFloat16}, {});
+  bf16Identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, bf16Identity, governor, true);
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&

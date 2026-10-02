@@ -230,7 +230,7 @@ void runUntilIdle(engine::NativeRuntime &loop) {
 void testPromptProgress() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -335,7 +335,7 @@ void testPromptProgress() {
 void testWireLifecycleAndCacheHit() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -411,7 +411,7 @@ void testWireLifecycleAndCacheHit() {
 void testGenerationPromptBoundsTheReplayState() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -447,7 +447,7 @@ void testGenerationPromptBoundsTheReplayState() {
 void testRequestFlagsReachTheModel() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   double monotonic = 100.0;
   engine::NativeLoopConfig config;
@@ -476,7 +476,7 @@ void testRequestFlagsReachTheModel() {
 void testSamplingReachesTheModel() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   double monotonic = 100.0;
   engine::NativeLoopConfig config;
@@ -516,7 +516,7 @@ void testSamplingReachesTheModel() {
 void testFatalFramingClosesConnection() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 8);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeRuntime loop(
@@ -538,7 +538,7 @@ void testFatalFramingClosesConnection() {
 void testRequestErrorKeepsFraming() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -604,7 +604,7 @@ void testCapacityFailureHasOneTerminalFrame() {
   test::TestKvStorage storage(4, 4096, 1);
   storage.budgetPages = 1;
   KvPool pool(storage, 1);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -660,7 +660,7 @@ void testCommandWatchdogAndPendingHealthWake() {
   for (bool gpuCompleted : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
     double now = 0.0;
@@ -722,7 +722,7 @@ void testCommandWatchdogAndPendingHealthWake() {
 
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
@@ -736,7 +736,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   for (bool malformed : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     protocol::ProtocolLimits limits;
@@ -777,7 +777,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 void testCancelledIdIsReusableInTheSameInput() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeRuntime loop(
@@ -820,7 +820,7 @@ void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeRuntime loop(
@@ -862,7 +862,7 @@ void testFrameFailureUsesExecutionBoundary() {
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
@@ -909,7 +909,7 @@ void testFrameFailureUsesExecutionBoundary() {
 void testInvalidLimitsAreRejectedAtConstruction() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 8);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   protocol::ProtocolLimits limits;
   limits.maxMaskWords = 0;
@@ -930,7 +930,7 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 void testAdmissionExceptionStopsTheEngineOnce() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.onBegin = [] { throw std::runtime_error("begin failed"); };
   std::vector<uint8_t> output;
@@ -966,7 +966,7 @@ void testEngineFailureNamesItsReason() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     const std::system_error closed(EPIPE, std::generic_category(),
                                    "write(native output)");
@@ -993,7 +993,7 @@ void testEngineFailureNamesItsReason() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeRuntime loop(
@@ -1035,7 +1035,7 @@ void testEngineFailureNamesItsReason() {
 void testInvalidPromptTokensStayRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1083,7 +1083,7 @@ void testInvalidPromptTokensStayRequestScoped() {
 uint64_t announcedFeatures(uint32_t maxImagePatches) {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1119,7 +1119,7 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
 void testImageRequestWithoutVisionStaysRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1163,7 +1163,7 @@ void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
     std::vector<uint8_t> output;
@@ -1226,7 +1226,7 @@ protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
 void testScoreRequestCompletesAfterFullPrompt() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1271,7 +1271,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
 void testCancelledScoreReturnsEmptyLogits() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
   std::vector<uint8_t> output;
@@ -1332,7 +1332,7 @@ struct ScoreBesideChat final {
 ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   if (invalidScore)
     executor.invalidScores.insert(21);
@@ -1442,7 +1442,7 @@ void testConstrainedMaskExchange() {
         Reply::AfterTimeout}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeLoopConfig config;

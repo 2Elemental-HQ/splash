@@ -158,45 +158,38 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 }
 
-void testRuntimeCacheNamespaceBindsIdentityOnce() {
-  constexpr kv::Layout kvLayout{16, 4, 256};
-  const std::string combinedA(64, 'a');
-  const std::string combinedB(64, 'b');
-  const std::string targetA(64, 'c');
-  const std::string targetB(64, 'd');
-  const engine::RuntimeCacheIdentity first =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity same =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity modelChanged =
-      engine::makeRuntimeCacheIdentity(combinedB, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity targetChanged =
-      engine::makeRuntimeCacheIdentity(combinedA, targetB, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity buildChanged =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-b",
-                                       kvLayout);
-  auto bf16Layout = kvLayout;
-  bf16Layout.format = kv::Format::BFloat16;
-  const auto formatChanged = engine::makeRuntimeCacheIdentity(
-      combinedA, targetA, "build-a", bf16Layout);
-  require(first.cacheNamespace != formatChanged.cacheNamespace &&
-              first.namespaceSha256 != formatChanged.namespaceSha256,
-          "INT8 and BF16 aliased the same prefix-cache namespace");
-  require(first.cacheNamespace == same.cacheNamespace &&
-              first.namespaceSha256 == same.namespaceSha256,
-          "runtime cache namespace is not deterministic");
-  require(first.cacheNamespace != modelChanged.cacheNamespace &&
-              first.cacheNamespace != targetChanged.cacheNamespace &&
-              first.cacheNamespace != buildChanged.cacheNamespace,
-          "runtime cache namespace omitted model, layout, or build identity");
-  require(kv::matchesLayout(first.kvLayout, kvLayout) &&
-              first.kvLayout.modelArtifactSha256 !=
-                  targetChanged.kvLayout.modelArtifactSha256,
-          "runtime Q8 layout guard omitted the target artifact");
+// The identity reports the loaded model's digests in lowercase hex and the
+// KV layout as loaded; a malformed digest or a missing build id fails before
+// anything is served.
+void testRuntimeCacheIdentityReportsTheLoadedModel() {
+  constexpr kv::Layout int8Layout{16, 4, 256};
+  constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
+  const std::string combined(64, 'A');
+  const std::string target(64, 'c');
+  const engine::RuntimeCacheIdentity int8 =
+      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout);
+  require(int8.modelLayoutSha256 == std::string(64, 'a') &&
+              int8.targetModelSha256 == target && int8.buildId == "build" &&
+              int8.kvLayout == int8Layout,
+          "the cache identity did not report the loaded model");
+  const engine::RuntimeCacheIdentity bf16 =
+      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout);
+  require(bf16.kvLayout == bf16Layout && bf16.kvLayout.format != int8.kvLayout.format,
+          "the cache identity did not report the KV format");
+  const auto rejected = [&](std::string_view combinedDigest,
+                            std::string_view targetDigest, std::string_view build) {
+    try {
+      static_cast<void>(engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest,
+                                                         build, int8Layout));
+    } catch (const std::invalid_argument &) {
+      return true;
+    }
+    return false;
+  };
+  require(rejected(std::string(63, 'a'), target, "build") &&
+              rejected(combined, std::string(63, 'c') + 'g', "build") &&
+              rejected(combined, target, ""),
+          "a malformed digest or an empty build id was accepted");
 }
 
 DeviceCapabilities device() {
@@ -344,7 +337,7 @@ public:
   Harness(const EngineMemoryPlan &plan, int failingStep = -1,
           int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16, 4096, 4), pool_(backing_, 16),
-        resources_(pool_, CacheNamespace{}),
+        resources_(pool_),
         executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
                   throwingStep),
         loop_(
@@ -770,7 +763,7 @@ int main() {
   try {
     testWarmupLaneComparisons();
     testInstalledManifestBindsExecutionGeometry();
-    testRuntimeCacheNamespaceBindsIdentityOnce();
+    testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
     testOptionalAllocationFailuresAreMemoryLimited();

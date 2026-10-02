@@ -14,6 +14,16 @@ uint64_t mix(uint64_t hash, uint64_t value) noexcept {
   return hash;
 }
 
+uint64_t indexHash(uint64_t parentHash, std::span<const uint32_t> tokens,
+                   ImageIdentity images) noexcept {
+  uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentHash);
+  for (uint32_t token : tokens)
+    hash = mix(hash, token);
+  hash = mix(hash, images.lo);
+  hash = mix(hash, images.hi);
+  return hash;
+}
+
 } // namespace
 
 ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
@@ -51,19 +61,6 @@ KvCache::~KvCache() noexcept {
       std::terminate();
     }
   }
-}
-
-uint64_t KvCache::indexHash(uint64_t parentHash,
-                            std::span<const uint32_t> tokens,
-                            ImageIdentity images) const noexcept {
-  uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentHash);
-  for (uint8_t byte : cacheNamespace_.digest)
-    hash = mix(hash, byte);
-  for (uint32_t token : tokens)
-    hash = mix(hash, token);
-  hash = mix(hash, images.lo);
-  hash = mix(hash, images.hi);
-  return hash;
 }
 
 std::optional<KvCache::BlockMatch>

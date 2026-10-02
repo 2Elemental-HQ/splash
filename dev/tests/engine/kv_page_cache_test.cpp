@@ -27,12 +27,6 @@ void requireThrows(Function &&function, const char *message) {
   throw std::runtime_error(message);
 }
 
-CacheNamespace cacheNamespace(uint8_t salt = 0x5a) {
-  CacheNamespace result;
-  result.digest.fill(salt);
-  return result;
-}
-
 std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
   std::array<uint32_t, KvCache::pageTokens> result{};
   result.fill(token);
@@ -43,7 +37,7 @@ void testImageIdentityKeysBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(2);
   require(acquired.granted() && acquired.pages.size() == 2,
           "test pages were not acquired");
@@ -94,7 +88,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(4);
   require(acquired.granted() && acquired.pages.size() == 4,
           "test pages were not acquired");
@@ -167,7 +161,7 @@ void testErasedLeafParentInheritsRecency() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(4);
   require(acquired.granted() && acquired.pages.size() == 4,
           "test pages were not acquired");
@@ -207,7 +201,7 @@ void testInputValidation() {
   test::TestKvStorage storage(2, 100, 1);
   KvPool pool(storage, 2);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(1);
   require(acquired.granted(), "validation page was not acquired");
   const std::array<uint32_t, 1> shortTokens{1};
@@ -231,7 +225,7 @@ void testCandidateOrderThroughChurn() {
   test::TestKvStorage storage(count, 100, 1);
   KvPool pool(storage, count);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(count);
   require(acquired.granted(), "churn test pages were not acquired");
   struct Reference {
@@ -321,7 +315,7 @@ void testSubtreeThroughChurn() {
   test::TestKvStorage storage(steps, 100, 1);
   KvPool pool(storage, steps);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   struct Reference {
     uint64_t parent = 0;
     bool live = false;
@@ -401,7 +395,7 @@ void testDiskTierTransitions() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(4);
   require(acquired.granted(), "test pages were not acquired");
   const auto rootTokens = page(21);
@@ -498,7 +492,7 @@ void testDiskOnlyAdoptionAndPoison() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(4);
   require(acquired.granted(), "test pages were not acquired");
   const auto rootTokens = page(31);
@@ -557,7 +551,7 @@ void testMatchableExcludesPoisonedBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   auto acquired = pool.acquirePages(2);
   require(acquired.granted(), "test pages were not acquired");
   auto root = cache.insert(0, page(41), acquired.pages[0]);

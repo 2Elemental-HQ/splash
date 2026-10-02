@@ -80,14 +80,13 @@ std::string runtimeStatusJson(
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
           : 0.0;
 
+  const kv::Format kvFormat = cacheIdentity.kvLayout.format;
   std::ostringstream kvIdentity;
-  kvIdentity << "{\"target_model_sha256\":"
-      << json::quote(digestHex(cacheIdentity.kvLayout.modelArtifactSha256))
-      << ",\"format\":" << json::quote(kv::formatName(cacheIdentity.kvLayout.format()))
-      << ",\"quantization\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "symmetric_int8" : "none")
-      << ",\"scale_type\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "float32" : "none")
+  kvIdentity << "{\"target_model_sha256\":" << json::quote(cacheIdentity.targetModelSha256)
+      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
+      << ",\"quantization\":"
+      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
       << ",\"value_layout\":\"dimension_major\"}";
 
@@ -110,14 +109,12 @@ std::string runtimeStatusJson(
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
-      << ",\"runtime_cache_namespace\":"
-      << json::quote(cacheIdentity.namespaceSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(cacheIdentity.kvLayout.format()))
+      << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
       << ",\"block_tokens\":" << kv::kPageTokens
       << "},\"kv\":" << kvIdentity.str();
   // Additive status evolution: retain the previous INT8 identity field.
-  if (cacheIdentity.kvLayout.format() == kv::Format::Int8)
+  if (kvFormat == kv::Format::Int8)
     out << ",\"q8\":" << kvIdentity.str();
   out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()

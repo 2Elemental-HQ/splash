@@ -11,7 +11,6 @@
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -37,28 +36,15 @@ enum class RuntimeResourceStage {
 [[nodiscard]] std::string_view
 runtimeResourceStageName(RuntimeResourceStage stage);
 
-[[nodiscard]] inline std::string
-digestHex(const std::array<uint8_t, 32> &digest) {
-  constexpr char hex[] = "0123456789abcdef";
-  std::string result;
-  result.reserve(digest.size() * 2);
-  for (uint8_t byte : digest) {
-    result.push_back(hex[byte >> 4]);
-    result.push_back(hex[byte & 0x0f]);
-  }
-  return result;
-}
-
+// What /status reports of the loaded model, the build and the KV pages.
+// Both digests are SHA-256 in lowercase hex.
 struct RuntimeCacheIdentity {
+  // The combined manifest of every model the runtime loaded.
   std::string modelLayoutSha256;
   std::string buildId;
-  // One process-wide content namespace. KV blocks never copy model/build
-  // strings or physical layout metadata.
-  CacheNamespace cacheNamespace;
-  // Stable binary layout guard for physical KV pages.
-  kv::LayoutGuard kvLayout;
-  // SHA-256 of the versioned model/build/KV compatibility tuple.
-  std::string namespaceSha256;
+  kv::Layout kvLayout;
+  // The target model's manifest.
+  std::string targetModelSha256;
 };
 
 [[nodiscard]] RuntimeCacheIdentity

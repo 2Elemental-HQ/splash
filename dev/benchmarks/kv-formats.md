@@ -8,8 +8,10 @@ choice, not a general speed improvement.
 ## Implementation boundaries
 
 - One `kv::Layout` supplies allocation, admission, cache identity, and attention
-  planning. Format is part of execution-policy keys and the prefix-cache
-  namespace, so policies and cached blocks cannot cross formats.
+  planning. Format is part of execution-policy keys, so policies cannot cross
+  formats, and of the cache identity `/status` reports. One process serves one
+  format and keeps KV only in its own extents and unlinked slot files, so
+  cached blocks cannot cross formats either.
 - `PageStorage` owns both formats. BF16 extents have no scale regions. Every
   region of an extent starts 64 KiB aligned, and extents target about 128 MiB.
   Logical prefix blocks remain 32 tokens.

@@ -19,15 +19,6 @@
 
 namespace splash::engine {
 
-// One process owns one loaded target+draft model, executable build and Q8
-// layout. Their canonical SHA-256 is stored once on the cache instance; KV
-// blocks never duplicate strings or layout metadata.
-struct CacheNamespace final {
-  std::array<uint8_t, 32> digest{};
-
-  bool operator==(const CacheNamespace &) const = default;
-};
-
 struct ImageIdentity final {
   uint64_t lo = 0;
   uint64_t hi = 0;
@@ -62,9 +53,8 @@ public:
     std::vector<uint32_t> pages;
   };
 
-  KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
-      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency),
-        blockOnPage_(pool.pageCount()) {}
+  KvCache(KvPool &pool, CacheRecency &recency)
+      : pool_(pool), recency_(recency), blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -185,9 +175,6 @@ private:
     RecencyOrder::Node diskNode;
   };
 
-  [[nodiscard]] uint64_t indexHash(uint64_t parentHash,
-                                   std::span<const uint32_t> tokens,
-                                   ImageIdentity images) const noexcept;
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
   // Places the block in the orders its state calls for.
@@ -201,7 +188,6 @@ private:
   void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   KvPool &pool_;
-  CacheNamespace cacheNamespace_;
   CacheRecency &recency_;
   std::unordered_map<uint64_t, Block> blocks_;
   // The resident block on each page, 0 for none. A resident block owns its

@@ -27,12 +27,6 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-CacheNamespace cacheNamespace() {
-  CacheNamespace result;
-  result.digest.fill(0x5a);
-  return result;
-}
-
 void publish(engine::Cache &resources, uint64_t block,
              uint64_t bytes) {
   resources.publishCompositeState(block, std::make_shared<State>(bytes));
@@ -48,7 +42,7 @@ std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {
 void testCanonicalPagesAndSparseState() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(65);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, prompt.size()).granted(),
@@ -73,7 +67,7 @@ void testCanonicalPagesAndSparseState() {
 void testKvDeeperThanStateAndDependencyEviction() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(97);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 96).granted(), "KV allocation failed");
@@ -106,7 +100,7 @@ void testActiveTipProtectsTheContentChain() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(97, 1000);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 64).granted(),
@@ -132,7 +126,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(129, 2000);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(),
@@ -163,7 +157,7 @@ void testFragmentedColdKvPrecedesNewerState() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   const auto prompt = tokens(129);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(), "fixture allocation failed");
@@ -185,7 +179,7 @@ void testReplacementKeepsTheExtentItEmpties() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   resources.beginRequest(1);
   const auto prompt = tokens(33);
   require(resources.ensureTokens(1, 32).granted(), "fixture allocation failed");
@@ -214,7 +208,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t empty = 200;
   test::TestKvStorage storage(4 * (empty + 1), 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   const auto prompt = tokens(33);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 32).granted(), "cached page allocation failed");
@@ -252,7 +246,7 @@ void testReleaseTimeCoversOneExtent() {
   test::TestKvStorage storage(4 * extents, 4096, 4);
   storage.releaseTime = std::chrono::milliseconds(5);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   for (uint32_t chain = 0; chain < extents; ++chain) {
     const uint64_t id = chain + 1;
     resources.beginRequest(id);
@@ -281,7 +275,7 @@ void testReleaseTimeCoversOneExtent() {
 void testPublicationReleasesTheExtentItEmpties() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   // The publishing request runs on the first extent.
   const auto running = tokens(129);
   resources.beginRequest(1);

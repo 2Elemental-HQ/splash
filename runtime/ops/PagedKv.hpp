@@ -4,12 +4,10 @@
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
-#include <type_traits>
 
 namespace splash::kv {
 
@@ -211,67 +209,5 @@ struct Layout final {
 
   bool operator==(const Layout &) const = default;
 };
-
-enum class Quantization : uint32_t { SymmetricInt8 = 1, BFloat16 = 2 };
-enum class ScaleType : uint32_t { None = 0, Float32 = 2 };
-enum class KeyLayout : uint32_t { TokenMajor = 1 };
-enum class ValueLayout : uint32_t { DimensionMajor = 1 };
-
-// Identity of the KV page format and of the target it belongs to:
-// modelArtifactSha256 is the digest of the exact packed target artifact set;
-// geometry/layout fields remain explicit so format changes cannot alias. Its
-// fields enter the runtime cache namespace and the status report
-// (RuntimeResources.mm, Status.cpp); nothing stores or compares the struct.
-struct alignas(8) LayoutGuard final {
-  uint32_t quantization = 0;
-  uint32_t scaleType = 0;
-  uint32_t keyLayout = 0;
-  uint32_t valueLayout = 0;
-  uint32_t pageTokens = 0;
-  uint32_t elementsPerScale = 0;
-  uint32_t attentionLayers = 0;
-  uint32_t kvHeads = 0;
-  uint32_t headDimension = 0;
-  int32_t quantizedMinimum = 0;
-  int32_t quantizedMaximum = 0;
-  uint64_t bytesPerLayerPage = 0;
-  uint64_t bytesPerModelPage = 0;
-  std::array<uint8_t, 32> modelArtifactSha256{};
-
-  [[nodiscard]] Format format() const noexcept {
-    switch (quantization) {
-    case uint32_t(Quantization::SymmetricInt8): return Format::Int8;
-    case uint32_t(Quantization::BFloat16): return Format::BFloat16;
-    default: return static_cast<Format>(0);
-    }
-  }
-};
-
-static_assert(sizeof(LayoutGuard) == 96);
-static_assert(std::is_standard_layout_v<LayoutGuard>);
-static_assert(std::is_trivially_copyable_v<LayoutGuard>);
-
-[[nodiscard]] inline LayoutGuard makeLayoutGuard(
-    Layout layout,
-    const std::array<uint8_t, 32> &modelArtifactSha256) {
-  LayoutGuard result;
-  const bool quantized = layout.format == Format::Int8;
-  result.quantization = uint32_t(quantized ? Quantization::SymmetricInt8
-                                         : Quantization::BFloat16);
-  result.scaleType = uint32_t(quantized ? ScaleType::Float32 : ScaleType::None);
-  result.keyLayout = uint32_t(KeyLayout::TokenMajor);
-  result.valueLayout = uint32_t(ValueLayout::DimensionMajor);
-  result.pageTokens = kPageTokens;
-  result.elementsPerScale = layout.elementsPerScale();
-  result.attentionLayers = layout.attentionLayers;
-  result.kvHeads = layout.kvHeads;
-  result.headDimension = layout.headDimension;
-  result.quantizedMinimum = quantized ? kQuantizedMinimum : 0;
-  result.quantizedMaximum = quantized ? kQuantizedMaximum : 0;
-  result.bytesPerLayerPage = layout.bytesPerLayerPage();
-  result.bytesPerModelPage = layout.bytesPerModelPage();
-  result.modelArtifactSha256 = modelArtifactSha256;
-  return result;
-}
 
 } // namespace splash::kv

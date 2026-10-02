@@ -113,12 +113,6 @@ private:
   SharedBudget &budget_;
 };
 
-CacheNamespace cacheNamespace() {
-  CacheNamespace result;
-  result.digest.fill(0x5a);
-  return result;
-}
-
 // Admits pages the way the engine does: each denial makes room in one
 // reclaim step, until the pages fit, a transfer in flight holds what they
 // need, or nothing more can be reclaimed.
@@ -175,7 +169,7 @@ struct CacheFixture {
   // With running, the request that cached the chain stays unfinished, so
   // none of its KV is a victim, as for a request publishing its states.
   explicit CacheFixture(engine::KvTier *tier = nullptr, bool running = false)
-      : cache(pool, cacheNamespace(), tier) {
+      : cache(pool, tier) {
     storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
@@ -213,7 +207,7 @@ struct Prefixes {
   std::array<uint64_t, 4> blocks{};
 
   explicit Prefixes(test::TestKvTier *tier = nullptr, bool continued = true)
-      : cache(pool, cacheNamespace(), tier) {
+      : cache(pool, tier) {
     storage.budgetPages = 4;
     for (uint32_t i = 0; i < prompts.size(); ++i) {
       prompts[i].assign(KvCache::pageTokens, 1000 + i);
@@ -393,7 +387,7 @@ void testProbeFallsBackWhenKvChanges() {
 
   test::TestKvStorage storage{1, 100, 1};
   KvPool pool{storage, 1};
-  engine::Cache cache{pool, cacheNamespace()};
+  engine::Cache cache{pool};
   std::vector<uint32_t> prompt(33, 77);
   const CacheProbe cold = cache.probe(prompt);
   require(cold.cachedTokens() == 0, "cold admission probe found cached work");
@@ -411,7 +405,7 @@ void testProbeFallsBackWhenKvChanges() {
 void testProbeBindsImageIdentity() {
   test::TestKvStorage storage{1, 100, 1};
   KvPool pool{storage, 1};
-  engine::Cache cache{pool, cacheNamespace()};
+  engine::Cache cache{pool};
   std::vector<uint32_t> prompt(33, 77);
   const ImageSpan image{0, 32, 1, 1, 101, 202};
   const std::span<const ImageSpan> images(&image, 1);
@@ -431,8 +425,8 @@ void testProbeCannotCrossCaches() {
   test::TestKvStorage secondStorage{1, 100, 1};
   KvPool firstPool{firstStorage, 1};
   KvPool secondPool{secondStorage, 1};
-  engine::Cache first{firstPool, cacheNamespace()};
-  engine::Cache second{secondPool, cacheNamespace()};
+  engine::Cache first{firstPool};
+  engine::Cache second{secondPool};
   const std::vector<uint32_t> firstPrompt(33, 11);
   const std::vector<uint32_t> secondPrompt(33, 22);
   const auto populate = [](engine::Cache &cache,
@@ -465,7 +459,7 @@ void testProbeCannotCrossCaches() {
 void testPageTableReportsWhatChanged() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   constexpr uint32_t page = KvCache::pageTokens;
   std::vector<uint32_t> prompt;
   for (uint32_t token = 0; token <= 2 * page; ++token)
@@ -749,7 +743,7 @@ void testUnifiedRecencyAndReleasedByteAccounting() {
 void testFinishedRequestLeavesTailKvBeforeItsState() {
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};
-  engine::Cache cache{pool, cacheNamespace()};
+  engine::Cache cache{pool};
   std::vector<uint32_t> prompt;
   for (uint32_t token = 0; token < 129; ++token)
     prompt.push_back(5000 + token);
@@ -955,7 +949,7 @@ void testCheckpointPressurePreservesHotPrefix() {
   storage.growthAllowed = [&](uint32_t) { return budget.acquire(100); };
   storage.released = [&] { budget.release(100); };
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const std::vector<uint32_t> hot(33, 11);
   const std::vector<uint32_t> cold(65, 22);
   cache.beginRequest(1);
@@ -1659,7 +1653,7 @@ void testQuotaWithoutTheKvTier() {
   auto budget = std::make_shared<model::DiskBudget>(4 * size);
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};
-  engine::Cache cache(pool, cacheNamespace(), nullptr, budget);
+  engine::Cache cache(pool, nullptr, budget);
   model::SlotFile states(size, budget);
   auto slot = states.acquire();
   std::vector<std::byte> source(size, std::byte{1}), restored(size);
@@ -2358,7 +2352,7 @@ void testFailedRestoreDropsTheBlocksBelow() {
   storage.budgetPages = 8;
   KvPool pool{storage, 8};
   test::TestKvTier tier;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   // Two prompts share three blocks and part at the fourth, which holds a
@@ -2439,7 +2433,7 @@ void testBusyTierPreservesDiskVictim() {
     test::TestKvTier tier;
     tier.capacity = 2;
     tier.transferLimit = 1;
-    engine::Cache cache{pool, cacheNamespace(), &tier};
+    engine::Cache cache{pool, &tier};
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     control->capacity = 4;
@@ -2496,7 +2490,7 @@ void testReclaimForPagesCoversTheShortfall() {
     test::TestKvStorage storage{16, 100, 1};
     storage.budgetPages = 8;
     KvPool pool{storage, 0};
-    engine::Cache cache{pool, cacheNamespace()};
+    engine::Cache cache{pool};
     // Eight one-page leaves fill the budget. With states, each holds one, so
     // none is dead KV, and the first leaf's state is the oldest victim.
     for (uint32_t leaf = 0; leaf < 8; ++leaf) {
@@ -2533,7 +2527,7 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};
   test::TestKvTier tier;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   std::vector<uint32_t> chain(65);
@@ -2666,7 +2660,7 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
   test::TestKvTier tier;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   std::vector<uint32_t> prompt(129);
@@ -2718,7 +2712,7 @@ void testLargeSharedDiskRestore() {
   test::TestKvTier tier;
   tier.capacity = pages;
   tier.transferLimit = 96;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   std::vector<uint32_t> prompt(tokens, 17);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, tokens).granted(), "large prefix admission failed");
@@ -2769,7 +2763,7 @@ void testRefusedRestoresStopAtTheFirstRefusal() {
   test::TestKvTier tier;
   tier.capacity = pages;
   tier.transferLimit = 2;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   std::vector<uint32_t> prompt(tokens, 19);
   cache.beginRequest(1);
   require(admitTokens(cache, 1, tokens).granted(), "the disk chain's admission failed");
@@ -2821,7 +2815,7 @@ struct ExtentFixture {
   std::array<uint64_t, 3> lastBlocks{};
 
   explicit ExtentFixture(uint32_t pages = 16, KvTier *tier = nullptr)
-      : storage(pages, 100, 4), cache(pool, cacheNamespace(), tier) {
+      : storage(pages, 100, 4), cache(pool, tier) {
     for (uint32_t prompt = 0; prompt < 3; ++prompt) {
       for (uint32_t token = 0; token <= 3 * KvCache::pageTokens; ++token)
         prompts[prompt].push_back(1000 * (prompt + 1) + token);
@@ -3056,7 +3050,7 @@ void testCompactionLeavesAPageBeingRestored() {
   test::TestKvStorage storage{16, 100, 4};
   KvPool pool{storage, 16};
   test::TestKvTier tier;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   const auto prompt = [](uint32_t first, uint32_t blocks) {
@@ -3137,7 +3131,7 @@ void testCompactionLeavesAPageBeingDemoted() {
   test::TestKvStorage storage{16, 100, 4};
   KvPool pool{storage, 16};
   test::TestKvTier tier;
-  engine::Cache cache{pool, cacheNamespace(), &tier};
+  engine::Cache cache{pool, &tier};
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   // One plain block on page 0, then four blocks on pages 1 to 4 whose state
@@ -3252,7 +3246,7 @@ void testKvAStateInUseNeedsGoesLast() {
   storage.budgetPages = 6;
   KvPool pool{storage, 6};
   test::TestKvTier tier;
-  engine::Cache cache(pool, cacheNamespace(), &tier);
+  engine::Cache cache(pool, &tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
@@ -3314,7 +3308,7 @@ void testKvInUseFollowsItsState() {
   test::TestKvStorage storage{7, 100, 1};
   storage.budgetPages = 6;
   KvPool pool{storage, 6};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
   cache.publishCompositeState(used[1], std::make_shared<TestState>(100));
   StateUse use = cache.useState(used[1]);
@@ -3591,7 +3585,7 @@ void testPageShortageTakesLeavesInUseLast() {
   test::TestKvStorage storage{7, 100, 1};
   storage.budgetPages = 6;
   KvPool pool{storage, 6};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const auto [usedPrompt, used] = cacheChain(cache, 1, 2);
   // The older chain's leaf holds the state in use.
   StateUse use = cache.useState(used[1]);
@@ -3642,7 +3636,7 @@ void testOrdinaryDemotionKeepsCopiesInUse() {
   KvPool pool{storage, 6};
   test::TestKvTier tier;
   tier.capacity = 3;
-  engine::Cache cache(pool, cacheNamespace(), &tier);
+  engine::Cache cache(pool, &tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   const auto settle = [&](const char *message) {
@@ -3706,7 +3700,7 @@ void testPromotionSkipsForAStateInUse() {
 void testDeadKvGoesBeforeOlderStates() {
   test::TestKvStorage storage{6, 100, 1};
   KvPool pool{storage, 6};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const std::vector<uint64_t> older = cacheChain(cache, 1, 2).second;
   cache.publishCompositeState(older[1], std::make_shared<TestState>(100));
   const std::vector<uint64_t> newer = cacheChain(cache, 2, 3).second;
@@ -3725,7 +3719,7 @@ void testPendingDemotionLeavesOtherKvOpen() {
   KvPool pool{storage, 8};
   test::TestKvTier tier;
   tier.transferLimit = 1;
-  engine::Cache cache(pool, cacheNamespace(), &tier);
+  engine::Cache cache(pool, &tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 3;
@@ -3781,7 +3775,7 @@ void testInUseEvictionsCountChoices() {
 void testPublicationInUseTakesOrdinaryKv() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const auto older = cacheChain(cache, 1, 2).first;
   const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
   cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
@@ -3817,7 +3811,7 @@ void testPublicationInUseTakesOrdinaryKv() {
 void testOrdinaryPublicationTakesOrdinaryKvNotWhatIsInUse() {
   test::TestKvStorage storage{8, 100, 2};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   static_cast<void>(cacheChain(cache, 1, 4));
   const uint64_t used = cacheChain(cache, 2, 2).second[1];
   StateUse use = cache.useState(used);
@@ -3864,7 +3858,7 @@ void testOrdinaryPublicationWaitsForTheWriteSlot() {
 void testPublicationInUseWithoutGrowthTakesStatesAlone() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const auto older = cacheChain(cache, 1, 2).first;
   const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
   cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
@@ -3901,7 +3895,7 @@ void testPublicationInUseLeavesKvInUse() {
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};
   test::TestKvTier tier;
-  engine::Cache cache(pool, cacheNamespace(), &tier);
+  engine::Cache cache(pool, &tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
@@ -3929,7 +3923,7 @@ void testInUsePublicationStartsNoDemotion() {
   KvPool pool{storage, 6};
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, cacheNamespace(), &tier);
+  engine::Cache cache(pool, &tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   for (uint64_t id : {1, 2}) {
@@ -3963,7 +3957,7 @@ void testInUsePublicationStartsNoDemotion() {
 void testInUsePublicationTakesNoKvWhenNoExtentCanEmpty() {
   test::TestKvStorage storage{8, 100, 4};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   const uint64_t other = cacheChain(cache, 1, 3, true).second[2];
   StateUse held = cache.useState(other);
   cache.publishCompositeState(other, std::make_shared<TestState>(100));
@@ -3991,7 +3985,7 @@ void testPageReuseTakesKvBeforeStates() {
   constexpr auto reuse = CacheReclaimMode::ReusePages;
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
-  engine::Cache cache(pool, cacheNamespace());
+  engine::Cache cache(pool);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   // Two chains whose leaves hold states only the disk holds, so neither is

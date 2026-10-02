@@ -19,10 +19,10 @@ std::span<const ImageSpan> spansFrom(std::span<const ImageSpan> images, uint64_t
 
 } // namespace
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
+Cache::Cache(KvPool &pool, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
-      kv_(pool, cacheNamespace, recency_),
+      kv_(pool, recency_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }) {}
 
 void Cache::beginRequest(uint64_t requestId) {

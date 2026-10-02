@@ -670,7 +670,7 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
 void testScoreRequestsCarryNoSamplingOptions() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -703,7 +703,7 @@ void testScoreRequestsCarryNoSamplingOptions() {
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -727,7 +727,7 @@ void testConcurrentColdPrefixesComputeOnce() {
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -755,7 +755,7 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
 void testSharedPrefillReleasesDifferentJunctionsIndependently() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -779,7 +779,7 @@ void testSharedPrefillReleasesDifferentJunctionsIndependently() {
 void testSharedPrefillEvictedPublicationFallsBack() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -803,7 +803,7 @@ void testSharedPrefillProducerFailureReleasesWaiters() {
   for (bool cancelled : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -830,7 +830,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
   for (bool cancelled : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -853,7 +853,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
 void testSharedPrefillFailedPublicationFallsBack() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   model.deniedSnapshots = 100;
   Events events;
@@ -871,7 +871,7 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
   for (bool images : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -898,7 +898,7 @@ void testSharedPrefillHonorsPriorityAndLateArrival() {
   for (bool foreground : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -928,7 +928,7 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
   for (bool denyCheckpoint : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     if (denyCheckpoint)
       model.denySnapshotAtBoundary = 4096;
@@ -956,7 +956,7 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
 void testSharedJunctionAtACheckpointIsReusable() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -992,7 +992,7 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -1016,7 +1016,7 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
 void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -1048,7 +1048,7 @@ void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
 void testColdPublishesReplayStateAndRebuildsALostOne() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, resources, executor, events);
@@ -1098,7 +1098,7 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
 void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1129,7 +1129,7 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
 void testReplayStateEndsBeforeTheGenerationPrompt() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1172,7 +1172,7 @@ void testFollowUpResumesBeforeTheGenerationPrompt() {
   const auto followUp = [](uint32_t generationPromptTokens) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -1207,7 +1207,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
   for (bool concurrent : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -1237,7 +1237,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
 void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1268,7 +1268,7 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
 void testImageSpansKeyPrefixIdentity() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1341,7 +1341,7 @@ void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
   for (const Shape &shape : {Shape{{a, b}, {a, c}, 192}, Shape{{a}, {otherA}, 32}}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -1383,7 +1383,7 @@ std::vector<uint32_t> branchPrompt(uint32_t token) {
 void testOneRequestPublishesJunctionAndLatestReplayState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1413,7 +1413,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
 void testLazyJunctionNeedsADraftWindowOfGain() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1465,7 +1465,7 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   bool paused = false;
@@ -1531,7 +1531,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
 void testCancellationAfterJunctionDiscardsLaterState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1568,7 +1568,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
 void testPublicationInvariantFailureIsFatal() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.snapshotObserver = [] { throw std::logic_error("snapshot invariant"); };
   Events events;
@@ -1592,7 +1592,7 @@ void testPublicationInvariantFailureIsFatal() {
 void testDeniedSnapshotCostsOnlyThatAttempt() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.deniedSnapshots = 100;
   Events events;
@@ -1645,7 +1645,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
 void testDeniedSnapshotRecyclesLruStateAndRetries() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1697,7 +1697,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
 void testPersistentSnapshotDenialRecyclesAtMostOneState() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1727,7 +1727,7 @@ void testPersistentSnapshotDenialRecyclesAtMostOneState() {
 void testLongSuffixSkipsDraftRestore() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1754,7 +1754,7 @@ void testLongSuffixSkipsDraftRestore() {
 void testCancellationInFlightAtBoundaryPublishesNoState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1792,7 +1792,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
   for (bool hostPressure : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     EngineConfig config;
@@ -1840,7 +1840,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
                        metal::AllocationFailure::HostPressure}) {
     test::TestKvStorage storage(12, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     EngineConfig config;
@@ -1884,7 +1884,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
 void testKvGrowthDenialKeepsEveryLaneReplayState() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1918,7 +1918,7 @@ void testKvGrowthDenialKeepsEveryLaneReplayState() {
 void testPressurePassKeepsCachesWithoutATarget() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1943,7 +1943,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
   Executor executor(1);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Events events;
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
@@ -1964,7 +1964,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
 void testPressureReclaimRespectsStateLifetimes() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2030,7 +2030,7 @@ void testPressureReclaimRespectsStateLifetimes() {
 void testWarningReclaimKeepsTheServingFootprint() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2069,7 +2069,7 @@ void testWarningReclaimKeepsTheServingFootprint() {
 void testWarningReclaimCountsOnlyWhatReachesTheHost() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2099,7 +2099,7 @@ void testWarningReclaimCountsOnlyWhatReachesTheHost() {
 void testWarningReclaimWakesARefusedStart() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2136,7 +2136,7 @@ void testPressureReclaimFollowsTheChain() {
   test::TestKvStorage storage(4, 100, 1);
   KvPool pool(storage, 4);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -2184,7 +2184,7 @@ void testPressureReclaimFollowsTheChain() {
 void testFullStateCellsSkipAdmissionAttempts() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   // The first pass starts the three short prompts and tries request 5, the
@@ -2235,7 +2235,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
 void testConcurrencyLimitDoesNotEvictCache() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2274,7 +2274,7 @@ void testConcurrencyLimitDoesNotEvictCache() {
 void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2320,7 +2320,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
 void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2387,7 +2387,7 @@ struct HostPause final {
 void testRequestInServiceGrowsThroughTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   HostPause host;
@@ -2433,7 +2433,7 @@ void testRequestInServiceGrowsThroughTheHostPause() {
 void testPausedPageShortfallKeepsTheLaneRunway() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   HostPause host;
@@ -2471,7 +2471,7 @@ void testPausedPageShortfallKeepsTheLaneRunway() {
 void testFirstRequestStartsThroughTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2517,7 +2517,7 @@ void testFirstRequestStartsThroughTheHostPause() {
 void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2555,7 +2555,7 @@ void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
 void testSuspendedRequestWaitsForTheHostBesideOneInService() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -2608,7 +2608,7 @@ void testSuspendedRequestWaitsForTheHostBesideOneInService() {
 void testEngineLimitBindsThroughTheHostPause() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2650,7 +2650,7 @@ void testEngineLimitBindsThroughTheHostPause() {
 void testPausedPageShortageKeepsCachedStates() {
   test::TestKvStorage storage(64, 4096, 1);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2691,7 +2691,7 @@ void testPausedPageShortageKeepsCachedStates() {
 void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2730,7 +2730,7 @@ void testAdmissionWaitsOutEarlierLanes() {
   for (const bool hostRecovers : {true, false}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -2775,7 +2775,7 @@ void testAdmissionWaitsOutEarlierLanes() {
 void testLaterLanesDoNotExtendAResourceWait() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   // The host has memory for the later request's state, not the waiting one's.
@@ -2825,7 +2825,7 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
   for (const bool lanesFull : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
@@ -2878,7 +2878,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
   for (uint32_t outcome = 0; outcome < 4; ++outcome) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     MemoryPressure pressure = MemoryPressure::Normal;
@@ -2965,7 +2965,7 @@ void testKvPressureNarrowsTheRealBatch() {
   test::TestKvStorage storage(4, 4096, 1);
   storage.budgetPages = 3;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2991,7 +2991,7 @@ void testKvPressureNarrowsTheRealBatch() {
 void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   storage.growthAllowed = [&](uint32_t) {
     return resources.snapshot().stateCache.entries == 0;
@@ -3028,7 +3028,7 @@ void testRequiredWorkDoesNotReserveAnExtraPage() {
     test::TestKvStorage storage(2, 4096, 1);
     storage.budgetPages = 1;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -3045,7 +3045,7 @@ void testRequiredWorkDoesNotReserveAnExtraPage() {
 void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3079,7 +3079,7 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
 void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3110,7 +3110,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
 void testActivationReceivesTheRestoreBoundary() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3141,7 +3141,7 @@ void testActivationReceivesTheRestoreBoundary() {
 void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3182,7 +3182,7 @@ void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
 void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3222,7 +3222,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
 void testDroppedLeaseLooksUpAgain() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -3250,7 +3250,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
   test::TestKvStorage storage(2, 4096, 1);
   storage.budgetPages = 1;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3268,7 +3268,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
 void testQueuedLongPrefillsLeaveRoomForShortWork() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3293,7 +3293,7 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
 void testAdmissionUsesCachedRemainingWork() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3318,7 +3318,7 @@ void testAdmissionUsesCachedRemainingWork() {
 void testUnselectableCandidatesAreNotProbed() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3358,7 +3358,7 @@ void testUnselectableCandidatesAreNotProbed() {
 void testWaitingCandidateProbeIsRefreshedNotRepeated() {
   test::TestKvStorage storage(4096, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3392,7 +3392,7 @@ void testWaitingCandidateProbeIsRefreshedNotRepeated() {
 void testMemoryWaitHoldsBackLaterArrivals() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3424,7 +3424,7 @@ void testMemoryWaitHoldsBackLaterArrivals() {
 void testMemoryWaitClosesAdmissionBesideAResidentLane() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3469,7 +3469,7 @@ void testMemoryWaitClosesAdmissionBesideAResidentLane() {
 void testClosedAdmissionReopensWhenTheWaitEnds() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3504,7 +3504,7 @@ void testClosedAdmissionReopensWhenTheWaitEnds() {
 void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   // Two lanes: the first two requests take both, so the producer waits for
   // a lane while the host refuses request 4.
   Executor executor(2);
@@ -3558,7 +3558,7 @@ void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
 void testRefusedResumeHoldsBackLaterSuspendedLanes() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -3614,7 +3614,7 @@ void testRefusedResumeHoldsBackLaterSuspendedLanes() {
 void testHeldSuspendedRequestNeitherWakesNorExpires() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -3658,7 +3658,7 @@ void testHeldSuspendedRequestNeitherWakesNorExpires() {
 void testStatusCountsRequestsHeldBehindARefusal() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3711,7 +3711,7 @@ void testStatusCountsRequestsHeldBehindARefusal() {
 void testStatusCountsSuspendedRequestsHeldDuringRecovery() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   bool hostRefuses = true;
@@ -3755,7 +3755,7 @@ void testStatusCountsSuspendedRequestsHeldDuringRecovery() {
 void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
@@ -3787,7 +3787,7 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
 void testUnadmittedRequestsHonorCancellationAndDeadline() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3814,7 +3814,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
                                    RequestPriority::Background}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -3855,7 +3855,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
 void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3884,7 +3884,7 @@ void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
 void testPrefillGrowthPreservesAnActiveDecodePeer() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -3915,7 +3915,7 @@ void testPrefillGrowthPreservesAnActiveDecodePeer() {
 void testKvPressureSuspendsInsteadOfKillingActiveWork() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   Events events;
@@ -3939,7 +3939,7 @@ void testKvPressureSuspendsInsteadOfKillingActiveWork() {
 void testPressureRetryIsBackedOffWithoutProgress() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -3981,7 +3981,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
     Events events;
@@ -4005,7 +4005,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     bool paused = true;
@@ -4037,7 +4037,7 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
     test::TestKvStorage storage(3, 4096, 1);
     storage.budgetPages = 2;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     executor.decodeFinishes = false;
     Events events;
@@ -4093,7 +4093,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   test::TestKvStorage storage(3, 4096, 1);
   storage.budgetPages = 2;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   // A replay result may carry a previously prepared consumer stage. It is
@@ -4164,7 +4164,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
 void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.decodeFinishes = false;
   executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
@@ -4265,7 +4265,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
 void testResumedProducerPlansJunctionsForSiblings() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   bool paused = false;
@@ -4372,7 +4372,7 @@ struct LostReplayPoint {
   const std::vector<uint32_t> other = std::vector<uint32_t>(257, 6);
   test::TestKvStorage storage{1024, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor{1};
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -4445,7 +4445,7 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
 void testSharedJunctionPublishesFromCachedKv() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -4477,7 +4477,7 @@ void testSharedJunctionPublishesFromCachedKv() {
 void testPausedPublicationInUseTakesNoKv() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   bool paused = false;
@@ -4509,7 +4509,7 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -4547,7 +4547,7 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -4581,7 +4581,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   for (bool cancel : {false, true}) {
     test::TestKvStorage storage(4, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.kvGrowthBlocked = &storage.growthBlocked;
     executor.unblockGrowthOnSuspend = false;
@@ -4633,7 +4633,7 @@ void testBudgetDenialRetriesAfterRelease() {
   for (bool recovers : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     auto pages = pool.acquirePages(8);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
@@ -4680,7 +4680,7 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
   for (bool state : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor(1);
     executor.pooledLaneBytes = 4096;
     Events events;
@@ -4709,7 +4709,7 @@ void testPausedStateAdmissionReusesCachedStates() {
   for (uint32_t lacked : {1U, 2U}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     bool paused = false;
@@ -4756,7 +4756,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   constexpr uint32_t budgetExtents = 32;
   test::TestKvStorage storage(4 * 128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -4800,7 +4800,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
 void testGrowthBeyondTheBudgetFailsAtOnce() {
   test::TestKvStorage storage(4 * 32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -4824,7 +4824,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   for (bool targeted : {true, false}) {
     test::TestKvStorage storage(4 * extents, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     auto pages = pool.acquirePages(4 * extents);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
@@ -4855,7 +4855,7 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 void testReclaimRefusesACommandInFlight() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   auto pages = pool.acquirePages(8);
   require(pages.granted(), "could not seed the KV extents");
   for (uint32_t page : pages.pages)
@@ -4945,7 +4945,7 @@ struct ScatteredPages {
 
   test::TestKvStorage storage{16, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache cache{pool, CacheNamespace{}};
+  engine::Cache cache{pool};
   Executor model;
   Events events;
   engine::Engine engine{EngineConfig{}, cache, model, events};
@@ -5020,7 +5020,7 @@ void testAllocationCausesRemainDistinct() {
                         metal::AllocationFailure::DriverRejected}) {
       test::TestKvStorage storage(8, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache cache(pool, CacheNamespace{});
+      engine::Cache cache(pool);
       Executor executor(1);
       Events events;
       engine::Engine engine({}, cache, executor, events);
@@ -5057,7 +5057,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
   for (bool sharePrefix : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     executor.unblockGrowthOnSuspend = false;
     executor.kvGrowthBlocked = &storage.growthBlocked;
@@ -5131,7 +5131,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
 void testFailedResumeRestoreKeepsTheKvTarget() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -5190,7 +5190,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -5230,7 +5230,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
 void testAdmissionRespectsPriorityBeforeHashOrder() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5308,7 +5308,7 @@ struct SuspendedBesideAMaskWait {
 
   test::TestKvStorage storage{64, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor;
   Events events;
   bool paused = false;
@@ -5407,7 +5407,7 @@ void testRecoveryDrainEndsWhenAResidentReleasesMemory() {
     test::TestKvStorage storage(32, 4096, 4);
     storage.budgetPages = 16;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     EngineConfig config;
@@ -5483,7 +5483,7 @@ void testForegroundArrivalPreemptsWhenCellsAreFull() {
   for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -5530,7 +5530,7 @@ void testForegroundArrivalPreemptsWhenCellsAreFull() {
 void testRefusedHigherPriorityStartPreemptsLowerResident() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   executor.beginGrowthBlocked = [&] {
@@ -5567,7 +5567,7 @@ void testRefusedHigherPriorityStartPreemptsLowerResident() {
 void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -5614,7 +5614,7 @@ void testRequestBelowARunningPriorityTakesNoLane() {
   for (const bool recovering : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -5665,7 +5665,7 @@ void testRequestBelowARunningPriorityTakesNoLane() {
 void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5684,7 +5684,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5704,7 +5704,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5724,7 +5724,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
 void testUnansweredVerifyMaskFailsOnlyItsRequest() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5767,7 +5767,7 @@ void testUnansweredInitialMaskFails() {
   for (const bool answered : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5799,7 +5799,7 @@ void testUnansweredInitialMaskFails() {
 void testDecodeNearContextCeilingCoversVerifyRows() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.decodeFinishes = false;
   Events events;
@@ -5822,7 +5822,7 @@ void testDecodeNearContextCeilingCoversVerifyRows() {
 void testExpiredMaskWaitFinalizesWhileAnotherCommandRuns() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5856,7 +5856,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
   for (WorkKind heldKind : {WorkKind::Prefill, WorkKind::Decode}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5904,7 +5904,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
 void testStalledSuspensionFailsWithCapacity() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -5933,7 +5933,7 @@ void testTerminalAnchorWithoutKvIsNotCached() {
   for (uint32_t withoutKv : {1U, 0U}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.decodeTokensWithoutKv = withoutKv;
     Events events;
@@ -5955,7 +5955,7 @@ void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.prefillAnchor = stop;
     Events events;
@@ -5977,7 +5977,7 @@ void testPrefillCanCompleteTheRequest() {
 void testOutOfVocabularyOutputFailsLaneOnly() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   EngineConfig config;
@@ -6019,7 +6019,7 @@ void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
 void testCancelledColdPrefillResumesItsLatestCheckpoint() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6048,7 +6048,7 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
 void testConcurrentProgressRetainsAtMostOnePointPerLane() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6077,7 +6077,7 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
 void testSharedCheckpointSurvivesPeerRollingReplacement() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6104,7 +6104,7 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
 void testRepeatedRetriesRollTheRestoredCheckpoint() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6132,7 +6132,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
 void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6163,7 +6163,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
     for (uint32_t suffix : {1U, 31U}) {
       test::TestKvStorage storage(1024, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache resources(pool, CacheNamespace{});
+      engine::Cache resources(pool);
       Executor executor(1);
       if (disk) {
         executor.deniedSnapshots = 1000;
@@ -6208,7 +6208,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
 void testRetryRetiresCheckpointAtDeeperJunction() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
@@ -6248,7 +6248,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
 void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6279,7 +6279,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6305,7 +6305,7 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
 void testRollingHandleCannotRetirePromotedState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6331,7 +6331,7 @@ void testRollingHandleCannotRetirePromotedState() {
 void testCheckpointDenialPreservesUnrelatedHotState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6355,7 +6355,7 @@ void testCheckpointDenialPreservesUnrelatedHotState() {
 void testCheckpointRecyclesItsBufferBeforeReplacement() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6379,7 +6379,7 @@ void testCheckpointRecyclesItsBufferBeforeReplacement() {
 void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
@@ -6407,7 +6407,7 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
 void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6436,7 +6436,7 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
 void testJunctionRetiresEarlierProgressPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6471,7 +6471,7 @@ void testJunctionRetiresEarlierProgressPoint() {
 void testShortSuffixContinuesCheckpointDraftState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6495,7 +6495,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
 void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6553,7 +6553,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
 void testCheckpointIntervalValidationAndDisable() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   for (uint32_t invalid : {1U, 2047U, 2049U}) {
@@ -6582,7 +6582,7 @@ void testCheckpointIntervalValidationAndDisable() {
 void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6628,7 +6628,7 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
 void testDecodeShareValidation() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   for (double invalid : {-0.5, std::numeric_limits<double>::infinity(),
@@ -6655,7 +6655,7 @@ void testDecodeShareValidation() {
 void testStateWithoutACacheSlotGoesToDisk() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6729,7 +6729,7 @@ void testStateWithoutACacheSlotGoesToDisk() {
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6762,7 +6762,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
 void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor(1);
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6814,7 +6814,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
   for (bool cancel : {true, false}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     executor.deniedSnapshots = 1000;
     executor.stateTier = std::make_shared<OffloadControl>();
@@ -6882,7 +6882,7 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
     for (uint32_t remaining : {32u, chunk - 32, chunk}) {
       test::TestKvStorage storage(512, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache cache(pool, CacheNamespace{});
+      engine::Cache cache(pool);
       Executor executor;
       executor.deniedSnapshots = denyRam ? 1000 : 0;
       executor.stateTier = std::make_shared<OffloadControl>();
@@ -6924,7 +6924,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor(1);
     executor.deniedSnapshots = disk ? 1000 : 0;
     executor.stateTier = std::make_shared<OffloadControl>();
@@ -6980,7 +6980,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
   for (bool paused : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
@@ -7054,7 +7054,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7095,7 +7095,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -7128,7 +7128,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7166,7 +7166,7 @@ void testNothingInFlightIsNotPending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.writableFile = false;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7200,7 +7200,7 @@ void testPageShortfallDemotesInBulk() {
   test::TestKvTier tier;
   tier.transferLimit = 8;
   tier.capacity = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7236,7 +7236,7 @@ void testPageShortfallDemotesInBulk() {
 void testKvGrowthProceedsThroughDemotion() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7288,7 +7288,7 @@ void testAsyncRestoreLifecycle() {
   for (int outcome = 0; outcome < 4; ++outcome) {
     test::TestKvStorage storage(128, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7331,7 +7331,7 @@ void testAsyncRestoreLifecycle() {
 void testDiskHitWithNoActiveMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7349,7 +7349,7 @@ void testDiskHitWithNoActiveMemory() {
 void testRepeatedDiskHitPromotesToMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7371,7 +7371,7 @@ void testRepeatedDiskHitPromotesToMemory() {
 void testFailedDiskRestoreKeepsShallowerState() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7400,7 +7400,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7454,7 +7454,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
 void testSharedPrefillWaitsForARestoringProducer() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7485,7 +7485,7 @@ void testSharedPrefillWaitsForARestoringProducer() {
 void testCancelledRestoringProducerReleasesItsWaiter() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7524,7 +7524,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7604,7 +7604,7 @@ void testSkipCacheCandidateIsNotProbed() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7650,7 +7650,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
     test::TestKvStorage storage(64, 4096, 1);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache cache(pool, CacheNamespace{}, written ? &tier : nullptr);
+    engine::Cache cache(pool, written ? &tier : nullptr);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -7711,7 +7711,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
 void testRestoringRequestIsNotWaitingForMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   bool hostRefuses = true;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
@@ -7742,7 +7742,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 1;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7798,7 +7798,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7847,7 +7847,7 @@ void testRefusedRestoreClosesAdmission() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     executor.restoreControl->ready = true;
@@ -7932,7 +7932,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7998,7 +7998,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   test::TestKvTier tier;
   tier.capacity = 64;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8085,7 +8085,7 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8143,7 +8143,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -8195,7 +8195,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8251,7 +8251,7 @@ void testRunningRequestKeepsItsReplayPoint() {
   test::TestKvStorage storage(16, 4096, 4);
   storage.budgetPages = 12;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8302,7 +8302,7 @@ void testRunningRequestKeepsItsReplayPoint() {
 void testSuspendedRequestKeepsItsReplayPoint() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(3);
   executor.decodeFinishes = false;
   Events events;
@@ -8365,7 +8365,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8433,7 +8433,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
 void testRestoredHistoryCheckpointStaysDisposable() {
   test::TestKvStorage storage(64, 4096, 1);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8492,7 +8492,7 @@ void testRestoredHistoryCheckpointStaysDisposable() {
 void testSharedReplayPointCountsEachRequest() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8522,7 +8522,7 @@ void testSharedReplayPointCountsEachRequest() {
 void testRestoredEndpointIsInUse() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -8553,7 +8553,7 @@ void testRestoredEndpointIsInUse() {
 void testReplayPointRecyclesAnOlderPointInUse() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8590,7 +8590,7 @@ void testReplayPointRecyclesAnOlderPointInUse() {
 void testWarningShrinkKeepsTheFinishedPoint() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -8640,7 +8640,7 @@ void testHeldBackStartTakesNothingInUse() {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache resources(pool, CacheNamespace{}, &tier);
+    engine::Cache resources(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -8720,7 +8720,7 @@ void testHeldBackStartTakesNothingInUse() {
 void testLaneThatWouldYieldTakesNothingInUse() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8770,7 +8770,7 @@ void testEveryEndReleasesTheReplayPoint() {
     if (end == End::Capacity)
       storage.budgetPages = 3;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -8811,7 +8811,7 @@ void testWaitingEndsReleaseTheReplayPoint() {
                         End::CancelAfterFailedRead}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     executor.deniedSnapshots = 1000;
     executor.stateTier = std::make_shared<OffloadControl>();

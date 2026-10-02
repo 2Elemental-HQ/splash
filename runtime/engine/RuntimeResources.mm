@@ -5,7 +5,6 @@
 #include "metal/abi/ExecutionGeometry.h"
 
 #import <Foundation/Foundation.h>
-#include <CommonCrypto/CommonDigest.h>
 
 #include <array>
 #include <limits>
@@ -94,52 +93,15 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
   return result;
 }
 
-std::string sha256(std::string_view value) {
-  if (value.size() > std::numeric_limits<CC_LONG>::max()) {
-    throw std::overflow_error("runtime cache identity is too large to hash");
+std::string digestHex(const std::array<uint8_t, 32> &digest) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(digest.size() * 2);
+  for (uint8_t byte : digest) {
+    result.push_back(hex[byte >> 4]);
+    result.push_back(hex[byte & 0x0f]);
   }
-  std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
-  if (!CC_SHA256(value.data(), static_cast<CC_LONG>(value.size()),
-                 digest.data())) {
-    throw std::runtime_error("runtime cache identity SHA-256 failed");
-  }
-  return digestHex(digest);
-}
-
-std::string
-canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
-  // Length-prefix the unconstrained strings; every other field has a fixed
-  // name and decimal representation. This is the one semantic cache tuple,
-  // never a hash of compiler padding or native struct bytes.
-  std::ostringstream canonical;
-  canonical << "splash.runtime-cache-identity\n"
-            << "loaded_model_layout_sha256=" << identity.modelLayoutSha256
-            << '\n'
-            << "build_id_bytes=" << identity.buildId.size() << '\n'
-            << "build_id=" << identity.buildId << '\n'
-            << "dtype=" << kv::storageFormatName(identity.kvLayout.format()) << '\n'
-            << "page_tokens=" << identity.kvLayout.pageTokens << '\n'
-            << "elements_per_scale=" << identity.kvLayout.elementsPerScale
-            << '\n'
-            << "target_model_sha256="
-            << digestHex(identity.kvLayout.modelArtifactSha256) << '\n'
-            << "q8_quantization=" << identity.kvLayout.quantization << '\n'
-            << "q8_scale_type=" << identity.kvLayout.scaleType << '\n'
-            << "q8_key_layout=" << identity.kvLayout.keyLayout << '\n'
-            << "q8_value_layout=" << identity.kvLayout.valueLayout << '\n'
-            << "q8_attention_layers=" << identity.kvLayout.attentionLayers
-            << '\n'
-            << "q8_kv_heads=" << identity.kvLayout.kvHeads << '\n'
-            << "q8_head_dimension=" << identity.kvLayout.headDimension << '\n'
-            << "q8_quantized_minimum=" << identity.kvLayout.quantizedMinimum
-            << '\n'
-            << "q8_quantized_maximum=" << identity.kvLayout.quantizedMaximum
-            << '\n'
-            << "q8_bytes_per_layer_page=" << identity.kvLayout.bytesPerLayerPage
-            << '\n'
-            << "q8_bytes_per_model_page=" << identity.kvLayout.bytesPerModelPage
-            << '\n';
-  return sha256(canonical.str());
+  return result;
 }
 
 } // namespace
@@ -184,16 +146,13 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   if (!targetKvLayout.valid()) {
     throw std::invalid_argument("runtime target KV layout is invalid");
   }
-  // Parse both digests even though only the target digest belongs in the
-  // physical-page ABI. This rejects malformed combined manifests early.
-  std::array<uint8_t, 32> combinedDigest = parseSha256(combinedManifestSha256);
-  std::array<uint8_t, 32> targetDigest = parseSha256(targetManifestSha256);
+  // Parsing rejects a malformed manifest digest before the KV pool and the
+  // cache are built.
   RuntimeCacheIdentity result;
-  result.modelLayoutSha256 = digestHex(combinedDigest);
+  result.modelLayoutSha256 = digestHex(parseSha256(combinedManifestSha256));
   result.buildId = buildId;
-  result.kvLayout = kv::makeLayoutGuard(targetKvLayout, targetDigest);
-  result.namespaceSha256 = canonicalRuntimeCacheNamespace(result);
-  result.cacheNamespace.digest = parseSha256(result.namespaceSha256);
+  result.kvLayout = targetKvLayout;
+  result.targetModelSha256 = digestHex(parseSha256(targetManifestSha256));
   return result;
 }
 
@@ -510,8 +469,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                    error.what(), ").");
       }
     }
-    auto cache = std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace,
-                                                 kvTier.get(), diskBudget);
+    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
 
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("state cells were allocated eagerly");

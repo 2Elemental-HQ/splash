@@ -849,9 +849,7 @@ int main(int argc, char **argv) {
     const std::string identity =
         "{\"model_root\":" + json::quote(modelRoot) +
         ",\"loaded_model_layout_sha256\":" +
-        json::quote(cacheIdentity.modelLayoutSha256) +
-        ",\"runtime_cache_namespace\":" +
-        json::quote(cacheIdentity.namespaceSha256) + ",\"device\":" +
+        json::quote(cacheIdentity.modelLayoutSha256) + ",\"device\":" +
         json::quote(resources->backend().capabilities().deviceName) + "}";
     if (progress)
       progress->identity(identity);

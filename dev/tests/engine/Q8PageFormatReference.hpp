@@ -11,6 +11,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace splash::kv {
 
@@ -195,32 +196,6 @@ inline void dequantizeLayerPage(const Q8LayerPage &source,
       }
     }
   }
-}
-
-// Test-only guard checks: production compares guards through the runtime
-// cache identity, so these helpers live with the tests that assert on them.
-[[nodiscard]] inline bool isValidLayoutGuard(const LayoutGuard &guard) {
-  const Layout layout{guard.attentionLayers, guard.kvHeads,
-                        guard.headDimension};
-  return layout.valid() &&
-         guard.quantization == uint32_t(Quantization::SymmetricInt8) &&
-         guard.scaleType == uint32_t(ScaleType::Float32) &&
-         guard.keyLayout == uint32_t(KeyLayout::TokenMajor) &&
-         guard.valueLayout == uint32_t(ValueLayout::DimensionMajor) &&
-         guard.pageTokens == kPageTokens &&
-         guard.elementsPerScale == layout.elementsPerScale() &&
-         guard.quantizedMinimum == kQuantizedMinimum &&
-         guard.quantizedMaximum == kQuantizedMaximum &&
-         guard.bytesPerLayerPage == layout.bytesPerLayerPage() &&
-         guard.bytesPerModelPage == layout.bytesPerModelPage();
-}
-
-[[nodiscard]] inline bool matchesLayout(const LayoutGuard &guard,
-                                          Layout layout) {
-  return isValidLayoutGuard(guard) &&
-         guard.attentionLayers == layout.attentionLayers &&
-         guard.kvHeads == layout.kvHeads &&
-         guard.headDimension == layout.headDimension;
 }
 
 } // namespace splash::kv
