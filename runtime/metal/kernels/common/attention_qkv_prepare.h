@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // q_norm and k_norm are read in their stored type W: bfloat in the packed
 // formats, float for a GGUF's F32 norms.
@@ -42,19 +43,11 @@ inline void full_qkv_storage_phase(
   }
 
   float element = float(source[thread_index]);
-  float square_sum = simd_sum(element * element);
-  if (lane == 0)
-    reductions[simd_group] = square_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < 8; ++i)
-      total += reductions[i];
-    reductions[0] = rsqrt(total / HeadDim + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
+                                            reductions, thread_index, lane,
+                                            simd_group);
   normalized[thread_index] =
-      bfloat(element * reductions[0] * float(weight[thread_index]));
+      bfloat(element * inverse * float(weight[thread_index]));
   if (!query) {
     ulong value_offset =
         (ulong(head_index) * HeadDim + thread_index) * params.stride +

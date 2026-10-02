@@ -2,6 +2,7 @@
 
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // Four-tap causal convolution of one channel at one token of the command,
 // reading the three preceding tokens from the carried state, rounded to bf16
@@ -90,19 +91,10 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
        gdn_output_head<KeyHeads, ValueHeads>(head, tiled)) *
       HeadDim;
   float value = float(recurrent[base + thread_index]);
-  float square_sum = simd_sum(value * value);
-  if (lane == 0)
-    scratch[simd_group] = square_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < Simdgroups; ++i)
-      total += scratch[i];
-    scratch[0] = rsqrt(total / HeadDim + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inverse = rms_inverse_of_sums<Simdgroups>(
+      value * value, HeadDim, scratch, thread_index, lane, simd_group);
   bfloat normalized =
-      bfloat(value * scratch[0] * float(norm_weight[thread_index]));
+      bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
   float silu = splash_silu(gate);

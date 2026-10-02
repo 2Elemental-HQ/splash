@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // One KV head of one context row: a row of context_kv holds the row's keys,
 // then its values (KWidth each). The keys are normalized and rotated into
@@ -26,20 +27,12 @@ inline void draft_context_kv_phase(
   device bfloat *value = values + ulong(head_index) * HeadDim * Window + slot;
 
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
-  float square_sum = simd_sum(element * element);
-  if (lane == 0)
-    reductions[simd_group] = square_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float total = 0.0f;
-    for (uint i = 0; i < 8; ++i)
-      total += reductions[i];
-    reductions[0] = rsqrt(total / HeadDim + 1e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
+                                            reductions, thread_index, lane,
+                                            simd_group);
   if (thread_index < HeadDim) {
     normalized[thread_index] =
-        bfloat(element * reductions[0] * float(k_norm[thread_index]));
+        bfloat(element * inverse * float(k_norm[thread_index]));
     value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

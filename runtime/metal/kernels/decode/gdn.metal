@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 // Decode threadgroups are 256 threads: one simdgroup per verify row in the
 // prologue and the gate, and in the scan the head's 128 state rows strided
@@ -97,8 +98,8 @@ inline void gdn_decode_prologue(
     q_sum += simd_sum(q[g] * q[g]);
     k_sum += simd_sum(k[g] * k[g]);
   }
-  const float q_scale = rsqrt(q_sum / HeadDim + 1e-6f);
-  const float k_scale = rsqrt(k_sum / HeadDim + 1e-6f);
+  const float q_scale = rsqrt(q_sum / HeadDim + kRmsEpsilon);
+  const float k_scale = rsqrt(k_sum / HeadDim + kRmsEpsilon);
   for (uint g = 0; g < Groups; ++g) {
     const uint dim = 32 * g + lane;
     const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
@@ -236,7 +237,7 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
   float total = 0.0f;
   for (uint g = 0; g < Groups; ++g)
     total += simd_sum(value[g] * value[g]);
-  const float inverse = rsqrt(total / HeadDim + 1e-6f);
+  const float inverse = rsqrt(total / HeadDim + kRmsEpsilon);
   for (uint g = 0; g < Groups; ++g) {
     const uint dim = 32 * g + lane;
     const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));

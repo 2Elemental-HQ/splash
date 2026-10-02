@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 template <uint Hidden>
 inline void draft_conv_phase(device const bfloat *input,
@@ -77,21 +78,11 @@ inline void draft_qkv_prepare_phase(
                                  (attention_head * Rows + row) * HeadDim;
 
     float value = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
-    float square_sum = simd_sum(value * value);
-    if (lane == 0)
-      reductions[simd_group] = square_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index == 0) {
-      float total = 0.0f;
-      for (uint i = 0; i < 8; ++i)
-        total += reductions[i];
-      reductions[0] = rsqrt(total / HeadDim + 1e-6f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index < HeadDim) {
-      head[thread_index] =
-          bfloat(value * reductions[0] * float(weight[thread_index]));
-    }
+    const float inverse = rms_inverse_of_sums(value * value, HeadDim,
+                                              reductions, thread_index, lane,
+                                              simd_group);
+    if (thread_index < HeadDim)
+      head[thread_index] = bfloat(value * inverse * float(weight[thread_index]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (thread_index < HeadDim / 2) {
       float first = float(head[thread_index]);

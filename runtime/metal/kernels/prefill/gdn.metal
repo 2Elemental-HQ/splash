@@ -1,6 +1,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
+#include "metal/kernels/common/rms_inverse.h"
 
 constant constexpr uint GdnScanBlock = 16;
 
@@ -228,11 +229,11 @@ inline void gdn_prepare_prefill_phase(
     reductions[0] =
         rsqrt((reductions[0] + reductions[1] + reductions[2] + reductions[3]) /
                   HeadDim +
-              1e-6f);
+              kRmsEpsilon);
     reductions[4] =
         rsqrt((reductions[4] + reductions[5] + reductions[6] + reductions[7]) /
                   HeadDim +
-              1e-6f);
+              kRmsEpsilon);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong key_row = ulong(token) * KeyWidth;
