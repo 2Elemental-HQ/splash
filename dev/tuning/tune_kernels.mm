@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
       const auto &device = backend.capabilities();
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
       const uint64_t budget =
-          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
+          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes, 0);
       if (!budget)
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(

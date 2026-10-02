@@ -29,8 +29,7 @@ struct HostMemoryPages {
 // carve-out, tag storage) is never available. The governor also enforces
 // the engine budget, host reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize,
-    bool compression = false) noexcept;
+    const HostMemoryPages &pages, uint64_t pageSize, bool compression) noexcept;
 // The live estimate, counting compression unless macOS reports critical
 // memory pressure (or none): a Mac that uses its compressor as designed keeps
 // serving, the credit shrinking as the anonymous pages it counts are

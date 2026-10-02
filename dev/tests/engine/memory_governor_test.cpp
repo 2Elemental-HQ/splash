@@ -38,7 +38,7 @@ void allocate(uint64_t bytes) {
 void testHostAvailabilityCountsReclaimablePages() {
   constexpr uint64_t pageSize = 16384;
   auto availablePages = [](const HostMemoryPages &pages) {
-    return estimateHostAvailableMemory(pages, pageSize) / pageSize;
+    return estimateHostAvailableMemory(pages, pageSize, false) / pageSize;
   };
   // free_count includes the speculative pages; they are file-backed too.
   HostMemoryPages pages{
@@ -71,18 +71,18 @@ void testHostAvailabilityCountsReclaimablePages() {
   require(estimateHostAvailableMemory(
               {.free = 2'349'632, .speculative = 90'428,
                .fileBacked = 417'802, .purgeable = 23'495},
-              pageSize) == 44'245'008'384ULL,
+              pageSize, false) == 44'245'008'384ULL,
           "unexpected available memory for a 64 GB snapshot");
   const uint64_t maximum = std::numeric_limits<uint64_t>::max();
-  require(estimateHostAvailableMemory({.free = maximum, .fileBacked = 1}, 1) ==
+  require(estimateHostAvailableMemory({.free = maximum, .fileBacked = 1}, 1, false) ==
                   0 &&
               estimateHostAvailableMemory(
-                  {.fileBacked = maximum, .purgeable = 1}, 1) == 0 &&
-              estimateHostAvailableMemory({.free = maximum}, pageSize) == 0 &&
-              estimateHostAvailableMemory({.free = 1, .speculative = 2}, 1) ==
+                  {.fileBacked = maximum, .purgeable = 1}, 1, false) == 0 &&
+              estimateHostAvailableMemory({.free = maximum}, pageSize, false) == 0 &&
+              estimateHostAvailableMemory({.free = 1, .speculative = 2}, 1, false) ==
                   0 &&
-              estimateHostAvailableMemory({.free = maximum}, 1) == maximum &&
-              estimateHostAvailableMemory(pages, 0) == 0,
+              estimateHostAvailableMemory({.free = maximum}, 1, false) == maximum &&
+              estimateHostAvailableMemory(pages, 0, false) == 0,
           "invalid host counters or arithmetic overflow did not fail closed");
   // With compression (below critical system pressure), compressing the
   // anonymous pages frees what the compressor would not keep: at its
@@ -92,7 +92,7 @@ void testHostAvailabilityCountsReclaimablePages() {
                                         .compressor = compressor, .compressed = compressed},
                                        1, true);
   };
-  require(estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40}, 1) == 30 &&
+  require(estimateHostAvailableMemory({.free = 10, .fileBacked = 20, .anonymous = 40}, 1, false) == 30 &&
               compressedPages(0, 0) == 50 && compressedPages(10, 15) == 44 && compressedPages(10, 40) == 50 &&
               compressedPages(10, 10) == 30 && compressedPages(10, 5) == 30,
           "compression credit is not the anonymous pages' savings at the compressor's ratio, at most 2:1");
@@ -322,7 +322,7 @@ void testReclaimablePagesReopenGrowth() {
                           [&available] { return available; });
   const auto admitsMore = [&governor] { return static_cast<bool>(admit(governor, 1)); };
   HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = kGiB / 2};
-  available = estimateHostAvailableMemory(pressurePages, 1);
+  available = estimateHostAvailableMemory(pressurePages, 1, false);
   MemoryPressurePolicy hostPolicy;
   const auto hostDirective = hostPolicy.update(governor.snapshot(), 0.0, false);
   require(!admitsMore() && governor.snapshot().pressure == MemoryPressure::Warning &&
@@ -330,7 +330,7 @@ void testReclaimablePagesReopenGrowth() {
               hostDirective->targetBytes == kGiB,
           "low reclaimable memory bypassed bounded pressure recovery");
   pressurePages.fileBacked = 3 * kGiB;
-  available = estimateHostAvailableMemory(pressurePages, 1);
+  available = estimateHostAvailableMemory(pressurePages, 1, false);
   require(governor.snapshot().hostGrowthAllowed && admitsMore() &&
               !hostPolicy.update(governor.snapshot(), 1000.0, false),
           "reclaimable host recovery did not reopen normal admission");
