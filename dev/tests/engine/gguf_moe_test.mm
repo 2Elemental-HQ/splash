@@ -618,10 +618,10 @@ int moe(MetalBackend &backend) {
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
              stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
     }
-    // The 32-row tiles, whose 16- and 32-row matmuls both run at 263 rows,
-    // with the router on each float tile: a row's result is the same in every
-    // chunk on one tile (either tile's scores of a row depend on that row
-    // alone).
+    // The 32-row tiles, whose live-row matmuls (moe_live_rows) differ by
+    // chunk, with the router on each float tile: a row's result is the same
+    // in every chunk on one tile (either tile's scores of a row depend on that
+    // row alone).
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
       const int before = failures;
       Stats stats;

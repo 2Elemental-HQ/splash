@@ -6,11 +6,11 @@
 // avoids the register pressure of a fused gate/up tile. Gate and up round to
 // bf16 before silu(gate) * up.
 //
-// Tiles with at most 8 or 16 live rows use smaller MPP tiles. The up pass and
-// combine read only live rows, so skipped padding is never consumed. All row
-// variants share one kernel: register allocation follows the 32-row path,
-// while smaller paths save instructions. This path has been measured on
-// Apple10; Apple9 performance remains unmeasured.
+// Tiles with at most 8 or 16 live rows use smaller MPP tiles (moe_live_rows).
+// The up pass and combine read only live rows, so skipped padding is never
+// consumed. All row variants share one kernel: register allocation follows the
+// 32-row path, while smaller paths save instructions. This path has been
+// measured on Apple10; Apple9 performance remains unmeasured.
 constant constexpr uint PrefillMoeTileRows = 32;
 
 template <ushort Rows, bool MultiplySiluGate>
@@ -44,20 +44,11 @@ inline void prefill_moe_expert(device bfloat *grouped_input,
                                uint simd_group) {
   if (group.y >= *tile_count)
     return;
-  const uint rows = tiles[group.y].rows;
-  if (rows <= 8) {
-    prefill_moe_expert_tile<8, MultiplySiluGate>(
+  moe_live_rows<PrefillMoeTileRows>(tiles[group.y].rows, [&](auto rows) {
+    prefill_moe_expert_tile<decltype(rows)::value, MultiplySiluGate>(
         grouped_input, tiles, packed, shared, gate, output, params, group,
         input_sums, simd_lane, simd_group);
-  } else if (rows <= 16) {
-    prefill_moe_expert_tile<16, MultiplySiluGate>(
-        grouped_input, tiles, packed, shared, gate, output, params, group,
-        input_sums, simd_lane, simd_group);
-  } else {
-    prefill_moe_expert_tile<32, MultiplySiluGate>(
-        grouped_input, tiles, packed, shared, gate, output, params, group,
-        input_sums, simd_lane, simd_group);
-  }
+  });
 }
 
 // Gate and down passes: one affine projection of each tile.

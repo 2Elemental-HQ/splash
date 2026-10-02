@@ -226,11 +226,12 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
 // register tile. Staged: 8-row tiles while the chunk's routes average at most
 // one row per expert (rows * topK <= experts), 32-row tiles beyond, which
-// stream an expert's weights once for up to 32 of its rows (its tiles run 16-
-// or 32-row matmuls by their live rows). On the 35B's real prefill routes
-// (wikitext, 16-core M5 Pro, the three expert passes of a layer, ms) 8- vs
-// 32-row tiles: 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29,
-// 256 rows 2.60 / 1.71.
+// stream an expert's weights once for up to 32 of its rows (its tiles run 8-,
+// 16- or 32-row matmuls by their live rows, moe_live_rows). On the 35B's
+// real prefill routes (wikitext, 16-core M5 Pro, the three expert passes of a
+// layer, ms, with 16-row matmuls for up to 16 live rows) 8- vs 32-row tiles:
+// 32 rows 0.72 / 0.71, 64 rows 1.03 / 0.97, 128 rows 1.59 / 1.29, 256 rows
+// 2.60 / 1.71.
 [[nodiscard]] constexpr MoeExpertTile moeGgufPrefillTile(MoeShape shape, uint32_t rows,
                                                          MoeGgufTile tile) noexcept {
   return tile == MoeGgufTile::Register ||

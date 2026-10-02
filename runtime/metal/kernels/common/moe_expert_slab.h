@@ -3,6 +3,23 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/QuantFormat.h"
 
+// A grouped expert tile of Max rows (kernels/shared/moe.metal) holds its
+// live rows first, then padding. Calls run(integral_constant<ushort, R>{})
+// with the rows R of the matmul an expert pass runs on `rows` live rows: the
+// smallest of 8, 16 and Max that holds them.
+template <ushort Max, typename Run>
+inline void moe_live_rows(uint rows, Run run) {
+  if constexpr (8 < Max) {
+    if (rows <= 8)
+      return run(integral_constant<ushort, 8>{});
+  }
+  if constexpr (16 < Max) {
+    if (rows <= 16)
+      return run(integral_constant<ushort, 16>{});
+  }
+  run(integral_constant<ushort, Max>{});
+}
+
 // One expert's Q4 slab, [weights][BF16 scales][BF16 biases] in the same
 // StorageN=256 affine package as the dense kernels. Routed experts sit at
 // their stride in the packed buffer; expert `experts` is the shared expert,
