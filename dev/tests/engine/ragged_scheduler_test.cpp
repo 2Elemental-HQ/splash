@@ -99,6 +99,27 @@ void testAdmissionRespectsContendedBudgetAndDecodePriority() {
           "prefill admission did not resume after foreground decode left");
 }
 
+// The tier admission can select is set by the lanes that prefill or decode,
+// not by those waiting for a mask or for admission.
+void testHighestRunnablePriority() {
+  Scheduler scheduler;
+  require(!scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
+  scheduler.submit(request(1, 1, BatchCohort::Constrained, RequestPriority::Foreground));
+  scheduler.resourcesReady(1, 1);
+  const BatchPlan initial = *scheduler.next();
+  scheduler.commit(initial);
+  const std::array result{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+  scheduler.complete(initial, result);
+  scheduler.submit(request(2, 1, BatchCohort::Greedy, RequestPriority::Background));
+  scheduler.resourcesReady(2, 1);
+  scheduler.submit(request(3, 100));
+  scheduler.resourcesReady(3, 0);
+  scheduler.submit(request(4, 100, BatchCohort::Greedy, RequestPriority::Foreground));
+  require(scheduler.phase(1) == Phase::WaitingMask &&
+              scheduler.highestRunnablePriority() == RequestPriority::Normal,
+          "a mask wait or a queued request set the runnable tier");
+}
+
 void testQueuedPrefillCannotBeOvertakenIndefinitely() {
   Scheduler scheduler;
   scheduler.submit(request(1, 8193));
@@ -983,6 +1004,7 @@ int main() {
   try {
     testAdmissionSharesDispatchOrderAndBudget();
     testAdmissionRespectsContendedBudgetAndDecodePriority();
+    testHighestRunnablePriority();
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
     testShortestRemainingFirstUsesActualRows();

@@ -221,6 +221,9 @@ private:
     // leaves it in place.
     bool refusedMemory = false;
     std::vector<uint32_t> exactTokens;
+    // Made from request.prompt and request.images, which do not change while
+    // the request waits; refreshed each pass and dropped once it starts or
+    // skips the cache.
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;

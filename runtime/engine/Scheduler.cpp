@@ -220,6 +220,16 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
   return result;
 }
 
+std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexcept {
+  std::optional<RequestPriority> result;
+  for (const auto &[_, request] : requests_) {
+    if ((request.phase == Phase::Prefill || request.phase == Phase::Decode) &&
+        (!result || request.spec.priority < *result))
+      result = request.spec.priority;
+  }
+  return result;
+}
+
 std::optional<BatchPlan> Scheduler::next() const {
   if (active_)
     return std::nullopt;

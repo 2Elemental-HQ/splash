@@ -91,6 +91,11 @@ public:
   // Preview the dispatch row budget before allocating new resident cells.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates) const;
+  // The highest priority among requests that prefill or decode. A waiting
+  // request of a lower priority cannot be in prefillAdmissionOrder's result
+  // while it lasts: the plan takes one tier, the highest among resident
+  // prefill lanes and candidates, and is dropped when a higher tier decodes.
+  [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
   [[nodiscard]] std::optional<BatchPlan> next() const;
   void commit(const BatchPlan &plan);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,

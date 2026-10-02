@@ -3265,6 +3265,81 @@ void testAdmissionUsesCachedRemainingWork() {
           "cache-aware admission failed to finish");
 }
 
+// While a higher priority decodes, a waiting request cannot be selected:
+// admission queues it without hashing its prompt. Once the higher priority
+// is gone, one probe finds its cached prefix and it starts.
+void testUnselectableCandidatesAreNotProbed() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return resources.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> cached(129, 5);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  executor.decodeFinishes = false;
+  auto urgent = request(2, std::vector<uint32_t>(33, 6));
+  urgent.priority = RequestPriority::Foreground;
+  urgent.maxNewTokens = 1000;
+  engine.submit(std::move(urgent));
+  double now = 100;
+  tickUntil(engine, now, [&] { return events.outputs.contains(2); },
+            "the higher priority did not decode");
+  std::vector<uint32_t> prompt(cached.begin(), cached.begin() + 128);
+  prompt.resize(161, 8);
+  engine.submit(request(3, prompt));
+  const uint64_t before = hashed();
+  for (uint32_t step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(hashed() == before && !executor.requests.contains(3) &&
+              engine.snapshot().scheduler.queued == 1,
+          "admission probed a request it could not select");
+  engine.cancel(2);
+  tickUntil(engine, now, [&] { return executor.requests.contains(3); },
+            "the waiting request did not start once the higher priority left");
+  require(hashed() - before == 5 && events.startIds.back() == 3 &&
+              events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 128U},
+          "the request was not probed once, or missed its cached prefix");
+}
+
+// A request that waits beside a shorter resident prefill keeps its probe
+// from pass to pass. Every resident command publishes blocks, a change of
+// the KV graph, yet each pass hashes only the page past the match again.
+void testWaitingCandidateProbeIsRefreshedNotRepeated() {
+  test::TestKvStorage storage(4096, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return resources.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> cached(257, 3);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  engine.submit(request(2, std::vector<uint32_t>(20'000, 2)));
+  double now = 100;
+  tickUntil(engine, now, [&] { return executor.requests.contains(2); },
+            "the resident prefill did not start");
+  std::vector<uint32_t> prompt(cached.begin(), cached.begin() + 256);
+  prompt.resize(40'000, 4);
+  engine.submit(request(3, prompt));
+  const uint64_t before = hashed();
+  tickUntil(engine, now, [&] { return hashed() != before; },
+            "the waiting request was not probed");
+  require(hashed() - before == 9, "the first probe did not hash its prefix and the page past it");
+  const uint64_t probed = hashed();
+  const size_t commands = executor.prefillWidths.size();
+  for (uint32_t step = 0; step < 6; ++step)
+    static_cast<void>(engine.tick(now++));
+  const size_t passes = executor.prefillWidths.size() - commands;
+  require(passes >= 2 && hashed() - probed == passes && !executor.requests.contains(3),
+          "a kept probe hashed more than the page past its match");
+}
+
 // A request that waits for memory closes admission behind it: the request
 // that arrived after it is not tried, and starts once the first has.
 void testMemoryWaitHoldsBackLaterArrivals() {
@@ -7124,6 +7199,49 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
           "the producer planned a junction for the request that skips the cache");
 }
 
+// A request whose prefix restore cannot fit even alone ignores the cache
+// until it starts: admission no longer probes it, and it starts cold.
+void testSkipCacheCandidateIsNotProbed() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return cache.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
+              storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+          "the prefix did not move to disk whole");
+  // No page can be allocated until the request starts again.
+  storage.growthBlocked = true;
+  executor.beginObserver = [&] { storage.growthBlocked = executor.beginAttempts < 2; };
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(hashed() == 2 && events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
+          "the restore that cannot fit alone did not wait");
+  double now = 2;
+  tickUntil(engine, now, [&] { return !events.starts.empty(); },
+            "the request did not start without its prefix");
+  require(hashed() == 2 && events.starts[0] == std::pair{EngineCacheStatus::Miss, 0U},
+          "a request that ignores the cache was probed or ranked by its prefix");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.completedCount == 1 && executor.prefillRows == 65 && tier.restores == 0,
+          "the request did not finish cold");
+}
+
 // A request admitted into a restore waits for its disk reads, not for
 // memory, although the host refused its previous attempt: /status counts it
 // as restoring.
@@ -8323,6 +8441,7 @@ int main() {
     testLimitOutlivedByProgressDoesNotWakeTheLoop();
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
+    testSkipCacheCandidateIsNotProbed();
     testRestoringRequestIsNotWaitingForMemory();
     testSharedPrefillWaitsForARestoringProducer();
     testCancelledRestoringProducerReleasesItsWaiter();
@@ -8420,6 +8539,8 @@ int main() {
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
+    testUnselectableCandidatesAreNotProbed();
+    testWaitingCandidateProbeIsRefreshedNotRepeated();
     testMemoryWaitHoldsBackLaterArrivals();
     testMemoryWaitClosesAdmissionBesideAResidentLane();
     testClosedAdmissionReopensWhenTheWaitEnds();

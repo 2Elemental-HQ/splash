@@ -459,11 +459,11 @@ bool Engine::admitQueued(double now) {
   // A request this pass does not start, or that waits behind one refused
   // memory, waits for scheduling.
   const auto queue = [&](uint64_t id) {
-    Request &active = request(id);
-    active.admissionProbe.reset();
-    deferWait(active);
+    deferWait(request(id));
     scheduler_.deferAdmission(id);
   };
+  // Requests below it cannot be selected this pass; they are not probed.
+  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
   // A request whose start was refused memory closes admission behind it
   // until it starts: admission is open for order[0, open). What reclaim and
   // finishing lanes free would otherwise keep going to later arrivals that
@@ -472,6 +472,8 @@ bool Engine::admitQueued(double now) {
   // one.
   size_t open = order.size();
   std::vector<PrefillAdmission> candidates;
+  // Each candidate's place in order.
+  std::unordered_map<uint64_t, size_t> positions;
   for (size_t index = 0; index < order.size(); ++index) {
     const uint64_t id = order[index];
     Request &active = request(id);
@@ -489,27 +491,34 @@ bool Engine::admitQueued(double now) {
       deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
       continue;
     }
-    active.admissionProbe =
-        cache_.probe(active.request.prompt, active.request.images);
-    const uint32_t cached = active.admissionProbe->cachedTokens();
+    if (runnable && active.request.priority > *runnable) {
+      queue(id);
+      continue;
+    }
+    // A request that ignores the cache is ranked by its whole prompt.
+    uint32_t cached = 0;
+    if (!active.skipCache) {
+      if (active.admissionProbe)
+        cache_.refresh(*active.admissionProbe, active.request.prompt, active.request.images);
+      else
+        active.admissionProbe = cache_.probe(active.request.prompt, active.request.images);
+      cached = active.admissionProbe->cachedTokens();
+    }
     if (pendingSharedPrefill(active, cached)) {
-      active.admissionProbe.reset();
       deferWait(active);
       scheduler_.waitForPrefix(id);
       continue;
     }
+    positions.emplace(id, index);
     candidates.push_back({id, cached});
   }
-  const auto position = [&](uint64_t id) {
-    return static_cast<size_t>(std::find(order.begin(), order.end(), id) - order.begin());
-  };
   bool progressed = false;
   while (!candidates.empty()) {
     const auto selected = scheduler_.prefillAdmissionOrder(candidates);
     if (selected.empty())
       break;
     for (uint64_t id : selected) {
-      if (position(id) >= open)
+      if (positions.at(id) >= open)
         continue;
       progressed = admit(request(id), now) || progressed;
       std::erase_if(candidates, [id](const auto &value) {
@@ -517,10 +526,10 @@ bool Engine::admitQueued(double now) {
       });
       // Refused memory in this pass, it closes admission behind it at once.
       if (request(id).refusedMemory)
-        open = std::min(open, position(id) + 1);
+        open = std::min(open, positions.at(id) + 1);
     }
     std::erase_if(candidates, [&](const auto &value) {
-      if (position(value.requestId) < open)
+      if (positions.at(value.requestId) < open)
         return false;
       queue(value.requestId);
       return true;
@@ -608,7 +617,6 @@ bool Engine::admit(Request &active, double now) {
           : cache_.lookup(modelRequest.prompt, active.request.images,
                           active.admissionProbe ? &*active.admissionProbe
                                                 : nullptr);
-  active.admissionProbe.reset();
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
@@ -692,8 +700,10 @@ bool Engine::admit(Request &active, double now) {
       return true;
     }
     // Release the prefix pin before retrying without its memory footprint.
-    if (verdict == Verdict::Fail)
+    if (verdict == Verdict::Fail) {
       active.skipCache = true;
+      active.admissionProbe.reset();
+    }
     active.refusedMemory = true;
     scheduler_.waitForResources(requestId);
     deferResourceRetry(active, now, kv.denial);
@@ -721,6 +731,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = active.suspended;
   active.skipCache = false;
+  active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
