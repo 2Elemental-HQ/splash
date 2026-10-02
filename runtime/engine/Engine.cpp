@@ -574,10 +574,18 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
 
 bool Engine::pendingSharedPrefill(const Request &active,
                                   uint32_t resumeBoundary) const {
+  // A request that ignores the cache uses no producer's state.
+  if (active.skipCache)
+    return false;
   for (const auto &[id, peer] : requests_) {
     if (!peer.stateCell || peer.finalized || peer.pendingEnd ||
-        peer.request.priority > active.request.priority ||
-        scheduler_.phase(id) != Phase::Prefill)
+        peer.request.priority > active.request.priority)
+      continue;
+    // A peer still restoring its prefix from disk has planned its boundaries
+    // at admission; siblings wait for it rather than each reading the same
+    // state. A failed restore discards those boundaries (pollRestores), which
+    // releases them.
+    if (scheduler_.phase(id) != Phase::Prefill && !peer.restore)
       continue;
     const uint32_t shared = sharedPrefillBoundary(active, peer);
     for (size_t i = peer.stateBoundaryCursor; i < peer.stateBoundaries.size(); ++i) {
@@ -911,8 +919,9 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
 bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   bool changed = false;
   for (const auto &[id, peer] : requests_) {
+    // A request that ignores the cache uses no junction.
     if (id == active.request.id || peer.stateCell || peer.suspended ||
-        peer.finalized || peer.pendingEnd ||
+        peer.finalized || peer.pendingEnd || peer.skipCache ||
         peer.request.priority < active.request.priority)
       continue;
     changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false) ||

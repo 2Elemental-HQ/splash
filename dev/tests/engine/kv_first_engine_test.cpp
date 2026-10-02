@@ -6827,6 +6827,120 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
           "restore accounting is off");
 }
 
+// Siblings that share a prefix whose deepest state is on disk wait for the
+// one admitted first while it is still restoring: it planned the junction at
+// their shared boundary at admission, so the state is read once and the
+// shared span prefilled once.
+void testSharedPrefillWaitsForARestoringProducer() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // 64 tokens whose state is on disk, 128 more both share, 34 of their own.
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  publishDiskState(cache, prompt);
+  executor.restoreControl->ready = false;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 192, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(executor.diskReads == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+          "the sibling did not wait for the restoring producer");
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(executor.diskReads == 1 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 192} &&
+              executor.prefillRows == (192 - 64) + 2 * 34 && events.completedCount == 2,
+          "the sibling read the state again or prefilled the shared span");
+}
+
+// A request whose restore could not fit ignores the cache until it starts:
+// it uses no producer's state, so it does not wait for one, even for one
+// restoring the same prefix with a boundary planned inside it, and no
+// producer plans a junction for it.
+void testSkipCacheRequestDoesNotWaitForAProducer() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // The state at 64 and both blocks of KV under it are on disk.
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  cache.endRequest(999);
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
+          "state was not demoted");
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  while (pool.snapshot().pagesAllocated)
+    require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress,
+            "an empty extent was not released");
+  // Alone, with no page the budget grants, its restore fails: it skips the
+  // cache from then on.
+  storage.growthBlocked = true;
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(engine.resourceWaitSnapshot(1).memory == 1 && executor.diskReads == 0,
+          "the restore that could not fit did not wait for memory");
+  storage.growthBlocked = false;
+  // A foreground request sharing its first 192 tokens is admitted first and
+  // restores the prefix. It plans a junction at 160 for a sibling sharing
+  // that much with it, and none at 192 for the request that skips the cache.
+  std::vector<uint32_t> producer = prompt;
+  std::fill(producer.begin() + 192, producer.end(), 7);
+  auto foreground = request(2, producer);
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  std::vector<uint32_t> sibling = producer;
+  std::fill(sibling.begin() + 160, sibling.end(), 9);
+  engine.submit(request(3, sibling));
+  double now = 101;
+  tickUntil(engine, now,
+            [&] {
+              return std::find(events.startIds.begin(), events.startIds.end(), 1) !=
+                     events.startIds.end();
+            },
+            "the request that skips the cache did not start");
+  require(events.starts.front() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::Miss, 0} &&
+              executor.diskReads == 1 && executor.restored == 0,
+          "the request that skips the cache waited for the restoring producer");
+  executor.restoreControl->ready = true;
+  for (; now < 300 && !idle(engine); ++now) {
+    static_cast<void>(engine.tick(now));
+    tier.complete();
+  }
+  require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
+          "the requests did not finish");
+  const auto &boundaries = executor.plans.at(2).boundaries;
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 160} &&
+              std::none_of(boundaries.begin(), boundaries.end(),
+                           [](const DraftBoundaryPlan &boundary) {
+                             return boundary.boundary == 192;
+                           }),
+          "the producer planned a junction for the request that skips the cache");
+}
+
 // A request admitted into a restore waits for its disk reads, not for
 // memory, although the host refused its previous attempt: /status counts it
 // as restoring.
@@ -8026,6 +8140,8 @@ int main() {
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testRestoringRequestIsNotWaitingForMemory();
+    testSharedPrefillWaitsForARestoringProducer();
+    testSkipCacheRequestDoesNotWaitForAProducer();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
     testRefusedRestoreClosesAdmission();

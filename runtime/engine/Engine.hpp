@@ -294,7 +294,8 @@ private:
   bool addStateBoundary(Request &request, uint32_t after, uint32_t tokens,
                         bool disposable);
   // Plans a junction at the boundary each queued peer of the same or lower
-  // priority shares with this lane, past `after`; true when one was added.
+  // priority shares with this lane, past `after`, unless the peer ignores the
+  // cache; true when one was added.
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
