@@ -1094,13 +1094,12 @@ struct Runtime::Impl {
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     for (const PackedPrefillSequence &sequence : batch.sequences) {
-      const QwenSlotBuffers &buffers = states.buffers(sequence.entry->stateLane);
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         DFlashPrefillSpan &span = spans.at(spanCount++);
         span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
         span.rows = capture.absoluteEnd - capture.absoluteBegin;
         span.startPosition = capture.absoluteBegin;
-        span.ring = buffers.draft;
+        span.ring = states.draft(sequence.entry->stateLane);
       }
     }
     draftModel.addContextPrefill(
@@ -1159,17 +1158,13 @@ struct Runtime::Impl {
           std::span(recurrentIn).subspan(stateBegin, gdnLayers);
       destination.recurrentOut =
           std::span(recurrentOut).subspan(stateBegin, gdnLayers);
-      const QwenLaneMetadata &metadata = states.metadata(sequence.entry->stateLane);
-      const QwenSlotBuffers &buffers = states.buffers(sequence.entry->stateLane);
+      const GdnParityBuffers &in = states.current(sequence.entry->stateLane);
+      const GdnParityBuffers &out = states.next(sequence.entry->stateLane);
       for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
-        convolutionIn[stateBegin + layer] =
-            buffers.gdn[metadata.activeParity].convolutionLayers[layer];
-        convolutionOut[stateBegin + layer] =
-            buffers.gdn[metadata.activeParity ^ 1].convolutionLayers[layer];
-        recurrentIn[stateBegin + layer] =
-            buffers.gdn[metadata.activeParity].recurrentLayers[layer];
-        recurrentOut[stateBegin + layer] =
-            buffers.gdn[metadata.activeParity ^ 1].recurrentLayers[layer];
+        convolutionIn[stateBegin + layer] = in.convolutionLayers[layer];
+        convolutionOut[stateBegin + layer] = out.convolutionLayers[layer];
+        recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
+        recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
       }
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
@@ -1310,7 +1305,7 @@ struct Runtime::Impl {
     for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
       for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
         const auto &ring =
-            states.buffers(laneEntry(entries, lane).stateLane).draft[layer];
+            states.draft(laneEntry(entries, lane).stateLane)[layer];
         keys[layer][lane] = ring.keys;
         values[layer][lane] = ring.values;
       }
@@ -1453,11 +1448,8 @@ struct Runtime::Impl {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
-      const uint32_t active = states.metadata(entry.stateLane).activeParity;
-      buffers.currentGdnStates[lane] =
-          states.buffers(entry.stateLane).gdn[active].stateBase;
-      buffers.nextGdnStates[lane] =
-          states.buffers(entry.stateLane).gdn[active ^ 1].stateBase;
+      buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
+      buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
     }
     for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
       gdnPacked[layer] = decodeArena->gdnBatchSlice(
@@ -1602,10 +1594,8 @@ struct Runtime::Impl {
       Request *entry = lanes[std::min(lane, width - 1)];
       if (!entry)
         throw std::invalid_argument("empty GDN commit lane");
-      const uint32_t active = states.metadata(entry->stateLane).activeParity;
-      const auto &gdn = states.buffers(entry->stateLane).gdn;
-      currentStates[lane] = gdn[active].stateBase;
-      nextStates[lane] = gdn[active ^ 1].stateBase;
+      currentStates[lane] = states.current(entry->stateLane).stateBase;
+      nextStates[lane] = states.next(entry->stateLane).stateBase;
     }
     targetModel.addStateCommit(
         graph,

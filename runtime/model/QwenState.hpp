@@ -46,12 +46,6 @@ private:
   friend class QwenStateStorage;
 };
 
-struct QwenSlotBuffers final {
-  // Views retain the slot's GDN and draft allocations without copying data.
-  std::array<GdnParityBuffers, 2> gdn;
-  std::vector<DFlashDraftRingLayer> draft;
-};
-
 struct QwenLogicalLengths final {
   uint64_t targetTokens = 0;
   uint64_t draftBase = 0;
@@ -176,8 +170,14 @@ public:
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
-  [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t lane) const;
   [[nodiscard]] const QwenLaneMetadata &metadata(uint32_t lane) const;
+  // An assigned lane's buffers, read through the cells and the ring it
+  // holds: current() is the GDN cell its next transition reads, next() the
+  // one that transition writes, draft() its draft ring. swapParity()
+  // exchanges current and next.
+  [[nodiscard]] const GdnParityBuffers &current(uint32_t lane) const;
+  [[nodiscard]] const GdnParityBuffers &next(uint32_t lane) const;
+  [[nodiscard]] const std::vector<DFlashDraftRingLayer> &draft(uint32_t lane) const;
 
   // Activation takes pooled buffers and asks the governor once for all the
   // pool lacks, together with `extraBytes` for what else the request's start
@@ -236,11 +236,13 @@ public:
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
 private:
-  struct Lane final {
-    QwenSlotBuffers buffers;
-    QwenLaneMetadata metadata;
+  struct Buffers final {
     std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
     std::shared_ptr<DFlashDraftRing> draft;
+  };
+  struct Lane final {
+    QwenLaneMetadata metadata;
+    Buffers cells;
   };
 
   [[nodiscard]] Lane &lane(uint32_t index);
@@ -251,16 +253,11 @@ private:
   // `cells` GDN cells and a draft ring: the pool's buffers, and one
   // admission for everything the pool lacks and for the caller's extra. A
   // refusal allocates nothing and takes nothing from the pool.
-  struct Buffers final {
-    std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
-    std::shared_ptr<DFlashDraftRing> draft;
-  };
   [[nodiscard]] metal::AllocationResult
   acquire(uint32_t cells, std::string_view label, Buffers &buffers,
           uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
   // The bytes of the cells and the ring the pool lacks of that.
   [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
-  static void refreshViews(Lane &lane);
   void restore(uint32_t lane, const QwenCompositeState &state,
                bool restoreDraftState);
   void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);

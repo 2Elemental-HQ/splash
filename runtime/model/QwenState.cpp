@@ -222,12 +222,27 @@ QwenStateStorage::~QwenStateStorage() {
   pool_->rings.clear();
 }
 
-const QwenSlotBuffers &QwenStateStorage::buffers(uint32_t index) const {
-  return lane(index).buffers;
-}
-
 const QwenLaneMetadata &QwenStateStorage::metadata(uint32_t index) const {
   return lane(index).metadata;
+}
+
+const GdnParityBuffers &QwenStateStorage::current(uint32_t index) const {
+  const Lane &assigned = lane(index);
+  requireAssigned(assigned);
+  return assigned.cells.gdn[assigned.metadata.activeParity]->buffers();
+}
+
+const GdnParityBuffers &QwenStateStorage::next(uint32_t index) const {
+  const Lane &assigned = lane(index);
+  requireAssigned(assigned);
+  return assigned.cells.gdn[assigned.metadata.activeParity ^ 1]->buffers();
+}
+
+const std::vector<DFlashDraftRingLayer> &
+QwenStateStorage::draft(uint32_t index) const {
+  const Lane &assigned = lane(index);
+  requireAssigned(assigned);
+  return assigned.cells.draft->layers();
 }
 
 metal::AllocationResult
@@ -244,14 +259,12 @@ QwenStateStorage::tryActivateLane(uint32_t index, uint64_t requestId, uint64_t e
                                buffers, extraBytes, allocateExtra);
       !admission)
     return admission;
-  current.gdn = std::move(buffers.gdn);
-  current.draft = std::move(buffers.draft);
-  refreshViews(current);
+  current.cells = std::move(buffers);
 
   // A fresh recurrent sequence reads parity zero immediately. Parity one is
   // fully overwritten by the first transition. Draft validity is controlled
   // by the zero logical lengths below.
-  clear(current.buffers.gdn[0].stateBase, "lane GDN state");
+  clear(current.cells.gdn[0]->buffers().stateBase, "lane GDN state");
   current.metadata = {requestId, 0, {}};
   return {};
 }
@@ -264,12 +277,11 @@ void QwenStateStorage::releaseLane(uint32_t index, uint64_t requestId) {
   }
   // Parity one first, so the next activation pops parity zero first and a
   // reactivated lane gets its previous buffers back in the same order.
-  for (uint32_t parity = current.gdn.size(); parity > 0;) {
+  for (uint32_t parity = current.cells.gdn.size(); parity > 0;) {
     --parity;
-    pool_->cells.push_back(std::move(current.gdn[parity]));
+    pool_->cells.push_back(std::move(current.cells.gdn[parity]));
   }
-  pool_->rings.push_back(std::move(current.draft));
-  refreshViews(current);
+  pool_->rings.push_back(std::move(current.cells.draft));
   current.metadata = {};
 }
 
@@ -326,21 +338,20 @@ QwenStateStorage::snapshot(uint32_t index) {
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
-  Lane &source = lane(index);
-  requireAssigned(source);
+  const GdnParityBuffers &gdn = current(index);
+  const std::vector<DFlashDraftRingLayer> &ring = draft(index);
   validateLengths(lengths, true);
   Buffers buffers;
   if (!acquire(1, "qwen-state-cache", buffers))
     return nullptr;
   QwenCacheSlot cacheSlot{std::move(buffers.gdn[0]), std::move(buffers.draft)};
-  const uint32_t active = source.metadata.activeParity;
-  copyExact(cacheSlot.gdn->buffers().stateBase,
-            source.gdn[active]->buffers().stateBase, "cached GDN state");
-  for (uint32_t layer = 0; layer < source.buffers.draft.size(); ++layer) {
-    copyExact(cacheSlot.draft->layers()[layer].keys,
-              source.buffers.draft[layer].keys, "cached draft keys");
-    copyExact(cacheSlot.draft->layers()[layer].values,
-              source.buffers.draft[layer].values, "cached draft values");
+  copyExact(cacheSlot.gdn->buffers().stateBase, gdn.stateBase,
+            "cached GDN state");
+  for (uint32_t layer = 0; layer < ring.size(); ++layer) {
+    copyExact(cacheSlot.draft->layers()[layer].keys, ring[layer].keys,
+              "cached draft keys");
+    copyExact(cacheSlot.draft->layers()[layer].values, ring[layer].values,
+              "cached draft values");
   }
   return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
       pool_, std::move(cacheSlot), layout_, lengths, file_, staging_));
@@ -348,15 +359,15 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
 
 std::unique_ptr<StateOffload>
 QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completion) {
-  Lane &source = lane(index);
+  const Lane &source = lane(index);
   requireAssigned(source);
   validateLengths(source.metadata.lengths, true);
   if (!canSnapshotToDisk())
     return {};
-  return QwenCompositeState::write(
-      file_, staging_,
-      stateSpans(source.buffers.gdn[source.metadata.activeParity], source.buffers.draft),
-      layout_, source.metadata.lengths, std::move(completion));
+  return QwenCompositeState::write(file_, staging_,
+                                   stateSpans(current(index), draft(index)),
+                                   layout_, source.metadata.lengths,
+                                   std::move(completion));
 }
 
 metal::AllocationResult
@@ -402,18 +413,14 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
 
 void QwenStateStorage::restore(uint32_t index, const QwenCompositeState &state,
                                bool restoreDraftState) {
-  Lane &destination = lane(index);
-  const uint32_t active = destination.metadata.activeParity;
-  copyExact(destination.gdn[active]->buffers().stateBase,
-            state.slot_.gdn->buffers().stateBase, "restored GDN state");
+  copyExact(current(index).stateBase, state.slot_.gdn->buffers().stateBase,
+            "restored GDN state");
   if (restoreDraftState) {
-    for (uint32_t layer = 0; layer < destination.buffers.draft.size();
-         ++layer) {
-      copyExact(destination.buffers.draft[layer].keys,
-                state.slot_.draft->layers()[layer].keys,
+    const std::vector<DFlashDraftRingLayer> &ring = draft(index);
+    for (uint32_t layer = 0; layer < ring.size(); ++layer) {
+      copyExact(ring[layer].keys, state.slot_.draft->layers()[layer].keys,
                 "restored draft keys");
-      copyExact(destination.buffers.draft[layer].values,
-                state.slot_.draft->layers()[layer].values,
+      copyExact(ring[layer].values, state.slot_.draft->layers()[layer].values,
                 "restored draft values");
     }
   }
@@ -438,15 +445,13 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
   if (!typed || typed->layout_ != layout_)
     throw std::invalid_argument("incompatible Qwen composite state");
   validateLengths(typed->lengths_, true);
-  Lane &destination = lane(index);
-  requireAssigned(destination);
+  requireAssigned(lane(index));
   if (!typed->disk_) {
     restore(index, *typed, restoreDraftState);
     committed();
     return {};
   }
-  auto spans = stateSpans(destination.buffers.gdn[destination.metadata.activeParity],
-                          destination.buffers.draft);
+  auto spans = stateSpans(current(index), draft(index));
   auto commit = [this, index, lengths = typed->lengths_, restoreDraftState,
                  committed = std::move(committed)] {
     restoreLengths(index, lengths, restoreDraftState);
@@ -460,17 +465,6 @@ std::unique_ptr<StateRestore> QwenStateStorage::beginRestore(
     operation->drain();
     throw;
   }
-}
-
-void QwenStateStorage::refreshViews(Lane &current) {
-  for (uint32_t parity = 0; parity < current.gdn.size(); ++parity) {
-    current.buffers.gdn[parity] = current.gdn[parity]
-                                      ? current.gdn[parity]->buffers()
-                                      : GdnParityBuffers{};
-  }
-  current.buffers.draft =
-      current.draft ? current.draft->layers()
-                    : std::vector<DFlashDraftRingLayer>{};
 }
 
 QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) {

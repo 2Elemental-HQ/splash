@@ -157,20 +157,20 @@ void requireCommittedStateIdentical(const model::QwenStateStorage &states,
   const auto &masked = states.metadata(maskedLane);
   require(budget.lengths == masked.lengths,
           label + " logical state differs between budget and mask commits");
-  const auto &left = states.buffers(budgetLane);
-  const auto &right = states.buffers(maskedLane);
   auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
                        const std::string &part) {
     require(a.sizeBytes() == b.sizeBytes() && a.contents() && b.contents() &&
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
-  identical(left.gdn[budget.activeParity].stateBase,
-            right.gdn[masked.activeParity].stateBase, "GDN state");
+  identical(states.current(budgetLane).stateBase,
+            states.current(maskedLane).stateBase, "GDN state");
+  const auto &left = states.draft(budgetLane);
+  const auto &right = states.draft(maskedLane);
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    identical(left.draft[layer].keys, right.draft[layer].keys,
+    identical(left[layer].keys, right[layer].keys,
               "draft keys layer=" + std::to_string(layer));
-    identical(left.draft[layer].values, right.draft[layer].values,
+    identical(left[layer].values, right[layer].values,
               "draft values layer=" + std::to_string(layer));
   }
 }
@@ -393,8 +393,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
     }
     result.emplace_back(std::move(name), std::move(values));
   };
-  const auto &buffers = states.buffers(lane);
-  const auto &gdn = buffers.gdn[states.metadata(lane).activeParity];
+  const auto &gdn = states.current(lane);
   const auto &target = states.layout().target;
   add("convolution", convolutionHalf(backend, gdn, target), true);
   add("recurrent", recurrentHalf(backend, gdn, target), false);
@@ -405,9 +404,10 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
-  for (uint32_t layer = 0; layer < buffers.draft.size(); ++layer) {
-    const auto *keys = bfloatContents(buffers.draft[layer].keys, "draft keys");
-    const auto *values = bfloatContents(buffers.draft[layer].values, "draft values");
+  const auto &ring = states.draft(lane);
+  for (uint32_t layer = 0; layer < ring.size(); ++layer) {
+    const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
+    const auto *values = bfloatContents(ring[layer].values, "draft values");
     std::vector<float> keySamples, valueSamples;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
@@ -797,8 +797,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 void poisonRecurrentState(const metal::MetalBackend &backend,
                           const model::QwenStateStorage &states, uint32_t lane) {
   const metal::MetalBuffer recurrent =
-      recurrentHalf(backend, states.buffers(lane).gdn[states.metadata(lane).activeParity],
-                    states.layout().target);
+      recurrentHalf(backend, states.current(lane), states.layout().target);
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
@@ -1754,35 +1753,21 @@ int main(int argc, char **argv) {
     require(baselineMetadata.lengths == partitionedMetadata.lengths &&
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
-    const model::QwenSlotBuffers &baselineState = states.buffers(2);
-    const model::QwenSlotBuffers &partitionedState = states.buffers(3);
     const model::GdnStateLayout &gdnLayout = states.layout().target;
-    const Similarity convolution = compareBfloat(
-        convolutionHalf(backend, baselineState.gdn[baselineMetadata.activeParity],
-                        gdnLayout),
-        convolutionHalf(backend,
-                        partitionedState.gdn[partitionedMetadata.activeParity],
-                        gdnLayout));
-    const Similarity recurrent = compareFloat(
-        recurrentHalf(backend, baselineState.gdn[baselineMetadata.activeParity],
-                      gdnLayout),
-        recurrentHalf(backend,
-                      partitionedState.gdn[partitionedMetadata.activeParity],
-                      gdnLayout));
+    const Similarity convolution =
+        compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
+                      convolutionHalf(backend, states.current(3), gdnLayout));
+    const Similarity recurrent =
+        compareFloat(recurrentHalf(backend, states.current(2), gdnLayout),
+                     recurrentHalf(backend, states.current(3), gdnLayout));
     std::cout
         << "partition_equivalence conv_cos=" << convolution.cosine
         << " parity=" << baselineMetadata.activeParity << '/'
         << partitionedMetadata.activeParity
         << " conv_norms=" << convolution.leftNorm << '/'
         << convolution.rightNorm << " partition_other_conv_norm="
-        << compareBfloat(
-               convolutionHalf(backend,
-                               baselineState.gdn[baselineMetadata.activeParity],
-                               gdnLayout),
-               convolutionHalf(
-                   backend,
-                   partitionedState.gdn[partitionedMetadata.activeParity ^ 1],
-                   gdnLayout))
+        << compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
+                         convolutionHalf(backend, states.next(3), gdnLayout))
                .rightNorm
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
