@@ -162,7 +162,7 @@ public:
   QwenStateStorage(metal::MetalBackend &backend,
                    metal::AllocationAdmission admitAllocation,
                    CompositeStateLayout layout,
-                   std::shared_ptr<SlotFile> file = nullptr);
+                   std::shared_ptr<SlotFile> file);
 
   ~QwenStateStorage();
   QwenStateStorage(const QwenStateStorage &) = delete;

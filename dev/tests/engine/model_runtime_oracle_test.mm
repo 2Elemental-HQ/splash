@@ -1447,7 +1447,7 @@ int main(int argc, char **argv) {
       stopForHostMemory("the prepared weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot, descriptor);
+        model::loadModelPackage(backend, modelRoot, descriptor, {});
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
@@ -1518,7 +1518,7 @@ int main(int argc, char **argv) {
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
-                                    model.stateLayout());
+                                    model.stateLayout(), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -

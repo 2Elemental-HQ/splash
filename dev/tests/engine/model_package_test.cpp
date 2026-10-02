@@ -442,7 +442,7 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         [&] {
             WeightFile truncated(
                 backend, validPath, "test/valid.bin", "TEST0001", 7, 9);
-            (void)truncated.section(fileBytes);
+            (void)truncated.section(fileBytes, {});
         },
         "truncated packed section was accepted");
 
@@ -453,7 +453,7 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         [&] {
             WeightFile extra(
                 backend, extraPath, "test/extra.bin", "TEST0001", 1, 2);
-            (void)extra.section(64);
+            (void)extra.section(64, {});
             extra.finish();
         },
         "unconsumed packed bytes were accepted");
@@ -717,7 +717,7 @@ void testSyntheticPackage(MetalBackend &backend,
         auto package = loadModelPackage(
             backend, root,
             makeModelDescriptor("Qwen dense loader oracle", target, draft,
-                                vision));
+                                vision), {});
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
@@ -807,7 +807,7 @@ void validateRealPackage(MetalBackend &backend,
     std::string fingerprint;
     std::string name;
     {
-        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root));
+        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root), {});
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(package.draft.files);
         visionBytes = declaredBytes(package.vision.files);

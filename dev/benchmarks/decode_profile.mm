@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
       model::ModelPackage model =
-          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
+          model::loadModelPackage(backend, root, model::inspectModelPackage(root), {});
       ops::ExecutionPlans operators(backend.capabilities());
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
@@ -251,7 +251,7 @@ int main(int argc, char **argv) {
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
-                                      model.stateLayout());
+                                      model.stateLayout(), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 

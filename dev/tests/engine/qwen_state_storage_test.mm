@@ -409,7 +409,7 @@ void run(const std::string &metallib) {
   uint64_t observedPrefixActual = 0;
 
   {
-    QwenStateStorage storage(backend, admitState, kStateLayout);
+    QwenStateStorage storage(backend, admitState, kStateLayout, nullptr);
     require(storage.actualAllocatedBytes() == 0 &&
                 backend.memoryStats().allocatedBytes == beforeStorage,
             "lane state was allocated eagerly");

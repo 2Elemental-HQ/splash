@@ -19,7 +19,7 @@ struct DFlashDraftLayout;
 class DraftCheckpointLoader final {
 public:
   DraftCheckpointLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                        const DFlashDraftLayout &layout, PreparationCheck admitConversion = {});
+                        const DFlashDraftLayout &layout, PreparationCheck admitConversion);
   ~DraftCheckpointLoader();
   // Every file's cache identity and size, layers first, for the model's disk
   // check before the first file is written.
