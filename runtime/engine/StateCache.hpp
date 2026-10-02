@@ -298,7 +298,6 @@ private:
   acquireBlock(uint64_t kvBlock);
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
-  static void unlink(Entry &entry) noexcept;
   void discardDisk(Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.

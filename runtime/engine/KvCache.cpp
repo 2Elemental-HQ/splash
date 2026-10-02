@@ -145,8 +145,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   entry.images = images;
   entry.page = physicalPage;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
-  entry.ramNode = RecencyOrder::allocate(entry.id);
-  entry.diskNode = RecencyOrder::allocate(entry.id);
+  entry.ramNode = RecencyOrder::allocate();
+  entry.diskNode = RecencyOrder::allocate();
 
   pool_.retainPage(physicalPage, true);
   auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
@@ -464,7 +464,7 @@ std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
 }
 
 void KvCache::erase(uint64_t blockId) {
-  const Block &candidate = block(blockId);
+  Block &candidate = block(blockId);
   if (candidate.children || candidate.activeUsers || candidate.transferring) {
     throw std::logic_error("cannot evict a referenced KV cache block");
   }
@@ -480,7 +480,8 @@ void KvCache::erase(uint64_t blockId) {
       first, last, [&](const auto &value) { return value.second == blockId; });
   if (indexed == last)
     throw std::logic_error("KV cache index is incomplete");
-  unlink(block(blockId));
+  RecencyOrder::unlink(candidate.ramNode);
+  RecencyOrder::unlink(candidate.diskNode);
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
@@ -534,7 +535,8 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 // copies of resident blocks, or disk-only blocks without children. A block a
 // request uses, one in transfer, or a poisoned one is in no order.
 void KvCache::reindex(Block &entry) noexcept {
-  unlink(entry);
+  RecencyOrder::unlink(entry.ramNode);
+  RecencyOrder::unlink(entry.diskNode);
   if (entry.activeUsers || entry.transferring || entry.poisoned)
     return;
   const bool resident = entry.page != noPage;
@@ -544,13 +546,6 @@ void KvCache::reindex(Block &entry) noexcept {
     duplicates_.link(entry.diskNode, entry.lastUsed, entry.id);
   else if (entry.slot && !entry.children)
     diskLeaves_.link(entry.diskNode, entry.lastUsed, entry.id);
-}
-
-void KvCache::unlink(Block &entry) noexcept {
-  if (entry.ramNode.linked())
-    RecencyOrder::unlink(entry.ramNode);
-  if (entry.diskNode.linked())
-    RecencyOrder::unlink(entry.diskNode);
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {

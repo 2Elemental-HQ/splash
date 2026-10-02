@@ -212,7 +212,6 @@ private:
   [[nodiscard]] const Block &block(uint64_t blockId) const;
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
-  void unlink(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
   // Applies count to every block above this one.

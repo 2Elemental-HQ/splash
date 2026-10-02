@@ -438,7 +438,8 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   // A copy that failed is not the protection giving way.
   if (!target.invalid && inUse(kvBlock))
     ++inUseEvictions_;
-  unlink(target);
+  RecencyOrder::unlink(target.ramNode);
+  RecencyOrder::unlink(target.diskNode);
   entries_.erase(found);
   kv_.countState(kvBlock, false, inUse(kvBlock));
   if (retirement)
@@ -507,8 +508,8 @@ StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
   if (found != entries_.end())
     return found->second;
   Entry fresh;
-  fresh.ramNode = RecencyOrder::allocate(kvBlock);
-  fresh.diskNode = RecencyOrder::allocate(kvBlock);
+  fresh.ramNode = RecencyOrder::allocate();
+  fresh.diskNode = RecencyOrder::allocate();
   fresh.publication = publications_ + 1;
   Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
   kv_.countState(kvBlock, true, inUse(kvBlock));
@@ -558,7 +559,8 @@ void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
 // redundant copies or as the only copy, of a state in use or not. A pinned
 // or invalid entry, or a copy being written, is in no order.
 void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
-  unlink(target);
+  RecencyOrder::unlink(target.ramNode);
+  RecencyOrder::unlink(target.diskNode);
   if (target.pins || target.invalid)
     return;
   const bool used = inUse(kvBlock);
@@ -568,13 +570,6 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   if (target.disk && !writing(kvBlock))
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)
         .link(target.diskNode, target.lastUsed, kvBlock);
-}
-
-void StateCache::unlink(Entry &target) noexcept {
-  if (target.ramNode.linked())
-    RecencyOrder::unlink(target.ramNode);
-  if (target.diskNode.linked())
-    RecencyOrder::unlink(target.diskNode);
 }
 
 void StateCache::discardDisk(Entry &target) noexcept {
