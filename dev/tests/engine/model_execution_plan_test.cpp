@@ -76,8 +76,6 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
     return model::qwenTargetGeometry(weights);
   }, package.target);
   ops::OperatorChoices choices;
-  choices.draftAttention.push_back(
-      {{package.draft.layout.attentionShape(), 3}, {80}});
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
     choices.moe.push_back({{geometry.moeShape(), 24, ops::MoePhase::Decode},
                            {ops::MoeExpertTile::M32}});
@@ -100,9 +98,6 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   require(after.laneStatePlannedAllocatedBytes ==
               before.laneStatePlannedAllocatedBytes,
           "kernel selection changed the lane state");
-  require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
-                  .configuration().groups == 80,
-          "paired draft did not use the same selection owner");
   selected.install({});
   const auto reset = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
   require(reset.sharedPrefillPlannedAllocatedBytes ==

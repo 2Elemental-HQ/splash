@@ -12,12 +12,6 @@
 
 namespace splash::ops {
 
-struct DraftAttentionWorkload final {
-  DraftAttentionShape shape;
-  uint32_t lanes = 0;
-  auto operator<=>(const DraftAttentionWorkload &) const = default;
-};
-
 struct MoeWorkload final {
   MoeShape shape;
   // Physical rows in both phases: decode uses 8, 16, 24 or 32.
@@ -26,10 +20,6 @@ struct MoeWorkload final {
   auto operator<=>(const MoeWorkload &) const = default;
 };
 
-struct DraftAttentionChoice final {
-  DraftAttentionWorkload workload;
-  DraftAttentionConfiguration configuration;
-};
 struct MoeChoice final {
   MoeWorkload workload;
   MoeConfig configuration;
@@ -37,11 +27,10 @@ struct MoeChoice final {
 
 struct OperatorChoices final {
   std::vector<LinearChoice> linear;
-  std::vector<DraftAttentionChoice> draftAttention;
   std::vector<MoeChoice> moe;
 
   [[nodiscard]] bool empty() const noexcept {
-    return linear.empty() && draftAttention.empty() && moe.empty();
+    return linear.empty() && moe.empty();
   }
 };
 

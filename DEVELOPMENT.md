@@ -1352,9 +1352,9 @@ Compare performance on the same idle Mac with the same model and workload.
 installed model on this Mac against the policy defaults in `runtime/ops` and
 prints, per key, the winner with its paired GPU and wall-time gain, spelled as
 the enumerators it would install, or that the default is kept; it changes no
-default and saves no profile. For a GGUF model it measures only the draft,
-and says so in its header, since GGUF projection and MoE plans read no tuned
-choice ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
+default and saves no profile. For a GGUF model it measures only the draft's
+projections, and says so in its header, since GGUF projection and MoE plans
+read no tuned choice ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
 and experiment notes out of the source tree and commits.
 
 ### Release check

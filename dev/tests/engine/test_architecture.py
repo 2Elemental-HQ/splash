@@ -163,7 +163,6 @@ class ArchitectureTests(unittest.TestCase):
             "MoeExpertTile",
             "MoeExpertSimdgroups",
             "MoeConfig",
-            "DraftAttentionConfiguration",
             "selectorShards",
         )
         with tempfile.TemporaryDirectory() as temporary:

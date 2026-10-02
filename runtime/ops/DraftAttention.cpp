@@ -14,10 +14,6 @@ namespace {
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
-constexpr std::array kConfigurations{DraftAttentionConfiguration{},
-                                      DraftAttentionConfiguration{32},
-                                      DraftAttentionConfiguration{60},
-                                      DraftAttentionConfiguration{80}};
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 // Each split leaves a 32-row x (128 + max + sum) fp32 partial behind the
 // grouped queries.
@@ -26,14 +22,11 @@ constexpr uint32_t kAttentionRows = 32;
 constexpr uint64_t kPartialBytes =
     uint64_t{kAttentionRows} * (128 + 2) * sizeof(float);
 
-// Dispatch width of one surrounding phase per lane: the configured persistent
-// count, or else one 256-thread group per 256 elements and at least one group
-// per whole-group task.
-uint32_t phaseGroups(const DraftAttentionPlan &plan, uint64_t elements,
-                     uint32_t tasks = 0) {
-  if (const uint32_t configured = plan.configuration().groups) return configured;
-  const uint64_t groups = std::max<uint64_t>((elements + kThreads - 1) / kThreads, tasks);
-  return static_cast<uint32_t>(groups);
+// Dispatch width of one surrounding phase per lane: one 256-thread group per
+// 256 elements and at least one group per whole-group task.
+uint32_t phaseGroups(uint64_t elements, uint32_t tasks = 0) {
+  return static_cast<uint32_t>(
+      std::max<uint64_t>((elements + kThreads - 1) / kThreads, tasks));
 }
 
 void requireBuffer(const metal::MetalBuffer &buffer, uint64_t bytes) {
@@ -92,21 +85,11 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
 }
 
-std::span<const DraftAttentionConfiguration>
-DraftAttention::candidates(DraftAttentionShape shape) {
-  static_cast<void>(kernelShape(shape));
-  return kConfigurations;
-}
-
-DraftAttentionPlan
-DraftAttention::plan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration) {
+DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
+                                        uint32_t lanes) {
   requireLanes(lanes);
-  const auto configurations = candidates(shape);
-  if (std::find(configurations.begin(), configurations.end(), configuration) ==
-      configurations.end())
-    throw std::invalid_argument("unsupported draft attention configuration");
-  return {shape, lanes, configuration};
+  static_cast<void>(kernelShape(shape));
+  return {shape, lanes};
 }
 
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
@@ -124,7 +107,7 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   }
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
-  const uint32_t groups = phaseGroups(plan, uint64_t{kRows} * shape.hiddenSize);
+  const uint32_t groups = phaseGroups(uint64_t{kRows} * shape.hiddenSize);
   const uint32_t lanes = plan.lanes();
   requireBuffer(buffers.input, workspace.convolutionBytes);
   requireBuffer(buffers.output, workspace.convolutionBytes);
@@ -132,7 +115,7 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   requireBuffer(buffers.dynamic, uint64_t{lanes} * kRows * shape.dynamicSize * 2);
   requireBuffer(buffers.weights, uint64_t{4} * shape.hiddenSize * 2);
   const KernelLayout kernel = kernelShape(shape);
-  const DraftConvBatchParams params{groups, finish};
+  const DraftConvBatchParams params{finish};
   graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"
                                                : "draft_conv_h2048",
             {std::move(buffers.input), std::move(buffers.dynamic),
@@ -146,10 +129,10 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
                                 const DraftAttentionPlan &plan) {
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
-  // The prepare kernel runs an element loop over the key/value rows and a
-  // task loop with one group per (row, head) normalization.
+  // The prepare kernel copies one element of the value rows per thread and
+  // normalizes one (row, head) per group.
   const uint32_t groups = phaseGroups(
-      plan, uint64_t{kRows} * shape.kvHeads * shape.headDimension,
+      uint64_t{kRows} * shape.kvHeads * shape.headDimension,
       kRows * (shape.queryHeads + shape.kvHeads));
   const uint32_t lanes = plan.lanes();
   requireBuffer(buffers.qkv, workspace.qkvBytes);
@@ -161,13 +144,12 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const uint64_t ropeBytes = uint64_t{lanes} * kRows * shape.headDimension / 2 * 4;
   requireBuffer(buffers.ropeCos, ropeBytes);
   requireBuffer(buffers.ropeSin, ropeBytes);
-  const DraftQkvBatchParams params{groups};
   graph.add("draft_attention_qkv",
             {std::move(buffers.qkv), std::move(buffers.groupedQueries),
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
              std::move(buffers.ropeCos), std::move(buffers.ropeSin),
              std::move(buffers.queryKeys), std::move(buffers.queryValues)},
-            params, {groups, lanes, 1});
+            {groups, lanes, 1});
 }
 
 void DraftAttention::addDecode(
@@ -209,14 +191,12 @@ void DraftAttention::addReorder(metal::CommandGraph &graph,
                                 metal::MetalBuffer packed,
                                 const DraftAttentionPlan &plan) {
   const auto shape = plan.shape();
-  const uint32_t groups = phaseGroups(
-      plan, uint64_t{kRows} * shape.queryHeads * shape.headDimension);
+  const uint32_t groups =
+      phaseGroups(uint64_t{kRows} * shape.queryHeads * shape.headDimension);
   const uint32_t lanes = plan.lanes();
   requireBuffer(grouped, queryRowsBytes(plan));
   requireBuffer(packed, queryRowsBytes(plan));
-  const DraftQkvBatchParams params{groups};
-  graph.add("draft_attention_reorder",
-            {std::move(grouped), std::move(packed)}, params,
+  graph.add("draft_attention_reorder", {std::move(grouped), std::move(packed)},
             {groups, lanes, 1});
 }
 

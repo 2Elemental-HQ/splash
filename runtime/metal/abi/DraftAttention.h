@@ -12,19 +12,11 @@
 // per-lane arrays hold those lanes, and entries past them are zero and unread.
 
 struct DraftConvBatchParams {
-  uint32_t groups;
   uint32_t finish;
 };
 
-static_assert(sizeof(DraftConvBatchParams) == 8,
-              "Draft convolution parameters are 8 bytes on both sides");
-
-struct DraftQkvBatchParams {
-  uint32_t groups;
-};
-
-static_assert(sizeof(DraftQkvBatchParams) == 4,
-              "Draft QKV parameters are 4 bytes on both sides");
+static_assert(sizeof(DraftConvBatchParams) == 4,
+              "Draft convolution parameters are 4 bytes on both sides");
 
 // The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.

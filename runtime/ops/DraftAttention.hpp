@@ -3,8 +3,6 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
-#include <array>
-#include <compare>
 #include <cstdint>
 #include <span>
 
@@ -19,18 +17,7 @@ struct DraftAttentionShape final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
 
-  auto operator<=>(const DraftAttentionShape &) const = default;
-};
-
-// These configurations vary the surrounding convolution, QKV preparation and
-// reorder phases. The compiled attention core stays M32/N128/D128 with eight
-// query rows, 256 threads, a fixed number of ring splits per KV head and the
-// semantic 2048 window.
-struct DraftAttentionConfiguration final {
-  // Zero uses the full element/task grid. Nonzero selects a persistent group
-  // count for the surrounding phases.
-  uint32_t groups = 0;
-  bool operator==(const DraftAttentionConfiguration &) const = default;
+  bool operator==(const DraftAttentionShape &) const = default;
 };
 
 struct DraftAttentionWorkspace final {
@@ -41,27 +28,22 @@ struct DraftAttentionWorkspace final {
   uint64_t queryValuesBytes = 0;
 };
 
-// Constructed only by DraftAttention::plan so configuration, physical rows
-// and workspace cannot disagree. The grouped-queries tensor also carries the
+// Constructed only by DraftAttention::plan so the shape, physical rows and
+// workspace cannot disagree. The grouped-queries tensor also carries the
 // split partials of the attention core behind the query rows, so the core
 // needs no device scratch beyond these tensors.
 class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
-  [[nodiscard]] DraftAttentionConfiguration configuration() const noexcept {
-    return configuration_;
-  }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration)
-      : shape_(shape), lanes_(lanes), configuration_(configuration) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
+      : shape_(shape), lanes_(lanes) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
-  DraftAttentionConfiguration configuration_;
 
   friend class DraftAttention;
 };
@@ -97,11 +79,8 @@ struct DraftDecodeAttentionBuffers final {
 
 class DraftAttention final {
 public:
-  [[nodiscard]] static std::span<const DraftAttentionConfiguration>
-  candidates(DraftAttentionShape shape);
-  [[nodiscard]] static DraftAttentionPlan
-  plan(DraftAttentionShape shape, uint32_t lanes,
-       DraftAttentionConfiguration configuration = {});
+  [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
+                                               uint32_t lanes);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,

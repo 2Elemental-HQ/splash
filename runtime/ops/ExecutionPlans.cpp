@@ -13,13 +13,6 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 static_assert(kMaximumLanes == 4);
 
-constexpr std::array draftFields{
-    &DraftAttentionWorkspace::convolutionBytes,
-    &DraftAttentionWorkspace::qkvBytes,
-    &DraftAttentionWorkspace::groupedQueriesBytes,
-    &DraftAttentionWorkspace::queryKeysBytes,
-    &DraftAttentionWorkspace::queryValuesBytes};
-
 // The shipped configuration of a MoE workload's phase, the first candidate.
 MoeConfig baselineMoeConfig(MoePhase phase) noexcept {
   return (phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates()).front();
@@ -56,9 +49,6 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
   Linear nextLinear = baselineLinear_;
   nextLinear.setChoices(pending.linear);
-  for (const auto &choice : pending.draftAttention)
-    (void)DraftAttention::plan(choice.workload.shape, choice.workload.lanes,
-                               choice.configuration);
   for (const auto &choice : pending.moe) {
     const auto &w = choice.workload;
     if (w.shape.weightLayout == WeightLayout::Block32)
@@ -67,7 +57,6 @@ void ExecutionPlans::install(const OperatorChoices &choices) {
     // although moePlan replaces it.
     (void)phasePlan(w, choice.configuration);
   }
-  sortUniqueChoices(pending.draftAttention);
   sortUniqueChoices(pending.moe);
   // All potentially throwing work is above. No partial table install can
   // affect a production lookup if validation or allocation fails.
@@ -89,11 +78,7 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
-  return DraftAttention::plan(
-      shape, lanes,
-      chosenConfiguration(choices_.draftAttention,
-                       DraftAttentionWorkload{shape, lanes},
-                       DraftAttentionConfiguration{}));
+  return DraftAttention::plan(shape, lanes);
 }
 
 // The device's fields of a MoE plan: the router threshold, the 8-row tile
@@ -149,20 +134,11 @@ AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
   return PagedAttention::verifyWorkspace(1, queryHeads, layout);
 }
 
+// The draft workspace is linear in the lanes: one lane's is every width's
+// share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
-  DraftAttentionWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, DraftAttention::plan(shape, lanes).workspace(), draftFields,
-            lanes);
-  for (const auto &choice : choices_.draftAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape)
-      include(bound, DraftAttention::plan(shape, w.lanes,
-                                          choice.configuration).workspace(),
-              draftFields, w.lanes);
-  }
-  return bound;
+  return DraftAttention::plan(shape, 1).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,

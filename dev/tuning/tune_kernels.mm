@@ -9,7 +9,6 @@
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
-#include "tuning/DraftAttentionTuning.hpp"
 #include "tuning/LinearTuning.hpp"
 #include "tuning/MoeTuning.hpp"
 #include "tuning/TuningWorkloads.hpp"
@@ -166,23 +165,12 @@ std::string describe(const LinearConfig &c) {
   out << "{" << name(c.tile) << ", " << c.groups << ", " << name(c.simdgroups) << ", " << c.splits << "}";
   return out.str();
 }
-std::string describe(const DraftAttentionConfiguration &c) {
-  return "{" + (c.groups ? std::to_string(c.groups) : std::string("full")) + "}";
-}
 std::string describe(const MoeConfig &c) { return "{" + name(c.expertTile) + "}"; }
 
 std::string describe(const LinearWorkload &w) {
   std::ostringstream out;
   out << "{{" << w.matrix.outputSize << ", " << w.matrix.inputSize << "}, " << w.rows << ", "
       << name(w.phase) << ", " << name(w.epilogue) << "}";
-  return out.str();
-}
-std::string describe(const DraftAttentionWorkload &w) {
-  const auto &s = w.shape;
-  std::ostringstream out;
-  out << "{{" << s.hiddenSize << ", " << s.dynamicSize << ", " << s.qkvSize << ", "
-      << s.attentionSize << ", " << s.queryHeads << ", " << s.kvHeads << ", "
-      << s.headDimension << "}, " << w.lanes << "}";
   return out.str();
 }
 std::string describe(const MoeWorkload &w) {
@@ -392,7 +380,7 @@ int main(int argc, char **argv) {
       // every target projection and expert as Block32.
       if (descriptor.targetSource == model::TargetSource::Gguf)
         std::cout << "  GGUF target: its projections and experts follow the device policy; "
-                     "only the draft is measured\n";
+                     "only the draft's projections are measured\n";
       std::cout << '\n';
 
       auto account = [&](bool complete, bool didChange, std::exception_ptr failure) {
@@ -438,19 +426,6 @@ int main(int argc, char **argv) {
         }
         account(result.complete, didChange, result.failure);
       }
-      for (uint32_t width : kDecodeProbeWidths) {
-        if (interrupted) break;
-        const DraftAttentionWorkload workload{workloads.draftAttention, width};
-        const auto result = tuneDraftAttention(backend, admit, workload, options.measurement, underPressure, stop);
-        const bool didChange = result.complete && result.choice.configuration != DraftAttentionConfiguration{};
-        if (didChange) choices.draftAttention.push_back(result.choice);
-        outcome("draft attention", describe(workload), result.complete, didChange,
-                describe(result.choice.configuration),
-                evidence(result.measurements,
-                         candidateOf(DraftAttention::candidates(workload.shape), result.choice.configuration)),
-                result.failure);
-        account(result.complete, didChange, result.failure);
-      }
       for (const auto &input : workloads.moe) {
         if (interrupted) break;
         const auto result = tuneMoe(backend, admit, input, options.measurement, underPressure, stop);
@@ -478,9 +453,6 @@ int main(int argc, char **argv) {
                 << "// matters, change the rules in runtime/ops, not a table.\n";
       for (const auto &c : choices.linear)
         std::cout << "choices.linear.push_back({" << describe(c.workload) << ", "
-                  << describe(c.configuration) << "});\n";
-      for (const auto &c : choices.draftAttention)
-        std::cout << "choices.draftAttention.push_back({" << describe(c.workload) << ", "
                   << describe(c.configuration) << "});\n";
       for (const auto &c : choices.moe)
         std::cout << "choices.moe.push_back({" << describe(c.workload) << ", "

@@ -148,7 +148,6 @@ TuningWorkloads collectTuningWorkloads(
   const auto &draft = package.draft;
   if (draft.layers.empty())
     throw std::invalid_argument("operator probes require draft layers");
-  result.draftAttention = draft.layout.attentionShape();
   bothPhases(draft.contextProjection);
   for (const auto &layer : draft.layers) {
     bothPhases(layer.qkvProjection);
