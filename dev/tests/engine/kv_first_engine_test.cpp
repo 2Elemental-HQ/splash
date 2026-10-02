@@ -1650,9 +1650,10 @@ void testPressureReclaimRespectsStateLifetimes() {
           "an empty cache did not report reclaim exhausted");
 }
 
-// Pressure short of critical takes cached state and KV but leaves what a
-// request starts from, since growth is paused: a lane's pooled buffers and
-// one empty extent. Critical pressure takes those too.
+// Pressure short of critical takes cached state and KV but keeps what a
+// request starts from without allocating: a lane's pooled buffers and one
+// empty extent, for the request that arrives while the host is short.
+// Critical pressure takes those too.
 void testWarningReclaimKeepsTheServingFootprint() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -1866,9 +1867,9 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
           "state admission did not recover after host pressure cleared");
 }
 
-// Host pressure pauses foreground cache eviction for KV growth, but landing a
-// denied snapshot by recycling one cached state is memory-neutral and still
-// happens: the state footprint does not grow, and KV is untouched.
+// Host pressure holds back growth that no request in service needs, but
+// landing a denied snapshot by recycling one cached state is memory-neutral
+// and still happens: the state footprint does not grow, and KV is untouched.
 void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
