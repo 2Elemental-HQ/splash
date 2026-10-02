@@ -1,6 +1,8 @@
-"""Incremental model-output parsing and final tool/answer validation."""
+"""Incremental model-output parsing, output blocks and final tool/answer
+validation."""
 
 import re
+from dataclasses import dataclass
 
 from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
@@ -424,6 +426,83 @@ def _typed_tool_value(value, string_schema):
     if string_schema is None:
         return parsed
     return value if string_schema[0] == "raw" or value in string_schema[1] else parsed
+
+
+@dataclass(slots=True)
+class Block:
+    """One block of output: the reasoning, a run of text or a tool call."""
+
+    kind: str  # "reasoning", "text" or "tool"
+    # The text streamed into the block, or a call's argument fragments.
+    parts: list[str]
+    call_id: str | None = None
+    name: str | None = None
+    # "completed" or "incomplete" once the block closes.
+    status: str = "in_progress"
+
+    @property
+    def text(self):
+        return "".join(self.parts)
+
+
+class BlockSequencer:
+    """Output in order as blocks, one open at a time: the reasoning, each run
+    of text, each tool call. A new kind or a tool header closes the open
+    block. Messages and Responses render the same sequence, streamed or not;
+    each callback receives a block with its position."""
+
+    def __init__(self, on_open=None, on_delta=None, on_close=None):
+        self.on_open = on_open
+        self.on_delta = on_delta
+        self.on_close = on_close
+        self.blocks = []
+        self.open = None
+
+    def _start(self, block):
+        self._close("completed")
+        self.blocks.append(block)
+        self.open = block
+        if self.on_open is not None:
+            self.on_open(len(self.blocks) - 1, block)
+
+    def _append(self, text):
+        self.open.parts.append(text)
+        if self.on_delta is not None:
+            self.on_delta(len(self.blocks) - 1, self.open, text)
+
+    def _close(self, status):
+        block, self.open = self.open, None
+        if block is None:
+            return
+        block.status = status
+        if self.on_close is not None:
+            self.on_close(len(self.blocks) - 1, block)
+
+    def text(self, field, text):
+        """Collected text, in field "reasoning_content" or "content"."""
+        kind = "reasoning" if field == "reasoning_content" else "text"
+        if self.open is None or self.open.kind != kind:
+            self._start(Block(kind, []))
+        self._append(text)
+
+    def tool(self, delta):
+        """A projected tool delta: a call's header or its arguments."""
+        function = delta["function"]
+        if "name" in function:
+            self._start(Block("tool", [], call_id=delta["id"], name=function["name"]))
+        if arguments := function.get("arguments"):
+            self._append(arguments)
+
+    def finish(self, incomplete, reasoning_open):
+        """Close the open block, cut if the output was cut inside it, and end
+        with an empty text block when there is neither text nor a call."""
+        if self.open is not None:
+            cut = incomplete and (self.open.kind != "reasoning" or reasoning_open)
+            self._close("incomplete" if cut else "completed")
+        if all(block.kind == "reasoning" for block in self.blocks):
+            self._start(Block("text", []))
+            self._close("incomplete" if incomplete else "completed")
+        return self.blocks
 
 
 def _validate(validator, value):

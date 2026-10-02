@@ -4125,6 +4125,58 @@ class ServerTest(unittest.TestCase):
                 response.read()
                 connection.close()
 
+    def test_chat_and_text_streams_share_keepalive_and_usage_chunks(self):
+        usage = {"stream": True, "stream_options": {"include_usage": True}}
+        for path, body, field, empty in (
+            (
+                "/v1/chat/completions",
+                self.body(reasoning_effort="none", **usage),
+                "delta",
+                {},
+            ),
+            (
+                "/v1/completions",
+                {"model": "test-model", "prompt": "hello", **usage},
+                "text",
+                "",
+            ),
+        ):
+            with self.subTest(path=path):
+                plan = Plan([[4]], before_start=True, block=True)
+                harness = self.harness(FakeRuntime(plan))
+                with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
+                    connection, response = harness.open_stream(path, body)
+                    try:
+                        # A comment until the request starts, then a chunk
+                        # that adds nothing.
+                        self.assertEqual(response.readline(), b": splash-keepalive\n")
+                        plan.start_release.set()
+                        chunk = json.loads(self.next_sse_data(response))
+                        if path == "/v1/chat/completions":
+                            self.assertEqual(
+                                chunk["choices"][0]["delta"],
+                                {"role": "assistant", "content": ""},
+                            )
+                            chunk = json.loads(self.next_sse_data(response))
+                        self.assertEqual(chunk["choices"][0][field], empty)
+                        self.assertIsNone(chunk["choices"][0]["finish_reason"])
+                    finally:
+                        plan.release.set()
+                        payload = response.read()
+                        connection.close()
+                chunks = [
+                    json.loads(line[6:])
+                    for line in payload.decode().splitlines()
+                    if line.startswith("data: {")
+                ]
+                finish, final = chunks[-2:]
+                self.assertEqual(finish["choices"][0]["finish_reason"], "stop")
+                self.assertIn("timings", finish)
+                self.assertEqual(final["choices"], [])
+                self.assertEqual(final["usage"]["completion_tokens"], 1)
+                self.assertIn("metrics", final)
+                self.assertTrue(payload.endswith(b"data: [DONE]\n\n"))
+
     def test_responses_stream_heartbeats_before_native_start(self):
         plan = Plan([[4]], before_start=True)
         harness = self.harness(FakeRuntime(plan))
@@ -4274,14 +4326,14 @@ class ServerTest(unittest.TestCase):
             events=SimpleNamespace(get=next_event),
         )
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            _, _, calls, _, _ = handler._collect(
+            calls = handler._collect(
                 job,
                 False,
                 True,
-                lambda field, text: handler._sse({field: text}),
-                handler._sse,
-                handler._sse_keepalive,
-            )
+                on_text=lambda field, text: handler._sse({field: text}),
+                on_tool_delta=handler._sse,
+                on_idle=handler._sse_keepalive,
+            ).tool_calls
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
         self.assertGreaterEqual(snapshots[-3].count(b": splash-keepalive"), 3)
@@ -4305,7 +4357,7 @@ class ServerTest(unittest.TestCase):
                 clock[0] += 0.5
                 handler._next_event(job, heartbeat)
                 if index % 2:
-                    handler._responses_sse("event", {"text": "x"})
+                    handler._event_sse("event", {"text": "x"})
                 else:
                     handler._sse({"text": "x"})
         heartbeat.assert_not_called()
@@ -4618,31 +4670,27 @@ class ServerTest(unittest.TestCase):
                 "POST", "/v1/responses", dict(body, stream=True)
             )
         self.assertEqual((status, stream_status), (200, 200))
-        response = json.loads(payload)
-        nonstream_message = next(
-            item for item in response["output"] if item["type"] == "message"
-        )
         events = self.response_events(stream_payload)
         streamed = "".join(
             event["delta"]
             for event in events
             if event["type"] == "response.output_text.delta"
         )
-        completed = events[-1]["response"]
-        stream_messages = [
-            item for item in completed["output"] if item["type"] == "message"
-        ]
         expected = " \nalpha \t\n beta \t\n"
-        self.assertEqual(nonstream_message["content"][0]["text"], expected)
-        self.assertEqual(
-            "".join(item["content"][0]["text"] for item in stream_messages),
-            expected,
-        )
         self.assertEqual(streamed, expected)
-        self.assertEqual(
-            [item["type"] for item in completed["output"]],
-            ["message", "function_call", "message"],
-        )
+        for output in (json.loads(payload)["output"], events[-1]["response"]["output"]):
+            self.assertEqual(
+                [item["type"] for item in output],
+                ["message", "function_call", "message"],
+            )
+            self.assertEqual(
+                "".join(
+                    item["content"][0]["text"]
+                    for item in output
+                    if item["type"] == "message"
+                ),
+                expected,
+            )
         self.assertNotIn("<tool_call>", stream_payload.decode())
 
     def test_streaming_multiple_tools_never_exposes_xml(self):
@@ -7743,15 +7791,15 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("boom", stderr.getvalue())
 
     def test_unexpected_responses_stream_error_is_failed_and_cancels(self):
-        harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
+        # The first output item fails to render while the model still writes.
+        plan = Plan([[14], [15]], delay=1)
+        harness = self.harness(FakeRuntime(plan))
         stderr = io.StringIO()
         with (
             mock.patch.object(
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
-            mock.patch.object(
-                api.FrontendHandler, "_collect", side_effect=RuntimeError("boom")
-            ),
+            mock.patch.object(api, "responses_item", side_effect=RuntimeError("boom")),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
             status, _, payload = harness.request(
@@ -7766,6 +7814,7 @@ class ServerTest(unittest.TestCase):
             events[-1]["response"]["error"]["code"], "internal_server_error"
         )
         cancel.assert_called_once()
+        self.assertTrue(plan.cancelled.is_set())
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",

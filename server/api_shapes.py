@@ -1117,57 +1117,57 @@ def text_completion_chunk(
     )
 
 
-def responses_item(job, kind, value, index=0, status="completed"):
-    public_id = job.public_id
-    if kind == "reasoning":
+_RESPONSES_ITEM_PREFIXES = {"reasoning": "rs", "text": "msg", "tool": "fc"}
+
+
+def responses_item_id(job, kind, index):
+    """The id of the Responses item of a block of `kind` at `index`."""
+    return f"{_RESPONSES_ITEM_PREFIXES[kind]}_{job.public_id}_{index}"
+
+
+def responses_item(job, block, index):
+    """The Responses output item of `block` at `index`. An item in progress
+    carries no text or arguments yet."""
+    item_id = responses_item_id(job, block.kind, index)
+    status = block.status
+    text = "" if status == "in_progress" else block.text
+    if block.kind == "reasoning":
         return {
-            "id": f"rs_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "reasoning",
             "status": status,
-            "summary": ([{"type": "summary_text", "text": value}] if value else []),
-            "content": ([{"type": "reasoning_text", "text": value}] if value else []),
+            "summary": ([{"type": "summary_text", "text": text}] if text else []),
+            "content": ([{"type": "reasoning_text", "text": text}] if text else []),
             "encrypted_content": None,
         }
-    if kind == "message":
+    if block.kind == "text":
         return {
-            "id": f"msg_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "message",
             "status": status,
             "role": "assistant",
-            "content": [{"type": "output_text", "text": value, "annotations": []}],
+            "content": (
+                []
+                if status == "in_progress"
+                else [{"type": "output_text", "text": text, "annotations": []}]
+            ),
         }
-    name = value["function"]["name"]
-    namespaced = job.tool_policy.namespaces.get(name) if job.tool_policy else None
+    namespaced = job.tool_policy.namespaces.get(block.name) if job.tool_policy else None
     item = {
-        "id": f"fc_{public_id}_{index}",
+        "id": item_id,
         "type": "function_call",
         "status": status,
-        "call_id": value["id"],
-        "name": namespaced[1] if namespaced else name,
-        "arguments": "" if status == "in_progress" else value["function"]["arguments"],
+        "call_id": block.call_id,
+        "name": namespaced[1] if namespaced else block.name,
+        "arguments": text,
     }
     if namespaced:
         item["namespace"] = namespaced[0]
     return item
 
 
-def responses_output(
-    job, reasoning, content, calls, status="completed", reasoning_status="completed"
-):
-    output = []
-    if reasoning:
-        output.append(
-            responses_item(job, "reasoning", reasoning, status=reasoning_status)
-        )
-    if content or not calls:
-        output.append(
-            responses_item(job, "message", content, len(output), status=status)
-        )
-    for call in calls:
-        output.append(
-            responses_item(job, "function_call", call, len(output), status=status)
-        )
-    return output
+def responses_output(job, blocks):
+    return [responses_item(job, block, index) for index, block in enumerate(blocks)]
 
 
 def anthropic_stop(result, tool_calls, output_clamped_to_context):
@@ -1192,44 +1192,46 @@ def anthropic_usage(prompt_tokens, output_tokens, cache):
     }
 
 
-def anthropic_response(
-    model, job, reasoning, content, tool_calls, result, thinking_signature=""
-):
-    parsed_calls = []
-    for call in tool_calls:
-        try:
-            arguments = json_codec.loads(call["function"]["arguments"])
-        except ValueError:
-            if result.reason != "length":
-                raise
-            continue
-        parsed_calls.append((call, arguments))
-    blocks = []
-    if reasoning:
-        blocks.append(
-            {
-                "type": "thinking",
-                "thinking": "" if job.thinking_display == "omitted" else reasoning,
-                "signature": thinking_signature,
-            }
-        )
-    if content or not parsed_calls:
-        blocks.append({"type": "text", "text": content})
-    for call, arguments in parsed_calls:
-        blocks.append(
-            {
-                "type": "tool_use",
-                "id": call["id"],
-                "name": call["function"]["name"],
-                "input": arguments,
-            }
-        )
+def anthropic_response(model, job, blocks, result, tool_calls, thinking_signature):
+    content = []
+    for block in blocks:
+        if block.kind == "reasoning":
+            content.append(
+                {
+                    "type": "thinking",
+                    "thinking": (
+                        "" if job.thinking_display == "omitted" else block.text
+                    ),
+                    "signature": thinking_signature,
+                }
+            )
+        elif block.kind == "text":
+            content.append({"type": "text", "text": block.text})
+        else:
+            try:
+                arguments = json_codec.loads(block.text)
+            except ValueError:
+                # Only a call the token limit cut has unfinished arguments,
+                # and a complete message leaves it out.
+                if result.reason != "length":
+                    raise
+                continue
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": block.call_id,
+                    "name": block.name,
+                    "input": arguments,
+                }
+            )
+    if all(item["type"] == "thinking" for item in content):
+        content.append({"type": "text", "text": ""})
     return {
         "id": f"msg_{job.public_id}",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": blocks,
+        "content": content,
         "stop_reason": anthropic_stop(
             result, tool_calls, job.output_clamped_to_context
         ),

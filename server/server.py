@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 import weakref
+from dataclasses import dataclass
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -36,13 +38,14 @@ if __package__:
         completion_response,
         finish_reason,
         responses_item,
+        responses_item_id,
         responses_output,
         responses_response,
         stream_chunk,
         text_completion_chunk,
         text_completion_response,
     )
-    from .backend import NativeBackend, remaining_request_time
+    from .backend import NativeBackend, NativeResult, remaining_request_time
     from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
@@ -63,6 +66,7 @@ if __package__:
     )
     from .origins import ANY_ORIGIN, parse_allowed_origin
     from .output import (
+        BlockSequencer,
         ReasoningSplitter,
         StreamingToolCallProjector,
         validate_response_content,
@@ -82,13 +86,14 @@ else:
         completion_response,
         finish_reason,
         responses_item,
+        responses_item_id,
         responses_output,
         responses_response,
         stream_chunk,
         text_completion_chunk,
         text_completion_response,
     )
-    from backend import NativeBackend, remaining_request_time
+    from backend import NativeBackend, NativeResult, remaining_request_time
     from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
@@ -109,6 +114,7 @@ else:
     )
     from origins import ANY_ORIGIN, parse_allowed_origin
     from output import (
+        BlockSequencer,
         ReasoningSplitter,
         StreamingToolCallProjector,
         validate_response_content,
@@ -187,6 +193,18 @@ def _normalize_path(raw_path):
     if trailing and normalized != "/":
         normalized += "/"
     return normalized
+
+
+@dataclass(slots=True)
+class Collected:
+    """A generation as FrontendHandler._collect gathered it."""
+
+    reasoning: str
+    content: str
+    tool_calls: list
+    result: NativeResult
+    # The output ended inside its reasoning.
+    reasoning_open: bool
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -729,12 +747,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._responses_stream(job, thinking, has_tools)
             elif responses:
                 self._responses_complete(job, thinking, has_tools)
-            elif completions and stream:
-                self._text_completion_stream(job, stream_options)
+            elif stream:
+                self._openai_stream(
+                    job, thinking, has_tools, stream_options, chat=not completions
+                )
             elif completions:
                 self._text_completion(job)
-            elif stream:
-                self._stream(job, thinking, has_tools, stream_options)
             else:
                 self._complete(job, thinking, has_tools)
         except judgments.SystemOneError as error:
@@ -915,11 +933,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         job,
         thinking,
         has_tools,
+        *,
+        on_start=None,
         on_text=None,
         on_tool_delta=None,
         on_idle=None,
         on_progress=None,
     ):
+        """Gather a generation until it is done. The callbacks receive the
+        start, each piece of output, the idle waits and prompt progress:
+        streams send them, and complete Messages and Responses gather the
+        output into blocks."""
         splitter = ReasoningSplitter(thinking)
         # Output with tools is parsed as it arrives whether it streams or not.
         projector = (
@@ -947,7 +971,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         while result is None:
             kind, value = self._next_event(job, on_idle)
-            if kind == "text":
+            if kind == "start" and on_start is not None:
+                on_start()
+            elif kind == "text":
                 for field, text in splitter.put(value):
                     append(field, text)
             elif kind == "progress" and on_progress is not None:
@@ -961,37 +987,51 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         if unsent and on_text is not None:
             on_text("content", unsent)
-        return "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+        return Collected(
+            "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+        )
 
     def _complete(self, job, thinking, has_tools):
-        reasoning_text, content_text, tool_calls, result, _ = self._collect(
-            job, thinking, has_tools
-        )
-        message = {"role": "assistant", "content": content_text or None}
-        if reasoning_text:
-            message["reasoning_content"] = reasoning_text
-        if tool_calls:
-            message["tool_calls"] = tool_calls
+        collected = self._collect(job, thinking, has_tools)
+        message = {"role": "assistant", "content": collected.content or None}
+        if collected.reasoning:
+            message["reasoning_content"] = collected.reasoning
+        if collected.tool_calls:
+            message["tool_calls"] = collected.tool_calls
         self._json(
             200,
             completion_response(
-                self.app.response_model, job, result, message, bool(tool_calls)
+                self.app.response_model,
+                job,
+                collected.result,
+                message,
+                bool(collected.tool_calls),
             ),
         )
 
     def _text_completion(self, job):
-        _, text, _, result, _ = self._collect(job, False, False)
+        collected = self._collect(job, False, False)
         self._json(
-            200, text_completion_response(self.app.response_model, job, result, text)
+            200,
+            text_completion_response(
+                self.app.response_model, job, collected.result, collected.content
+            ),
         )
 
     def _anthropic_complete(self, job, thinking, has_tools):
-        reasoning, content, tool_calls, result, _ = self._collect(
-            job, thinking, has_tools
+        sequencer = BlockSequencer()
+        collected = self._collect(
+            job,
+            thinking,
+            has_tools,
+            on_text=sequencer.text,
+            on_tool_delta=sequencer.tool,
         )
+        result = collected.result
+        blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
         signature = (
-            self.app.thinking_codec.encode(reasoning)
-            if reasoning and job.thinking_display == "omitted"
+            self.app.thinking_codec.encode(collected.reasoning)
+            if collected.reasoning and job.thinking_display == "omitted"
             else ""
         )
         self._json(
@@ -999,115 +1039,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
             anthropic_response(
                 self.app.response_model,
                 job,
-                reasoning,
-                content,
-                tool_calls,
+                blocks,
                 result,
+                collected.tool_calls,
                 signature,
             ),
         )
 
     def _anthropic_stream(self, job, thinking, has_tools):
-        content_index = 0
-        active_kind = None
-        hidden_thinking = []
         omitted = job.thinking_display == "omitted"
 
         def send(event, payload):
-            self._responses_sse(event, {"type": event, **payload})
+            self._event_sse(event, {"type": event, **payload})
 
-        def keepalive():
-            self._start_event_stream()
-            send("ping", {})
-
-        def finish_active():
-            nonlocal active_kind, content_index
-            if active_kind is None:
-                return
-            if active_kind == "thinking" and omitted:
-                signature = self.app.thinking_codec.encode("".join(hidden_thinking))
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {"type": "signature_delta", "signature": signature},
-                    },
-                )
-                hidden_thinking.clear()
-            send("content_block_stop", {"index": content_index})
-            content_index += 1
-            active_kind = None
-
-        def put_text(field, text):
-            nonlocal active_kind
-            kind = "thinking" if field == "reasoning_content" else "text"
-            if active_kind != kind:
-                finish_active()
-                active_kind = kind
-                block = (
-                    {"type": "thinking", "thinking": "", "signature": ""}
-                    if kind == "thinking"
-                    else {"type": "text", "text": ""}
-                )
-                send(
-                    "content_block_start",
-                    {"index": content_index, "content_block": block},
-                )
-                if kind == "thinking" and omitted:
-                    send(
-                        "content_block_delta",
-                        {
-                            "index": content_index,
-                            "delta": {"type": "thinking_delta", "thinking": ""},
-                        },
-                    )
-            if kind == "thinking" and omitted:
-                hidden_thinking.append(text)
-                return
-            delta = (
-                {"type": "thinking_delta", "thinking": text}
-                if kind == "thinking"
-                else {"type": "text_delta", "text": text}
-            )
-            send("content_block_delta", {"index": content_index, "delta": delta})
-
-        def put_tool_delta(delta):
-            nonlocal active_kind
-            function = delta.get("function") or {}
-            if function.get("name") is not None:
-                finish_active()
-                active_kind = "tool"
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": delta["id"],
-                            "name": function["name"],
-                            "input": {},
-                        },
-                    },
-                )
-            arguments = function.get("arguments")
-            if arguments:
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": arguments,
-                        },
-                    },
-                )
-
-        def run():
-            nonlocal content_index
+        def start():
             # Cache accounting is known at native admission. Keep the socket
             # alive while queued, but do not publish guessed input usage.
-            if self._next_event(job, keepalive)[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
             self._start_event_stream()
             send(
                 "message_start",
@@ -1124,31 +1071,83 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            _, _, tool_calls, result, _ = self._collect(
+
+        def keepalive():
+            self._start_event_stream()
+            send("ping", {})
+
+        def open_block(index, block):
+            if block.kind == "reasoning":
+                content_block = {"type": "thinking", "thinking": "", "signature": ""}
+            elif block.kind == "text":
+                content_block = {"type": "text", "text": ""}
+            else:
+                content_block = {
+                    "type": "tool_use",
+                    "id": block.call_id,
+                    "name": block.name,
+                    "input": {},
+                }
+            send(
+                "content_block_start", {"index": index, "content_block": content_block}
+            )
+            if block.kind == "reasoning" and omitted:
+                send(
+                    "content_block_delta",
+                    {
+                        "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": ""},
+                    },
+                )
+
+        def block_delta(index, block, text):
+            if block.kind == "reasoning":
+                if omitted:
+                    return
+                delta = {"type": "thinking_delta", "thinking": text}
+            elif block.kind == "text":
+                delta = {"type": "text_delta", "text": text}
+            else:
+                delta = {"type": "input_json_delta", "partial_json": text}
+            send("content_block_delta", {"index": index, "delta": delta})
+
+        def close_block(index, block):
+            if block.kind == "reasoning" and omitted:
+                signature = self.app.thinking_codec.encode(block.text)
+                send(
+                    "content_block_delta",
+                    {
+                        "index": index,
+                        "delta": {"type": "signature_delta", "signature": signature},
+                    },
+                )
+            send("content_block_stop", {"index": index})
+
+        sequencer = BlockSequencer(open_block, block_delta, close_block)
+
+        def run():
+            collected = self._collect(
                 job,
                 thinking,
                 has_tools,
-                put_text,
-                put_tool_delta,
-                keepalive,
-                lambda progress: send("ping", {"prompt_progress": progress}),
+                on_start=start,
+                on_text=sequencer.text,
+                on_tool_delta=sequencer.tool,
+                on_idle=keepalive,
+                on_progress=lambda progress: send(
+                    "ping", {"prompt_progress": progress}
+                ),
             )
-            finish_active()
-            if content_index == 0:
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                send("content_block_stop", {"index": content_index})
+            result = collected.result
+            sequencer.finish(result.reason == "length", collected.reasoning_open)
             send(
                 "message_delta",
                 {
                     "delta": {
                         "stop_reason": anthropic_stop(
-                            result, tool_calls, job.output_clamped_to_context
+                            result,
+                            collected.tool_calls,
+                            job.output_clamped_to_context,
                         ),
                         "stop_sequence": result.stop_sequence,
                     },
@@ -1171,20 +1170,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._guarded_stream(job, run, send_error)
 
     def _responses_complete(self, job, thinking, has_tools):
-        reasoning, content, tool_calls, result, reasoning_active = self._collect(
-            job, thinking, has_tools
+        sequencer = BlockSequencer()
+        collected = self._collect(
+            job,
+            thinking,
+            has_tools,
+            on_text=sequencer.text,
+            on_tool_delta=sequencer.tool,
         )
-        status = "incomplete" if result.reason == "length" else "completed"
-        reasoning_status = (
-            "incomplete" if status == "incomplete" and reasoning_active else "completed"
-        )
+        result = collected.result
+        incomplete = result.reason == "length"
         output = responses_output(
-            job, reasoning, content, tool_calls, status, reasoning_status
+            job, sequencer.finish(incomplete, collected.reasoning_open)
         )
         response = responses_response(
             self.app.response_model,
             job,
-            status,
+            "incomplete" if incomplete else "completed",
             output,
             result=result,
         )
@@ -1204,21 +1206,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self._response_started = True
 
+    def _write_sse(self, frame):
+        self.wfile.write(frame)
+        self.wfile.flush()
+        self._last_sse_write = time.monotonic()
+
     def _sse(self, payload):
         data = (
             payload.encode("utf-8")
             if isinstance(payload, str)
             else json_codec.encode(payload)
         )
-        self.wfile.write(b"data: " + data + b"\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+        self._write_sse(b"data: " + data + b"\n\n")
 
-    def _responses_sse(self, event, payload):
+    def _event_sse(self, event, payload):
         data = json_codec.encode(payload)
-        self.wfile.write(f"event: {event}\ndata: ".encode() + data + b"\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+        self._write_sse(f"event: {event}\ndata: ".encode() + data + b"\n\n")
 
     def _sse_keepalive(self):
         # An SSE comment is traffic, so socket read timeouts and proxies do
@@ -1228,9 +1231,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # chat and text completion streams until the request starts, the
         # Responses stream once output has begun.
         self._start_event_stream()
-        self.wfile.write(b": splash-keepalive\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+        self._write_sse(b": splash-keepalive\n\n")
 
     def _sse_error(self, error):
         self._sse(
@@ -1273,12 +1274,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _responses_stream(self, job, thinking, has_tools):
         output, sequence = [], 0
-        active_kind, active_parts = None, []
-        active_call = None
 
         def send(event, **payload):
             nonlocal sequence
-            self._responses_sse(
+            self._event_sse(
                 event, {"type": event, "sequence_number": sequence, **payload}
             )
             sequence += 1
@@ -1300,25 +1299,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 ),
             )
 
-        def keepalive():
-            begin()
-            if active_kind is None and not output:
-                send(
-                    "response.in_progress",
-                    response=responses_response(
-                        self.app.response_model, job, "in_progress", []
-                    ),
-                )
-            else:
-                # The data event that adds nothing, response.in_progress,
-                # carries a snapshot of the response, which would replace the
-                # output streamed so far. A comment keeps the stream alive
-                # instead, though clients that time out on missing data events
-                # ignore it.
-                self._sse_keepalive()
-
-        def start_part(kind, item, index):
-            if kind == "reasoning":
+        def open_item(index, block):
+            item = responses_item(job, block, index)
+            send("response.output_item.added", output_index=index, item=item)
+            if block.kind == "reasoning":
                 send(
                     "response.reasoning_summary_part.added",
                     item_id=item["id"],
@@ -1326,7 +1310,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     summary_index=0,
                     part={"type": "summary_text", "text": ""},
                 )
-            elif kind == "message":
+            elif block.kind == "text":
                 send(
                     "response.content_part.added",
                     item_id=item["id"],
@@ -1335,8 +1319,30 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     part={"type": "output_text", "text": "", "annotations": []},
                 )
 
-        def finish_part(kind, item, index):
-            if kind == "function_call":
+        def item_delta(index, block, text):
+            if block.kind == "tool":
+                event, extra = "response.function_call_arguments.delta", {}
+            elif block.kind == "reasoning":
+                event, extra = (
+                    "response.reasoning_summary_text.delta",
+                    {"summary_index": 0},
+                )
+            else:
+                event, extra = (
+                    "response.output_text.delta",
+                    {"content_index": 0, "logprobs": []},
+                )
+            send(
+                event,
+                item_id=responses_item_id(job, block.kind, index),
+                output_index=index,
+                delta=text,
+                **extra,
+            )
+
+        def close_item(index, block):
+            item = responses_item(job, block, index)
+            if block.kind == "tool":
                 send(
                     "response.function_call_arguments.done",
                     item_id=item["id"],
@@ -1344,15 +1350,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     name=item["name"],
                     arguments=item["arguments"],
                 )
-            elif kind == "reasoning":
-                text = item["summary"][0]["text"] if item["summary"] else ""
-                part = {"type": "summary_text", "text": text}
+            elif block.kind == "reasoning":
+                part = {"type": "summary_text", "text": block.text}
                 send(
                     "response.reasoning_summary_text.done",
                     item_id=item["id"],
                     output_index=index,
                     summary_index=0,
-                    text=text,
+                    text=block.text,
                 )
                 payload = {
                     "item_id": item["id"],
@@ -1360,10 +1365,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "summary_index": 0,
                     "part": part,
                 }
-                if item["status"] == "incomplete":
+                if block.status == "incomplete":
                     payload["status"] = "incomplete"
                 send("response.reasoning_summary_part.done", **payload)
-            elif kind == "message":
+            else:
                 part = item["content"][0]
                 send(
                     "response.output_text.done",
@@ -1380,141 +1385,38 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     content_index=0,
                     part=part,
                 )
-
-        def finish_active(status="completed", value=None):
-            nonlocal active_call, active_kind, active_parts
-            if active_kind is None:
-                return
-            index = len(output)
-            if active_kind == "function_call":
-                if value is None:
-                    value = {
-                        "id": active_call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": active_call["function"]["name"],
-                            "arguments": "".join(active_parts),
-                        },
-                    }
-            item = responses_item(
-                job,
-                active_kind,
-                "".join(active_parts) if value is None else value,
-                index,
-                status,
-            )
-            finish_part(active_kind, item, index)
             send("response.output_item.done", output_index=index, item=item)
             output.append(item)
-            active_call, active_kind, active_parts = None, None, []
 
-        def emit_delta(kind, item, index, text):
-            if kind == "function_call":
-                event, extra = "response.function_call_arguments.delta", {}
-            elif kind == "reasoning":
-                event, extra = (
-                    "response.reasoning_summary_text.delta",
-                    {"summary_index": 0},
+        sequencer = BlockSequencer(open_item, item_delta, close_item)
+
+        def keepalive():
+            begin()
+            if not sequencer.blocks:
+                send(
+                    "response.in_progress",
+                    response=responses_response(
+                        self.app.response_model, job, "in_progress", []
+                    ),
                 )
             else:
-                event, extra = (
-                    "response.output_text.delta",
-                    {"content_index": 0, "logprobs": []},
-                )
-            send(
-                event,
-                item_id=item["id"],
-                output_index=index,
-                delta=text,
-                **extra,
-            )
-
-        def put_text(field, text):
-            nonlocal active_kind
-            kind = "reasoning" if field == "reasoning_content" else "message"
-            if kind != active_kind:
-                finish_active()
-                active_kind = kind
-                item = responses_item(job, kind, "", len(output), "in_progress")
-                if kind == "message":
-                    item["content"] = []
-                send(
-                    "response.output_item.added",
-                    output_index=len(output),
-                    item=item,
-                )
-                start_part(kind, item, len(output))
-            else:
-                item = responses_item(job, kind, "", len(output), "in_progress")
-            active_parts.append(text)
-            emit_delta(kind, item, len(output), text)
-
-        def put_tool_delta(delta):
-            nonlocal active_call, active_kind, active_parts
-            function = delta.get("function") or {}
-            if function.get("name") is not None:
-                finish_active()
-                active_kind = "function_call"
-                active_parts = []
-                active_call = {
-                    "id": delta["id"],
-                    "type": "function",
-                    "function": {
-                        "name": function["name"],
-                        "arguments": "",
-                    },
-                }
-                item = responses_item(
-                    job,
-                    "function_call",
-                    active_call,
-                    len(output),
-                    "in_progress",
-                )
-                send(
-                    "response.output_item.added",
-                    output_index=len(output),
-                    item=item,
-                )
-            arguments = function.get("arguments")
-            if arguments:
-                active_parts.append(arguments)
-                item = responses_item(
-                    job,
-                    "function_call",
-                    active_call,
-                    len(output),
-                    "in_progress",
-                )
-                emit_delta("function_call", item, len(output), arguments)
-
-        def emit_empty_message(status):
-            index = len(output)
-            pending_item = responses_item(job, "message", "", index, "in_progress")
-            pending_item["content"] = []
-            send(
-                "response.output_item.added",
-                output_index=index,
-                item=pending_item,
-            )
-            start_part("message", pending_item, index)
-            item = responses_item(job, "message", "", index, status)
-            finish_part("message", item, index)
-            send("response.output_item.done", output_index=index, item=item)
-            output.append(item)
+                # The data event that adds nothing, response.in_progress,
+                # carries a snapshot of the response, which would replace the
+                # output streamed so far. A comment keeps the stream alive
+                # instead, though clients that time out on missing data events
+                # ignore it.
+                self._sse_keepalive()
 
         def run():
-            if self._next_event(job, keepalive)[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            begin()
-            _, _, calls, result, reasoning_active = self._collect(
+            collected = self._collect(
                 job,
                 thinking,
                 has_tools,
-                put_text,
-                put_tool_delta,
-                keepalive,
-                lambda progress: send(
+                on_start=begin,
+                on_text=sequencer.text,
+                on_tool_delta=sequencer.tool,
+                on_idle=keepalive,
+                on_progress=lambda progress: send(
                     "response.in_progress",
                     response=responses_response(
                         self.app.response_model, job, "in_progress", []
@@ -1522,28 +1424,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     prompt_progress=progress,
                 ),
             )
-            status = "incomplete" if result.reason == "length" else "completed"
-            active_status = (
-                "completed"
-                if active_kind == "reasoning" and not reasoning_active
-                else status
-            )
-            finish_active(
-                active_status, calls[-1] if active_kind == "function_call" else None
-            )
-            if not calls and not any(item["type"] == "message" for item in output):
-                emit_empty_message(status)
-            event = (
-                "response.incomplete"
-                if status == "incomplete"
-                else "response.completed"
-            )
+            result = collected.result
+            incomplete = result.reason == "length"
+            sequencer.finish(incomplete, collected.reasoning_open)
+            status = "incomplete" if incomplete else "completed"
             response = responses_response(
                 self.app.response_model, job, status, output, result=result
             )
             self.app.persist_response(job, response, output)
             send(
-                event,
+                f"response.{status}",
                 response=response,
             )
 
@@ -1565,152 +1455,61 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         self._guarded_stream(job, run, send_error)
 
-    def _stream(self, job, thinking, has_tools, stream_options):
-        public_id = job.public_id
+    def _openai_stream(self, job, thinking, has_tools, stream_options, *, chat):
+        """A Chat or text completion stream; text completions have no tools."""
+        chunk = partial(
+            stream_chunk if chat else text_completion_chunk,
+            self.app.response_model,
+            job.public_id,
+            job.created_at,
+        )
+        empty = {} if chat else ""
+        started = False
+
+        def payload(field, text):
+            return {field: text} if chat else text
+
+        def start():
+            nonlocal started
+            started = True
+            self._start_event_stream()
+            if chat:
+                self._sse(chunk({"role": "assistant", "content": ""}))
+
+        def keepalive():
+            # After the start, a chunk that adds nothing: tool arguments of
+            # arrays and objects are buffered until complete, which can take
+            # minutes, and clients that time out on missing data events
+            # ignore SSE comments.
+            if started:
+                self._sse(chunk(empty))
+            else:
+                self._sse_keepalive()
 
         def run():
-            first = self._next_event(job, self._sse_keepalive)
-            if first[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            self._start_event_stream()
-            created = job.created_at
-            self._sse(
-                stream_chunk(
-                    self.app.response_model,
-                    public_id,
-                    created,
-                    {"role": "assistant", "content": ""},
-                )
-            )
-
-            def put_progress(progress):
-                chunk = stream_chunk(self.app.response_model, public_id, created, {})
-                chunk["prompt_progress"] = progress
-                self._sse(chunk)
-
-            def put_text(field, text):
-                self._sse(
-                    stream_chunk(
-                        self.app.response_model,
-                        public_id,
-                        created,
-                        {field: text},
-                    )
-                )
-
-            def put_tool_delta(delta):
-                self._sse(
-                    stream_chunk(
-                        self.app.response_model,
-                        public_id,
-                        created,
-                        {"tool_calls": [delta]},
-                    )
-                )
-
-            def keepalive():
-                # Array/object tool arguments are buffered until complete, which
-                # can take minutes. Clients that time out on missing data events
-                # ignore SSE comments, so send an empty delta chunk instead.
-                self._sse(stream_chunk(self.app.response_model, public_id, created, {}))
-
-            _, _, tool_calls, result, _ = self._collect(
+            collected = self._collect(
                 job,
                 thinking,
                 has_tools,
-                put_text,
-                put_tool_delta,
-                keepalive,
-                put_progress,
+                on_start=start,
+                on_text=lambda field, text: self._sse(chunk(payload(field, text))),
+                on_tool_delta=lambda delta: self._sse(chunk({"tool_calls": [delta]})),
+                on_idle=keepalive,
+                on_progress=lambda progress: self._sse(
+                    chunk(empty) | {"prompt_progress": progress}
+                ),
             )
+            result = collected.result
             self._sse(
-                stream_chunk(
-                    self.app.response_model,
-                    public_id,
-                    created,
-                    {},
-                    finish_reason(result, tool_calls),
+                chunk(
+                    empty,
+                    finish_reason(result, collected.tool_calls),
                     timings=timings_dict(result),
                 )
             )
             if stream_options.get("include_usage"):
                 self._sse(
-                    stream_chunk(
-                        self.app.response_model,
-                        public_id,
-                        created,
-                        {},
-                        usage=usage_dict(result, job),
-                        metrics=result.metrics,
-                    )
-                )
-            self._sse("[DONE]")
-
-        self._guarded_stream(job, run, self._sse_error)
-
-    def _text_completion_stream(self, job, stream_options):
-        public_id = job.public_id
-
-        def run():
-            first = self._next_event(job, self._sse_keepalive)
-            if first[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            self._start_event_stream()
-            created = job.created_at
-
-            def put_progress(progress):
-                chunk = text_completion_chunk(
-                    self.app.response_model, public_id, created, ""
-                )
-                chunk["prompt_progress"] = progress
-                self._sse(chunk)
-
-            def put_text(_field, text):
-                self._sse(
-                    text_completion_chunk(
-                        self.app.response_model, public_id, created, text
-                    )
-                )
-
-            def keepalive():
-                # Clients that time out on missing data events ignore SSE
-                # comments; an empty text chunk is one, as chat's empty
-                # delta is.
-                self._sse(
-                    text_completion_chunk(
-                        self.app.response_model, public_id, created, ""
-                    )
-                )
-
-            _, _, _, result, _ = self._collect(
-                job,
-                False,
-                False,
-                put_text,
-                None,
-                keepalive,
-                put_progress,
-            )
-            self._sse(
-                text_completion_chunk(
-                    self.app.response_model,
-                    public_id,
-                    created,
-                    "",
-                    result.reason,
-                    timings=timings_dict(result),
-                )
-            )
-            if stream_options.get("include_usage"):
-                self._sse(
-                    text_completion_chunk(
-                        self.app.response_model,
-                        public_id,
-                        created,
-                        "",
-                        usage=usage_dict(result, job),
-                        metrics=result.metrics,
-                    )
+                    chunk(empty, usage=usage_dict(result, job), metrics=result.metrics)
                 )
             self._sse("[DONE]")
 

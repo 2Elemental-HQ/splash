@@ -775,10 +775,11 @@ class TextAfterToolCallTests(unittest.TestCase):
     def test_whitespace_around_parallel_calls_in_every_protocol(self):
         # After a preface and parallel calls, the newlines between and after
         # the calls are not text. With text after the calls as well, the
-        # newline between them separates the two texts.
+        # newline between them separates the two texts. Only a complete chat
+        # message joins its text ahead of its calls.
         paris, rome = weather_call("Paris"), weather_call("Rome")
         calls = [("call", '{"city":"Paris"}'), ("call", '{"city":"Rome"}')]
-        for text, complete, streamed in (
+        for text, joined, ordered in (
             (
                 "I'll check both.\n\n" + paris + "\n" + rome + "\n",
                 [("text", "I'll check both.\n\n")] + calls,
@@ -800,7 +801,8 @@ class TextAfterToolCallTests(unittest.TestCase):
                         status, payload = respond(path, text, stream, False)
                         self.assertEqual(status, 200, payload)
                         items, _ = output(payload, stream)
-                        self.assertEqual(items, streamed if stream else complete)
+                        chat = path == "/v1/chat/completions" and not stream
+                        self.assertEqual(items, joined if chat else ordered)
 
     def check_cut_after_text_following_a_call(self, path, output, complete, finish):
         # The model writes text, a call and more text, and the token limit
@@ -847,21 +849,80 @@ class TextAfterToolCallTests(unittest.TestCase):
             "/v1/responses",
             responses_output,
             [
-                ("text", "First message. \nPost-call text.\n"),
+                ("text", "First message. "),
                 ("call", '{"city":"Paris"}'),
+                ("text", "\nPost-call text.\n"),
                 ("call", '{"city":"Ro'),
             ],
             "incomplete",
         )
 
     def test_messages_keep_text_after_a_call_at_max_tokens(self):
-        # A message leaves out the unfinished call's partial input.
+        # A complete message leaves out the unfinished call's partial input.
         self.check_cut_after_text_following_a_call(
             "/v1/messages",
             messages_output,
             [
-                ("text", "First message. \nPost-call text.\n"),
+                ("text", "First message. "),
                 ("call", '{"city":"Paris"}'),
+                ("text", "\nPost-call text.\n"),
             ],
             "max_tokens",
         )
+
+    def test_responses_stored_object_is_the_same_streamed_or_not(self):
+        # Items closed before the cut are complete in both modes; only the
+        # call the token limit cut is incomplete.
+        text = (
+            "First message. "
+            + PARIS
+            + "\nPost-call text.\n"
+            + "<tool_call>\n<function=weather>\n<parameter=city>\nRo"
+        )
+        stored = []
+        for stream in (False, True):
+            harness = character_harness(text, "length")
+            try:
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/responses",
+                    weather_request("/v1/responses", stream, False),
+                )
+                self.assertEqual(status, 200, payload)
+                response = (
+                    events(payload)[-1]["response"] if stream else json.loads(payload)
+                )
+                status, _, payload = harness.request(
+                    "GET", "/v1/responses/" + response["id"]
+                )
+                self.assertEqual(status, 200, payload)
+            finally:
+                harness.close()
+            public_id = response["id"].removeprefix("resp_")
+            stored.append(
+                json.loads(payload.decode().replace(public_id, "id"))["output"]
+            )
+        self.assertEqual(stored[0], stored[1])
+        self.assertEqual(
+            [(item["type"], item["status"]) for item in stored[0]],
+            [
+                ("message", "completed"),
+                ("function_call", "completed"),
+                ("message", "completed"),
+                ("function_call", "incomplete"),
+            ],
+        )
+
+    def test_thinking_only_output_ends_with_an_empty_text_block_in_both_modes(self):
+        for path, output in (
+            ("/v1/responses", responses_output),
+            ("/v1/messages", messages_output),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    status, payload = respond(path, "Reasoning.</think>", stream, True)
+                    self.assertEqual(status, 200, payload)
+                    self.assertEqual(
+                        output(payload, stream)[0],
+                        [("reasoning", "Reasoning."), ("text", "")],
+                    )

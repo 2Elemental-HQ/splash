@@ -774,9 +774,11 @@ Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
-responses alike, and `constraints.py` compiles token constraints.
-`make architecture-check` prevents lower layers from importing the HTTP entry
-module.
+responses alike, and `constraints.py` compiles token constraints. Messages and
+Responses build streamed and complete responses from the same block sequence;
+the one difference is a call cut by the token limit, which a complete Messages
+response leaves out. `make architecture-check` prevents lower layers from
+importing the HTTP entry module.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
