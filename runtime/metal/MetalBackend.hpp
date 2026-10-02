@@ -2,7 +2,6 @@
 
 #include "metal/DeviceCapabilities.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -122,12 +121,6 @@ struct CommandTiming {
   double wallSeconds = 0.0;
 };
 
-// GPU time of one dispatch replayed as its own command while profiling.
-struct DispatchTiming {
-  std::string pipelineName;
-  double gpuSeconds = 0.0;
-};
-
 // Move-only ownership of one submitted Metal command. Completion is signalled
 // without blocking the submitting thread; wait() is normally called only
 // after the host event loop receives the completion notification.
@@ -145,8 +138,6 @@ public:
   CommandTicket(CommandTicket &&) noexcept;
   CommandTicket &operator=(CommandTicket &&) noexcept;
 
-  [[nodiscard]] explicit operator bool() const noexcept;
-  [[nodiscard]] uint64_t sequence() const noexcept;
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] CommandTiming wait();
 
@@ -159,7 +150,7 @@ private:
   friend class MetalBackend;
 };
 
-using CommandCompletion = std::function<void(uint64_t sequence)>;
+using CommandCompletion = std::function<void()>;
 
 // Bytes one allocation added between two memoryStats() readings.
 [[nodiscard]] inline uint64_t allocationDelta(uint64_t before, uint64_t after) {
@@ -232,8 +223,8 @@ public:
 
   MetalBackend(const MetalBackend &) = delete;
   MetalBackend &operator=(const MetalBackend &) = delete;
-  MetalBackend(MetalBackend &&) noexcept;
-  MetalBackend &operator=(MetalBackend &&) noexcept;
+  MetalBackend(MetalBackend &&) = delete;
+  MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
@@ -280,24 +271,14 @@ public:
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
 
-  // Development profiling replays a multi-dispatch command synchronously,
-  // one dispatch per command buffer. Even submitCommandAsync() then blocks,
-  // invokes completion inline and returns an already-completed ticket.
-  // Production serving leaves this disabled. Benchmarks read and clear the
-  // per-dispatch timings with takeDispatchProfile().
-  void setDispatchProfiling(bool enabled) noexcept;
-  [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
-
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
   // control-plane status query must use memoryStats() so it can never wait
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
-  [[nodiscard]] uint64_t submissionCount() const noexcept;
   // True from a submission until its ticket has been consumed: while memory
   // the command reaches through addresses must stay allocated.
   [[nodiscard]] bool commandInFlight() const noexcept;
-  [[nodiscard]] size_t pipelineCount() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
   // Serving-loop check of the command in flight. Terminal results may invoke
   // completion here if the driver callback is delayed.
@@ -309,6 +290,8 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class BackendInstrumentation;
 };
 
 } // namespace splash::metal

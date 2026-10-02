@@ -2,6 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
+#include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
@@ -29,6 +30,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using metal::BackendInstrumentation;
 using splash::model::IdleMemory;
 
 namespace {
@@ -458,7 +460,8 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                                  const model::ModelPackage &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
-  const uint64_t originalSubmissions = backend.submissionCount();
+  const uint64_t originalSubmissions =
+      BackendInstrumentation::submittedCommands(backend);
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
   image.imagePixels.resize(image.images.front().pixelBytes());
@@ -584,7 +587,8 @@ void requireAtomicImageAdmission(model::Runtime &executor,
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "image admission test leaked resources");
   }
-  require(backend.submissionCount() == originalSubmissions,
+  require(BackendInstrumentation::submittedCommands(backend) ==
+              originalSubmissions,
           "image allocation regression unexpectedly submitted GPU work");
   std::cout << "image_admission_atomic_rollback=PASS\n";
 }
@@ -1553,7 +1557,8 @@ int main(int argc, char **argv) {
     pages.releaseExtent(0);
     {
       const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
-      const uint64_t beforeCommands = backend.submissionCount();
+      const uint64_t beforeCommands =
+          BackendInstrumentation::submittedCommands(backend);
       bool rejected = false;
       try {
         static_cast<void>(executor.warmupPrefill(1));
@@ -1562,7 +1567,8 @@ int main(int argc, char **argv) {
       }
       require(rejected && !states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
-                  backend.submissionCount() == beforeCommands,
+                  BackendInstrumentation::submittedCommands(backend) ==
+                      beforeCommands,
               "real warmup ran without its KV runway or executed/leaked work");
     }
     require(static_cast<bool>(pages.allocateExtent(0)),
@@ -1627,9 +1633,11 @@ int main(int argc, char **argv) {
     require(promptSnapshot->bytes() <= predictedPromptSnapshotBytes,
             "prompt snapshot exceeded preflight prediction");
 
-    const uint64_t beforeFirstDecode = backend.submissionCount();
+    const uint64_t beforeFirstDecode =
+        BackendInstrumentation::submittedCommands(backend);
     ModelStepResult decoded = decodeOne(executor, 1, 128, pageTable);
-    require(backend.submissionCount() == beforeFirstDecode + 1,
+    require(BackendInstrumentation::submittedCommands(backend) ==
+                beforeFirstDecode + 1,
             "speculative verify and commit were not one Metal command");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
     require(states.metadata(0).lengths.targetTokens ==
@@ -2427,11 +2435,13 @@ int main(int argc, char **argv) {
                                                .pageTable = raggedPages[lane]});
       raggedPrefillItems[lane].inputTokens = raggedPrompts[lane];
     }
-    const uint64_t beforeRaggedPrefill = backend.submissionCount();
+    const uint64_t beforeRaggedPrefill =
+        BackendInstrumentation::submittedCommands(backend);
     auto raggedPrefill =
         executor.prefill(raggedPrefillPlan, raggedPrefillItems);
     require(raggedPrefill.size() == raggedIds.size() &&
-                backend.submissionCount() == beforeRaggedPrefill + 1,
+                BackendInstrumentation::submittedCommands(backend) ==
+                    beforeRaggedPrefill + 1,
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&

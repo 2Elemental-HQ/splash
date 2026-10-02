@@ -5,6 +5,7 @@
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
 #include "AffineQ4Fixture.hpp"
+#include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/WeightStore.hpp"
@@ -30,6 +31,7 @@
 
 namespace {
 
+using splash::metal::BackendInstrumentation;
 using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
@@ -663,7 +665,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
 }
 
 void bufferBounds(MetalBackend &backend, Fixture &fixture) {
-  const uint64_t submissions = backend.submissionCount();
+  const uint64_t submissions = BackendInstrumentation::submittedCommands(backend);
   for (const auto &plan : candidates(10, fixture.shape, 33, MoePhase::Prefill)) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
@@ -737,7 +739,7 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   rejects([&] { MoE::add(graph, fixture.buffers, fixture.weights, largeTiles); },
           "scratch from incompatible plan");
   require(graph.empty(), "incompatible plan partially encoded MoE");
-  require(backend.submissionCount() == submissions,
+  require(BackendInstrumentation::submittedCommands(backend) == submissions,
           "MoE buffer validation submitted a GPU command");
 }
 

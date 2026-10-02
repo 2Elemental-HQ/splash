@@ -2,15 +2,15 @@
 // across cache lengths, for the prefill chunk (2048 rows), and the DFlash
 // verify batch (8 rows per lane, one and four lanes). Each case builds the same
 // store + attention graph the executor encodes, reports the fused GPU time of
-// the whole graph and, with dispatch profiling, the GPU time of each pipeline
-// over the attention tuner's deterministic synthetic history
-// (tuning/AttentionFixture.hpp). These are kernel timings, not a correctness
-// oracle (the tuning tests are). The KV sits in extents of the size the
-// memory plan picks for the model, or of --extent-pages pages, which must
+// the whole graph and, with each dispatch submitted as its own command, the GPU
+// time of each pipeline over the attention tuner's deterministic synthetic
+// history (tuning/AttentionFixture.hpp). These are kernel timings, not a
+// correctness oracle (the tuning tests are). The KV sits in extents of the size
+// the memory plan picks for the model, or of --extent-pages pages, which must
 // hold whole alignment units of every swept shape; the swept layer is the
-// second of two so that its region starts past the first one's, and each
-// case prints a digest of its output: two builds that fill the same pages must
-// print the same digests, whatever their storage.
+// second of two so that its region starts past the first one's, and each case
+// prints a digest of its output: two builds that fill the same pages must print
+// the same digests, whatever their storage.
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
@@ -20,6 +20,7 @@
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
 // build baselines from a tree that has that kernel.
+#include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -158,20 +159,16 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
       const size_t i = (round + offset) % backends.size();
       fused[i].push_back(backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds * 1000.0);
     }
-  for (auto *backend : backends) backend->setDispatchProfiling(true);
   for (uint64_t round = 0; round <= repeat; ++round)
     for (size_t offset = 0; offset < backends.size(); ++offset) {
       const size_t i = (round + offset) % backends.size();
-      static_cast<void>(backends[i]->submitCommand(graphs[i].dispatches()));
-      std::map<std::string, double> run;
-      for (const auto &timing : backends[i]->takeDispatchProfile())
-        run[timing.pipelineName] += timing.gpuSeconds * 1000.0;
+      const auto run =
+          benchmark::replayDispatches(*backends[i], graphs[i].dispatches());
       if (round)
-        for (const auto &[name, milliseconds] : run)
-          perPipeline[i][name].push_back(milliseconds);
+        for (const auto &[name, seconds] : run)
+          perPipeline[i][name].push_back(seconds * 1000.0);
     }
   for (size_t i = 0; i < backends.size(); ++i) {
-    backends[i]->setDispatchProfiling(false);
     results[i].fusedMilliseconds = median(fused[i]);
     for (auto &[name, samples] : perPipeline[i])
       results[i].pipelineMilliseconds[name] = median(samples);

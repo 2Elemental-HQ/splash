@@ -1692,9 +1692,7 @@ struct Runtime::Impl {
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
-          timing_(priorTiming),
-          wake_(std::make_shared<std::function<void()>>(
-              std::move(completion))) {
+          timing_(priorTiming), wake_(std::move(completion)) {
       submit(draft);
     }
 
@@ -1841,11 +1839,7 @@ struct Runtime::Impl {
     };
 
     void submit(const CommandGraph &graph) {
-      command_ = impl_.backend.submitCommandAsync(
-          graph.dispatches(), [wake = wake_](uint64_t) {
-            if (*wake)
-              (*wake)();
-          });
+      command_ = impl_.backend.submitCommandAsync(graph.dispatches(), wake_);
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -1865,7 +1859,7 @@ struct Runtime::Impl {
     double targetForwardGpuSeconds_ = 0.0;
     double maskWaitSeconds_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> maskWaitStarted_;
-    std::shared_ptr<std::function<void()>> wake_;
+    std::function<void()> wake_;
   };
 };
 
@@ -2072,12 +2066,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
-  CommandTicket command =
-      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      graph.dispatches(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, captures,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2346,12 +2336,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  auto notify = [completion = std::move(completion)](uint64_t) {
-    if (completion)
-      completion();
-  };
   CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(), std::move(notify));
+      commandGraph.dispatches(), std::move(completion));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
 }

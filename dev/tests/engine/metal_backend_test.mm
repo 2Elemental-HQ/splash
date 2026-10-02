@@ -1,3 +1,4 @@
+#include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 
 #import <Foundation/Foundation.h>
@@ -26,6 +27,7 @@
 namespace {
 
 using splash::metal::AllocationFailure;
+using splash::metal::BackendInstrumentation;
 using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
 using splash::metal::BufferStorage;
@@ -240,7 +242,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
         MethodReplacement completion(command, @selector(addCompletedHandler:),
                                      reinterpret_cast<IMP>(delayCompletionNotification));
         originalCompletedHandler = completion.original;
-        auto ticket = backend.submitAsync(dispatch, [&](uint64_t) { ++notifications; });
+        auto ticket = backend.submitAsync(dispatch, [&] { ++notifications; });
         require(gpuDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
                 "GPU did not reach the delayed completion handler");
         require(!ticket.ready(), "test did not delay the completion notification");
@@ -293,7 +295,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
             commandWatchdogGate.signaledValue = 1;
             (void)next.wait();
             commandWatchdogGate = nil;
-        } else if (next) {
+        } else if (!failed) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (!next.ready() && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -431,7 +433,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch, [&](uint64_t) { completed = true; });
+        ticket = backend.submitAsync(dispatch, [&] { completed = true; });
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     requireBackendError([&] { backend.checkHealth(); },
@@ -589,7 +591,7 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch, [&](uint64_t) { completed = true; });
+        ticket = backend.submitAsync(dispatch, [&] { completed = true; });
     }
     std::string failure;
     try {
@@ -601,6 +603,41 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
     require(completed && failure.empty() && backend.healthy(),
             "a shutdown gave up a command that completed: " + failure);
     std::cout << "PASS shutdown spares a command that completes\n";
+}
+
+// Profiling times every dispatch of every command, a command of one dispatch
+// included, and hands back a completed ticket with their summed time.
+void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, increment = 1;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    for (const size_t dispatches : {1, 2}) {
+        const std::vector<ComputeDispatch> command(dispatches, dispatch);
+        bool notified = false;
+        auto ticket =
+            backend.submitCommandAsync(command, [&] { notified = true; });
+        require(notified && ticket.ready(),
+                "a profiled command was not complete on return");
+        const auto timing = ticket.wait();
+        const auto profile = BackendInstrumentation::takeDispatchProfile(backend);
+        double total = 0.0;
+        for (const auto &entry : profile) {
+            require(entry.pipelineName == dispatch.pipelineName,
+                    "a profiled dispatch lost its pipeline name");
+            total += entry.gpuSeconds;
+        }
+        require(profile.size() == dispatches && timing.gpuSeconds == total,
+                "profiling skipped a dispatch or misreported the command");
+    }
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    require(*value == 3, "profiling did not run each dispatch exactly once");
+    std::cout << "PASS dispatch profiling covers every command\n";
 }
 
 std::atomic<unsigned> blitEncoders{0};
@@ -995,7 +1032,7 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    auto ticket = backend.submitAsync(dispatch, [gate](uint64_t) {
+    auto ticket = backend.submitAsync(dispatch, [gate] {
         std::unique_lock lock(gate->mutex);
         gate->entered = true;
         gate->condition.notify_all();
@@ -1082,8 +1119,10 @@ void run(const std::string &metallibPath) {
                 !probed.validationMessage(),
             "the device check read the device differently from the backend");
     require(backend.healthy(), "new backend is unhealthy");
-    require(backend.submissionCount() == 0, "new backend has submissions");
-    require(backend.pipelineCount() == 0, "pipeline cache is not empty");
+    require(BackendInstrumentation::submittedCommands(backend) == 0,
+            "new backend has submissions");
+    require(BackendInstrumentation::cachedPipelines(backend) == 0,
+            "pipeline cache is not empty");
 
     constexpr uint32_t kElementCount = 64;
     constexpr uint32_t kViewElementCount = kElementCount / 2;
@@ -1144,7 +1183,8 @@ void run(const std::string &metallibPath) {
             fail("operation guard admitted a GPU submission");
         } catch (const MetalAllocationError &error) {
             require(error.failure() == AllocationFailure::HostPressure &&
-                        backend.healthy() && backend.submissionCount() == 0,
+                        backend.healthy() &&
+                        BackendInstrumentation::submittedCommands(backend) == 0,
                     "guarded submission lost its cause or altered the backend");
         }
         backend.setOperationGuard({});
@@ -1154,14 +1194,10 @@ void run(const std::string &metallibPath) {
             if (!runIndex) {
                 timing = backend.submit(dispatch);
             } else {
-                std::promise<uint64_t> completedSequence;
-                auto notified = completedSequence.get_future();
+                std::promise<void> completion;
+                auto notified = completion.get_future();
                 auto ticket = backend.submitAsync(
-                    dispatch, [&](uint64_t sequence) {
-                        completedSequence.set_value(sequence);
-                    });
-                require(ticket && ticket.sequence() > 0,
-                        "async submission returned an empty ticket");
+                    dispatch, [&] { completion.set_value(); });
                 requireBackendError(
                     [&] { (void)backend.submit(dispatch); },
                     "a second in-flight command was accepted");
@@ -1172,8 +1208,7 @@ void run(const std::string &metallibPath) {
                 // wait() may return first; only the callback's own signal
                 // shows the notification was delivered.
                 require(notified.wait_for(std::chrono::seconds(5)) ==
-                                std::future_status::ready &&
-                            notified.get() == ticket.sequence(),
+                            std::future_status::ready,
                         "async completion notification was not delivered");
             }
             require(std::isfinite(timing.gpuSeconds) &&
@@ -1186,9 +1221,9 @@ void run(const std::string &metallibPath) {
         }
     }
 
-    require(backend.submissionCount() == 2,
+    require(BackendInstrumentation::submittedCommands(backend) == 2,
             "successful submissions were not counted");
-    require(backend.pipelineCount() == 1,
+    require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "pipeline cache did not reuse the pipeline");
     for (uint32_t i = 0; i < kViewElementCount; ++i) {
         require(values[i] == i, "dispatch wrote before the buffer view");
@@ -1211,7 +1246,7 @@ void run(const std::string &metallibPath) {
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommand(command);
     }
-    require(backend.submissionCount() == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 3,
             "explicit operation list did not use one command buffer");
     for (uint32_t i = kViewElementCount; i < kElementCount; ++i) {
         require(values[i] == i + 4 * kIncrement,
@@ -1245,9 +1280,9 @@ void run(const std::string &metallibPath) {
             "a descriptor error incorrectly poisoned the backend");
     require(backend.unhealthyReason().empty(),
             "healthy backend has an unhealthy reason");
-    require(backend.submissionCount() == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 3,
             "failed pre-commit dispatch was counted as submitted");
-    require(backend.pipelineCount() == 1,
+    require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "failed pipeline lookup polluted the cache");
 
     base = MetalBuffer{};
@@ -1309,6 +1344,7 @@ int main(int argc, const char *argv[]) {
             shutdownInterruptsACommandWait(argv[1]);
             shutdownLeavesTicketTeardownToTheCommand(argv[1]);
             shutdownSparesACommandThatCompletes(argv[1]);
+            dispatchProfilingCoversEveryCommand(argv[1]);
             buffersStayResident(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
