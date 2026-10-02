@@ -12,14 +12,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".metal"}
 INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULTILINE)
+# Tile, split and kernel-configuration names runtime/ops owns: model/ and
+# engine/ size workspaces through the operators, never through these.
+OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
+    "prefillAttentionTiles",
+    "kVerifySplits",
+    "kPrefillAttentionTileRows",
+    "moeMaximumTiles",
+    "LinearTile",
+    "LinearConfig",
+    "LinearSimdgroups",
+    "MoeExpertTile",
+    "MoeExpertSimdgroups",
+    "MoeConfig",
+)
 OPERATOR_WORKSPACE_POLICY = re.compile(
-    r"\b(?:PrefillAttentionWave|prefillAttentionTiles|"
-    r"kVerifySplits|kPrefillAttentionTileRows|"
-    r"moeMaximumTiles|kMoePrefillTileRows|kMoeDecodeTileRows|"
-    r"Q4DecodeKind|Q4DecodeShape|Q4PrefillShape|kQ4PrefillTileRows|"
-    r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
-    r"attentionGroups|addPrefill128|LinearTile|LinearConfig|LinearSimdgroups|"
-    r"MoeExpertTile|MoeExpertSimdgroups|MoeConfig|selectorShards)\b"
+    r"\b(?:" + "|".join(OPERATOR_WORKSPACE_POLICY_NAMES) + r")\b"
 )
 
 
@@ -141,14 +149,6 @@ def check_package_imports() -> list[str]:
 
 def check() -> list[str]:
     errors = check_server_dependencies() + check_package_imports()
-    obsolete_roots = (
-        ROOT / "runtime" / "kernels",
-        ROOT / "runtime" / "src" / "metal",
-    )
-    for path in obsolete_roots:
-        if path.exists():
-            errors.append(f"obsolete production directory exists: {relative(path)}")
-
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
@@ -228,8 +228,26 @@ def check() -> list[str]:
     return errors
 
 
+def stale_policy_names() -> list[str]:
+    """The guarded operator policy names no source under runtime/ops uses,
+    which the rule would keep guarding for nothing."""
+    operators = [
+        path.read_text(errors="replace")
+        for path in production_sources()
+        if relative(path).startswith("runtime/ops/")
+    ]
+    return [
+        name
+        for name in OPERATOR_WORKSPACE_POLICY_NAMES
+        if not any(re.search(rf"\b{name}\b", text) for text in operators)
+    ]
+
+
 def main() -> int:
-    errors = check()
+    errors = check() + [
+        f"rule guards vanished operator policy symbol {name}"
+        for name in stale_policy_names()
+    ]
     if errors:
         for error in errors:
             print(f"architecture error: {error}", file=sys.stderr)

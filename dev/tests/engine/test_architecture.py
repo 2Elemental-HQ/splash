@@ -139,32 +139,7 @@ class ArchitectureTests(unittest.TestCase):
                 )
 
     def test_workspace_policy_belongs_to_operators(self):
-        symbols = (
-            "PrefillAttentionWave",
-            "prefillAttentionTiles",
-            "kVerifySplits",
-            "kPrefillAttentionTileRows",
-            "moeMaximumTiles",
-            "kMoePrefillTileRows",
-            "kMoeDecodeTileRows",
-            "Q4DecodeKind",
-            "Q4DecodeShape",
-            "Q4PrefillShape",
-            "kQ4PrefillTileRows",
-            "narrowAffineKind",
-            "narrowResidualKind",
-            "headKind",
-            "gdnInputGroups",
-            "attentionGroups",
-            "addPrefill128",
-            "LinearTile",
-            "LinearConfig",
-            "LinearSimdgroups",
-            "MoeExpertTile",
-            "MoeExpertSimdgroups",
-            "MoeConfig",
-            "selectorShards",
-        )
+        symbols = check_architecture.OPERATOR_WORKSPACE_POLICY_NAMES
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             operator = root / "runtime/ops/Attention.cpp"
@@ -194,6 +169,23 @@ class ArchitectureTests(unittest.TestCase):
                                 ],
                             )
                     source.unlink()
+
+    def test_workspace_policy_names_exist_in_operators(self):
+        self.assertEqual(check_architecture.stale_policy_names(), [])
+
+    def test_workspace_policy_reports_a_vanished_name(self):
+        symbols = check_architecture.OPERATOR_WORKSPACE_POLICY_NAMES
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            operator = root / "runtime/ops/Attention.cpp"
+            operator.parent.mkdir(parents=True)
+            operator.write_text("\n".join(symbols[1:]))
+            # A name that only survives in model/ or engine/ is not an operator's.
+            model = root / "runtime/model/Runtime.cpp"
+            model.parent.mkdir(parents=True)
+            model.write_text(symbols[0])
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.stale_policy_names(), [symbols[0]])
 
     def test_only_engine_assembly_depends_on_concrete_models(self):
         headers = (
