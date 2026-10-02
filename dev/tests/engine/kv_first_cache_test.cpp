@@ -500,7 +500,7 @@ void testByteLruAndPins() {
   require(pinned.state.has_value(), "state pin failed");
   fixture.publish(2, 150);
   // Keep the only KV leaf state-backed so this assertion isolates state LRU;
-  // state-free KV leaves otherwise participate in the same global order.
+  // a state-free KV leaf would go first.
   fixture.publish(3, 150);
   require(fixture.cache.reclaimCache(1, false, false) == 150,
           "state LRU did not evict one unpinned entry");
@@ -645,9 +645,9 @@ void testUnifiedRecencyAndReleasedByteAccounting() {
 }
 
 // A request publishes a state on an interior block, then keeps committing
-// blocks (its decode tail) before it ends. endRequest stamps the state newer
-// than the tail, so the unified LRU evicts the state-free tail leaves first
-// and the state only once its own block is the oldest leaf.
+// blocks (its decode tail) before it ends. No state restores through the
+// tail, so its leaves go first, as dead KV goes before any state; then the
+// state, and its block after it.
 void testFinishedRequestLeavesTailKvBeforeItsState() {
   test::TestKvStorage storage{4, 100, 1};
   KvPool pool{storage, 4};
@@ -2318,6 +2318,12 @@ void testBusyTierPreservesDiskVictim() {
     }
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.slots == 2,
             "second demotion did not fill quota");
+    // While the tier is busy, a leaf that needs a write stays; the restored
+    // prefix, which keeps its disk copy, still gives its page.
+    if (restored)
+      require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 2 &&
+                  cache.snapshot().kvTier.demotionsRefused == 1,
+              "a busy tier held back the page of a leaf with a disk copy");
     require(!cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "busy tier did not wait");
     require(tier.slots == 2 && cache.snapshot().kvTier.diskBlocks == 2 &&
                 cache.lookup(prompts[0]).kvBoundary == KvCache::pageTokens,
@@ -2340,15 +2346,15 @@ void testReclaimForPagesCoversTheShortfall() {
     storage.budgetPages = 8;
     KvPool pool{storage, 0};
     engine::Cache cache{pool, cacheNamespace()};
-    // Eight one-page leaves fill the budget; a state on the first is older
-    // than the other seven.
+    // Eight one-page leaves fill the budget. With states, each holds one, so
+    // none is dead KV, and the first leaf's state is the oldest victim.
     for (uint32_t leaf = 0; leaf < 8; ++leaf) {
       cache.beginRequest(leaf + 1);
       require(admitTokens(cache, leaf + 1, 32).granted(), "leaf KV admission failed");
       const uint64_t block = cache.publishCommittedBlocks(
           leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
       cache.endRequest(leaf + 1);
-      if (withState && !leaf)
+      if (withState)
         cache.publishCompositeState(block, std::make_shared<TestState>(100));
     }
     require(pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8,
@@ -2357,7 +2363,7 @@ void testReclaimForPagesCoversTheShortfall() {
     if (withState) {
       require(reclaimed.madeProgress && reclaimed.reclaimedBytes > 0 &&
                   pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8 &&
-                  cache.snapshot().stateCache.entries == 0,
+                  cache.snapshot().stateCache.entries == 7,
               "the reclaim step went on evicting after a state returned memory");
     } else {
       require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
@@ -3452,6 +3458,67 @@ void testPromotionSkipsForAStateInUse() {
           "promotion took a state in use for its slot");
 }
 
+// KV no state restores through saves no prefill: a newer conversation's dead
+// tail goes before an older conversation's state.
+void testDeadKvGoesBeforeOlderStates() {
+  test::TestKvStorage storage{6, 100, 1};
+  KvPool pool{storage, 6};
+  engine::Cache cache(pool, cacheNamespace());
+  const std::vector<uint64_t> older = cacheChain(cache, 1, 2).second;
+  cache.publishCompositeState(older[1], std::make_shared<TestState>(100));
+  const std::vector<uint64_t> newer = cacheChain(cache, 2, 3).second;
+  cache.publishCompositeState(newer[1], std::make_shared<TestState>(100));
+  require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+              cache.snapshot().kvCache.blocks == 4 && cache.stateResident(older[1]) &&
+              cache.stateResident(newer[1]),
+          "an older state went before a newer conversation's dead KV");
+}
+
+// A demotion the busy tier cannot start keeps only the leaves that need one:
+// a newer leaf with a disk copy still gives its page, before a newer state.
+void testPendingDemotionLeavesOtherKvOpen() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  test::TestKvTier tier;
+  tier.transferLimit = 1;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 3;
+  // Three one-page chains whose states only the disk holds: each leaf needs
+  // a demotion to go.
+  std::vector<std::vector<uint32_t>> prompts;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    auto [prompt, blocks] = cacheChain(cache, id, 1);
+    cache.publishCompositeState(blocks[0], std::make_shared<TieredState>(control));
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
+            "a state was not written");
+    prompts.push_back(std::move(prompt));
+  }
+  // The oldest leaf is written while a lookup holds it, so it keeps its page
+  // beside its new disk copy; the next leaf's demotion stays in flight.
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "a demotion did not start");
+  {
+    const CacheLookup held = cache.lookup(prompts[0]);
+    tier.complete();
+    require(cache.pollTransfers(), "the demotion did not land");
+  }
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && !tier.canDemote(),
+          "the second demotion did not fill the tier");
+  const uint64_t state = cacheChain(cache, 4, 1).second[0];
+  cache.publishCompositeState(state, std::make_shared<TestState>(100));
+  const CacheSnapshot before = cache.snapshot();
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
+          "nothing was reclaimed while a demotion had to wait");
+  const CacheSnapshot after = cache.snapshot();
+  require(after.kvCache.blocks == before.kvCache.blocks - 1 &&
+              after.kvTier.diskBlocks == before.kvTier.diskBlocks &&
+              cache.lookup(prompts[0]).kvBoundary == KvCache::pageTokens &&
+              cache.stateResident(state) && after.kvTier.demotionsRefused == 1,
+          "a demotion that had to wait closed the KV whose page frees at once");
+}
+
 // A copy that failed is not the protection giving way.
 void testInUseEvictionsCountChoices() {
   CacheFixture fixture;
@@ -3464,10 +3531,10 @@ void testInUseEvictionsCountChoices() {
           "a failed copy counted as an eviction of a state in use");
 }
 
-// A publication in use makes room as running work does: another
-// conversation's KV older than every ordinary state goes first, then that
-// state, then newer KV. Optional and ordinary publications take no KV, and
-// the running chain the publication belongs to is never a victim.
+// A publication in use makes room as running work does: KV no state
+// restores through goes first, oldest first, then the ordinary state, then
+// the KV it restored through. Optional and ordinary publications take no KV,
+// and the running chain the publication belongs to is never a victim.
 void testPublicationInUseTakesOrdinaryKv() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 8};
@@ -3475,7 +3542,7 @@ void testPublicationInUseTakesOrdinaryKv() {
   const auto older = cacheChain(cache, 1, 2).first;
   const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
   cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
-  const auto newer = cacheChain(cache, 3, 2);
+  const auto newer = cacheChain(cache, 3, 2).first;
   const uint64_t point = cacheChain(cache, 4, 2, true).second[1];
   StateUse use = cache.useState(point);
   const auto blocks = [&] { return cache.snapshot().kvCache.blocks; };
@@ -3483,21 +3550,20 @@ void testPublicationInUseTakesOrdinaryKv() {
           "an optional publication took KV");
   for (uint32_t leaf = 0; leaf < 2; ++leaf)
     require(cache.reclaimOneState(false, point, true) && cache.stateResident(stated[1]),
-            "the older KV did not go before the newer ordinary state");
+            "the older dead KV did not go before the ordinary state");
   require(blocks() == 6 && cache.lookup(older).kvBoundary == 0 &&
-              pool.snapshot().pagesAllocated == 6,
-          "the older KV did not go with its extents");
+              cache.lookup(newer).kvBoundary == 64 && pool.snapshot().pagesAllocated == 6,
+          "the older dead KV did not go first, with its extents");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point, true) && cache.stateResident(stated[1]),
+            "the newer dead KV did not go before the ordinary state");
   require(cache.reclaimOneState(false, point, true) && !cache.stateResident(stated[1]) &&
-              blocks() == 6,
-          "the ordinary state did not go before newer KV");
-  require(!cache.reclaimOneState(false, newer.second[0], true) && blocks() == 6,
+              blocks() == 4,
+          "the ordinary state did not go before the KV it restored through");
+  require(!cache.reclaimOneState(false, stated[0], true) && blocks() == 4,
           "an ordinary publication took KV");
   for (uint32_t leaf = 0; leaf < 2; ++leaf)
     require(cache.reclaimOneState(false, point, true).made, "the KV of the old state did not go");
-  require(blocks() == 4 && cache.lookup(newer.first).kvBoundary == 64,
-          "newer KV went before older KV");
-  for (uint32_t leaf = 0; leaf < 2; ++leaf)
-    require(cache.reclaimOneState(false, point, true).made, "the newest KV did not go");
   require(!cache.reclaimOneState(false, point, true) && blocks() == 2 &&
               cache.snapshot().stateCache.inUseEvictions == 0,
           "a publication took its own running chain");
@@ -3648,6 +3714,8 @@ int main() {
     testPromotionSkipsForAStateInUse();
     testInUseEvictionsCountChoices();
     testPublicationInUseTakesOrdinaryKv();
+    testDeadKvGoesBeforeOlderStates();
+    testPendingDemotionLeavesOtherKvOpen();
     testPublicationInUseWithoutGrowthTakesStatesAlone();
     testPublicationInUseLeavesKvInUse();
     testInUsePublicationStartsNoDemotion();

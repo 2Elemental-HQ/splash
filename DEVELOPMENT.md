@@ -974,20 +974,21 @@ next turn may render it differently, so a follow-up resumes from there.
 
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. Cache victims come in three classes: checkpoints,
-then ordinary states and KV, then what is in use. No work displaces anything of
-a class above its own. Memory for running requests takes what is in use after
-everything else. A start that a resident lane holds back takes nothing in use:
-it waits for that lane. Nor does the lane that yields first when no lane's
-growth fits, such as one just started beside a decoding lane: its own suspension
-pays for the memory, and while other lanes fit it waits for them, resident. A
-publication in use takes cached KV and states in the same order, then the oldest
-state in use; of the KV it takes only leaves whose page frees at once, and only
-while an extent can be emptied; the extent is released at once, and the snapshot
-follows. Other publications recycle only states, a disk copy in use may displace
-the oldest copy in use, and ordinary or optional work never displaces anything
-in use. Nothing in use is pinned, so running work that needs the memory still
-takes it once nothing else is left. A resumed lane that lost its prompt's replay
-point rebuilds it on the way.
+then ordinary states and KV (first the KV no state restores through, which saves
+no prefill), then what is in use. No work displaces anything of a class above
+its own. Memory for running requests takes what is in use after everything
+else. A start that a resident lane holds back takes nothing in use: it waits for
+that lane. Nor does the lane that yields first when no lane's growth fits, such
+as one just started beside a decoding lane: its own suspension pays for the
+memory, and while other lanes fit it waits for them, resident. A publication in
+use takes cached KV and states in the same order, then the oldest state in use;
+of the KV it takes only leaves whose page frees at once, and only while an
+extent can be emptied; the extent is released at once, and the snapshot follows.
+Other publications recycle only states, a disk copy in use may displace the
+oldest copy in use, and ordinary or optional work never displaces anything in
+use. Nothing in use is pinned, so running work that needs the memory still takes
+it once nothing else is left. A resumed lane that lost its prompt's replay point
+rebuilds it on the way.
 `/status` reports under `state` the replay points unfinished requests hold
 (`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 
@@ -1045,15 +1046,16 @@ once the engine loads. The tier does not raise the context limit.
 Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
-after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. A restored page is read straight into its
-extent. Either way the transfer runs on the file's IO worker beside whatever
-command the model runs: a cached page is never written by a command, and no
-command uses a page before its read has landed. At most 128 KV pages are in
-transfer at a time, demotions at most half of them and restores at most three
-quarters, since one worker serves both in order and a burst of either kind
-must leave the other its share. When the tier takes no more, admission waits
-for a transfer instead of evicting additional victims.
+after the write succeeds. Unneeded tails are dropped without writing, before any
+state, together with any disk copies below them. A restored page is read
+straight into its extent. Either way the transfer runs on the file's IO worker
+beside whatever command the model runs: a cached page is never written by a
+command, and no command uses a page before its read has landed. At most 128 KV
+pages are in transfer at a time, demotions at most half of them and restores at
+most three quarters, since one worker serves both in order and a burst of either
+kind must leave the other its share. When the tier takes no more, leaves that
+need a write stay until a transfer lands, while leaves whose page frees without
+one still go.
 
 A state with no available RAM cache slot can be written directly from its lane.
 When every state in RAM is in use and no cached KV is left to take, a replay
