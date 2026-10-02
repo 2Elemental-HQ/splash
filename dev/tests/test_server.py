@@ -2235,9 +2235,9 @@ class ServerTest(unittest.TestCase):
         status, _, payload = harness.request("GET", "/v1/models")
         self.assertEqual(status, 200)
         models = json.loads(payload)["data"]
-        self.assertEqual([model["id"] for model in models], ["test-model", "local"])
-        self.assertNotIn("root", models[1])
-        self.assertEqual(models[0]["root"], "local")
+        self.assertEqual([model["id"] for model in models], ["local", "test-model"])
+        self.assertNotIn("root", models[0])
+        self.assertEqual(models[1]["root"], "local")
         # Diagnostics keep reporting the loaded package id even while
         # responses announce the served name (#81).
         status, _, payload = harness.request("GET", "/status")
@@ -4197,7 +4197,7 @@ class ServerTest(unittest.TestCase):
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
         app = SimpleNamespace(
-            model="test-model",
+            response_model="test-model",
             backend=SimpleNamespace(cancel=mock.Mock()),
             persist_response=mock.Mock(),
         )

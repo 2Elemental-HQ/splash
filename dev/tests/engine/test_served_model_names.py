@@ -14,13 +14,22 @@ from server import frontend
 from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
+ANNOUNCED = ALIASES[0]
 SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
 
 
+def expected(announce):
+    """The model name responses report."""
+    return ANNOUNCED if announce else "test-model"
+
+
 class ServedModelNamesTests(unittest.TestCase):
-    def harness(self, runtime=None, **kwargs):
+    def harness(self, runtime=None, announce=False, **kwargs):
         harness = fixtures.Harness(
-            runtime or fixtures.FakeRuntime(), served_model_names=ALIASES, **kwargs
+            runtime or fixtures.FakeRuntime(),
+            served_model_names=ALIASES,
+            announce_served_name=announce,
+            **kwargs,
         )
         self.addCleanup(harness.close)
         return harness
@@ -198,6 +207,34 @@ class ServedModelNamesTests(unittest.TestCase):
             self.assertEqual(frontend.validate_served_model_name(name), name)
             self.assertEqual(launcher._parse_served_model_name(name), name)
 
+    def test_announce_requires_a_served_name(self):
+        for parse, args in (
+            (api.parse_args, SERVER_ARGS),
+            (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+        ):
+            with self.subTest(parse=parse.__module__):
+                with (
+                    mock.patch("sys.stderr", io.StringIO()) as stderr,
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    parse([*args, "--announce-served-name"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(
+                    "--announce-served-name needs --served-model-name",
+                    stderr.getvalue(),
+                )
+        with self.assertRaises(ValueError):
+            fixtures.make_frontend(
+                fixtures.FakeTokenizer(),
+                None,
+                "test-model",
+                128,
+                1,
+                2,
+                vision=True,
+                announce_served_name=True,
+            )
+
     def test_launcher_forwards_repeated_aliases(self):
         keep_stop_signals(self)
         with (
@@ -251,25 +288,35 @@ class ServedModelNamesTests(unittest.TestCase):
                 self.assertEqual(parsed.served_model_name, ["local"])
                 self.assertIs(parsed.announce_served_name, announced)
 
-    def test_client_launcher_uses_canonical_model_when_aliases_are_listed(self):
-        models = [
-            {"id": name, "owned_by": "splash"} for name in ("owner/repo", "local")
-        ]
-        with (
-            mock.patch.object(
-                launcher.clients, "find_executable", return_value="codex"
-            ),
-            mock.patch.object(
-                launcher,
-                "_running_status",
-                return_value={"maximum_context_tokens": 4096},
-            ),
-            mock.patch.object(launcher, "_request_json", return_value={"data": models}),
-            mock.patch.object(
-                launcher.clients, "command", return_value=(["codex"], {})
-            ) as command,
-            mock.patch.object(launcher.os, "execvpe"),
-            mock.patch("sys.stdout", io.StringIO()),
-        ):
-            launcher.coding_client(launcher.parse_args(["codex"]))
-            self.assertEqual(command.call_args.args[3], "owner/repo")
+    def test_client_launcher_configures_the_name_responses_report(self):
+        for announce in (False, True):
+            with self.subTest(announce=announce):
+                harness = self.harness(announce=announce)
+                status, _, payload = harness.request("GET", "/v1/models")
+                self.assertEqual(status, 200)
+                with (
+                    mock.patch.object(
+                        launcher.clients, "find_executable", return_value="codex"
+                    ),
+                    mock.patch.object(
+                        launcher,
+                        "_running_status",
+                        return_value={"maximum_context_tokens": 4096},
+                    ),
+                    mock.patch.object(
+                        launcher, "_request_json", return_value=json.loads(payload)
+                    ),
+                    mock.patch.object(
+                        launcher.clients, "command", return_value=(["codex"], {})
+                    ) as command,
+                    mock.patch.object(launcher.os, "execvpe"),
+                    mock.patch("sys.stdout", io.StringIO()),
+                ):
+                    launcher.coding_client(launcher.parse_args(["codex"]))
+                model = command.call_args.args[3]
+                self.assertEqual(model, expected(announce))
+                body = request_body(PATHS[0])
+                body["model"] = model
+                status, _, payload = harness.request("POST", PATHS[0], body)
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(json.loads(payload)["model"], model)

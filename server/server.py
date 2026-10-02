@@ -497,7 +497,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
                     "input_modalities": self.app.input_modalities,
-                    **({"root": self.app.model} if name != self.app.model else {}),
+                    **(
+                        {"root": self.app.response_model}
+                        if name != self.app.response_model
+                        else {}
+                    ),
                 }
                 for name in self.app.model_names
             ]
@@ -775,7 +779,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             raise APIError(500, "runtime protocol error", "protocol_error")
         self._json(
             200,
-            judgments.judgment_response(self.app.model, row, job.meta, result),
+            judgments.judgment_response(self.app.response_model, row, job.meta, result),
         )
 
     def _systemone(self, body, deadline):
@@ -821,7 +825,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._json(
             200,
             {
-                "model": self.app.model,
+                "model": self.app.response_model,
                 "answers": answers,
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
@@ -984,12 +988,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
             message["tool_calls"] = tool_calls
         self._json(
             200,
-            completion_response(self.app.model, job, result, message, bool(tool_calls)),
+            completion_response(
+                self.app.response_model, job, result, message, bool(tool_calls)
+            ),
         )
 
     def _text_completion(self, job):
         _, text, _, result, _ = self._collect(job, False, False)
-        self._json(200, text_completion_response(self.app.model, job, result, text))
+        self._json(
+            200, text_completion_response(self.app.response_model, job, result, text)
+        )
 
     def _anthropic_complete(self, job, thinking, has_tools):
         reasoning, content, tool_calls, result, _ = self._collect(
@@ -1003,7 +1011,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._json(
             200,
             anthropic_response(
-                self.app.model, job, reasoning, content, tool_calls, result, signature
+                self.app.response_model,
+                job,
+                reasoning,
+                content,
+                tool_calls,
+                result,
+                signature,
             ),
         )
 
@@ -1128,7 +1142,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         "id": f"msg_{job.public_id}",
                         "type": "message",
                         "role": "assistant",
-                        "model": self.app.model,
+                        "model": self.app.response_model,
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
@@ -1220,7 +1234,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             job, reasoning, content, tool_calls, status, reasoning_status
         )
         response = responses_response(
-            self.app.model,
+            self.app.response_model,
             job,
             status,
             output,
@@ -1328,11 +1342,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._start_event_stream()
             send(
                 "response.created",
-                response=responses_response(self.app.model, job, "in_progress", []),
+                response=responses_response(
+                    self.app.response_model, job, "in_progress", []
+                ),
             )
             send(
                 "response.in_progress",
-                response=responses_response(self.app.model, job, "in_progress", []),
+                response=responses_response(
+                    self.app.response_model, job, "in_progress", []
+                ),
             )
 
         def keepalive():
@@ -1340,7 +1358,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if active_kind is None and not output:
                 send(
                     "response.in_progress",
-                    response=responses_response(self.app.model, job, "in_progress", []),
+                    response=responses_response(
+                        self.app.response_model, job, "in_progress", []
+                    ),
                 )
             else:
                 # The data event that adds nothing, response.in_progress,
@@ -1564,7 +1584,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 keepalive,
                 lambda progress: send(
                     "response.in_progress",
-                    response=responses_response(self.app.model, job, "in_progress", []),
+                    response=responses_response(
+                        self.app.response_model, job, "in_progress", []
+                    ),
                     prompt_progress=progress,
                 ),
             )
@@ -1594,7 +1616,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 else "response.completed"
             )
             response = responses_response(
-                self.app.model, job, status, output, result=result
+                self.app.response_model, job, status, output, result=result
             )
             self.app.persist_response(job, response, output)
             send(
@@ -1606,7 +1628,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send(
                 "response.failed",
                 response=responses_response(
-                    self.app.model,
+                    self.app.response_model,
                     job,
                     "failed",
                     output,
@@ -1631,7 +1653,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             created = job.created_at
             self._sse(
                 stream_chunk(
-                    self.app.model,
+                    self.app.response_model,
                     public_id,
                     created,
                     {"role": "assistant", "content": ""},
@@ -1639,14 +1661,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
 
             def put_progress(progress):
-                chunk = stream_chunk(self.app.model, public_id, created, {})
+                chunk = stream_chunk(self.app.response_model, public_id, created, {})
                 chunk["prompt_progress"] = progress
                 self._sse(chunk)
 
             def put_text(field, text):
                 self._sse(
                     stream_chunk(
-                        self.app.model,
+                        self.app.response_model,
                         public_id,
                         created,
                         {field: text},
@@ -1656,7 +1678,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             def put_tool_delta(delta):
                 self._sse(
                     stream_chunk(
-                        self.app.model,
+                        self.app.response_model,
                         public_id,
                         created,
                         {"tool_calls": [delta]},
@@ -1667,7 +1689,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # Array/object tool arguments are buffered until complete, which
                 # can take minutes. Clients that time out on missing data events
                 # ignore SSE comments, so send an empty delta chunk instead.
-                self._sse(stream_chunk(self.app.model, public_id, created, {}))
+                self._sse(stream_chunk(self.app.response_model, public_id, created, {}))
 
             _, _, tool_calls, result, _ = self._collect(
                 job,
@@ -1680,7 +1702,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             self._sse(
                 stream_chunk(
-                    self.app.model,
+                    self.app.response_model,
                     public_id,
                     created,
                     {},
@@ -1691,7 +1713,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if stream_options.get("include_usage"):
                 self._sse(
                     stream_chunk(
-                        self.app.model,
+                        self.app.response_model,
                         public_id,
                         created,
                         {},
@@ -1714,20 +1736,28 @@ class FrontendHandler(BaseHTTPRequestHandler):
             created = job.created_at
 
             def put_progress(progress):
-                chunk = text_completion_chunk(self.app.model, public_id, created, "")
+                chunk = text_completion_chunk(
+                    self.app.response_model, public_id, created, ""
+                )
                 chunk["prompt_progress"] = progress
                 self._sse(chunk)
 
             def put_text(_field, text):
                 self._sse(
-                    text_completion_chunk(self.app.model, public_id, created, text)
+                    text_completion_chunk(
+                        self.app.response_model, public_id, created, text
+                    )
                 )
 
             def keepalive():
                 # Clients that time out on missing data events ignore SSE
                 # comments; an empty text chunk is one, as chat's empty
                 # delta is.
-                self._sse(text_completion_chunk(self.app.model, public_id, created, ""))
+                self._sse(
+                    text_completion_chunk(
+                        self.app.response_model, public_id, created, ""
+                    )
+                )
 
             _, _, _, result, _ = self._collect(
                 job,
@@ -1740,7 +1770,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             self._sse(
                 text_completion_chunk(
-                    self.app.model,
+                    self.app.response_model,
                     public_id,
                     created,
                     "",
@@ -1751,7 +1781,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if stream_options.get("include_usage"):
                 self._sse(
                     text_completion_chunk(
-                        self.app.model,
+                        self.app.response_model,
                         public_id,
                         created,
                         "",
@@ -2116,7 +2146,7 @@ class FrontendServer(ThreadingHTTPServer):
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
-            "model": self.app.loaded_model,
+            "model": self.app.model,
             "host": self.server_address[0],
             "port": self.server_address[1],
             "started_at": self.started_at,
@@ -2255,15 +2285,14 @@ def parse_args(argv=None):
         action="append",
         default=[],
         type=validate_served_model_name,
-        help="additional API model name; responses still identify the loaded model (repeatable)",
+        help="additional API model name (repeatable); responses report the "
+        "loaded model ID unless --announce-served-name",
     )
     parser.add_argument(
         "--announce-served-name",
         action="store_true",
-        help=(
-            "with --served-model-name, report the first served name in API "
-            "responses; /status keeps reporting the loaded model"
-        ),
+        help="report the first --served-model-name in API responses and list it "
+        "first in /v1/models; /status keeps the loaded model ID",
     )
     parser.add_argument(
         "--default-reasoning-effort",
@@ -2309,6 +2338,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
+    if args.announce_served_name and not args.served_model_name:
+        parser.error("--announce-served-name needs --served-model-name")
     if (
         args.default_reasoning_effort is not None
         and args.default_reasoning_effort not in REASONING_EFFORTS
