@@ -13,6 +13,8 @@ namespace splash {
 // when it is constructed. Only dev/tests writes it
 // (dev/tests/engine/ScopedTestConfig.hpp).
 struct TestConfig final {
+  std::optional<double> commandTimeoutSeconds;     // metal::kCommandTimeoutSeconds
+  std::optional<double> residencyKeepAliveSeconds; // metal::kResidencyKeepAliveSeconds
   std::optional<uint32_t> kvTierTransfers;        // engine::KvPageTier::kTransfers
   std::optional<size_t> transportInputQueueBytes; // engine::FdTransport::kInputQueueBytes
   std::optional<uint32_t> metricsLatencyWindow;   // engine::RuntimeMetrics::kLatencyWindow

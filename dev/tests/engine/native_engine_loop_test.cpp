@@ -613,7 +613,7 @@ void testCapacityFailureHasOneTerminalFrame() {
 }
 
 void testCommandWatchdogAndPendingHealthWake() {
-  metal::CommandWatchdog generations;
+  metal::CommandWatchdog generations(120.0);
   generations.start(1, 0.0);
   generations.complete(1);
   require(!generations.expired(1000.0), "completed command retained a deadline");
@@ -629,7 +629,7 @@ void testCommandWatchdogAndPendingHealthWake() {
     double &now = fixture.monotonic;
     now = 0.0;
     executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
-    metal::CommandWatchdog watchdog;
+    metal::CommandWatchdog watchdog(120.0);
     executor.onSubmit = [&] { watchdog.start(1, now / 1000.0); };
     executor.onHealthCheck = [&] {
       if (watchdog.expired(now / 1000.0))

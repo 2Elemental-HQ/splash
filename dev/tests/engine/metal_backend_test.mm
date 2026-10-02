@@ -1,5 +1,6 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "ScopedTestConfig.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -35,6 +36,7 @@ using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
+using splash::test::ScopedTestConfig;
 using splash::metal::MetalBuffer;
 
 [[noreturn]] void fail(const std::string &message) {
@@ -112,7 +114,8 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
 }
 
 void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -217,7 +220,8 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
 
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                                    bool pendingNext = false) {
-    MetalBackend backend(metallibPath, 0.1);
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -327,7 +331,8 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
 }
 
 void pendingCommandStillTimesOut(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
@@ -381,7 +386,8 @@ bool awaitAllocationsReleased(const MetalBackend &backend) {
 // A synchronous submission throws once the watchdog gives up on its command,
 // which keeps its allocations until the GPU ends it.
 void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
@@ -423,7 +429,8 @@ void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
 // Destroying a ticket whose command the watchdog gave up on returns while the
 // command is still pending, and the command completes once the GPU ends it.
 void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
@@ -488,7 +495,7 @@ void stopRefusesSubmission(const std::string &metallibPath) {
 // throws and the backend is unhealthy, and the command keeps its allocations
 // until the GPU ends it.
 void shutdownInterruptsACommandWait(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
+    MetalBackend backend(metallibPath);
     std::atomic<bool> stop{false};
     backend.setWaitInterrupt([&] { return stop.load(); });
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
@@ -535,7 +542,7 @@ void shutdownInterruptsACommandWait(const std::string &metallibPath) {
 // wait() gives a command up for a shutdown, and only the watchdog judges the
 // backend's health meanwhile.
 void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
+    MetalBackend backend(metallibPath);
     backend.setWaitInterrupt([] { return true; });
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
@@ -572,7 +579,7 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
 // success: the wait gives up only a command still unfinished, so the backend
 // stays healthy.
 void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
+    MetalBackend backend(metallibPath);
     auto buffer = backend.allocateBuffer(sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
@@ -766,7 +773,8 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     ResidencyCalls calls;
     unsigned lapseCommits = 0, lapseComputes = 0;
     {
-        MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
+        const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+        MetalBackend backend(metallibPath);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
         MetalBuffer lapsing = backend.allocateBuffer(page);
         (void)waitFor([] { return commits != 0; }, std::chrono::seconds(5));
@@ -819,7 +827,8 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
 void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -861,7 +870,7 @@ void allocationDoesNotRequestResidency(const std::string &metallibPath) {
     constexpr uint32_t kAllocations = 20;
     constexpr double kBeatSeconds = 0.5;
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, 600.0);
+    MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = backend.allocateBuffer(page);
     const uint32_t count = 1, increment = 7;
@@ -893,8 +902,8 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
     ResidencyCalls calls;
-    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0,
-                                                  kKeepAliveSeconds);
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    auto backend = std::make_unique<MetalBackend>(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = backend->allocateBuffer(page);
     *static_cast<uint32_t *>(used.contents()) = 0;
@@ -960,7 +969,8 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
     MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;

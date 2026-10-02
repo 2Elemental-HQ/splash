@@ -1,6 +1,7 @@
 #import "MetalBackend.hpp"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
+#include "TestConfig.hpp"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
 #include "BackendInstrumentation.hpp"
 #endif
@@ -223,6 +224,9 @@ struct MetalBuffer::Impl {
 };
 
 struct BackendAsyncState {
+    explicit BackendAsyncState(double commandTimeoutSeconds)
+        : commandWatchdog(commandTimeoutSeconds) {}
+
     __strong id<MTLDevice> device = nil;
     mutable std::atomic<uint64_t> deviceCurrentAllocatedBytes{0};
     mutable std::atomic<uint64_t> devicePeakAllocatedBytes{0};
@@ -529,7 +533,8 @@ struct MetalBackend::Impl {
     std::shared_ptr<AllocationAccounting> accounting =
         std::make_shared<AllocationAccounting>();
     std::shared_ptr<BackendAsyncState> asyncState =
-        std::make_shared<BackendAsyncState>();
+        std::make_shared<BackendAsyncState>(
+            testConfig().commandTimeoutSeconds.value_or(kCommandTimeoutSeconds));
 
     void sampleDeviceMemory() const noexcept {
         asyncState->sampleDeviceMemory();
@@ -885,15 +890,8 @@ CommandTiming CommandTicket::wait() {
     return timing;
 }
 
-MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSeconds,
-                           double residencyKeepAliveSeconds)
+MetalBackend::MetalBackend(std::string metallibPath)
     : impl_(std::make_unique<Impl>()) {
-    impl_->asyncState->commandWatchdog = CommandWatchdog(commandTimeoutSeconds);
-    if (!std::isfinite(residencyKeepAliveSeconds) ||
-        residencyKeepAliveSeconds <= 0.0) {
-        throw MetalBackendError(
-            "residency keep-alive must be finite and positive");
-    }
     @autoreleasepool {
         if (metallibPath.empty()) {
             throw MetalBackendError("metallib path must not be empty");
@@ -946,7 +944,8 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         impl_->residency = std::make_shared<Residency>(
             impl_->device, impl_->queue,
             impl_->newPipeline(Residency::kKickPipeline),
-            residencyKeepAliveSeconds);
+            testConfig().residencyKeepAliveSeconds.value_or(
+                kResidencyKeepAliveSeconds));
 
         readDeviceCapabilities(impl_->device, impl_->capabilities);
     }

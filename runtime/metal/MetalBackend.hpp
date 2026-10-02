@@ -198,17 +198,20 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
+// How long a command may run before the backend gives up on it, and how long
+// every buffer stays wired after the last command (see allocateBuffer). Tests
+// substitute shorter ones through TestConfig.
+inline constexpr double kCommandTimeoutSeconds = 120.0;
+inline constexpr double kResidencyKeepAliveSeconds = 600.0;
+static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
 // One thread submits, allocates and looks up pipelines; checkHealth(),
 // healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
 // called from any thread.
 class MetalBackend final {
 public:
-  // Every buffer stays wired until residencyKeepAliveSeconds pass without a
-  // command (see allocateBuffer).
-  explicit MetalBackend(std::string metallibPath,
-                        double commandTimeoutSeconds = 120.0,
-                        double residencyKeepAliveSeconds = 600.0);
+  explicit MetalBackend(std::string metallibPath);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
