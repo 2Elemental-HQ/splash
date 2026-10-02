@@ -975,8 +975,10 @@ response writing for admitted API requests. Preparation, queue, template,
 tokenization, output grammar preparation and image preparation are measured
 separately; preparation includes its nested stages. Tokenization covers the encoding call, including reuse when
 available. Histogram buckets are cumulative and labeled by upper bound.
-TTFT starts before upload and ends at the first native token
-event. Output intervals are between native token events, which can contain
+HTTP TTFT (`http_ttft`) starts before upload and ends at the first native
+token event; native TTFT (`metrics.ttft_ms`, per-request
+`request_latency.ttft_ms`) starts when the engine receives the request.
+Output intervals are between native token events, which can contain
 multiple speculative tokens; they are not per-token latency. Native queue timing
 is recorded from successful completions. These histograms live with the HTTP
 process and survive a native engine restart.
@@ -1461,7 +1463,7 @@ Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
 alone does not measure end-to-end agent performance.
 
 For slow tool-bearing requests, the `latency` section of `/status` separates
-preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
+preparation, tokenization, grammar preparation, native queueing and HTTP TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;
 it does not include generation-time masks. The `grammar_cache` counters show
 whether compiled output grammars are reused. Tool definitions still contribute

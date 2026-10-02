@@ -3327,16 +3327,18 @@ class ServerTest(unittest.TestCase):
             "template",
             "tokenization",
             "images",
-            "ttft",
+            "http_ttft",
             "output_interval",
         ):
             with self.subTest(stage=stage):
                 self.assertEqual(snapshot[stage]["count"], 1)
                 self.assertGreater(snapshot[stage]["sum"], 0)
-        self.assertGreater(snapshot["http_request"]["sum"], snapshot["ttft"]["sum"])
+        self.assertGreater(
+            snapshot["http_request"]["sum"], snapshot["http_ttft"]["sum"]
+        )
         status, _, payload = harness.request("GET", "/metrics")
         self.assertEqual(status, 200, payload)
-        self.assertIn(b"splash_ttft_seconds_count 1", payload)
+        self.assertIn(b"splash_http_ttft_seconds_count 1", payload)
         self.assertIn(b"splash_output_interval_seconds_count 1", payload)
 
     def test_console_request_summary(self):
