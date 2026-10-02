@@ -91,18 +91,17 @@ struct MemoryGovernorSnapshot {
   bool hostGrowthAllowed = true;
 };
 
+// Critical pressure evicts every unpinned entry and takes what a request
+// starts from, one lane's pooled state buffers and the empty KV runway
+// extent, so it has no target. Every other pass keeps those, since growth is
+// paused; targetBytes zero returns only empty extents. keepResumePoint keeps
+// the newest state publication (else the newest checkpoint), the point a
+// follow-up request resumes from; only a shrink nothing waits for can afford
+// to.
 struct MemoryReclaimDirective {
-  bool reclaim = false;
-  bool evictAllUnpinnedPrefixes = false;
+  bool critical = false;
   uint64_t targetBytes = 0;
-  // Keep the newest ordinary state publication (else the newest checkpoint),
-  // the point a follow-up request resumes from. Only a shrink that nothing is
-  // waiting for can afford to.
   bool keepResumePoint = false;
-  // Keep what a request starts from without growing: one lane's pooled state
-  // buffers and one empty KV extent, so the next request starts without
-  // allocating while the host is short. Only critical pressure takes them.
-  bool keepServingFootprint = false;
 };
 
 // What a reclaim pass made of its directive's target.
@@ -127,9 +126,10 @@ struct MemoryReclaimResult {
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
-  // requestWaiting reports whether a request cannot proceed for want of
-  // memory. Without one the pass is speculative and keeps the resume point.
-  [[nodiscard]] MemoryReclaimDirective
+  // The pass to run now; none under normal pressure. requestWaiting reports
+  // whether a request cannot proceed for want of memory. Without one the
+  // pass is speculative and keeps the resume point.
+  [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
   // What the pass of `directive` achieved. The passes up to the next

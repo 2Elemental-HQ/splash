@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <limits.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -417,13 +418,15 @@ int runNative(const NativeArguments &arguments) {
       writeStderrLine(diagnostic);
     // Requests held back by a refusal wait for memory too, the refused one
     // included while a pass defers it.
-    engine::MemoryReclaimDirective directive = pressurePolicy.update(
-        memory, now, wait.memory || wait.suspended || wait.heldBehindRefusal);
-    if (!directive.reclaim)
+    const std::optional<engine::MemoryReclaimDirective> directive =
+        pressurePolicy.update(memory, now,
+                              wait.memory || wait.suspended ||
+                                  wait.heldBehindRefusal);
+    if (!directive)
       return false;
     const engine::MemoryReclaimResult reclaim =
-        published->nativeLoop().reclaimMemory(directive);
-    pressurePolicy.reclaimed(directive, reclaim);
+        published->nativeLoop().reclaimMemory(*directive);
+    pressurePolicy.reclaimed(*directive, reclaim);
     governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
     // What transfers held back continues at the next command-free point.

@@ -1497,18 +1497,17 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     throw std::logic_error("memory reclaim requested while a command is in flight");
   if (cache_.pollTransfers())
     signalResourceProgress();
-  if (!directive.reclaim)
-    return {};
 
-  const bool keep = directive.keepServingFootprint;
+  const bool keep = !directive.critical;
   uint64_t released = 0;
   // A reclaim step may free memory that stays in the engine, pages of an
   // extent that stays or buffers that refill the lane's footprint, and a
   // waiting request may fit in it all the same.
   bool reclaimed = false;
-  // Pages whose copies are being written count toward the target.
+  // Pages whose copies are being written count toward the target. A
+  // critical directive has none: it takes everything it may.
   const auto targetUnmet = [&] {
-    return released + cache_.pendingBytes() < directive.targetBytes;
+    return directive.critical || released + cache_.pendingBytes() < directive.targetBytes;
   };
   // Evicted states park their buffers in the model's pool, which a pass
   // returns to the host at once, or uses to refill the buffers it keeps.
@@ -1517,8 +1516,9 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
       released += idle;
   };
   releaseIdle();
-  // Caches the model can rebuild go only toward a byte target: a pass
-  // without one keeps the embedding rows and the vision encoder.
+  // Caches the model can rebuild go only toward a byte target or under
+  // critical pressure: an untargeted pass keeps the embedding rows and the
+  // vision encoder.
   const auto reclaimModelCaches = [&] {
     while (targetUnmet()) {
       const uint64_t cache =
@@ -1529,7 +1529,7 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     }
   };
   reclaimModelCaches();
-  if (directive.evictAllUnpinnedPrefixes) {
+  if (directive.critical) {
     const CacheReclaimResult evicted = cache_.evictAll();
     reclaimed = evicted.madeProgress;
     released += evicted.reclaimedBytes;
@@ -1552,9 +1552,9 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
   reclaimModelCaches();
   if (released || reclaimed)
     signalResourceProgress();
-  if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)
+  if (!directive.critical && !directive.targetBytes)
     return {released, ReclaimOutcome::Untargeted};
-  if (!directive.evictAllUnpinnedPrefixes && !targetUnmet())
+  if (!targetUnmet())
     return {released, ReclaimOutcome::Met};
   return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
                                                : ReclaimOutcome::Exhausted};

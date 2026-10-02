@@ -1927,13 +1927,11 @@ void testPressurePassKeepsCachesWithoutATarget() {
   guardReleases(storage, engine);
   executor.reclaimableIdleStateBytes = 64;
   executor.cacheUnits = {100, 100, 100};
-  static_cast<void>(
-      engine.reclaimMemory({.reclaim = true, .keepServingFootprint = true}));
+  static_cast<void>(engine.reclaimMemory({}));
   require(executor.reclaimedIdleStateBytes == 64 && executor.cacheReclaims == 0 &&
               executor.cacheUnits.size() == 3,
           "a pass without a target took the model's caches");
-  const MemoryReclaimResult targeted = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 150, .keepServingFootprint = true});
+  const MemoryReclaimResult targeted = engine.reclaimMemory({.targetBytes = 150});
   require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
               targeted.releasedBytes >= 200,
           "a targeted pass did not stop taking caches at its target");
@@ -1954,10 +1952,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
   runUntilIdle(engine);
   require(resources.snapshot().stateCache.entries == 1 && executor.cacheUnits.empty(),
           "setup did not cache a state holding rows");
-  const MemoryReclaimResult critical =
-      engine.reclaimMemory({.reclaim = true,
-                            .evictAllUnpinnedPrefixes = true,
-                            .targetBytes = std::numeric_limits<uint64_t>::max()});
+  const MemoryReclaimResult critical = engine.reclaimMemory({.critical = true});
   require(resources.snapshot().stateCache.entries == 0 && executor.cacheUnits.empty() &&
               critical.releasedBytes >= 164,
           "a critical pass left the rows of the state it evicted");
@@ -1980,15 +1975,12 @@ void testPressureReclaimRespectsStateLifetimes() {
 
   // A shrink that nothing is waiting for stops at the resume point. Freeing
   // its cell gains the host a little; the next request pays a full replay.
-  static_cast<void>(engine.reclaimMemory({.reclaim = true,
-                                          .targetBytes = 64,
-                                          .keepResumePoint = true}));
+  static_cast<void>(engine.reclaimMemory({.targetBytes = 64, .keepResumePoint = true}));
   require(resources.snapshot().stateCache.entries == 1,
           "a speculative shrink discarded the only resume point");
 
   executor.reclaimableIdleStateBytes = 128;
-  const MemoryReclaimResult first = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult first = engine.reclaimMemory({.targetBytes = 64});
   require(first.releasedBytes >= 128 && first.outcome == ReclaimOutcome::Met &&
               executor.reclaimedIdleStateBytes == 128,
           "pressure reclaim did not release idle state buffers first");
@@ -1998,11 +1990,9 @@ void testPressureReclaimRespectsStateLifetimes() {
 
   // Drain the extents the test starts with but does not use, then prove cached
   // state is the next lifecycle selected while its parent KV remains usable.
-  require(engine.reclaimMemory({.reclaim = true}).outcome ==
-              ReclaimOutcome::Untargeted,
+  require(engine.reclaimMemory({}).outcome == ReclaimOutcome::Untargeted,
           "a pass without a target reported one");
-  const MemoryReclaimResult state =
-      engine.reclaimMemory({.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult state = engine.reclaimMemory({.targetBytes = 64});
   require(state.releasedBytes >= 64 && state.outcome == ReclaimOutcome::Met,
           "pressure reclaim did not release immutable cached state");
   const auto stateEvicted = resources.snapshot();
@@ -2010,17 +2000,13 @@ void testPressureReclaimRespectsStateLifetimes() {
               stateEvicted.pool.pagesPrefix == 2,
           "cached-state eviction incorrectly removed target KV");
 
-  require(engine.reclaimMemory({.reclaim = true,
-                                .evictAllUnpinnedPrefixes = true,
-                                .targetBytes = std::numeric_limits<uint64_t>::max()})
-                  .outcome == ReclaimOutcome::Exhausted,
+  require(engine.reclaimMemory({.critical = true}).outcome == ReclaimOutcome::Exhausted,
           "evicting everything left something to reclaim");
   const auto critical = resources.snapshot();
   require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
               critical.pool.allocatedBytes == 0,
           "critical pressure left evictable cached state or KV extents");
-  const MemoryReclaimResult empty =
-      engine.reclaimMemory({.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult empty = engine.reclaimMemory({.targetBytes = 64});
   require(!empty.releasedBytes && empty.outcome == ReclaimOutcome::Exhausted,
           "an empty cache did not report reclaim exhausted");
 }
@@ -2044,20 +2030,15 @@ void testWarningReclaimKeepsTheServingFootprint() {
   require(resources.snapshot().pool.allocatedBytes == extentBytes,
           "footprint setup did not keep one allocated extent of cached KV");
 
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true,
-       .targetBytes = std::numeric_limits<uint64_t>::max(),
-       .keepServingFootprint = true}));
+  static_cast<void>(
+      engine.reclaimMemory({.targetBytes = std::numeric_limits<uint64_t>::max()}));
   const auto warning = resources.snapshot();
   require(executor.keptLane && warning.stateCache.entries == 0 &&
               warning.pool.pagesPrefix == 0 &&
               warning.pool.allocatedBytes == extentBytes,
           "warning pressure did not keep only the serving footprint");
 
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true,
-       .evictAllUnpinnedPrefixes = true,
-       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+  static_cast<void>(engine.reclaimMemory({.critical = true}));
   require(!executor.keptLane &&
               resources.snapshot().pool.allocatedBytes == 0,
           "critical pressure kept the serving footprint");
@@ -2085,8 +2066,7 @@ void testWarningReclaimCountsOnlyWhatReachesTheHost() {
           "fixture did not cache a state and an extent of KV beside the runway");
   // The lane's pooled buffers went back to the host earlier.
   executor.laneFootprintBytes = 64;
-  const MemoryReclaimResult result = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
   require(result.releasedBytes == extentBytes && result.outcome == ReclaimOutcome::Met &&
               executor.pooledLaneBytes == 64 &&
               resources.snapshot().stateCache.entries == 0 &&
@@ -2117,8 +2097,7 @@ void testWarningReclaimWakesARefusedStart() {
   require(engine.resourceWaitSnapshot(100).memory == 1 &&
               engine.nextWakeupMilliseconds() == 200.0,
           "the host did not refuse the start");
-  const MemoryReclaimResult result = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
   require(!result.releasedBytes && executor.pooledLaneBytes == 64 &&
               resources.snapshot().stateCache.entries == 0 &&
               engine.nextWakeupMilliseconds() == 0.0,
@@ -2133,7 +2112,8 @@ void testWarningReclaimWakesARefusedStart() {
 // pass reports that transfers hold back the rest of its target, and passes
 // with that rest (MemoryPressurePolicy continues it) take the chain as the
 // copies land, each pass first collecting the copies that landed since the
-// last, each leaf after its child, and stop at the target.
+// last, each leaf after its child, and stop at the target. The first extent
+// the copies empty stays allocated as the runway.
 void testPressureReclaimFollowsTheChain() {
   test::TestKvStorage storage(4, 100, 1);
   KvPool pool(storage, 4);
@@ -2155,27 +2135,29 @@ void testPressureReclaimFollowsTheChain() {
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
-    return engine.reclaimMemory({.reclaim = true, .targetBytes = target});
+    return engine.reclaimMemory({.targetBytes = target});
   };
   // The state's buffers, which the model returns once the cache has written
   // the state, then the chain's leaf, whose parent waits for its copy.
-  MemoryReclaimResult result = reclaim(364);
+  MemoryReclaimResult result = reclaim(264);
   require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
               tier.demotions == 1,
           "the leaf's copy did not hold back the rest of the target");
-  uint64_t target = 364 - result.releasedBytes;
-  for (uint32_t demoted = 2; demoted <= 3; ++demoted) {
-    tier.complete();
-    result = reclaim(target);
-    target -= result.releasedBytes;
-    require(result.releasedBytes == 100 && tier.demotions == demoted &&
-                result.outcome == (demoted < 3 ? ReclaimOutcome::Pending : ReclaimOutcome::Met),
-            "the rest of the target did not take the chain leaf by leaf");
-  }
+  const uint64_t target = 264 - result.releasedBytes;
   tier.complete();
-  result = engine.reclaimMemory({.reclaim = true});
+  result = reclaim(target);
+  require(result.releasedBytes == 0 && result.outcome == ReclaimOutcome::Pending &&
+              tier.demotions == 2,
+          "the first extent the copies emptied did not stay as the runway");
+  tier.complete();
+  result = reclaim(target);
+  require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Met &&
+              tier.demotions == 3,
+          "the rest of the target did not take the chain leaf by leaf");
+  tier.complete();
+  result = engine.reclaimMemory({});
   require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Untargeted &&
-              tier.demotions == 3 && pool.snapshot().pagesAllocated == 1,
+              tier.demotions == 3 && pool.snapshot().pagesAllocated == 2,
           "reclaim went past its target");
 }
 
@@ -4820,10 +4802,11 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
 }
 
 // One reclaim pass releases every empty extent, however many there are,
-// and reports what is left: nothing for a target, no target otherwise.
+// and reports what is left: nothing after a critical pass, no target
+// otherwise. A pass short of critical keeps one extent as the runway.
 void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t extents = 200;
-  for (bool targeted : {true, false}) {
+  for (bool critical : {true, false}) {
     test::TestKvStorage storage(4 * extents, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool);
@@ -4835,17 +4818,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
     Events events;
     engine::Engine engine({}, cache, executor, events);
     guardReleases(storage, engine);
-    MemoryReclaimDirective directive{.reclaim = true};
-    if (targeted) {
-      directive.evictAllUnpinnedPrefixes = true;
-      directive.targetBytes = std::numeric_limits<uint64_t>::max();
-    }
-    const MemoryReclaimResult result = engine.reclaimMemory(directive);
-    require(result.outcome == (targeted ? ReclaimOutcome::Exhausted
+    const MemoryReclaimResult result = engine.reclaimMemory({.critical = critical});
+    const uint32_t kept = critical ? 0 : 1;
+    require(result.outcome == (critical ? ReclaimOutcome::Exhausted
                                         : ReclaimOutcome::Untargeted) &&
-                result.releasedBytes == uint64_t{extents} * 4 * 4096 &&
-                pool.snapshot().pagesAllocated == 0 &&
-                pool.snapshot().reclaimableBytes == 0,
+                result.releasedBytes == uint64_t{extents - kept} * 4 * 4096 &&
+                pool.snapshot().pagesAllocated == kept * 4 &&
+                pool.snapshot().reclaimableBytes == kept * 4 * 4096,
             "a pass did not release every empty extent or report what was left");
   }
 }
@@ -4874,8 +4853,7 @@ void testReclaimRefusesACommandInFlight() {
               pool.snapshot().reclaimableBytes == 4 * 4096,
           "the prefill did not stay in flight beside an empty extent");
 
-  const MemoryReclaimDirective directive{.reclaim = true,
-                                         .evictAllUnpinnedPrefixes = true};
+  const MemoryReclaimDirective directive{.critical = true};
   bool refused = false;
   try {
     static_cast<void>(engine.reclaimMemory(directive));
@@ -5164,8 +5142,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
   static_cast<void>(engine.tick(104));
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true, .evictAllUnpinnedPrefixes = true}));
+  static_cast<void>(engine.reclaimMemory({.critical = true}));
   require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesAllocated == 0 &&
               engine.snapshot().resourceResumptions == 0,
           "fixture did not release the failed resumption's memory");
@@ -8677,10 +8654,8 @@ void testWarningShrinkKeepsTheFinishedPoint() {
               resources.snapshot().stateCache.inUse == 1,
           "the fixture did not cache three replay points, one in use");
 
-  static_cast<void>(engine.reclaimMemory({.reclaim = true,
-                                          .targetBytes = std::numeric_limits<uint64_t>::max(),
-                                          .keepResumePoint = true,
-                                          .keepServingFootprint = true}));
+  static_cast<void>(engine.reclaimMemory(
+      {.targetBytes = std::numeric_limits<uint64_t>::max(), .keepResumePoint = true}));
   const auto cachedTokens = [&](uint32_t token) {
     std::vector<uint32_t> next(65, token);
     next.resize(80, 9);

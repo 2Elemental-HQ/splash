@@ -245,15 +245,14 @@ void testHostRefusalStartsReclaim() {
           "a request beyond the host headroom was admitted");
   const MemoryGovernorSnapshot refused = governor.snapshot();
   MemoryPressurePolicy policy;
-  const MemoryReclaimDirective directive = policy.update(refused, 0.0, true);
+  const std::optional<MemoryReclaimDirective> directive = policy.update(refused, 0.0, true);
   require(refused.pressure == MemoryPressure::Warning &&
-              !refused.hostGrowthAllowed && directive.reclaim &&
-              !directive.evictAllUnpinnedPrefixes &&
-              !directive.keepResumePoint && directive.keepServingFootprint &&
-              directive.targetBytes == kGiB - 200 * kMiB,
+              !refused.hostGrowthAllowed && directive && !directive->critical &&
+              !directive->keepResumePoint &&
+              directive->targetBytes == kGiB - 200 * kMiB,
           "a request-sized host refusal did not start the paced reclaim");
   // The reclaim reaches the recovery margin, and the request fits.
-  *available += directive.targetBytes;
+  *available += directive->targetBytes;
   require(governor.tryReserve(stateCell).has_value() &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "the waiting request did not fit after the reclaim");
@@ -293,7 +292,7 @@ void testPolicyContinuesHeldBackTarget() {
                                   .hostMeasurementValid = true,
                                   .hostHeadroomBytes = kHostRecoveryMarginBytes - 300};
   const auto pass = [&](double now, MemoryReclaimResult result) {
-    const MemoryReclaimDirective directive = policy.update(pressure, now, true);
+    const MemoryReclaimDirective directive = policy.update(pressure, now, true).value();
     policy.reclaimed(directive, result);
     return directive.targetBytes;
   };
@@ -307,7 +306,7 @@ void testPolicyContinuesHeldBackTarget() {
   require(pass(2000.0, none) == 100 && pass(2100.0, none) == 0,
           "a measurement did not replace the held-back target");
   pressure.pressure = MemoryPressure::Critical;
-  require(!policy.update(pressure, 2150.0, true).keepServingFootprint,
+  require(policy.update(pressure, 2150.0, true).value().critical,
           "critical pressure kept the serving footprint");
   static_cast<void>(pass(2200.0, {0, ReclaimOutcome::Pending}));
   pressure.pressure = MemoryPressure::Warning;

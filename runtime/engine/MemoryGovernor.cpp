@@ -322,21 +322,17 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
   reservedBytes_ -= bytes;
 }
 
-MemoryReclaimDirective MemoryPressurePolicy::update(
+std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
     bool requestWaiting) noexcept {
   if (snapshot.pressure == MemoryPressure::Normal) {
     nextReclaimMilliseconds_ = 0.0;
-    return {};
+    return std::nullopt;
   }
-  if (snapshot.pressure == MemoryPressure::Critical) {
-    return {.reclaim = true,
-            .evictAllUnpinnedPrefixes = true,
-            .targetBytes = std::numeric_limits<uint64_t>::max()};
-  }
+  if (snapshot.pressure == MemoryPressure::Critical)
+    return MemoryReclaimDirective{.critical = true};
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return continued_.value_or(MemoryReclaimDirective{
-        .reclaim = true, .keepServingFootprint = true});
+    return continued_.value_or(MemoryReclaimDirective{});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
@@ -346,7 +342,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // cache must be discarded. Empty extents can still be returned.
   if (!snapshot.hostMeasurementValid &&
       snapshot.systemPressure == MemoryPressure::Normal)
-    return {.reclaim = true, .keepServingFootprint = true};
+    return MemoryReclaimDirective{};
 
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
@@ -354,17 +350,16 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return {.reclaim = true,
-          .targetBytes = std::min(desired, kHostWarningMarginBytes),
-          .keepResumePoint = !requestWaiting,
-          .keepServingFootprint = true};
+  return MemoryReclaimDirective{
+      .targetBytes = std::min(desired, kHostWarningMarginBytes),
+      .keepResumePoint = !requestWaiting};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
                                      const MemoryReclaimResult &result) noexcept {
   continued_.reset();
   // Every critical pass evicts everything again by itself.
-  if (result.outcome != ReclaimOutcome::Pending || directive.evictAllUnpinnedPrefixes)
+  if (result.outcome != ReclaimOutcome::Pending || directive.critical)
     return;
   continued_ = directive;
   continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
