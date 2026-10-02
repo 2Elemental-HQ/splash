@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import BinaryIO, Callable, Protocol, Sequence, TypeAlias
 
 if __package__:
@@ -114,29 +114,12 @@ class StatusUnanswered(TimeoutError):
     """The native loop accepted a status request but did not answer it in time."""
 
 
-@dataclass(slots=True, frozen=True)
-class Deadline:
-    absolute_unix_micros: int
-    remaining_micros: int
-
-    @classmethod
-    def after(
-        cls,
-        seconds: float,
-        *,
-        wall_time_ns: Callable[[], int] = time.time_ns,
-    ) -> Deadline:
-        if seconds <= 0:
-            raise ValueError("deadline duration must be positive")
-        duration_micros = max(1, int(seconds * 1_000_000))
-        return cls(wall_time_ns() // 1000 + duration_micros, duration_micros)
-
-
 MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], bytes]
 EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
 
 _READ_CHUNK_BYTES = 64 * 1024
+_MAX_U64 = (1 << 64) - 1
 
 
 def _remaining(deadline: float) -> float:
@@ -146,29 +129,37 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
+def _wire_deadline(remaining: float) -> tuple[int, int]:
+    """(absolute unix µs, remaining µs) for a deadline `remaining` seconds
+    away; an infinite one saturates at the wire's u64 maximum."""
+    wall = time.time_ns() // 1000
+    limit = _MAX_U64 - wall
+    micros = (
+        limit if remaining >= limit / 1_000_000 else max(1, int(remaining * 1_000_000))
+    )
+    return wall + micros, micros
+
+
 @dataclass(slots=True, frozen=True)
 class GenerationRequest:
-    prompt_tokens: tuple[int, ...]
-    logical_max_output_tokens: int
-    deadline: Deadline
-    priority: wire.RequestPriority = wire.RequestPriority.NORMAL
-    sampling: wire.SamplingParameters = field(default_factory=wire.SamplingParameters)
-    seed: int = 0
-    constraint: wire.ConstraintMode = wire.ConstraintMode.NONE
-    mask_provider: MaskProvider | None = None
-    # Image spans in prompt order with their concatenated resized pixels.
-    image_spans: tuple[wire.ImageSpan, ...] = ()
-    image_pixels: bytes = b""
-    # Keeps the frontend's byte reservation alive across cancellation and CPU
-    # mask work. It is ownership only and is never serialized to the engine.
-    image_owner: object | None = None
-    return_progress: bool = False
-    # Option token ids for score-only requests; empty means generation.
-    score_tokens: tuple[int, ...] = ()
-    # Trailing prompt tokens of the chat template's generation prompt; zero
-    # when unknown.
-    generation_prompt_tokens: int = 0
-    flags: wire.RequestFlag = wire.RequestFlag(0)
+    """One native request: its wire frame, without the request id and the
+    deadline stamp MultiplexedRuntime.submit fills in, plus what stays in
+    Python."""
+
+    # request_id and both deadline fields are 0.
+    frame: wire.RequestFrame
+    # time.monotonic() deadline; math.inf for none.
+    deadline: float
+    mask_provider: MaskProvider | None
+    # Keeps the frontend's per-request image charge until the call ends;
+    # never serialized.
+    image_owner: object | None
+
+    def __post_init__(self):
+        if (self.frame.constraint is wire.ConstraintMode.TOKEN_MASK) != (
+            self.mask_provider is not None
+        ):
+            raise ValueError("a token-mask request needs exactly one mask provider")
 
 
 class RuntimeCall:
@@ -186,7 +177,15 @@ class RuntimeCall:
         self._client = client
         self.request_id = request_id
         self.generation = generation
-        self.request = request
+        # The counts native events are checked against, not the request:
+        # its pixels must not outlive the written frame.
+        frame = request.frame
+        self._prompt_tokens = len(frame.prompt_tokens)
+        self._logical_max = frame.logical_max_output_tokens
+        self._score_tokens = len(frame.score_tokens)
+        self._return_progress = frame.return_progress
+        self.mask_provider = request.mask_provider
+        self.image_owner = request.image_owner
         self._on_event = on_event
         self._on_complete = on_complete
         self._event = threading.Event()
@@ -264,14 +263,14 @@ class RuntimeCall:
 
     def _record_progress(self, event: wire.PromptProgressEvent) -> str | None:
         with self._lock:
-            if not self.request.return_progress:
+            if not self._return_progress:
                 return "unsolicited prompt progress"
             if self._event.is_set() or self._start is None or self._next_token_offset:
                 return "prompt progress outside prefill"
             if (
                 not self._start.matched_prompt_tokens
                 <= event.processed_tokens
-                <= len(self.request.prompt_tokens)
+                <= self._prompt_tokens
             ):
                 return "prompt progress is outside the request's token range"
             if self._progress is not None and (
@@ -300,10 +299,10 @@ class RuntimeCall:
                     f"expected {self._next_token_offset}"
                 )
             next_offset = self._next_token_offset + len(event.tokens)
-            if next_offset > self.request.logical_max_output_tokens:
+            if next_offset > self._logical_max:
                 return (
                     f"TokensEvent stream length {next_offset} exceeds logical "
-                    f"maximum {self.request.logical_max_output_tokens}"
+                    f"maximum {self._logical_max}"
                 )
             self._next_token_offset = next_offset
         self._emit(event)
@@ -316,8 +315,8 @@ class RuntimeCall:
 
     def _check_done(self, done: wire.DoneEvent) -> wire.DoneEvent:
         with self._lock:
-            prompt_tokens = len(self.request.prompt_tokens)
-            logical_max = self.request.logical_max_output_tokens
+            prompt_tokens = self._prompt_tokens
+            logical_max = self._logical_max
             completion_tokens = self._next_token_offset
             if done.prompt_tokens != prompt_tokens:
                 raise ProtocolFatal(
@@ -348,7 +347,7 @@ class RuntimeCall:
                     f"length-finished DoneEvent has {completion_tokens} tokens; "
                     f"expected logical maximum {logical_max}"
                 )
-            expected_scores = len(self.request.score_tokens)
+            expected_scores = self._score_tokens
             if expected_scores:
                 if done.decode_micros:
                     raise ProtocolFatal(
@@ -556,14 +555,7 @@ class MultiplexedRuntime:
     ) -> RuntimeCall:
         """Admit and immediately write one request without client scheduling."""
 
-        deadline = (
-            time.monotonic()
-            + min(
-                request.deadline.remaining_micros,
-                request.deadline.absolute_unix_micros - time.time_ns() // 1000,
-            )
-            / 1_000_000
-        )
+        deadline = request.deadline
         request_id = next(self._request_ids)
         if not self._admission_slots.acquire(blocking=False):
             raise PendingLimitExceeded(
@@ -573,29 +565,20 @@ class MultiplexedRuntime:
         call: RuntimeCall | None = None
         try:
             # Admission must precede serialization, which copies image payloads.
-            _remaining(deadline)
-            protocol_request = wire.RequestFrame(
+            absolute, remaining = _wire_deadline(_remaining(deadline))
+            frame = replace(
+                request.frame,
                 request_id=request_id,
-                priority=request.priority,
-                absolute_deadline_unix_micros=request.deadline.absolute_unix_micros,
-                remaining_deadline_micros=request.deadline.remaining_micros,
-                logical_max_output_tokens=request.logical_max_output_tokens,
-                prompt_tokens=request.prompt_tokens,
-                sampling=request.sampling,
-                seed=request.seed,
-                constraint=request.constraint,
-                image_spans=request.image_spans,
-                image_pixels=request.image_pixels,
-                return_progress=request.return_progress,
-                score_tokens=request.score_tokens,
-                generation_prompt_tokens=request.generation_prompt_tokens,
-                flags=request.flags,
+                absolute_deadline_unix_micros=absolute,
+                remaining_deadline_micros=remaining,
             )
             try:
-                encoded = wire.serialize_message(protocol_request)
+                encoded = wire.serialize_message(frame)
             except wire.ProtocolError as error:
                 raise self._request_protocol_error(request_id, error.issue) from error
-            generation = self._ensure_process(timeout=_remaining(deadline))
+            generation = self._ensure_process(
+                timeout=min(_remaining(deadline), threading.TIMEOUT_MAX)
+            )
             _remaining(deadline)
             with self._state_lock:
                 self._require_generation_ready_locked(generation)
@@ -1163,6 +1146,10 @@ class MultiplexedRuntime:
             return
         if isinstance(message, wire.MaskRequestEvent):
             call = self._require_call(generation, message.request_id)
+            if call.mask_provider is None:
+                raise ProtocolFatal(
+                    "native requested a token mask for an unconstrained request"
+                )
             self._submit_mask(call, message)
             return
         if isinstance(message, wire.DoneEvent):
@@ -1220,15 +1207,7 @@ class MultiplexedRuntime:
     def _submit_mask(self, call: RuntimeCall, event: wire.MaskRequestEvent) -> None:
         if call.cancel_requested or call.done:
             return
-        provider = call.request.mask_provider
-        if provider is None:
-            self._mask_failed(
-                call,
-                MaskComputationFailed(
-                    f"request {call.request_id} has no token-mask provider"
-                ),
-            )
-            return
+        provider = call.mask_provider
         if not self._mask_slots.acquire(blocking=False):
             self._mask_failed(
                 call, MaskComputationFailed("token-mask queue is full", retryable=True)

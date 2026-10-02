@@ -106,7 +106,7 @@ class PdfProtocolTests(unittest.TestCase):
                         status, _, payload = harness.request("POST", path, body)
                         self.assertEqual(status, 200, payload)
                         self.assertEqual(len(runtime.requests), 1)
-                        self.assertEqual(len(runtime.requests[0].image_spans), 2)
+                        self.assertEqual(len(runtime.requests[0].frame.image_spans), 2)
                         if stream:
                             self.assertIn(b"data:", payload)
                         else:
@@ -145,7 +145,7 @@ class PdfProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, payload)
-        self.assertEqual([len(r.image_spans) for r in runtime.requests], [2, 2])
+        self.assertEqual([len(r.frame.image_spans) for r in runtime.requests], [2, 2])
 
     def test_unsupported_file_rejected_before_stream_or_runtime(self):
         runtime = FakeRuntime()

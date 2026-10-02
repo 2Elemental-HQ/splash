@@ -455,7 +455,7 @@ class FakeRuntime:
         done = native_wire.DoneEvent(
             call.request_id,
             reason,
-            len(request.prompt_tokens),
+            len(request.frame.prompt_tokens),
             completion,
             1_000,
             2_000,
@@ -1269,7 +1269,7 @@ class ServerTest(unittest.TestCase):
             {"status": "hit", "matched_tokens": 1, "lane": 0},
         )
         self.assertNotIn("queue_ms", response["metrics"])
-        self.assertEqual(runtime.requests[0].seed, 7)
+        self.assertEqual(runtime.requests[0].frame.seed, 7)
 
     class CharTokenizer(FakeTokenizer):
         """One token per character, so single-letter answer slots are exact."""
@@ -1349,7 +1349,7 @@ class ServerTest(unittest.TestCase):
             },
         )
 
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         # The rendered prompt plus one slot token is exactly the boundary the
         # engine scores; verify it against the tokenizer, not the response.
         prompt_text = harness.tokenizer.decode(request.prompt_tokens)
@@ -1777,7 +1777,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
         )
         self.assertEqual(status, 200)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         # 64x64 upscales to the 256x256 minimum: a 16x16 patch grid, 64 tokens.
         self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
         (span,) = request.image_spans
@@ -1802,7 +1802,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
         )
         self.assertEqual(harness.app.images.stats()["entries"], 1)
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
+        self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
 
     def test_image_positions_ignore_quoted_vision_tokens(self):
         from tokenizers import pre_tokenizers
@@ -2280,7 +2280,7 @@ class ServerTest(unittest.TestCase):
             [part["type"] for part in rendered[0]["content"]],
             ["text", "image_url", "text"],
         )
-        self.assertEqual(len(runtime.requests[0].image_spans), 1)
+        self.assertEqual(len(runtime.requests[0].frame.image_spans), 1)
 
         status, _, _ = harness.request(
             "POST",
@@ -2299,9 +2299,9 @@ class ServerTest(unittest.TestCase):
             ),
         )
         self.assertEqual(status, 200)
-        self.assertEqual(len(runtime.requests[1].image_spans), 1)
+        self.assertEqual(len(runtime.requests[1].frame.image_spans), 1)
         self.assertEqual(
-            runtime.requests[1].image_spans, runtime.requests[0].image_spans
+            runtime.requests[1].frame.image_spans, runtime.requests[0].frame.image_spans
         )
 
     def test_tool_results_carry_images_like_user_content(self):
@@ -2357,7 +2357,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
         )
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
         (span,) = request.image_spans
         self.assertEqual((span.offset, span.tokens), (1, 64))
@@ -2395,7 +2395,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
         )
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
+        self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
 
         # Responses tool outputs use the same image pixels and span geometry,
         # including when the tool result is replayed from stored history.
@@ -2438,8 +2438,12 @@ class ServerTest(unittest.TestCase):
                 [part["type"] for part in rendered[-1]["content"]],
                 ["text", "image_url"],
             )
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
-            self.assertEqual(runtime.requests[-1].image_pixels, request.image_pixels)
+            self.assertEqual(
+                runtime.requests[-1].frame.image_spans, request.image_spans
+            )
+            self.assertEqual(
+                runtime.requests[-1].frame.image_pixels, request.image_pixels
+            )
             status, _, payload = harness.request(
                 "POST",
                 "/v1/responses",
@@ -2448,7 +2452,9 @@ class ServerTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(status, 200, payload)
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
+            self.assertEqual(
+                runtime.requests[-1].frame.image_spans, request.image_spans
+            )
 
     def test_responses_tool_images_reject_invalid_content_before_inference(self):
         runtime = FakeRuntime()
@@ -6374,7 +6380,7 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(**fields, **neutral)
                 )
                 self.assertEqual(status, 200, payload)
-                sampling = runtime.requests[0].sampling
+                sampling = runtime.requests[0].frame.sampling
                 for name, value in fields.items():
                     self.assertEqual(getattr(sampling, name), value)
         # A nonzero temperature below 0.01 samples at 0.01; zero stays
@@ -6393,7 +6399,9 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(temperature=temperature)
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[0].sampling.temperature, sampled)
+                self.assertEqual(
+                    runtime.requests[0].frame.sampling.temperature, sampled
+                )
         refused = (
             ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
             ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
@@ -6456,7 +6464,7 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(top_k=top_k)
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[0].sampling.top_k, sent)
+                self.assertEqual(runtime.requests[0].frame.sampling.top_k, sent)
         for top_k in (-2, 2.5, True, "20"):
             with self.subTest(top_k=top_k):
                 runtime.requests.clear()
@@ -6484,7 +6492,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(
-            runtime.requests[0].sampling,
+            runtime.requests[0].frame.sampling,
             native_wire.SamplingParameters(
                 temperature=1.0,
                 top_p=0.95,
@@ -6511,7 +6519,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/responses", self.responses_body(store=False, **fields)
         )
         self.assertEqual(status, 200, payload)
-        sampling = runtime.requests[0].sampling
+        sampling = runtime.requests[0].frame.sampling
         for name, value in fields.items():
             self.assertEqual(getattr(sampling, name), value)
         status, _, payload = harness.request(
@@ -6647,7 +6655,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(len(runtime.requests), 1)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(
             len(request.prompt_tokens) + request.logical_max_output_tokens, 10
         )
@@ -6695,8 +6703,10 @@ class ServerTest(unittest.TestCase):
             with self.subTest(path=path):
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 8)
-                self.assertEqual(runtime.requests[-1].prompt_tokens, (101, 102))
+                self.assertEqual(
+                    runtime.requests[-1].frame.logical_max_output_tokens, 8
+                )
+                self.assertEqual(runtime.requests[-1].frame.prompt_tokens, (101, 102))
 
         # The window, not a server default, bounds a request that names no
         # limit; one that names a limit inside the window gets it as is.
@@ -6710,7 +6720,7 @@ class ServerTest(unittest.TestCase):
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 200, payload)
                 self.assertEqual(
-                    runtime.requests[-1].logical_max_output_tokens, expected
+                    runtime.requests[-1].frame.logical_max_output_tokens, expected
                 )
 
         harness.app.max_context = 100000
@@ -7803,8 +7813,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(
             (
-                runtime.requests[0].logical_max_output_tokens,
-                runtime.requests[0].seed,
+                runtime.requests[0].frame.logical_max_output_tokens,
+                runtime.requests[0].frame.seed,
             ),
             (8, 7),
         )

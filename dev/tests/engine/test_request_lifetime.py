@@ -172,6 +172,34 @@ class RequestLifetimeTests(unittest.TestCase):
                 self.assert_released(cache, owner)
                 self.assertFalse(backend.active)
 
+    def test_pixel_bytes_are_released_once_the_request_frame_is_written(self):
+        backend, process = self.backend()
+        job, cache, owner = self.job()
+        span = wire.ImageSpan(1, 256, 32, 32, 1, 2)
+        pixels = bytes(span.pixel_bytes)
+        job.prompt_tokens = [101] * 258
+        job.image_spans = (span,)
+        job.image_pixels = pixels
+        self.assertTrue(backend.submit(job))
+        process.stdin.wait_for(wire.RequestFrame)
+
+        self.assertEqual(job.image_pixels, b"")
+        holders = (
+            engine_runtime.RuntimeCall,
+            engine_runtime.GenerationRequest,
+            wire.RequestFrame,
+        )
+        self.assertFalse(
+            [held for held in gc.get_referrers(pixels) if isinstance(held, holders)]
+        )
+        # The charge for the images is a separate lease, held until the end.
+        self.assertGreater(cache.stats()["request_bytes"], 0)
+        call = backend.active[job.request_id].call
+        send_success(process, call, tokens=(4,))
+        self.assertEqual(self.terminal(job)[0], "done")
+        del call, job
+        self.assert_released(cache, owner)
+
     def test_mask_worker_keeps_image_lease_until_it_exits(self):
         backend, process = self.backend()
         entered = threading.Event()

@@ -1391,8 +1391,8 @@ class InstalledCodexTests(unittest.TestCase):
             # context its prompt leaves.
             for request in runtime.requests:
                 self.assertEqual(
-                    request.logical_max_output_tokens,
-                    131072 - len(request.prompt_tokens),
+                    request.frame.logical_max_output_tokens,
+                    131072 - len(request.frame.prompt_tokens),
                 )
             rows = [
                 json.loads(line) for line in stdout.splitlines() if line.startswith("{")

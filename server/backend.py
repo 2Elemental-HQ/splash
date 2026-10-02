@@ -47,9 +47,6 @@ REQUEST_PRIORITIES = {"foreground": 0, "normal": 1, "background": 2}
 REQUEST_PRIORITY_NAMES = {value: name for name, value in REQUEST_PRIORITIES.items()}
 
 
-MAX_PROTOCOL_U64 = (1 << 64) - 1
-
-
 def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -440,23 +437,6 @@ class NativeBackend:
         return snapshot
 
     @staticmethod
-    def _deadline(job):
-        remaining_request_time(job.deadline)
-        # Uncapped, unlike a wait's timeout: a request without a deadline
-        # gets the wire's maximum.
-        remaining = job.deadline - time.monotonic()
-        wall_micros = time.time_ns() // 1000
-        maximum_remaining = MAX_PROTOCOL_U64 - wall_micros
-        if remaining >= maximum_remaining / 1_000_000:
-            remaining_micros = maximum_remaining
-        else:
-            remaining_micros = max(1, int(remaining * 1_000_000))
-        return engine_runtime.Deadline(
-            wall_micros + remaining_micros,
-            remaining_micros,
-        )
-
-    @staticmethod
     def _mask_provider(job):
         if job.constraint is None:
             return None
@@ -471,28 +451,30 @@ class NativeBackend:
         return provide
 
     def _generation_request(self, job):
-        priority = wire.RequestPriority(job.priority)
         constraint = (
             wire.ConstraintMode.TOKEN_MASK
             if job.constraint is not None
             else wire.ConstraintMode.NONE
         )
-        return engine_runtime.GenerationRequest(
-            prompt_tokens=tuple(job.prompt_tokens),
+        frame = wire.RequestFrame(
+            request_id=0,
+            priority=wire.RequestPriority(job.priority),
+            absolute_deadline_unix_micros=0,
+            remaining_deadline_micros=0,
             logical_max_output_tokens=job.max_new_tokens,
-            deadline=self._deadline(job),
-            priority=priority,
+            prompt_tokens=tuple(job.prompt_tokens),
             sampling=job.sampling,
             seed=job.seed,
             constraint=constraint,
-            mask_provider=self._mask_provider(job),
             image_spans=job.image_spans,
             image_pixels=job.image_pixels,
-            image_owner=job.image_owner,
             return_progress=job.return_progress,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+        )
+        return engine_runtime.GenerationRequest(
+            frame, job.deadline, self._mask_provider(job), job.image_owner
         )
 
     def submit(self, job):
@@ -512,12 +494,10 @@ class NativeBackend:
             self.tokenizer, emit, job.stop_sequences, stop_matched
         )
         state = _JobState(job, streamer)
-        try:
-            request = self._generation_request(job)
-        except APIError as error:
-            state.detach()
-            job.events.put(("error", self._api_error(error)))
-            return True
+        request = self._generation_request(job)
+        # The engine copies the pixels at admission; only the frame written
+        # below needs them, and the job lives until the response ends.
+        job.image_pixels = b""
 
         def on_event(call, event):
             with self.lock:
@@ -580,10 +560,6 @@ class NativeBackend:
                     # recovery grace promptly.
                     if job.cancelled.wait(NATIVE_RECOVERY_GRACE_SECONDS):
                         raise
-                    # Refresh the relative deadline for the replacement
-                    # generation while preserving the original absolute job
-                    # deadline.
-                    request = self._generation_request(job)
             with self.lock:
                 if not state.detached:
                     state.call = call

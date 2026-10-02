@@ -588,7 +588,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.assertGreater(len(json.dumps(body)), 16 * 1024**2)
         status, _, payload = harness.request("POST", "/v1/chat/completions", body)
         self.assertEqual(status, 200, payload)
-        request = harness.backend.runtime.requests[-1]
+        request = harness.backend.runtime.requests[-1].frame
         self.assertEqual(len(request.image_spans), 5)
         self.wait_bytes(harness, 0)
 

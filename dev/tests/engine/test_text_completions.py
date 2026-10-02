@@ -94,7 +94,7 @@ class TextCompletionTests(unittest.TestCase):
         self.assertIn("timings", response)
         self.assertEqual(harness.tokenizer.templates, [])
         self.assertEqual(harness.tokenizer.encodings, [("once upon a time", True)])
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(request.prompt_tokens, (9, 14, 15, 16, 17))
         self.assertEqual(request.generation_prompt_tokens, 0)
         self.assertEqual(request.logical_max_output_tokens, 8)
@@ -105,7 +105,7 @@ class TextCompletionTests(unittest.TestCase):
         status, response = self.complete(harness, prompt=[3, 1, 27])
         self.assertEqual(status, 200, response)
         self.assertEqual(response["choices"][0]["text"], "plain answer\n")
-        self.assertEqual(runtime.requests[0].prompt_tokens, (3, 1, 27))
+        self.assertEqual(runtime.requests[0].frame.prompt_tokens, (3, 1, 27))
         self.assertEqual(harness.tokenizer.encodings, [])
         for prompt in ([28], [-1], [3, 2**32]):
             with self.subTest(prompt=prompt):
@@ -222,7 +222,7 @@ class TextCompletionTests(unittest.TestCase):
         harness.tokenizer.bos = 9
         status, response = self.complete(harness, prompt="")
         self.assertEqual(status, 200, response)
-        self.assertEqual(runtime.requests[0].prompt_tokens, (9,))
+        self.assertEqual(runtime.requests[0].frame.prompt_tokens, (9,))
 
     def test_default_values_of_unsupported_fields_are_accepted(self):
         harness, runtime = self.harness()
@@ -245,11 +245,11 @@ class TextCompletionTests(unittest.TestCase):
         for fields in ({}, {"max_tokens": None}):
             status, response = self.complete(harness, **fields)
             self.assertEqual(status, 200, response)
-            self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 16)
+            self.assertEqual(runtime.requests[-1].frame.logical_max_output_tokens, 16)
         harness, runtime = self.harness(max_context=16)
         status, response = self.complete(harness)
         self.assertEqual(status, 200, response)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(
             request.logical_max_output_tokens, 16 - len(request.prompt_tokens)
         )
@@ -269,7 +269,7 @@ class TextCompletionTests(unittest.TestCase):
             priority="foreground",
         )
         self.assertEqual(status, 200, response)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(
             request.sampling,
             wire.SamplingParameters(0.7, 0.5, 5, 1.5, -0.5, 1.1, 0.25),

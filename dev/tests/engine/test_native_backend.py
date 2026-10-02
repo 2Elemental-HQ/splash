@@ -241,13 +241,14 @@ class NativeBackendContractTests(unittest.TestCase):
 
         self.assertTrue(transport.submit(job))
         request = runtime.calls[0].request
-        self.assertEqual(request.prompt_tokens, (11, 12, 13, 14))
-        self.assertEqual(request.logical_max_output_tokens, 37)
-        self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
-        self.assertEqual(request.sampling, job.sampling)
-        self.assertEqual(request.seed, 0x123456789ABCDEF0)
-        self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
-        self.assertGreater(request.deadline.remaining_micros, 0)
+        frame = request.frame
+        self.assertEqual(frame.prompt_tokens, (11, 12, 13, 14))
+        self.assertEqual(frame.logical_max_output_tokens, 37)
+        self.assertEqual(frame.priority, wire.RequestPriority.FOREGROUND)
+        self.assertEqual(frame.sampling, job.sampling)
+        self.assertEqual(frame.seed, 0x123456789ABCDEF0)
+        self.assertEqual(frame.constraint, wire.ConstraintMode.TOKEN_MASK)
+        self.assertEqual(request.deadline, job.deadline)
 
         event = wire.MaskRequestEvent(runtime.calls[0].request_id, 91, 2, (5, 6))
         self.assertEqual(
@@ -293,15 +294,15 @@ class NativeBackendContractTests(unittest.TestCase):
         )
 
         self.assertTrue(transport.submit(job))
-        request = runtime.calls[0].request
-        self.assertEqual(request.prompt_tokens, (31, 32, 33))
-        self.assertEqual(request.logical_max_output_tokens, 19)
-        self.assertEqual(request.priority, wire.RequestPriority.BACKGROUND)
+        frame = runtime.calls[0].request.frame
+        self.assertEqual(frame.prompt_tokens, (31, 32, 33))
+        self.assertEqual(frame.logical_max_output_tokens, 19)
+        self.assertEqual(frame.priority, wire.RequestPriority.BACKGROUND)
         self.assertEqual(
-            request.sampling,
+            frame.sampling,
             wire.SamplingParameters(0.7, 0.8, 13, 1.5, 0.5, 1.05),
         )
-        self.assertEqual(request.seed, 99)
+        self.assertEqual(frame.seed, 99)
 
     def test_adapter_through_real_runtime_serializes_request_frame(self):
         factory = FakeFactory()
@@ -366,9 +367,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
         self.assertTrue(transport.submit(job))
         frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
-        self.assertEqual(
-            frame.absolute_deadline_unix_micros, backend_api.MAX_PROTOCOL_U64
-        )
+        self.assertEqual(frame.absolute_deadline_unix_micros, runtime._MAX_U64)
 
     def test_score_job_maps_to_score_only_request_and_returns_logits(self):
         factory = FakeFactory()
