@@ -77,8 +77,11 @@ def current_build_id():
     return identity
 
 
-def validate_server_configuration(initial, model, expected_model, context, identity):
-    if model != expected_model or initial["maximum_context_tokens"] != context:
+def validate_server_configuration(initial, model, context, identity):
+    if (
+        initial["instance"]["model"] != model
+        or initial["maximum_context_tokens"] != context
+    ):
         raise AgentFailure(
             "running server model/context differs from the test configuration"
         )
@@ -1122,12 +1125,13 @@ def main(argv=None):
                     )
                 time.sleep(0.5)
         initial = idle_status()
+        # Clients get the first entry, the name responses report, as with
+        # splash <client>; /status names the loaded model.
         served = launcher._request_json("/v1/models")["data"][0]
         model = served["id"]
         context = initial["maximum_context_tokens"]
         validate_server_configuration(
             initial,
-            model,
             args.model,
             launcher._parse_max_context(args.max_context),
             identity,

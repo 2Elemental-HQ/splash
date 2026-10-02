@@ -160,14 +160,15 @@ class AgentRunnerTests(unittest.TestCase):
     def test_server_configuration_rejects_wrong_model_context_or_build(self):
         identity = "src-" + "a" * 64
         context = 102400
-        initial = {
-            "maximum_context_tokens": context,
-            "identity": {"cache": {"build_id": identity}},
-        }
         for selected in MODEL_IDS:
             with self.subTest(model=selected):
+                initial = {
+                    "instance": {"model": selected},
+                    "maximum_context_tokens": context,
+                    "identity": {"cache": {"build_id": identity}},
+                }
                 agent.validate_server_configuration(
-                    initial, selected, selected, context, identity
+                    initial, selected, context, identity
                 )
                 other = next(value for value in MODEL_IDS if value != selected)
                 for model, expected_context, expected_identity in (
@@ -177,16 +178,14 @@ class AgentRunnerTests(unittest.TestCase):
                 ):
                     with self.assertRaises(agent.AgentFailure):
                         agent.validate_server_configuration(
-                            initial,
-                            model,
-                            selected,
-                            expected_context,
-                            expected_identity,
+                            initial, model, expected_context, expected_identity
                         )
                 with self.assertRaisesRegex(agent.AgentFailure, "native build"):
                     agent.validate_server_configuration(
-                        {"maximum_context_tokens": context},
-                        selected,
+                        {
+                            "instance": {"model": selected},
+                            "maximum_context_tokens": context,
+                        },
                         selected,
                         context,
                         identity,
@@ -219,9 +218,13 @@ class AgentRunnerTests(unittest.TestCase):
         model = "incoai/Qwen3.8-27B-Splash"
         identity = "src-" + "a" * 64
         initial = {
+            "instance": {"model": model},
             "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
             "identity": {"cache": {"build_id": "src-" + "b" * 64}},
         }
+        # An announced alias leads /v1/models while the loaded model matches,
+        # so only the build is rejected.
+        served = {"data": [{"id": "local"}, {"id": model}]}
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch.object(
@@ -236,7 +239,7 @@ class AgentRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     agent.launcher,
                     "_request_json",
-                    side_effect=[initial, {"data": [{"id": model}]}],
+                    side_effect=[initial, served],
                 ),
                 mock.patch.object(agent, "idle_status", return_value=initial),
                 mock.patch.object(agent.subprocess, "Popen") as start,
@@ -1235,6 +1238,7 @@ class AgentRunnerTests(unittest.TestCase):
         model = "incoai/Qwen3.8-27B-Splash"
         identity = "src-" + "a" * 64
         initial = {
+            "instance": {"model": model},
             "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
             "identity": {"cache": {"build_id": identity}},
         }

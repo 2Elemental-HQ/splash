@@ -187,10 +187,18 @@ stored bytes without further quantization; it does not survive a restart.
 ## API model aliases
 
 Repeat `--served-model-name NAME` to accept additional API model IDs. The full
-`--model` ID still selects the model. `/v1/models` lists that ID first, followed
-by unique aliases; each alias's `root` identifies the loaded model. Generation
-and scoring responses always report the real model ID, even when requested
-through an alias. The model list and lookup support both names.
+`--model` ID still selects the model. By default `/v1/models` lists that ID
+first, followed by unique aliases; each alias's `root` identifies the loaded
+model, and generation and scoring responses report the real model ID even when
+requested through an alias. The model list and lookup support both names.
+
+Some clients check a response's `model` against the name they requested and
+reject the real ID. For them, add `--announce-served-name`, which requires
+`--served-model-name`: responses then report the first alias, whichever
+accepted name the request used, and `/v1/models` lists that alias first and
+gives every other entry, the real ID included, that alias as its `root`, so
+`splash <client>` configures clients with it. `/status` keeps reporting the
+loaded model.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
