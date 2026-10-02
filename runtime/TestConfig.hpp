@@ -18,6 +18,8 @@ struct TestConfig final {
   std::optional<uint32_t> kvTierTransfers;        // engine::KvPageTier::kTransfers
   std::optional<size_t> transportInputQueueBytes; // engine::FdTransport::kInputQueueBytes
   std::optional<uint32_t> metricsLatencyWindow;   // engine::RuntimeMetrics::kLatencyWindow
+  std::optional<uint32_t> prefillCheckpointTokens; // engine::kPrefillCheckpointTokens
+  std::optional<double> resourceWaitTimeoutMilliseconds; // engine::kResourceWaitTimeoutMilliseconds
   // RuntimeResources and its governor: the live vm_statistics64 estimate.
   std::function<std::optional<uint64_t>()> hostAvailableMemory;
   // NativeRuntime: the system clock in microseconds and the steady clock in

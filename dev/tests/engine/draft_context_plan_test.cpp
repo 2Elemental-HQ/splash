@@ -108,7 +108,7 @@ void testFinalFullBlockBound() {
 }
 
 void testBenchmarkWorkIncludesRecoveryPoints() {
-  const uint32_t interval = engine::EngineConfig{}.prefillCheckpointTokens;
+  const uint32_t interval = engine::kPrefillCheckpointTokens;
   using benchmark::expectedDraftContextRows;
   // No checkpoint lies within one prefill chunk of an end: not 8192 before
   // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K

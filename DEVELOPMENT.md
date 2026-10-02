@@ -797,10 +797,13 @@ a PEP 366 header. `serve_options.py` defines the options
 help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
 
-Tests substitute some of the values the native runtime holds constant, such
-as the input queue's bound, and its live host-memory estimate through
-`runtime/TestConfig.hpp` with `test::ScopedTestConfig`;
-`make architecture-check` keeps production from writing that configuration.
+Tests substitute the values the native runtime holds constant (the Metal
+command timeout and residency keep-alive, the KV tier's transfers, the input
+queue's bound, the latency window, the prefill checkpoint interval and the
+resource wait) and its clocks and live host-memory estimate through
+`runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
+production parameter; `make architecture-check` keeps production from writing
+that configuration.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
