@@ -7361,6 +7361,50 @@ void testHeldBackStartTakesNothingInUse() {
   }
 }
 
+// A lane that has just started beside a decoding one is the first to yield
+// (laneToYield): when its first chunk's pages are refused, it is suspended.
+// The reclaim before that takes nothing in use, so the decoding
+// conversation's replay point is not spent on a lane that does not run.
+void testLaneThatWouldYieldTakesNothingInUse() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  const std::vector<uint32_t> first(65, 1);
+  auto conversation = request(1, first);
+  conversation.maxNewTokens = 1000;
+  engine.submit(std::move(conversation));
+  tickUntil(engine, now, [&] { return events.outputs[1].size() >= 2; },
+            "the conversation did not decode");
+  require(resources.snapshot().stateCache.inUse == 1,
+          "the decode did not use its replay point");
+  while (resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+             .madeProgress) {
+  }
+  storage.growthBlocked = true;
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+            "the starting lane was not suspended");
+  std::vector<uint32_t> next = first;
+  next.resize(first.size() + 40, 7);
+  require(resources.snapshot().stateCache.inUseEvictions == 0 &&
+              resources.probe(next).cachedTokens() == 64,
+          "the lane that yielded took the decoding conversation's replay point");
+  require(!executor.requests.at(2).resident && executor.requests.at(1).resident &&
+              !events.usage.contains(1),
+          "the starting lane did not yield to the decoding one");
+  executor.decodeFinishes = true;
+  storage.growthBlocked = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the suspended lane did not finish");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "the lanes did not both complete");
+}
+
 // Every end of a decoding request releases its replay point: cancellation
 // and failure at once, before the request leaves the engine, the deadline
 // and capacity exhaustion when the engine ends it.
@@ -7473,6 +7517,7 @@ int main() {
     testReplayPointRecyclesAnOlderPointInUse();
     testWarningShrinkKeepsTheFinishedPoint();
     testHeldBackStartTakesNothingInUse();
+    testLaneThatWouldYieldTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testScoreRequestsCarryNoSamplingOptions();

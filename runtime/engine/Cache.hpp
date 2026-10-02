@@ -130,11 +130,12 @@ struct CacheReclaimResult final {
 enum class CacheReclaimMode { KeepExtents, ReleaseExtents };
 
 // The highest class a reclaim step may take (the class rule). Ordinary:
-// checkpoints, ordinary states and KV, for work a resident lane holds
-// back anyway (a start beside one: Engine's inService is false). InUse:
+// checkpoints, ordinary states and KV, for growth that can wait or yield
+// instead: a start a resident lane holds back, and the lane that would
+// yield first (Engine::laneToYield) while another lane is resident. InUse:
 // after all of those, the states unfinished requests use and the KV they
-// restore through, for running work (a resident lane, or a start that no
-// resident lane precedes) and for pressure passes.
+// restore through, for other running work (any other resident lane, or a
+// start no resident lane precedes) and for pressure passes.
 enum class ReclaimClass : uint8_t { Ordinary, InUse };
 
 // Whether the caller can wait for KV memory a step leaves to come back.

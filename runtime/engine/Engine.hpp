@@ -272,7 +272,7 @@ private:
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the
-  // class allocate() derives from inService.
+  // class allocate() is given.
   [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
@@ -301,17 +301,29 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // Runs one allocation of a lane's state or of KV pages, reclaiming between
-  // attempts while that makes progress. A request in service is running
-  // work and reclaims up to what is in use; one that a resident lane holds
-  // back takes nothing in use and waits for that lane. A refusal from the
-  // host reuses what the engine holds; when that gives nothing, a request in
-  // service retries as one (EngineConfig::serving), which only the engine's
-  // limit and critical pressure refuse. A refusal from the engine's limit
-  // reclaims cache; when that gives nothing, fallback, given the denial so
-  // far, may let go of what the request itself pins, and the reclaim goes on.
+  // The prompt rows a lane in prefill has processed, or the tokens a
+  // decoding lane holds.
+  [[nodiscard]] uint64_t completedTokens(const Request &request) const;
+  // Whether lane a gives up its memory before lane b: the lower priority,
+  // then, at equal priority, a lane in prefill before a decoding one, then
+  // the one with fewer completed tokens.
+  [[nodiscard]] bool yieldsBefore(const Request &a, const Request &b) const;
+  // The resident lane in prefill or decode that yields first when every
+  // lane's growth fails (yieldsBefore; on a tie, the later submission), or
+  // nullptr without one. prepare() gates that lane's growth and suspends
+  // that lane.
+  [[nodiscard]] Request *laneToYield();
+  // Runs one allocation of a lane's state or of KV pages, reclaiming cache
+  // up to class upTo between attempts while that makes progress: what is in
+  // use only for running work that would not yield for it, never for a
+  // start a resident lane holds back. A refusal from the host reuses what
+  // the engine holds; when that gives nothing, a request in service retries
+  // as one (EngineConfig::serving), which only the engine's limit and
+  // critical pressure refuse. A refusal from the engine's limit reclaims
+  // cache; when that gives nothing, fallback, given the denial so far, may
+  // let go of what the request itself pins, and the reclaim goes on.
   template <class Attempt>
-  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
+  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {})
       -> Allocation<std::invoke_result_t<Attempt &>>;
   void suspendForGrowth(Request &request, uint64_t workEnd,

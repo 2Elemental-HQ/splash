@@ -609,8 +609,10 @@ bool Engine::admit(Request &active, double now) {
   active.refusedMemory = false;
   // A request is in service when no other lane is resident
   // (anotherResident): it starts through the host's pause once reuse gives
-  // nothing.
+  // nothing, and reclaims up to what is in use. Beside a resident lane it
+  // takes nothing in use and waits for that lane.
   const bool inService = !anotherResident(active.request.id);
+  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   // The request's own lease goes only when nothing else can free memory
   // (judge() says Fail: no other lane is resident, nothing is pending, the
   // host is not refusing). It then starts without the pin rather than wait
@@ -619,7 +621,7 @@ bool Engine::admit(Request &active, double now) {
   bool droppedLease = false;
   const auto state = allocate(
       [&] { return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest); },
-      inService, [&](const Denial &denial) {
+      inService, upTo, [&](const Denial &denial) {
         if (!lookup.state || judge(denial, active.request.id) != Verdict::Fail)
           return false;
         lookup = {};
@@ -653,14 +655,14 @@ bool Engine::admit(Request &active, double now) {
   // a resident request its pages wait for the host.
   Allocation<TokenAdmission> kv;
   if (lookup.state)
-    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService);
+    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService, upTo);
   const bool restoring =
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
   if (kv.admission.granted() && (resuming || restoring)) {
     const uint64_t workEnd =
         resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService);
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService, upTo);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -1104,6 +1106,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
   };
   std::vector<Denied> denied;
   denied.reserve(plan.items.size());
+  Request *const yielding = laneToYield();
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.stateCell)
@@ -1115,9 +1118,16 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    // A scheduled lane is resident: it is in service.
+    // A scheduled lane is resident: it grows as a request in service. The
+    // lane that yields first if growth fails takes nothing in use, since its
+    // own suspension, not another conversation's replay point, pays for it.
+    // While other lanes fit, it waits for them instead, resident and denied
+    // each step, as a start a resident lane holds back waits.
+    const ReclaimClass upTo = &active == yielding && anotherResident(active.request.id)
+                                  ? ReclaimClass::Ordinary
+                                  : ReclaimClass::InUse;
     const auto kv = allocate(
-        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true);
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true, upTo);
     if (!kv.admission.granted()) {
       denied.push_back(Denied{active.request.id, kv.admission, workEnd, kv.denial});
       continue;
@@ -1148,26 +1158,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     return Prepared::Runnable;
   }
 
-  // Partial admissions execute at their actual width. If no lane fits, choose
-  // among all runnable residents: an unstarted peer can release its state
-  // cell before completed prefill is discarded.
+  // Partial admissions execute at their actual width. If no lane fits, the
+  // lane to yield is chosen among all runnable residents: an unstarted peer
+  // can release its state cell before completed prefill is discarded.
   if (denied.empty())
     throw std::logic_error("empty resource admission result");
-  const auto completedTokens = [&](const Request &active) -> uint64_t {
-    return scheduler_.phase(active.request.id) == Phase::Prefill
-               ? scheduler_.promptProcessed(active.request.id)
-               : active.exactTokens.size();
-  };
-  const auto yieldsBefore = [&](const Request &a, const Request &b) {
-    if (a.request.priority != b.request.priority)
-      return a.request.priority > b.request.priority;
-    const Phase aPhase = scheduler_.phase(a.request.id);
-    const Phase bPhase = scheduler_.phase(b.request.id);
-    // At equal priority, prefer uninterrupted streaming over less replay work.
-    if (aPhase != bPhase)
-      return aPhase == Phase::Prefill;
-    return completedTokens(a) < completedTokens(b);
-  };
   // Memory on its way back arrives without anyone yielding. The lanes still
   // take a retry deadline: the transfer's completion wakes the engine, and
   // the deadline is what makes the wait end if that wake is ever missed.
@@ -1182,23 +1177,18 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       [&](const Denied &left, const Denied &right) {
         return yieldsBefore(request(left.requestId), request(right.requestId));
       });
-  Request *selected = &request(victim.requestId);
-  uint64_t resumeTarget = victim.workEnd;
-  for (auto &[id, candidate] : requests_) {
-    if (!candidate.stateCell)
-      continue;
-    // Requests enter the scheduler before they can acquire a resident cell.
-    const Phase phase = scheduler_.phase(id);
-    if ((phase == Phase::Prefill || phase == Phase::Decode) &&
-        yieldsBefore(candidate, *selected)) {
-      selected = &candidate;
-      // This peer has not failed a growth attempt. Retain its current KV
-      // capacity as the resume target, not the blocked lane's requirement.
-      resumeTarget =
-          uint64_t{cache_.pageTable(id).pages.size()} * KvCache::pageTokens;
-    }
-  }
-  Request &active = *selected;
+  if (!yielding)
+    throw std::logic_error("no resident lane can yield");
+  Request &active = *yielding;
+  const auto own = std::find_if(denied.begin(), denied.end(), [&](const Denied &entry) {
+    return entry.requestId == active.request.id;
+  });
+  // A peer that has not failed a growth attempt resumes to its current KV
+  // capacity, not to the blocked lane's requirement.
+  const uint64_t resumeTarget =
+      own != denied.end()
+          ? own->workEnd
+          : uint64_t{cache_.pageTable(active.request.id).pages.size()} * KvCache::pageTokens;
   if (judge(victim.denial, active.request.id) == Verdict::Fail)
     settle(request(victim.requestId),
            capacityExhausted("KV target", victim.admission.allocationFailure,
@@ -1207,6 +1197,39 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     suspendForGrowth(active, resumeTarget, victim.admission.allocationFailure,
                      now);
   return Prepared::Yielded;
+}
+
+uint64_t Engine::completedTokens(const Request &active) const {
+  return scheduler_.phase(active.request.id) == Phase::Prefill
+             ? scheduler_.promptProcessed(active.request.id)
+             : active.exactTokens.size();
+}
+
+bool Engine::yieldsBefore(const Request &a, const Request &b) const {
+  if (a.request.priority != b.request.priority)
+    return a.request.priority > b.request.priority;
+  const Phase aPhase = scheduler_.phase(a.request.id);
+  const Phase bPhase = scheduler_.phase(b.request.id);
+  // At equal priority, prefer uninterrupted streaming over less replay work.
+  if (aPhase != bPhase)
+    return aPhase == Phase::Prefill;
+  return completedTokens(a) < completedTokens(b);
+}
+
+Engine::Request *Engine::laneToYield() {
+  Request *yielding = nullptr;
+  for (auto &[id, candidate] : requests_) {
+    if (!candidate.stateCell)
+      continue;
+    // Requests enter the scheduler before they can acquire a resident cell.
+    const Phase phase = scheduler_.phase(id);
+    if (phase != Phase::Prefill && phase != Phase::Decode)
+      continue;
+    if (!yielding || yieldsBefore(candidate, *yielding) ||
+        (!yieldsBefore(*yielding, candidate) && candidate.sequence > yielding->sequence))
+      yielding = &candidate;
+  }
+  return yielding;
 }
 
 bool Engine::anotherResident(uint64_t requestId) const {
@@ -1228,7 +1251,7 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
 }
 
 template <class Attempt>
-auto Engine::allocate(Attempt &&attempt, bool inService,
+auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                       const std::function<bool(const Denial &)> &fallback)
     -> Allocation<std::invoke_result_t<Attempt &>> {
   using Admission = std::invoke_result_t<Attempt &>;
@@ -1242,7 +1265,6 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
   Allocation<Admission> result{tryOnce(), {}};
   Admission &admission = result.admission;
   Denial &denial = result.denial;
-  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   while (memoryDenied(admission)) {
     const bool paused =
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
