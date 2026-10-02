@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """HTTP routes, protocol responses and serving-process startup."""
 
 import argparse
@@ -25,86 +24,43 @@ from urllib.parse import unquote
 from huggingface_hub.utils import validate_repo_id
 from transformers import AutoTokenizer
 
-if __package__:
-    from . import images as image_input
-    from . import json_codec, judgments, serve_options
-    from . import runtime as engine_runtime
-    from .api_shapes import (
-        anthropic_response,
-        anthropic_stop,
-        anthropic_to_chat_body,
-        anthropic_to_chat_prompt,
-        anthropic_usage,
-        completion_response,
-        finish_reason,
-        responses_item,
-        responses_item_id,
-        responses_output,
-        responses_response,
-        stream_chunk,
-        text_completion_chunk,
-        text_completion_response,
-    )
-    from .backend import NativeBackend, NativeResult, remaining_request_time
-    from .chat_templates import ChatTemplateError, ChatTemplates
-    from .constraints import ConstraintFactory, validate_tokenizer
-    from .diagnostics import log_unexpected, print_request, print_status
-    from .errors import APIError, ContextLengthError
-    from .frontend import Frontend
-    from .http_security import OriginRefused, authenticate, validate_headers
-    from .latency import RequestLatency
-    from .metrics import prometheus_metrics, timings_dict, usage_dict
-    from .origins import ANY_ORIGIN
-    from .output import (
-        BlockSequencer,
-        ReasoningSplitter,
-        StreamingToolCallProjector,
-        validate_response_content,
-        validate_tool_calls,
-    )
-    from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-else:
-    import images as image_input
-    import json_codec
-    import judgments
-    import serve_options
-    from api_shapes import (
-        anthropic_response,
-        anthropic_stop,
-        anthropic_to_chat_body,
-        anthropic_to_chat_prompt,
-        anthropic_usage,
-        completion_response,
-        finish_reason,
-        responses_item,
-        responses_item_id,
-        responses_output,
-        responses_response,
-        stream_chunk,
-        text_completion_chunk,
-        text_completion_response,
-    )
-    from backend import NativeBackend, NativeResult, remaining_request_time
-    from chat_templates import ChatTemplateError, ChatTemplates
-    from constraints import ConstraintFactory, validate_tokenizer
-    from diagnostics import log_unexpected, print_request, print_status
-    from errors import APIError, ContextLengthError
-    from frontend import Frontend
-    from http_security import OriginRefused, authenticate, validate_headers
-    from latency import RequestLatency
-    from metrics import prometheus_metrics, timings_dict, usage_dict
-    from origins import ANY_ORIGIN
-    from output import (
-        BlockSequencer,
-        ReasoningSplitter,
-        StreamingToolCallProjector,
-        validate_response_content,
-        validate_tool_calls,
-    )
-    from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-
-    import runtime as engine_runtime
-
+from . import images as image_input
+from . import json_codec, judgments, serve_options
+from . import runtime as engine_runtime
+from .api_shapes import (
+    anthropic_response,
+    anthropic_stop,
+    anthropic_to_chat_body,
+    anthropic_to_chat_prompt,
+    anthropic_usage,
+    completion_response,
+    finish_reason,
+    responses_item,
+    responses_item_id,
+    responses_output,
+    responses_response,
+    stream_chunk,
+    text_completion_chunk,
+    text_completion_response,
+)
+from .backend import NativeBackend, NativeResult, remaining_request_time
+from .chat_templates import ChatTemplateError, ChatTemplates
+from .constraints import ConstraintFactory, validate_tokenizer
+from .diagnostics import log_unexpected, print_request, print_status
+from .errors import APIError, ContextLengthError
+from .frontend import Frontend
+from .http_security import OriginRefused, authenticate, validate_headers
+from .latency import RequestLatency
+from .metrics import prometheus_metrics, timings_dict, usage_dict
+from .origins import ANY_ORIGIN
+from .output import (
+    BlockSequencer,
+    ReasoningSplitter,
+    StreamingToolCallProjector,
+    validate_response_content,
+    validate_tool_calls,
+)
+from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Match the former generation ingress envelope (32 slots × 16 MiB).
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024

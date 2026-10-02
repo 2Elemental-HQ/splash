@@ -10,78 +10,40 @@ from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
 
-if __package__:
-    from . import images as image_input
-    from . import json_codec, judgments
-    from . import protocol as wire
-    from .api_shapes import (
-        IMAGE_PAD_TOKEN,
-        canonical_responses_input,
-        normalize_messages,
-        responses_to_chat_body,
-        template_messages,
-    )
-    from .backend import Job, remaining_request_time
-    from .chat_templates import (
-        LATER_SYSTEM_UNSUPPORTED,
-        RESERVED_TEMPLATE_KWARGS,
-        render_chat_template,
-        template_options,
-    )
-    from .diagnostics import print_status
-    from .errors import APIError, ContextLengthError
-    from .latency import LatencyMetrics
-    from .metrics import is_finite_number
-    from .serve_options import REASONING_EFFORTS, parse_served_model_name
-    from .tokenization import PromptTokenizer
-    from .tool_schema import (
-        THINK_END,
-        THINK_END_TOKEN_ID,
-        TOOL_CALL_OPEN,
-        ToolPolicy,
-        function_opening,
-        json_grammar,
-        normalize_response_format,
-        normalize_tools,
-        tool_grammar,
-    )
-else:
-    import images as image_input
-    import json_codec
-    import judgments
-    import protocol as wire
-    from api_shapes import (
-        IMAGE_PAD_TOKEN,
-        canonical_responses_input,
-        normalize_messages,
-        responses_to_chat_body,
-        template_messages,
-    )
-    from backend import Job, remaining_request_time
-    from chat_templates import (
-        LATER_SYSTEM_UNSUPPORTED,
-        RESERVED_TEMPLATE_KWARGS,
-        render_chat_template,
-        template_options,
-    )
-    from diagnostics import print_status
-    from errors import APIError, ContextLengthError
-    from latency import LatencyMetrics
-    from metrics import is_finite_number
-    from serve_options import REASONING_EFFORTS, parse_served_model_name
-    from tokenization import PromptTokenizer
-    from tool_schema import (
-        THINK_END,
-        THINK_END_TOKEN_ID,
-        TOOL_CALL_OPEN,
-        ToolPolicy,
-        function_opening,
-        json_grammar,
-        normalize_response_format,
-        normalize_tools,
-        tool_grammar,
-    )
-
+from . import images as image_input
+from . import json_codec, judgments
+from . import protocol as wire
+from .api_shapes import (
+    IMAGE_PAD_TOKEN,
+    canonical_responses_input,
+    normalize_messages,
+    responses_to_chat_body,
+    template_messages,
+)
+from .backend import Job, remaining_request_time
+from .chat_templates import (
+    LATER_SYSTEM_UNSUPPORTED,
+    RESERVED_TEMPLATE_KWARGS,
+    render_chat_template,
+    template_options,
+)
+from .diagnostics import print_status
+from .errors import APIError, ContextLengthError
+from .latency import LatencyMetrics
+from .metrics import is_finite_number
+from .serve_options import REASONING_EFFORTS, parse_served_model_name
+from .tokenization import PromptTokenizer
+from .tool_schema import (
+    THINK_END,
+    THINK_END_TOKEN_ID,
+    TOOL_CALL_OPEN,
+    ToolPolicy,
+    function_opening,
+    json_grammar,
+    normalize_response_format,
+    normalize_tools,
+    tool_grammar,
+)
 
 PREPARATION_WAIT_SECONDS = 30.0
 

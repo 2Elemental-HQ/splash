@@ -45,10 +45,7 @@ from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
-if __package__:
-    from .serve_options import REASONING_EFFORTS
-else:
-    from serve_options import REASONING_EFFORTS
+from .serve_options import REASONING_EFFORTS
 
 # Template arguments request preparation sets itself, and apply_chat_template's
 # own controls: a request's template kwargs cannot set them.

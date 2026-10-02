@@ -13,10 +13,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 MAX_SECONDS = 30.0
 MAX_MEMORY_BYTES = 1024 * 1024 * 1024
@@ -86,7 +83,8 @@ def render(payload, limits, remaining):
     deadline = time.monotonic() + duration
     command = [
         sys.executable,
-        str(Path(__file__).resolve()),
+        "-m",
+        "server.document_worker",
         json.dumps(limits),
         str(duration),
     ]
@@ -96,8 +94,14 @@ def render(payload, limits, remaining):
         source.write(payload)
         source.seek(0)
         try:
+            # From the directory that holds the server package, so the worker
+            # imports it however the server was started.
             process = subprocess.Popen(
-                command, stdin=source, stdout=output, stderr=subprocess.DEVNULL
+                command,
+                stdin=source,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                cwd=Path(__file__).resolve().parents[1],
             )
         except OSError:
             raise APIError(
@@ -152,7 +156,7 @@ def render(payload, limits, remaining):
 
 
 def main():
-    from documents import MAX_PDF_BYTES, DocumentBudget, RenderLimits, render_pages
+    from .documents import MAX_PDF_BYTES, DocumentBudget, RenderLimits, render_pages
 
     limits = RenderLimits(**json.loads(sys.argv[1]))
     duration = float(sys.argv[2])

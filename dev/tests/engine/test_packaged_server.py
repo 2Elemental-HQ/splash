@@ -1,4 +1,5 @@
 import base64
+import os
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,25 @@ class PackagedServerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ALPHA 42", result.stdout)
+
+    def test_staged_server_starts_as_the_launcher_starts_it(self):
+        # From another directory, which -P keeps off sys.path, with the
+        # release named by PYTHONPATH alone.
+        with tempfile.TemporaryDirectory() as directory:
+            stage = stage_release(Path(directory))
+            elsewhere = Path(directory) / "elsewhere"
+            (elsewhere / "server").mkdir(parents=True)
+            (elsewhere / "server/__init__.py").write_text("raise ImportError\n")
+            result = subprocess.run(
+                [sys.executable, "-P", "-m", "server.server", "--help"],
+                cwd=elsewhere,
+                env={**os.environ, "PYTHONPATH": str(stage)},
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--max-context", result.stdout)
 
     def test_staged_launcher_shares_the_origin_rule_without_dependencies(self):
         # As the entry point runs it, but with no site-packages: the launcher

@@ -58,6 +58,11 @@ MODEL_IDS = (
 )
 
 
+def server_arguments(argv):
+    """The server's own arguments in the launcher's command for it."""
+    return argv[argv.index("server.server") + 1 :]
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and
@@ -152,7 +157,7 @@ class LauncherTests(unittest.TestCase):
                 factory.return_value.__enter__.return_value.bind.assert_called_once_with(
                     (expected, 9123)
                 )
-                served = api.parse_args(execute.call_args.args[1][3:])
+                served = api.parse_args(server_arguments(execute.call_args.args[1]))
                 self.assertEqual(served.host, expected)
                 self.assertEqual(served.allowed_host, ["proxy.example"])
 
@@ -205,7 +210,7 @@ class LauncherTests(unittest.TestCase):
                 # test_serve_options.py checks every shared option; these
                 # are the launcher's own and the shared options it was given.
                 with mock.patch.dict(os.environ, environment):
-                    served = api.parse_args(argv[3:])
+                    served = api.parse_args(server_arguments(argv))
                 self.assertEqual(
                     (served.binary, served.model, served.port),
                     (str(launcher.paths.BINARY), MODEL_ID, launcher.PORT),
@@ -562,6 +567,7 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "server").mkdir()
+            (root / "server/__init__.py").write_text("")
             (root / "server/server.py").write_text(
                 "import sys\nprint('ready', flush=True)\nsys.stdin.read()\n"
             )
@@ -868,7 +874,7 @@ class LauncherTests(unittest.TestCase):
             )
             root.assert_called_once_with(chosen.models_root, MODEL_ID, **options)
             argv = execute.call_args.args[1]
-            self.assertEqual(argv[3], str(runtime / "selected"))
+            self.assertEqual(server_arguments(argv)[0], str(runtime / "selected"))
 
             with (
                 mock.patch.object(
@@ -911,7 +917,7 @@ class LauncherTests(unittest.TestCase):
                     try:
                         fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
-                        held.append(argv[3])
+                        held.append(server_arguments(argv)[0])
 
             with (
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
@@ -1007,7 +1013,7 @@ class LauncherTests(unittest.TestCase):
     def test_programs_take_a_stop_held_from_their_start(self):
         home = self.enterContext(tempfile.TemporaryDirectory())
         # Unstopped, each would go on to fail at its first step.
-        server = ["server/server.py", "model", "--tokenizer", "tokenizer"]
+        server = ["-m", "server.server", "model", "--tokenizer", "tokenizer"]
         server += ["--model", MODEL_ID, "--port", "0"]
         installer = ["install/models.py", "--models", home, "--model", MODEL_ID]
         installer.append("prepare")
@@ -1022,7 +1028,7 @@ class LauncherTests(unittest.TestCase):
             (server, signal.SIGTERM, 0),
             (installer, signal.SIGINT, 130),
         ):
-            with self.subTest(program=program[0], signal=number.name):
+            with self.subTest(program=program[:2], signal=number.name):
                 result = subprocess.run(
                     with_stop_held([sys.executable, *program], number),
                     cwd=launcher.ROOT,

@@ -6,18 +6,11 @@ import hashlib
 import json
 import re
 
-if __package__:
-    from . import json_codec
-    from . import protocol as wire
-    from .documents import DocumentBudget, document_parts, file_content
-    from .errors import APIError
-    from .metrics import timings_dict, usage_dict
-else:  # ``python server/server.py`` from the repo root.
-    import json_codec
-    import protocol as wire
-    from documents import DocumentBudget, document_parts, file_content
-    from errors import APIError
-    from metrics import timings_dict, usage_dict
+from . import json_codec
+from . import protocol as wire
+from .documents import DocumentBudget, document_parts, file_content
+from .errors import APIError
+from .metrics import timings_dict, usage_dict
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (

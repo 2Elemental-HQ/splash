@@ -10,12 +10,8 @@ from collections import OrderedDict
 from contextlib import closing
 from dataclasses import asdict, dataclass
 
-if __package__:
-    from .errors import APIError
-    from .protocol import MAX_IMAGE_SPANS
-else:
-    from errors import APIError
-    from protocol import MAX_IMAGE_SPANS
+from .errors import APIError
+from .protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
@@ -83,10 +79,7 @@ _cache_bytes = 0
 
 
 def _render(payload, budget):
-    if __package__:
-        from .document_worker import render
-    else:
-        from document_worker import render
+    from .document_worker import render
 
     limits = RenderLimits(
         min(MAX_PAGES, budget.remaining_pages),

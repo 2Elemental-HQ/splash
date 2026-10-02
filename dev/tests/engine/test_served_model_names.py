@@ -15,7 +15,7 @@ from dev.tests.engine.test_json_responses import (
     stream_events,
     tool_request,
 )
-from dev.tests.engine.test_launcher import keep_stop_signals
+from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
 from server import protocol as native_wire
 from server import serve_options
@@ -363,7 +363,7 @@ class ServedModelNamesTests(unittest.TestCase):
                 ]
             )
             argv = execute.call_args.args[1]
-            parsed = api.parse_args(argv[3:])
+            parsed = api.parse_args(server_arguments(argv))
             self.assertEqual(parsed.model, "owner/repo")
             self.assertEqual(parsed.served_model_name, ["local", "stable", "-local"])
 
@@ -389,7 +389,7 @@ class ServedModelNamesTests(unittest.TestCase):
                         *flags,
                     ]
                 )
-                parsed = api.parse_args(execute.call_args.args[1][3:])
+                parsed = api.parse_args(server_arguments(execute.call_args.args[1]))
                 self.assertEqual(parsed.served_model_name, ["local"])
                 self.assertIs(parsed.announce_served_name, announced)
 

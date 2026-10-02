@@ -9,30 +9,16 @@ from dataclasses import dataclass, field
 
 from tokenizers.decoders import DecodeStream
 
-if __package__:
-    from . import json_codec
-    from . import protocol as wire
-    from . import runtime as engine_runtime
-    from .constraints import TokenConstraint
-    from .diagnostics import print_status
-    from .errors import APIError, ConstraintError
-    from .latency import RequestLatency
-    from .metrics import metrics_dict
-    from .output import hold_partial
-    from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
-else:
-    import json_codec
-    import protocol as wire
-    from constraints import TokenConstraint
-    from diagnostics import print_status
-    from errors import APIError, ConstraintError
-    from latency import RequestLatency
-    from metrics import metrics_dict
-    from output import hold_partial
-    from tool_schema import THINK_END_TOKEN_ID, ToolPolicy
-
-    import runtime as engine_runtime
-
+from . import json_codec
+from . import protocol as wire
+from . import runtime as engine_runtime
+from .constraints import TokenConstraint
+from .diagnostics import print_status
+from .errors import APIError, ConstraintError
+from .latency import RequestLatency
+from .metrics import metrics_dict
+from .output import hold_partial
+from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
 
 # A failure counts toward a crash loop unless its engine served this long.
 CRASH_LOOP_WINDOW_SECONDS = 60.0

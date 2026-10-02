@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import test_server as fixtures
-from dev.tests.engine.test_launcher import keep_stop_signals
+from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
 from server import server as api
 
@@ -214,7 +214,8 @@ class DefaultReasoningTests(unittest.TestCase):
                     launcher.main(["serve", "--model", "owner/repo", *options])
                     argv = execute.call_args.args[1]
                     self.assertEqual(
-                        api.parse_args(argv[3:]).default_reasoning_effort, expected
+                        api.parse_args(server_arguments(argv)).default_reasoning_effort,
+                        expected,
                     )
                     # The server reads the environment's default itself.
                     self.assertEqual(

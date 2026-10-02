@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -221,6 +222,15 @@ def main(argv=None):
             ],
             cwd=stage,
             check=True,
+        )
+        # The server's entry point as the launcher starts it, which the
+        # import above does not run. Not isolated: -I would ignore PYTHONPATH.
+        subprocess.run(
+            [str(python), "-P", "-m", "server.server", "--help"],
+            cwd=stage,
+            env={**os.environ, "PYTHONPATH": str(stage)},
+            check=True,
+            stdout=subprocess.DEVNULL,
         )
         subprocess.run(
             [str(python), "-B", str(stage / "install/launcher.py"), "--help"],

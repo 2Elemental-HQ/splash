@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Bounded native-protocol crash traces and deterministic local replay.
 
 The ring keeps the newest MAX_TRACE_ENTRIES frames within MAX_TRACE_BYTES of a
@@ -30,11 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
 
-if __package__:
-    from . import protocol as wire
-else:  # Direct execution from the server directory.
-    import protocol as wire
-
+from . import protocol as wire
 
 TRACE_SCHEMA_VERSION = 1
 MAX_TRACE_ENTRIES = 512

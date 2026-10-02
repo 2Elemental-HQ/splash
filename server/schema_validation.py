@@ -11,10 +11,7 @@ from jsonschema import ValidationError, validators
 from jsonschema.exceptions import UndefinedTypeCheck
 from referencing import Registry
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 
 class SchemaEvaluationError(Exception):

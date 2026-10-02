@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import math
 
-if __package__:
-    from .latency import prometheus_latency
-else:
-    from latency import prometheus_latency
+from .latency import prometheus_latency
 
 
 def is_finite_number(value):

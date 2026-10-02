@@ -12,12 +12,8 @@ from urllib.parse import unquote
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
-if __package__:
-    from .errors import APIError
-    from .schema_validation import build_validator, json_objects, subschemas
-else:  # ``python server/server.py`` from the repo root.
-    from errors import APIError
-    from schema_validation import build_validator, json_objects, subschemas
+from .errors import APIError
+from .schema_validation import build_validator, json_objects, subschemas
 
 MAX_JSON_NESTING = 256
 

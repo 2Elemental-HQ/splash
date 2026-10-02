@@ -17,22 +17,114 @@ class ArchitectureTests(unittest.TestCase):
             (server / "backend.py").write_text("from . import runtime")
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
-                for statement in (
-                    "from .frontend import Frontend",
-                    "from frontend import Frontend",
-                    "from server.frontend import Frontend",
-                    "from server import frontend",
-                    "import server.frontend",
-                    "import importlib\nimportlib.import_module('server.frontend')",
-                    "from importlib import import_module\nimport_module('.frontend', 'server')",
-                    "__import__('server.frontend')",
+                for statement, module in (
+                    ("from .frontend import Frontend", None),
+                    ("from frontend import Frontend", "frontend"),
+                    ("from server.frontend import Frontend", "server.frontend"),
+                    ("from server import frontend", "server"),
+                    ("import server.frontend", "server.frontend"),
+                    (
+                        "import importlib\nimportlib.import_module('server.frontend')",
+                        None,
+                    ),
+                    (
+                        "from importlib import import_module\n"
+                        "import_module('.frontend', 'server')",
+                        None,
+                    ),
+                    ("__import__('server.frontend')", None),
                 ):
                     with self.subTest(statement=statement):
                         (server / "backend.py").write_text(statement)
+                        # The package's own modules are imported relatively.
+                        style = (
+                            [
+                                f"server/backend.py: imports {module} without a "
+                                "relative import"
+                            ]
+                            if module
+                            else []
+                        )
                         self.assertEqual(
                             check_architecture.check(),
-                            ["server/backend.py: imports upper serving layer frontend"],
+                            [
+                                "server/backend.py: imports upper serving layer frontend",
+                                *style,
+                            ],
                         )
+
+    def test_package_modules_import_their_siblings_relatively(self):
+        header = (
+            "import sys\nfrom pathlib import Path\n\n"
+            'if __name__ == "__main__" and not __package__:\n'
+            "    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+            '    __package__ = "install"\n\n'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for package in ("server", "install"):
+                (root / package).mkdir()
+            (root / "server/errors.py").write_text("")
+            (root / "server/backend.py").write_text("from .errors import APIError\n")
+            (root / "install/paths.py").write_text("")
+            (root / "install/clients.py").write_text("")
+            # Another package's modules are imported by their package.
+            (root / "install/launcher.py").write_text(
+                header + "from server import serve_options\n\nfrom . import paths\n"
+            )
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+                for path, text, errors in (
+                    (
+                        "server/backend.py",
+                        "from errors import APIError",
+                        ["imports errors without a relative import"],
+                    ),
+                    (
+                        "server/backend.py",
+                        "import errors",
+                        ["imports errors without a relative import"],
+                    ),
+                    (
+                        "server/backend.py",
+                        "if __package__:\n    from .errors import APIError\n"
+                        "else:\n    from errors import APIError\n",
+                        [
+                            "reads __package__",
+                            "imports errors without a relative import",
+                        ],
+                    ),
+                    (
+                        "install/launcher.py",
+                        header + "import paths\n",
+                        ["imports paths without a relative import"],
+                    ),
+                    # Nor by the package's own name.
+                    (
+                        "install/clients.py",
+                        "from install import paths",
+                        ["imports install without a relative import"],
+                    ),
+                    (
+                        "install/clients.py",
+                        "import install.paths",
+                        ["imports install.paths without a relative import"],
+                    ),
+                    # Only the script entry points take the header.
+                    (
+                        "install/clients.py",
+                        header + "from . import paths\n",
+                        ["reads __package__", "reads __package__"],
+                    ),
+                ):
+                    original = (root / path).read_text()
+                    with self.subTest(path=path, text=text):
+                        (root / path).write_text(text)
+                        self.assertCountEqual(
+                            check_architecture.check(),
+                            [f"{path}: {error}" for error in errors],
+                        )
+                    (root / path).write_text(original)
 
     def test_serving_entrypoint_is_not_a_shared_module(self):
         with tempfile.TemporaryDirectory() as temporary:

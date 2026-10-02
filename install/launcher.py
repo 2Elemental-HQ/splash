@@ -13,23 +13,20 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-try:
-    from . import assembly, catalog, clients, paths
-    from . import models as model_artifacts
-except ImportError:  # Executed directly by the source or packaged entry point.
-    import assembly
-    import catalog
-    import clients
-    import models as model_artifacts
-    import paths
-
-    # Run as a script, the launcher has only install/ on sys.path.
-    sys.path.insert(1, str(paths.ROOT))
+if __name__ == "__main__" and not __package__:
+    # Run as a script by the PATH wrappers and ./splash: import siblings as
+    # the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
 
 # The options serve shares with the server, in modules of the standard
 # library alone: the launcher runs before .venv exists.
 from server import serve_options
+
+from . import assembly, catalog, clients, paths
+from . import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -246,10 +243,15 @@ def serve(args):
         root, record = assembly.hold(selection.link, selection.models_root)
         if record is not None:
             os.set_inheritable(record.fileno(), True)
+        # The server package of this installation, from any working
+        # directory: -P keeps the directory, which may hold a package of the
+        # same name, off sys.path, and PYTHONPATH names the root.
         command = [
             str(paths.PYTHON),
             "-u",
-            str(ROOT / "server/server.py"),
+            "-P",
+            "-m",
+            "server.server",
             str(root),
             "--tokenizer",
             str(root / "tokenizer"),
@@ -265,6 +267,7 @@ def serve(args):
             os.environ,
             PYTHONUNBUFFERED="1",
             TRANSFORMERS_VERBOSITY="error",
+            PYTHONPATH=str(ROOT),
             **serve_options.serve_environment(args),
         )
         # Detached, because execve replaces this process a line later and a

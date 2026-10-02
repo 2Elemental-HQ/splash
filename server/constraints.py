@@ -12,15 +12,9 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
-if __package__:
-    from . import runtime as engine_runtime
-    from .errors import APIError, ConstraintError
-    from .tool_schema import THINK_END, THINK_END_TOKEN_ID
-else:
-    from errors import APIError, ConstraintError
-    from tool_schema import THINK_END, THINK_END_TOKEN_ID
-
-    import runtime as engine_runtime
+from . import runtime as engine_runtime
+from .errors import APIError, ConstraintError
+from .tool_schema import THINK_END, THINK_END_TOKEN_ID
 
 
 class TokenConstraint:

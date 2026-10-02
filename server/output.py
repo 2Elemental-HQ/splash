@@ -7,35 +7,19 @@ from dataclasses import dataclass
 from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
-if __package__:
-    from . import json_codec
-    from .errors import APIError
-    from .schema_validation import SchemaEvaluationError
-    from .tool_schema import (
-        FUNCTION_CLOSE,
-        FUNCTION_OPEN,
-        PARAMETER_CLOSE,
-        PARAMETER_OPEN,
-        THINK_END,
-        TOOL_CALL_OPEN,
-        json_value,
-        raw_string_schema,
-    )
-else:
-    import json_codec
-    from errors import APIError
-    from schema_validation import SchemaEvaluationError
-    from tool_schema import (
-        FUNCTION_CLOSE,
-        FUNCTION_OPEN,
-        PARAMETER_CLOSE,
-        PARAMETER_OPEN,
-        THINK_END,
-        TOOL_CALL_OPEN,
-        json_value,
-        raw_string_schema,
-    )
-
+from . import json_codec
+from .errors import APIError
+from .schema_validation import SchemaEvaluationError
+from .tool_schema import (
+    FUNCTION_CLOSE,
+    FUNCTION_OPEN,
+    PARAMETER_CLOSE,
+    PARAMETER_OPEN,
+    THINK_END,
+    TOOL_CALL_OPEN,
+    json_value,
+    raw_string_schema,
+)
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
 _SURROGATE = re.compile("[\ud800-\udfff]")

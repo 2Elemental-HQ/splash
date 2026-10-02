@@ -20,12 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import BinaryIO, Callable, Protocol, Sequence, TypeAlias
 
-if __package__:
-    from . import protocol as wire
-    from .crash_trace import CrashTraceRing
-else:  # Direct execution from the server directory.
-    import protocol as wire
-    from crash_trace import CrashTraceRing
+from . import protocol as wire
+from .crash_trace import CrashTraceRing
 
 
 class ProcessLike(Protocol):

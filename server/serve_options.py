@@ -12,13 +12,8 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
-if __package__:
-    from . import images, origins
-    from .http_security import validate_api_key
-else:
-    import images
-    import origins
-    from http_security import validate_api_key
+from . import images, origins
+from .http_security import validate_api_key
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 MAX_CONTEXT_TOKENS = 262144

@@ -779,7 +779,11 @@ responses alike, and `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit, which a complete Messages
 response leaves out. `make architecture-check` prevents lower layers from
-importing the HTTP entry module. `serve_options.py` defines the options
+importing the HTTP entry module, and keeps one import style in `server/` and
+`install/`: a module imports its package's modules relatively. The server
+runs as `python -m server.server`; `install/launcher.py`, `install/models.py`
+and `install/catalog.py`, which run as scripts, import their siblings through
+a PEP 366 header. `serve_options.py` defines the options
 `splash serve` shares with the server once, each with its check, default and
 help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
@@ -998,7 +1002,8 @@ logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data. A frame over 16 MiB, such as a request
 with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
-cannot be replayed.
+cannot be replayed. `python -m server.crash_trace <trace>`, run from the
+checkout root, replays a trace.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
