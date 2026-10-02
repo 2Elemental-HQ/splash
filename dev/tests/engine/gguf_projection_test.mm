@@ -14,6 +14,7 @@
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every embedding format's native rows is checked here too.
 #include "GgufFormatReference.hpp"
+#include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
@@ -102,7 +103,7 @@ struct Tensor {
 };
 
 MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes.size());
+  MetalBuffer buffer = test::sharedBuffer(backend, bytes.size());
   std::memcpy(buffer.contents(), bytes.data(), bytes.size());
   return buffer;
 }
@@ -233,7 +234,7 @@ struct Guarded {
   uint64_t bytes = 0;
   Guarded(MetalBackend &backend, uint64_t size, uint8_t fill) : bytes(size) {
     if (!size) return;
-    backing = backend.allocateBuffer(size + kGuardBytes);
+    backing = test::sharedBuffer(backend, size + kGuardBytes);
     std::memset(backing.contents(), fill, size);
     std::memset(static_cast<uint8_t *>(backing.contents()) + size, kGuardByte, kGuardBytes);
     view = backend.view(backing, 0, size);
@@ -647,7 +648,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   for (const auto &splits : splitPairs)
     for (uint32_t i = 0; i < 2; ++i) size.include(plan(i, splits[i]).scratchSize());
   const Scratch scratch(backend, size);
-  MetalBuffer poison = backend.allocateBuffer(size.partials);
+  MetalBuffer poison = test::sharedBuffer(backend, size.partials);
   std::vector<Operands> operands;
   std::vector<std::vector<uint16_t>> auxiliary;
   for (uint32_t i = 0; i < 2; ++i) {

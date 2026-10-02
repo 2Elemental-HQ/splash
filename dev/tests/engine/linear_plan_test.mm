@@ -1,4 +1,5 @@
 #include "AffineQ4Fixture.hpp"
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
@@ -1200,7 +1201,7 @@ void scalingContracts() {
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   if (!bytes) return {};
-  auto buffer = backend.allocateBuffer(bytes);
+  auto buffer = test::sharedBuffer(backend, bytes);
   std::memset(buffer.contents(), 0, bytes);
   return buffer;
 }

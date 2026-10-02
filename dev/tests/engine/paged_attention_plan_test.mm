@@ -1,3 +1,4 @@
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
@@ -215,7 +216,7 @@ struct Case final {
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   if (!bytes) return {};
-  auto buffer = backend.allocateBuffer(bytes);
+  auto buffer = test::sharedBuffer(backend, bytes);
   std::memset(buffer.contents(), 0, bytes);
   return buffer;
 }

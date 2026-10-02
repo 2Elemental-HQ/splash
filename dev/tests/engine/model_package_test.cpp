@@ -1,3 +1,4 @@
+#include "TestBuffers.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/PreparedFiles.hpp"
@@ -46,6 +47,7 @@ using splash::model::weightManifestFingerprint;
 using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::test::sharedBuffer;
 
 constexpr std::string_view kDraftLayerMagic = "MDFD0004";
 constexpr std::string_view kGgufImageMagic = "MDGG0001";
@@ -561,9 +563,9 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
     constexpr uint32_t gathered = 8;
-    const MetalBuffer tokens = backend.allocateBuffer(gathered * sizeof(uint32_t), BufferStorage::Shared);
+    const MetalBuffer tokens = sharedBuffer(backend, gathered * sizeof(uint32_t));
     const MetalBuffer output =
-        backend.allocateBuffer(uint64_t{gathered} * columns * splash::model::kBFloat16Bytes, BufferStorage::Shared);
+        sharedBuffer(backend, uint64_t{gathered} * columns * splash::model::kBFloat16Bytes);
     splash::metal::CommandGraph graph;
     splash::ops::Embedding::add(graph, tokens, table, output, gathered);
     for (const auto &[tokenBytes, outputBytes] :

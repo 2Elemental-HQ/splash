@@ -7,6 +7,7 @@
 // checked at fp32 accuracy from the kernel's own k/v and gates, after those
 // were checked against the reference; the hidden rows from the recurrent rows
 // read from that state with the reference q and rounded to bf16.
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -575,9 +576,9 @@ struct PreparedTables final {
       : layout(tableLayout), width(hiddenWidth), lanes(laneCount),
         tableSize(tableBytes(width, lanes * kRows)),
         sumsSize(tableSumsBytes(layout, width, lanes * kRows)),
-        table(backend.allocateBuffer(tableSize)), sums(backend.allocateBuffer(sumsSize)),
-        referenceTable(backend.allocateBuffer(tableSize)),
-        referenceSums(backend.allocateBuffer(sumsSize)) {}
+        table(sharedBuffer(backend, tableSize)), sums(sharedBuffer(backend, sumsSize)),
+        referenceTable(sharedBuffer(backend, tableSize)),
+        referenceSums(sharedBuffer(backend, sumsSize)) {}
 
   LinearScratch scratch() const { return {table, sums, {}, {}}; }
   void addReference(CommandGraph &graph, const MetalBuffer &hidden) const {
@@ -709,8 +710,8 @@ void rejectsInvalid(MetalBackend &backend) {
   });
   rejects([&] {
     auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = backend.allocateBuffer(16);
-    buffers.linearScratch.sums = backend.allocateBuffer(4);
+    buffers.linearScratch.input = sharedBuffer(backend, 16);
+    buffers.linearScratch.sums = sharedBuffer(backend, 4);
     GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
                    splash::ops::LinearInput::Table64);
   });
@@ -718,8 +719,8 @@ void rejectsInvalid(MetalBackend &backend) {
     // Sums sized for the affine table are below the GGUF table's.
     const uint32_t width = shape.valueHeads * shape.headDimension;
     auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = backend.allocateBuffer(tableBytes(width, kRows));
-    buffers.linearScratch.sums = backend.allocateBuffer(tableSumsBytes(LinearInput::Table64, width, kRows));
+    buffers.linearScratch.input = sharedBuffer(backend, tableBytes(width, kRows));
+    buffers.linearScratch.sums = sharedBuffer(backend, tableSumsBytes(LinearInput::Table64, width, kRows));
     GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
                    LinearInput::Table16);
   });

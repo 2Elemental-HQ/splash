@@ -401,7 +401,7 @@ struct CommandTicket::State {
         finish(timing, std::move(error));
     }
 
-    void finish(CommandTiming result, std::string failure = {}) {
+    void finish(CommandTiming result, std::string failure) {
         CommandCompletion notify;
         {
             std::lock_guard lock(mutex);
@@ -1081,11 +1081,8 @@ CommandTiming MetalBackend::submitCommand(
     return submitCommandAsync(dispatches).wait();
 }
 
-CommandTicket MetalBackend::submitAsync(
-    const ComputeDispatch &dispatch, CommandCompletion completion) {
-    return submitCommandAsync(
-        std::span<const ComputeDispatch>(&dispatch, 1),
-        std::move(completion));
+CommandTicket MetalBackend::submitAsync(const ComputeDispatch &dispatch) {
+    return submitCommandAsync(std::span<const ComputeDispatch>(&dispatch, 1));
 }
 
 CommandTicket MetalBackend::submitCommandAsync(

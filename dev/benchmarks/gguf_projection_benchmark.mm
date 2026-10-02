@@ -45,7 +45,7 @@ std::vector<std::string> split(const std::string &text, char separator) {
 }
 
 MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes.size());
+  MetalBuffer buffer = backend.allocateBuffer(bytes.size(), metal::BufferStorage::Shared, "projection operand");
   std::memcpy(buffer.contents(), bytes.data(), bytes.size());
   return buffer;
 }
@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
       }
       const auto zeros = [&](uint64_t n) {
         if (!n) return MetalBuffer{};
-        MetalBuffer b = backend.allocateBuffer(n);
+        MetalBuffer b = backend.allocateBuffer(n, metal::BufferStorage::Shared, "projection scratch");
         std::memset(b.contents(), 0, n);
         return b;
       };

@@ -244,15 +244,15 @@ public:
   // reach KV extents: residency makes it resident for every command, so no
   // command names it.
   [[nodiscard]] MetalBuffer
-  allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
-                 std::string_view label = {});
+  allocateBuffer(uint64_t bytes, BufferStorage storage,
+                 std::string_view label);
 
   // Wraps page-aligned shared memory without copying it. The lifetime token
   // is retained by Metal's deallocator, including any internal buffer owners
   // that outlive our C++ views and completed tickets.
   [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
                                              std::shared_ptr<void> lifetime,
-                                             std::string_view label = {});
+                                             std::string_view label);
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
 
@@ -268,9 +268,7 @@ public:
   // notifies host control flow; command results and errors are consumed from
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
-  [[nodiscard]] CommandTicket
-  submitAsync(const ComputeDispatch &dispatch,
-              CommandCompletion completion = {});
+  [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});

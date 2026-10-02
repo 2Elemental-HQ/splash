@@ -1,6 +1,7 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/ScopedTestConfig.hpp"
+#include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
@@ -319,7 +320,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   // 0 starts its extent, so its entry is the extent's address.
   std::byte *const base = pages.spans(0).front().data();
   const uint64_t address = test::entryOf(
-      pages, 0, backend.allocateBuffer(sizeof(SplashKvPage)));
+      pages, 0, test::sharedBuffer(backend, sizeof(SplashKvPage)));
   const auto slabs = [&](uint32_t page, std::vector<uint64_t> &table) {
     for (const auto span : pages.spans(page)) {
       if (span.size() == data) table.push_back(address + static_cast<uint64_t>(span.data() - base));
@@ -331,12 +332,12 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
     if (page != restored) slabs(page, around);
   }
   const auto tableOf = [&](const std::vector<uint64_t> &entries) {
-    metal::MetalBuffer table = backend.allocateBuffer(entries.size() * sizeof(uint64_t));
+    metal::MetalBuffer table = test::sharedBuffer(backend, entries.size() * sizeof(uint64_t));
     std::memcpy(table.contents(), entries.data(), entries.size() * sizeof(uint64_t));
     return table;
   };
   const metal::MetalBuffer ownTable = tableOf(own), aroundTable = tableOf(around);
-  metal::MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
+  metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
   auto *mismatched = static_cast<uint32_t *>(mismatches.contents());
   // Writes seed ^ (131071 * entry + word) to every word of every slab of a
   // table, or counts the words that hold something else.

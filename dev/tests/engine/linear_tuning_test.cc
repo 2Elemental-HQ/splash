@@ -1,4 +1,5 @@
 #include "AffineQ4Fixture.hpp"
+#include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "tuning/LinearTuning.hpp"
 
@@ -330,7 +331,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   uint64_t gateBytes = 0;
   for (const auto &plan : plans) gateBytes = std::max(gateBytes, plan.gateScratchBytes());
   const auto allocate = [&](uint64_t bytes) {
-    return bytes ? backend.allocateBuffer(bytes) : metal::MetalBuffer{};
+    return bytes ? test::sharedBuffer(backend, bytes) : metal::MetalBuffer{};
   };
   LinearBuffers buffers{
       allocate(uint64_t{baseline.storageRows()} * workload.matrix.inputSize * 2),

@@ -1,3 +1,4 @@
+#include "TestBuffers.hpp"
 #include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/TestChecks.hpp"
@@ -147,9 +148,9 @@ void run(const std::string &metallib) {
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
         "an extent of a part of an alignment unit was accepted");
 
-    metal::MetalBuffer table = backend.allocateBuffer(4 * sizeof(SplashKvPage));
-    const metal::MetalBuffer probe = backend.allocateBuffer(sizeof(SplashKvPage));
-    metal::MetalBuffer word = backend.allocateBuffer(sizeof(uint32_t));
+    metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(SplashKvPage));
+    const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(SplashKvPage));
+    metal::MetalBuffer word = test::sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
     const uint64_t extentBytes = 128 * kvLayout.bytesPerModelPage();
