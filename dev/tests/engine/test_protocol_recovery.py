@@ -122,6 +122,16 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 self.assertEqual(status, 200, payload)
                 self.assertIn(b"because ", payload)
 
+    def test_chat_body_cannot_set_thinking_display(self):
+        # Only Messages hides reasoning, through its thinking.display.
+        harness = self.harness(FakeRuntime(Plan([[1], [2], [3]])))
+        body = request_body(thinking_display="omitted")
+        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "because ")
+        self.assertEqual(harness.app.prepare(body).thinking_display, "summarized")
+
     def test_omitted_tool_roundtrip_and_summarized_compatibility(self):
         codec = ThinkingCodec()
         signature = codec.encode("inspect before acting")

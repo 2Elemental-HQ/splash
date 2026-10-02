@@ -526,25 +526,27 @@ class Frontend:
     def prepare(
         self,
         body,
-        tool_namespaces=None,
         *,
         deadline=None,
         output_field=None,
         clamp_output_budget=False,
+        thinking_display="summarized",
     ):
-        """A Chat request, or another API's request converted to Chat.
+        """A Chat request, or a Messages request converted to Chat.
         Output limit errors name output_field, that API's own field; with
         clamp_output_budget, a limit larger than what the context leaves is
-        lowered to it instead of refused."""
+        lowered to it instead of refused. thinking_display "omitted" hides
+        Messages reasoning behind a signature."""
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             return self._prepare(
                 body,
-                tool_namespaces,
+                None,
                 deadline,
                 output_field=output_field,
                 clamp_output_budget=clamp_output_budget,
+                thinking_display=thinking_display,
             )
 
     def prepare_completion(self, body, *, deadline=None):
@@ -607,7 +609,7 @@ class Frontend:
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
-            prompt = self._prepare_prompt(body, deadline=deadline)
+            prompt = self._prepare_prompt(body, None, deadline=deadline)
             rendered = self._render_prompt(prompt, deadline, check_context=False)
             return self._image_token_count(
                 rendered.tokens, rendered.images, rendered.image_positions
@@ -792,7 +794,7 @@ class Frontend:
         if deadline is None:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
-            prompt = self._prepare_prompt(body, deadline=deadline)
+            prompt = self._prepare_prompt(body, None, deadline=deadline)
             return self._render_prompt(
                 prompt,
                 deadline,
@@ -829,7 +831,7 @@ class Frontend:
                 self.preparation_active -= 1
             self.preparation_slots.release()
 
-    def _prepare_prompt(self, body, tool_namespaces=None, *, deadline=None):
+    def _prepare_prompt(self, body, tool_namespaces, *, deadline=None):
         if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
@@ -959,8 +961,9 @@ class Frontend:
         tool_namespaces,
         deadline,
         *,
-        output_field=None,
-        clamp_output_budget=False,
+        output_field,
+        clamp_output_budget,
+        thinking_display,
     ):
         body = _drop_nulls(
             body,
@@ -1053,9 +1056,7 @@ class Frontend:
             max_new,
             deadline,
             thinking=thinking,
-            thinking_display=(
-                "omitted" if body.get("thinking_display") == "omitted" else "summarized"
-            ),
+            thinking_display=thinking_display,
             tool_policy=tool_policy,
             response_validator=response_validator,
             response_format=body.get("response_format"),
@@ -1207,10 +1208,14 @@ class Frontend:
                     reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
             items = [*previous_items, *canonical_responses_input(body.get("input"))]
-            chat = responses_to_chat_body(body, items)
-            namespaces = chat.pop("_tool_namespaces")
+            chat, namespaces = responses_to_chat_body(body, items)
             job = self._prepare(
-                chat, namespaces, deadline, output_field="max_output_tokens"
+                chat,
+                namespaces,
+                deadline,
+                output_field="max_output_tokens",
+                clamp_output_budget=False,
+                thinking_display="summarized",
             )
             job.response_store = store
             job.response_previous_id = previous_id

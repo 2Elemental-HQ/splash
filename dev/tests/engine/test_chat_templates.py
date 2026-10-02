@@ -748,9 +748,9 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "Continue"},
             ],
         }
-        chat = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
-            harness.app._prepare_prompt(chat), float("inf"), check_context=False
+            harness.app._prepare_prompt(chat, None), float("inf"), check_context=False
         ).text
         self.assertTrue(
             prompt.startswith(
@@ -850,7 +850,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "developer", "content": "Developer"},
                 {"role": "user", "content": "Ask"},
             ],
-        )["messages"]
+        )[0]["messages"]
         anthropic = api_shapes.anthropic_to_chat_prompt(
             {
                 "model": "m",

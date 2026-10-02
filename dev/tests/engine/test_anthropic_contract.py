@@ -138,7 +138,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 body = request_body(**fields)
                 original = copy.deepcopy(body)
-                translated = anthropic_to_chat_body(
+                translated, _ = anthropic_to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 self.assertEqual(body, original)
@@ -427,7 +427,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
         ):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
-                translated = anthropic_to_chat_body(
+                translated, _ = anthropic_to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 # Conversion leaves the PDF to request preparation.

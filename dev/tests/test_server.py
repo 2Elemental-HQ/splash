@@ -2130,7 +2130,7 @@ class ServerTest(unittest.TestCase):
                             ],
                         }
                     ],
-                )["messages"],
+                )[0]["messages"],
                 "anthropic": anthropic(
                     {
                         "model": "m",
@@ -2717,11 +2717,10 @@ class ServerTest(unittest.TestCase):
                         self.assertEqual(status, 200, payload)
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
-                job = harness.app.prepare(
-                    api.anthropic_to_chat_body(
-                        {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
-                    )
+                chat, _ = api.anthropic_to_chat_body(
+                    {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
                 )
+                job = harness.app.prepare(chat)
                 self.assertEqual(counted["input_tokens"], len(job.prompt_tokens))
                 self.assertEqual(job.request_id, index + 1)
                 counts.append(counted["input_tokens"])
@@ -2755,18 +2754,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(json.loads(payload), {"input_tokens": 130})
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
-        with self.assertRaisesRegex(api.APIError, "context window"):
-            harness.app.prepare(
-                api.anthropic_to_chat_body(
-                    {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
-                )
-            )
-        harness.app.max_context = 256
-        job = harness.app.prepare(
-            api.anthropic_to_chat_body(
-                {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
-            )
+        chat, _ = api.anthropic_to_chat_body(
+            {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
         )
+        with self.assertRaisesRegex(api.APIError, "context window"):
+            harness.app.prepare(chat)
+        harness.app.max_context = 256
+        job = harness.app.prepare(chat)
         self.assertEqual(len(job.prompt_tokens), 130)
         del job
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
@@ -2839,7 +2833,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(harness.backend.runtime.requests, [])
 
     def test_anthropic_tool_history_and_choice_use_one_chat_pipeline(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 system=[{"type": "text", "text": "be exact"}],
                 messages=[
@@ -2899,7 +2893,7 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(translated["parallel_tool_calls"])
 
     def test_anthropic_adaptive_thinking_maps_reasoning_effort(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
@@ -2907,7 +2901,7 @@ class ServerTest(unittest.TestCase):
             thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(translated["reasoning_effort"], "high")
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "low"},
@@ -2946,7 +2940,7 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_strips_nonsemantic_billing_system_block(self):
         def translated(metadata):
-            return api.anthropic_to_chat_body(
+            chat, _ = api.anthropic_to_chat_body(
                 self.anthropic_body(
                     system=[
                         {
@@ -2963,6 +2957,7 @@ class ServerTest(unittest.TestCase):
                 ),
                 thinking_resolver=no_signed_thinking,
             )
+            return chat
 
         first = translated("one")
         self.assertEqual(first, translated("two"))
@@ -2972,7 +2967,7 @@ class ServerTest(unittest.TestCase):
         )
 
     def test_anthropic_preserves_inline_system_messages(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 messages=[
                     {"role": "user", "content": "hello"},
@@ -6016,7 +6011,7 @@ class ServerTest(unittest.TestCase):
             body = self.anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
                 body["thinking"] = thinking
-            chat = api.anthropic_to_chat_body(
+            chat, _ = api.anthropic_to_chat_body(
                 body, thinking_resolver=no_signed_thinking
             )
             job = app.prepare(chat)
@@ -6129,7 +6124,7 @@ class ServerTest(unittest.TestCase):
                     },
                 )
                 original = json.dumps(body, sort_keys=True)
-                prompt = harness.app._prepare_prompt(body)
+                prompt = harness.app._prepare_prompt(body, None)
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
                 self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)
@@ -6225,7 +6220,9 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_effort_is_preserved_until_the_template_renders(self):
         harness = self.harness(FakeRuntime())
-        prompt = harness.app._prepare_prompt(self.body(reasoning_effort="minimal"))
+        prompt = harness.app._prepare_prompt(
+            self.body(reasoning_effort="minimal"), None
+        )
         self.assertEqual(prompt.reasoning_effort, "minimal")
         job = harness.app.prepare(self.body(reasoning_effort="minimal"))
         self.assertTrue(job.thinking)
@@ -8731,7 +8728,7 @@ class ServerTest(unittest.TestCase):
                 "name": first_name,
             },
         )
-        translated = api_shapes.responses_to_chat_body(body, body["input"])
+        translated, namespaces = api_shapes.responses_to_chat_body(body, body["input"])
         aliases = [tool["function"]["name"] for tool in translated["tools"]]
         self.assertEqual([len(alias) for alias in aliases], [64, 64])
         self.assertNotEqual(aliases[0], aliases[1])
@@ -8739,10 +8736,7 @@ class ServerTest(unittest.TestCase):
             translated["tool_choice"],
             {"type": "function", "function": {"name": aliases[0]}},
         )
-        self.assertEqual(
-            translated["_tool_namespaces"][aliases[0]],
-            (namespace, first_name),
-        )
+        self.assertEqual(namespaces[aliases[0]], (namespace, first_name))
         self.assertEqual(_namespace_alias(namespace, first_name), aliases[0])
 
     def test_responses_streaming_tool_call_and_failed_event(self):

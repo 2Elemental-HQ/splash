@@ -695,13 +695,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     400, "return_progress requires stream: true and must be a boolean"
                 )
             if anthropic:
+                chat, thinking_display = anthropic_to_chat_body(
+                    body, thinking_resolver=self.app.thinking_codec.decode
+                )
                 job = self.app.prepare(
-                    anthropic_to_chat_body(
-                        body, thinking_resolver=self.app.thinking_codec.decode
-                    ),
+                    chat,
                     deadline=deadline,
                     output_field="max_tokens",
                     clamp_output_budget=True,
+                    thinking_display=thinking_display,
                 )
                 stream_options = None
             elif responses:

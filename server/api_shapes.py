@@ -499,8 +499,6 @@ def _response_function(tool, name=None):
 
 
 def normalize_responses_tools(tools):
-    if tools is None:
-        return None
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array")
     output, namespaces = [], {}
@@ -551,8 +549,9 @@ def _responses_format(text):
 
 
 def responses_to_chat_body(body, items):
-    """A Responses request as a Chat body; `items` are its canonical input
-    items after those of the response it continues."""
+    """A Responses request as a Chat body, and the namespace and name of
+    each namespaced tool by its alias. `items` are the request's canonical
+    input items after those of the response it continues."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
@@ -606,8 +605,7 @@ def responses_to_chat_body(body, items):
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
-    chat["_tool_namespaces"] = namespaces
-    return chat
+    return chat, namespaces
 
 
 def _anthropic_system_text(value, label):
@@ -663,8 +661,9 @@ def _anthropic_content(value, label):
 
 
 def anthropic_to_chat_body(body, *, thinking_resolver):
-    """A Messages generation request as a Chat body. count_tokens converts
-    only the prompt, so it still counts a final assistant message."""
+    """A Messages generation request as a Chat body, and how its response
+    shows reasoning. count_tokens converts only the prompt, so it still
+    counts a final assistant message."""
     max_tokens = body.get("max_tokens")
     if (
         not isinstance(max_tokens, int)
@@ -674,7 +673,7 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         raise APIError(400, "max_tokens must be a positive integer")
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
-    chat = anthropic_to_chat_prompt(body, thinking_resolver=thinking_resolver)
+    chat, thinking_display = _anthropic_chat(body, thinking_resolver)
     # Anthropic continues a final assistant message (a prefill); Splash would
     # close that turn and start another, so it refuses it.
     if body["messages"][-1]["role"] == "assistant":
@@ -693,7 +692,8 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         timeout=body.get("timeout"),
         priority=body.get("priority"),
     )
-    return {key: value for key, value in chat.items() if value is not None}
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
 
 def _anthropic_preserve_thinking(context_management):
@@ -718,7 +718,45 @@ def _anthropic_preserve_thinking(context_management):
     return True if edits else None
 
 
+def _anthropic_thinking(thinking, effort):
+    """The reasoning effort and the reasoning display of a Messages
+    request's thinking, which is off when omitted."""
+    if thinking is None:
+        return "none", "summarized"
+    if not isinstance(thinking, dict) or thinking.get("type") not in (
+        "enabled",
+        "disabled",
+        "adaptive",
+    ):
+        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
+    thinking_type = thinking["type"]
+    display = thinking.get("display")
+    if "display" in thinking:
+        if thinking_type == "disabled":
+            raise APIError(
+                400, "thinking.display requires enabled or adaptive thinking"
+            )
+        if display not in (None, "summarized", "omitted", "updates"):
+            raise APIError(
+                400,
+                "thinking.display must be summarized, omitted, updates, or null",
+            )
+    return (
+        "none" if thinking_type == "disabled" else effort,
+        # Models expose reasoning and text, not separate progress-update blocks.
+        "omitted" if display in ("omitted", "updates") else "summarized",
+    )
+
+
 def anthropic_to_chat_prompt(body, *, thinking_resolver):
+    """The prompt of a Messages request as a Chat body, as count_tokens
+    counts it."""
+    return _anthropic_chat(body, thinking_resolver)[0]
+
+
+def _anthropic_chat(body, thinking_resolver):
+    """A Messages request's prompt as a Chat body, and how its response
+    shows reasoning."""
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise APIError(400, "model must be a non-empty string")
     preserve_thinking = _anthropic_preserve_thinking(body.get("context_management"))
@@ -884,44 +922,16 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
     if system_text:
         translated.insert(0, {"role": "system", "content": system_text})
 
+    reasoning_effort, thinking_display = _anthropic_thinking(
+        body.get("thinking"), effort
+    )
     chat = {
         "model": body["model"],
         "messages": translated,
         "response_format": response_format,
         "preserve_thinking": preserve_thinking,
+        "reasoning_effort": reasoning_effort,
     }
-    thinking = body.get("thinking")
-    if thinking is None:
-        chat["reasoning_effort"] = "none"
-    elif not isinstance(thinking, dict) or thinking.get("type") not in (
-        "enabled",
-        "disabled",
-        "adaptive",
-    ):
-        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
-    else:
-        thinking_type = thinking["type"]
-        if "display" in thinking:
-            if thinking_type == "disabled":
-                raise APIError(
-                    400, "thinking.display requires enabled or adaptive thinking"
-                )
-            display = thinking["display"]
-            if display not in (None, "summarized", "omitted", "updates"):
-                raise APIError(
-                    400,
-                    "thinking.display must be summarized, omitted, updates, or null",
-                )
-            # Models expose reasoning and text, not separate progress-update blocks.
-            chat["thinking_display"] = (
-                "omitted" if display in ("omitted", "updates") else "summarized"
-            )
-        if thinking_type == "disabled":
-            chat["reasoning_effort"] = "none"
-        elif thinking_type == "adaptive":
-            chat["reasoning_effort"] = effort
-        else:
-            chat["reasoning_effort"] = effort
 
     tools = body.get("tools")
     if tools is not None:
@@ -972,7 +982,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
         else:
             raise APIError(400, "invalid Anthropic tool_choice")
-    return {key: value for key, value in chat.items() if value is not None}
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
 
 def responses_response(model, job, status, output, result=None, error=None):
