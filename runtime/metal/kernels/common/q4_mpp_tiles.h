@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/split_reduce.h"
 
 // Q4 (4-bit, group 64) tiles shared by dense and MoE projections. A
@@ -105,11 +106,10 @@ q4_store_output(thread Sums &sums_0, thread Sums &sums_1, ushort i,
   if constexpr (GateUp) {
     float gate = float(bfloat(sums_0[i]));
     float up = float(bfloat(sums_1[i]));
-    value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
+    value = splash_silu(gate) * up;
   } else if constexpr (MultiplySiluGate) {
     float gate = float(auxiliary[index]);
-    value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) *
-            float(bfloat(sums_0[i]));
+    value = splash_silu(gate) * float(bfloat(sums_0[i]));
   } else if constexpr (is_same_v<Out, float>) {
     value = sums_0[i];
   } else {

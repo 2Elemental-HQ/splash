@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
 // W: the q/k norm weights' stored type (float: a GGUF's F32 norms, _f32).
@@ -46,7 +47,7 @@ inline void full_attention_gate_prefill_phase(
     uint dim = remainder % HeadDim;
     float gate = float(packed_qkv[ulong(row) * PackedStride +
                                   query_head * QStride + HeadDim + dim]);
-    float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+    float gate_scale = splash_sigmoid(gate);
     uint kv_head = query_head / HeadsPerKV;
     uint local_head = query_head % HeadsPerKV;
     hidden[element] = bfloat(
@@ -55,7 +56,7 @@ inline void full_attention_gate_prefill_phase(
                          local_head) *
                             HeadDim +
                         dim]) *
-        sigmoid);
+        gate_scale);
   }
 }
 

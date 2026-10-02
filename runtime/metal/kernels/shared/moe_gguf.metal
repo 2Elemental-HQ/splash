@@ -1,6 +1,7 @@
 // GGUF MoE experts on the staged decode tile (kernels/common/gguf_staged_tile.h); the Apple9 register form is in
 // kernels/decode/linear_gguf_sgmatrix.metal.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
@@ -38,7 +39,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     gguf_elements(acc, [&](uint row, uint column, float v) {
       // gguf_epilogue inline: calling it here reorders the lambda's captures.
       const ulong o = out + ulong(row) * p.output_size + origin + column;
-      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
       output[o] = bfloat(v);
     });
   };

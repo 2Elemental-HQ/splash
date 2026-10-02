@@ -6,6 +6,7 @@
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -134,7 +135,7 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
     // gguf_epilogue inline: calling it here reorders the lambda's captures.
     const ulong o = ulong(row) * p.out_stride + column0 + column;
     if constexpr (Ep == EpResidual) v += float(aux[o]);
-    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+    if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
     output[o] = Out(v);
   });
 }

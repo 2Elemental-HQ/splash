@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
 kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
@@ -123,7 +124,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
       auto index = accumulated.get_multidimensional_index(i);
       float gate =
           float(auxiliary[index[1] * output_size + output_origin + index[0]]);
-      value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * value;
+      value = splash_silu(gate) * value;
     }
     if constexpr (AddResidual) {
       auto index = accumulated.get_multidimensional_index(i);

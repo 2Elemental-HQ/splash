@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
@@ -334,8 +335,7 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     for (uint partial = 0; partial < Simdgroups; ++partial)
       total += scalar_partials[partial];
     selected[row_routes + params.top_k] = params.experts;
-    routing_weights[row_routes + params.top_k] =
-        1.0f / (1.0f + fast::exp2(-1.44269504089f * total));
+    routing_weights[row_routes + params.top_k] = splash_sigmoid(total);
   }
   if (simd_group != 0)
     return;

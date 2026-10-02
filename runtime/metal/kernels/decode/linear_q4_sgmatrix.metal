@@ -2,6 +2,7 @@
 // lets the compiler reassociate, so the epilogue order below is fixed. Set
 // before the includes, so it also holds for their code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 #include "metal/kernels/common/q4_sgmatrix.h"
 #include "metal/kernels/common/sgmatrix.h"
@@ -115,7 +116,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   if (gateUp) {
     const uint n = base + fm;
     const float2 gate = float2(bfloat2(acc[0])), up = float2(bfloat2(acc[1]));
-    const float2 value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
+    const float2 value = splash_silu(gate) * up;
     out[fn * N + n] = bfloat(value.x);
     out[(fn + 1) * N + n] = bfloat(value.y);
   } else {

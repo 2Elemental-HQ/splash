@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 
 // Four-tap causal convolution of one channel at one token of the command,
 // reading the three preceding tokens from the carried state, rounded to bf16
@@ -19,7 +20,7 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));
-  return bfloat(value / (1.0f + fast::exp2(-1.44269504089f * value)));
+  return bfloat(splash_silu(value));
 }
 
 // Row `row` of the carried state after consumed_tokens: the last three inputs
@@ -47,7 +48,7 @@ inline GdnGates gdn_gates(device const bfloat *packed_row,
                           uint a_offset, uint head) {
   float b = float(packed_row[b_offset + head]);
   GdnGates gates;
-  gates.beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
+  gates.beta = bfloat(splash_sigmoid(b));
   bfloat x = bfloat(float(packed_row[a_offset + head]) + float(dt_bias[head]));
   float xf = float(x);
   bfloat softplus =
@@ -104,6 +105,6 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * scratch[0] * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
+  float silu = splash_silu(gate);
   hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
 }

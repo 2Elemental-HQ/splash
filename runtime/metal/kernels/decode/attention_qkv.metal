@@ -1,5 +1,6 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
 template <uint QHeads, uint KHeads, class W>
@@ -70,7 +71,7 @@ inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
   float gate = float(
       packed_qkv[(ulong(batch) * Rows + row) * PackedStride +
                  query_head * QStride + HeadDim + dim]);
-  float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+  float gate_scale = splash_sigmoid(gate);
   uint kv_head = query_head / HeadsPerKV;
   uint local_head = query_head % HeadsPerKV;
   ulong attention_index =
@@ -79,7 +80,7 @@ inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
        local_head) *
           HeadDim +
       dim;
-  return bfloat(float(attention[attention_index]) * sigmoid);
+  return bfloat(float(attention[attention_index]) * gate_scale);
 }
 
 template <uint QHeads, uint KHeads>

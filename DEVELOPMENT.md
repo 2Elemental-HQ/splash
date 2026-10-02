@@ -709,9 +709,10 @@ up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>`. The norm, GDN and
 attention-gate variants that also write a register kernel's input table carry `table64` (the
-affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds and SiLU of
-both GGUF families are in `kernels/common/gguf_tile.h`, and the MMA helpers every register
-kernel uses, affine, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds of both GGUF
+families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, affine, GGUF or
+fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
