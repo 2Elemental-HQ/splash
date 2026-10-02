@@ -253,9 +253,9 @@ std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) con
                                              : std::move(prefill);
   }
 
-  // Prefill and fixed-eight decode use different Metal graphs and cannot be
-  // packed into one command. Honor request priority first. Then decode runs
-  // while prefill owes it time, and otherwise the kinds alternate at command
+  // Prefill and decode use different Metal graphs and cannot be packed into
+  // one command. Honor request priority first. Then decode runs while
+  // prefill owes it time, and otherwise the kinds alternate at command
   // boundaries so equal-priority work cannot starve.
   if (decodeDebtMilliseconds_ > 0.0)
     return decode;

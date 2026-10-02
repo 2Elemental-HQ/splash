@@ -888,7 +888,7 @@ void testContract() {
           kPageTokens,
       {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
-          "final fixed-eight verification rows exceeded physical KV scratch");
+          "the final cycle's verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its fixed seven-row allowance");

@@ -893,7 +893,7 @@ void testDecodeCommandContainsOnePriorityTier() {
   BatchPlan plan = *scheduler.next({});
   require(plan.kind == WorkKind::Decode && plan.width() == 1 &&
               plan.items[0].requestId == 1,
-          "fixed-eight decode mixed priority tiers in one command");
+          "a decode command mixed priority tiers");
   scheduler.commit(plan, {});
   const std::array result{
       StepResult{1, 0, true, DecodeStage::Regular}};

@@ -641,10 +641,6 @@ void testCapacityFailureHasOneTerminalFrame() {
           "request-scoped capacity failure made the engine unhealthy");
 }
 
-// A verify step can retain every row and add the terminal anchor; the wire
-// limit the production binary derives from ExecutionLimits must carry that
-// step in one TokensEvent, and an event that cannot be encoded must surface
-// as an engine error rather than a silently shorter stream.
 void testCommandWatchdogAndPendingHealthWake() {
   metal::CommandWatchdog generations;
   generations.start(1, 0.0);
@@ -1154,6 +1150,10 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
   }
 }
 
+// A verify step can retain every row and add the terminal anchor; the wire
+// limit the production binary derives from ExecutionLimits must carry that
+// step in one TokensEvent, and an event that cannot be encoded must surface
+// as an engine error rather than a silently shorter stream.
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
     test::TestKvStorage storage(32, 4096, 4);

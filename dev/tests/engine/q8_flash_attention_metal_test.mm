@@ -50,7 +50,7 @@ void testContract() {
       splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
-          "final fixed-eight verification rows exceeded physical KV scratch");
+          "the final cycle's verification rows exceeded physical KV scratch");
   require(verifyAttentionSplits(0) == kVerifySplits &&
               verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
               verifyAttentionSplits(131072) == kVerifyMaximumSplits,
