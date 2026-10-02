@@ -833,13 +833,15 @@ Proxy consumers can use these fields; additional fields may be added:
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
 
-`GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
-require the API key when authentication is enabled. Consumers should tolerate
-missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat and text completion streams include token usage when
-the request sets `"stream_options":{"include_usage":true}`; their non-streaming
-responses always include usage. A proxy must consume these fields to display
-statistics.
+`GET /metrics` exposes the same counters in Prometheus text format.
+`splash_kv_free_allocated_pages` counts free pages of allocated extents, not
+remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Both
+endpoints require the API key when authentication is enabled. Consumers should
+tolerate missing native fields while the engine is unavailable, and counter
+resets after an engine restart. Chat and text completion streams include token
+usage when the request sets `"stream_options":{"include_usage":true}`; their
+non-streaming responses always include usage. A proxy must consume these fields
+to display statistics.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,

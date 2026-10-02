@@ -1152,6 +1152,8 @@ class ServerTest(unittest.TestCase):
                         "pages_cache": 4,
                         "pages_free": 2,
                         "allocated_bytes": 8192,
+                        "extent_allocate_max_ms": 2.5,
+                        "extent_release_max_ms": 0.75,
                     },
                     "state": {
                         "entries": 2,
@@ -1226,8 +1228,12 @@ class ServerTest(unittest.TestCase):
             metrics,
         )
         self.assertIn("splash_kv_pages_allocated 8", metrics)
-        self.assertIn("splash_kv_pages_free 2", metrics)
+        self.assertIn("splash_kv_free_allocated_pages 2", metrics)
+        self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
         self.assertIn("splash_kv_allocated_bytes 8192", metrics)
+        self.assertIn("splash_kv_extent_allocate_max_milliseconds 2.5", metrics)
+        self.assertIn("splash_kv_extent_release_max_milliseconds 0.75", metrics)
+        self.assertFalse([line for line in metrics if "_max_ms " in line])
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
