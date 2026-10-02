@@ -39,8 +39,20 @@ struct PreparedWeight {
 
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
 void writeWeightBytes(int descriptor, uint64_t offset, std::span<const uint8_t> bytes);
+// The lowercase hex SHA-256 of bytes or text.
 [[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
 [[nodiscard]] std::string weightDigest(std::string_view text);
+// A SHA-256 digest in lowercase hex.
+[[nodiscard]] inline std::string digestHex(std::span<const uint8_t, 32> digest) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(2 * digest.size());
+  for (uint8_t byte : digest) {
+    result += digits[byte >> 4];
+    result += digits[byte & 15];
+  }
+  return result;
+}
 
 // A source file, opened once; checkUnchanged throws when it was modified or
 // replaced since. Its parser reads the metadata through descriptor() and

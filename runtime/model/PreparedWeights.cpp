@@ -84,16 +84,6 @@ private:
   Descriptor file_;
 };
 
-std::string hex(const unsigned char *digest) {
-  constexpr char digits[] = "0123456789abcdef";
-  std::string result;
-  for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
-    result += digits[digest[i] >> 4];
-    result += digits[digest[i] & 15];
-  }
-  return result;
-}
-
 // Whether two stats describe the same, unmodified file.
 bool sameFile(const struct stat &a, const struct stat &b) {
   return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
@@ -130,7 +120,7 @@ std::string fileDigest(int fd, uint64_t from, const PreparationCheck &check) {
   if (!sameFile(before, after)) throw std::runtime_error("weight file changed while reading");
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
   CC_SHA256_Final(digest, &context);
-  return hex(digest);
+  return digestHex(digest);
 }
 
 // The proof of a hashed file names the digest of its bytes [from, end) and
@@ -419,7 +409,7 @@ std::string weightDigest(std::span<const uint8_t> bytes) {
     throw std::overflow_error("weight identity is too large");
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
   CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()), digest);
-  return hex(digest);
+  return digestHex(digest);
 }
 
 std::string weightDigest(std::string_view text) {

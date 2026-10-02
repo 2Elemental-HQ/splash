@@ -3,6 +3,7 @@
 #include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/PreparedWeights.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -93,17 +94,6 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
   return result;
 }
 
-std::string digestHex(const std::array<uint8_t, 32> &digest) {
-  constexpr char hex[] = "0123456789abcdef";
-  std::string result;
-  result.reserve(digest.size() * 2);
-  for (uint8_t byte : digest) {
-    result.push_back(hex[byte >> 4]);
-    result.push_back(hex[byte & 0x0f]);
-  }
-  return result;
-}
-
 } // namespace
 
 void requireLoadedModel(const model::ModelPackage &package) {
@@ -149,10 +139,10 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   // Parsing rejects a malformed manifest digest before the KV pool and the
   // cache are built.
   RuntimeCacheIdentity result;
-  result.modelLayoutSha256 = digestHex(parseSha256(combinedManifestSha256));
+  result.modelLayoutSha256 = model::digestHex(parseSha256(combinedManifestSha256));
   result.buildId = buildId;
   result.kvLayout = targetKvLayout;
-  result.targetModelSha256 = digestHex(parseSha256(targetManifestSha256));
+  result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
   return result;
 }
 

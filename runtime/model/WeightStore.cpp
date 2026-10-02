@@ -5,14 +5,10 @@
 #include "model/GgufImageLayout.hpp"
 #include "model/PreparedWeights.hpp"
 
-#include <CommonCrypto/CommonDigest.h>
-
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <limits>
 #include <sstream>
 #include <system_error>
 #include <tuple>
@@ -363,23 +359,7 @@ std::string weightManifestFingerprint(
         if (!record.contentIdentity.empty()) canonical << '\t' << record.contentIdentity;
         canonical << '\n';
     }
-    std::string value = canonical.str();
-    if (value.size() > std::numeric_limits<CC_LONG>::max()) {
-        throw WeightStoreError("manifest is too large to fingerprint");
-    }
-    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
-    if (!CC_SHA256(value.data(), static_cast<CC_LONG>(value.size()),
-                   digest.data())) {
-        throw WeightStoreError("unable to calculate manifest SHA-256");
-    }
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(digest.size() * 2);
-    for (unsigned char byte : digest) {
-        result.push_back(hex[byte >> 4]);
-        result.push_back(hex[byte & 0x0f]);
-    }
-    return result;
+    return weightDigest(canonical.str());
 }
 
 } // namespace splash::model
