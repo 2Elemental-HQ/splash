@@ -1165,7 +1165,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
   constexpr uint32_t lanes = 2;
   Sampling sampling(vocabulary);
   const std::array<SamplingPolicy, lanes> policies{
-      SamplingPolicy{.topK = 1, .temperature = 0.0F},
+      SamplingPolicy{},
       SamplingPolicy{
           .topK = 0, .temperature = 0.8F, .topP = 0.9F, .minP = 0.05F}};
   const auto stops = shardEdgeStopTokens(vocabulary);

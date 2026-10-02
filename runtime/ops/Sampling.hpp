@@ -24,12 +24,15 @@ struct SamplingPenalties final {
   }
 };
 
+// One lane's target policy. The defaults are a request's: greedy, and a
+// sampling lane keeps every token.
 struct SamplingPolicy final {
   // A sampling lane keeps the tokens minP leaves it, then its topK most
   // likely of those, or every one for 0 or a topK past the vocabulary (top-k
-  // disabled), then its top-p nucleus of those.
-  uint32_t topK = 1;
-  float temperature = 1.0F;
+  // disabled), then its top-p nucleus of those. Greedy lanes (temperature 0)
+  // read none of the three.
+  uint32_t topK = 0;
+  float temperature = 0.0F;
   float topP = 1.0F;
   bool constrained = false;
   // The lane ignores end-of-sequence: the target never selects a stop token,

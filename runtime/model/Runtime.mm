@@ -316,8 +316,7 @@ struct Runtime::Impl {
                                       .constrained = true,
                                       .penalties = {1.1F, 0.5F, 0.5F},
                                       .minP = 0.05F};
-    const std::array<ops::SamplingPolicy, 2> policies{
-        sampled, {.topK = 1, .temperature = 0.0F}};
+    const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
@@ -792,14 +791,10 @@ struct Runtime::Impl {
   }
 
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
-    const bool enabled = samplingEnabled(entry);
-    return {enabled ? entry.sampling.topK : 1,
-            enabled ? entry.sampling.temperature : 0.0F,
-            enabled ? entry.sampling.topP : 1.0F,
-            entry.constraint == ConstraintMode::TokenMask,
+    return {entry.sampling.topK, entry.sampling.temperature,
+            entry.sampling.topP, entry.constraint == ConstraintMode::TokenMask,
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
-            samplingPenalties(entry),
-            enabled ? entry.sampling.minP : 0.0F};
+            samplingPenalties(entry), entry.sampling.minP};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -904,8 +899,7 @@ struct Runtime::Impl {
                              decodeArena->linearScratch(), stats);
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
-    std::array<ops::SamplingPolicy, kLaneCount> policies;
-    policies.fill({.topK = 1, .temperature = 0.0F});
+    std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
     for (const InitialSelection &lane : lanes) {
       if (!lane.select)
