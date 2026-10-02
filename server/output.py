@@ -99,18 +99,14 @@ class ReasoningSplitter:
 
 
 class StreamingToolCallProjector:
-    """Stream Qwen tool XML as OpenAI JSON argument deltas.
+    """Parse Qwen tool XML as it arrives into OpenAI JSON argument deltas,
+    for streamed and complete responses alike.
 
     Emit function names before their arguments finish. Validate each closed
     call before its closing JSON brace, then validate the complete response
     at request completion. Text outside calls streams as it arrives, after a
     call as before one.
     """
-
-    _FUNCTION_PREFIX = FUNCTION_OPEN
-    _PARAMETER_PREFIX = PARAMETER_OPEN
-    _PARAMETER_CLOSE = PARAMETER_CLOSE
-    _FUNCTION_CLOSE = FUNCTION_CLOSE
 
     def __init__(self, policy, request_id, structured=False):
         self.policy = policy
@@ -224,16 +220,16 @@ class StreamingToolCallProjector:
     def _finish_parameter(self, events):
         # Only text that may begin the closing marker stays pending, so each
         # character of a value is scanned and copied a bounded number of times.
-        value_end = self.pending.find(self._PARAMETER_CLOSE)
+        value_end = self.pending.find(PARAMETER_CLOSE)
         if value_end < 0:
-            ready, self.pending = hold_partial(self.pending, self._PARAMETER_CLOSE)
+            ready, self.pending = hold_partial(self.pending, PARAMETER_CLOSE)
             if self.streaming_string:
                 self._emit_string_value(ready, events)
             elif ready:
                 self.parameter_value_fragments.append(ready)
             return False
         tail = self.pending[:value_end]
-        self.pending = self.pending[value_end + len(self._PARAMETER_CLOSE) :]
+        self.pending = self.pending[value_end + len(PARAMETER_CLOSE) :]
         if self.streaming_string:
             self._emit_string_value(tail, events)
             value = "".join(self.parameter_value_fragments)
@@ -309,7 +305,7 @@ class StreamingToolCallProjector:
                 self._emit_content(ready, events)
                 break
             if self.state == "function_prefix":
-                if not self._literal(self._FUNCTION_PREFIX):
+                if not self._literal(FUNCTION_OPEN):
                     break
                 self.state = "function_name"
                 continue
@@ -318,17 +314,18 @@ class StreamingToolCallProjector:
                     break
                 continue
             if self.state == "body":
-                if self.pending.startswith(self._PARAMETER_PREFIX):
-                    self.pending = self.pending[len(self._PARAMETER_PREFIX) :]
+                if self.pending.startswith(PARAMETER_OPEN):
+                    self.pending = self.pending[len(PARAMETER_OPEN) :]
                     self.state = "parameter_name"
                     continue
-                if self.pending.startswith(self._FUNCTION_CLOSE):
-                    self.pending = self.pending[len(self._FUNCTION_CLOSE) :]
+                if self.pending.startswith(FUNCTION_CLOSE):
+                    self.pending = self.pending[len(FUNCTION_CLOSE) :]
                     self._finish_call(events)
                     continue
-                if self._PARAMETER_PREFIX.startswith(
-                    self.pending
-                ) or self._FUNCTION_CLOSE.startswith(self.pending):
+                if any(
+                    marker.startswith(self.pending)
+                    for marker in (PARAMETER_OPEN, FUNCTION_CLOSE)
+                ):
                     break
                 self._malformed()
             if self.state == "parameter_name":
@@ -365,14 +362,28 @@ class StreamingToolCallProjector:
                 continue
         return events
 
-    def interrupted_result(self):
-        """The content and calls of output cut at the token limit.
+    def finish(self, incomplete):
+        """The content and calls of the output, and the content the stream
+        still owes, which put() held back to see what followed.
 
-        Closed calls are complete, and an open call keeps the arguments it
-        has. With a call, the content is the text the stream published, which
-        leaves out whitespace that no visible text has followed since the
-        start or the last call. Without one, the text is kept exactly, apart
-        from a trailing partial call marker or unfinished call header."""
+        Closed calls are complete, and output cut at the token limit keeps
+        an open call with the arguments it has. Cut output with a call has
+        the content the stream published, which leaves out whitespace that
+        no visible text has followed since the start or the last call.
+        Otherwise the content is the text outside calls without whitespace
+        that only frames them and, when cut, a trailing partial call marker
+        or unfinished call header."""
+        if self.state in ("content", "output", "json"):
+            if self.pending and not (
+                incomplete and TOOL_CALL_OPEN.startswith(self.pending)
+            ):
+                self.content_fragments.append(self.pending)
+            elif self.closed_calls:
+                # Whitespace held after the last text only framed the calls.
+                del self.content_fragments[self.streamed_count :]
+            self.pending = ""
+        elif not incomplete:
+            self._malformed()
         calls = list(self.closed_calls)
         if self.call_id is not None:
             calls.append(
@@ -385,48 +396,9 @@ class StreamingToolCallProjector:
                     },
                 }
             )
-        if calls:
-            return self._streamed_content(), calls
-        content = "".join(self.content_fragments)
-        in_text = self.state in ("content", "output", "json")
-        if in_text and not TOOL_CALL_OPEN.startswith(self.pending):
-            content += self.pending
-        return content, calls
-
-    def finish(self, canonical_content, canonical_calls, incomplete):
-        content = []
-        if self.state in ("content", "output", "json"):
-            if self.pending and not (
-                incomplete and TOOL_CALL_OPEN.startswith(self.pending)
-            ):
-                self.content_fragments.append(self.pending)
-            elif self.closed_calls:
-                # Whitespace held after the last text only framed the calls.
-                del self.content_fragments[self.streamed_count :]
-            self.pending = ""
-        elif not incomplete:
-            self._malformed()
-        parsed_content = "".join(self.content_fragments)
-        emitted = self._streamed_content()
-        if (
-            not incomplete and parsed_content != canonical_content
-        ) or not canonical_content.startswith(emitted):
-            raise APIError(
-                500,
-                "streamed content does not match canonical content",
-                "internal_server_error",
-            )
-        remaining = canonical_content[len(emitted) :]
-        if remaining:
-            content.append(remaining)
-        if self.closed_calls != canonical_calls:
-            if not incomplete:
-                raise APIError(
-                    500,
-                    "streamed tool calls do not match canonical tool calls",
-                    "internal_server_error",
-                )
-        return content
+        streamed = self._streamed_content()
+        content = streamed if calls and incomplete else "".join(self.content_fragments)
+        return content, calls, content[len(streamed) :]
 
 
 def argument_deltas(arguments):
@@ -452,74 +424,6 @@ def _typed_tool_value(value, string_schema):
     if string_schema is None:
         return parsed
     return value if string_schema[0] == "raw" or value in string_schema[1] else parsed
-
-
-def parse_tool_calls(text, request_id, policy=None):
-    calls = []
-    content, cursor = [], 0
-    opening = TOOL_CALL_OPEN + FUNCTION_OPEN
-    while (start := text.find(TOOL_CALL_OPEN, cursor)) >= 0:
-        content.append(text[cursor:start])
-        if not text.startswith(opening, start):
-            raise APIError(
-                500, "model returned malformed tool XML", "invalid_model_output"
-            )
-        name_start = start + len(opening)
-        name_end = text.find(">\n", name_start)
-        if name_end < 0:
-            raise APIError(
-                500, "model returned malformed tool XML", "invalid_model_output"
-            )
-        name = text[name_start:name_end]
-        cursor = name_end + 2
-        arguments = {}
-        while text.startswith(PARAMETER_OPEN, cursor):
-            parameter_start = cursor + len(PARAMETER_OPEN)
-            parameter_end = text.find(">\n", parameter_start)
-            if parameter_end < 0:
-                raise APIError(
-                    500, "model returned malformed tool XML", "invalid_model_output"
-                )
-            parameter_name = text[parameter_start:parameter_end]
-            if parameter_name in arguments:
-                raise APIError(
-                    500, "model repeated a tool parameter", "invalid_model_output"
-                )
-            value_start = parameter_end + 2
-            value_end = text.find(PARAMETER_CLOSE, value_start)
-            if value_end < 0:
-                raise APIError(
-                    500, "model returned malformed tool XML", "invalid_model_output"
-                )
-            arguments[parameter_name] = _typed_tool_value(
-                text[value_start:value_end],
-                raw_string_schema(_tool_property_schema(policy, name, parameter_name)),
-            )
-            cursor = value_end + len(PARAMETER_CLOSE)
-        if not text.startswith(FUNCTION_CLOSE, cursor):
-            raise APIError(
-                500, "model returned malformed tool XML", "invalid_model_output"
-            )
-        cursor += len(FUNCTION_CLOSE)
-        index = len(calls)
-        calls.append(
-            {
-                "id": f"call_{request_id}_{index}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": _tool_json(arguments),
-                },
-            }
-        )
-    content.append(text[cursor:])
-    if calls:
-        # Whitespace alone before the first text or after the last is the
-        # chat template's framing around calls; between two texts it
-        # separates them.
-        visible = [index for index, part in enumerate(content) if part.strip()]
-        content = content[visible[0] : visible[-1] + 1] if visible else []
-    return "".join(content), calls
 
 
 def _validate(validator, value):

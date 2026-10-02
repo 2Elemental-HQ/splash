@@ -21,8 +21,8 @@ else:  # ``python server/server.py`` from the repo root.
 
 MAX_JSON_NESTING = 256
 
-# The chat template's tool-call framing. The projector, the parser and the
-# grammars must agree byte for byte, so every piece is spelled here once.
+# The chat template's tool-call framing. The projector that parses output and
+# the grammars must agree byte for byte, so every piece is spelled here once.
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 FUNCTION_OPEN = "\n<function="

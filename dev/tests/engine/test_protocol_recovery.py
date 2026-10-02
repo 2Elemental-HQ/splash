@@ -5,9 +5,8 @@ from itertools import product
 from unittest import mock
 
 from dev.tests.test_server import FakeRuntime, Harness, Plan
-from dev.tests.tool_output import argument_grammar
+from dev.tests.tool_output import argument_grammar, project
 from server import errors as api_errors
-from server import output as model_output
 from server import server as api
 from server import tool_schema
 from server.api_shapes import (
@@ -446,15 +445,18 @@ class ProtocolRecoveryTests(unittest.TestCase):
                     + json.dumps(value)
                     + "\n</parameter>\n</function>\n</tool_call>"
                 )
-                _, calls = model_output.parse_tool_calls(text, 1, policy)
+                if value is invalid:
+                    # Typed as written, the value fails validation.
+                    with self.assertRaisesRegex(
+                        api.APIError,
+                        rf"^invalid arguments for echo at \$\.value: {value!r} ",
+                    ):
+                        project(text, policy)
+                    continue
+                _, calls, _ = project(text, policy)
                 self.assertEqual(
                     json.loads(calls[0]["function"]["arguments"]), {"value": value}
                 )
-                if value is invalid:
-                    with self.assertRaises(api.APIError):
-                        model_output.validate_tool_calls(calls, policy)
-                else:
-                    model_output.validate_tool_calls(calls, policy)
 
     def test_anthropic_overflow_has_actual_counts_for_text_and_image_precheck(self):
         harness = self.harness(FakeRuntime(), max_context=2)

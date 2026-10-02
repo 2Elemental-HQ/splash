@@ -66,7 +66,6 @@ if __package__:
         ReasoningSplitter,
         StreamingToolCallProjector,
         argument_deltas,
-        parse_tool_calls,
         validate_response_content,
         validate_tool_calls,
     )
@@ -114,7 +113,6 @@ else:
         ReasoningSplitter,
         StreamingToolCallProjector,
         argument_deltas,
-        parse_tool_calls,
         validate_response_content,
         validate_tool_calls,
     )
@@ -911,33 +909,26 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except ConnectionError:
             return True
 
-    def _finalize_content(self, content, job, has_tools, incomplete, projector=None):
-        structured = job.response_validator is not None
-        if not has_tools or (structured and not content.lstrip().startswith("<")):
+    def _finalize_content(self, content, job, has_tools, incomplete, projector):
+        """The content and calls of the output, validated unless it was cut,
+        and the content the stream still owes. `content` is read only without
+        tools: with tools, the projector holds the content."""
+        if not has_tools:
             if not incomplete:
                 validate_response_content(content, job.response_validator)
-                if has_tools:
-                    validate_tool_calls([], job.tool_policy)
-            return content, []
-        if incomplete:
-            if projector is None:
-                projector = StreamingToolCallProjector(
-                    job.tool_policy, job.public_id, structured
-                )
-                projector.put(content)
-            return projector.interrupted_result()
-        content, tool_calls = parse_tool_calls(content, job.public_id, job.tool_policy)
-        validate_tool_calls(tool_calls, job.tool_policy)
-        if structured:
+            return content, [], ""
+        content, tool_calls, unsent = projector.finish(incomplete)
+        if not incomplete:
+            validate_tool_calls(tool_calls, job.tool_policy)
             if not tool_calls:
                 validate_response_content(content, job.response_validator)
-            elif content.strip():
+            elif job.response_validator is not None and content.strip():
                 raise APIError(
                     500,
                     "structured tool output contains text outside tool calls",
                     "invalid_model_output",
                 )
-        return content, tool_calls
+        return content, tool_calls, unsent
 
     def _collect(
         self,
@@ -950,30 +941,29 @@ class FrontendHandler(BaseHTTPRequestHandler):
         on_progress=None,
     ):
         splitter = ReasoningSplitter(thinking)
-        tool_projector = (
+        # Output with tools is parsed as it arrives whether it streams or not.
+        projector = (
             StreamingToolCallProjector(
                 job.tool_policy, job.public_id, job.response_validator is not None
             )
-            if has_tools and on_text is not None
+            if has_tools
             else None
         )
         reasoning, content, result = [], [], None
 
         def append(field, text):
-            (reasoning if field == "reasoning_content" else content).append(text)
+            if field == "content" and projector is not None:
+                events = projector.put(text)
+            else:
+                (reasoning if field == "reasoning_content" else content).append(text)
+                events = [(field, text)]
             if on_text is None:
                 return
-            if field == "reasoning_content":
-                on_text(field, text)
-                return
-            if tool_projector is not None:
-                for kind, value in tool_projector.put(text):
-                    if kind == "content":
-                        on_text("content", value)
-                    else:
-                        on_tool_delta(value)
-                return
-            on_text(field, text)
+            for kind, value in events:
+                if kind == "tool":
+                    on_tool_delta(value)
+                else:
+                    on_text(kind, value)
 
         while result is None:
             kind, value = self._next_event(job, on_idle)
@@ -990,14 +980,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if job.timed_out:
                 raise APIError(504, "request timed out", "request_timeout")
             raise APIError(500, "request cancelled", "request_cancelled")
-        content_text = "".join(content)
-        incomplete = result.reason == "length"
-        content_text, tool_calls = self._finalize_content(
-            content_text, job, has_tools, incomplete, tool_projector
+        content_text, tool_calls, unsent = self._finalize_content(
+            "".join(content), job, has_tools, result.reason == "length", projector
         )
-        if tool_projector is not None:
-            for ready in tool_projector.finish(content_text, tool_calls, incomplete):
-                on_text("content", ready)
+        if unsent and on_text is not None:
+            on_text("content", unsent)
         return "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
 
     def _complete(self, job, thinking, has_tools):

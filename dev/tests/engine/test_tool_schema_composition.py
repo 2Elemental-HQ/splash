@@ -7,6 +7,7 @@ from llguidance import LLMatcher
 
 from dev.tests.engine import test_structured_tools as structured
 from dev.tests.test_server import no_signed_thinking
+from dev.tests.tool_output import project, streamed_arguments
 from server import api_shapes, output, tool_schema
 from server.errors import APIError
 
@@ -45,20 +46,10 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         self.assertEqual(matcher.validate_tokens(tokens), len(tokens), xml)
         self.assertTrue(matcher.consume_tokens(tokens))
         self.assertTrue(matcher.is_accepting())
-        content, calls = output.parse_tool_calls(xml, 1, policy)
+        _, calls, events = project(xml, policy, size=1)
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), arguments)
+        self.assertEqual(streamed_arguments(events), calls[0]["function"]["arguments"])
         output.validate_tool_calls(calls, policy)
-        projector = output.StreamingToolCallProjector(policy, 1)
-        events = []
-        for char in xml:
-            events.extend(projector.put(char))
-        events.extend(projector.finish(content, calls, False))
-        streamed = "".join(
-            value.get("function", {}).get("arguments", "")
-            for kind, value in events
-            if kind == "tool"
-        )
-        self.assertEqual(json.loads(streamed), arguments)
         self.assertEqual(schema, original)
         calls[0]["function"]["arguments"] = json.dumps(invalid)
         with self.assertRaises(APIError):

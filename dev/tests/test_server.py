@@ -23,7 +23,7 @@ from tokenizers import Tokenizer, decoders, models
 
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
-from dev.tests.tool_output import argument_grammar
+from dev.tests.tool_output import argument_grammar, project, tool_policy
 from server import api_shapes, diagnostics, documents, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
@@ -4918,7 +4918,7 @@ class ServerTest(unittest.TestCase):
             f"<parameter=nested>\n{nested}\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1)
+        _, calls, _ = project(text, tool_policy({"f": {}}))
         arguments = json.loads(calls[0]["function"]["arguments"])
         self.assertEqual(
             arguments,
@@ -4952,14 +4952,13 @@ class ServerTest(unittest.TestCase):
             },
             "required": ["text", "count"],
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=text>\n123\n</parameter>\n"
             "<parameter=count>\n3\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"text": "123", "count": 3},
@@ -5204,14 +5203,13 @@ class ServerTest(unittest.TestCase):
                 "text": {"type": "string"},
             },
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=direct>\n123\n</parameter>\n"
             "<parameter=chained>\n456\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"direct": "123", "chained": "456"},
@@ -5228,13 +5226,12 @@ class ServerTest(unittest.TestCase):
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             '<parameter=text>\n "line"\n\n</parameter>\n'
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"text": ' "line"\n'},
@@ -5260,7 +5257,7 @@ class ServerTest(unittest.TestCase):
             "</function>\n</tool_call>world\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        content, calls = model_output.parse_tool_calls(text, 1)
+        content, calls, _ = project(text, tool_policy({"echo": {}}))
         self.assertEqual(content, "")
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
@@ -5293,7 +5290,7 @@ class ServerTest(unittest.TestCase):
             "<parameter=maybe>\nnull\n</parameter>\n"
             "</function>\n</tool_call> visible suffix"
         )
-        content, calls = model_output.parse_tool_calls(raw, "fuzz", policy)
+        content, calls, _ = project(raw, policy, "fuzz")
         model_output.validate_tool_calls(calls, policy)
         self.assertEqual(content, "visible prefix  visible suffix")
 
@@ -5302,13 +5299,12 @@ class ServerTest(unittest.TestCase):
             "type": "object",
             "properties": {"text": {"type": "string", "enum": [" edge "]}},
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=text>\n edge \n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"text": " edge "}
         )
@@ -6102,10 +6098,11 @@ class ServerTest(unittest.TestCase):
                 events = []
                 for start in range(0, len(payload), width):
                     events.extend(projector.put(payload[start : start + width]))
-                tail = projector.finish(payload, [], False)
+                content, _, unsent = projector.finish(False)
+                self.assertEqual(content, payload)
                 self.assertTrue(all(kind == "content" for kind, _ in events))
                 self.assertEqual(
-                    "".join(value for _, value in events) + "".join(tail), payload
+                    "".join(value for _, value in events) + unsent, payload
                 )
 
     def test_structured_tool_response_streams_and_recovers_from_length(self):
@@ -6289,14 +6286,14 @@ class ServerTest(unittest.TestCase):
                 }
                 grammar = argument_grammar(schema)
                 self.assertIn("%json", grammar)
-                policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
+                policy = tool_policy({"echo": schema})
                 values = []
                 for wire in ("null", '"null"'):
                     text = (
                         "<tool_call>\n<function=echo>\n<parameter=value>\n"
                         f"{wire}\n</parameter>\n</function>\n</tool_call>"
                     )
-                    _, calls = model_output.parse_tool_calls(text, 1, policy)
+                    _, calls, _ = project(text, policy)
                     values.append(
                         json.loads(calls[0]["function"]["arguments"])["value"]
                     )

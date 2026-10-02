@@ -773,9 +773,10 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
-generated text for both streaming and complete responses, and `constraints.py`
-compiles token constraints. `make architecture-check` prevents lower layers from
-importing the HTTP entry module.
+generated text as it arrives, one parser serving streamed and complete
+responses alike, and `constraints.py` compiles token constraints.
+`make architecture-check` prevents lower layers from importing the HTTP entry
+module.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
