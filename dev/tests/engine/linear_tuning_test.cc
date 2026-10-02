@@ -32,31 +32,34 @@ template <class Function> void rejects(Function function) {
 
 void cpuContracts() {
   DeviceCapabilities device;
-  device.appleGpuFamily = 9;
   device.maxBufferLengthBytes = uint64_t{1} << 40;
-  for (const uint32_t hidden : {2048U, 5120U}) {
-    const LinearMatrix matrix{hidden, hidden};
-    for (const auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
-      for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
-        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
-             phase == LinearPhase::Prefill ? LinearEpilogue::UpWithGate : LinearEpilogue::GateUp}) {
-          const LinearWorkload workload{matrix, rows, phase, epilogue};
-          const auto plans = Linear(device).candidates(workload);
-          const uint64_t bytes = linearTuningFixtureBytes(device, workload);
-          const uint64_t base = uint64_t{plans.front().storageRows()} *
-              (matrix.inputSize + 2 * matrix.outputSize) * 2;
-          require(bytes >= base && bytes % 16384 == 0,
-                  "fixture does not cover input/output/reference or physical alignment");
-          for (const auto &plan : plans)
-            require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
-                2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
-                "fixture misses a candidate workspace");
-          auto denied = device;
-          denied.maxBufferLengthBytes = bytes - 1;
-          rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
-          denied.maxBufferLengthBytes = bytes;
-          require(linearTuningFixtureBytes(denied, workload) == bytes,
-                  "exact admitted capacity rejected");
+  // Apple10 also lists Split128, whose partials and counters the fixture holds.
+  for (const uint32_t family : {9U, 10U}) {
+    device.appleGpuFamily = family;
+    for (const uint32_t hidden : {2048U, 5120U}) {
+      const LinearMatrix matrix{hidden, hidden};
+      for (const auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
+        for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+               phase == LinearPhase::Prefill ? LinearEpilogue::UpWithGate : LinearEpilogue::GateUp}) {
+            const LinearWorkload workload{matrix, rows, phase, epilogue};
+            const auto plans = linearCandidates(device, workload);
+            const uint64_t bytes = linearTuningFixtureBytes(device, workload);
+            const uint64_t base = uint64_t{plans.front().storageRows()} *
+                (matrix.inputSize + 2 * matrix.outputSize) * 2;
+            require(bytes >= base && bytes % 16384 == 0,
+                    "fixture does not cover input/output/reference or physical alignment");
+            for (const auto &plan : plans)
+              require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
+                  2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
+                  "fixture misses a candidate workspace");
+            auto denied = device;
+            denied.maxBufferLengthBytes = bytes - 1;
+            rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
+            denied.maxBufferLengthBytes = bytes;
+            require(linearTuningFixtureBytes(denied, workload) == bytes,
+                    "exact admitted capacity rejected");
+          }
         }
       }
     }
@@ -69,7 +72,9 @@ void cpuContracts() {
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
        LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
-       LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
+       LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill},
+       LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::None,
+                      WeightLayout::Block32}})
     rejects([&] { (void)linearTuningFixtureBytes(device, workload); });
   MeasurementOptions options;
   require(validMeasurementOptions(options), "default measurement options rejected");
@@ -188,12 +193,13 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
         ? std::optional{weights} : std::nullopt});
     weightsBefore.push_back(fingerprint(weights));
   }
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   // A gate/up sweep mixing split-K and sequential plans computes the exact
   // gate and up projections once per representative, outside the timing.
   bool mixed = false;
-  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums() ||
-      plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  for (const auto &plan : plans)
+    mixed |= plan.configuration().splits != plans.front().configuration().splits ||
+        plan.usesSimdgroup() || plans.front().usesSimdgroup();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = BackendInstrumentation::submittedCommands(backend);
@@ -255,7 +261,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
 void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   require(plans.size() > 1, "interruption fixture has no alternative");
   const auto admit = [](uint64_t, const auto &allocate) {
     allocate();
@@ -303,7 +309,7 @@ void gpuEveryRepresentative(metal::MetalBackend &backend,
                             const Projection &first, Projection &second) {
   const LinearWorkload workload{{first.outputSize, first.inputSize}, 8};
   const LinearTuningInput input{workload, {{first, {}}, {second, {}}}};
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   auto *scales = static_cast<uint16_t *>(second.affine().scales.contents());
   const auto saved = scales[0];
   scales[0] = 0x7fc1;
@@ -328,7 +334,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   const LinearWorkload workload{{projections.front().outputSize,
       projections.front().inputSize}, rows, phase, epilogue};
   Linear linear(backend.capabilities());
-  const auto plans = linear.candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   const auto &baseline = plans.front();
   uint64_t gateBytes = 0;
   for (const auto &plan : plans) gateBytes = std::max(gateBytes, plan.gateScratchBytes());
@@ -470,17 +476,15 @@ int main(int argc, char **argv) {
                     deterministicQ4Projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
-    // K % 1024 == 0 lists the split-K tiles beside the sequential ones, and on
-    // a GPU with two or more cores the baseline splits K too (Apple9's
-    // simdgroup tile, Apple10's Split128), so every qualification runs the
-    // derived bound, including a one-lane split tile's against a Split128
-    // baseline with as many partial sums.
+    // Four 256-input blocks of K list Split128 at two and four K splits on
+    // Apple10 and later, and Apple9's baseline is its simdgroup tile, so
+    // these sweeps hold outputs to the derived bound as well as bitwise.
     std::array split{deterministicQ4Projection(backend, {512, 1024}, 29),
                      deterministicQ4Projection(backend, {512, 1024}, 131)};
     bool mixedClasses = false;
-    for (const auto &plan : Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
-      mixedClasses |= plan.partialSums() > 1;
-    require(mixedClasses, "split-K candidates are missing for a K % 1024 == 0 workload");
+    for (const auto &plan : linearCandidates(backend.capabilities(), {{512, 1024}, 8}))
+      mixedClasses |= plan.configuration().splits > 1 || plan.usesSimdgroup();
+    require(mixedClasses, "no candidate of a four-block K workload splits K");
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::GateUp})
       gpuSweep(backend, split, 8, LinearPhase::Decode, epilogue);

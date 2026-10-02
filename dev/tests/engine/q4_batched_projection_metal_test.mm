@@ -80,63 +80,9 @@ ComputeDispatch gateUp(std::string pipeline, MetalBuffer input,
   return result;
 }
 
-ComputeDispatch residualDispatch(std::string pipeline, MetalBuffer input,
-                                 MetalBuffer weights, MetalBuffer scales,
-                                 MetalBuffer biases, MetalBuffer residual,
-                                 MetalBuffer output, const Q4Params &params) {
-  ComputeDispatch result;
-  result.pipelineName = std::move(pipeline);
-  result.buffers = {{0, std::move(input)},
-                    {1, std::move(weights)},
-                    {2, std::move(scales)},
-                    {3, std::move(biases)},
-                    {4, std::move(residual)},
-                    {5, std::move(output)}};
-  result.bytes = {{6, &params, sizeof(params)}};
-  result.threadgroups = {params.persistent_groups, 1, 1};
-  result.threadsPerThreadgroup = {256, 1, 1};
-  return result;
-}
-
 ComputeDispatch withThreads(ComputeDispatch dispatch, uint32_t threads) {
   dispatch.threadsPerThreadgroup = {threads, 1, 1};
   return dispatch;
-}
-
-// Split-K outputs against the sequential kernel's: every element within the
-// derived bound of tuning/LinearNumerics.hpp (one bf16 ulp of the projection,
-// the epilogue's propagation of that step, fp32 reassociation slack).
-void requireSplitTolerance(const char *what, splash::ops::LinearEpilogue epilogue,
-                           const MetalBuffer &exact, const MetalBuffer &split,
-                           const MetalBuffer *residual, const MetalBuffer *gateUpValue,
-                           uint64_t elements, uint32_t inputSize) {
-  using namespace splash::ops::tuning;
-  const auto *exactValues = static_cast<const uint16_t *>(exact.contents());
-  const auto *splitValues = static_cast<const uint16_t *>(split.contents());
-  const auto *residualValues =
-      residual ? static_cast<const uint16_t *>(residual->contents()) : nullptr;
-  const auto *gateValues =
-      gateUpValue ? static_cast<const uint16_t *>(gateUpValue->contents()) : nullptr;
-  float maxAbs = 0;
-  for (uint64_t i = 0; i < elements; ++i)
-    maxAbs = std::max(maxAbs, std::fabs(bf16ToFloat(exactValues[i])));
-  const float slack = reassociationSlack(inputSize, maxAbs);
-  float maxDiff = 0;
-  for (uint64_t i = 0; i < elements; ++i) {
-    SplitReference reference{bf16ToFloat(exactValues[i])};
-    if (residualValues) reference.residual = bf16ToFloat(residualValues[i]);
-    // Gate and up streams read the same weights here, so one plain
-    // projection is both the exact gate and the exact up value.
-    if (gateValues) reference.gate = reference.up = bf16ToFloat(gateValues[i]);
-    const float actual = bf16ToFloat(splitValues[i]);
-    maxDiff = std::max(maxDiff, std::fabs(actual - reference.value));
-    if (!withinSplitTolerance(actual, epilogue, reference, slack))
-      fail(std::string(what) + " element " + std::to_string(i) + " actual=" +
-           std::to_string(actual) + " reference=" + std::to_string(reference.value) +
-           " bound=" + std::to_string(splitTolerance(epilogue, reference, slack)));
-  }
-  std::cout << "PASS " << what << " within_bound=true max_abs_diff=" << maxDiff
-            << " max_abs_ref=" << maxAbs << " slack=" << slack << '\n';
 }
 
 ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
@@ -302,11 +248,13 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
     if (runSplitPlan(backend, linear, plan(width), c, up, gate, inputValues, residualValues, poison) !=
         std::vector<uint8_t>(lanes.begin(), lanes.begin() + width * laneBytes))
       fail(describe(c) + " M" + std::to_string(width * kRows) + " differs from its lanes at 8 rows");
-  // The sequential tile of lane 0 and, for gate/up, its exact gate and up.
-  const auto sequential = [&](LinearEpilogue epilogue, const Projection &weights, LinearTile tile, FloatOutput type) {
+  // The sequential tile of lane 0 and, for gate/up, its exact gate and up,
+  // into bf16: both destinations compare as bf16, since an fp32 output rounds
+  // to its bf16 plan's.
+  const auto sequential = [&](LinearEpilogue epilogue, const Projection &weights, LinearTile tile) {
     const LinearPlan reference = Linear::plan({c.matrix, kRows, LinearPhase::Decode, epilogue},
-                                              {tile, n / (tile == LinearTile::N256 ? 256 : 128)}, type);
-    MetalBuffer output = shared(backend, uint64_t{kRows} * n * elementBytes(type), "q4-split-reference");
+                                              {tile, n / (tile == LinearTile::N256 ? 256 : 128)});
+    MetalBuffer output = shared(backend, uint64_t{kRows} * n * 2, "q4-split-reference");
     MetalBuffer gateScratch = shared(backend, std::max<uint64_t>(reference.gateScratchBytes(), 2), "q4-split-gate");
     splash::metal::CommandGraph graph;
     linear.add(graph, {input, output, {}, epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
@@ -316,28 +264,28 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
     return output;
   };
   const bool gateUp = c.epilogue == LinearEpilogue::GateUp;
-  const MetalBuffer exact = sequential(c.epilogue, up, gateUp ? LinearTile::N256 : LinearTile::N128, c.destination);
-  const MetalBuffer exactGate = gateUp ? sequential(LinearEpilogue::None, gate, LinearTile::N128, FloatOutput::BFloat16)
-                                       : MetalBuffer{};
-  const MetalBuffer exactUp = gateUp ? sequential(LinearEpilogue::None, up, LinearTile::N128, FloatOutput::BFloat16)
-                                     : MetalBuffer{};
+  const MetalBuffer exact = sequential(c.epilogue, up, gateUp ? LinearTile::N256 : LinearTile::N128);
+  const MetalBuffer exactGate = gateUp ? sequential(LinearEpilogue::None, gate, LinearTile::N128) : MetalBuffer{};
+  const MetalBuffer exactUp = gateUp ? sequential(LinearEpilogue::None, up, LinearTile::N128) : MetalBuffer{};
   const uint64_t elements = uint64_t{kRows} * n;
-  // Both destinations compare as bf16: an fp32 output rounds to its bf16 plan's.
-  const auto bf16At = [&](const void *data, uint64_t i) {
-    return element == 4 ? bf16ToFloat(floatToBf16(static_cast<const float *>(data)[i]))
-                        : bf16ToFloat(static_cast<const uint16_t *>(data)[i]);
+  const auto bf16At = [](const MetalBuffer &buffer, uint64_t i) {
+    return bf16ToFloat(static_cast<const uint16_t *>(buffer.contents())[i]);
+  };
+  const auto actualAt = [&](uint64_t i) {
+    return element == 4 ? bf16ToFloat(floatToBf16(reinterpret_cast<const float *>(lanes.data())[i]))
+                        : bf16ToFloat(reinterpret_cast<const uint16_t *>(lanes.data())[i]);
   };
   float maxAbs = 0, maxDiff = 0;
-  for (uint64_t i = 0; i < elements; ++i) maxAbs = std::max(maxAbs, std::fabs(bf16At(exact.contents(), i)));
+  for (uint64_t i = 0; i < elements; ++i) maxAbs = std::max(maxAbs, std::fabs(bf16At(exact, i)));
   const float slack = reassociationSlack(k, maxAbs);
   for (uint64_t i = 0; i < elements; ++i) {
-    SplitReference reference{bf16At(exact.contents(), i)};
+    SplitReference reference{bf16At(exact, i)};
     if (c.epilogue == LinearEpilogue::Residual) reference.residual = bf16ToFloat(residualValues[i]);
     if (gateUp) {
-      reference.gate = bf16At(exactGate.contents(), i);
-      reference.up = bf16At(exactUp.contents(), i);
+      reference.gate = bf16At(exactGate, i);
+      reference.up = bf16At(exactUp, i);
     }
-    const float actual = bf16At(lanes.data(), i);
+    const float actual = actualAt(i);
     maxDiff = std::max(maxDiff, std::fabs(actual - reference.value));
     if (!withinSplitTolerance(actual, c.epilogue, reference, slack))
       fail(describe(c) + " element " + std::to_string(i) + " actual=" + std::to_string(actual) +
@@ -538,12 +486,9 @@ void run(const std::string &metallibPath) {
               << " exact=true\n";
   }
 
-  // One-lane tiles against the sequential N128 reference (lane 0). The
-  // four-simdgroup N256 tile changes only the cooperative scope and must be
-  // bitwise identical. The split tiles reduce four fp32 range sums before the
-  // single bf16 rounding: within the derived bound of the sequential result,
-  // and bitwise identical to each other since they share that reduction.
-  using splash::ops::LinearEpilogue;
+  // The one-lane four-simdgroup N256 tile against the sequential N128
+  // reference (lane 0): it changes only the cooperative scope and must be
+  // bitwise identical.
   const uint64_t laneBytes = outputElements * sizeof(__bf16);
   const MetalBuffer lane0Input = backend.view(input, 0, inputElements * sizeof(__bf16));
   const MetalBuffer lane0Reference = backend.view(reference, 0, laneBytes);
@@ -557,59 +502,6 @@ void run(const std::string &metallibPath) {
       fail("four-simdgroup N256 M8 projection differs from the sequential N128 projection");
   }
   std::cout << "PASS q4 paired N256 sg4 M8 exact=true\n";
-
-  MetalBuffer split32 = shared(backend, laneBytes, "q4-split32-output");
-  MetalBuffer split64 = shared(backend, laneBytes, "q4-split64-output");
-  const Q4Params split32Params{kOutput, kInput, kOutput / 32};
-  const Q4Params split64Params{kOutput, kInput, kOutput / 64};
-  std::memset(split32.contents(), 0, laneBytes);
-  std::memset(split64.contents(), 0, laneBytes);
-  (void)backend.submit(withThreads(affine("decode_linear_q4_n32_split4", lane0Input, weights,
-                                          scales, biases, split32, split32Params), 128));
-  (void)backend.submit(withThreads(affine("decode_linear_q4_n64_split4", lane0Input, weights,
-                                          scales, biases, split64, split64Params), 256));
-  requireSplitTolerance("q4 n32_split4 M8 vs N128", LinearEpilogue::None, lane0Reference,
-                        split32, nullptr, nullptr, outputElements, kInput);
-  requireSplitTolerance("q4 n64_split4 M8 vs N128", LinearEpilogue::None, lane0Reference,
-                        split64, nullptr, nullptr, outputElements, kInput);
-  if (std::memcmp(split32.contents(), split64.contents(), laneBytes))
-    fail("Split32 and Split64 disagree although they share the four-partial reduction");
-  std::cout << "PASS q4 split32/split64 M8 exact=true\n";
-
-  MetalBuffer residual = shared(backend, laneBytes, "q4-residual");
-  auto *residualValues = static_cast<__bf16 *>(residual.contents());
-  for (uint64_t index = 0; index < outputElements; ++index)
-    residualValues[index] = __bf16(inputValues(random));
-  MetalBuffer residualReference = shared(backend, laneBytes, "q4-residual-reference");
-  const Q4Params residualParams{kOutput, kInput, kGroups};
-  (void)backend.submit(residualDispatch("decode_linear_q4_n128_residual", lane0Input, weights,
-                                        scales, biases, residual, residualReference,
-                                        residualParams));
-  std::memset(split32.contents(), 0, laneBytes);
-  std::memset(split64.contents(), 0, laneBytes);
-  (void)backend.submit(withThreads(residualDispatch("decode_linear_q4_n32_split4_residual",
-                                                    lane0Input, weights, scales, biases,
-                                                    residual, split32, split32Params), 128));
-  (void)backend.submit(withThreads(residualDispatch("decode_linear_q4_n64_split4_residual",
-                                                    lane0Input, weights, scales, biases,
-                                                    residual, split64, split64Params), 256));
-  requireSplitTolerance("q4 n32_split4_residual M8 vs N128", LinearEpilogue::Residual,
-                        residualReference, split32, &residual, nullptr, outputElements, kInput);
-  requireSplitTolerance("q4 n64_split4_residual M8 vs N128", LinearEpilogue::Residual,
-                        residualReference, split64, &residual, nullptr, outputElements, kInput);
-  if (std::memcmp(split32.contents(), split64.contents(), laneBytes))
-    fail("Split32 and Split64 residual outputs disagree");
-
-  // Gate/up: both streams read the same weights, so lane 0 of the sequential
-  // plain projection is the exact gate and up value of every element.
-  MetalBuffer splitGateUp = shared(backend, laneBytes, "q4-split32-gate-up");
-  std::memset(splitGateUp.contents(), 0, laneBytes);
-  (void)backend.submit(withThreads(gateUp("decode_linear_q4_n32_split4_gate_up", lane0Input,
-                                          weights, scales, biases, splitGateUp, split32Params),
-                                   128));
-  requireSplitTolerance("q4 n32_split4_gate_up M8 vs N256 gate/up", LinearEpilogue::GateUp,
-                        backend.view(gateUpReference, 0, laneBytes), splitGateUp, nullptr,
-                        &lane0Reference, outputElements, kInput);
 
   splitTiles(backend);
 }

@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
 #include "tuning/LinearNumerics.hpp"
+#include "tuning/LinearTuning.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -45,12 +46,13 @@ template <class Function> void rejects(Function function) {
 }
 
 
-Linear gpu(uint32_t family, uint32_t cores) {
+DeviceCapabilities simulatedDevice(uint32_t family, uint32_t cores) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
   device.gpuCoreCount = cores;
-  return Linear(device);
+  return device;
 }
+Linear gpu(uint32_t family, uint32_t cores) { return Linear(simulatedDevice(family, cores)); }
 
 // Throws naming the rule a plan broke and the plan.
 [[noreturn]] void broke(const char *rule, uint32_t family, uint32_t cores, LinearWorkload w) {
@@ -247,8 +249,7 @@ void checkAffineDecode(const Linear &linear, uint32_t family, uint32_t reportedC
   const bool simdgroup = expected.tile == LinearTile::Simdgroup;
   const uint32_t columns = simdgroup ? (w.epilogue == LinearEpilogue::GateUp ? 32U : 64U)
       : expected.tile == LinearTile::N256 || expected.tile == LinearTile::Paired256 ? 256U : 128U;
-  rule(plan.tileColumns() == columns && plan.partialSums() == expected.splits,
-       "affine decode tile geometry differs from its configuration");
+  rule(plan.tileColumns() == columns, "affine decode tile geometry differs from its configuration");
   rule(plan.input() == (simdgroup ? LinearInput::Table64 : LinearInput::Plain),
        "affine decode input layout differs from its tile");
   rule(sameScratch(plan.scratchSize(), expectedScratch(expected, w, columns)),
@@ -452,12 +453,12 @@ void baselinePlans() {
           "one-lane pipelining or prefill tile rule changed for the measured shapes");
 }
 
-// `widestCandidates` accumulates the largest candidate set seen, so main() can
-// check that the bound below is reached and not merely respected.
-void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
-  Linear linear = gpu(family, cores);
-  // Include a wide Apple9 projection with four distinct persistent grids,
-  // both paired N256 grids and all four K splits to reach the candidate bound.
+// The tuner's candidates (tuning::linearCandidates): the policy's plan first,
+// then each configuration that won a measured key wherever the workload
+// admits it, once.
+void planContracts(uint32_t family, uint32_t cores) {
+  const DeviceCapabilities device = simulatedDevice(family, cores);
+  const Linear linear(device);
   for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
                                     LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},
                                     LinearMatrix{23040, 2048}, LinearMatrix{131072, 4096}}) {
@@ -465,50 +466,41 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                  LinearEpilogue::GateUp}) {
         const LinearWorkload workload{matrix, lanes * 8, LinearPhase::Decode, epilogue};
-        const auto candidates = linear.candidates(workload);
-        require(linear.plan(workload).configuration().tile != LinearTile::Split32 &&
-                    linear.plan(workload).configuration().tile != LinearTile::Split64,
-                "offline split-K candidate became a serving default");
-        require(!candidates.empty() && candidates.size() <= Linear::kMaximumCandidates,
-                "Linear candidates exceed the bounded set");
-        widestCandidates = std::max(widestCandidates, candidates.size());
-        require(candidates.front().configuration() == linear.plan(workload).configuration(),
-                "Linear baseline is not first candidate");
-        uint32_t fourScopeCandidates = 0, splitCandidates = 0, split128Candidates = 0, simdgroupCandidates = 0;
+        const auto candidates = tuning::linearCandidates(device, workload);
+        // N128 and N256 on their full grids where the epilogue has the tile,
+        // Split128 at each K split of whole 256-input blocks from Apple10,
+        // and the one-lane plain paired N256 tile on its full grid.
+        std::vector<LinearConfig> expected{linear.plan(workload).configuration()};
+        const auto list = [&](LinearConfig config) {
+          if (std::find(expected.begin(), expected.end(), config) == expected.end())
+            expected.push_back(config);
+        };
+        const uint32_t n = matrix.outputSize;
+        if (epilogue != LinearEpilogue::GateUp) list({LinearTile::N128, n / 128});
+        if (epilogue != LinearEpilogue::Residual) list({LinearTile::N256, n / 256});
+        if (family >= 10)
+          for (const uint32_t splits : {2U, 4U, 8U})
+            if (matrix.inputSize / 256 >= splits)
+              list({LinearTile::Split128, n / 128, LinearSimdgroups::Eight, splits});
+        if (lanes == 1 && epilogue == LinearEpilogue::None)
+          list({LinearTile::Paired256, n / 256, LinearSimdgroups::Four});
+        require(candidates.size() == expected.size(), "Linear candidate set omitted or added a plan");
         for (size_t index = 0; index < candidates.size(); ++index) {
           const auto &plan = candidates[index];
+          require(plan.configuration() == expected[index], "Linear candidates are out of their order");
           const bool four = plan.configuration().simdgroups == LinearSimdgroups::Four;
           const auto tile = plan.configuration().tile;
-          const bool split = tile == LinearTile::Split32 || tile == LinearTile::Split64;
           const bool split128 = tile == LinearTile::Split128;
-          if (split) {
-            ++splitCandidates;
-            require(lanes == 1 && matrix.inputSize % 1024 == 0 && plan.partialSums() == 4 &&
-                        plan.configuration().groups == matrix.outputSize / plan.tileColumns() &&
-                        (epilogue != LinearEpilogue::GateUp || tile == LinearTile::Split32) &&
-                        plan.secondPipeline().empty(),
-                    "split-K candidate escaped its one-lane full-grid contract");
-          } else if (split128) {
-            ++split128Candidates;
-            const uint32_t splits = plan.configuration().splits;
-            require(splits >= 2 && matrix.inputSize / 256 >= splits && plan.partialSums() == splits &&
-                        plan.configuration().groups == matrix.outputSize / 128 &&
-                        plan.secondPipeline().empty() == (epilogue != LinearEpilogue::GateUp),
-                    "Split128 candidate escaped its full-grid contract");
-          } else if (plan.usesSimdgroup()) {
-            ++simdgroupCandidates;
+          if (split128)
+            require(plan.secondPipeline().empty() == (epilogue != LinearEpilogue::GateUp),
+                    "Split128 gate/up runs a gate pass and an up pass");
+          else if (plan.usesSimdgroup())
             require(family == 9 && four &&
-                        plan.partialSums() == plan.configuration().splits &&
                         plan.configuration().groups == matrix.outputSize / plan.tileColumns(),
                     "simdgroup candidate escaped its full-grid contract");
-          } else {
-            require(plan.partialSums() == 1, "sequential candidate reports partial sums");
-          }
           if (four) {
-            ++fourScopeCandidates;
-            const bool oneLane = lanes == 1 &&
-                (tile == LinearTile::Split32 ||
-                 (tile == LinearTile::Paired256 && epilogue == LinearEpilogue::None));
+            const bool oneLane = lanes == 1 && tile == LinearTile::Paired256 &&
+                epilogue == LinearEpilogue::None;
             require(((lanes == 3 && tile == LinearTile::N128 && epilogue != LinearEpilogue::GateUp) ||
                      oneLane || plan.usesSimdgroup()) && plan.secondPipeline().empty(),
                     "four-SIMDgroup candidate escaped its precompiled workload set");
@@ -525,39 +517,15 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                       (epilogue == LinearEpilogue::GateUp && (split128 || (lanes >= 3 && !plan.usesSimdgroup()))
                            ? uint64_t{lanes} * 8 * matrix.outputSize * 2 : 0),
                   "decode gate scratch disagrees with decomposition");
-          for (size_t prior = 0; prior < index; ++prior)
-            require(candidates[prior].configuration() != plan.configuration(),
-                    "duplicate Linear candidates");
         }
-        // One lane always lists the paired N256 tile for plain projections and
-        // the split tiles when K allows them: Split32 for every decode
-        // epilogue, Split64 for the single-stream ones.
-        require((fourScopeCandidates != 0) ==
-                    (family == 9 || (lanes == 3 && epilogue != LinearEpilogue::GateUp) ||
-                     (lanes == 1 && (family == 9 || epilogue == LinearEpilogue::None || matrix.inputSize % 1024 == 0))),
-                "Linear candidate set omitted or added four-SIMDgroup plans");
-        uint32_t legalSplits = 0;
-        if (family == 9)
-          for (uint32_t split : {1U, 2U, 4U, 8U})
-            legalSplits += matrix.inputSize % (64 * split) == 0;
-        require(simdgroupCandidates == legalSplits,
-                "Linear candidates omit a legal Apple9 K split");
-        require(splitCandidates == (lanes == 1 && matrix.inputSize % 1024 == 0
-                                        ? (epilogue == LinearEpilogue::GateUp ? 1U : 2U) : 0U),
-                "Linear candidate set omitted or added split-K plans");
-        // Apple10 lists Split128 at every lane count and each K split its
-        // blocks allow.
-        uint32_t legalSplit128 = 0;
-        if (family >= 10)
-          for (uint32_t split : {2U, 4U, 8U}) legalSplit128 += matrix.inputSize / 256 >= split;
-        require(split128Candidates == legalSplit128, "Linear candidate set omitted or added Split128 plans");
       }
     }
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::UpWithGate}) {
       // Every prefill epilogue has the eight-simdgroup N256 tile and the
       // four-simdgroup N128 tile; the plain and residual ones also N128/8.
-      const auto candidates = linear.candidates({matrix, 2048, LinearPhase::Prefill, epilogue});
+      const auto candidates =
+          tuning::linearCandidates(device, {matrix, 2048, LinearPhase::Prefill, epilogue});
       const bool up = epilogue == LinearEpilogue::UpWithGate;
       require(candidates.size() == (up ? 2U : 3U) &&
                   candidates.front().configuration() ==
@@ -606,11 +574,10 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::Residual}, {LinearTile::N256, 1}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::GateUp}, {LinearTile::N128, 1}); });
   rejects([&] { (void)Linear::plan({{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, {LinearTile::N128, 0}); });
-  // Split tiles: one lane, K % 1024 == 0, the full grid and the kernel's own
-  // simdgroup count; Split64 has no gate/up form. Split128: the full grid,
-  // eight simdgroups and two to eight K partitions of at least one 256-input
-  // block, at every lane count and epilogue. Paired256: one lane, plain
-  // epilogue, four simdgroups. None exists in prefill.
+  // Split128: the full grid, eight simdgroups and two to eight K partitions of
+  // at least one 256-input block, at every lane count and epilogue.
+  // Paired256: one lane, plain epilogue, four simdgroups. Neither exists in
+  // prefill.
   const LinearWorkload splitWorkload{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::None};
   const LinearWorkload splitResidual{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload splitGateUp{{512, 1024}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
@@ -632,8 +599,6 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
       {LinearTile::Simdgroup, 4, LinearSimdgroups::Four, 4}); });
   rejects([&] { (void)Linear::plan(splitWorkload,
       {LinearTile::Simdgroup, 8, LinearSimdgroups::Eight, 4}); });
-  const LinearConfig split32{LinearTile::Split32, 16, LinearSimdgroups::Four};
-  const LinearConfig split64{LinearTile::Split64, 8, LinearSimdgroups::Eight};
   const LinearConfig split128{LinearTile::Split128, 4, LinearSimdgroups::Eight, 4};
   const LinearConfig paired256{LinearTile::Paired256, 2, LinearSimdgroups::Four};
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -641,7 +606,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
     const LinearWorkload plain{{512, 1024}, lanes * 8, LinearPhase::Decode, LinearEpilogue::None};
     const auto plan = Linear::plan(plain, split128);
     require(plan.pipeline() == "decode_linear_q4_n128_split" + rows && plan.threadsPerThreadgroup() == 256 &&
-                plan.tileColumns() == 128 && plan.partialSums() == 4 && plan.secondPipeline().empty() &&
+                plan.tileColumns() == 128 && plan.secondPipeline().empty() &&
                 plan.storageRows() == lanes * 8 && plan.input() == LinearInput::Plain &&
                 sameScratch(plan.scratchSize(), expectedScratch(split128, plain, 128)),
             "Split128 plan geometry, pipeline or scratch is wrong");
@@ -655,31 +620,10 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                 gateUpPlan.gateScratchBytes() == uint64_t{lanes} * 8 * 512 * 2,
             "Split128 gate/up runs a gate pass into the gate scratch and an up pass");
   }
-  {
-    const auto plan = Linear::plan(splitWorkload, split64);
-    require(plan.pipeline() == "decode_linear_q4_n64_split4" && plan.threadsPerThreadgroup() == 256 &&
-                plan.tileColumns() == 64 && plan.partialSums() == 4 && plan.secondPipeline().empty(),
-            "Split64 plan geometry or pipeline is wrong");
-    const auto residual = Linear::plan(splitResidual, split32);
-    require(residual.pipeline() == "decode_linear_q4_n32_split4_residual" &&
-                residual.threadsPerThreadgroup() == 128 && residual.tileColumns() == 32 &&
-                residual.partialSums() == 4,
-            "Split32 residual plan geometry or pipeline is wrong");
-    require(Linear::plan(splitResidual, split64).pipeline() == "decode_linear_q4_n64_split4_residual" &&
-                Linear::plan(splitWorkload, split32).pipeline() == "decode_linear_q4_n32_split4",
-            "split plan pipeline names are wrong");
-    const auto gateUpPlan = Linear::plan(splitGateUp, split32);
-    require(gateUpPlan.pipeline() == "decode_linear_q4_n32_split4_gate_up" &&
-                gateUpPlan.threadsPerThreadgroup() == 128 && gateUpPlan.secondPipeline().empty() &&
-                gateUpPlan.gateScratchBytes() == 0,
-            "Split32 gate/up plan geometry or pipeline is wrong");
-    const auto wide = Linear::plan(splitWorkload, paired256);
-    require(wide.pipeline() == "decode_linear_q4_n256_paired_sg4" && wide.threadsPerThreadgroup() == 128 &&
-                wide.tileColumns() == 256 && wide.partialSums() == 1,
-            "Paired256 plan geometry or pipeline is wrong");
-  }
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 16, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 8, LinearSimdgroups::Four}); });
+  const auto wide = Linear::plan(splitWorkload, paired256);
+  require(wide.pipeline() == "decode_linear_q4_n256_paired_sg4" && wide.threadsPerThreadgroup() == 128 &&
+              wide.tileColumns() == 256,
+          "Paired256 plan geometry or pipeline is wrong");
   // Split128 takes eight simdgroups, the full grid and 2, 4 or 8 partitions
   // of at least one block: 1024 inputs hold four.
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 4, LinearSimdgroups::Four, 4}); });
@@ -687,20 +631,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   for (const uint32_t splits : {0U, 1U, 3U, 8U, 16U})
     rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split128, 4, LinearSimdgroups::Eight, splits}); });
   rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split32, 8, LinearSimdgroups::Four}); });
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 4, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Linear::plan(splitWorkload, {LinearTile::Split64, 16, LinearSimdgroups::Eight}); });
-  rejects([&] { (void)Linear::plan(splitGateUp, split64); });
   rejects([&] { (void)Linear::plan(splitResidual, paired256); });
   rejects([&] { (void)Linear::plan(splitGateUp, paired256); });
-  for (const LinearConfig config : {split32, split64})
-    rejects([&] { (void)Linear::plan({{512, 768}, 8}, config); });
   for (uint32_t rows : {16U, 24U, 32U})
-    for (const LinearConfig config : {split32, split64, paired256})
-      rejects([&] { (void)Linear::plan({{512, 1024}, rows}, config); });
-  for (const auto tile : {LinearTile::Split32, LinearTile::Split64, LinearTile::Paired256})
-    rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
-        {tile, 0, tile == LinearTile::Split64 ? LinearSimdgroups::Eight : LinearSimdgroups::Four}); });
+    rejects([&] { (void)Linear::plan({{512, 1024}, rows}, paired256); });
+  rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
+                                   {LinearTile::Paired256, 0, LinearSimdgroups::Four}); });
   rejects([&] { (void)Linear::plan({{512, 1024}, 32, LinearPhase::Prefill},
                                    {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}); });
   const LinearWorkload fourWorkload{{512, 256}, 24, LinearPhase::Decode, LinearEpilogue::None};
@@ -768,8 +704,8 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, tile kernel, input table and scratch of
 // its bf16 plan on every family and core count, and only plain decode
-// workloads take one. Returns the kernels of the plain decode candidates,
-// whose fp32 instances floatInstances looks up.
+// workloads take one. Returns the kernels of those plans, whose fp32
+// instances floatInstances looks up.
 std::set<std::string_view> floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -789,8 +725,7 @@ std::set<std::string_view> floatOutputPlans() {
                   head.pipeline() != bf16.pipeline() || head.input() != bf16.input() ||
                   head.storageRows() != bf16.storageRows() || !sameScratch(head.scratchSize(), bf16.scratchSize()))
                 broke("an fp32 plan differs from its bf16 plan", family, cores, w);
-              for (const LinearPlan &candidate : linear.candidates(w))
-                if (!candidate.pipeline().empty()) kernels.insert(candidate.pipeline());
+              if (!head.pipeline().empty()) kernels.insert(head.pipeline());
             }
     }
   std::vector<LinearWorkload> others{{{5120, 2048}, 8, LinearPhase::Decode, LinearEpilogue::Residual},
@@ -868,7 +803,8 @@ constexpr std::array kRegisterSplitAnchors{
 // fp32 K-split partials over the plan's rows and columns and one completion
 // counter per 64-column tile (LinearPlan::scratchSize).
 uint64_t splitPartialsBytes(const LinearPlan &plan) {
-  return uint64_t{plan.partialSums()} * plan.storageRows() * plan.workload().matrix.outputSize * sizeof(float);
+  return uint64_t{plan.configuration().splits} * plan.storageRows() * plan.workload().matrix.outputSize *
+         sizeof(float);
 }
 uint64_t splitCountersBytes(const LinearPlan &plan) {
   return uint64_t{plan.configuration().groups} * sizeof(uint32_t);
@@ -904,7 +840,7 @@ void ggufPlans() {
   const LinearPlan single = linear.plan(down, blockProjection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&
               single.configuration() == LinearConfig{LinearTile::GgufStaged, 80, LinearSimdgroups::Two, 2} &&
-              single.input() == LinearInput::Plain && single.partialSums() == 2 &&
+              single.input() == LinearInput::Plain &&
               single.scratchSize().partials == splitPartialsBytes(single) &&
               single.scratchSize().counters == splitCountersBytes(single) && single.scratchSize().input == 0,
           "GGUF single-tensor decode plan");
@@ -912,7 +848,7 @@ void ggufPlans() {
     requireAnchorSplits(anchorPlan(10, anchor), anchor, "GGUF staged split policy");
   const LinearPlan gateUpPlan = linear.plan({{512, 2048}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
                                             blockProjection(512, 2048, 1));
-  require(gateUpPlan.partialSums() == 4 && gateUpPlan.gateScratchBytes() == gateBytes(gateUpPlan) &&
+  require(gateUpPlan.configuration().splits == 4 && gateUpPlan.gateScratchBytes() == gateBytes(gateUpPlan) &&
               gateUpPlan.scratchSize().partials == splitPartialsBytes(gateUpPlan),
           "GGUF staged gate/up runs a gate pass into the gate scratch");
   // Decode tiles hold 8, 16 or 32 rows: three lanes run the 32-row tile.
@@ -930,7 +866,7 @@ void ggufPlans() {
     const uint32_t splits = rows <= 32 ? 2 : 1;
     require(prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
                 prefill.gateScratchBytes() == gateBytes(prefill) &&
-                prefill.configuration().splits == splits && prefill.partialSums() == splits &&
+                prefill.configuration().splits == splits &&
                 prefill.scratchSize().partials == (splits > 1 ? splitPartialsBytes(prefill) : 0) &&
                 prefill.threadsPerThreadgroup() == (rows <= 32 ? 64U : 128U),
             "GGUF prefill tile rows and splits");
@@ -977,7 +913,7 @@ void ggufPlans() {
     const LinearPlan plan = m3.plan({{5120, 17408}, rows, LinearPhase::Decode, LinearEpilogue::Residual},
                                     blockProjection(5120, 17408, 1));
     const LinearScratchSize size = plan.scratchSize();
-    require(plan.partialSums() == 8 && size.input == tableBytes(17408, rows) &&
+    require(plan.configuration().splits == 8 && size.input == tableBytes(17408, rows) &&
                 size.sums == tableSumsBytes(LinearInput::Table16, 17408, rows) &&
                 size.partials == splitPartialsBytes(plan) && size.counters == splitCountersBytes(plan) &&
                 plan.gateScratchBytes() == 0,
@@ -1103,8 +1039,7 @@ void ggufCoreLaws() {
               const LinearConfig c = one.configuration();
               for (const uint32_t rows : {16U, 24U, 32U}) {
                 const LinearPlan wider = plan(linear, n, rows);
-                require(wider.configuration() == c && wider.partialSums() == one.partialSums() &&
-                            wider.input() == one.input(),
+                require(wider.configuration() == c && wider.input() == one.input(),
                         "GGUF decode plan depends on the batch width");
               }
               const uint32_t s = c.splits;
@@ -1201,14 +1136,15 @@ void apple10AffineCoreLaws() {
 }
 
 // Exercise continuous core counts, not just measured SKU anchors. These
-// contracts check legal grids, bounded candidates and override workspace;
-// they do not claim performance on simulated hardware.
+// contracts check the tuner's candidates keep the policy's plan first, legal
+// grids and no duplicates; they do not claim performance on simulated
+// hardware.
 void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
       const uint32_t reported = index == 129 ? 4096 : index;
-      const uint32_t cores = reported ? reported : 32U;
-      Linear linear = gpu(family, reported);
+      const DeviceCapabilities device = simulatedDevice(family, reported);
+      const Linear linear(device);
       for (uint32_t n : {256U, 5120U, 131072U}) {
         for (uint32_t k : {256U, 768U, 1024U, 4096U, 5120U, 17408U}) {
           for (uint32_t rows : {8U, 16U, 24U, 32U}) {
@@ -1216,9 +1152,8 @@ void scalingContracts() {
                                  LinearEpilogue::GateUp}) {
               const LinearWorkload w{{n, k}, rows, LinearPhase::Decode, epilogue};
               const auto baseline = linear.plan(w);
-              const auto candidates = linear.candidates(w);
-              require(candidates.front().configuration() == baseline.configuration() &&
-                          candidates.size() <= Linear::kMaximumCandidates,
+              const auto candidates = tuning::linearCandidates(device, w);
+              require(candidates.front().configuration() == baseline.configuration(),
                       "core scaling lost or displaced the baseline");
               for (size_t i = 0; i < candidates.size(); ++i) {
                 const auto &plan = candidates[i];
@@ -1228,16 +1163,6 @@ void scalingContracts() {
                 for (size_t j = 0; j < i; ++j)
                   require(plan.configuration() != candidates[j].configuration(),
                           "core scaling produced duplicate candidates");
-              }
-              // N128 is available for every non-gated decode workload. Its
-              // candidate waves must follow the device, including tiny GPUs.
-              if (epilogue != LinearEpilogue::GateUp) {
-                for (uint32_t wave : {2U, 3U, 4U}) {
-                  const LinearConfig wanted{LinearTile::N128, std::min(n / 128, cores * wave)};
-                  require(std::any_of(candidates.begin(), candidates.end(), [&](const auto &p) {
-                    return p.configuration() == wanted;
-                  }), "candidate waves do not scale with GPU core count");
-                }
               }
             }
           }
@@ -1472,12 +1397,15 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
   }
 }
 
+// Every tuning candidate of the workload against the CPU reference and the
+// others; a plain decode kernel of `floatKernels` also into fp32.
 void numericalCase(metal::MetalBackend &backend, Linear &linear,
+                      const std::set<std::string_view> &floatKernels,
                       const Projection &p, const Projection &gate,
                       LinearWorkload workload, bool inPlaceResidual = false) {
   require(!inPlaceResidual || workload.epilogue == LinearEpilogue::Residual,
           "in-place residual fixture requires residual epilogue");
-  const auto candidates = linear.candidates(workload);
+  const auto candidates = tuning::linearCandidates(backend.capabilities(), workload);
   const uint32_t storageRows = candidates[0].storageRows();
   auto input = allocate(backend, uint64_t{storageRows} * p.inputSize * 2);
   auto *inputValues = static_cast<uint16_t *>(input.contents());
@@ -1596,7 +1524,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     try {
       checkReference(p, gate, workload, b,
                      inPlaceResidual ? immutableResidual.data() : nullptr,
-                     plan.partialSums() > 1 || plan.usesSimdgroup(),
+                     plan.configuration().splits > 1 || plan.usesSimdgroup(),
                      plan.usesSimdgroup() ? std::max(tuning::simdgroupSlack(workload, b.input, p),
                          tuning::simdgroupSlack(workload, b.input, gate)) : 0);
     } catch (const std::exception &) {
@@ -1612,7 +1540,8 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     }
     const auto *output = static_cast<const uint16_t *>(b.output.contents());
     const uint64_t elements = uint64_t{storageRows} * p.outputSize;
-    if (workload.phase == LinearPhase::Decode && workload.epilogue == LinearEpilogue::None) {
+    if (workload.phase == LinearPhase::Decode && workload.epilogue == LinearEpilogue::None &&
+        floatKernels.contains(plan.pipeline())) {
       // The fp32 instance (the logits) holds the values the bf16 one
       // rounds, bit for bit, and writes nothing past its rows.
       const LinearPlan fp32 = Linear::plan(workload, plan.configuration(), FloatOutput::Float32);
@@ -1635,7 +1564,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
           throw std::runtime_error("an fp32 output does not round to its bf16 plan's output");
         }
     }
-    if (plan.partialSums() > 1 || plan.usesSimdgroup()) {
+    if (plan.configuration().splits > 1 || plan.usesSimdgroup()) {
       splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.usesSimdgroup()});
     } else {
       if (baseline.empty()) baseline.assign(output, output + elements);
@@ -1706,36 +1635,35 @@ void floatInstances(const char *metallib, const std::set<std::string_view> &kern
             "a plain decode kernel has no fp32 instance");
 }
 
-// Every Linear pipeline a candidate plan of any family and core count
-// launches, with its threads per threadgroup: one pipeline never takes two
-// execution scopes. Device-free.
+// Every Linear pipeline a tuning candidate of any family and core count
+// launches, the policy's plain decode plans also into fp32, with its threads
+// per threadgroup: one pipeline never takes two execution scopes.
+// Device-free.
 std::map<std::string, uint32_t> pipelineScopes() {
   std::map<std::string, uint32_t> names{{"prefill_linear_q4_sums32", 256}};
-  const auto collect = [&](const Linear &linear, LinearWorkload workload) {
-    const bool plain = workload.phase == LinearPhase::Decode && workload.epilogue == LinearEpilogue::None;
-    for (const auto &candidate : linear.candidates(workload)) {
-      std::vector<LinearPlan> plans{candidate};
-      if (plain) plans.push_back(Linear::plan(workload, candidate.configuration(), FloatOutput::Float32));
-      for (const auto &plan : plans)
-        for (auto name : {plan.pipeline(), plan.secondPipeline()}) {
-          if (name.empty()) continue;
-          const auto [found, inserted] = names.emplace(kernelInstance(name, plan.destination()),
-                                                       plan.threadsPerThreadgroup());
-          require(inserted || found->second == plan.threadsPerThreadgroup(),
-                  "one Linear pipeline was assigned incompatible execution scopes");
-        }
-    }
+  const auto collect = [&](const DeviceCapabilities &device, LinearWorkload workload) {
+    std::vector<LinearPlan> plans = tuning::linearCandidates(device, workload);
+    if (workload.phase == LinearPhase::Decode && workload.epilogue == LinearEpilogue::None)
+      plans.push_back(Linear::plan(workload, plans.front().configuration(), FloatOutput::Float32));
+    for (const auto &plan : plans)
+      for (auto name : {plan.pipeline(), plan.secondPipeline()}) {
+        if (name.empty()) continue;
+        const auto [found, inserted] = names.emplace(kernelInstance(name, plan.destination()),
+                                                     plan.threadsPerThreadgroup());
+        require(inserted || found->second == plan.threadsPerThreadgroup(),
+                "one Linear pipeline was assigned incompatible execution scopes");
+      }
   };
   for (const uint32_t family : {9U, 10U, 11U})
     for (const uint32_t cores : {0U, 10U, 16U, 20U, 40U, 80U}) {
-      const Linear linear = gpu(family, cores);
+      const DeviceCapabilities device = simulatedDevice(family, cores);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                    LinearEpilogue::GateUp})
-          collect(linear, {{16640, 5120}, lanes * 8, LinearPhase::Decode, epilogue});
+          collect(device, {{16640, 5120}, lanes * 8, LinearPhase::Decode, epilogue});
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                  LinearEpilogue::UpWithGate})
-        collect(linear, {{16640, 5120}, 33, LinearPhase::Prefill, epilogue});
+        collect(device, {{16640, 5120}, 33, LinearPhase::Prefill, epilogue});
     }
   return names;
 }
@@ -1792,13 +1720,9 @@ int main(int argc, char **argv) {
     const std::set<std::string_view> plainKernels = floatOutputPlans();
     apple10AffineCoreLaws();
     scalingContracts();
-    // Apple9 at the assumed core count reaches the expanded split set;
-    // Apple10 exercises the MPP-only candidate bound.
-    size_t widestCandidates = 0;
-    planContracts(9, 0, widestCandidates);
-    planContracts(10, 16, widestCandidates);
-    require(widestCandidates == Linear::kMaximumCandidates,
-            "no covered workload reaches the Linear candidate bound");
+    // Apple9 at the assumed core count, and Apple10, which lists Split128.
+    planContracts(9, 0);
+    planContracts(10, 16);
     // The resources behind these scopes are --capabilities' check.
     static_cast<void>(pipelineScopes());
     if (std::string_view(argv[1]) == "--cpu") {
@@ -1821,16 +1745,16 @@ int main(int argc, char **argv) {
         for (uint32_t lanes = 1; lanes <= 4; ++lanes)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                      LinearEpilogue::GateUp}) {
-            numericalCase(backend, linear, p, gate,
+            numericalCase(backend, linear, plainKernels, p, gate,
                           {matrix, lanes * 8, LinearPhase::Decode, epilogue});
             if (epilogue == LinearEpilogue::Residual)
-              numericalCase(backend, linear, p, gate,
+              numericalCase(backend, linear, plainKernels, p, gate,
                             {matrix, lanes * 8, LinearPhase::Decode, epilogue}, true);
           }
       for (const uint32_t rows : {1U, 33U, 2048U})
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                    LinearEpilogue::UpWithGate})
-          numericalCase(backend, linear, p, gate,
+          numericalCase(backend, linear, plainKernels, p, gate,
                         {matrix, rows, LinearPhase::Prefill, epilogue});
       require(projectionFingerprint(p) == immutableProjection &&
                   projectionFingerprint(gate) == immutableGateProjection,

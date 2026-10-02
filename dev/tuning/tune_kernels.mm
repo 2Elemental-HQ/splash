@@ -1,8 +1,9 @@
-// Offline kernel measurement. Loads an installed model, measures every
-// precompiled operator candidate against the policy default in runtime/ops
-// through the production encoders, and prints one line per key: the winner
-// with its paired GPU/wall gain, or "default kept". With --candidates every
-// timed candidate is listed, so a policy rule can be judged by what it costs.
+// Offline kernel measurement. Loads an installed model, measures each
+// projection key's tuning candidates (tuning::linearCandidates) against the
+// policy default in runtime/ops through the production encoders, and prints
+// one line per key: the winner with its paired GPU/wall gain, or "default
+// kept". With --candidates every timed candidate is listed, so a policy rule
+// can be judged by what it costs.
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
@@ -101,8 +102,6 @@ std::string_view name(LinearTile tile) {
     ENUMERATOR_NAME(LinearTile::N128);
     ENUMERATOR_NAME(LinearTile::N256);
     ENUMERATOR_NAME(LinearTile::Paired128);
-    ENUMERATOR_NAME(LinearTile::Split32);
-    ENUMERATOR_NAME(LinearTile::Split64);
     ENUMERATOR_NAME(LinearTile::Split128);
     ENUMERATOR_NAME(LinearTile::Paired256);
     ENUMERATOR_NAME(LinearTile::Simdgroup);
@@ -256,21 +255,19 @@ int main(int argc, char **argv) {
                      "only the draft's projections are measured\n";
       std::cout << '\n';
 
-      const Linear linear(device);
       for (const auto &input : workloads) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
-        const auto baseline = linear.plan(input.workload).configuration();
+        const auto plans = linearCandidates(device, input.workload);
+        const auto baseline = plans.front().configuration();
         const bool didChange = result.complete && result.configuration != baseline;
         outcome(describe(input.workload), result.complete, didChange,
                 describe(result.configuration),
-                evidence(result.measurements,
-                         candidateOf(linear.candidates(input.workload), result.configuration)),
+                evidence(result.measurements, candidateOf(plans, result.configuration)),
                 result.failure);
         if (options.candidates) {
           // Every candidate's own paired evidence against the default, so a
           // policy rule can be judged by what it costs, not only by who won.
-          const auto plans = linear.candidates(input.workload);
           std::vector<std::pair<double, std::string>> rows;
           for (const auto &m : result.measurements) {
             if (m.candidate.value >= plans.size()) continue;

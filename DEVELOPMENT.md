@@ -1347,8 +1347,9 @@ unnoticed, but no target runs it because it needs real models: after
 matching installed package to compare every prepared byte.
 
 Compare performance on the same idle Mac with the same model and workload.
-`make tune-kernels MODEL=...` measures the precompiled projection tiles for the
-installed model on this Mac against the policy defaults in `runtime/ops` and
+`make tune-kernels MODEL=...` measures each projection key of the installed
+model on this Mac: the policy default in `runtime/ops` against the tile
+configurations that won an earlier run (`dev/tuning/LinearTuning.hpp`). It
 prints, per key, the winning configuration with its paired GPU and wall-time
 gain, or that the default is kept; it changes no default and saves no profile.
 For a GGUF model it measures only the draft's projections, and says so in its

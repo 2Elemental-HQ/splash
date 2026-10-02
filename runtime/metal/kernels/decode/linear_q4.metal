@@ -24,8 +24,9 @@
                input_sums, tile * TileN, simd_lane, simd_group);               \
     }                                                                          \
   }
-// Each plain projection into bf16 and into fp32 (Name_f32: the logits,
-// ops::Projection::destination).
+// Each plain projection the policy runs, into bf16 and into fp32 (Name_f32:
+// the logits, ops::Projection::destination). The plain tiles only
+// tune-kernels times write bf16 alone.
 #define Q4_DECODE_AFFINE(Name, TileCall, Sums, TileN)                          \
   Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, bfloat)                        \
   Q4_DECODE_OUTPUT(Name##_f32, TileCall, Sums, TileN, float)
@@ -73,19 +74,22 @@
     }                                                                          \
   }
 
-Q4_DECODE_AFFINE(decode_linear_q4_n128, (q4_mpp_tile<128, false, false, 256>), 64,
-                 128)
+Q4_DECODE_OUTPUT(decode_linear_q4_n128, (q4_mpp_tile<128, false, false, 256>), 64,
+                 128, bfloat)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_m16,
                  (q4_mpp_tile_batched<16, 128, false, false, 256>), 128, 128)
-Q4_DECODE_AFFINE(decode_linear_q4_n128_m24,
-                 (q4_mpp_tile_batched<24, 128, false, false, 256>), 192, 128)
+Q4_DECODE_OUTPUT(decode_linear_q4_n128_m24,
+                 (q4_mpp_tile_batched<24, 128, false, false, 256>), 192, 128,
+                 bfloat)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_m24_sg4,
                  (q4_mpp_tile_batched<24, 128, false, false, 256, false, 4>), 192, 128)
-Q4_DECODE_AFFINE(decode_linear_q4_n256_m16,
-                 (q4_mpp_tile_batched<16, 256, false, false>), 128, 256)
-Q4_DECODE_AFFINE(decode_linear_q4_n256_m24,
-                 (q4_mpp_tile_batched<24, 256, false, false>), 192, 256)
-Q4_DECODE_AFFINE(decode_linear_q4_n256, (q4_mpp_tile<256, false, false>), 64, 256)
+Q4_DECODE_OUTPUT(decode_linear_q4_n256_m16,
+                 (q4_mpp_tile_batched<16, 256, false, false>), 128, 256, bfloat)
+// Also the gate pass of three-lane gate/up projections.
+Q4_DECODE_OUTPUT(decode_linear_q4_n256_m24,
+                 (q4_mpp_tile_batched<24, 256, false, false>), 192, 256, bfloat)
+Q4_DECODE_OUTPUT(decode_linear_q4_n256, (q4_mpp_tile<256, false, false>), 64,
+                 256, bfloat)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_paired,
                  (q4_mpp_tile<128, false, false, 256, true>), 64, 128)
 // 128 threads: four 8 x 256 tiles per core reach the occupancy knee for very

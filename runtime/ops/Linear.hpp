@@ -6,12 +6,10 @@
 
 #include <algorithm>
 #include <compare>
-#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace splash::ops {
 
@@ -44,12 +42,9 @@ void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
-// quant groups of one lane. Split32 and Split64 keep one 8-row tile per
-// threadgroup and split K into four partitions whose fp32 partial sums are
-// reduced before the bf16 rounding; they take one lane, K % 1024 == 0 and one
-// threadgroup per tile. Split128 is the N128 tile with K split across `splits`
-// threadgroups, grid (column tiles, splits), every lane's rows in each tile;
-// the last threadgroup of a tile to finish reduces the fp32 partial sums
+// quant groups of one lane. Split128 is the N128 tile with K split across
+// `splits` threadgroups, grid (column tiles, splits), every lane's rows in each
+// tile; the last threadgroup of a tile to finish reduces the fp32 partial sums
 // before the bf16 rounding. Paired256 is the four-simdgroup N256 paired tile.
 // Simdgroup uses bf16 8x8 matrix operations and an explicit activation/split
 // workspace.
@@ -60,7 +55,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // register tile on bf16 8x8 matrix operations (Apple9): 64 columns per
 // threadgroup, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Split128, Paired256, Simdgroup, GgufStaged, GgufRegister
+  N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufRegister
 };
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
@@ -83,8 +78,7 @@ struct LinearConfig final {
   // Decode grid size. Prefill uses its matrix grid and requires zero here.
   uint32_t groups = 0;
   // Simdgroups per threadgroup, independent of the persistent grid size: the
-  // cooperative scope of one tile, or for Split32 and Split64 the four
-  // partitions together (4 x 1 and 4 x 2; Paired256 runs four).
+  // cooperative scope of one tile (Paired256 runs four).
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
   // Cross-threadgroup K partitions for Split128, Simdgroup and the GGUF
   // tiles, a power of two up to kMaximumSplits (Split128 takes at least two);
@@ -159,12 +153,6 @@ public:
   [[nodiscard]] uint32_t storageRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
-  // fp32 partial sums the kernel reduces before the single bf16 rounding of
-  // the projection: 1 for the sequential tiles, whose outputs are bitwise
-  // identical for a workload; 4 for the one-lane split tiles; the K splits of
-  // Split128, Simdgroup and the GGUF tiles. Simdgroup also reassociates within
-  // each quantization group, even with one split.
-  [[nodiscard]] uint32_t partialSums() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
   [[nodiscard]] LinearInput input() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
@@ -218,14 +206,6 @@ class Linear final {
 public:
   explicit Linear(const DeviceCapabilities &device) noexcept;
 
-  // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
-  // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
-  // 3 * 4 + 2 + 2 + 4 = 20. Apple10 and later list up to 3 Split128 K splits
-  // instead and at most one additional baseline (20). M24 replaces Paired128
-  // with N128/four-simdgroup candidates and adds up to four matrix or three
-  // Split128 K splits, with no one-lane tiles (at most 17).
-  static constexpr std::size_t kMaximumCandidates = 20;
-
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` in the projection's weight layout, into its destination type; a gate/up plan also runs
   // `gate`.
@@ -249,9 +229,10 @@ public:
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).
   [[nodiscard]] FloatTile ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept;
+  // The plan of `config` for `workload`, whether or not the device's policy
+  // picks it.
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config,
                                        FloatOutput destination = FloatOutput::BFloat16);
-  [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Returns what the scratch table describes after the dispatch.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
                     const Projection &projection, const LinearPlan &plan,
