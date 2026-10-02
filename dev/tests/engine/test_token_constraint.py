@@ -69,6 +69,39 @@ class TokenConstraintTest(unittest.TestCase):
             constraint.masks((a, z)),
         )
 
+    def test_masks_validate_drafts_without_copying_or_advancing_the_matcher(self):
+        class Uncopyable:
+            """The matcher, which masks() must not copy."""
+
+            def __init__(self, matcher):
+                self.matcher = matcher
+
+            def deep_copy(self):
+                raise AssertionError("masks() copied the matcher")
+
+            def __getattr__(self, name):
+                return getattr(self.matcher, name)
+
+        class Executor:
+            """Hands LLGuidance the matchers inside Uncopyable."""
+
+            def __init__(self, executor):
+                self.executor = executor
+
+            def __getattr__(self, name):
+                compute = getattr(self.executor, name)
+                return lambda matchers, *mask: compute(
+                    [(matcher.matcher, *rest) for matcher, *rest in matchers], *mask
+                )
+
+        a, z = self.a, self.z
+        constraint = self.Constraint(
+            Uncopyable(self.matcher.deep_copy()), Executor(self.executor)
+        )
+        rows = self.rows(constraint.masks((a, z)))
+        constraint.commit([a])
+        self.assertEqual(self.rows(constraint.masks(())), rows[1:2])
+
     def test_generated_tokens_advance_the_grammar_and_end_with_eos(self):
         a, b, c, eos = self.a, self.b, self.c, self.eos
         constraint = self.constraint()

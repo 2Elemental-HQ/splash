@@ -60,8 +60,7 @@ class TokenConstraint:
             ),
             len(simulation_tokens),
         )
-        probe = self.matcher.deep_copy()
-        valid_count = probe.validate_tokens(list(simulation_tokens[:in_range]))
+        valid_count = self.matcher.validate_tokens(list(simulation_tokens[:in_range]))
         valid_tokens = simulation_tokens[:valid_count]
         if valid_tokens:
             fill_next_token_bitmask_par_with_draft_tokens(
