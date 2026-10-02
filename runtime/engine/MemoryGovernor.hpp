@@ -72,7 +72,6 @@ struct MemoryGovernorSnapshot {
   // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
   uint64_t chargedBytes = 0;
-  uint64_t reservedBytes = 0;
   // Room under the limit beside what is charged and reserved: zero once the
   // engine's limit is reached.
   uint64_t headroomBytes = 0;

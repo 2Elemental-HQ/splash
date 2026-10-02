@@ -262,7 +262,6 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   return {
       limitBytes_,
       observed,
-      reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
       deniedReservations_,
