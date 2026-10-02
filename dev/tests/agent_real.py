@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 from dev.tests import smoke_real  # noqa: E402
 from dev.tools import build_identity  # noqa: E402
 from install import clients, launcher  # noqa: E402
+from server import serve_options  # noqa: E402
 
 CLIENTS = tuple(clients.INSTALL_URLS)
 # The server this harness starts or finds, on the default port.
@@ -1151,7 +1152,7 @@ def main(argv=None):
         validate_server_configuration(
             initial,
             args.model,
-            launcher._parse_max_context(args.max_context),
+            serve_options.parse_max_context(args.max_context),
             identity,
         )
         document.update(model=model, context=context, identity=initial["identity"])

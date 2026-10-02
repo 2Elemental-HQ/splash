@@ -8,7 +8,6 @@ from unittest import mock
 from dev.tests import test_server as fixtures
 from dev.tests.engine.test_launcher import keep_stop_signals
 from install import launcher
-from server import chat_templates
 from server import server as api
 
 SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
@@ -190,7 +189,6 @@ class DefaultReasoningTests(unittest.TestCase):
 
     def test_cli_over_environment_and_launcher_forwarding(self):
         keep_stop_signals(self)
-        self.assertEqual(chat_templates.REASONING_EFFORTS, launcher.REASONING_EFFORTS)
         for env, explicit, expected in (
             (None, None, None),
             ("none", None, "none"),
@@ -218,6 +216,11 @@ class DefaultReasoningTests(unittest.TestCase):
                     self.assertEqual(
                         api.parse_args(argv[3:]).default_reasoning_effort, expected
                     )
+                    # The server reads the environment's default itself.
                     self.assertEqual(
-                        "--default-reasoning-effort" in argv, expected is not None
+                        any(
+                            argument.startswith("--default-reasoning-effort")
+                            for argument in argv
+                        ),
+                        explicit is not None,
                     )

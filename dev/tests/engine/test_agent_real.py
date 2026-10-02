@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import agent_real as agent
+from server import serve_options
 
 MODEL_IDS = (
     "incoai/Qwen3.8-27B-Splash",
@@ -219,7 +220,7 @@ class AgentRunnerTests(unittest.TestCase):
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
-            "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
+            "maximum_context_tokens": serve_options.parse_max_context("100K"),
             "identity": {"cache": {"build_id": "src-" + "b" * 64}},
         }
         # An announced alias leads /v1/models while the loaded model matches,
@@ -1272,7 +1273,7 @@ class AgentRunnerTests(unittest.TestCase):
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
-            "maximum_context_tokens": agent.launcher._parse_max_context("100K"),
+            "maximum_context_tokens": serve_options.parse_max_context("100K"),
             "identity": {"cache": {"build_id": identity}},
         }
         served = {"data": [{"id": model, "input_modalities": ["text"]}]}

@@ -420,14 +420,8 @@ class ServerAccessTests(unittest.TestCase):
     def test_cli_takes_origins_as_browsers_send_them(self):
         typed = ["tauri://localhost", "http://localhost:3000", "*"]
         flags = [flag for origin in typed for flag in ("--allowed-origin", origin)]
-        # The launcher passes the values on as typed; the server parses them.
-        for (parse, arguments), parsed in zip(
-            PARSERS,
-            (
-                typed,
-                [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN],
-            ),
-        ):
+        parsed = [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN]
+        for parse, arguments in PARSERS:
             self.assertEqual(parse([*arguments, *flags]).allowed_origin, parsed)
             self.assertEqual(parse(arguments).allowed_origin, [])
             for origin, refusal in (

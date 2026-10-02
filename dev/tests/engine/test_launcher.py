@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from install import launcher
+from server import server as api
 
 MODEL_ID = "community/custom-splash"
 
@@ -73,55 +74,6 @@ class LauncherTests(unittest.TestCase):
             os.environ.pop(name, None)
         keep_stop_signals(self)
 
-    def test_kv_format_is_an_explicit_load_option(self):
-        base = ["serve", "--model", MODEL_ID]
-        self.assertEqual(launcher.parse_args(base).kv_format, "int8")
-        self.assertEqual(
-            launcher.parse_args(base + ["--kv-format", "bf16"]).kv_format, "bf16"
-        )
-        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            launcher.parse_args(base + ["--kv-format", "fp16"])
-
-    def test_request_timeout_reaches_the_server(self):
-        base = ["serve", "--model", MODEL_ID]
-        # Unset stays unset: the server's own default (none) remains authoritative.
-        self.assertIsNone(launcher.parse_args(base).request_timeout)
-        self.assertEqual(
-            launcher.parse_args(base + ["--request-timeout", "3600"]).request_timeout,
-            3600.0,
-        )
-        # Mirror the server's validation: positive and finite only.
-        for value in ("0", "-1", "inf", "nan", "soon"):
-            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-                launcher.parse_args(base + ["--request-timeout", value])
-
-        def check_exec(binary, argv, environment):
-            self.assertEqual(argv[argv.index("--request-timeout") + 1], "3600.0")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            with (
-                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
-                mock.patch.object(launcher.socket, "socket"),
-                mock.patch.object(launcher, "_ensure_installed"),
-                mock.patch.object(
-                    launcher.os, "execve", side_effect=check_exec
-                ) as execute,
-                mock.patch("sys.stdout", io.StringIO()),
-            ):
-                launcher.main(base + ["--request-timeout", "3600"])
-            execute.assert_called_once()
-
-    def test_queue_size_is_optional_and_positive(self):
-        base = ["serve", "--model", MODEL_ID]
-        # Unset stays unset: the server's own default (32) remains authoritative.
-        self.assertIsNone(launcher.parse_args(base).queue_size)
-        self.assertEqual(
-            launcher.parse_args(base + ["--queue-size", "64"]).queue_size, 64
-        )
-        for value in ("0", "-1", "1.5", "many"):
-            with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-                launcher.parse_args(base + ["--queue-size", value])
-
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
             ["serve"],
@@ -174,73 +126,6 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
-    def test_cache_disk_quota(self):
-        required = ["serve", "--model", MODEL_ID]
-        self.assertEqual(launcher.parse_args(required).max_cache_disk, 0)
-        self.assertEqual(
-            launcher.parse_args([*required, "--max-cache-disk", "5G"]).max_cache_disk,
-            5 * 1024**3,
-        )
-        for invalid in ("auto", "-1", "0G", "5X", "nan"):
-            with (
-                self.subTest(invalid=invalid),
-                mock.patch("sys.stderr", io.StringIO()) as error,
-                self.assertRaises(SystemExit),
-            ):
-                launcher.parse_args([*required, "--max-cache-disk", invalid])
-            self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
-
-    def test_decode_share(self):
-        required = ["serve", "--model", MODEL_ID]
-        # Unset stays unset: the engine's own default remains authoritative.
-        self.assertIsNone(launcher.parse_args(required).decode_share)
-        for value, share in (("0", 0.0), ("0.25", 0.25), ("2", 2.0)):
-            self.assertEqual(
-                launcher.parse_args([*required, "--decode-share", value]).decode_share,
-                share,
-            )
-        for invalid in ("-0.5", "inf", "nan", "half"):
-            with (
-                self.subTest(invalid=invalid),
-                mock.patch("sys.stderr", io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                launcher.parse_args([*required, "--decode-share", invalid])
-
-    def test_image_budget_fails_before_installation(self):
-        for value in ("-1", "0", "65535", "4194305", "invalid"):
-            with (
-                self.subTest(value=value),
-                mock.patch.object(launcher, "_ensure_installed") as install,
-                mock.patch("sys.stderr", io.StringIO()),
-                self.assertRaises(SystemExit) as failed,
-            ):
-                launcher.main(
-                    ["serve", "--model", MODEL_ID, "--max-image-pixels", value]
-                )
-            self.assertEqual(failed.exception.code, 2)
-            install.assert_not_called()
-        for value in (65_536, 4_194_304):
-            args = launcher.parse_args(
-                ["serve", "--model", MODEL_ID, "--max-image-pixels", str(value)]
-            )
-            self.assertEqual(args.max_image_pixels, value)
-
-    def test_size_validation(self):
-        for value in ("1G", "1GB", "1GiB", "1073741824"):
-            self.assertEqual(launcher._parse_max_memory(value), 1024**3)
-        for flag, values in (
-            ("--max-context", ("0", "-1", "257K", "bad")),
-            ("--max-memory", ("0", "-1G", "bad", str(2**64))),
-            ("--max-request-size", ("auto", "0", "-1G", "bad", str(2**64))),
-        ):
-            for value in values:
-                with self.subTest(value=value), mock.patch("sys.stderr", io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        launcher.parse_args(
-                            ["serve", "--model", MODEL_ID, f"{flag}={value}"]
-                        )
-
     def test_host_controls_probe_and_server_independently_of_allowed_host(self):
         for host in (None, "0.0.0.0", "192.0.2.10", "localhost"):
             with (
@@ -267,11 +152,9 @@ class LauncherTests(unittest.TestCase):
                 factory.return_value.__enter__.return_value.bind.assert_called_once_with(
                     (expected, 9123)
                 )
-                argv = execute.call_args.args[1]
-                self.assertEqual(argv[argv.index("--host") + 1], expected)
-                self.assertEqual(
-                    argv[argv.index("--allowed-host") + 1], "proxy.example"
-                )
+                served = api.parse_args(execute.call_args.args[1][3:])
+                self.assertEqual(served.host, expected)
+                self.assertEqual(served.allowed_host, ["proxy.example"])
 
     def test_invalid_bind_address_fails_before_model_work(self):
         with (
@@ -319,40 +202,27 @@ class LauncherTests(unittest.TestCase):
             def check_exec(binary, argv, environment):
                 self.refresh.assert_called_once_with()
                 self.assertEqual(binary, str(launcher.paths.PYTHON))
-                self.assertEqual(argv[argv.index("--max-context") + 1], "102400")
+                # test_serve_options.py checks every shared option; these
+                # are the launcher's own and the shared options it was given.
+                with mock.patch.dict(os.environ, environment):
+                    served = api.parse_args(argv[3:])
                 self.assertEqual(
-                    argv[argv.index("--max-memory") + 1], str(28 * 1024**3)
+                    (served.binary, served.model, served.port),
+                    (str(launcher.paths.BINARY), MODEL_ID, launcher.PORT),
                 )
                 self.assertEqual(
-                    argv[argv.index("--binary") + 1], str(launcher.paths.BINARY)
-                )
-                self.assertEqual(argv[argv.index("--model") + 1], MODEL_ID)
-                self.assertEqual(argv[argv.index("--kv-format") + 1], "bf16")
-                self.assertEqual(
-                    argv[argv.index("--max-request-size") + 1], str(256 * 1024**2)
+                    (served.max_context, served.max_memory, served.kv_format),
+                    (102400, 28 * 1024**3, "bf16"),
                 )
                 self.assertEqual(
-                    argv[argv.index("--max-cache-disk") + 1], str(5 * 1024**3)
+                    served.allowed_origin, [("tauri", "localhost", None), "*"]
                 )
-                self.assertEqual(argv[argv.index("--queue-size") + 1], "64")
-                self.assertEqual(argv[argv.index("--decode-share") + 1], "0.25")
-                self.assertEqual(
-                    argv[-8:],
-                    [
-                        "--allowed-host",
-                        "splash.local",
-                        "--allowed-host",
-                        "proxy.local",
-                        "--allowed-origin",
-                        "tauri://localhost",
-                        "--allowed-origin",
-                        "*",
-                    ],
-                )
+                self.assertTrue(served.no_webui)
                 self.assertNotIn("start_new_session", environment)
-                self.assertIn("--no-webui", argv)
-                self.assertNotIn("test-server-key", argv)
-                self.assertEqual(environment["SPLASH_API_KEY"], "test-server-key")
+                self.assertFalse(
+                    any("test-server-key" in argument for argument in argv)
+                )
+                self.assertEqual(served.api_key, "test-server-key")
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
                 self.assertEqual(lock_path.stat().st_ino, original_inode)
                 with (runtime / "serve.lock").open("a+") as upgrade:
@@ -384,22 +254,10 @@ class LauncherTests(unittest.TestCase):
                         "--api-key",
                         "test-server-key",
                         "--no-webui",
-                        "--max-request-size",
-                        "256M",
                         "--max-context",
                         "100K",
                         "--max-memory",
                         "28G",
-                        "--max-cache-disk",
-                        "5G",
-                        "--decode-share",
-                        "0.25",
-                        "--queue-size",
-                        "64",
-                        "--allowed-host",
-                        "splash.local",
-                        "--allowed-host",
-                        "proxy.local",
                         "--allowed-origin",
                         "tauri://localhost",
                         "--allowed-origin",

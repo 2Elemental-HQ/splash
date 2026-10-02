@@ -27,7 +27,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, serve_options
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -46,25 +46,15 @@ if __package__:
         text_completion_response,
     )
     from .backend import NativeBackend, NativeResult, remaining_request_time
-    from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
+    from .chat_templates import ChatTemplateError, ChatTemplates
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import Frontend, validate_served_model_name
-    from .http_security import (
-        OriginRefused,
-        authenticate,
-        validate_api_key,
-        validate_headers,
-    )
+    from .frontend import Frontend
+    from .http_security import OriginRefused, authenticate, validate_headers
     from .latency import RequestLatency
-    from .metrics import (
-        is_finite_number,
-        prometheus_metrics,
-        timings_dict,
-        usage_dict,
-    )
-    from .origins import ANY_ORIGIN, parse_allowed_origin
+    from .metrics import prometheus_metrics, timings_dict, usage_dict
+    from .origins import ANY_ORIGIN
     from .output import (
         BlockSequencer,
         ReasoningSplitter,
@@ -77,6 +67,7 @@ else:
     import images as image_input
     import json_codec
     import judgments
+    import serve_options
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -94,25 +85,15 @@ else:
         text_completion_response,
     )
     from backend import NativeBackend, NativeResult, remaining_request_time
-    from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
+    from chat_templates import ChatTemplateError, ChatTemplates
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import Frontend, validate_served_model_name
-    from http_security import (
-        OriginRefused,
-        authenticate,
-        validate_api_key,
-        validate_headers,
-    )
+    from frontend import Frontend
+    from http_security import OriginRefused, authenticate, validate_headers
     from latency import RequestLatency
-    from metrics import (
-        is_finite_number,
-        prometheus_metrics,
-        timings_dict,
-        usage_dict,
-    )
-    from origins import ANY_ORIGIN, parse_allowed_origin
+    from metrics import prometheus_metrics, timings_dict, usage_dict
+    from origins import ANY_ORIGIN
     from output import (
         BlockSequencer,
         ReasoningSplitter,
@@ -125,10 +106,8 @@ else:
     import runtime as engine_runtime
 
 
-DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 # Match the former generation ingress envelope (32 slots × 16 MiB).
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
-MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
@@ -1841,7 +1820,7 @@ class FrontendServer(ThreadingHTTPServer):
         allowed_hosts=(),
         api_key=None,
         webui=True,
-        max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
     ):
         if (
@@ -1854,14 +1833,14 @@ class FrontendServer(ThreadingHTTPServer):
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
-        self.api_key = validate_api_key(api_key) if api_key is not None else None
+        self.api_key = api_key
         self.webui = webui
         self.allowed_hosts = {
             host.lower().rstrip(".")
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
             if host not in ("0.0.0.0", "::")
         }
-        # As parse_allowed_origin returns them.
+        # As serve_options.parse_allowed_origin returns them.
         self.allowed_origins = frozenset(allowed_origins)
         self.refused_origins = RefusedOriginLog()
         self.instance_id = secrets.token_hex(12)
@@ -1921,76 +1900,6 @@ class FrontendServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def _parse_max_context(value):
-    if value == "auto":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"must be 'auto' or an integer in [1, {MAX_CONTEXT_TOKENS}]"
-        ) from error
-    if not 1 <= parsed <= MAX_CONTEXT_TOKENS:
-        raise argparse.ArgumentTypeError(
-            f"must be 'auto' or an integer in [1, {MAX_CONTEXT_TOKENS}]"
-        )
-    return parsed
-
-
-def _parse_max_cache_disk(value):
-    if value.strip() == "0":
-        return 0
-    try:
-        result = _parse_max_memory(value)
-    except argparse.ArgumentTypeError:
-        result = None
-    if result is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
-    return result
-
-
-def _parse_max_memory(value):
-    if value == "auto":
-        return None
-    normalized = value.strip().upper()
-    multipliers = {
-        "K": 1024,
-        "KB": 1024,
-        "KIB": 1024,
-        "M": 1024**2,
-        "MB": 1024**2,
-        "MIB": 1024**2,
-        "G": 1024**3,
-        "GB": 1024**3,
-        "GIB": 1024**3,
-    }
-    suffix = ""
-    for candidate in sorted(multipliers, key=len, reverse=True):
-        if normalized.endswith(candidate):
-            suffix = candidate
-            normalized = normalized[: -len(candidate)]
-            break
-    try:
-        number = int(normalized)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
-        ) from error
-    result = number * multipliers.get(suffix, 1)
-    if number <= 0 or result > 2**63 - 1:
-        raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
-        )
-    return result
-
-
-def _parse_request_size(value):
-    size = _parse_max_memory(value)
-    if size is None:
-        raise argparse.ArgumentTypeError("must be a positive byte count such as 128M")
-    return size
-
-
 def _parse_model_id(value):
     repo_id, separator, variant = value.partition(":")
     if repo_id.count("/") != 1:
@@ -2008,13 +1917,6 @@ def _parse_model_id(value):
     return value
 
 
-def _parse_allowed_origin(value):
-    try:
-        return parse_allowed_origin(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from None
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2026,108 +1928,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
     )
-    parser.add_argument(
-        "--served-model-name",
-        action="append",
-        default=[],
-        type=validate_served_model_name,
-        help="additional API model name (repeatable); responses report the "
-        "loaded model ID unless --announce-served-name",
-    )
-    parser.add_argument(
-        "--announce-served-name",
-        action="store_true",
-        help="report the first --served-model-name in API responses and list it "
-        "first in /v1/models; /status keeps the loaded model ID",
-    )
-    parser.add_argument(
-        "--default-reasoning-effort",
-        choices=REASONING_EFFORTS,
-        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
-        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
-    )
-    parser.add_argument("--max-context", type=_parse_max_context, default=None)
-    parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
-    parser.add_argument(
-        "--kv-format",
-        choices=("int8", "bf16"),
-        default="int8",
-        help="target KV cache storage (default: int8); bf16 uses more memory",
-    )
-    parser.add_argument(
-        "--max-request-size",
-        type=_parse_request_size,
-        default=DEFAULT_MAX_REQUEST_BYTES,
-        help="maximum HTTP request body size (default: 128M); "
-        "shared input budget is max(512M, twice this limit)",
-    )
-    parser.add_argument(
-        "--max-cache-disk",
-        dest="max_cache_disk",
-        type=_parse_max_cache_disk,
-        default=0,
-    )
-    parser.add_argument(
-        "--decode-share",
-        type=float,
-        default=None,
-        help="decode time owed per unit of prefill time while other requests "
-        "decode (default: 0.5; 0 alternates one command each)",
-    )
-    parser.add_argument(
-        "--max-image-pixels",
-        type=int,
-        default=image_input.MAX_PIXELS,
-        help=f"maximum resized pixels per image (default: {image_input.MAX_PIXELS}); "
-        "bounds the vision scratch one image needs",
-    )
-    parser.add_argument("--request-timeout", type=float, default=None)
-    parser.add_argument("--queue-size", type=int, default=32)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--allowed-host", action="append", default=[])
-    parser.add_argument(
-        "--allowed-origin",
-        action="append",
-        default=[],
-        type=_parse_allowed_origin,
-        metavar="ORIGIN",
-    )
-    parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
-    parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
-    if args.announce_served_name and not args.served_model_name:
-        parser.error("--announce-served-name needs --served-model-name")
-    if (
-        args.default_reasoning_effort is not None
-        and args.default_reasoning_effort not in REASONING_EFFORTS
-    ):
-        parser.error(
-            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
-        )
-    if args.api_key is not None:
-        try:
-            validate_api_key(args.api_key)
-        except ValueError as error:
-            parser.error(str(error))
-    if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
-        parser.error(
-            "--max-image-pixels must be in "
-            f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
-        )
-    if args.request_timeout is None:
-        # No deadline unless given, as in vLLM and SGLang; a request still
-        # ends when its client disconnects.
-        args.request_timeout = math.inf
-    elif not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
-        parser.error("--request-timeout must be positive and finite")
-    if args.decode_share is not None and (
-        not is_finite_number(args.decode_share) or args.decode_share < 0
-    ):
-        parser.error("--decode-share must be nonnegative and finite")
-    if args.queue_size <= 0:
-        parser.error("--queue-size must be positive")
+    serve_options.check_serve_arguments(parser, args)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
@@ -2217,7 +2022,7 @@ def main():
         readiness = runtime.readiness
         if (
             readiness is None
-            or not 1 <= readiness.max_context_tokens <= MAX_CONTEXT_TOKENS
+            or not 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
             or (
                 args.max_context is not None
                 and readiness.max_context_tokens != args.max_context
@@ -2233,7 +2038,9 @@ def main():
             backend,
             args.model,
             effective_context,
-            args.request_timeout,
+            # No deadline unless given, as in vLLM and SGLang; a request still
+            # ends when its client disconnects.
+            math.inf if args.request_timeout is None else args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,
             chat_templates=chat_templates,

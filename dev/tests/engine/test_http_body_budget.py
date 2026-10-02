@@ -16,8 +16,7 @@ from unittest import mock
 from PIL import Image
 
 from dev.tests import test_server as fixtures
-from install import launcher
-from server import frontend, json_codec
+from server import frontend, json_codec, serve_options
 from server import server as api
 
 
@@ -56,15 +55,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
         return connection
 
     def test_config_and_exact_body_boundary(self):
-        for parse in (launcher._parse_request_size, api._parse_request_size):
-            for value in ("128M", "128MB", "128MiB", "134217728"):
-                self.assertEqual(parse(value), 128 * 1024**2)
-            for value in ("auto", "0", "-1", "bad", str(2**64)):
-                with (
-                    self.subTest(value=value),
-                    self.assertRaises(argparse.ArgumentTypeError),
-                ):
-                    parse(value)
+        for value in ("128M", "128MB", "128MiB", "134217728"):
+            self.assertEqual(serve_options.parse_request_size(value), 128 * 1024**2)
+        for value in ("auto", "0", "-1", "bad", str(2**64)):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(argparse.ArgumentTypeError),
+            ):
+                serve_options.parse_request_size(value)
         harness = self.harness(max_request_bytes=128)
         body = json.dumps({"content": "hello"}).encode().ljust(128)
         connection = self.headers(harness, len(body), "/tokenize")

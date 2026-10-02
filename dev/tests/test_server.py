@@ -24,7 +24,15 @@ from tokenizers import Tokenizer, decoders, models
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
-from server import api_shapes, diagnostics, documents, judgments, tool_schema
+from server import (
+    api_shapes,
+    diagnostics,
+    documents,
+    images,
+    judgments,
+    serve_options,
+    tool_schema,
+)
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -516,15 +524,15 @@ def main_args(**overrides):
             "max_memory": None,
             "max_cache_disk": 0,
             "decode_share": None,
-            "max_image_pixels": api.image_input.MAX_PIXELS,
-            "request_timeout": 2,
+            "max_image_pixels": images.MAX_PIXELS,
+            "request_timeout": None,
             "queue_size": 1,
             "host": "127.0.0.1",
             "allowed_host": [],
             "allowed_origin": [],
             "api_key": None,
             "no_webui": False,
-            "max_request_size": api.DEFAULT_MAX_REQUEST_BYTES,
+            "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
@@ -573,7 +581,7 @@ class Harness:
         thinking_codec=None,
         api_key=None,
         webui=True,
-        max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
+        max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
         allowed_origins=(),
@@ -2082,9 +2090,9 @@ class ServerTest(unittest.TestCase):
                     cases.append((path, kind, self.anthropic_body(messages=messages)))
         with (
             mock.patch.object(
-                api.image_input,
+                images,
                 "decode_data_url",
-                wraps=api.image_input.decode_data_url,
+                wraps=images.decode_data_url,
             ) as decode,
             mock.patch.object(
                 documents, "pdf_content", wraps=documents.pdf_content
@@ -2118,9 +2126,7 @@ class ServerTest(unittest.TestCase):
         anthropic = api_shapes.anthropic_to_chat_prompt
         responses = api_shapes.responses_to_chat_body
         with (
-            mock.patch.object(
-                api.image_input, "decode_data_url", side_effect=AssertionError
-            ),
+            mock.patch.object(images, "decode_data_url", side_effect=AssertionError),
             mock.patch.object(documents, "_render", side_effect=AssertionError),
         ):
             converted = {
@@ -2219,7 +2225,7 @@ class ServerTest(unittest.TestCase):
             {"role": "user", "content": [part] * limit},
             {"role": "tool", "content": [part]},
         ]
-        with mock.patch.object(api.image_input, "decode_data_url") as decode:
+        with mock.patch.object(images, "decode_data_url") as decode:
             with self.assertRaisesRegex(api.APIError, f"at most {limit} images"):
                 app._prepare_images(messages, check_context=False)
             decode.assert_not_called()
@@ -2270,11 +2276,9 @@ class ServerTest(unittest.TestCase):
             FakeRuntime(), tokenizer=self.ImagePadTokenizer(), max_context=1024
         ).app
         self.enterContext(
-            mock.patch.object(
-                api.image_input.ImageCache, "REQUEST_BUDGET_BYTES", 256 * 256 * 3
-            )
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 256 * 256 * 3)
         )
-        app.images = api.image_input.ImageCache()
+        app.images = images.ImageCache()
         job = app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         native_request = app.backend._generation_request(job)
         self.assertIs(native_request.image_owner, job.image_owner)
@@ -3501,14 +3505,6 @@ class ServerTest(unittest.TestCase):
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
-        for invalid in ("auto", "-1", "0G", "5X"):
-            with (
-                self.subTest(invalid=invalid),
-                mock.patch("sys.stderr", io.StringIO()) as error,
-                self.assertRaises(SystemExit),
-            ):
-                api.parse_args([*required, "--max-cache-disk", invalid])
-            self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
@@ -3520,8 +3516,6 @@ class ServerTest(unittest.TestCase):
             api._native_command(disk_bf16_args)[-3:],
             [str(5 * 1024**3), "--kv-format", "bf16"],
         )
-        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            api.parse_args([*required, "--kv-format", "fp16"])
         self.assertIsNone(args.decode_share)
         self.assertNotIn("--decode-share", api._native_command(args))
         share_args = api.parse_args(
@@ -3539,13 +3533,7 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(
                 api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
             )
-        self.assertEqual(
-            api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
-        )
-        self.assertEqual(
-            api.parse_args([*required, "--max-memory", "32G"]).max_memory, 32 * 1024**3
-        )
-        self.assertEqual(args.request_timeout, math.inf)
+        self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
         tokenizer = FakeTokenizer()
@@ -3560,24 +3548,9 @@ class ServerTest(unittest.TestCase):
             app.prepare(self.body(), deadline=FOREVER).max_new_tokens, 39998
         )
         with mock.patch("sys.stderr"):
-            for option, value in (
-                ("--max-context", "0"),
-                ("--max-context", "262145"),
-                ("--max-context", "not-a-number"),
-                ("--max-memory", "0"),
-                ("--max-memory", "not-a-number"),
-                ("--request-timeout", "0"),
-                ("--request-timeout", "nan"),
-                ("--request-timeout", "inf"),
-                ("--decode-share", "-0.5"),
-                ("--decode-share", "nan"),
-                ("--decode-share", "inf"),
-                ("--queue-size", "0"),
-                ("--port", "-1"),
-                ("--port", "65536"),
-            ):
+            for value in ("-1", "65536"):
                 with self.assertRaises(SystemExit):
-                    api.parse_args([*required, option, value])
+                    api.parse_args([*required, "--port", value])
 
     def test_public_ids_are_stable_and_unique_across_app_instances(self):
         tokenizer = FakeTokenizer()
@@ -3709,6 +3682,8 @@ class ServerTest(unittest.TestCase):
             runtime, tokenizer, request_logger=diagnostics.print_request
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
+        # No --request-timeout, no deadline.
+        self.assertEqual(app_type.call_args.args[4], math.inf)
         self.assertEqual(app_type.call_args.args[5], 4)
         runtime.wait_ready.assert_called_once_with()
         server.serve_forever.assert_called_once()
@@ -6981,7 +6956,7 @@ class ServerTest(unittest.TestCase):
         for length in (0, -1):
             status, _ = harness.raw_post(b"", length)
             self.assertEqual(status, 400)
-        status, _ = harness.raw_post(b"", api.DEFAULT_MAX_REQUEST_BYTES + 1)
+        status, _ = harness.raw_post(b"", serve_options.DEFAULT_MAX_REQUEST_BYTES + 1)
         self.assertEqual(status, 413)
         status, _ = harness.raw_post(b"\xff", 1)
         self.assertEqual(status, 400)
@@ -7169,7 +7144,7 @@ class ServerTest(unittest.TestCase):
                 connection.putrequest("POST", path)
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader(
-                    "Content-Length", str(api.DEFAULT_MAX_REQUEST_BYTES)
+                    "Content-Length", str(serve_options.DEFAULT_MAX_REQUEST_BYTES)
                 )
                 connection.endheaders()  # Do not send any body to an overloaded server.
                 response = connection.getresponse()

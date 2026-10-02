@@ -1,3 +1,4 @@
+import argparse
 import io
 import json
 import tempfile
@@ -16,8 +17,8 @@ from dev.tests.engine.test_json_responses import (
 )
 from dev.tests.engine.test_launcher import keep_stop_signals
 from install import launcher
-from server import frontend
 from server import protocol as native_wire
+from server import serve_options
 from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
@@ -267,8 +268,8 @@ class ServedModelNamesTests(unittest.TestCase):
             "a/../b",
         ):
             with self.subTest(name=name):
-                with self.assertRaises(ValueError):
-                    frontend.validate_served_model_name(name)
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    serve_options.parse_served_model_name(name)
                 for parse, args in (
                     (api.parse_args, SERVER_ARGS),
                     (launcher.parse_args, ["serve", "--model", "owner/repo"]),
@@ -279,8 +280,7 @@ class ServedModelNamesTests(unittest.TestCase):
                     ):
                         parse([*args, "--served-model-name", name])
         for name in ALIASES:
-            self.assertEqual(frontend.validate_served_model_name(name), name)
-            self.assertEqual(launcher._parse_served_model_name(name), name)
+            self.assertEqual(serve_options.parse_served_model_name(name), name)
 
     def test_announce_requires_a_served_name(self):
         for parse, args in (

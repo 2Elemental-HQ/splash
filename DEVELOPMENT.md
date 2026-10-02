@@ -779,7 +779,10 @@ responses alike, and `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit, which a complete Messages
 response leaves out. `make architecture-check` prevents lower layers from
-importing the HTTP entry module.
+importing the HTTP entry module. `serve_options.py` defines the options
+`splash serve` shares with the server once, each with its check, default and
+help, and how the launcher passes it on; it imports only the standard library,
+since the launcher parses them before `.venv` exists.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The

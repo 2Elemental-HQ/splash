@@ -24,7 +24,6 @@ if __package__:
     from .backend import Job, remaining_request_time
     from .chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
-        REASONING_EFFORTS,
         RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
@@ -33,6 +32,7 @@ if __package__:
     from .errors import APIError, ContextLengthError
     from .latency import LatencyMetrics
     from .metrics import is_finite_number
+    from .serve_options import REASONING_EFFORTS, parse_served_model_name
     from .tokenization import PromptTokenizer
     from .tool_schema import (
         THINK_END,
@@ -60,7 +60,6 @@ else:
     from backend import Job, remaining_request_time
     from chat_templates import (
         LATER_SYSTEM_UNSUPPORTED,
-        REASONING_EFFORTS,
         RESERVED_TEMPLATE_KWARGS,
         render_chat_template,
         template_options,
@@ -69,6 +68,7 @@ else:
     from errors import APIError, ContextLengthError
     from latency import LatencyMetrics
     from metrics import is_finite_number
+    from serve_options import REASONING_EFFORTS, parse_served_model_name
     from tokenization import PromptTokenizer
     from tool_schema import (
         THINK_END,
@@ -276,19 +276,6 @@ class GenerationOptions:
     priority: wire.RequestPriority
 
 
-def validate_served_model_name(value):
-    if (
-        not isinstance(value, str)
-        or not value
-        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
-        or any(part in ("", ".", "..") for part in value.split("/"))
-    ):
-        raise ValueError(
-            "model alias must be a non-empty name without whitespace or URL delimiters"
-        )
-    return value
-
-
 class Frontend:
     def __init__(
         self,
@@ -323,7 +310,7 @@ class Frontend:
         # The package id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
         self.model = model
-        served = tuple(validate_served_model_name(name) for name in served_model_names)
+        served = tuple(parse_served_model_name(name) for name in served_model_names)
         if announce_served_name and not served:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
