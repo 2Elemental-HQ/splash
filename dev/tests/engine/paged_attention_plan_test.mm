@@ -260,8 +260,10 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     firstPage += pageCounts[lane];
     data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
-    data.stores[lane] = {historyLengths[lane], rows, data.stride,
-                         pageCounts[lane], {}};
+    data.stores[lane] =
+        verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane])
+               : ops::PagedAttention::prefillParams(historyLengths[lane], rows, data.stride,
+                                                    pageCounts[lane]);
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
       const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
@@ -640,7 +642,8 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
                      bool float32, bool verify) {
   constexpr uint32_t kDim = 256, kPairs = 32;
   const uint32_t kvHeads = layout.kvHeads, group = queryHeads / kvHeads;
-  const uint32_t lanes = verify ? 3 : 1, rows = verify ? 8 : 37, stride = verify ? 32 : 64;
+  const uint32_t lanes = verify ? 3 : 1, rows = verify ? 8 : 37,
+                 stride = verify ? kv::kVerifyChunkStride : 64;
   const uint32_t packedWidth = 2 * queryHeads * kDim + 2 * kvHeads * kDim;
   auto packed = allocate(backend, uint64_t{lanes} * rows * packedWidth * 2);
   auto ropeCos = allocate(backend, uint64_t{lanes} * rows * kPairs * 4);
@@ -667,8 +670,7 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   const auto addProjection = [&](metal::CommandGraph &graph, const ops::NormWeights &keyWeights) {
     if (verify)
       ops::PagedAttention::addVerifyProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
-                                               queries, keys, values, stride, queryHeads, layout,
-                                               lanes);
+                                               queries, keys, values, queryHeads, layout, lanes);
     else
       ops::PagedAttention::addPrefillProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
                                                 queries, keys, values, rows, stride, queryHeads,

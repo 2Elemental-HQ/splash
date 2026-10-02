@@ -160,7 +160,7 @@ static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                            kTileRows *
+                            kv::kVerifyChunkStride *
                             geometry.target.attentionHeadDimension);
 }
 
@@ -194,7 +194,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kTileRows * geometry.target.attentionHeadDimension));
+                         kv::kVerifyChunkStride *
+                         geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
       operators.verifyAttentionWorkspacePerLane(
           geometry.target.attentionQueryHeads, geometry.target.kvLayout);
@@ -202,7 +203,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kTileRows * geometry.target.attentionHeadDimension));
+                         kv::kVerifyChunkStride *
+                         geometry.target.attentionHeadDimension));
   put(DecodeTensor::AttentionHidden,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::AttentionOutput,

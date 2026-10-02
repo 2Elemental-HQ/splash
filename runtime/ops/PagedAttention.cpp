@@ -199,19 +199,17 @@ void PagedAttention::addVerifyProjection(
     const NormWeights &queryNorm, const NormWeights &keyNorm,
     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
     metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-    metal::MetalBuffer chunkValues, uint32_t stride, uint32_t queryHeads,
-    kv::Layout layout, uint32_t lanes) {
+    metal::MetalBuffer chunkValues, uint32_t queryHeads, kv::Layout layout,
+    uint32_t lanes) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!stride || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify projection geometry");
-  const FullDecodeBatchParams params{stride, lanes};
   graph.add(qkNormKernel(pipeline(kernel, "verify_attention_qkv",
                                   "verify_attention_qkv_kv2_g8"),
                          queryNorm, keyNorm, layout.headDimension),
             {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
-            params,
             {uint64_t{SPLASH_TARGET_VERIFY_ROWS} * (queryHeads + layout.kvHeads),
              lanes, 1});
 }
@@ -219,12 +217,11 @@ void PagedAttention::addVerifyProjection(
 PreparedInput PagedAttention::addVerifyGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
-    uint32_t stride, uint32_t queryHeads, kv::Layout layout, uint32_t lanes,
-    LinearScratch scratch, LinearInput input) {
+    uint32_t queryHeads, kv::Layout layout, uint32_t lanes, LinearScratch scratch,
+    LinearInput input) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
-  if (!stride || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
-  const FullDecodeBatchParams params{stride, lanes};
   const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
   if (input != LinearInput::Plain && scratch.input) {
     const uint32_t width = queryHeads * layout.headDimension;
@@ -236,13 +233,14 @@ PreparedInput PagedAttention::addVerifyGate(
                                          "verify_attention_gate_table16_kv2_g8")
                               : pipeline(kernel, "verify_attention_gate_table64",
                                          "verify_attention_gate_table64_kv2_g8")),
-              {packed, attention, hidden, scratch.input, scratch.sums}, params,
+              {packed, attention, hidden, scratch.input, scratch.sums},
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return {std::move(hidden), input};
   }
   graph.add(std::string(pipeline(kernel, "verify_attention_gate",
                                  "verify_attention_gate_kv2_g8")),
-            {std::move(packed), std::move(attention), hidden}, params,
+            {std::move(packed), std::move(attention), hidden},
+            FullDecodeBatchParams{lanes},
             {gateGroups(rows, queryHeads, layout.headDimension), 1, 1});
   return {};
 }
@@ -259,6 +257,12 @@ kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
   return params;
+}
+
+kv::Q8ChunkedPrefillParams PagedAttention::verifyParams(uint64_t logicalPosition,
+                                                        uint32_t pageTableEntries) {
+  return prefillParams(logicalPosition, kv::kQ8VerifyMaximumRows,
+                       kv::kVerifyChunkStride, pageTableEntries);
 }
 
 void PagedAttention::addPrefillStore(
@@ -318,7 +322,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     throw std::invalid_argument(
         "verify attention scratch is smaller than its bound");
   }
-  // prefillParams validated each chunk, and the plan scaled each lane's
+  // verifyParams validated each chunk, and the plan scaled each lane's
   // split count from the same committed history; every lane's partials use
   // the plan-wide slot stride.
   std::array<kv::Q8ChunkedPrefillParams, maximumLanes> stores{};
@@ -327,9 +331,8 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     const kv::Q8ChunkedPrefillParams &chunk = chunks[lane];
     stores[lane] = chunk;
     stores[lane].kv = layer;
-    attention[lane] = {chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-                       chunk.page_table_entries, layer, plan.laneSplits[lane],
-                       plan.splits};
+    attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
+                       plan.laneSplits[lane], plan.splits};
   }
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),

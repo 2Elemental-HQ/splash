@@ -370,12 +370,12 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
   Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
   Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
-  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view, 32,
+  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view,
                                         heads, {1, kvHeads, 256}, lanes).layout == LinearInput::Plain,
           "plain attention gate claimed a table");
   addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, lanes);
   const PreparedInput prepared =
-      PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 32,
+      PagedAttention::addVerifyGate(graph, packed, attention, fused.view,
                                     heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
   require(prepared.layout == layout && prepared.source.sameView(fused.view),
           "fused attention gate did not report the table it wrote");

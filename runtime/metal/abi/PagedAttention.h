@@ -19,14 +19,14 @@ struct FullPrefillParams {
 static_assert(sizeof(FullPrefillParams) == 8,
               "Full attention prefill parameters are 8 bytes on both sides");
 
-// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows; stride as above.
+// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows in a chunk staging of
+// SPLASH_VERIFY_CHUNK_STRIDE rows.
 struct FullDecodeBatchParams {
-  uint32_t stride;
   uint32_t lanes;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 8,
-              "Full attention verify parameters are 8 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 4,
+              "Full attention verify parameters are 4 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final Q8 page slot before attention. Prefill and verify both read
@@ -59,10 +59,10 @@ struct SplashQ8PrefillAttentionParams {
 static_assert(sizeof(SplashQ8PrefillAttentionParams) == 28,
               "Q8 prefill attention parameters are 28 bytes on both sides");
 
+// A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
+// queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
 struct SplashQ8VerifyAttentionParams {
   uint32_t committed_tokens;
-  uint32_t active_rows;
-  uint32_t chunk_stride;
   uint32_t page_table_entries;
   SplashKvLayer kv;
   // Filled from the plan: this lane's history-scaled split count and the
@@ -71,5 +71,5 @@ struct SplashQ8VerifyAttentionParams {
   uint32_t slot_splits;
 };
 
-static_assert(sizeof(SplashQ8VerifyAttentionParams) == 32,
-              "Q8 verify attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashQ8VerifyAttentionParams) == 24,
+              "Q8 verify attention parameters are 24 bytes on both sides");

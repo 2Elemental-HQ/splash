@@ -14,6 +14,9 @@
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u
+// Rows per KV head (and per query group) of one lane's verify chunk staging:
+// one KV block, which holds the lane's SPLASH_TARGET_VERIFY_ROWS rows.
+#define SPLASH_VERIFY_CHUNK_STRIDE SPLASH_TARGET_KV_BLOCK_TOKENS
 #define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
 #define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
 // Draft attention deals the live ring tiles of one (lane, KV head)

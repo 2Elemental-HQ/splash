@@ -43,16 +43,12 @@ inline bool splash_q8_prefill_attention_contract_valid(
 
 inline bool splash_q8_verify_attention_contract_valid(
     constant SplashQ8VerifyAttentionParams &params) {
-  return params.active_rows > 0 &&
-         params.active_rows <= SPLASH_TARGET_VERIFY_ROWS &&
-         params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
-         params.chunk_stride >= params.active_rows &&
-         params.page_table_entries >=
-             (params.committed_tokens + params.active_rows +
+  return params.page_table_entries >=
+             (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
               SplashQ8PageTokens - 1) /
                  SplashQ8PageTokens &&
          params.kv.extent_pages > 0 &&
-         ulong(params.committed_tokens) + params.active_rows <=
+         ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&

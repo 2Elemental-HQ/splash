@@ -15,7 +15,6 @@ struct SplashQ8VerifyTile {
   uint split;
   uint splits;
   uint committed_tokens;
-  uint active_rows;
   bool active;
 };
 
@@ -34,7 +33,8 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   if (!splash_q8_verify_attention_contract_valid(lane_params) ||
       kv_head >= KVHeads || split >= lane_params.split_count)
     return tile;
-  ulong group_stride = ulong(lane_params.chunk_stride) * QueryHeadsPerKVHead * D;
+  constexpr ulong group_stride =
+      ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
   tile.queries = queries + (ulong(batch) * KVHeads + kv_head) * group_stride;
   tile.page_table =
       batch == 0 ? page_table0
@@ -46,7 +46,6 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   tile.split = split;
   tile.splits = lane_params.split_count;
   tile.committed_tokens = lane_params.committed_tokens;
-  tile.active_rows = lane_params.active_rows;
   tile.active = true;
   return tile;
 }
@@ -93,9 +92,9 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
     splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
                                 CacheElement>(                                 \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, tile.active_rows, tile.splits, tile.split,      \
-        partials, statistics, tile.slot, scores, probabilities, row_max,       \
-        row_sum, previous_scale, &rescale, thread_index);                      \
+        tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, scores, probabilities,    \
+        row_max, row_sum, previous_scale, &rescale, thread_index);             \
   }
 
 Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
@@ -123,12 +122,13 @@ inline void splash_q8_verify_attention_reduce_phase(
   if (!splash_q8_verify_attention_contract_valid(lane_params) ||
       kv_head >= KVHeads || fused_row >= M || thread_index >= D)
     return;
-  ulong group_stride = ulong(lane_params.chunk_stride) * QueryHeadsPerKVHead * D;
+  constexpr ulong group_stride =
+      ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
   splash_q8_attention_reduce_row_shared<QueryHeadsPerKVHead,
                                    SPLASH_TARGET_VERIFY_ROWS>(
       partials, statistics,
       output + (ulong(batch) * KVHeads + kv_head) * group_stride,
-      lane_params.committed_tokens, lane_params.active_rows,
+      lane_params.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
       lane_params.split_count,
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
       thread_index, weights, group_values);

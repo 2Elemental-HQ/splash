@@ -31,6 +31,11 @@ static_assert(std::is_trivially_copyable_v<Q8PrefillAttentionParams>);
 inline constexpr uint32_t kQ8VerifyMaximumRows = SPLASH_TARGET_VERIFY_ROWS;
 inline constexpr uint32_t kQ8VerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
+// Rows per KV head (and per query group) of one lane's verify chunk
+// staging: one KV block, which holds the lane's verify rows.
+inline constexpr uint32_t kVerifyChunkStride = SPLASH_VERIFY_CHUNK_STRIDE;
+static_assert(kVerifyChunkStride >= kQ8VerifyMaximumRows &&
+              kVerifyChunkStride % kPageTokens == 0);
 // Verify attention runs one split per kQ8VerifyPagesPerSplit visible Page32
 // blocks, at least kQ8VerifySplits and at most the maximum that sizes the
 // partial workspace (q8VerifyAttentionSplits).
@@ -205,13 +210,13 @@ public:
                       const NormWeights &queryNorm, const NormWeights &keyNorm,
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-                      metal::MetalBuffer chunkValues, uint32_t stride,
-                      uint32_t queryHeads, kv::Layout layout, uint32_t lanes);
+                      metal::MetalBuffer chunkValues, uint32_t queryHeads,
+                      kv::Layout layout, uint32_t lanes);
   // Also writes the out-projection's `input` table when it needs one.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
                                      metal::MetalBuffer packed,
                                      metal::MetalBuffer attention,
-                                     metal::MetalBuffer hidden, uint32_t stride,
+                                     metal::MetalBuffer hidden,
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch = {},
                                      LinearInput input = LinearInput::Plain);
@@ -221,6 +226,10 @@ public:
   [[nodiscard]] static kv::Q8ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
                 uint32_t chunkStride, uint32_t pageTableEntries);
+  // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
+  // staging, the only parameters addVerify attends.
+  [[nodiscard]] static kv::Q8ChunkedPrefillParams
+  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,
@@ -240,7 +249,7 @@ public:
                          metal::MetalBuffer pageTable,
                          const kv::Q8ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
-  // Stores each lane's chunk (prefillParams, one per plan lane) and attends
+  // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,

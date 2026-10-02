@@ -15,14 +15,15 @@ inline void splash_store_verify_phase(
   constant SplashChunkedPrefillParams &lane_params = params[batch];
   if (!splash_chunk_contract_valid(lane_params) ||
       lane_params.chunk_tokens != Rows ||
+      lane_params.chunk_stride != SPLASH_VERIFY_CHUNK_STRIDE ||
       thread_index >= SplashQ8HeadDimension)
     return;
   device const SplashKvPage *page_table =
       batch == 0 ? page_table0
                  : (batch == 1 ? page_table1
                                : (batch == 2 ? page_table2 : page_table3));
-  ulong lane_tensor_stride =
-      ulong(KVHeads) * lane_params.chunk_stride * SplashQ8HeadDimension;
+  constexpr ulong lane_tensor_stride =
+      ulong(KVHeads) * SPLASH_VERIFY_CHUNK_STRIDE * SplashQ8HeadDimension;
   chunk_keys += batch * lane_tensor_stride;
   chunk_values += batch * lane_tensor_stride;
 

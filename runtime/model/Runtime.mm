@@ -1446,8 +1446,9 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      q8[lane] = q8Params(items[lane].logicalPosition, kDecodeRows, kTileRows,
-                          items[lane].pageTable);
+      q8[lane] = ops::PagedAttention::verifyParams(
+          items[lane].logicalPosition,
+          static_cast<uint32_t>(items[lane].pageTable.size()));
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
