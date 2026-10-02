@@ -1151,6 +1151,57 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   }
 }
 
+// The runtime uploads masks for constrained lanes alone, so an unconstrained
+// lane must select the same first token and verify rows over a mask buffer
+// of all zeros as over one of all ones.
+void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t lanes = 2;
+  Sampling sampling(vocabulary);
+  const std::array<SamplingPolicy, lanes> policies{
+      SamplingPolicy{.topK = 1, .temperature = 0.0F},
+      SamplingPolicy{
+          .topK = 0, .temperature = 0.8F, .topP = 0.9F, .minP = 0.05F}};
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  const auto select = [&](uint32_t maskWord) {
+    const Batch batch = makeBatch(backend, vocabulary, lanes);
+    batch.poison();
+    Random random(4127);
+    for (uint32_t row = 0; row < batch.rows; ++row) {
+      fillRow(batch.row(row), vocabulary, random);
+      batch.inputTokens()[row] = random.next() % vocabulary;
+    }
+    auto *candidates =
+        static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
+    auto *proposal =
+        static_cast<float *>(batch.buffers.draftProbabilities.contents());
+    for (uint32_t entry = 0; entry < lanes * kPositions * kDraftCandidates;
+         ++entry) {
+      candidates[entry] = random.next() % vocabulary;
+      proposal[entry] = 0.5F * (random.unit() + 1.0F) / kDraftCandidates;
+    }
+    for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    std::fill_n(batch.masks(), lanes * (kRows + 1) * batch.maskWords(),
+                maskWord);
+    CommandGraph verify;
+    sampling.addVerify(verify, policies, batch.buffers, stops[0], stops[1], {});
+    static_cast<void>(backend.submitCommand(verify.dispatches()));
+    std::vector<uint32_t> tokens(batch.outputTokens(),
+                                 batch.outputTokens() + batch.rows);
+    for (const SamplingPolicy &policy : policies) {
+      CommandGraph initial;
+      sampling.addInitial(initial, policy, batch.buffers, 3, stops[0],
+                          stops[1], {});
+      static_cast<void>(backend.submitCommand(initial.dispatches()));
+      tokens.push_back(batch.outputTokens()[0]);
+    }
+    return tokens;
+  };
+  require(select(0) == select(std::numeric_limits<uint32_t>::max()),
+          "an unconstrained lane read its constraint mask");
+}
+
 // Constrained greedy lanes (the argmax kernels) and constrained sampled
 // lanes with top-k 1 (a distribution of one token) must agree with a
 // full-vocabulary CPU argmax, including ties, row offsets and masks: the
@@ -2008,6 +2059,8 @@ int main(int argc, char **argv) {
     overProposedResidual(backend);
     stage = "extreme searches";
     extremeSearches(backend);
+    stage = "unconstrained rows ignore masks";
+    unconstrainedRowsIgnoreMasks(backend);
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {

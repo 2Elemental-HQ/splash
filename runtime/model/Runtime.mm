@@ -791,25 +791,34 @@ struct Runtime::Impl {
     return next;
   }
 
-  void loadPolicyBuffers(Request &entry, uint32_t lane,
-                         std::span<const uint32_t> masks) const {
-    auto uniforms = decodeArena->get(lane, DecodeTensor::SamplingUniforms);
-    auto *uniformData = contents<float>(uniforms, "sampling uniforms");
+  // Only a sampled lane's draws read its cycle's uniforms.
+  void uploadSamplingUniforms(const Request &entry, uint32_t lane) const {
     std::copy(entry.cycleUniforms.begin(), entry.cycleUniforms.end(),
-              uniformData);
+              contents<float>(
+                  decodeArena->get(lane, DecodeTensor::SamplingUniforms),
+                  "sampling uniforms"));
+  }
 
-    auto constraint = decodeArena->get(lane, DecodeTensor::ConstraintMasks);
-    auto *maskData = contents<uint32_t>(constraint, "constraint masks");
-    const uint64_t capacity =
-        uint64_t{ExecutionLimits::maximumStepTokens} * geometry.maskWords();
-    std::fill(maskData, maskData + capacity,
-              std::numeric_limits<uint32_t>::max());
-    if (!masks.empty()) {
-      if (masks.size() > capacity) {
-        throw std::invalid_argument("constraint mask exceeds decode arena");
-      }
-      std::copy(masks.begin(), masks.end(), maskData);
-    }
+  // Only a constrained lane's selections read its mask rows.
+  std::span<uint32_t> constraintMasks(uint32_t lane) const {
+    const MetalBuffer masks =
+        decodeArena->get(lane, DecodeTensor::ConstraintMasks);
+    return {contents<uint32_t>(masks, "constraint masks"),
+            masks.sizeBytes() / sizeof(uint32_t)};
+  }
+
+  void uploadConstraintMasks(uint32_t lane,
+                             std::span<const uint32_t> masks) const {
+    const std::span<uint32_t> rows = constraintMasks(lane);
+    if (masks.size() > rows.size())
+      throw std::invalid_argument("constraint mask exceeds decode arena");
+    std::ranges::copy(masks, rows.begin());
+  }
+
+  // A constrained lane whose mask was abandoned admits every token.
+  void admitEveryToken(uint32_t lane) const {
+    std::ranges::fill(constraintMasks(lane),
+                      std::numeric_limits<uint32_t>::max());
   }
 
   static ops::SamplingPenalties samplingPenalties(const Request &entry) noexcept {
@@ -925,11 +934,12 @@ struct Runtime::Impl {
       std::copy(entry.finalTargetHidden.begin(), entry.finalTargetHidden.end(),
                 hidden + uint64_t{row} * geometry.target.hiddenSize);
     }
-    entry.cycleUniforms.fill(0.0F);
     if (samplingEnabled(entry)) {
+      entry.cycleUniforms.fill(0.0F);
       entry.cycleUniforms[0] = nextUniform(entry);
+      uploadSamplingUniforms(entry, lane);
     }
-    loadPolicyBuffers(entry, lane, masks);
+    uploadConstraintMasks(lane, masks);
 
     CommandGraph graph;
     targetModel.addHead(graph, d(DecodeTensor::Hidden0),
@@ -1228,7 +1238,7 @@ struct Runtime::Impl {
         if (samplingEnabled(entry)) {
           entry.cycleUniforms.fill(0.0F);
           entry.cycleUniforms[0] = nextUniform(entry);
-          loadPolicyBuffers(entry, sequence.lane, {});
+          uploadSamplingUniforms(entry, sequence.lane);
         }
         addPrefillPolicy(graph, entry, sequence.lane, lastRows - 1);
       }
@@ -1788,10 +1798,10 @@ struct Runtime::Impl {
             Request &entry = *laneResult.request;
             entries[lane] = &entry;
             maximumRetained[lane] = laneResult.maximumRetained;
-            impl_.loadPolicyBuffers(
-                entry, lane,
-                abandoned_[lane] ? std::span<const uint32_t>{}
-                                 : std::span<const uint32_t>{entry.maskWords});
+            if (abandoned_[lane])
+              impl_.admitEveryToken(lane);
+            else
+              impl_.uploadConstraintMasks(lane, entry.maskWords);
           }
 
           CommandGraph commit;
@@ -2285,8 +2295,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
     if (constrained && !entry.maskWords.empty())
       throw std::logic_error("constrained request has stale mask state");
-    if (Impl::samplingEnabled(entry))
+    if (Impl::samplingEnabled(entry)) {
       Impl::stageSamplingCycle(entry);
+      impl_->uploadSamplingUniforms(entry, lane);
+    }
 
     // DFlash has one physical graph: anchor + seven proposal rows. A shorter
     // output budget only lowers the token-exact commit count; it never
@@ -2295,7 +2307,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.maximumRetained = std::min(remaining, kDecodeRows);
 
     impl_->prepareDecodeLane(entry, item, lane);
-    impl_->loadPolicyBuffers(entry, lane, {});
     laneResult.running = true;
   }
 
