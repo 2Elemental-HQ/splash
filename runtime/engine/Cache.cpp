@@ -348,10 +348,9 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
   const bool release = mode == CacheReclaimMode::ReleaseExtents;
   if (release) {
-    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
-      return {true, bytes};
-    if (compactExtent())
-      return {true, reclaimEmptyExtents(keepRunway, 1)};
+    if (const CacheReclaimResult released = releaseExtent(keepRunway);
+        released.madeProgress)
+      return released;
   }
   CacheReclaimResult evicted = evictOne(keepResumePoint);
   if (evicted.madeProgress && release)
@@ -452,7 +451,7 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
   }
   if (growth) {
     // A publication in use makes room as running work does.
-    if (releaseExtent())
+    if (releaseExtent(false).reclaimedBytes)
       return {true, true};
     if (oldest && states_.checkpointState(oldest->id))
       return recycle(*oldest, false);
@@ -460,7 +459,7 @@ StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool g
     while (const auto victim = reclaimOldest(false, false, false)) {
       if (!victim->kv)
         return {true, false};
-      if (releaseExtent())
+      if (releaseExtent(false).reclaimedBytes)
         return {true, true};
     }
   }
@@ -552,10 +551,12 @@ uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   return before >= after ? before - after : 0;
 }
 
-uint64_t Cache::releaseExtent() {
-  if (const uint64_t bytes = reclaimEmptyExtents(false, 1))
-    return bytes;
-  return compactExtent() ? reclaimEmptyExtents(false, 1) : 0;
+CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
+  if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
+    return {true, bytes};
+  if (compactExtent())
+    return {true, reclaimEmptyExtents(keepRunway, 1)};
+  return {};
 }
 
 bool Cache::compactExtent() {

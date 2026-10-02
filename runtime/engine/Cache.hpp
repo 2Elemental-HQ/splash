@@ -429,8 +429,9 @@ private:
   reclaimEmptyExtents(bool keepRunway,
                       uint32_t limit = std::numeric_limits<uint32_t>::max());
   // Returns one extent of free pages: an empty one, or the one compactExtent
-  // empties. Zero when the free pages fill none.
-  [[nodiscard]] uint64_t releaseExtent();
+  // empties; progress with zero bytes when the extent emptied is the runway
+  // kept. No progress when the free pages fill none.
+  [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
   // Empties one extent that still holds pages (KvPool::compactExtent); the
   // blocks and requests on its pages follow them. A page a transfer reads or
   // writes stays where it is until the transfer has landed. False when the
