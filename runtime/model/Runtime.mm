@@ -130,6 +130,10 @@ void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
       items.size() != plan.items.size()) {
     throw std::invalid_argument("model runtime received an invalid batch plan");
   }
+  // Applying the initial mask can end a request or start drafting it; one
+  // lane per plan keeps every plan's lanes all running or none.
+  if (plan.decodeStage == DecodeStage::ApplyInitialMask && plan.width() != 1)
+    throw std::invalid_argument("an initial mask is applied one request at a time");
   for (size_t index = 0; index < items.size(); ++index) {
     if (items[index].requestId != plan.items[index].requestId ||
         (expected == WorkKind::Prefill &&
@@ -258,9 +262,8 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
-    bool verify = false;
-    bool draftForMask = false;
-    bool draftComputed = false;
+    // The lane drafts and verifies this cycle.
+    bool running = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -1625,13 +1628,10 @@ struct Runtime::Impl {
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::vector<ModelStepResult> results,
       std::span<const ModelBatchItem> items, const ops::LinearDispatchStats &stats,
-      uint32_t planWidth, CommandTiming timing) {
-    if (lanes.size() != items.size() || results.size() != items.size())
-      throw std::logic_error("decode completion shape changed");
-
+      CommandTiming timing) {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
-      if (!laneResult.verify)
+      if (!laneResult.running)
         continue;
       auto d = [&](DecodeTensor tensor) {
         return decodeArena->get(lane, tensor);
@@ -1660,7 +1660,7 @@ struct Runtime::Impl {
 
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
-      if (!laneResult.verify)
+      if (!laneResult.running)
         continue;
       Request &entry = *laneResult.request;
       if (!laneResult.failure.empty()) {
@@ -1706,7 +1706,7 @@ struct Runtime::Impl {
         emitTerminalAnchor(entry, result);
     }
 
-    counters.lastDecodeWidth = planWidth;
+    counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
     counters.lastDecodeFusedOperations = stats.fusedSourceOperations;
     counters.lastDecodeM16Dispatches = stats.m16Dispatches;
     counters.lastDecodeM24Dispatches = stats.m24Dispatches;
@@ -1730,12 +1730,11 @@ struct Runtime::Impl {
                             std::vector<ModelStepResult> results,
                             std::span<const ModelBatchItem> items,
                             const ops::LinearDispatchStats &stats,
-                            uint32_t planWidth, CommandTiming priorTiming,
-                            const CommandGraph &draft,
+                            CommandTiming priorTiming, const CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
-          planWidth_(planWidth), timing_(priorTiming),
+          timing_(priorTiming),
           wake_(std::make_shared<std::function<void()>>(
               std::move(completion))) {
       submit(draft);
@@ -1754,11 +1753,6 @@ struct Runtime::Impl {
               "constrained draft proposals");
           entry.maskWords.clear();
           entry.verifyMaskInFlight = true;
-
-          const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
-          laneResult.currentAnchor = *entry.pendingToken;
-          laneResult.maximumRetained = std::min(remaining, kDecodeRows);
-          laneResult.verify = true;
           entries[lane] = &entry;
 
           if (!abandoned_[lane]) {
@@ -1872,7 +1866,7 @@ struct Runtime::Impl {
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
       return impl_.finalizeDecode(lanes_, std::move(results_), items_, stats_,
-                                  planWidth_, timing_);
+                                  timing_);
     }
 
     double wallMilliseconds() const noexcept override {
@@ -1906,7 +1900,6 @@ struct Runtime::Impl {
     std::vector<ModelStepResult> results_;
     std::vector<ModelBatchItem> items_;
     ops::LinearDispatchStats stats_;
-    uint32_t planWidth_ = 0;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
@@ -2355,19 +2348,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
       throw std::logic_error("terminal anchor was not emitted on selection");
     }
 
-    if (constrained) {
-      if (!entry.maskWords.empty()) {
-        throw std::logic_error("constrained request has stale mask state");
-      }
-      laneResult.draftForMask = true;
-      impl_->prepareDecodeLane(entry, item, lane);
-      if (Impl::samplingEnabled(entry))
-        Impl::stageSamplingCycle(entry);
-      impl_->loadPolicyBuffers(entry, lane, {});
-      laneResult.draftComputed = true;
-      continue;
-    }
-
+    if (constrained && !entry.maskWords.empty())
+      throw std::logic_error("constrained request has stale mask state");
     if (Impl::samplingEnabled(entry))
       Impl::stageSamplingCycle(entry);
 
@@ -2379,25 +2361,25 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});
-    laneResult.draftComputed = true;
-    laneResult.verify = true;
+    laneResult.running = true;
   }
 
-  CommandGraph commandGraph;
-  uint32_t verified = 0;
-  uint32_t draftComputed = 0;
-  for (const Impl::DecodeLaneResult &lane : lanes)
-    verified += lane.verify ? 1U : 0U;
-  for (const Impl::DecodeLaneResult &lane : lanes)
-    draftComputed += lane.draftComputed ? 1U : 0U;
-  if (verified && verified != lanes.size()) {
-    throw std::logic_error("decode batch mixed mask and verify phases");
-  }
+  // validatePlan's one-lane rule for initial masks leaves a plan's lanes
+  // all running or none.
+  const bool running =
+      std::ranges::any_of(lanes, &Impl::DecodeLaneResult::running);
   const uint32_t width = static_cast<uint32_t>(lanes.size());
-  if (draftComputed && draftComputed != lanes.size()) {
-    throw std::logic_error("decode batch mixed draft execution phases");
-  }
-  if (draftComputed || verified) {
+  CommandGraph commandGraph;
+  if (running) {
+    std::array<Impl::Request *, kLaneCount> requests{};
+    std::array<uint64_t, kLaneCount> logicalPositions{};
+    std::array<uint32_t, kLaneCount> maximumRetained{};
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      requests[lane] = lanes[lane].request;
+      logicalPositions[lane] = items[lane].logicalPosition;
+      maximumRetained[lane] = lanes[lane].maximumRetained;
+    }
+    const std::span<Impl::Request *const> entries(requests.data(), width);
     const uint32_t ropeRows = width * kDecodeRows;
     impl_->addRopeTables(
         commandGraph,
@@ -2407,64 +2389,40 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::RopeSin, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
-  }
-  if (draftComputed) {
-    std::array<Impl::Request *, kLaneCount> requests{};
-    std::array<uint64_t, kLaneCount> logicalPositions{};
-    for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
-      requests[lane] = lanes[lane].request;
-      logicalPositions[lane] = items[lane].logicalPosition;
-    }
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width);
-    impl_->encodeDraftBatchGraph(commandGraph, {requests.data(), lanes.size()},
-                                 {logicalPositions.data(), lanes.size()},
-                                 batchStats);
-  }
-  if (verified) {
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width}, batchStats);
+    if (constrained) {
+      return std::make_unique<Impl::ConstrainedDecodeTicket>(
+          *impl_, std::move(lanes), std::move(results), items, batchStats,
+          priorTiming, commandGraph, std::move(completion));
+    }
     impl_->encodeBatchVerifyInput(commandGraph, width);
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width);
-    std::array<Impl::Request *, kLaneCount> requests{};
-    std::array<uint32_t, kLaneCount> maximumRetained{};
-    for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
-      requests[lane] = lanes[lane].request;
-      maximumRetained[lane] = lanes[lane].maximumRetained;
-    }
-    impl_->encodeTargetVerifyBatchForward(
-        commandGraph, {requests.data(), lanes.size()}, items, batchStats);
-    impl_->encodeTargetVerifyBatchPolicy(commandGraph,
-                                         {requests.data(), lanes.size()});
-    impl_->encodeBatchAcceptance(commandGraph, {requests.data(), lanes.size()},
-                                 {maximumRetained.data(), lanes.size()});
-    impl_->encodeBatchGdnCommit(commandGraph, {requests.data(), lanes.size()});
-    impl_->encodeDraftStateCommitBatch(
-        commandGraph, {requests.data(), lanes.size()}, items, batchStats);
-  }
-
-  const bool overlapConstraintMask =
-      constrained && !lanes.empty() &&
-      std::all_of(lanes.begin(), lanes.end(),
-                  [](const auto &lane) { return lane.draftForMask; });
-  if (overlapConstraintMask) {
-    return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), std::move(results), items, batchStats,
-        plan.width(), priorTiming, commandGraph, std::move(completion));
+    impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items,
+                                          batchStats);
+    impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
+    impl_->encodeBatchAcceptance(commandGraph, entries,
+                                 {maximumRetained.data(), width});
+    impl_->encodeBatchGdnCommit(commandGraph, entries);
+    impl_->encodeDraftStateCommitBatch(commandGraph, entries, items,
+                                       batchStats);
   }
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  const uint32_t planWidth = plan.width();
   Impl *impl = impl_.get();
   auto finish = [impl, lanes = std::move(lanes), results = std::move(results),
-                 items = std::move(copiedItems), batchStats, planWidth,
+                 items = std::move(copiedItems), batchStats,
                  priorTiming](CommandTiming timing) mutable {
     timing.gpuSeconds += priorTiming.gpuSeconds;
     timing.wallSeconds += priorTiming.wallSeconds;
     return impl->finalizeDecode(lanes, std::move(results), items, batchStats,
-                                planWidth, timing);
+                                timing);
   };
 
-  if (commandGraph.empty()) {
+  if (!running) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);

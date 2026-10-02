@@ -2182,9 +2182,11 @@ int main(int argc, char **argv) {
 
     // A B2 constrained cycle keeps both lanes reserved while host grammar
     // work overlaps the target forward. No proposal/logit state is copied to
-    // a different arena lane between draft and commit.
+    // a different arena lane between draft and commit. Each lane applies its
+    // initial mask in a plan of its own, as the scheduler issues them; the
+    // B2 cycle continues both.
     EngineRequest crossLane0 =
-        makeRequest(42, prompt129, 2, BatchCohort::Constrained);
+        makeRequest(42, prompt129, 3, BatchCohort::Constrained);
     crossLane0.constraint = ConstraintMode::TokenMask;
     crossLane0.sampling = {4.0F, 1.0F, 32, 7001};
     EngineRequest crossLane1 = crossLane0;
@@ -2227,13 +2229,52 @@ int main(int argc, char **argv) {
             crossInitial[0].nextDecodeStage == DecodeStage::ApplyInitialMask &&
             crossInitial[1].nextDecodeStage == DecodeStage::ApplyInitialMask,
         "B2 constrained initial masks are not empty simulations");
-    std::array<uint32_t, 1> crossAnchor0{110};
-    std::array<uint32_t, 1> crossAnchor1{111};
-    provideMask(executor, 42, singletonMasks(crossAnchor0));
-    provideMask(executor, 43, singletonMasks(crossAnchor1));
+    const std::array<uint32_t, 2> crossAnchors{110, 111};
+    provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
+    provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
+    // Applying an initial mask can end a request or start drafting it, so a
+    // plan applies one: a wider one is refused before any lane changes.
     crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
+    bool widePlanRejected = false;
+    try {
+      static_cast<void>(executor.decode(crossInitialPlan, crossItems));
+    } catch (const std::invalid_argument &) {
+      widePlanRejected = true;
+    }
+    require(widePlanRejected, "a B2 plan applied two initial masks");
+    // Each lane's initial cycle keeps its anchor; the masked successor that
+    // rejects the second proposal becomes its next anchor.
+    std::array<uint32_t, 2> crossNext{};
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint64_t id = 42 + lane;
+      PendingMaskedDecode initial = beginMaskedDecodeOne(
+          executor, id, 129, lane ? crossPages1 : crossPages0,
+          DecodeStage::ApplyInitialMask);
+      require(initial.maskRequests.size() == 1 &&
+                  initial.maskRequests[0].simulationTokens.front() ==
+                      crossAnchors[lane],
+              "B1 initial constrained cycle did not draft from its anchor");
+      crossNext[lane] =
+          initial.maskRequests[0].simulationTokens[1] == 112 ? 113 : 112;
+      const std::array<uint32_t, 9> verify{
+          crossAnchors[lane], crossNext[lane], 114, 115, 116, 117, 118, 119, 120};
+      provideMask(executor, id, singletonMasks(verify));
+      const auto initialResults = finishMaskedDecode(std::move(initial));
+      require(initialResults.size() == 1 &&
+                  initialResults[0].outputTokens ==
+                      std::vector<uint32_t>{crossAnchors[lane]} &&
+                  initialResults[0].outputTokensWithoutKv == 0,
+              "B1 initial constrained cycle did not keep only its anchor");
+    }
+    BatchPlan crossPlan{WorkKind::Decode,
+                        BatchCohort::Constrained,
+                        {{42, 0}, {43, 0}},
+                        DecodeStage::Regular};
+    const std::vector<ModelBatchItem> crossCycleItems{
+        withRevision({.requestId = 42, .logicalPosition = 130, .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 130, .pageTable = crossPages1})};
     PendingMaskedDecode crossPending =
-        beginMaskedDecode(executor, crossInitialPlan, crossItems);
+        beginMaskedDecode(executor, crossPlan, crossCycleItems);
     require(crossPending.maskRequests.size() == 2 &&
                 crossPending.ticket->ownsMaskWait(42) &&
                 crossPending.ticket->ownsMaskWait(43),
@@ -2242,19 +2283,18 @@ int main(int argc, char **argv) {
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const auto &simulation =
           crossPending.maskRequests[lane].simulationTokens;
-      const uint32_t anchor = lane ? crossAnchor1[0] : crossAnchor0[0];
-      const uint32_t rejected = simulation[1] == 112 ? 113 : 112;
+      const uint32_t rejected = simulation[1] == 121 ? 122 : 121;
       crossVerify[lane] =
-          {anchor, rejected, 114, 115, 116, 117, 118, 119, 120};
+          {crossNext[lane], rejected, 123, 124, 125, 126, 127, 128, 129};
       provideMask(executor, crossPending.maskRequests[lane].requestId,
                   singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
     require(crossResults.size() == 2 &&
                 crossResults[0].outputTokens ==
-                    std::vector<uint32_t>{crossAnchor0[0], crossVerify[0][1]} &&
+                    std::vector<uint32_t>{crossNext[0], crossVerify[0][1]} &&
                 crossResults[1].outputTokens ==
-                    std::vector<uint32_t>{crossAnchor1[0], crossVerify[1][1]} &&
+                    std::vector<uint32_t>{crossNext[1], crossVerify[1][1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
                 crossResults[0].draftedTokens == 7 &&
@@ -2265,9 +2305,9 @@ int main(int argc, char **argv) {
     const model::ModelTelemetry constrainedTelemetry =
         executor.telemetry();
     require(constrainedTelemetry.constrainedMaskOverlapBatches -
-                    beforeConstrained.constrainedMaskOverlapBatches == 3 &&
+                    beforeConstrained.constrainedMaskOverlapBatches == 5 &&
                 constrainedTelemetry.constrainedMaskOverlapRequests -
-                    beforeConstrained.constrainedMaskOverlapRequests == 4 &&
+                    beforeConstrained.constrainedMaskOverlapRequests == 6 &&
                 constrainedTelemetry.totalConstrainedTargetForwardGpuSeconds >
                     beforeConstrained.totalConstrainedTargetForwardGpuSeconds,
             "constrained overlap telemetry does not match B1/B2 execution");
