@@ -23,13 +23,13 @@ constexpr std::array<std::array<uint32_t, kLanes>, 2> histories{{
 enum class Tensor : size_t {
   Input0, Input1, Dynamic0, Dynamic1, Weights0, Weights1, Residual0,
   Residual1, Convolution0, Convolution1, Convolution2, Convolution3,
-  Qkv, QkvOriginal, Grouped, QueryKeys, QueryValues, Packed, QueryNorm,
+  Qkv, Grouped, QueryKeys, QueryValues, Packed, QueryNorm,
   KeyNorm, RopeCos, RopeSin, RingKeys, RingValues, Reference, Count
 };
 constexpr size_t index(Tensor tensor) { return static_cast<size_t>(tensor); }
 constexpr std::array outputs{
     Tensor::Convolution0, Tensor::Convolution1, Tensor::Convolution2,
-    Tensor::Convolution3, Tensor::Qkv, Tensor::Grouped, Tensor::QueryKeys,
+    Tensor::Convolution3, Tensor::Grouped, Tensor::QueryKeys,
     Tensor::QueryValues, Tensor::Packed};
 
 uint64_t aligned(uint64_t bytes) {
@@ -63,7 +63,7 @@ struct FixturePlan final {
         rows * w.shape.dynamicSize * 2;
     sizes[index(Tensor::Weights0)] = sizes[index(Tensor::Weights1)] =
         uint64_t{4} * w.shape.hiddenSize * 2;
-    sizes[index(Tensor::Qkv)] = sizes[index(Tensor::QkvOriginal)] = workspace.qkvBytes;
+    sizes[index(Tensor::Qkv)] = workspace.qkvBytes;
     // The grouped tensor also holds the attention core's fp32 split partials
     // behind the query rows; only the rows are outputs.
     sizes[index(Tensor::Grouped)] = workspace.groupedQueriesBytes;
@@ -117,7 +117,7 @@ public:
     std::memset(base_.contents(), 0, plan_.bytes);
     for (Tensor tensor : {Tensor::Input0, Tensor::Input1, Tensor::Dynamic0,
                            Tensor::Dynamic1, Tensor::Weights0, Tensor::Weights1,
-                           Tensor::Residual0, Tensor::Residual1, Tensor::QkvOriginal,
+                           Tensor::Residual0, Tensor::Residual1, Tensor::Qkv,
                            Tensor::RingKeys, Tensor::RingValues}) {
       const auto buffer = get(tensor);
       auto *data = static_cast<uint16_t *>(buffer.contents());
@@ -145,10 +145,6 @@ public:
   void reset() {
     for (Tensor tensor : outputs)
       std::memset(get(tensor).contents(), 0, get(tensor).sizeBytes());
-    // QKV preparation normalizes its query portion in place. Every trial gets
-    // the original projection output, never a second normalization of it.
-    std::memcpy(get(Tensor::Qkv).contents(), get(Tensor::QkvOriginal).contents(),
-                 get(Tensor::Qkv).sizeBytes());
   }
 
   metal::CommandGraph graph(DraftAttentionConfiguration configuration,

@@ -329,8 +329,8 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   std::vector<uint16_t> originalQkv(
       static_cast<const uint16_t *>(qkv.contents()),
       static_cast<const uint16_t *>(qkv.contents()) + workspace.qkvBytes / 2);
-  const std::array preparedBuffers{qkv, queries, queryKeys, queryValues};
-  std::array<std::vector<uint16_t>, 4> preparedBaseline;
+  const std::array preparedBuffers{queries, queryKeys, queryValues};
+  std::array<std::vector<uint16_t>, preparedBuffers.size()> preparedBaseline;
   for (const auto configuration : DraftAttention::candidates(shape)) {
     const auto plan = DraftAttention::plan(shape, lanes, configuration);
     for (const auto stage : {DraftConvolutionStage::Prepare,
@@ -373,13 +373,15 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
       }
     }
 
-    std::memcpy(qkv.contents(), originalQkv.data(), qkv.sizeBytes());
     CommandGraph graph;
     DraftAttention::addPrepare(graph,
         {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
          queryValues}, plan);
     DraftAttention::addReorder(graph, queries, packed, plan);
     static_cast<void>(backend.submitCommand(graph.dispatches()));
+    require(std::equal(originalQkv.begin(), originalQkv.end(),
+                       static_cast<const uint16_t *>(qkv.contents())),
+            "draft prepare wrote its QKV input");
     for (size_t i = 0; i < preparedBuffers.size(); ++i) {
       const auto *values =
           static_cast<const uint16_t *>(preparedBuffers[i].contents());

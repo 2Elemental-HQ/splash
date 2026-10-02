@@ -36,7 +36,7 @@ inline void draft_conv_phase(device const bfloat *input,
 }
 
 inline void draft_qkv_prepare_phase(
-    device bfloat *proposal_qkv, device bfloat *queries,
+    device const bfloat *proposal_qkv, device bfloat *queries,
     device const bfloat *q_norm, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *query_keys, device bfloat *query_values, uint groups,
@@ -70,9 +70,8 @@ inline void draft_qkv_prepare_phase(
               : proposal_qkv + row * PackedWidth + QWidth +
                     attention_head * HeadDim;
     device const bfloat *weight = query ? q_norm : k_norm;
-    device bfloat *destination =
-        query ? proposal_qkv + row * PackedWidth + attention_head * HeadDim
-              : query_keys + (attention_head * Rows + row) * HeadDim;
+    device bfloat *destination = (query ? queries : query_keys) +
+                                 (attention_head * Rows + row) * HeadDim;
 
     float value = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
     float square_sum = simd_sum(value * value);
@@ -96,15 +95,9 @@ inline void draft_qkv_prepare_phase(
       float second = float(head[thread_index + HeadDim / 2]);
       float cosine = rope_cos[row * (HeadDim / 2) + thread_index];
       float sine = rope_sin[row * (HeadDim / 2) + thread_index];
-      bfloat first_rotated = bfloat(first * cosine - second * sine);
-      bfloat second_rotated = bfloat(second * cosine + first * sine);
-      destination[thread_index] = first_rotated;
-      destination[thread_index + HeadDim / 2] = second_rotated;
-      if (query) {
-        uint query_index = (attention_head * Rows + row) * HeadDim;
-        queries[query_index + thread_index] = first_rotated;
-        queries[query_index + thread_index + HeadDim / 2] = second_rotated;
-      }
+      destination[thread_index] = bfloat(first * cosine - second * sine);
+      destination[thread_index + HeadDim / 2] =
+          bfloat(second * cosine + first * sine);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -502,7 +495,7 @@ kernel void draft_conv_h2048(
 }
 
 kernel void draft_attention_qkv(
-    device bfloat *proposal_qkv [[buffer(0)]],
+    device const bfloat *proposal_qkv [[buffer(0)]],
     device bfloat *queries [[buffer(1)]],
     device const bfloat *q_norm [[buffer(2)]],
     device const bfloat *k_norm [[buffer(3)]],
