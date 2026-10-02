@@ -4,6 +4,7 @@
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -2142,20 +2143,10 @@ int main(int argc, char **argv) {
       std::vector<uint32_t> transcript;
       uint32_t pendingAnchorIndex = 0;
     };
-    // The sampling penalties; the defaults change nothing.
-    struct Penalties final {
-      float presence = 0.0F;
-      float frequency = 0.0F;
-      float repetition = 1.0F;
-
-      [[nodiscard]] bool active() const {
-        return presence != 0.0F || frequency != 0.0F || repetition != 1.0F;
-      }
-    };
     // A sampling request keeps the tokens minP leaves it, the topK of those,
     // all of them for 0, then its topP nucleus.
     const auto runPreemption = [&](BatchCohort cohort, uint32_t preemptionMode,
-                                   Penalties penalties = {},
+                                   ops::SamplingPenalties penalties = {},
                                    uint32_t topK = 20, float topP = 0.95F,
                                    uint32_t flags = 0, float minP = 0.0F) {
       const bool preempt = preemptionMode != 0;
@@ -2363,7 +2354,7 @@ int main(int argc, char **argv) {
     // that.
     constexpr float graphDrift = 0.03F;
     const auto probeLoss = [&](const std::vector<uint32_t> &transcript,
-                               const Penalties &penalties) {
+                               const ops::SamplingPenalties &penalties) {
       float worst = 0.0F;
       for (size_t position = 0; position < transcript.size(); ++position) {
         std::vector<uint32_t> context = prompt129;
@@ -2422,9 +2413,10 @@ int main(int argc, char **argv) {
     std::cout << "penalty_probe control_drift=" << drift
               << " tolerance=" << tolerance << '\n';
     bool penaltiesDecided = false;
-    for (const Penalties penalties :
-         {Penalties{-2.0F, -2.0F, 1.0F}, Penalties{1.5F, 0.0F, 1.0F},
-          Penalties{1.5F, 0.0F, 1.3F}}) {
+    for (const ops::SamplingPenalties penalties :
+         {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
+          ops::SamplingPenalties{1.0F, 1.5F, 0.0F},
+          ops::SamplingPenalties{1.3F, 1.5F, 0.0F}}) {
       const auto reference = runPreemption(BatchCohort::Greedy, 0, penalties);
       const auto promptResumed = runPreemption(BatchCohort::Greedy, 1, penalties);
       require(promptResumed.transcript == reference.transcript,
@@ -2453,7 +2445,7 @@ int main(int argc, char **argv) {
     // Sampled lanes with presence and frequency repeat under a fixed seed;
     // a constrained lane with repetition keeps its masked continuation.
     {
-      const Penalties sampled{1.5F, 0.5F, 1.0F};
+      const ops::SamplingPenalties sampled{1.0F, 1.5F, 0.5F};
       const auto reference = runPreemption(BatchCohort::Sampling, 0, sampled);
       require(runPreemption(BatchCohort::Sampling, 1, sampled).transcript ==
                   reference.transcript,
@@ -2466,7 +2458,7 @@ int main(int argc, char **argv) {
                   runPreemption(BatchCohort::Sampling, 2, sampled).transcript ==
                       resumed.transcript,
               "penalized sampled recomputation is not deterministic");
-      const Penalties repetition{0.0F, 0.0F, 1.3F};
+      const ops::SamplingPenalties repetition{1.3F, 0.0F, 0.0F};
       const auto masked = runPreemption(BatchCohort::Constrained, 0, repetition);
       require(runPreemption(BatchCohort::Constrained, 1, repetition).transcript ==
                   masked.transcript,

@@ -61,18 +61,27 @@ DraftSelectorWorkspace Sampling::draftWorkspace(uint32_t positions) {
           candidates * sizeof(float)};
 }
 
-void Sampling::loadPenaltyWords(std::span<uint32_t> words,
-                                std::span<const uint32_t> prompt,
-                                std::span<const uint32_t> selected,
-                                bool markPrompt) {
-  requireVocabulary(prompt, words.size());
-  requireVocabulary(selected, words.size());
+void Sampling::rebuildPenaltyWords(std::span<uint32_t> words,
+                                   std::span<const uint32_t> history,
+                                   uint64_t generatedTokens,
+                                   std::optional<uint32_t> pendingToken,
+                                   bool markPrompt) {
+  if (history.size() <= generatedTokens)
+    throw std::logic_error("request history holds no prompt");
+  const std::span<const uint32_t> prompt =
+      history.first(history.size() - generatedTokens);
+  requireVocabulary(history, words.size());
+  if (pendingToken)
+    requireVocabulary({&*pendingToken, 1}, words.size());
   std::fill(words.begin(), words.end(), 0U);
   if (markPrompt) {
     for (const uint32_t token : prompt)
       words[token] |= SPLASH_PENALTY_PROMPT_BIT;
   }
-  countPenaltyTokens(words, selected);
+  for (const uint32_t token : history.subspan(prompt.size()))
+    ++words[token];
+  if (pendingToken)
+    ++words[*pendingToken];
 }
 
 // Counts stay far below the prompt bit: a request selects at most one token

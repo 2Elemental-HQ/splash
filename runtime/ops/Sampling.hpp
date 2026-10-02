@@ -5,6 +5,7 @@
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace splash::ops {
@@ -137,14 +138,19 @@ public:
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
   [[nodiscard]] static DraftSelectorWorkspace draftWorkspace(uint32_t positions);
 
-  // A penalized request's penalty words (metal/abi/Sampling.h): the prompt
-  // bit of every prompt token when markPrompt, as only repetition reads it,
-  // and the count of every token the target selected. Every token must be
-  // inside the vocabulary, one word each.
-  static void loadPenaltyWords(std::span<uint32_t> words,
-                               std::span<const uint32_t> prompt,
-                               std::span<const uint32_t> selected,
-                               bool markPrompt);
+  // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
+  // when it takes a state slot from the history the slot's prefill consumes:
+  // its prompt, then the generatedTokens outputs it emitted. The prompt bit
+  // marks every prompt token when markPrompt, as only repetition reads it,
+  // and the counts are of every token the target selected: the emitted
+  // outputs and the pending anchor. Every token must be inside the
+  // vocabulary, one word each, and the history must hold a prompt.
+  static void rebuildPenaltyWords(std::span<uint32_t> words,
+                                  std::span<const uint32_t> history,
+                                  uint64_t generatedTokens,
+                                  std::optional<uint32_t> pendingToken,
+                                  bool markPrompt);
+  // Counts the tokens one step selected into a request's penalty words.
   static void countPenaltyTokens(std::span<uint32_t> words,
                                  std::span<const uint32_t> selected);
 

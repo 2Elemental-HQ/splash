@@ -746,24 +746,18 @@ struct Runtime::Impl {
             geometry.target.vocabularySize};
   }
 
-  // Loads a penalized request's penalty words when it takes a state slot, at
-  // activation and at resume, from the history the slot's prefill consumes:
-  // its prompt, then the outputs it emitted. With the pending anchor, those
-  // are every token the target selected. No command reads the slot yet.
+  // Rebuilds a penalized request's penalty words when it takes a state slot,
+  // at activation and at resume, from the history the slot's prefill
+  // consumes. No command reads the slot yet.
   void bindPenalties(const Request &entry,
                      std::span<const uint32_t> history) const {
     const ops::SamplingPenalties penalties = samplingPenalties(entry);
     if (!penalties.active())
       return;
-    if (history.size() <= entry.generatedTokens)
-      throw std::logic_error("request history holds no prompt");
-    const size_t prompt = history.size() - entry.generatedTokens;
-    const std::span<uint32_t> words = penaltyWords(entry.slot);
-    ops::Sampling::loadPenaltyWords(words, history.first(prompt),
-                                    history.subspan(prompt),
-                                    penalties.repetition != 1.0F);
-    if (entry.pendingToken)
-      ops::Sampling::countPenaltyTokens(words, {&*entry.pendingToken, 1});
+    ops::Sampling::rebuildPenaltyWords(penaltyWords(entry.slot), history,
+                                       entry.generatedTokens,
+                                       entry.pendingToken,
+                                       penalties.repetition != 1.0F);
   }
 
   // The one place a token the target selected becomes the pending anchor:

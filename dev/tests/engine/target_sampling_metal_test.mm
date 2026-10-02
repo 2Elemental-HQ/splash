@@ -39,6 +39,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 namespace {
@@ -62,10 +63,14 @@ void require(bool condition, const std::string &message) {
     throw std::runtime_error(message);
 }
 
-template <class Function> void rejects(Function function, const char *what) {
+// Requires function to throw an Error itself, not a subclass of it.
+template <class Error = std::invalid_argument, class Function>
+void rejects(Function function, const char *what) {
   try {
     function();
-  } catch (const std::invalid_argument &) {
+  } catch (const Error &error) {
+    require(typeid(error) == typeid(Error),
+            std::string("refused ") + what + " with another error");
     return;
   }
   throw std::runtime_error(std::string("accepted ") + what);
@@ -1790,17 +1795,22 @@ void extremeSearches(MetalBackend &backend) {
 }
 
 // The host words: prompt bits only when repetition reads them, counts of
-// every selected token, and no token outside the vocabulary.
+// every selected token (the generated history and the pending anchor), and
+// no token outside the vocabulary or history without a prompt.
 void penaltyWords() {
   std::vector<uint32_t> words(8, 0xDEADBEEFU);
-  const std::vector<uint32_t> prompt{1, 3, 3, 7};
-  const std::vector<uint32_t> selected{3, 5, 5, 0};
-  Sampling::loadPenaltyWords(words, prompt, selected, true);
+  // A prompt of 1, 3, 3, 7, then the generated 3, 5, 5, 0.
+  const std::vector<uint32_t> history{1, 3, 3, 7, 3, 5, 5, 0};
+  Sampling::rebuildPenaltyWords(words, history, 4, std::nullopt, true);
   constexpr uint32_t kPrompt = SPLASH_PENALTY_PROMPT_BIT;
   require(words == std::vector<uint32_t>{1, kPrompt, 0, kPrompt + 1, 0, 2, 0,
                                          kPrompt},
           "penalty words with prompt bits differ");
-  Sampling::loadPenaltyWords(words, prompt, selected, false);
+  Sampling::rebuildPenaltyWords(words, history, 4, 6, true);
+  require(words == std::vector<uint32_t>{1, kPrompt, 0, kPrompt + 1, 0, 2, 1,
+                                         kPrompt},
+          "penalty words with a pending token differ");
+  Sampling::rebuildPenaltyWords(words, history, 4, std::nullopt, false);
   require(words == std::vector<uint32_t>{1, 0, 0, 1, 0, 2, 0, 0},
           "penalty words without prompt bits differ");
   const std::vector<uint32_t> step{5, 6};
@@ -1811,10 +1821,17 @@ void penaltyWords() {
   const std::vector<uint32_t> outside{2, 8};
   rejects([&] { Sampling::countPenaltyTokens(words, outside); },
           "a counted token outside the vocabulary");
-  rejects([&] { Sampling::loadPenaltyWords(words, outside, {}, true); },
-          "a prompt token outside the vocabulary");
-  rejects([&] { Sampling::loadPenaltyWords(words, {}, outside, false); },
-          "a selected token outside the vocabulary");
+  rejects([&] {
+    Sampling::rebuildPenaltyWords(words, outside, 0, std::nullopt, true);
+  }, "a prompt token outside the vocabulary");
+  rejects([&] {
+    Sampling::rebuildPenaltyWords(words, outside, 1, std::nullopt, false);
+  }, "a generated token outside the vocabulary");
+  rejects([&] { Sampling::rebuildPenaltyWords(words, step, 0, 8, false); },
+          "a pending token outside the vocabulary");
+  rejects<std::logic_error>([&] {
+    Sampling::rebuildPenaltyWords(words, step, 2, std::nullopt, false);
+  }, "a history without a prompt");
   require(words == before, "a refused token changed the penalty words");
 }
 
@@ -1844,7 +1861,8 @@ void penaltyLifecycle() {
         std::vector<uint32_t> history = prompt;
         uint32_t generated = 0;
         std::optional<uint32_t> pending;
-        Sampling::loadPenaltyWords(words, prompt, {}, markPrompt);
+        Sampling::rebuildPenaltyWords(words, prompt, 0, std::nullopt,
+                                      markPrompt);
         const auto commit = [&](std::span<const uint32_t> tokens) {
           Sampling::countPenaltyTokens(words, tokens);
           pending = tokens.back();
@@ -1855,13 +1873,8 @@ void penaltyLifecycle() {
         };
         const auto resume = [&](const char *stage) {
           std::vector<uint32_t> rebuilt(vocabulary, 0xA5A5A5A5U);
-          require(history.size() > generated, "history lost its prompt");
-          const size_t promptSize = history.size() - generated;
-          Sampling::loadPenaltyWords(
-              rebuilt, std::span(history).first(promptSize),
-              std::span(history).subspan(promptSize), markPrompt);
-          if (pending)
-            Sampling::countPenaltyTokens(rebuilt, {&*pending, 1});
+          Sampling::rebuildPenaltyWords(rebuilt, history, generated, pending,
+                                        markPrompt);
           require(rebuilt == words,
                   std::string("resumed penalty words differ ") + stage);
           words = std::move(rebuilt);

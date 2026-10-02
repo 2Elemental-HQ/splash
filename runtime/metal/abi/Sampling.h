@@ -83,8 +83,9 @@ static_assert(sizeof(TargetVocabularyRange) == 8,
               "Target vocabulary ranges are 8 bytes on both sides");
 
 // A penalized request's word for each vocabulary token, in its state slot's
-// row of the penalty table (ops::Sampling::loadPenaltyWords): the prompt bit
-// marks a prompt token, and the count is how often the target selected it.
+// row of the penalty table (ops::Sampling::rebuildPenaltyWords): the
+// prompt bit marks a prompt token, and the count is how often the target
+// selected it.
 #define SPLASH_PENALTY_PROMPT_BIT 0x80000000u
 #define SPLASH_PENALTY_COUNT_MASK 0x7fffffffu
 
