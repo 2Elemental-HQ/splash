@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -4028,6 +4029,91 @@ void testPageReuseTakesKvBeforeStates() {
           "page reuse did not take the leaf its state left");
 }
 
+// A reclaim that keeps extents leaves the one its eviction empties allocated
+// for the next request, which takes its pages without allocating; releasing
+// the empty extents afterwards releases it.
+void testReplacementKeepsTheExtentItEmpties() {
+  test::TestKvStorage storage(8, 4096, 4);
+  storage.budgetPages = 4;
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool);
+  static_cast<void>(cacheChain(cache, 1, 1));
+
+  const auto reclaimed = cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+  require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
+              cache.snapshot().pool.pagesPrefix == 0 &&
+              storage.allocatedPages() == 4 && storage.releasedExtents == 0,
+          "replacement released the newly reusable extent");
+  cache.beginRequest(2);
+  require(cache.ensureTokens(2, 128).granted() &&
+              pool.snapshot().extentAllocations == 1 && storage.releasedExtents == 0,
+          "replacement allocated the reusable extent again");
+  cache.endRequest(2);
+  require(cache.releaseEmptyExtents(false) == 4 * 4096 &&
+              storage.allocatedPages() == 0 && storage.releasedExtents == 1,
+          "releasing the empty extents did not release the reused one");
+}
+
+// A pass that releases extents as its evictions empty them reports the
+// longest release of one extent, as growth reports the longest allocation of
+// one; the loop's longest tick covers the whole pass.
+void testReleaseTimeCoversOneExtent() {
+  constexpr uint32_t extents = 6;
+  test::TestKvStorage storage(4 * extents, 4096, 4);
+  storage.releaseTime = std::chrono::milliseconds(5);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool);
+  for (uint32_t chain = 0; chain < extents; ++chain)
+    static_cast<void>(cacheChain(cache, chain + 1, 4));
+  require(cache.snapshot().pool.reclaimableBytes == 0 &&
+              cache.snapshot().pool.pagesPrefix == 4 * extents,
+          "release time setup geometry changed");
+  static_cast<void>(cache.evictAll());
+  // The pool's timer runs around one release: no less than the storage saw
+  // its longest release take, and less than all of them took together. No
+  // bound in milliseconds holds on a loaded machine.
+  const double longest = cache.snapshot().pool.extentReleaseMaxMilliseconds;
+  require(storage.releasedExtents == extents && longest >= storage.longestRelease &&
+              longest < storage.totalRelease,
+          "the release time is not one extent's");
+}
+
+// KV gives a publication in use memory only through the extent it leaves
+// empty. An empty extent goes first. Then leaves go, oldest first, until one
+// leaves an extent empty, which is released before the call returns: the
+// snapshot that follows needs the memory at once.
+void testPublicationReleasesTheExtentItEmpties() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool);
+  // The publishing request runs on the first extent.
+  const uint64_t point = cacheChain(cache, 1, 4, true).second[3];
+  StateUse use = cache.useState(point);
+  // Another conversation's chain fills the second extent and half the third.
+  static_cast<void>(cacheChain(cache, 2, 6));
+  // A request that cached nothing leaves the fourth extent empty.
+  cache.beginRequest(3);
+  require(cache.ensureTokens(3, 96).granted(), "the empty extent was not allocated");
+  cache.endRequest(3);
+  require(cache.snapshot().pool.reclaimableBytes == 4 * 4096 &&
+              storage.allocatedPages() == 16,
+          "fixture geometry changed");
+
+  // An extent is room only for a snapshot that can allocate its bytes.
+  require(!cache.reclaimOneState(false, point, false) && storage.releasedExtents == 0 &&
+              cache.snapshot().pool.pagesPrefix == 10,
+          "a publication that cannot allocate released an extent or took KV");
+  StateRoom room = cache.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 1 &&
+              cache.snapshot().pool.pagesPrefix == 10,
+          "the publication did not release the empty extent first");
+  room = cache.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 2 &&
+              storage.allocatedPages() == 8 && cache.snapshot().pool.pagesPrefix == 8,
+          "the publication took more KV than its extent or kept the extent it emptied");
+  cache.endRequest(1);
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -4056,6 +4142,7 @@ int main() {
     testPublicationInUseLeavesKvInUse();
     testInUsePublicationStartsNoDemotion();
     testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
+    testPublicationReleasesTheExtentItEmpties();
     testLargeSharedDiskRestore();
     testRefusedRestoresStopAtTheFirstRefusal();
     testReclaimForPagesCoversTheShortfall();
@@ -4137,6 +4224,8 @@ int main() {
     testEvictAllGathersWhatRequestsHold();
     testCompactionLeavesAPageBeingRestored();
     testCompactionLeavesAPageBeingDemoted();
+    testReplacementKeepsTheExtentItEmpties();
+    testReleaseTimeCoversOneExtent();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
