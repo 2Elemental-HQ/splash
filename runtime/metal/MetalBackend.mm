@@ -237,12 +237,11 @@ struct BackendAsyncState {
     CommandWatchdog commandWatchdog;
     bool stopping = false;
 
-    uint64_t sampleDeviceMemory() const noexcept {
-        if (!device) return 0;
+    void sampleDeviceMemory() const noexcept {
+        if (!device) return;
         uint64_t current = static_cast<uint64_t>(device.currentAllocatedSize);
         deviceCurrentAllocatedBytes.store(current, std::memory_order_relaxed);
         raisePeak(devicePeakAllocatedBytes, current);
-        return current;
     }
 
     [[noreturn]] void throwUnhealthy() const {
@@ -486,8 +485,8 @@ struct MetalBackend::Impl {
         std::make_shared<BackendAsyncState>();
     mutable std::mutex commandMutex;
 
-    uint64_t sampleDeviceMemory() const noexcept {
-        return asyncState->sampleDeviceMemory();
+    void sampleDeviceMemory() const noexcept {
+        asyncState->sampleDeviceMemory();
     }
 
     void ensureHealthy() const {
@@ -496,13 +495,6 @@ struct MetalBackend::Impl {
 
     void markUnhealthy(std::string reason) {
         asyncState->markUnhealthy(std::move(reason));
-    }
-
-    MetalBuffer wrap(std::shared_ptr<MetalAllocation> allocation) {
-        auto result = std::make_shared<MetalBuffer::Impl>();
-        result->lengthBytes = allocation->buffer.length;
-        result->allocation = std::move(allocation);
-        return MetalBuffer(std::move(result));
     }
 
     MetalBuffer registerBuffer(id<MTLBuffer> buffer, BufferStorage storage,
@@ -520,16 +512,10 @@ struct MetalBackend::Impl {
                       allocation->bytes, std::memory_order_relaxed) +
                       allocation->bytes);
         sampleDeviceMemory();
-        return wrap(std::move(allocation));
-    }
-
-    MetalAllocation &allocationOf(const MetalBuffer &buffer) const {
-        if (!buffer.impl_ || !buffer.impl_->allocation ||
-            buffer.impl_->allocation->accounting != accounting) {
-            throw MetalBackendError(
-                "Metal buffer is empty or belongs to another backend");
-        }
-        return *buffer.impl_->allocation;
+        auto result = std::make_shared<MetalBuffer::Impl>();
+        result->lengthBytes = buffer.length;
+        result->allocation = std::move(allocation);
+        return MetalBuffer(std::move(result));
     }
 
     id<MTLComputePipelineState> pipeline(std::string_view name) {
@@ -723,7 +709,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
             impl_->device, impl_->queue,
             impl_->newPipeline(Residency::kKickPipeline),
             residencyKeepAliveSeconds);
-        impl_->sampleDeviceMemory();
 
         readDeviceCapabilities(impl_->device, impl_->capabilities);
     }
@@ -787,27 +772,6 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
     return impl_->registerBuffer(buffer, storage);
-}
-
-MetalBuffer MetalBackend::allocateAddressed(uint64_t bytes,
-                                            std::string_view label) {
-    checkOperation();
-    if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
-    if (bytes > impl_->capabilities.maxBufferLengthBytes) {
-        throw MetalBackendError("Metal buffer exceeds maxBufferLength");
-    }
-    id<MTLBuffer> buffer = [impl_->device
-        newBufferWithLength:checkedNSUInteger(bytes, "buffer size")
-        options:MTLResourceStorageModeShared |
-                MTLResourceHazardTrackingModeUntracked];
-    if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
-    if (buffer.allocatedSize != bytes) {
-        throw MetalAllocationError(
-            "Metal allocated " + std::to_string(buffer.allocatedSize) +
-            " bytes for an addressed buffer of " + std::to_string(bytes));
-    }
-    if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
-    return impl_->registerBuffer(buffer, BufferStorage::Shared);
 }
 
 MetalBuffer MetalBackend::wrapSharedMemory(

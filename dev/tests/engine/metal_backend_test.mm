@@ -642,29 +642,13 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
               << " lapses=" << lapses << '\n';
 }
 
-IMP originalNewBuffer = nullptr;
-MTLResourceOptions lastBufferOptions = 0;
-id recordBufferOptions(id device, SEL selector, NSUInteger length,
-                       MTLResourceOptions options) {
-    lastBufferOptions = options;
-    return reinterpret_cast<id (*)(id, SEL, NSUInteger, MTLResourceOptions)>(
-        originalNewBuffer)(device, selector, length, options);
-}
-
-IMP originalBufferAllocatedSize = nullptr;
-NSUInteger paddedAllocatedSize(id buffer, SEL selector) {
-    return reinterpret_cast<NSUInteger (*)(id, SEL)>(
-               originalBufferAllocatedSize)(buffer, selector) + 16384;
-}
-
-// Addressed buffers are shared and untracked, allocated at exactly their
-// size, and kernels reach them only through GPU addresses in a table. The
-// residency set makes them resident for every command, also once its
-// keep-alive has lapsed; one dispatch reads what the previous one wrote
-// through them; the CPU reads what kernels wrote and kernels read what the
-// CPU wrote between commands; and buffers released and allocated again
-// between commands work at once.
-void addressedBuffersThroughTables(const std::string &metallibPath) {
+// Kernels reach shared buffers only through GPU addresses in a table, as
+// they reach KV extents. The residency set makes the buffers resident for
+// every command, also once its keep-alive has lapsed; one dispatch reads
+// what the previous one wrote through them; the CPU reads what kernels wrote
+// and kernels read what the CPU wrote between commands; and buffers released
+// and allocated again between commands work at once.
+void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
@@ -672,41 +656,18 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
     MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     std::vector<MetalBuffer> buffers(kBuffers);
-    {
-        MethodReplacement options(device, @selector(newBufferWithLength:options:),
-                                  reinterpret_cast<IMP>(recordBufferOptions));
-        originalNewBuffer = options.original;
-        buffers[0] = backend.allocateAddressed(kBytes, "addressed-test");
-    }
-    require(lastBufferOptions == (MTLResourceStorageModeShared |
-                                  MTLResourceHazardTrackingModeUntracked),
-            "an addressed buffer is not shared and hazard-untracked");
-    {
-        id<MTLBuffer> sample = [device newBufferWithLength:kBytes
-            options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        MethodReplacement padded(sample, @selector(allocatedSize),
-                                 reinterpret_cast<IMP>(paddedAllocatedSize));
-        originalBufferAllocatedSize = padded.original;
-        try {
-            (void)backend.allocateAddressed(kBytes);
-            fail("an addressed buffer larger than its size was accepted");
-        } catch (const MetalAllocationError &) {
-        }
-    }
-    for (uint32_t index = 1; index < kBuffers; ++index)
-        buffers[index] = backend.allocateAddressed(kBytes);
+    for (MetalBuffer &buffer : buffers) buffer = backend.allocateBuffer(kBytes);
     require(buffers[0].storage() == BufferStorage::Shared && buffers[0].contents() &&
                 buffers[0].sizeBytes() == kBytes &&
                 backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
-            "addressed buffers were not allocated or counted at their size");
+            "buffers were not allocated or counted at their size");
     require(buffers[0].gpuAddress() &&
                 backend.view(buffers[0], 4096, 4096).gpuAddress() ==
                     buffers[0].gpuAddress() + 4096,
             "a view's GPU address does not start at its offset");
     require(backend.lapsedResidentBytes() == 0,
-            "addressed buffers did not hold the residency set");
+            "the buffers did not hold the residency set");
     const uint64_t members = backend.memoryStats().allocatedBytes;
 
     auto *entries = static_cast<uint64_t *>(table.contents());
@@ -733,8 +694,8 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
             buffers[index] = {};
             require(backend.memoryStats().allocatedBytes ==
                         before + (kBuffers - 1) * kBytes,
-                    "a released addressed buffer is still counted");
-            buffers[index] = backend.allocateAddressed(kBytes);
+                    "a released buffer is still counted");
+            buffers[index] = backend.allocateBuffer(kBytes);
             entries[index] = buffers[index].gpuAddress();
             ++regrown;
         }
@@ -744,7 +705,7 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
                    std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             require(backend.lapsedResidentBytes() == members,
-                    "addressed buffers did not lapse with the residency set");
+                    "the buffers did not lapse with the residency set");
             lapsedRound = true;
         }
         seed = 0x9e3779b9u * (round + 1);
@@ -779,8 +740,8 @@ void addressedBuffersThroughTables(const std::string &metallibPath) {
     buffers.clear();
     require(backend.memoryStats().allocatedBytes == before &&
                 backend.lapsedResidentBytes() == 0,
-            "released addressed buffers stayed counted or in the residency set");
-    std::cout << "PASS addressed buffers through tables rounds=" << kRounds
+            "released buffers stayed counted or in the residency set");
+    std::cout << "PASS buffers reached through tables rounds=" << kRounds
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
 }
 
@@ -1121,7 +1082,7 @@ int main(int argc, const char *argv[]) {
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
             residencyReturnsRemovedBuffers(argv[1]);
-            addressedBuffersThroughTables(argv[1]);
+            buffersReachedThroughTables(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

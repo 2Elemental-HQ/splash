@@ -235,18 +235,13 @@ public:
   // and the next request would wait to get them back. A member is wired from
   // its allocation on until the keep-alive passes without a command, and
   // again from the next command: memory goes back to macOS when the engine
-  // releases it, not when macOS chooses.
+  // releases it, not when macOS chooses. Kernels may also reach a Shared
+  // buffer only through its GPU address held in another buffer, as they
+  // reach KV extents: residency makes it resident for every command, so no
+  // command names it.
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
                  std::string_view label = {});
-  // A shared, hazard-untracked buffer that kernels reach only through GPU
-  // addresses held in other buffers, as they reach KV pages: the residency
-  // set makes it resident for every command, so nothing names it per command
-  // or dispatch. The CPU reaches it too, through contents(), which is how the
-  // disk tier moves KV pages. Fails with MetalAllocationError unless Metal
-  // allocates exactly `bytes`, the amount admission charged.
-  [[nodiscard]] MetalBuffer allocateAddressed(uint64_t bytes,
-                                              std::string_view label = {});
 
   // Wraps page-aligned shared memory without copying it. The lifetime token
   // is retained by Metal's deallocator, including any internal buffer owners
