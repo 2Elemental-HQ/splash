@@ -138,20 +138,16 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
       fourSimdgroups{8, 8, 24};
   const uint32_t tiles128 = matrix.outputSize / 128;
   const uint32_t tiles256 = matrix.outputSize / 256;
-  // Apple9 is unmeasured under the balanced rule and keeps its one-tile grids
-  // and the fused gate/up clamp of 2.25 resident groups per core.
+  // Apple9 reaches here only for wide plain projections of three or four
+  // lanes, which keep their one-tile grids.
   const auto groups = [&](uint32_t tiles, GroupRule rule) {
     return family >= 10 ? expectedGroups(tiles, cores, rule) : tiles;
   };
   if (family >= 10 && lanes == 1)
     if (const auto oneLane = expectedOneLane(cores, matrix, epilogue)) return *oneLane;
-  if (epilogue == LinearEpilogue::GateUp) {
-    if (family >= 10) return {LinearTile::N256, expectedGroups(tiles256, cores, gateUp)};
-    return {LinearTile::N256, std::min(tiles256, uint32_t(std::lround(2.25 * cores)))};
-  }
+  if (epilogue == LinearEpilogue::GateUp) return {LinearTile::N256, groups(tiles256, gateUp)};
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, n128)};
-  if (lanes == 3 && (family >= 10 ||
-      (family == 9 && epilogue == LinearEpilogue::None)))
+  if (lanes == 3)
     return {LinearTile::N128, groups(tiles128, fourSimdgroups), LinearSimdgroups::Four};
   if (lanes >= 3 && epilogue == LinearEpilogue::None && tiles256 >= 2 * cores)
     return {LinearTile::N256, groups(tiles256, n256)};

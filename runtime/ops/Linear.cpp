@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -352,9 +351,6 @@ struct DecodeGroupPolicy final {
 constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
     kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
-// Apple9 retains its measured gate/up clamp. The round-robin policy above was
-// measured on Apple10; applying it to Apple9 requires separate calibration.
-constexpr double kApple9GateUpGroupsPerCore = 2.25;
 
 // Tiles on the most loaded core when `groups` threadgroups are placed
 // round-robin on `cores` and group g streams tiles g, g + groups, ...
@@ -511,26 +507,19 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     if (lanes == 1)
       if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
   }
-  // Apple9 keeps its one-tile grids (see kApple9GateUpGroupsPerCore).
+  // Apple9 reaches here only for wide plain projections of three or four
+  // lanes, which keep their one-tile grids: the round-robin policy above was
+  // measured on Apple10.
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
     return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
                                  : tiles;
   };
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (appleGpuFamily_ < 10) {
-      const auto resident = static_cast<uint32_t>(
-          std::max(1L, std::lround(kApple9GateUpGroupsPerCore * gpuCores_)));
-      return {LinearTile::N256, std::min(tiles256, resident)};
-    }
+  if (w.epilogue == LinearEpilogue::GateUp)
     return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
-  }
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
-  // M24 plain projections benefit from four SIMD groups on Apple9 too.
-  // Apple9 residual projections retain eight groups with compact prefix
-  // traversal; Apple10 uses four for every M24 projection it does not split.
-  if (lanes == 3 && (appleGpuFamily_ >= 10 ||
-      (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
+  // Every M24 projection that gets here runs four SIMD groups.
+  if (lanes == 3)
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),
             LinearSimdgroups::Four};
   if (widePlain) return {LinearTile::N256, groups(tiles256, kN256Groups)};
