@@ -1,7 +1,6 @@
 #include "engine/Cache.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <utility>
