@@ -247,6 +247,9 @@ struct Runtime::Impl {
     uint64_t draftContextThrough = 0;
     std::optional<DraftContextPlan> draftContextPlan;
     std::vector<ImageState> images;
+    // What its activation took from a cached state: the images that end
+    // there were left out (ModelRequest::restoredTokens).
+    uint32_t restoredTokens = 0;
   };
 
   struct DecodeLaneResult final {
@@ -461,11 +464,12 @@ struct Runtime::Impl {
   // admission: the shared vision scratch when an image still needs an
   // encode and no encoder exists, and the pixel and embedding buffers of
   // the images nothing holds yet. Rows something holds are shared, encoded
-  // or not. At the budget the engine retries a denied start after each
-  // reclaim step, and a denial builds nothing, so no encoder arena, image
-  // buffer or state cell is built and dropped every time. The refusal keeps
-  // its cause; a grant hands the request's images to `images` and counts
-  // the rows it shares as reuses, each once.
+  // or not. Images the restored prefix covers are left out: only their
+  // spans are kept. At the budget the engine retries a denied start after
+  // each reclaim step, and a denial builds nothing, so no encoder arena,
+  // image buffer or state cell is built and dropped every time. The refusal
+  // keeps its cause; a grant hands the request's images to `images` and
+  // counts the rows it shares as reuses, each once.
   metal::AllocationResult activate(const ModelRequest &request, uint32_t slot,
                                    std::vector<ImageState> &images) {
     if (request.images.empty())
@@ -479,6 +483,10 @@ struct Runtime::Impl {
     uint64_t bytes = 0;
     bool encodes = false;
     for (const ImageSpan &span : request.images) {
+      if (span.end() <= request.restoredTokens) {
+        staged.push_back({span, nullptr});
+        continue;
+      }
       // New rows enter the registry now, so a repeated placement shares
       // them; they have no buffers until the admission allocates them.
       std::shared_ptr<ImageRows> rows = findRows(span);
@@ -507,8 +515,8 @@ struct Runtime::Impl {
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
-        ImageRows &rows = *image.rows;
-        if (!rows.embeddings) {
+        if (image.rows && !image.rows->embeddings) {
+          ImageRows &rows = *image.rows;
           rows.pixels = backend.allocateBuffer(
               span.pixelBytes(), BufferStorage::Shared, "image pixels");
           std::memcpy(contents<uint8_t>(rows.pixels, "image pixels"), pixels,
@@ -555,8 +563,10 @@ struct Runtime::Impl {
     for (ImageState &image : entry.images) {
       const uint64_t begin = std::max<uint64_t>(chunkBegin, image.span.offset);
       const uint64_t end = std::min<uint64_t>(chunkEnd, image.span.end());
-      if (begin >= end || !image.rows)
+      if (begin >= end)
         continue;
+      if (!image.rows)
+        throw std::logic_error("prefill reached an image its activation left out");
       ImageRows &rows = *image.rows;
       if (!rows.encoded && !rows.encoding) {
         if (!vision)
@@ -1897,6 +1907,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.images = std::move(images);
+    entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
   }
   rollback.committed = admission.granted();
@@ -1969,6 +1980,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.slot = stateSlot;
   entry.resident = true;
   entry.images = std::move(images);
+  entry.restoredTokens = request.restoredTokens;
   impl_->bindPenalties(entry, request.prompt);
   auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
   if (!inserted) {
@@ -2008,6 +2020,9 @@ std::unique_ptr<StateRestore> Runtime::beginRestore(
 void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
                             bool restoreDraftState) {
   Impl::Request &entry = impl_->request(requestId);
+  // A shorter restore would replay rows of images that were never staged.
+  if (restoredPrefixLength < entry.restoredTokens)
+    throw std::invalid_argument("restore stops before images its activation left out");
   if (!restoreDraftState)
     ++impl_->counters.draftStateRestoreSkipped;
   const QwenLogicalLengths &lengths =
@@ -2018,8 +2033,11 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
-  // Images fully inside the restored prefix are never encoded; their spans
-  // stay because rotary positions after them depend on their grids.
+  // Activation left out the images ModelRequest::restoredTokens covers; a
+  // restore further in releases the rest here: warmup and direct callers
+  // activate with 0, as does an engine start that let its cache lease go and
+  // found a state when it looked up again. Their spans stay because rotary
+  // positions after them depend on their grids.
   for (Impl::ImageState &image : entry.images) {
     if (image.span.end() <= restoredPrefixLength) {
       image.rows.reset();

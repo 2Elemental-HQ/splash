@@ -290,6 +290,8 @@ class SmokeRealTests(unittest.TestCase):
             red,
             {"images": {"encodes": 1, "embedding_reuses": 0}},
             repeat,
+            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            red,
             {"images": {"encodes": 1, "embedding_reuses": 1}},
             blue,
             {"type": "message", "content": [{"type": "text", "text": "red"}]},

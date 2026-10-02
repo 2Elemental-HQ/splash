@@ -159,6 +159,7 @@ public:
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
     lastBeginId = request.id;
+    lastRestoredTokens = request.restoredTokens;
     if (beginObserver) beginObserver();
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
@@ -192,6 +193,7 @@ public:
   }
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
+    lastRestoredTokens = request.restoredTokens;
     if (resumeDenied)
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
@@ -475,6 +477,8 @@ public:
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
+  // The restored prefix the latest begin() or resume() activated with.
+  uint32_t lastRestoredTokens = 0;
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
@@ -2971,6 +2975,37 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
               engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0 &&
               resources.snapshot().lookup.lookups == 2,
           "admission waited on its own cache pin instead of recomputing cold");
+}
+
+// Activation learns how much of the prompt a restore brings back, so the
+// model can leave out the images inside it; an attempt that gives up its
+// prefix to fit activates with nothing restored.
+void testActivationReceivesTheRestoreBoundary() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 247);
+  engine.submit(request(247, prompt));
+  runUntilIdle(engine);
+  require(executor.lastRestoredTokens == 0, "a cold start activated with a restored prefix");
+  engine.submit(request(248, prompt));
+  runUntilIdle(engine);
+  require(executor.lastRestoredTokens == 64 && executor.restored == 64,
+          "a prefix hit did not activate with its restore boundary");
+  std::vector<uint32_t> attempts;
+  executor.beginObserver = [&] { attempts.push_back(executor.lastRestoredTokens); };
+  executor.beginGrowthBlocked = [&] {
+    return resources.snapshot().stateCache.entries != 0;
+  };
+  engine.submit(request(249, prompt));
+  runUntilIdle(engine);
+  require(attempts.size() >= 2 && attempts.front() == 64 && attempts.back() == 0 &&
+              events.starts.back().first == EngineCacheStatus::Miss,
+          "the retry without its prefix activated with the dropped restore boundary");
 }
 
 // A start refused memory beside a resident lane is held back by that lane
@@ -8296,6 +8331,7 @@ int main() {
     testRequiredWorkDoesNotReserveAnExtraPage();
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
+    testActivationReceivesTheRestoreBoundary();
     testRefusedStartKeepsItsLeaseBesideAResidentLane();
     testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
     testDroppedLeaseLooksUpAgain();

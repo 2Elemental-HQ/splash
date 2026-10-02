@@ -631,7 +631,10 @@ bool Engine::admit(Request &active, double now) {
   // reclaim wrote to disk is restored, not recomputed.
   bool droppedLease = false;
   const auto state = allocate(
-      [&] { return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest); },
+      [&] {
+        modelRequest.restoredTokens = lookup.resumeBoundary();
+        return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
+      },
       inService, upTo, [&](const Denial &denial) {
         if (!lookup.state || judge(denial, active.request.id) != Verdict::Fail)
           return false;

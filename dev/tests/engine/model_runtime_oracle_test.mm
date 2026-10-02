@@ -1020,6 +1020,87 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
   std::cout << "injected_rows_become_reclaimable=PASS\n";
 }
 
+// A start whose restored prefix covers its only image leaves the image out:
+// no pixels, embeddings or encoder, only the lane. A restore that stops
+// before that prefix would replay rows of an image never staged and is
+// refused; one at it continues past the image without encoding it.
+void requireCoveredImagesAreNotStaged(model::Runtime &executor,
+                                      metal::MetalBackend &backend,
+                                      const model::ModelPackage &model) {
+  while (executor.reclaimIdleState(false)) {
+  }
+  const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
+  std::vector<uint32_t> prompt(128);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + index;
+  EngineRequest request = makeRequest(114, prompt, 1);
+  request.images = {{40, 16, 8, 8, 181, 463}};
+  request.imagePixels.resize(request.images.front().pixelBytes());
+  for (size_t index = 0; index < request.imagePixels.size(); ++index)
+    request.imagePixels[index] = static_cast<uint8_t>(index * 5 + 1);
+  const std::vector<uint32_t> pages = pageRange(120, 4);
+  // An earlier turn leaves states before the image and past it.
+  const StateAdmission producer = executor.begin(request.modelView());
+  require(producer.granted(), "covered image producer was not admitted");
+  const std::array<uint32_t, 2> checkpoints{32, 64};
+  executor.setDraftContextPlan(
+      request.id, planDraftContext(0, prompt.size(), std::nullopt, checkpoints));
+  prefillChunk(executor, request.id, *producer.cell, 0, 0,
+               std::span<const uint32_t>(prompt).first(32), pages);
+  std::shared_ptr<const CompositeState> beforeImage = executor.snapshot(request.id);
+  prefillChunk(executor, request.id, *producer.cell, 32, 32,
+               std::span<const uint32_t>(prompt).subspan(32, 32), pages,
+               BatchCohort::Greedy, false);
+  std::shared_ptr<const CompositeState> pastImage = executor.snapshot(request.id);
+  require(beforeImage && pastImage, "covered image states were not snapshotted");
+  executor.end(request.id);
+  while (executor.reclaimIdleState(false)) {
+  }
+
+  const uint64_t encodes = executor.telemetry().imageEncodes;
+  const uint64_t reuses = executor.telemetry().imageEmbeddingReuses;
+  for (const uint64_t id : {115U, 116U}) {
+    request.id = id;
+    ModelRequest covered = request.modelView();
+    covered.restoredTokens = 64;
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    const StateAdmission admission = executor.begin(covered);
+    const model::ModelTelemetry started = executor.telemetry();
+    require(admission.granted() && !started.imageRowsBytes && !started.visionArenaBytes &&
+                started.imageEmbeddingReuses == reuses &&
+                backend.memoryStats().allocatedBytes ==
+                    before + model.stateLayout().activeCellBytes(),
+            "a start staged an image its restored prefix covers");
+    if (id == 115) {
+      bool refused = false;
+      try {
+        executor.restore(id, 32, beforeImage, true);
+      } catch (const std::invalid_argument &error) {
+        refused = std::string(error.what()) ==
+                  "restore stops before images its activation left out";
+      }
+      require(refused, "a restore before a left-out image was accepted");
+    } else {
+      restoreActivePrefix(executor, id, prompt.size(), 64, pastImage);
+      prefillChunk(executor, id, *admission.cell, 64, 64,
+                   std::span<const uint32_t>(prompt).subspan(64), pages,
+                   BatchCohort::Greedy, true);
+      require(executor.telemetry().imageEncodes == encodes,
+              "a restore past an image encoded it");
+    }
+    executor.end(id);
+    while (executor.reclaimIdleState(false)) {
+    }
+  }
+  beforeImage.reset();
+  pastImage.reset();
+  while (executor.reclaimIdleState(false)) {
+  }
+  require(backend.memoryStats().allocatedBytes == originalBytes,
+          "covered image starts leaked resources");
+  std::cout << "covered_images_are_not_staged=PASS\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -1250,6 +1331,7 @@ int main(int argc, char **argv) {
       requireConcurrentRequestsShareOneEncode(executor, backend);
       requireSuspendedLaneKeepsItsRows(executor, backend);
       requireInjectedRowsBecomeReclaimable(executor, backend);
+      requireCoveredImagesAreNotStaged(executor, backend, model);
     } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
@@ -1257,7 +1339,7 @@ int main(int argc, char **argv) {
     if (imagesOnly) {
       std::cout << "PASS model-runtime-oracle scope=images-only model=" << model.name()
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
-                   " shared, suspended and injected rows)\n";
+                   " shared, suspended and injected rows, covered images)\n";
       return 0;
     }
 

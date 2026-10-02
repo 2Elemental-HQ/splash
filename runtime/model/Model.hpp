@@ -79,6 +79,10 @@ struct ModelRequest final {
   std::span<const uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  // Prompt tokens the lane takes from a cached state. Images that end at or
+  // before it are neither staged nor encoded; their spans still place
+  // rotary positions.
+  uint32_t restoredTokens = 0;
 };
 
 struct ImageSpan final {
