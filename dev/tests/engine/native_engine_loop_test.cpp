@@ -1,5 +1,6 @@
 #include "AllocationFailure.hpp"
 #include "ProtocolPeer.hpp"
+#include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
@@ -234,12 +235,14 @@ struct PoolShape {
 };
 
 // A native loop over the fake model, collecting the bytes it writes. Its
-// unix clock stands still and its steady clock reads `monotonic`, advanced
-// by `clockStep` on every read.
+// clocks come from the test seam: the unix clock stands still and the steady
+// clock reads `monotonic`, advanced by `clockStep` on every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
                        protocol::ProtocolLimits limits = {})
-      : storage(shape.pages, 4096, shape.extentPages),
+      : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
+              .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
+        storage(shape.pages, 4096, shape.extentPages),
         pool(storage, shape.runwayPages), cache(pool),
         loop(
             std::move(config), cache, executor,
@@ -248,10 +251,7 @@ struct LoopFixture {
                 throw *writeFailure;
               output.insert(output.end(), bytes.begin(), bytes.end());
             },
-            [this] { return status(); },
-            {[] { return uint64_t{1'000'000}; },
-             [this] { return monotonic += clockStep; }},
-            limits) {
+            [this] { return status(); }, limits) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
 
@@ -260,6 +260,7 @@ struct LoopFixture {
     return protocol::peer::decodeEvents(output);
   }
 
+  test::ScopedTestConfig seam;
   test::TestKvStorage storage;
   KvPool pool;
   engine::Cache cache;

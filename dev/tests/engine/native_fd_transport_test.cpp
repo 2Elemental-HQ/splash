@@ -145,7 +145,7 @@ struct Harness final {
   // What the loop answers a status request with.
   std::function<std::string()> status = test::readyStatusJson;
   engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
-                             [this] { return status(); }};
+                             [this] { return status(); }, protocol::ProtocolLimits{}};
 };
 
 // A request for three prompt tokens and one output token: its wall-clock
@@ -374,7 +374,7 @@ void testLoopWakesForAnEngineDeadline() {
           }
         }
       },
-      test::readyStatusJson};
+      test::readyStatusJson, protocol::ProtocolLimits{}};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));

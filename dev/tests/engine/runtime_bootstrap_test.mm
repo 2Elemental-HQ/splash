@@ -303,7 +303,7 @@ public:
               }
               output_.insert(output_.end(), bytes.begin(), bytes.end());
             },
-            test::readyStatusJson) {
+            test::readyStatusJson, protocol::ProtocolLimits{}) {
     backing_.commandInFlight = [this] { return loop_.commandInFlight(); };
   }
 
