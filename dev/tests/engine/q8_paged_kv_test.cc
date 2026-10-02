@@ -26,6 +26,31 @@ void testByteAccounting() {
   static_assert(compact.bytesPerModelPage() == 655'360);
   static_assert(compact.extentAlignmentPages() == 2);
   static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
+  // A pool's extents hold whole alignment units, so that every tensor region
+  // of an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions
+  // need 128 pages for four KV heads and 256 for two, BF16 one or two. The
+  // size is chosen per pool between half and one and a half times the
+  // 128 MiB target, leaving the fewest of its pages over, the one nearest the
+  // target on a tie.
+  static_assert(kExtentRegionAlignmentBytes == 64 * 1024);
+  static_assert(kOracleLayout.extentAlignmentPages() == 128);
+  static_assert(kOracleLayout.minimumExtentPages() == 128 &&
+                kOracleLayout.maximumExtentPages() == 128);
+  static_assert(kOracleLayout.extentPagesFor(127) == 0 && kOracleLayout.extentPagesFor(128) == 128 &&
+                kOracleLayout.extentPagesFor(1000) == 128);
+  constexpr Layout compactInt8{10, 2, 256};
+  static_assert(compactInt8.bytesPerModelPage() == 332'800);
+  static_assert(compactInt8.extentAlignmentPages() == 256);
+  static_assert(compactInt8.minimumExtentPages() == 256 && compactInt8.maximumExtentPages() == 512);
+  static_assert(compactInt8.extentPagesFor(255) == 0 && compactInt8.extentPagesFor(511) == 256);
+  // Both sizes leave nothing over: 512 pages (162.5 MiB) is nearer the target
+  // than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
+  static_assert(compactInt8.extentPagesFor(10'240) == 512);
+  static_assert(compactInt8.extentPagesFor(10'496) == 256);
+  // 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
+  // page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
+  static_assert(bf16.extentPagesFor(31) == 0 && bf16.extentPagesFor(448) == 64 &&
+                bf16.extentPagesFor(97) == 48);
   static_assert(!Layout{16, 4, 256, static_cast<Format>(0)}.valid());
   static_assert(kBytesPerModelPage == 1'064'960);
   // One page's keys (or values) and their scales across the layers.

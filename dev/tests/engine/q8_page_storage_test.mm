@@ -33,39 +33,10 @@ void requireThrows(Function &&function, const char *message) {
     throw std::runtime_error(message);
 }
 
-// A pool's extents hold whole alignment units, so that every tensor region of
-// an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions need
-// 128 pages for four KV heads and 256 for two, BF16 one or two. The size is
-// chosen per pool between half and one and a half times the 128 MiB target,
-// leaving the fewest of its pages over, the one nearest the target on a tie.
 constexpr kv::Layout kvLayout{16, 4, 256};
 constexpr kv::Layout compactLayout{10, 2, 256};
 constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
 constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
-static_assert(kv::kExtentRegionAlignmentBytes == 64 * 1024);
-static_assert(kvLayout.bytesPerModelPage() == 1'064'960);
-static_assert(kvLayout.extentAlignmentPages() == 128);
-static_assert(kvLayout.minimumExtentPages() == 128 && kvLayout.maximumExtentPages() == 128);
-static_assert(kvLayout.extentPagesFor(127) == 0 && kvLayout.extentPagesFor(128) == 128 &&
-              kvLayout.extentPagesFor(1000) == 128);
-static_assert(compactLayout.bytesPerModelPage() == 332'800);
-static_assert(compactLayout.extentAlignmentPages() == 256);
-static_assert(compactLayout.minimumExtentPages() == 256 &&
-              compactLayout.maximumExtentPages() == 512);
-static_assert(compactLayout.extentPagesFor(255) == 0 && compactLayout.extentPagesFor(511) == 256);
-// Both sizes leave nothing over: 512 pages (162.5 MiB) is nearer the target
-// than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
-static_assert(compactLayout.extentPagesFor(10'240) == 512);
-static_assert(compactLayout.extentPagesFor(10'496) == 256);
-static_assert(bf16Layout.extentAlignmentPages() == 1 && bf16Layout.minimumExtentPages() == 32 &&
-              bf16Layout.maximumExtentPages() == 96);
-// 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
-// page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
-static_assert(bf16Layout.extentPagesFor(31) == 0 && bf16Layout.extentPagesFor(448) == 64 &&
-              bf16Layout.extentPagesFor(97) == 48);
-static_assert(compactBf16Layout.extentAlignmentPages() == 2 &&
-              compactBf16Layout.minimumExtentPages() == 104 &&
-              compactBf16Layout.maximumExtentPages() == 306);
 
 // The host reaches a page through spans of its tensors, layer by layer as
 // keys, key scales, values and value scales, BF16 without scales. Kernels
