@@ -666,7 +666,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     sequential = makeBuffer(device, output.length);
     SplashQ8PrefillAttentionParams referenceParams{
-        params.committed_tokens, activeRows, kStride, splits, {1, 0}, splits, 0};
+        params.committed_tokens, activeRows, kStride, splits, {1, 0}, splits};
     command = [queue commandBuffer];
     encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(

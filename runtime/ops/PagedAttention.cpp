@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -374,7 +373,7 @@ kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(
     throw std::overflow_error("KV logical position exceeds kernel ABI");
   kv::Q8ChunkedPrefillParams params{
       static_cast<uint32_t>(logicalPosition), chunkTokens, chunkStride,
-      static_cast<uint32_t>(pageTable.size()), {}, 0, 0};
+      static_cast<uint32_t>(pageTable.size()), {}};
   const std::string_view error = kv::chunkedPrefillValidationError(params);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
@@ -419,7 +418,7 @@ void PagedAttention::addPrefill(
   }
   const kv::Q8PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, kvLayer(layer, plan.format), plan.splits, 0};
+      chunk.page_table_entries, kvLayer(layer, plan.format), plan.splits};
   graph.add(std::string(plan.splitPipeline),
             {std::move(queries), partials, statistics, std::move(pageTable)},
             params, plan.splitGroups);

@@ -3,11 +3,9 @@
 #include "metal/abi/PagedAttention.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/q8_paging.h"
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 
 using namespace metal;
-using namespace mpp::tensor_ops;
 
 constant uint SplashChunkMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
 constant uint SplashChunkMaximumPhysicalTokens =
@@ -27,8 +25,7 @@ splash_chunk_contract_valid(constant SplashChunkedPrefillParams &params) {
          params.chunk_stride <= SplashChunkMaximumRows &&
          params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
          params.page_table_entries >= required_pages &&
-         params.kv.extent_pages > 0 && params.reserved0 == 0 &&
-         params.reserved1 == 0;
+         params.kv.extent_pages > 0;
 }
 
 inline ulong splash_current_key_index(uint stride, uint head, uint token,

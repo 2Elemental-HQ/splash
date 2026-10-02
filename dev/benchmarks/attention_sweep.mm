@@ -174,7 +174,7 @@ public:
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
       stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride, plan_.pages[lane],
-                       {}, 0, 0};
+                       {}};
       attention_[lane] = kv::q8VerifyAttentionParams(
           plan_.histories[lane], kVerifyRows, plan_.stride, plan_.pages[lane]);
     }

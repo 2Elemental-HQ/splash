@@ -40,12 +40,10 @@ struct SplashChunkedPrefillParams {
   uint32_t chunk_stride;
   uint32_t page_table_entries;
   SplashKvLayer kv;
-  uint32_t reserved0;
-  uint32_t reserved1;
 };
 
-static_assert(sizeof(SplashChunkedPrefillParams) == 32,
-              "Q8 chunked store parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashChunkedPrefillParams) == 24,
+              "Q8 chunked store parameters are 24 bytes on both sides");
 
 // Prefill divides each query tile's visible Page32 history into balanced
 // splits. The same count and partition rule are used by split and reduce.
@@ -56,11 +54,10 @@ struct SplashQ8PrefillAttentionParams {
   uint32_t page_table_entries;
   SplashKvLayer kv;
   uint32_t split_count;
-  uint32_t reserved0;
 };
 
-static_assert(sizeof(SplashQ8PrefillAttentionParams) == 32,
-              "Q8 prefill attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashQ8PrefillAttentionParams) == 28,
+              "Q8 prefill attention parameters are 28 bytes on both sides");
 
 struct SplashQ8VerifyAttentionParams {
   uint32_t committed_tokens;

@@ -317,7 +317,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] = {historyLengths[lane], rows, data.stride,
-                         pageCounts[lane], {}, 0, 0};
+                         pageCounts[lane], {}};
     data.attention[lane] = {historyLengths[lane], rows, data.stride,
                             pageCounts[lane], {}, 32, 32};
     if (verify)
@@ -615,7 +615,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
                   params.page_table_entries == data.stores[0].page_table_entries &&
                   params.kv.extent_pages == data.layer.kv.extent_pages &&
                   params.kv.offset == data.layer.kv.offset &&
-                  params.split_count == plan.splits && params.reserved0 == 0,
+                  params.split_count == plan.splits,
               "recorded prefill ABI does not describe the actual split plan");
     };
     checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);

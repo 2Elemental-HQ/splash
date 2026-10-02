@@ -187,7 +187,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   result.pool = std::make_unique<Pool>(device, geometry);
   result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
   result.params = {committed, chunk, stride, pages,
-                   result.pool->pages->layer(kLayer).kv, 0, 0};
+                   result.pool->pages->layer(kLayer).kv};
   require(chunkedPrefillValid(result.params), "invalid generated params");
   require(chunkedPrefillPageTableInRange(result.params, result.pageTable,
                                          result.pool->pages->pageCount()),
@@ -302,7 +302,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   const Q8PrefillAttentionParams params = overrideParams ? *overrideParams :
       Q8PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
-                              data.params.kv, plan.splits, 0};
+                              data.params.kv, plan.splits};
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.partials offset:0 atIndex:1];
@@ -707,13 +707,12 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Q8PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,
-      data.params.kv, plan.splits, 0};
-  for (uint32_t invalidField = 0; invalidField < 4; ++invalidField) {
+      data.params.kv, plan.splits};
+  for (uint32_t invalidField = 0; invalidField < 3; ++invalidField) {
     auto params = valid;
     if (invalidField == 0) params.split_count = 0;
     if (invalidField == 1) params.split_count = 33;
-    if (invalidField == 2) params.reserved0 = 1;
-    if (invalidField == 3) params.kv.extent_pages = 0;
+    if (invalidField == 2) params.kv.extent_pages = 0;
     for (id<MTLBuffer> buffer : {data.partials, data.statistics, data.output})
       std::memset(buffer.contents, 0xa5, buffer.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -725,7 +724,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
       const auto *bytes = static_cast<const uint8_t *>(buffer.contents);
       require(std::all_of(bytes, bytes + buffer.length,
                           [](uint8_t value) { return value == 0xa5; }),
-              "invalid prefill split count, reserved field or KV layer wrote scratch/output");
+              "invalid prefill split count or KV layer wrote scratch/output");
     }
   }
 }
@@ -792,7 +791,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
   auto *values = static_cast<BFloat16Bits *>(chunkValues.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer).kv, 0, 0};
+    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer).kv};
     tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
     tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
     pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);
@@ -892,15 +891,14 @@ void testZeroEntryStoresNothing(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 void testContract() {
-  static_assert(sizeof(Q8PrefillAttentionParams) == 32);
+  static_assert(sizeof(Q8PrefillAttentionParams) == 28);
   static_assert(offsetof(Q8PrefillAttentionParams, committed_tokens) == 0);
   static_assert(offsetof(Q8PrefillAttentionParams, rows) == 4);
   static_assert(offsetof(Q8PrefillAttentionParams, chunk_stride) == 8);
   static_assert(offsetof(Q8PrefillAttentionParams, page_table_entries) == 12);
   static_assert(offsetof(Q8PrefillAttentionParams, kv) == 16);
   static_assert(offsetof(Q8PrefillAttentionParams, split_count) == 24);
-  static_assert(offsetof(Q8PrefillAttentionParams, reserved0) == 28);
-  Q8ChunkedPrefillParams params{129, 8, 32, 5, {}, 0, 0};
+  Q8ChunkedPrefillParams params{129, 8, 32, 5, {}};
   require(chunkedPrefillValid(params),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
@@ -915,9 +913,7 @@ void testContract() {
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,
-      {},
-      0,
-      0};
+      {}};
   require(chunkedPrefillValid(finalCycle),
           "final fixed-eight verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;

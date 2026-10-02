@@ -38,8 +38,7 @@ inline bool splash_q8_prefill_attention_contract_valid(
          params.kv.extent_pages > 0 && params.split_count > 0 &&
          params.split_count <= SplashPrefillMaximumSplits &&
          ulong(params.committed_tokens) + params.rows <=
-             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
-         params.reserved0 == 0;
+             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS);
 }
 
 inline bool splash_q8_verify_attention_contract_valid(

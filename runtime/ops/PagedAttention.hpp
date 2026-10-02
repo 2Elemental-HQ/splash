@@ -112,8 +112,6 @@ chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
     return "chunk_stride_invalid";
   if (params.page_table_entries < chunkedPrefillRequiredPages(params))
     return "page_table_too_short";
-  if (params.reserved0 || params.reserved1)
-    return "reserved_fields_nonzero";
   return {};
 }
 
