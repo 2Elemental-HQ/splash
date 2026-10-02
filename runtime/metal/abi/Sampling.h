@@ -130,17 +130,6 @@ struct VerifyInputBatchParams {
 static_assert(sizeof(VerifyInputBatchParams) == 4,
               "Verify input parameters are 4 bytes on both sides");
 
-// The lane view of AcceptBatchParams. No host bytes flow through it: the
-// acceptance kernel builds one per lane from the batched struct.
-struct AcceptParams {
-  uint32_t remaining;
-  uint32_t stop_token_0;
-  uint32_t stop_token_1;
-};
-
-static_assert(sizeof(AcceptParams) == 12,
-              "Acceptance lane parameters are 12 bytes on both sides");
-
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;

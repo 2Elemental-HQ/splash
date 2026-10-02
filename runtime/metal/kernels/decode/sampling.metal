@@ -1368,6 +1368,13 @@ inline float sparse_lookup(device const uint *ids,
   return 0.0f;
 }
 
+// One lane's view of AcceptBatchParams, built by decode_accept_dflash.
+struct AcceptParams {
+  uint remaining;
+  uint stop_token_0;
+  uint stop_token_1;
+};
+
 // Keeps at most params.remaining of the accepted tokens plus the correction,
 // cut after the first stop token, and records the retained and accepted
 // counts.
