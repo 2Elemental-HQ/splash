@@ -11,7 +11,7 @@ from install import launcher
 from server import chat_templates
 from server import server as api
 
-SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 

@@ -539,8 +539,7 @@ def main_args(**overrides):
     """Parsed command-line arguments for main() tests."""
     return SimpleNamespace(
         **{
-            "target": "target",
-            "draft": "draft",
+            "model_root": "model",
             "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
@@ -3471,8 +3470,7 @@ class ServerTest(unittest.TestCase):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
         required = [
-            str(package / "target"),
-            str(package / "draft"),
+            str(package),
             "--tokenizer",
             str(package / "tokenizer"),
             "--model",
@@ -3493,8 +3491,7 @@ class ServerTest(unittest.TestCase):
             ):
                 api.parse_args(arguments)
         args = api.parse_args(required)
-        self.assertEqual(Path(args.target), package / "target")
-        self.assertEqual(Path(args.draft), package / "draft")
+        self.assertEqual(Path(args.model_root), package)
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
@@ -3693,8 +3690,7 @@ class ServerTest(unittest.TestCase):
             [
                 "splash",
                 "serve-native",
-                "target",
-                "draft",
+                "model",
                 "auto",
                 "auto",
             ],

@@ -22,7 +22,7 @@ from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
 ANNOUNCED = ALIASES[0]
-SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
 
 
 def expected(announce):

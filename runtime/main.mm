@@ -123,7 +123,7 @@ private:
 void printUsage(std::string_view executable) {
   writeStderrLine(
       "usage: " + std::string(executable) +
-      " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
+      " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES]");
@@ -177,38 +177,26 @@ double parseDecodeShare(std::string_view value) {
   return result;
 }
 
-std::filesystem::path canonicalDirectory(std::string_view argument,
-                                         std::string_view label) {
+std::filesystem::path requireModelRoot(std::string_view argument) {
   std::error_code error;
-  std::filesystem::path path =
+  const std::filesystem::path root =
       std::filesystem::canonical(std::filesystem::path(argument), error);
-  if (error || !std::filesystem::is_directory(path, error) || error) {
-    throw UsageError(std::string(label) + " must name an existing directory");
+  if (error || !std::filesystem::is_directory(root, error))
+    throw UsageError("MODEL_DIRECTORY must name an existing directory");
+  for (const char *role : {"target", "draft"}) {
+    if (!std::filesystem::is_directory(root / role, error))
+      throw UsageError(
+          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
   }
-  return path;
-}
-
-std::filesystem::path requireModelRoot(std::string_view targetArgument,
-                                       std::string_view draftArgument) {
-  std::filesystem::path target =
-      canonicalDirectory(targetArgument, "TARGET_DIRECTORY");
-  std::filesystem::path draft =
-      canonicalDirectory(draftArgument, "DRAFT_DIRECTORY");
-  if (target.filename() != "target" || draft.filename() != "draft" ||
-      target.parent_path() != draft.parent_path()) {
-    throw UsageError(
-        "TARGET_DIRECTORY and DRAFT_DIRECTORY must be the target/ and "
-        "draft/ subdirectories of one model root");
-  }
-  return target.parent_path();
+  return root;
 }
 
 NativeArguments parseArguments(int argc, char **argv) {
-  if (argc < 6 || std::string_view(argv[1]) != "serve-native") {
+  if (argc < 5 || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
   }
   NativeArguments result;
-  int next = 6;
+  int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
     if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
@@ -230,10 +218,10 @@ NativeArguments parseArguments(int argc, char **argv) {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
-  result.modelRoot = requireModelRoot(argv[2], argv[3]);
+  result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelPackage(result.modelRoot);
-  result.maxContext = parseMaxContext(argv[4], result.model.capabilities);
-  result.maxMemoryBytes = parseMaxMemory(argv[5]);
+  result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
+  result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;
 }
 

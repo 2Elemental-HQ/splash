@@ -161,12 +161,7 @@ class SmokeRealTests(unittest.TestCase):
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
                             )
-                            self.assertEqual(
-                                command[2], str(package.resolve() / "target")
-                            )
-                            self.assertEqual(
-                                command[3], str(package.resolve() / "draft")
-                            )
+                            self.assertEqual(command[2], str(package.resolve()))
                             self.assertEqual(
                                 command[command.index("--tokenizer") + 1],
                                 str(package.resolve() / "tokenizer"),
