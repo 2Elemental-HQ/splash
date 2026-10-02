@@ -1252,8 +1252,22 @@ void testImageSpansKeyPrefixIdentity() {
           "image request lifecycle did not complete cleanly");
 }
 
+// One prefill chunk that every caller's prompt shares, then 65 tokens of
+// `token`: the replay state lands at 2112. A prompt branching off a cached
+// one at the end of the chunk plans a junction there, a draft window past
+// the start.
+std::vector<uint32_t> branchPrompt(uint32_t token) {
+  std::vector<uint32_t> prompt(model::ExecutionLimits::prefillTokenBudget);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  prompt.resize(prompt.size() + 65, token);
+  return prompt;
+}
+
+// A request branching off a cached conversation that goes on to a state of
+// its own publishes the junction at the branch point, then its own latest
+// replay state.
 void testOneRequestPublishesJunctionAndLatestReplayState() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
@@ -1261,105 +1275,147 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(5, prompt));
+  engine.submit(request(5, branchPrompt(777)));
   runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
-            "test could not leave a KV-only shared prefix");
-  }
-
-  prompt.resize(161, 777);
-  engine.submit(request(6, prompt));
+  engine.submit(request(6, branchPrompt(888)));
   runUntilIdle(engine);
 
   const DraftContextPlan &plan = executor.plans.at(6);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
+  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 2048 &&
+              plan.boundaries[1].boundary == 2112 &&
+              plan.boundaries[2].boundary == 2113,
           "junction, latest replay state, and active end were not ordered");
   require(executor.snapshots == 3 && snapshot.junctionMaterializations == 1 &&
               snapshot.replayStatePublications == 2 &&
-              snapshot.resources.stateCache.entries == 2,
+              snapshot.resources.stateCache.entries == 3,
           "one request did not retain both sparse composite states");
+}
+
+// A junction costs a snapshot, a command split and a draft window of
+// capture, so it is planned only where it saves a later request at least a
+// draft window of prefill: at a branch point that far past the state the
+// request resumes from.
+void testLazyJunctionNeedsADraftWindowOfGain() {
+  test::TestKvStorage storage(256, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> shared(2112);
+  std::iota(shared.begin(), shared.end(), 1);
+  // The shared prefix, then 161 tokens of the conversation's own from
+  // `first` on: its replay state lands at 2272.
+  const auto conversation = [&](uint32_t first) {
+    std::vector<uint32_t> prompt = shared;
+    prompt.resize(shared.size() + 161);
+    std::iota(prompt.begin() + shared.size(), prompt.end(), first);
+    return prompt;
+  };
+  const std::vector<uint32_t> cached = conversation(10'000);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  engine.submit(request(2, conversation(20'000)));
+  runUntilIdle(engine);
+  require(engine.snapshot().junctionMaterializations == 1,
+          "a branch off the cached conversation did not publish its junction");
+  const uint32_t restored = executor.restored;
+  engine.submit(request(3, conversation(30'000)));
+  runUntilIdle(engine);
+  require(executor.restored == restored + 2112 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112},
+          "a third branch did not resume from the junction");
+  // This one follows the cached conversation 96 tokens past the junction,
+  // where that one goes on to its state, and then branches.
+  std::vector<uint32_t> follower = cached;
+  std::iota(follower.begin() + shared.size() + 96, follower.end(), 40'000);
+  engine.submit(request(4, follower));
+  runUntilIdle(engine);
+  const auto &boundaries = executor.plans.at(4).boundaries;
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112} &&
+              std::none_of(boundaries.begin(), boundaries.end(),
+                           [](const DraftBoundaryPlan &boundary) {
+                             return boundary.boundary == 2112 + 96;
+                           }) &&
+              engine.snapshot().junctionMaterializations == 1,
+          "a branch point 96 tokens past the resumed state planned a junction");
 }
 
 // A denied snapshot at the latest replay boundary recycles the least recently
 // used cached state, which is an older unrelated state, not the junction state
 // this same request published one command earlier.
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
   Events events;
-  engine::Engine engine({}, resources, executor, events);
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(7, prompt));
-  runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
-            "test could not remove the old composite state");
-  }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
+  engine.submit(request(7, branchPrompt(777)));
+  runUntilIdle(engine);
   const auto older = resources.snapshot();
-  require(older.stateCache.entries == 1 && older.stateCache.evictions == 1,
+  require(older.stateCache.entries == 2 && older.stateCache.evictions == 0,
           "older unrelated state was not left in the cache");
 
-  prompt.resize(161, 888);
-  engine.submit(request(8, prompt));
+  engine.submit(request(8, branchPrompt(888)));
   require(engine.tick(1) && engine.tick(2),
           "request did not publish its junction state");
   require(engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 2,
+              resources.snapshot().stateCache.entries == 3,
           "lazy junction was not materialized in the first command");
+  // The pages this request held for the cached prefix are free; while the
+  // engine may not grow, a snapshot takes none of them and recycles a state.
+  paused = true;
   executor.deniedSnapshots = 1;
   runUntilIdle(engine);
+  paused = false;
 
   const DraftContextPlan &plan = executor.plans.at(8);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
+  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 2048 &&
+              plan.boundaries[1].boundary == 2112 &&
+              plan.boundaries[2].boundary == 2113,
           "boundaries were not armed without reservation");
   require(executor.deniedSnapshots == 0 &&
               snapshot.recycledStatePublications == 1 &&
               snapshot.replayStatePublications == 3 &&
               snapshot.replayStatePublicationFailures == 0 &&
-              snapshot.resources.stateCache.evictions == 2 &&
-              snapshot.resources.stateCache.entries == 2,
+              snapshot.resources.stateCache.evictions == 1 &&
+              snapshot.resources.stateCache.entries == 3,
           "latest-state denial did not recycle exactly one older state");
 
-  // The junction state survived the recycle: the original prompt resumes
-  // from it, while the recycled prompt is back to KV without a state and
+  // The junction state survived the recycle: another branch resumes from
+  // it, while the recycled prompt is back to KV without a state and
   // publishes its replay state again.
   const uint32_t restored = executor.restored;
-  prompt.resize(97);
-  engine.submit(request(9, prompt));
+  engine.submit(request(9, branchPrompt(999)));
   runUntilIdle(engine);
-  require(executor.restored == restored + 96 &&
+  require(executor.restored == restored + 2048 &&
               events.starts.back() ==
                   std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 96},
+                      EngineCacheStatus::PrefixHit, 2048},
           "latest-state denial discarded the independent junction state");
   engine.submit(request(71, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
   require(events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().replayStatePublications == 4 &&
+              engine.snapshot().replayStatePublications == 5 &&
               engine.snapshot().junctionMaterializations == 1,
           "recycled state was not the older unrelated one");
 }
 
 void testCancellationAfterJunctionDiscardsLaterState() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
@@ -1367,32 +1423,23 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(9, prompt));
+  engine.submit(request(9, branchPrompt(777)));
   runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
-            "test could not remove the old composite state");
-  }
-
-  prompt.resize(161, 999);
-  engine.submit(request(10, prompt));
+  engine.submit(request(10, branchPrompt(999)));
   require(engine.tick(1) && engine.tick(2),
           "request did not publish its first sparse state");
   const auto published = engine.snapshot();
-  require(published.resources.stateCache.entries == 1 &&
+  require(published.resources.stateCache.entries == 2 &&
               published.junctionMaterializations == 1 &&
               executor.snapshotAttempts == 2,
           "junction publication did not land in the first command");
   engine.cancel(10);
   runUntilIdle(engine);
-  // The armed 160 boundary is dropped with the lane: no snapshot, no
+  // The armed 2112 boundary is dropped with the lane: no snapshot, no
   // failure counted, and the junction state stays cached.
   const auto cancelled = engine.snapshot();
   require(executor.snapshotAttempts == 2 &&
-              cancelled.resources.stateCache.entries == 1 &&
+              cancelled.resources.stateCache.entries == 2 &&
               cancelled.resources.stateCache.publications == 2 &&
               cancelled.replayStatePublications == 1 &&
               cancelled.replayStatePublicationFailures == 0 &&
@@ -3885,10 +3932,10 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   require(resources.snapshot().stateCache.entries == 0,
           "snapshot denial left a composite state to restore");
 
-  // Retain a KV junction one draft window past the prompt's replay boundary,
-  // whose state is gone. The resumed lane rebuilds that state, where the
-  // conversation's next turn resumes, then captures the junction and the
-  // generated history's end.
+  // Retain the lane's KV one draft window past the prompt's replay boundary,
+  // whose state is gone. That KV ends there, so it is no junction: the
+  // resumed lane rebuilds the state where the conversation's next turn
+  // resumes, then captures the generated history's end.
   constexpr uint32_t retainedKvTokens = 6144;
   while (resources.snapshot().kvCache.blocks >
          retainedKvTokens / KvCache::pageTokens) {
@@ -3899,7 +3946,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
     auto lookup = resources.lookup(history);
     require(lookup.kvBoundary == retainedKvTokens &&
                 lookup.resumeBoundary() == 0,
-            "long replay did not retain the intended stateless KV junction");
+            "long replay did not retain the intended stateless KV");
   }
 
   storage.growthBlocked = false;
@@ -3909,8 +3956,8 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   now += 101;
   require(engine.tick(now++), "long replay did not resume after pressure eased");
   const auto &plan = executor.plans.at(id);
-  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 3 &&
-              plan.boundaries.front().boundary == 4096,
+  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 2 &&
+              plan.boundaries.size() == 3 && plan.boundaries.front().boundary == 4096,
           "resumed draft plan did not rebuild the prompt's replay point first");
   const double finishBy = now + 100;
   for (; now < finishBy && !idle(engine); ++now)
@@ -5578,15 +5625,25 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
           "fixture did not commit past the last recovery point");
   engine.cancel(530);
   runUntilIdle(engine);
+  // Another conversation leaves the prompt at 18432 and goes on to a state
+  // of its own, so the retry's matched KV ends at a branch point.
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 18432);
+  branch.resize(18432 + KvCache::pageTokens, 35);
+  resources.beginRequest(999);
+  require(resources.ensureTokens(999, branch.size()).granted(), "branch fixture KV failed");
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(999, branch, static_cast<uint32_t>(branch.size())),
+      std::make_shared<State>());
+  resources.endRequest(999);
   engine.submit(request(531, prompt));
   require(engine.tick(1) && engine.tick(2) &&
               events.starts.back().second == 16384 &&
               engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry kept an earlier recovery point after publishing its junction");
   runUntilIdle(engine);
-  require(resources.snapshot().stateCache.entries == 2 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry did not retain its normal junction and replay states");
 }
@@ -5777,7 +5834,9 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
           "final state evicted unrelated hot state before its own checkpoint");
 }
 
-void testFinalJunctionRetiresEarlierProgressPoint() {
+// A junction is an ordinary state: publishing one retires the lane's
+// earlier progress point, as its replay state does.
+void testJunctionRetiresEarlierProgressPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
@@ -5786,20 +5845,30 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(20001, 29);
+  // Another conversation leaves the prompt at 18432 and goes on to a state
+  // of its own: the request plans a junction at that branch point, past its
+  // checkpoint at 16384.
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 18432);
+  branch.resize(18432 + KvCache::pageTokens, 30);
   resources.beginRequest(470);
-  require(resources.ensureTokens(470, 20000).granted(),
+  require(resources.ensureTokens(470, branch.size()).granted(),
           "junction fixture could not allocate its KV prefix");
-  static_cast<void>(resources.publishCommittedBlocks(470, prompt, 20000));
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(470, branch, static_cast<uint32_t>(branch.size())),
+      std::make_shared<State>());
   resources.endRequest(470);
   engine.submit(request(471, prompt));
+  double now = 1;
+  tickUntil(engine, now, [&] { return engine.snapshot().junctionMaterializations == 1; },
+            "the request did not publish its junction");
+  require(engine.snapshot().checkpointPublications == 4 &&
+              resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.snapshot().stateCache.entries == 2,
+          "the junction left a superseded progress checkpoint resident");
   runUntilIdle(engine);
-  // The junction at the prompt's end is its replay point.
-  require(engine.snapshot().checkpointPublications == (prompt.size() / defaultCheckpointTokens) &&
-              engine.snapshot().replayStatePublications == 1 &&
-              engine.snapshot().junctionMaterializations == 0 &&
-              resources.snapshot().stateCache.entries == 1 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.lookup(prompt).resumeBoundary() == 20000,
-          "prompt-end junction left a superseded progress checkpoint resident");
+          "the request did not publish its replay state after the junction");
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
@@ -6057,9 +6126,9 @@ void testStateWithoutACacheSlotGoesToDisk() {
 }
 
 // A foreground arrival does not wait for a background producer of the same
-// prompt, so both lanes compute it. Without a cache slot the producer's
-// states go to disk, and the other lane's publications at the same blocks
-// find them there: they are deduplicated, not counted as writes.
+// prompt, so both lanes compute it. Without a cache slot the first replay
+// state to land goes to disk, and the other lane's publication at the same
+// block finds it there: it is deduplicated, not counted as a write.
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -6084,9 +6153,8 @@ void testStateAlreadyOnDiskIsDeduplicated() {
               executor.prefillRows == 2 * prompt.size(),
           "both lanes did not compute the prompt");
   const auto counters = engine.snapshot();
-  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+  require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
               counters.replayStatePublications == 1 &&
-              counters.junctionMaterializations == 1 &&
               counters.deduplicatedStatePublications == 1 &&
               counters.resources.stateCache.deduplicatedPublications == 1,
           "a state already on disk was counted as written");
@@ -7854,7 +7922,7 @@ int main() {
     testCheckpointRecyclesItsBufferBeforeReplacement();
     testCancelAtCheckpointDoesNotPublishDrainingCommand();
     testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
-    testFinalJunctionRetiresEarlierProgressPoint();
+    testJunctionRetiresEarlierProgressPoint();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
@@ -7868,6 +7936,7 @@ int main() {
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
+    testLazyJunctionNeedsADraftWindowOfGain();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testPublicationInvariantFailureIsFatal();

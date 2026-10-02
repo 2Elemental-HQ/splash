@@ -1159,35 +1159,72 @@ int main(int argc, char **argv) {
       }
     }
 
-    // State eviction deliberately leaves the Page32 graph intact. The next
-    // request must replay target work and lazily materialize the proven KV
-    // junction; only the following request may restore it directly.
+    // A request lazily materializes a KV junction where its match ends past
+    // its state at a branch point: another branch goes on below and holds a
+    // state there, and the junction lies a draft window or more past the
+    // state the request resumes from. Two prompts share a 7K prefix and then
+    // diverge. State eviction deliberately leaves the Page32 graph intact.
     if (selected.context) {
       evictAllCache(resources->cache());
-      std::vector<uint32_t> lazyPrompt = prompt(10000, 0x4c415a594b56ULL);
+      const std::vector<uint32_t> lazyShared = prompt(7168, 0x4c415a594b56ULL);
+      const auto lazyBranch = [&](uint64_t salt) {
+        std::vector<uint32_t> branch = lazyShared;
+        const std::vector<uint32_t> tail = prompt(2048, salt);
+        branch.insert(branch.end(), tail.begin(), tail.end());
+        return branch;
+      };
+      const std::vector<uint32_t> lazyPrompt = lazyBranch(0x4c415a5941ULL);
       Measurement lazySeed =
           runRequest(engine, driver, *executor, events, progress.get(),
                      requestId++, "lazy_seed", 0, lazyPrompt);
       evictAllCompositeState(resources->cache());
+      // The repeat's match ends where its own chain does, so it plans no
+      // junction: it replays the prompt and rebuilds its replay point, which
+      // the next repeat restores.
+      Measurement lazyChainEnd =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_chain_end", 0, lazyPrompt);
+      Measurement lazyRepeat =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_repeat", 0, lazyPrompt);
+      const uint32_t lazyReplayBoundary =
+          ((lazyPrompt.size() - 1) / kv::kPageTokens) * kv::kPageTokens;
+      if (lazySeed.cacheStatus != "miss" ||
+          lazyChainEnd.cacheStatus != "miss" ||
+          lazyChainEnd.junctionMaterializations != 0 ||
+          lazyRepeat.matchedTokens != lazyReplayBoundary ||
+          lazyRepeat.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "chain-end KV junction oracle failed: junctions=" +
+            std::to_string(lazyChainEnd.junctionMaterializations) + "," +
+            std::to_string(lazyRepeat.junctionMaterializations) + " " +
+            lookups({lazySeed, lazyChainEnd, lazyRepeat}, lazyReplayBoundary));
+      }
+      // The other branch's match ends at the shared prefix, above the first
+      // branch's replay point: it materializes the junction there, and a
+      // third branch off the prefix restores from it.
       Measurement lazyMaterialize =
           runRequest(engine, driver, *executor, events, progress.get(),
-                     requestId++, "lazy_materialize", 0, lazyPrompt);
+                     requestId++, "lazy_materialize", 0,
+                     lazyBranch(0x4c415a5942ULL));
       Measurement lazyReuse =
           runRequest(engine, driver, *executor, events, progress.get(),
-                     requestId++, "lazy_reuse", 0, lazyPrompt);
-      const uint32_t lazyBoundary =
-          ((lazyPrompt.size() - 1) / kv::kPageTokens) *
-          kv::kPageTokens;
-      if (lazySeed.cacheStatus != "miss" ||
-          lazyMaterialize.cacheStatus != "miss" ||
-          lazyMaterialize.matchedTokens != 0 ||
-          lazyMaterialize.junctionMaterializations != 1 ||
-          lazyReuse.matchedTokens != lazyBoundary) {
-        throw std::runtime_error("lazy KV junction oracle failed");
+                     requestId++, "lazy_reuse", 0, lazyBranch(0x4c415a5943ULL));
+      const auto lazyBranchPoint = static_cast<uint32_t>(lazyShared.size());
+      if (lazyMaterialize.junctionMaterializations != 1 ||
+          lazyReuse.matchedTokens != lazyBranchPoint ||
+          lazyReuse.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "branch KV junction oracle failed: junctions=" +
+            std::to_string(lazyMaterialize.junctionMaterializations) + "," +
+            std::to_string(lazyReuse.junctionMaterializations) + " " +
+            lookups({lazyMaterialize, lazyReuse}, lazyBranchPoint));
       }
-      lazyMaterialize.coldOutputMatch = lazySeed.outputTokens == lazyMaterialize.outputTokens;
-      lazyReuse.coldOutputMatch = lazySeed.outputTokens == lazyReuse.outputTokens;
+      lazyChainEnd.coldOutputMatch = lazySeed.outputTokens == lazyChainEnd.outputTokens;
+      lazyRepeat.coldOutputMatch = lazySeed.outputTokens == lazyRepeat.outputTokens;
       measurements.push_back(std::move(lazySeed));
+      measurements.push_back(std::move(lazyChainEnd));
+      measurements.push_back(std::move(lazyRepeat));
       measurements.push_back(std::move(lazyMaterialize));
       measurements.push_back(std::move(lazyReuse));
     }

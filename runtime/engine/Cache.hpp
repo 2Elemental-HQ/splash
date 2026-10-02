@@ -21,15 +21,17 @@ namespace splash::engine {
 struct CacheLookup final {
   uint32_t kvBoundary = 0;
   std::optional<CompositeStateLease> state;
+  // The matched KV ends at a branch point past the state: another branch
+  // goes on below the deepest matched block and holds a state there. Zero
+  // at a chain end or inside a dead tail, where this request's own deeper
+  // states shadow any junction.
+  uint32_t junctionBoundary = 0;
   // A matched block deeper than the state once held a reusable state that
   // is gone from both tiers.
   bool lostState = false;
 
   [[nodiscard]] uint32_t resumeBoundary() const noexcept {
     return state ? state->boundary() : 0;
-  }
-  [[nodiscard]] uint32_t junctionBoundary() const noexcept {
-    return kvBoundary > resumeBoundary() ? kvBoundary : 0;
   }
 };
 
@@ -56,6 +58,7 @@ struct CacheLookupSnapshot final {
   uint64_t lookups = 0;
   uint64_t kvHitTokens = 0;
   uint64_t stateHitTokens = 0;
+  // Lookups that matched KV past their state at a branch point.
   uint64_t lazyJunctions = 0;
   // Lookups that matched KV where a reusable state used to be.
   uint64_t lostStateMisses = 0;

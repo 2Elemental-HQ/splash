@@ -60,7 +60,7 @@ void testCanonicalPagesAndSparseState() {
 
   auto lookup = resources.lookup(prompt);
   require(lookup.kvBoundary == 64 && lookup.resumeBoundary() == 64 &&
-              !lookup.junctionBoundary(),
+              !lookup.junctionBoundary,
           "KV-first lookup did not coordinate the sparse state");
   resources.beginRequest(2);
   require(resources.restoreRequest(2, lookup).granted(), "restore pages were denied");
@@ -82,8 +82,8 @@ void testKvDeeperThanStateAndDependencyEviction() {
   resources.endRequest(1);
   auto lookup = resources.lookup(prompt);
   require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 64 &&
-              lookup.junctionBoundary() == 96,
-          "dense KV did not expose the lazy state junction");
+              lookup.junctionBoundary == 0,
+          "KV ending at a chain end requested a lazy junction");
   lookup.state.reset();
   const auto step = [&] {
     return resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)

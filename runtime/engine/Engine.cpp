@@ -14,6 +14,9 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
 constexpr int kMaskWaitLimitMilliseconds = 5000;
+// A junction costs a snapshot, a command split and up to a draft window of
+// draft-context rows; a later request must save at least that much prefill.
+constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
 
 // While an active one lives, allocations are memory a request in service
 // needs (EngineConfig::serving).
@@ -687,7 +690,7 @@ bool Engine::admit(Request &active, double now) {
   }
   active.resourceWait = {};
   DraftContextPlan draft = configureDraftStatePlan(
-      active, resumeBoundary, lookup.junctionBoundary());
+      active, resumeBoundary, lookup.junctionBoundary);
   std::unique_ptr<StateRestore> transfer;
   if (lookup.state) {
     transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
@@ -872,7 +875,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true);
   }
-  addStateBoundary(active, stateBoundary, junctionBoundary, false);
+  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+    addStateBoundary(active, stateBoundary, junctionBoundary, false);
   addStateBoundary(active, stateBoundary, latestReplayBoundary, false);
   // A resumed lane below its prompt's replay point lost that state; it
   // rebuilds the one its conversation's next turn resumes from on the way.

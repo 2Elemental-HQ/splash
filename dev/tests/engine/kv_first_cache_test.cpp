@@ -258,13 +258,13 @@ void testValidAdmissionProbePreservesLookupAndAccounting() {
           "admission probe changed cache ownership or accounting");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
   require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 96 &&
-              lookup.junctionBoundary() == 128,
+              lookup.junctionBoundary == 0,
           "valid admission probe lost the deepest state or KV tail");
   fixture.cache.recordLookup(lookup);
   const auto after = fixture.cache.snapshot();
   require(after.lookup.lookups == 1 && after.lookup.kvHitTokens == 128 &&
               after.lookup.stateHitTokens == 96 &&
-              after.lookup.lazyJunctions == 1 &&
+              after.lookup.lazyJunctions == 0 &&
               after.stateCache.pinned == 1,
           "admission probe changed lookup accounting or lease ownership");
 }
@@ -467,14 +467,14 @@ void testCacheLookupAndOneTokenReplay() {
 
   auto full = fixture.cache.lookup(fixture.prompt);
   require(full.kvBoundary == 128 && full.resumeBoundary() == 96 &&
-              full.junctionBoundary() == 128 && full.state &&
+              full.junctionBoundary == 0 && full.state &&
               full.state->kvBlock() == fixture.blocks[2],
           "KV-first lookup did not coordinate dense KV and sparse state");
 
   full.state.reset();
   auto exactEdge = fixture.lookup(128);
   require(exactEdge.kvBoundary == 96 && exactEdge.resumeBoundary() == 96 &&
-              !exactEdge.junctionBoundary(),
+              !exactEdge.junctionBoundary,
           "exact block-edge prompt did not replay one input token");
 
   auto shortPrompt = fixture.lookup(32);
@@ -494,18 +494,50 @@ void testPage31Page32Page33Backoff() {
           "Page31/32/33 one-token replay boundary is wrong");
 }
 
+// A prompt that leaves the cached chain where it goes on to a state of its
+// own branches there: its lookup asks for a junction at the branch point,
+// and once one is published there the next lookup resumes from it.
 void testLazyJunctionMaterialization() {
   CacheFixture fixture;
   fixture.publish(0);
-  {
-    auto first = fixture.cache.lookup(fixture.prompt);
-    require(first.resumeBoundary() == 32 && first.junctionBoundary() == 128,
-            "first shared KV lookup did not request lazy materialization");
-  }
   fixture.publish(3);
-  auto second = fixture.cache.lookup(fixture.prompt);
-  require(second.resumeBoundary() == 128 && !second.junctionBoundary(),
+  std::vector<uint32_t> branch(fixture.prompt.begin(), fixture.prompt.begin() + 64);
+  branch.resize(97, 7);
+  {
+    auto first = fixture.cache.lookup(branch);
+    require(first.kvBoundary == 64 && first.resumeBoundary() == 32 &&
+                first.junctionBoundary == 64,
+            "first branch lookup did not request lazy materialization");
+  }
+  fixture.publish(1);
+  auto second = fixture.cache.lookup(branch);
+  require(second.resumeBoundary() == 64 && !second.junctionBoundary,
           "second request did not resume from the lazy junction");
+}
+
+// A junction is worth a state only where another branch goes on to a state
+// below the matched KV: not where the cached chain ends, nor inside a tail
+// past the state that holds none. Only a lookup at a branch point counts as
+// a lazy junction.
+void testLazyJunctionOnlyAtABranchPoint() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  std::vector<uint32_t> branch(fixture.prompt.begin(), fixture.prompt.begin() + 64);
+  branch.resize(97, 7);
+  const auto junction = [&](std::span<const uint32_t> prompt) {
+    auto lookup = fixture.cache.lookup(prompt);
+    require(lookup.resumeBoundary() == 32, "the lookup did not resume from the state");
+    fixture.cache.recordLookup(lookup);
+    return lookup.junctionBoundary;
+  };
+  const auto lazyJunctions = [&] { return fixture.cache.snapshot().lookup.lazyJunctions; };
+  require(junction(fixture.prompt) == 0 && lazyJunctions() == 0,
+          "a chain end requested a lazy junction");
+  require(junction(branch) == 0 && lazyJunctions() == 0,
+          "a dead tail past the state requested a lazy junction");
+  fixture.publish(3);
+  require(junction(branch) == 64 && lazyJunctions() == 1,
+          "a branch point with a state below did not request a lazy junction");
 }
 
 void testByteLruAndPins() {
@@ -3989,6 +4021,7 @@ int main() {
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
+    testLazyJunctionOnlyAtABranchPoint();
     testByteLruAndPins();
     testSpeculativeReclaimKeepsTheResumePoint();
     testCheckpointDoesNotOutrankTheResumePoint();

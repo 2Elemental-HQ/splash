@@ -136,6 +136,8 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
       kv_.touch(*resident);
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
     result.state = states_.acquireDeepest(blocks);
+    if (result.kvBoundary > result.resumeBoundary() && kv_.stateBelow(blocks.back()))
+      result.junctionBoundary = result.kvBoundary;
   }
   const uint64_t stateBlock = result.state ? result.state->kvBlock() : 0;
   for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
@@ -154,7 +156,7 @@ void Cache::recordLookup(const CacheLookup &result) {
   lookup_.stateHitTokens += result.resumeBoundary();
   states_.recordLookup(result.state.has_value(),
                        result.state && !result.state->state()->residentBytes());
-  if (result.junctionBoundary())
+  if (result.junctionBoundary)
     ++lookup_.lazyJunctions;
   if (result.lostState)
     ++lookup_.lostStateMisses;
