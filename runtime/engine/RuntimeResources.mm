@@ -1,5 +1,6 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Checked.hpp"
+#include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
@@ -594,6 +595,13 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.estimatedWarmupPeakBytes =
       std::max(estimatedWarmupPeakBytes, memory.peakAllocatedBytes + reserves);
   return report;
+}
+
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
+  config.growthPaused = [&governor] {
+    return !governor.snapshot().hostGrowthAllowed;
+  };
+  config.serving = [&governor](bool serving) { governor.setServing(serving); };
 }
 
 } // namespace splash::engine

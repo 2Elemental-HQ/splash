@@ -347,14 +347,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   }
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
-    config.nativeLoop.engine.growthPaused =
-        [governor = &resources->memoryGovernor()] {
-          return !governor->snapshot().hostGrowthAllowed;
-        };
-    config.nativeLoop.engine.serving =
-        [governor = &resources->memoryGovernor()](bool serving) {
-          governor->setServing(serving);
-        };
+    connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
         std::move(output), std::move(statusProvider), NativeLoopClocks{},

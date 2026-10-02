@@ -905,9 +905,7 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
-    engineConfig.growthPaused = [resources] {
-      return !resources->memoryGovernor().snapshot().hostGrowthAllowed;
-    };
+    engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
     Driver driver(engine, events);

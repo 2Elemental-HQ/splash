@@ -1,8 +1,10 @@
 #include "engine/RuntimeResources.hpp"
+#include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -256,6 +258,33 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   requireLoadedModel(package);
 }
 
+// The engine asks the governor whether the host pauses growth, and its
+// serving mark lets a request in service grow through that pause.
+void testEngineFollowsTheGovernor(const char *metallibPath) {
+  metal::MetalBackend backend(metallibPath);
+  constexpr uint64_t kGiB = 1ULL << 30;
+  constexpr uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + 8 * kGiB;
+  const metal::MetalMemoryStats memory = backend.memoryStats();
+  MemoryGovernor governor(
+      backend, std::max(memory.allocatedBytes, memory.deviceCurrentAllocatedBytes) + kGiB,
+      hostReserve, [&available] { return available; });
+  EngineConfig config;
+  connectToGovernor(config, governor);
+  require(config.growthPaused && config.serving && !config.growthPaused(),
+          "the engine was not connected to the governor");
+  // Inside the warning margin the host pauses growth that no request in
+  // service needs.
+  available = hostReserve + kGiB / 2;
+  require(config.growthPaused() && !governor.tryReserve(1024).has_value(),
+          "the engine did not see the host's pause");
+  config.serving(true);
+  require(governor.tryReserve(1024).has_value(),
+          "the serving mark did not reach the governor");
+  config.serving(false);
+  require(!governor.tryReserve(1024).has_value(), "the serving mark was not cleared");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -267,6 +296,7 @@ int main(int argc, char **argv) {
       testStateStagingNeedsAStartedTier(argv[1]);
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
+      testEngineFollowsTheGovernor(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {
