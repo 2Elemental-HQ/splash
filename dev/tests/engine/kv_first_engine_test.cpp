@@ -182,15 +182,15 @@ public:
       --deniedBegins;
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
-    for (uint32_t slot = 0; slot < maximumCells; ++slot) {
+    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
       const bool used = std::any_of(
-          requests.begin(), requests.end(), [slot](const auto &entry) {
-            return entry.second.resident && entry.second.slot == slot;
+          requests.begin(), requests.end(), [lane](const auto &entry) {
+            return entry.second.resident && entry.second.lane == lane;
           });
       if (!used) {
-        requests.emplace(request.id, Request{slot, 0, true});
+        requests.emplace(request.id, Request{lane, 0, true});
         prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
-        return {slot, StateFailure::None};
+        return {lane, StateFailure::None};
       }
     }
     return {{}, StateFailure::ConcurrencyLimit};
@@ -213,20 +213,20 @@ public:
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
-    for (uint32_t slot = 0; slot < maximumCells; ++slot) {
+    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [&](const auto &candidate) {
             return candidate.first != id && candidate.second.resident &&
-                   candidate.second.slot == slot;
+                   candidate.second.lane == lane;
           });
       if (!used) {
-        entry.slot = slot;
+        entry.lane = lane;
         entry.resident = true;
         entry.position = 0;
         entry.replaying = true;
         resumedPrompts.emplace_back(request.prompt.begin(), request.prompt.end());
         ++resumptions;
-        return {slot, StateFailure::None};
+        return {lane, StateFailure::None};
       }
     }
     return {{}, StateFailure::ConcurrencyLimit};
@@ -458,7 +458,7 @@ public:
   }
 
   struct Request {
-    uint32_t slot = 0;
+    uint32_t lane = 0;
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;

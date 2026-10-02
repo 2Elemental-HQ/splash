@@ -82,7 +82,7 @@ struct TargetVocabularyRange {
 static_assert(sizeof(TargetVocabularyRange) == 8,
               "Target vocabulary ranges are 8 bytes on both sides");
 
-// A penalized request's word for each vocabulary token, in its state slot's
+// A penalized request's word for each vocabulary token, in its state lane's
 // row of the penalty table (ops::Sampling::rebuildPenaltyWords): the
 // prompt bit marks a prompt token, and the count is how often the target
 // selected it.

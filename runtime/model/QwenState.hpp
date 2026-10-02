@@ -76,7 +76,7 @@ struct QwenLogicalLengths final {
   bool operator==(const QwenLogicalLengths &) const = default;
 };
 
-struct QwenSlotMetadata final {
+struct QwenLaneMetadata final {
   bool assigned = false;
   uint64_t requestId = 0;
   uint32_t activeParity = 0;
@@ -179,8 +179,8 @@ public:
   QwenStateStorage(const QwenStateStorage &) = delete;
   QwenStateStorage &operator=(const QwenStateStorage &) = delete;
 
-  [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t slot) const;
-  [[nodiscard]] const QwenSlotMetadata &metadata(uint32_t slot) const;
+  [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t lane) const;
+  [[nodiscard]] const QwenLaneMetadata &metadata(uint32_t lane) const;
 
   // Activation takes pooled buffers and asks the governor once for all the
   // pool lacks, together with `extraBytes` for what else the request's start
@@ -190,9 +190,9 @@ public:
   // resets draft logical lengths; later transitions overwrite the remaining
   // data. Release returns the lane's buffers to the pool.
   [[nodiscard]] metal::AllocationResult
-  tryActivateSlot(uint32_t slot, uint64_t requestId, uint64_t extraBytes = 0,
+  tryActivateLane(uint32_t lane, uint64_t requestId, uint64_t extraBytes = 0,
                   const std::function<void()> &allocateExtra = {});
-  void releaseSlot(uint32_t slot, uint64_t requestId);
+  void releaseLane(uint32_t lane, uint64_t requestId);
 
   // Returns one pooled buffer to macOS, a cell before a ring, keeping one
   // lane's cells and ring when keepLane: what a reclaim step for a denied
@@ -201,20 +201,20 @@ public:
   [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleRings() const noexcept;
-  // What activating a slot lacks in the idle pool, in cached states: each
+  // What activating a lane lacks in the idle pool, in cached states: each
   // holds one GDN cell and one draft ring, a lane two cells and a ring.
   [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
   // Hot-path metadata operations; neither performs a buffer copy.
-  void updateLengths(uint32_t slot, QwenLogicalLengths lengths);
-  void swapParity(uint32_t slot);
+  void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
+  void swapParity(uint32_t lane);
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells. Returns nullptr on capacity pressure,
   // with nothing allocated; dropping a cached state makes its slot available
   // for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
-  snapshot(uint32_t slot);
+  snapshot(uint32_t lane);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable();
   }
@@ -222,12 +222,12 @@ public:
   // taking no cache slot; the ticket carries the disk copy. Null without a
   // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] std::unique_ptr<StateOffload>
-  snapshotToDisk(uint32_t slot, std::function<void()> completion);
-  // Restores `state` into the slot's current cell, and into its draft ring
+  snapshotToDisk(uint32_t lane, std::function<void()> completion);
+  // Restores `state` into the lane's current cell, and into its draft ring
   // when restoreDraftState. A RAM state is copied now, runs `committed` and
   // returns null; a disk state returns the read, whose finish() runs it.
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
-      uint32_t slot, const CompositeState &state, bool restoreDraftState,
+      uint32_t lane, const CompositeState &state, bool restoreDraftState,
       std::function<void()> completion, std::function<void()> committed);
 
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
@@ -236,22 +236,22 @@ public:
   [[nodiscard]] uint64_t stagingBytes() const noexcept override {
     return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
-  [[nodiscard]] uint64_t actualSlotBytes(uint32_t slot) const;
+  [[nodiscard]] uint64_t actualSlotBytes(uint32_t lane) const;
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
 private:
-  struct Slot final {
+  struct Lane final {
     QwenSlotBuffers buffers;
-    QwenSlotMetadata metadata;
+    QwenLaneMetadata metadata;
     std::array<std::shared_ptr<QwenGdnCell>, kLaneCells> gdn;
     std::shared_ptr<DFlashDraftRing> draft;
   };
 
-  [[nodiscard]] Slot &slot(uint32_t index);
-  [[nodiscard]] const Slot &slot(uint32_t index) const;
+  [[nodiscard]] Lane &lane(uint32_t index);
+  [[nodiscard]] const Lane &lane(uint32_t index) const;
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
-  static void requireAssigned(const Slot &slot);
+  static void requireAssigned(const Lane &lane);
   // `cells` GDN cells and a draft ring: the pool's buffers, and one
   // admission for everything the pool lacks and for the caller's extra. A
   // refusal allocates nothing and takes nothing from the pool.
@@ -264,19 +264,19 @@ private:
           uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
   // The bytes of the cells and the ring the pool lacks of that.
   [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
-  static void refreshViews(Slot &slot);
-  void restore(uint32_t slot, const QwenCompositeState &state,
+  static void refreshViews(Lane &lane);
+  void restore(uint32_t lane, const QwenCompositeState &state,
                bool restoreDraftState);
-  void restoreLengths(uint32_t slot, QwenLogicalLengths lengths, bool restoreDraft);
+  void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
-  snapshot(uint32_t slot, QwenLogicalLengths lengths);
+  snapshot(uint32_t lane, QwenLogicalLengths lengths);
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;
   CompositeStateLayout layout_;
   std::shared_ptr<StateAllocationTracker> allocations_;
   std::shared_ptr<QwenBufferPool> pool_;
-  std::array<Slot, ExecutionLimits::maximumBatchWidth> slots_;
+  std::array<Lane, ExecutionLimits::maximumBatchWidth> lanes_;
   std::shared_ptr<SlotFile> file_;
   std::shared_ptr<StateStaging> staging_;
 };

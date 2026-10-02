@@ -151,14 +151,14 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 // commit identical state. Both use the same target arithmetic; compare bytes.
 // The GDN kernel tests independently check each retained count against FP64.
 void requireCommittedStateIdentical(const model::QwenStateStorage &states,
-                                    uint32_t budgetSlot, uint32_t maskedSlot,
+                                    uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
-  const auto &budget = states.metadata(budgetSlot);
-  const auto &masked = states.metadata(maskedSlot);
+  const auto &budget = states.metadata(budgetLane);
+  const auto &masked = states.metadata(maskedLane);
   require(budget.lengths == masked.lengths,
           label + " logical state differs between budget and mask commits");
-  const auto &left = states.buffers(budgetSlot);
-  const auto &right = states.buffers(maskedSlot);
+  const auto &left = states.buffers(budgetLane);
+  const auto &right = states.buffers(maskedLane);
   auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
                        const std::string &part) {
     require(a.sizeBytes() == b.sizeBytes() && a.contents() && b.contents() &&
@@ -189,8 +189,8 @@ EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
 }
 
 void beginCold(model::Runtime &runtime, const EngineRequest &request,
-               uint32_t slot) {
-  runtime.beginColdRequest(request.modelView(), slot);
+               uint32_t lane) {
+  runtime.beginColdRequest(request.modelView(), lane);
 }
 
 // Gives an item the revision of its page list the way the engine's cache
@@ -365,7 +365,7 @@ void provideMask(model::Runtime &executor, uint64_t requestId,
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
 StateSamples sampleCommittedState(const model::QwenStateStorage &states,
-                                   uint32_t slot) {
+                                   uint32_t lane) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
                        bool bfloat) {
@@ -379,13 +379,13 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
     }
     result.emplace_back(std::move(name), std::move(values));
   };
-  const auto &buffers = states.buffers(slot);
-  const auto &gdn = buffers.gdn[states.metadata(slot).activeParity];
+  const auto &buffers = states.buffers(lane);
+  const auto &gdn = buffers.gdn[states.metadata(lane).activeParity];
   add("convolution", gdn.convolutionBase, true);
   add("recurrent", gdn.recurrentBase, false);
   add("first_convolution", gdn.convolutionLayers.front(), true);
   add("first_recurrent", gdn.recurrentLayers.front(), false);
-  const auto &lengths = states.metadata(slot).lengths;
+  const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
   const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
                             layout.headDimension;
@@ -732,7 +732,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
               backend.memoryStats().allocatedBytes ==
                   originalBytes + singleImageBytes,
           "repeated placements allocated multiple image buffers");
-  const uint32_t slot = *admitted.cell;
+  const uint32_t lane = *admitted.cell;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
   executor.setDraftContextPlan(
@@ -748,7 +748,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes + 1,
           "repeated image placements encoded more than once");
-  const auto expected = sampleCommittedState(states, slot);
+  const auto expected = sampleCommittedState(states, lane);
   executor.end(request.id);
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -779,9 +779,9 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // its next transition reads, with 0xFF: NaN, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
-void poisonRecurrentState(const model::QwenStateStorage &states, uint32_t slot) {
+void poisonRecurrentState(const model::QwenStateStorage &states, uint32_t lane) {
   const metal::MetalBuffer &recurrent =
-      states.buffers(slot).gdn[states.metadata(slot).activeParity].recurrentBase;
+      states.buffers(lane).gdn[states.metadata(lane).activeParity].recurrentBase;
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
@@ -1416,8 +1416,8 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   }, package.target);
   package.descriptor.target = originalTarget;
   auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
-  for (uint32_t slot = 0; slot < 4; ++slot)
-    require(!states.metadata(slot).assigned,
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    require(!states.metadata(lane).assigned,
             "EOS warmup left an active state lane");
   std::cout << "warmup_eos=PASS prefill_stop=" << prefillStop
             << " decode_stop=" << decodeStop << '\n';
@@ -1732,8 +1732,8 @@ int main(int argc, char **argv) {
                      std::span<const uint32_t>(prompt16).subspan(8, 8),
                      partitionedPages);
 
-    const model::QwenSlotMetadata &baselineMetadata = states.metadata(2);
-    const model::QwenSlotMetadata &partitionedMetadata = states.metadata(3);
+    const model::QwenLaneMetadata &baselineMetadata = states.metadata(2);
+    const model::QwenLaneMetadata &partitionedMetadata = states.metadata(3);
     require(baselineMetadata.lengths == partitionedMetadata.lengths &&
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
@@ -2275,14 +2275,14 @@ int main(int argc, char **argv) {
     // rendezvous for a fourth request. State lanes are intentionally permuted
     // to prove that batch lanes belong to plan order.
     constexpr std::array<uint64_t, 3> b3Ids{60, 61, 62};
-    constexpr std::array<uint32_t, 3> b3Slots{2, 0, 3};
+    constexpr std::array<uint32_t, 3> b3StateLanes{2, 0, 3};
     std::array<std::vector<uint32_t>, 3> b3Pages{std::vector<uint32_t>{40},
                                                  std::vector<uint32_t>{41},
                                                  std::vector<uint32_t>{42}};
     constexpr std::array<uint32_t, 3> b3Words{279, 314, 264};
     for (uint32_t lane = 0; lane < b3Ids.size(); ++lane) {
       beginCold(executor, makeRequest(b3Ids[lane], {b3Words[lane]}, 16),
-                b3Slots[lane]);
+                b3StateLanes[lane]);
       prefillToken(executor, b3Ids[lane], 0, b3Words[lane],
                    b3Pages[lane]);
     }
@@ -2390,7 +2390,7 @@ int main(int argc, char **argv) {
     // its M32 decode with permuted lanes proves ragged addressing and state
     // isolation without requiring another batch width's numerical decisions.
     constexpr std::array<uint64_t, 4> raggedIds{100, 101, 102, 103};
-    constexpr std::array<uint32_t, 4> raggedSlots{3, 1, 0, 2};
+    constexpr std::array<uint32_t, 4> raggedStateLanes{3, 1, 0, 2};
     constexpr std::array<uint32_t, 4> raggedRows{1, 31, 257, 1759};
     std::array<std::vector<uint32_t>, 4> raggedPrompts;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
@@ -2418,7 +2418,7 @@ int main(int argc, char **argv) {
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       beginCold(executor,
           raggedRequest(raggedIds[lane], lane),
-          raggedSlots[lane]);
+          raggedStateLanes[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
       raggedPrefillItems[lane] = withRevision({.requestId = raggedIds[lane],
                                                .tokenCount = raggedRows[lane],
@@ -2433,7 +2433,7 @@ int main(int argc, char **argv) {
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
-                  states.metadata(raggedSlots[lane]).lengths.targetTokens ==
+                  states.metadata(raggedStateLanes[lane]).lengths.targetTokens ==
                       raggedRows[lane],
               "ragged prefill consumed or addressed the wrong rows");
       requireOpen(raggedPrefill[lane], "ragged prefill");
@@ -2465,7 +2465,7 @@ int main(int argc, char **argv) {
     // permuted. This isolates cross-lane addressing without conflating M32
     // with the independently optimized M8 numerical path.
     constexpr std::array<uint32_t, 4> raggedPermutation{2, 0, 3, 1};
-    constexpr std::array<uint32_t, 4> referenceSlots{1, 3, 0, 2};
+    constexpr std::array<uint32_t, 4> referenceStateLanes{1, 3, 0, 2};
     BatchPlan raggedReferencePrefillPlan;
     raggedReferencePrefillPlan.kind = WorkKind::Prefill;
     raggedReferencePrefillPlan.cohort = BatchCohort::Greedy;
@@ -2475,7 +2475,7 @@ int main(int argc, char **argv) {
       const uint64_t referenceId = 104 + lane;
       beginCold(executor,
           raggedRequest(referenceId, lane),
-          referenceSlots[order]);
+          referenceStateLanes[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
       raggedReferencePrefillItems[order] = withRevision(
@@ -2603,14 +2603,14 @@ int main(int argc, char **argv) {
       executor.end(id);
 
     constexpr std::array<uint64_t, 2> productionB2Ids{76, 77};
-    constexpr std::array<uint32_t, 2> productionB2Slots{3, 1};
+    constexpr std::array<uint32_t, 2> productionB2StateLanes{3, 1};
     std::array<std::vector<uint32_t>, 2> productionB2Pages{
         std::vector<uint32_t>{48, 49, 50, 51, 76},
         std::vector<uint32_t>{48, 49, 50, 51, 77}};
     for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
       beginCold(executor,
           makeRequest(productionB2Ids[lane], productionPrompt, 16),
-          productionB2Slots[lane]);
+          productionB2StateLanes[lane]);
       restoreActivePrefix(executor, productionB2Ids[lane],
                           productionPrompt.size(), productionPrefix.size(),
                           productionSnapshot);
@@ -2675,7 +2675,7 @@ int main(int argc, char **argv) {
             cycleResults[lane].acceptedDraftTokens);
         productionB2Lengths[lane] += cycleResults[lane].outputTokens.size() -
                                      cycleResults[lane].outputTokensWithoutKv;
-        require(states.metadata(productionB2Slots[lane]).lengths.targetTokens ==
+        require(states.metadata(productionB2StateLanes[lane]).lengths.targetTokens ==
                     productionB2Lengths[lane],
                 "production B2 committed length differs from its output accounting");
       }
@@ -2768,9 +2768,10 @@ int main(int argc, char **argv) {
       sequence.sampling.frequencyPenalty = penalties.frequency;
       sequence.sampling.repetitionPenalty = penalties.repetition;
       beginCold(executor, sequence, 0);
-      uint32_t slot = 0;
-      // A penalized request resumes in a slot other than lane 0, which it
-      // decodes in: its penalty words follow the slot, not the lane.
+      uint32_t stateLane = 0;
+      // A penalized request resumes in a state lane other than 0 and decodes
+      // in batch lane 0: its penalty words follow the state lane, not the
+      // batch lane.
       const auto resume = [&] {
         std::optional<EngineRequest> holder;
         if (penalties.active()) {
@@ -2787,16 +2788,16 @@ int main(int argc, char **argv) {
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
         const StateSamples before = repeatDuringReplay
-                                        ? sampleCommittedState(states, slot)
+                                        ? sampleCommittedState(states, stateLane)
                                         : StateSamples{};
         executor.suspend(sequence.id);
-        require(states.actualSlotBytes(slot) == 0,
+        require(states.actualSlotBytes(stateLane) == 0,
                 "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
           provideMask(executor, sequence.id, singletonMasks(anchor));
         }
-        slot = resume();
+        stateLane = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
         executor.setDraftContextPlan(
             sequence.id, planDraftContext(0, length, std::nullopt, {}));
@@ -2806,9 +2807,9 @@ int main(int argc, char **argv) {
                                    pageTable, cohort),
                       "interrupted state replay");
           executor.suspend(sequence.id);
-          require(states.actualSlotBytes(slot) == 0,
+          require(states.actualSlotBytes(stateLane) == 0,
                   "repeated preemption retained its state buffers");
-          slot = resume();
+          stateLane = resume();
           executor.setDraftContextPlan(
               sequence.id, planDraftContext(0, length, std::nullopt, {}));
         }
@@ -2816,21 +2817,21 @@ int main(int argc, char **argv) {
             executor, sequence.id, 0, sequence.prompt, pageTable, cohort);
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
-          const StateSamples rebuilt = sampleCommittedState(states, slot);
+          const StateSamples rebuilt = sampleCommittedState(states, stateLane);
           // Decode and prefill use different floating-point graphs. Record
           // that drift, but compare recovery itself to an independent cold
           // teacher-forced execution with the identical history and geometry.
           compareCommittedSamples(before, rebuilt, false);
           EngineRequest teacher = sequence;
           teacher.id = 82;
-          const uint32_t teacherSlot = slot == 0 ? 1 : 0;
+          const uint32_t teacherLane = stateLane == 0 ? 1 : 0;
           const auto teacherPages = pageRange(80, 8);
-          beginCold(executor, teacher, teacherSlot);
+          beginCold(executor, teacher, teacherLane);
           static_cast<void>(prefillChunk(executor, teacher.id, 0,
                                         teacher.prompt, teacherPages, cohort));
-          require(states.metadata(slot).lengths == states.metadata(teacherSlot).lengths,
+          require(states.metadata(stateLane).lengths == states.metadata(teacherLane).lengths,
                   "recomputed logical lengths differ from teacher forcing");
-          compareCommittedSamples(rebuilt, sampleCommittedState(states, teacherSlot), true);
+          compareCommittedSamples(rebuilt, sampleCommittedState(states, teacherLane), true);
           executor.end(teacher.id);
         }
         return replay.nextDecodeStage;

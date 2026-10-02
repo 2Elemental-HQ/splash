@@ -118,7 +118,7 @@ uint32_t parseCount(std::string_view text, std::string_view label) {
 
 struct Lane final {
   uint64_t id = 0;
-  uint32_t slot = 0;
+  uint32_t stateLane = 0;
   uint64_t position = 0;
   std::vector<uint32_t> pages;
   // The pages never change, so the page table keeps its first revision.
@@ -131,7 +131,7 @@ void prefill(model::Runtime &executor, Lane &lane,
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
   request.maxNewTokens = 256;
-  executor.beginColdRequest(request.modelView(), lane.slot);
+  executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
     const uint32_t count = std::min<uint32_t>(

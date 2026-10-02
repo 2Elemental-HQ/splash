@@ -19,7 +19,7 @@ public:
 
   // Direct native-oracle entry point. Production admission uses
   // begin() and installs its cache-aware plan explicitly.
-  void beginColdRequest(const ModelRequest &request, uint32_t stateSlot);
+  void beginColdRequest(const ModelRequest &request, uint32_t stateLane);
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
@@ -67,7 +67,7 @@ private:
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
-                                       uint32_t stateSlot);
+                                       uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   prefillAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                std::function<void()> completion);
