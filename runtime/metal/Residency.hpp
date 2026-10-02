@@ -63,12 +63,13 @@ public:
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Wires the buffer before returning and restarts the keep-alive.
+  // Adds the buffer to the set and restarts the keep-alive: a held set wires
+  // it at the commit, and a lapsed one is requested again off the caller's
+  // thread (use()).
   void add(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ addAllocation:buffer];
       [set_ commit];
-      [set_ requestResidency];
     });
     use();
   }

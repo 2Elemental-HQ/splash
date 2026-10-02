@@ -653,6 +653,37 @@ void buffersStayResident(const std::string &metallibPath) {
               << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
 }
 
+// Allocating into a held set wires the buffer at the set's commit: the
+// serving thread asks Metal for no residency of its own, and only the
+// heartbeat requests the set while allocations follow one another.
+void allocationDoesNotRequestResidency(const std::string &metallibPath) {
+    constexpr uint32_t kAllocations = 20;
+    constexpr double kBeatSeconds = 0.5;
+    ResidencyCalls calls;
+    MetalBackend backend(metallibPath, 120.0, 600.0);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    MetalBuffer used = backend.allocateBuffer(page);
+    const uint32_t count = 1, increment = 7;
+    const ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    (void)backend.submitAsync(dispatch).wait();
+    require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
+            "the set was not held before the allocations");
+    const unsigned held = calls.requests;
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<MetalBuffer> buffers;
+    for (uint32_t index = 0; index < kAllocations; ++index)
+        buffers.push_back(backend.allocateBuffer(page));
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+    const unsigned requests = calls.requests - held;
+    require(requests <= 1 + elapsed.count() / kBeatSeconds,
+            "allocations requested residency: " + std::to_string(requests) +
+                " requests in " + std::to_string(elapsed.count()) + " s");
+    std::cout << "PASS allocation does not request residency allocations=" << kAllocations
+              << " requests=" << requests << '\n';
+}
+
 // Allocating, lapsing and holding again race the heartbeat while another
 // thread drops buffers, as command completion can, and the backend is then
 // destroyed with its heartbeat live and a buffer outliving it. Nothing may
@@ -1150,6 +1181,7 @@ int main(int argc, const char *argv[]) {
             abandonedTicketReturnsAfterTheWatchdog(argv[1]);
             stopRefusesSubmission(argv[1]);
             buffersStayResident(argv[1]);
+            allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
             residencyReturnsRemovedBuffers(argv[1]);
