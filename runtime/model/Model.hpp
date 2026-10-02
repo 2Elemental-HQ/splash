@@ -29,7 +29,8 @@ enum class DecodeStage : uint8_t {
   return stage == DecodeStage::ApplyInitialMask;
 }
 
-enum class ConstraintMode : uint8_t { None, TokenMask };
+// Values are the native request frame's constraint byte.
+enum class ConstraintMode : uint8_t { None = 0, TokenMask = 1 };
 
 // Request options, one bit each, as the native request frame's flags word
 // carries them; a request with any other bit set is a request error.

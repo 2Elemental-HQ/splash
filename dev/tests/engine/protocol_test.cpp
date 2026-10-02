@@ -18,7 +18,10 @@
 namespace {
 
 using namespace splash::protocol;
+using splash::ConstraintMode;
 using splash::RequestIgnoreEndOfSequence;
+using splash::engine::EngineFinishReason;
+using splash::engine::RequestPriority;
 
 int failures = 0;
 
@@ -279,7 +282,8 @@ void testScoreRequestAndDoneLogits() {
   expectRequestIssue(tooFew, IssueCode::InvalidCount);
 
   RequestFrame tooMany = request;
-  tooMany.scoreTokens.resize(kMaximumScoreOptions + 1);
+  tooMany.scoreTokens.resize(
+      splash::model::ExecutionLimits::maximumScoreOptions + 1);
   for (uint32_t index = 0; index < tooMany.scoreTokens.size(); ++index)
     tooMany.scoreTokens[index] = index;
   expectRequestIssue(tooMany, IssueCode::InvalidCount);
@@ -323,7 +327,8 @@ void testScoreRequestAndDoneLogits() {
   sampling.cohort = Cohort::Sampling;
   expectRequestIssue(sampling, IssueCode::InvalidSampling);
 
-  DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500, {1.5f, -2.0f, 0.25f}};
+  DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
+                   {1.5f, -2.0f, 0.25f}};
   CHECK(test, roundTrip(scored) == scored);
 
   auto encodedDone = serializeMessage(Message{scored});
@@ -333,10 +338,10 @@ void testScoreRequestAndDoneLogits() {
     CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
   }
 
-  DoneEvent generation{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
+  DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
   CHECK(test, roundTrip(generation) == generation);
 
-  DoneEvent cancelled{91, FinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
+  DoneEvent cancelled{91, EngineFinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
   CHECK(test, roundTrip(cancelled) == cancelled);
 
   auto expectDoneIssue = [&](DoneEvent invalid, IssueCode code) {
@@ -369,11 +374,11 @@ void testScoreRequestAndDoneLogits() {
   expectDoneIssue(withDecode, IssueCode::InvalidCount);
 
   DoneEvent cancelledScored = scored;
-  cancelledScored.reason = FinishReason::Cancelled;
+  cancelledScored.reason = EngineFinishReason::Cancelled;
   expectDoneIssue(cancelledScored, IssueCode::InvalidCount);
 
   DoneEvent lengthScored = scored;
-  lengthScored.reason = FinishReason::Length;
+  lengthScored.reason = EngineFinishReason::Length;
   expectDoneIssue(lengthScored, IssueCode::InvalidCount);
 
   if (encodedDone) {
@@ -389,7 +394,7 @@ void testScoreRequestAndDoneLogits() {
 
     auto lengthWire = *encodedDone.value;
     lengthWire[kFrameHeaderBytes + 8] =
-        static_cast<uint8_t>(FinishReason::Length);
+        static_cast<uint8_t>(EngineFinishReason::Length);
     auto lengthResult = decodeFrame(decodeSingleFrame(lengthWire));
     CHECK(test, !lengthResult);
     if (lengthResult.issue) {
@@ -413,7 +418,7 @@ std::vector<Message> everyOtherMessage() {
       TokensEvent{91, 17, {10, 11, 12}},
       MaskRequestEvent{91, 6, 4, {}},
       MaskRequestEvent{91, 7, 4, {101, 102, 103}},
-      DoneEvent{91, FinishReason::Stop, 4096, 512, 1000, 2000, 3500},
+      DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000, 3500},
       ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                  "request deadline expired"},
       ErrorEvent{FailureClass::EngineUnhealthy, 0, false, "gpu_fault",

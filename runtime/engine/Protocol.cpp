@@ -16,6 +16,10 @@
 namespace splash::protocol {
 namespace {
 
+using engine::EngineFinishReason;
+using engine::RequestPriority;
+using model::ExecutionLimits;
+
 std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
@@ -95,7 +99,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     }
     return bounded(kMaskRequestFixedBytes, maximum);
   case FrameType::Done:
-    if (!checkedMultiply(kMaximumScoreOptions, sizeof(float), variable) ||
+    if (!checkedMultiply(ExecutionLimits::maximumScoreOptions, sizeof(float),
+                         variable) ||
         !checkedAdd(kDoneFixedBytes, variable, maximum)) {
       return std::nullopt;
     }
@@ -399,8 +404,8 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
       return invalid(IssueCode::InvalidCount,
                      "score requests are text-only");
     }
-    if (request.scoreTokens.size() < kMinimumScoreOptions ||
-        request.scoreTokens.size() > kMaximumScoreOptions) {
+    if (request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
+        request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
       return invalid(IssueCode::InvalidCount,
                      "score option count must be in [2, 255]");
     }
@@ -565,19 +570,19 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event,
                      "done event request id must be non-zero");
   }
   if (!validEnum(static_cast<uint8_t>(event.reason),
-                 {FinishReason::Stop, FinishReason::Length,
-                  FinishReason::Cancelled})) {
+                 {EngineFinishReason::Stop, EngineFinishReason::Length,
+                  EngineFinishReason::Cancelled})) {
     return makeIssue(failureClass, IssueCode::InvalidEnumValue, event.requestId,
                      "done finish reason is invalid");
   }
   if (!event.optionLogits.empty()) {
-    if (event.optionLogits.size() < kMinimumScoreOptions ||
-        event.optionLogits.size() > kMaximumScoreOptions) {
+    if (event.optionLogits.size() < ExecutionLimits::minimumScoreOptions ||
+        event.optionLogits.size() > ExecutionLimits::maximumScoreOptions) {
       return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
                        "done option logit count must be in [2, 255]");
     }
-    if (event.reason != FinishReason::Stop || event.completionTokens != 0 ||
-        event.decodeMicros != 0) {
+    if (event.reason != EngineFinishReason::Stop ||
+        event.completionTokens != 0 || event.decodeMicros != 0) {
       return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
                        "scored done events must stop and carry no completion "
                        "or decode activity");
@@ -890,7 +895,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   request.priority = static_cast<RequestPriority>(priority);
   request.cohort = static_cast<Cohort>(cohort);
   request.constraint = static_cast<ConstraintMode>(constraint);
-  if (scoreCount > kMaximumScoreOptions) {
+  if (scoreCount > ExecutionLimits::maximumScoreOptions) {
     return failure<Message>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
                   request.requestId, "score option count exceeds its limit"));
@@ -1123,7 +1128,7 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
                                       IssueCode::InvalidPayloadLength, 0,
                                       "done payload has an invalid length"));
   }
-  if (logitCount > kMaximumScoreOptions) {
+  if (logitCount > ExecutionLimits::maximumScoreOptions) {
     return failure<Message>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded,
                   event.requestId,
@@ -1145,7 +1150,7 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
                                         "done option logits are truncated"));
     }
   }
-  event.reason = static_cast<FinishReason>(reason);
+  event.reason = static_cast<EngineFinishReason>(reason);
   if (auto issue = validateDone(event, FailureClass::ProtocolFatal)) {
     return failure<Message>(std::move(*issue));
   }

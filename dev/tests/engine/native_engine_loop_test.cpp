@@ -209,9 +209,9 @@ std::vector<protocol::Message> decodeMessages(std::span<const uint8_t> bytes) {
 protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
   protocol::RequestFrame result;
   result.requestId = id;
-  result.priority = protocol::RequestPriority::Foreground;
+  result.priority = RequestPriority::Foreground;
   result.cohort = protocol::Cohort::Greedy;
-  result.constraint = protocol::ConstraintMode::None;
+  result.constraint = ConstraintMode::None;
   result.absoluteDeadlineUnixMicros = 2'000'000;
   result.remainingDeadlineMicros = 1'000'000;
   result.logicalMaxOutputTokens = maxOutputTokens;
@@ -328,7 +328,7 @@ void testPromptProgress() {
     if (std::holds_alternative<protocol::PromptProgressEvent>(message))
       ++count;
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
-      cancelled = event->reason == protocol::FinishReason::Cancelled;
+      cancelled = event->reason == EngineFinishReason::Cancelled;
   }
   require(count == 1 && cancelled,
           "cancelled prefill published further progress");
@@ -804,7 +804,7 @@ void testCancelledIdIsReusableInTheSameInput() {
   require(loop.receive(input),
           "a cancel and a request for one id closed the connection");
   runUntilIdle(loop);
-  std::vector<protocol::FinishReason> done;
+  std::vector<EngineFinishReason> done;
   uint32_t errors = 0;
   for (const auto &message : decodeMessages(output)) {
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
@@ -812,9 +812,9 @@ void testCancelledIdIsReusableInTheSameInput() {
     errors += std::holds_alternative<protocol::ErrorEvent>(message);
   }
   require(errors == 0 &&
-              done == std::vector<protocol::FinishReason>{
-                          protocol::FinishReason::Cancelled,
-                          protocol::FinishReason::Stop},
+              done == std::vector<EngineFinishReason>{
+                          EngineFinishReason::Cancelled,
+                          EngineFinishReason::Stop},
           "a cancelled id was not reusable in the same input");
 }
 
@@ -1262,7 +1262,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
       require(done->optionLogits[0] == 0.5f && done->optionLogits[1] == 1.5f &&
                   done->optionLogits[2] == 2.5f,
               "score done logits are not in request order");
-      require(done->reason == protocol::FinishReason::Stop,
+      require(done->reason == EngineFinishReason::Stop,
               "score done reason is not stop");
     }
   }
@@ -1302,7 +1302,7 @@ void testCancelledScoreReturnsEmptyLogits() {
   for (const protocol::Message &message : decodeMessages(output)) {
     if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
       ++doneCount;
-      require(done->reason == protocol::FinishReason::Cancelled,
+      require(done->reason == EngineFinishReason::Cancelled,
               "cancelled score did not report Cancelled");
       require(done->optionLogits.empty(),
               "cancelled score returned logits");
@@ -1467,9 +1467,9 @@ void testConstrainedMaskExchange() {
               "mask exchange message closed the connection");
     };
     auto constrained = request(7);
-    constrained.priority = protocol::RequestPriority::Background;
+    constrained.priority = RequestPriority::Background;
     constrained.cohort = protocol::Cohort::Constrained;
-    constrained.constraint = protocol::ConstraintMode::TokenMask;
+    constrained.constraint = ConstraintMode::TokenMask;
     constrained.absoluteDeadlineUnixMicros = 601'000'000;
     constrained.remainingDeadlineMicros = 600'000'000;
     send(constrained);
@@ -1511,7 +1511,7 @@ void testConstrainedMaskExchange() {
     }
     runUntilIdle(loop);
 
-    std::optional<protocol::FinishReason> done;
+    std::optional<EngineFinishReason> done;
     std::vector<std::string> errors;
     std::string errorMessage;
     uint32_t maskRequests = 0;
@@ -1531,11 +1531,11 @@ void testConstrainedMaskExchange() {
                 !loop.connectionMustClose() && !executor.holdsSlot(7),
             "mask exchange stopped the engine or kept the request's slot");
     if (reply == Reply::Valid) {
-      require(done == protocol::FinishReason::Stop && errors.empty() &&
+      require(done == EngineFinishReason::Stop && errors.empty() &&
                   executor.providedMasks == 1,
               "valid initial mask did not let the request finish");
     } else if (reply == Reply::AfterCancel) {
-      require(done == protocol::FinishReason::Cancelled && errors.empty() &&
+      require(done == EngineFinishReason::Cancelled && errors.empty() &&
                   executor.providedMasks == 0,
               "mask response after cancellation was not ignored");
     } else if (reply == Reply::AfterTimeout) {

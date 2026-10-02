@@ -79,7 +79,10 @@ CPP_GOLDEN_SOURCE = r"""
 #include <iostream>
 
 using namespace splash::protocol;
+using splash::ConstraintMode;
 using splash::RequestIgnoreEndOfSequence;
+using splash::engine::EngineFinishReason;
+using splash::engine::RequestPriority;
 
 void show(const Message &message) {
     auto result = serializeMessage(message);
@@ -143,9 +146,9 @@ int main() {
     show(TokensEvent{91, 17, {10, 11, 12}});
     show(MaskRequestEvent{91, 6, 4, {}});
     show(MaskRequestEvent{91, 7, 4, {101, 102, 103}});
-    show(DoneEvent{91, FinishReason::Stop, 4096, 512,
+    show(DoneEvent{91, EngineFinishReason::Stop, 4096, 512,
                    1000, 2000, 3500});
-    DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500};
+    DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500};
     scored.optionLogits = {1.5f, -2.25f, 0.5f};
     show(scored);
     show(ErrorEvent{FailureClass::RequestError, 91, true,

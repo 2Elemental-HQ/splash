@@ -10,6 +10,7 @@
 
 namespace splash::engine {
 
+// Values are the native request frame's priority byte.
 enum class RequestPriority : uint8_t {
   Foreground = 0,
   Normal = 1,
@@ -23,7 +24,12 @@ struct StepResult final {
   DecodeStage nextDecodeStage = DecodeStage::Regular;
 };
 
-enum class EngineFinishReason : uint8_t { Stop, Length, Cancelled };
+// Values are the Done event's reason byte.
+enum class EngineFinishReason : uint8_t {
+  Stop = 0,
+  Length = 1,
+  Cancelled = 2,
+};
 enum class EngineCacheStatus : uint8_t { Miss, PrefixHit };
 
 struct EngineRequest final {

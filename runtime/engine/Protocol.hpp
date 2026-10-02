@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/Types.hpp"
 #include "model/Model.hpp"
 #include "ops/Vision.hpp"
 
@@ -118,28 +119,10 @@ struct ProtocolLimits {
 [[nodiscard]] std::optional<ProtocolIssue>
 validateLimits(const ProtocolLimits &limits);
 
-// Direct finite-option scoring (SemIf/Jev System One): a request carrying
-// scoreTokens runs prefill only and returns the raw final-position logits at
-// those token ids in DoneEvent.optionLogits. The option count is bounded by
-// the wire contract; the engine additionally requires vocabulary bounds.
-inline constexpr uint32_t kMinimumScoreOptions = 2;
-inline constexpr uint32_t kMaximumScoreOptions = 255;
-
-enum class RequestPriority : uint8_t {
-  Foreground = 0,
-  Normal = 1,
-  Background = 2,
-};
-
 enum class Cohort : uint8_t {
   Greedy = 0,
   Sampling = 1,
   Constrained = 2,
-};
-
-enum class ConstraintMode : uint8_t {
-  None = 0,
-  TokenMask = 1,
 };
 
 // The defaults are greedy selection with nothing changing the logits, which
@@ -205,7 +188,7 @@ inline constexpr uint64_t kRequestFixedBytes = 88;
 
 struct RequestFrame {
   uint64_t requestId = 0;
-  RequestPriority priority = RequestPriority::Normal;
+  engine::RequestPriority priority = engine::RequestPriority::Normal;
 
   // absoluteDeadlineUnixMicros is wall-clock UTC. remainingDeadlineMicros
   // is the sender's remaining budget at serialization time.  Admission
@@ -326,15 +309,9 @@ struct MaskRequestEvent {
   bool operator==(const MaskRequestEvent &) const = default;
 };
 
-enum class FinishReason : uint8_t {
-  Stop = 0,
-  Length = 1,
-  Cancelled = 2,
-};
-
 struct DoneEvent {
   uint64_t requestId = 0;
-  FinishReason reason = FinishReason::Length;
+  engine::EngineFinishReason reason = engine::EngineFinishReason::Length;
   uint32_t promptTokens = 0;
   uint32_t completionTokens = 0;
   uint64_t prefillMicros = 0;

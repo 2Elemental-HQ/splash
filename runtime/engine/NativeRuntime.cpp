@@ -12,25 +12,6 @@
 namespace splash::engine {
 namespace {
 
-static_assert(protocol::kMaximumScoreOptions ==
-                  model::ExecutionLimits::maximumScoreOptions,
-              "native protocol and model score option bounds must match");
-static_assert(protocol::kMinimumScoreOptions ==
-                  model::ExecutionLimits::minimumScoreOptions,
-              "native protocol and model score option bounds must match");
-
-RequestPriority mapPriority(protocol::RequestPriority priority) {
-  switch (priority) {
-  case protocol::RequestPriority::Foreground:
-    return RequestPriority::Foreground;
-  case protocol::RequestPriority::Normal:
-    return RequestPriority::Normal;
-  case protocol::RequestPriority::Background:
-    return RequestPriority::Background;
-  }
-  throw std::invalid_argument("invalid protocol priority");
-}
-
 BatchCohort mapCohort(protocol::Cohort cohort) {
   switch (cohort) {
   case protocol::Cohort::Greedy:
@@ -43,16 +24,6 @@ BatchCohort mapCohort(protocol::Cohort cohort) {
   throw std::invalid_argument("invalid protocol cohort");
 }
 
-ConstraintMode mapConstraint(protocol::ConstraintMode constraint) {
-  switch (constraint) {
-  case protocol::ConstraintMode::None:
-    return ConstraintMode::None;
-  case protocol::ConstraintMode::TokenMask:
-    return ConstraintMode::TokenMask;
-  }
-  throw std::invalid_argument("invalid protocol constraint mode");
-}
-
 protocol::CacheDisposition mapCacheDisposition(EngineCacheStatus status) {
   switch (status) {
   case EngineCacheStatus::Miss:
@@ -61,18 +32,6 @@ protocol::CacheDisposition mapCacheDisposition(EngineCacheStatus status) {
     return protocol::CacheDisposition::PrefixHit;
   }
   throw std::logic_error("invalid engine cache status");
-}
-
-protocol::FinishReason mapFinishReason(EngineFinishReason reason) {
-  switch (reason) {
-  case EngineFinishReason::Stop:
-    return protocol::FinishReason::Stop;
-  case EngineFinishReason::Length:
-    return protocol::FinishReason::Length;
-  case EngineFinishReason::Cancelled:
-    return protocol::FinishReason::Cancelled;
-  }
-  throw std::logic_error("invalid engine finish reason");
 }
 
 } // namespace
@@ -261,7 +220,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   try {
     EngineRequest engineRequest;
     engineRequest.id = request.requestId;
-    engineRequest.priority = mapPriority(request.priority);
+    engineRequest.priority = request.priority;
     engineRequest.cohort = mapCohort(request.cohort);
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
@@ -283,7 +242,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
         .frequencyPenalty = request.sampling.frequencyPenalty,
         .repetitionPenalty = request.sampling.repetitionPenalty,
         .minP = request.sampling.minP};
-    engineRequest.constraint = mapConstraint(request.constraint);
+    engineRequest.constraint = request.constraint;
     engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;
     engineRequest.deadlineMilliseconds =
@@ -506,7 +465,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                        : telemetry.arrivedMilliseconds;
   double first = telemetry.firstTokenMilliseconds.value_or(now);
   send(protocol::DoneEvent{
-      requestId, mapFinishReason(reason), promptTokens, completionTokens,
+      requestId, reason, promptTokens, completionTokens,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
