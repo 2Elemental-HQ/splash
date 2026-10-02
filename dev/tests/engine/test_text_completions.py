@@ -232,7 +232,6 @@ class TextCompletionTests(unittest.TestCase):
             "echo": False,
             "logprobs": None,
             "best_of": 1,
-            "repetition_penalty": 1,
         }
         for fields in (defaults, {key: None for key in defaults}, {"n": 1}):
             with self.subTest(fields=fields):
@@ -280,12 +279,7 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(request.seed, 7)
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         invalid = (
-            ({"temperature": -1}, "temperature must be a number in [0, 2]"),
-            ({"top_k": -2}, "top_k must be 0 or -1 (disabled) or a positive"),
             ({"min_p": 1.1}, "min_p must be a number in [0, 1]"),
-            ({"presence_penalty": 3}, "presence_penalty must be a number in [-2, 2]"),
-            ({"repetition_penalty": 0}, "repetition_penalty must be a positive number"),
-            ({"logit_bias": {"1": 2}}, "logit_bias is not supported with speculative"),
             ({"seed": 2**64}, "seed must be an unsigned 64-bit integer"),
             ({"priority": "urgent"}, "priority must be"),
             ({"max_tokens": 0}, "max_tokens must be a positive integer"),

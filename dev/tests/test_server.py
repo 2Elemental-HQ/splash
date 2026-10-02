@@ -6269,10 +6269,6 @@ class ServerTest(unittest.TestCase):
     def test_validation(self):
         harness = self.harness(FakeRuntime())
         invalid = [
-            self.body(temperature=-1),
-            self.body(top_p=0),
-            self.body(top_k=-2),
-            self.body(top_k=1.5),
             self.body(stop=""),
             self.body(stop=3),
             self.body(stop=["x"] * 5),
@@ -6282,14 +6278,7 @@ class ServerTest(unittest.TestCase):
             self.body(n=True),
             self.body(n=1.0),
             self.body(logprobs=0),
-            self.body(temperature=1e300),
             self.body(temperature=float("nan")),
-            self.body(top_p=1e-46),
-            self.body(presence_penalty=False),
-            self.body(repetition_penalty=True),
-            self.body(min_p=1.1),
-            self.body(min_p=True),
-            self.body(logit_bias={"1": 2}),
             self.body(stream="true"),
             self.body(messages=[{"role": "system", "content": "instructions"}]),
             self.body(messages=[{"role": "assistant", "content": "answer"}]),
@@ -6357,10 +6346,6 @@ class ServerTest(unittest.TestCase):
                 body["stop"] = stop
             status, _, _ = harness.request("POST", "/v1/chat/completions", body)
             self.assertEqual(status, 200)
-        for repetition_penalty in (None, 1):
-            body = self.body(repetition_penalty=repetition_penalty)
-            status, _, _ = harness.request("POST", "/v1/chat/completions", body)
-            self.assertEqual(status, 200)
 
     def test_sampling_fields_reach_the_engine_and_are_validated_per_field(self):
         runtime = FakeRuntime()
@@ -6380,7 +6365,10 @@ class ServerTest(unittest.TestCase):
             ),
             ({"repetition_penalty": 1.1}, {"min_p": None}),
             ({"repetition_penalty": 2.5, "frequency_penalty": -2}, {}),
-            ({"presence_penalty": 2, "frequency_penalty": 2, "top_k": 32}, {}),
+            (
+                {"presence_penalty": 2, "frequency_penalty": 2, "top_k": 32},
+                {"repetition_penalty": None},
+            ),
             ({"repetition_penalty": 1e-40, "frequency_penalty": 0.25}, {}),
             ({"temperature": 0.7, "min_p": 0.25}, {}),
             ({"min_p": 1}, {}),
@@ -6415,11 +6403,18 @@ class ServerTest(unittest.TestCase):
         refused = (
             ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
             ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
+            ({"temperature": 1e300}, "temperature must be a number in [0, 2]"),
             ({"top_p": 0}, "top_p must be a number in (0, 1]"),
+            ({"top_p": 1e-46}, "top_p must be a number in (0, 1]"),
             ({"min_p": 1.5}, "min_p must be a number in [0, 1]"),
             ({"min_p": -0.1}, "min_p must be a number in [0, 1]"),
             ({"min_p": "0.1"}, "min_p must be a number in [0, 1]"),
+            ({"min_p": True}, "min_p must be a number in [0, 1]"),
             ({"presence_penalty": 2.5}, "presence_penalty must be a number in [-2, 2]"),
+            (
+                {"presence_penalty": False},
+                "presence_penalty must be a number in [-2, 2]",
+            ),
             (
                 {"frequency_penalty": -3},
                 "frequency_penalty must be a number in [-2, 2]",
@@ -6432,6 +6427,10 @@ class ServerTest(unittest.TestCase):
             ),
             ({"repetition_penalty": 1e-46}, "repetition_penalty must be a positive"),
             ({"repetition_penalty": 1e39}, "repetition_penalty must be a positive"),
+            (
+                {"repetition_penalty": True},
+                "repetition_penalty must be a positive number",
+            ),
             (
                 {"logit_bias": {"1": 2}},
                 "logit_bias is not supported with speculative decoding",
@@ -6497,17 +6496,14 @@ class ServerTest(unittest.TestCase):
         sampling = runtime.requests[0].sampling
         for name, value in fields.items():
             self.assertEqual(getattr(sampling, name), value)
-        for refused, message in (
-            ({"logit_bias": {"1": 2}}, "logit_bias is not supported with speculative"),
-            ({"presence_penalty": 3}, "presence_penalty must be a number"),
-            ({"min_p": 2}, "min_p must be a number in [0, 1]"),
-        ):
-            with self.subTest(fields=refused):
-                status, _, payload = harness.request(
-                    "POST", "/v1/responses", self.responses_body(**refused)
-                )
-                self.assertEqual(status, 400, payload)
-                self.assertIn(message, json.loads(payload)["error"]["message"])
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", self.responses_body(logit_bias={"1": 2})
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"],
+            "logit_bias is not supported with speculative decoding",
+        )
         self.assertEqual(len(runtime.requests), 1)
 
     def test_frontend_limits_generation_and_token_count_preparation_to_two(self):
