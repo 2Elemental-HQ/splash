@@ -1075,6 +1075,7 @@ tier. Matched KV restores start from the root toward the selected
 state, with the state read alongside. Cancellation drops unsubmitted, unshared
 reads; submitted transfers drain before their buffers can be reused. Restored
 states remain usable even when there is no room to promote them into RAM cache.
+Promotion takes only the RAM of a state that keeps a disk copy.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across

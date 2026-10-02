@@ -308,7 +308,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   const uint64_t reclaimed = entry.ram->bytes();
   // One write at a time.
   const bool writable = !entry.disk && entry.ram->canOffload();
-  if (writable && pending_ && unwritten == Unwritten::Wait)
+  if (writable && pending_ && unwritten != Unwritten::Drop)
     return {false, 0, true};
   if (writable) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
@@ -317,7 +317,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
       beginWrite(kvBlock, entry, std::move(transfer));
   }
   if (!entry.disk)
-    return erase(kvBlock, false);
+    return unwritten == Unwritten::Keep ? StateEviction{} : erase(kvBlock, false);
   // A write reads its own copy, so the RAM copy is free at once.
   bytes_ -= reclaimed;
   if (entry.checkpoint)

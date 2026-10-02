@@ -131,8 +131,11 @@ public:
   // What reclaim does with a state that has no disk copy when its write
   // cannot start now. Drop: the state goes. Wait: while the one write in
   // flight holds the staging buffer, the state stays and is reported
-  // pending; a write the quota refuses still drops it.
-  enum class Unwritten : uint8_t { Drop, Wait };
+  // pending; a write the quota refuses still drops it. Keep: the state goes
+  // only when it keeps a copy, a disk copy it has or a write that starts
+  // now; it stays otherwise, reported pending while the write in flight
+  // holds the staging buffer.
+  enum class Unwritten : uint8_t { Drop, Wait, Keep };
 
   // makeRoom gives up disk copies for a state's write the quota refuses.
   StateCache(KvCache &kv, CacheRecency &recency, DiskRoom makeRoom)

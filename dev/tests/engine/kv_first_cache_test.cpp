@@ -1120,11 +1120,17 @@ class PromotionTicket final : public StateRestore {
 public:
   uint32_t copies = 0;
   bool available = true;
+  // Copies refused before one succeeds, as while no cache slot is free.
+  uint32_t deniedCopies = 0;
   bool ready() const noexcept override { return true; }
   bool finish() override { return true; }
   void cancel() noexcept override {}
   std::shared_ptr<const CompositeState> snapshot() override {
     ++copies;
+    if (deniedCopies) {
+      --deniedCopies;
+      return nullptr;
+    }
     return available ? std::make_shared<TestState>(100) : nullptr;
   }
 };
@@ -1156,6 +1162,42 @@ void testPromotionIdentityAndDenial() {
     const auto stats = fixture.cache.snapshot().stateCache;
     require(stats.promotions == (available ? 1 : 0) &&
                 stats.promotionsSkipped == (available ? 0 : 1), "promotion accounting failed");
+  }
+}
+
+// Promotion only saves a later read: the oldest RAM copy gives it room only
+// when that state keeps a disk copy, never when the RAM copy is its only one.
+void testPromotionNeverDropsAUniqueState() {
+  for (const bool onDisk : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+    require(fixture.cache.reclaimOneState(false, 0, false) && fixture.cache.pollTransfers(),
+            "the state to promote was not written");
+    if (onDisk) {
+      // Written and published again, the older state has a RAM copy and a
+      // disk copy beside it.
+      fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
+      require(fixture.cache.reclaimOneState(false, 0, false) && fixture.cache.pollTransfers(),
+              "the older state was not written");
+      fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
+    } else {
+      fixture.publish(1);
+    }
+    const auto lookup = fixture.lookup(129);
+    PromotionTicket ticket;
+    ticket.deniedCopies = 1;
+    fixture.cache.promoteState(lookup, ticket);
+    const auto stats = fixture.cache.snapshot().stateCache;
+    if (onDisk)
+      require(stats.promotions == 1 && !fixture.cache.stateResident(fixture.blocks[1]) &&
+                  fixture.lookup(65).resumeBoundary() == 64,
+              "promotion did not take the RAM of a state with a disk copy");
+    else
+      require(stats.promotions == 0 && stats.promotionsSkipped == 1 &&
+                  fixture.cache.stateResident(fixture.blocks[1]),
+              "promotion dropped a state's only copy");
   }
 }
 
@@ -3832,6 +3874,7 @@ int main() {
     testReclaimCacheCountsPendingPages();
     testDemotionCostsNoSecondState();
     testPromotionIdentityAndDenial();
+    testPromotionNeverDropsAUniqueState();
     testRepublicationKeepsTheDiskCopy();
     testLostStatesAreCounted();
     testRestoredStateKeepsItsDiskCopy();

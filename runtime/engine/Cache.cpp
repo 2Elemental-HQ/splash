@@ -687,11 +687,12 @@ void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
   auto state = transfer.snapshot();
   if (!state) {
     // The restored state is the most recently used one; the oldest RAM copy
-    // makes room for it unless its write has to wait.
+    // makes room for it. Promotion only saves a later read: it takes only
+    // RAM whose state keeps a copy, never a state's only copy.
     auto victim = states_.checkpointCandidate(false);
     if (!victim)
       victim = states_.ordinaryCandidate(false);
-    if (victim && states_.reclaim(victim->id, StateCache::Unwritten::Wait).evicted)
+    if (victim && states_.reclaim(victim->id, StateCache::Unwritten::Keep).evicted)
       state = transfer.snapshot();
   }
   if (state) states_.promote(block, source, std::move(state));
