@@ -106,7 +106,7 @@ int main() {
     request.logicalMaxOutputTokens = 32768;
     request.promptTokens = {0, 1, 42, 0x80000000U, 0xffffffffU};
     request.sampling = {0.8f, 0.95f, 32, 1.5f, -0.25f, 1.1f, 0.05f};
-    request.seed = 0xfedcba9876543210ULL;
+    request.sampling.seed = 0xfedcba9876543210ULL;
     request.cohort = Cohort::Constrained;
     request.constraint = ConstraintMode::TokenMask;
     request.generationPromptTokens = 2;
@@ -122,7 +122,7 @@ int main() {
     RequestFrame score = request;
     score.promptTokens = {5, 6, 7};
     score.logicalMaxOutputTokens = 0;
-    score.sampling = {0.0f, 1.0f, 0};
+    score.sampling = {.seed = request.sampling.seed};
     score.cohort = Cohort::Greedy;
     score.constraint = ConstraintMode::None;
     score.scoreTokens = {101, 202, 303};

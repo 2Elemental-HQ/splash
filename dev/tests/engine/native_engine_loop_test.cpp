@@ -14,9 +14,11 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 using namespace splash;
 using namespace splash::engine;
@@ -219,6 +221,15 @@ protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
   for (uint32_t i = 0; i < result.promptTokens.size(); ++i) {
     result.promptTokens[i] = i + 1;
   }
+  return result;
+}
+
+protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
+  protocol::RequestFrame result = request(id, 0);
+  result.promptTokens.resize(promptTokens);
+  for (uint32_t i = 0; i < result.promptTokens.size(); ++i)
+    result.promptTokens[i] = i + 1;
+  result.scoreTokens = {10, 20, 30};
   return result;
 }
 
@@ -493,26 +504,16 @@ void testSamplingReachesTheModel() {
   greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
   auto sampled = request(2);
   sampled.cohort = protocol::Cohort::Sampling;
-  sampled.seed = 77;
   sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f, 0.05f};
+  sampled.sampling.seed = 77;
   for (const auto &input : {greedy, sampled}) {
     auto encoded = protocol::serializeMessage(protocol::Message{input});
     require(encoded && loop.receive(*encoded.value), "sampled request wire failed");
     runUntilIdle(loop);
   }
-  const auto matches = [&](uint64_t id, const protocol::RequestFrame &input) {
-    const SamplingParameters &sampling = executor.beganSampling.at(id);
-    const protocol::SamplingParameters &sent = input.sampling;
-    return sampling.temperature == sent.temperature &&
-           sampling.topP == sent.topP && sampling.topK == sent.topK &&
-           sampling.seed == input.seed &&
-           sampling.presencePenalty == sent.presencePenalty &&
-           sampling.frequencyPenalty == sent.frequencyPenalty &&
-           sampling.repetitionPenalty == sent.repetitionPenalty &&
-           sampling.minP == sent.minP;
-  };
-  require(matches(1, greedy) && matches(2, sampled),
-          "a penalty or min_p did not reach the model");
+  require(executor.beganSampling.at(1) == greedy.sampling &&
+              executor.beganSampling.at(2) == sampled.sampling,
+          "a penalty, min_p or the seed did not reach the model");
 }
 
 void testFatalFramingClosesConnection() {
@@ -1034,7 +1035,7 @@ void testEngineFailureNamesItsReason() {
   }
 }
 
-void testInvalidPromptTokensStayRequestScoped() {
+void testOutOfVocabularyTokensStayRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
   engine::Cache resources(pool);
@@ -1052,12 +1053,17 @@ void testInvalidPromptTokensStayRequestScoped() {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
+  std::vector<protocol::RequestFrame> invalid;
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
-    auto invalid = request(9);
-    invalid.promptTokens.back() = token;
-    const auto wire = protocol::serializeMessage(protocol::Message{invalid});
+    invalid.push_back(request(9));
+    invalid.back().promptTokens.back() = token;
+  }
+  invalid.push_back(scoreRequest(9, 65));
+  invalid.back().scoreTokens.back() = 128;
+  for (const protocol::RequestFrame &frame : invalid) {
+    const auto wire = protocol::serializeMessage(protocol::Message{frame});
     require(wire && loop.receive(*wire.value),
-            "invalid prompt token closed the native connection");
+            "out-of-vocabulary token closed the native connection");
   }
   auto valid = request(1);
   valid.promptTokens.back() = 127;
@@ -1070,12 +1076,12 @@ void testInvalidPromptTokensStayRequestScoped() {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       require(error->requestId == 9 && error->code == "invalid_request" &&
                   error->failureClass == protocol::FailureClass::RequestError,
-              "invalid prompt token did not produce its own request error");
+              "out-of-vocabulary token did not produce its own request error");
       ++errors;
     }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
-  require(errors == 2 && done == 1 && loop.engineHealthy() &&
+  require(errors == invalid.size() && done == 1 && loop.engineHealthy() &&
               loop.snapshot().submitted == 1,
           "invalid tokens reached admission or prevented subsequent completion");
 }
@@ -1116,49 +1122,56 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
           "Ready announced vision for an engine serving without it");
 }
 
-// Without vision an image request fails by itself and the engine keeps
-// serving.
-void testImageRequestWithoutVisionStaysRequestScoped() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  engine::NativeLoopConfig config;
-  config.engine.maxContext = 1024;
-  config.engine.maxImagePatches = 0;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  loop.announceReady();
-  auto image = request(9);
-  image.imageSpans = {{8, 16, 8, 8, 1, 2}};
-  image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
-  for (const protocol::RequestFrame &frame : {image, request(1)}) {
-    const auto wire = protocol::serializeMessage(protocol::Message{frame});
-    require(wire && loop.receive(*wire.value),
-            "image request closed the native connection");
-  }
-  runUntilIdle(loop);
-  uint32_t errors = 0, done = 0;
-  for (const auto &message : decodeMessages(output)) {
-    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
-      require(error->requestId == 9 && error->code == "invalid_request" &&
-                  error->failureClass == protocol::FailureClass::RequestError &&
-                  error->message == "this model is serving without vision",
-              "image request did not produce its own vision error");
-      ++errors;
+// Without vision, or past the server's per-image patch cap, an image request
+// fails by itself and the engine keeps serving.
+void testImageRequestBeyondVisionStaysRequestScoped() {
+  // The image below has 64 patches.
+  const std::pair<uint32_t, std::string_view> cases[] = {
+      {0, "this model is serving without vision"},
+      {32, "image has more patches than the server's pixel cap allows"}};
+  for (const auto &[maxImagePatches, expected] : cases) {
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
+    engine::Cache resources(pool);
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    config.engine.maxImagePatches = maxImagePatches;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    loop.announceReady();
+    auto image = request(9);
+    image.imageSpans = {{8, 16, 8, 8, 1, 2}};
+    image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+    for (const protocol::RequestFrame &frame : {image, request(1)}) {
+      const auto wire = protocol::serializeMessage(protocol::Message{frame});
+      require(wire && loop.receive(*wire.value),
+              "image request closed the native connection");
     }
-    done += std::holds_alternative<protocol::DoneEvent>(message);
+    runUntilIdle(loop);
+    uint32_t errors = 0, done = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 9 && error->code == "invalid_request" &&
+                    error->failureClass ==
+                        protocol::FailureClass::RequestError &&
+                    error->message == expected,
+                "image request did not produce its own vision error");
+        ++errors;
+      }
+      done += std::holds_alternative<protocol::DoneEvent>(message);
+    }
+    require(errors == 1 && done == 1 && loop.engineHealthy() &&
+                loop.snapshot().submitted == 1,
+            "image request reached admission or stopped the engine");
   }
-  require(errors == 1 && done == 1 && loop.engineHealthy() &&
-              loop.snapshot().submitted == 1,
-          "image request reached admission or stopped the engine");
 }
 
 void testStepTokensFitTheWire() {
@@ -1214,15 +1227,6 @@ void testStepTokensFitTheWire() {
               "an unencodable event left the engine failure unnamed");
     }
   }
-}
-
-protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
-  protocol::RequestFrame result = request(id, 0);
-  result.promptTokens.resize(promptTokens);
-  for (uint32_t i = 0; i < result.promptTokens.size(); ++i)
-    result.promptTokens[i] = i + 1;
-  result.scoreTokens = {10, 20, 30};
-  return result;
 }
 
 void testScoreRequestCompletesAfterFullPrompt() {
@@ -1659,9 +1663,9 @@ int main() {
     testAdmissionExceptionStopsTheEngineOnce();
     testFrameFailureUsesExecutionBoundary();
     testEngineFailureNamesItsReason();
-    testInvalidPromptTokensStayRequestScoped();
+    testOutOfVocabularyTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
-    testImageRequestWithoutVisionStaysRequestScoped();
+    testImageRequestBeyondVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();

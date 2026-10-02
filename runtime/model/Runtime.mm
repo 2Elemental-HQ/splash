@@ -376,8 +376,7 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{
-               ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
@@ -647,8 +646,7 @@ struct Runtime::Impl {
       if (!rows.encoded && !rows.encoding) {
         if (!vision)
           throw std::logic_error("image request has no vision encoder");
-        vision->encode(graph, {image.span.gridHeight, image.span.gridWidth},
-                       rows.pixels, rows.embeddings);
+        vision->encode(graph, image.span.grid(), rows.pixels, rows.embeddings);
         rows.encoding = true;
         ++counters.imageEncodes;
       }
@@ -1959,48 +1957,8 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
-  const BatchCohort expected =
-      entry.constraint == ConstraintMode::TokenMask
-          ? BatchCohort::Constrained
-          : (Impl::samplingEnabled(entry) ? BatchCohort::Sampling
-                                          : BatchCohort::Greedy);
-  if (entry.cohort != expected || !std::isfinite(entry.sampling.temperature) ||
-      entry.sampling.temperature < 0.0F ||
-      !std::isfinite(entry.sampling.topP) || entry.sampling.topP <= 0.0F ||
-      entry.sampling.topP > 1.0F || !(entry.sampling.minP >= 0.0F) ||
-      entry.sampling.minP > 1.0F) {
-    throw std::invalid_argument("request sampling/cohort contract is invalid");
-  }
-  // The penalties' ranges, as the API takes them.
-  if (!(std::fabs(entry.sampling.presencePenalty) <= 2.0F) ||
-      !(std::fabs(entry.sampling.frequencyPenalty) <= 2.0F) ||
-      !std::isfinite(entry.sampling.repetitionPenalty) ||
-      entry.sampling.repetitionPenalty <= 0.0F) {
-    throw std::invalid_argument("request sampling penalties are invalid");
-  }
-  if (!request.scoreTokens.empty()) {
-    if (request.maxNewTokens != 0 ||
-        request.constraint != ConstraintMode::None ||
-        request.cohort != BatchCohort::Greedy || request.sampling.penalized() ||
-        !request.images.empty() ||
-        !request.imagePixels.empty() ||
-        request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
-        request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
-      throw std::invalid_argument("invalid score request");
-    }
-    std::vector<uint32_t> distinct(request.scoreTokens.begin(),
-                                   request.scoreTokens.end());
-    std::sort(distinct.begin(), distinct.end());
-    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
-            distinct.end() ||
-        std::any_of(distinct.begin(), distinct.end(), [&](uint32_t token) {
-          return token >= impl_->geometry.target.vocabularySize;
-        })) {
-      throw std::invalid_argument("score token is out of vocabulary");
-    }
-    entry.scoreTokens.assign(request.scoreTokens.begin(),
-                             request.scoreTokens.end());
-  }
+  entry.scoreTokens.assign(request.scoreTokens.begin(),
+                           request.scoreTokens.end());
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;

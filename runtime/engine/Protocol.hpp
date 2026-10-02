@@ -2,7 +2,6 @@
 
 #include "engine/Types.hpp"
 #include "model/Model.hpp"
-#include "ops/Vision.hpp"
 
 #include <array>
 #include <cstddef>
@@ -111,9 +110,6 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
-  // Patches per image the wire accepts; the engine admits only what the
-  // server's pixel cap allows (EngineConfig::maxImagePatches).
-  uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>
@@ -123,46 +119,6 @@ enum class Cohort : uint8_t {
   Greedy = 0,
   Sampling = 1,
   Constrained = 2,
-};
-
-// The defaults are greedy selection with nothing changing the logits, which
-// score requests require.
-struct SamplingParameters {
-  float temperature = 0.0f;
-  float topP = 1.0f;
-  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
-  // a topK past the vocabulary.
-  uint32_t topK = 0;
-  // The penalties: presence and frequency in [-2, 2] lower the logits of
-  // output tokens; a positive repetition scales those of prompt and output
-  // tokens.
-  float presencePenalty = 0.0f;
-  float frequencyPenalty = 0.0f;
-  float repetitionPenalty = 1.0f;
-  // Sampling drops the tokens less likely than minP, in [0, 1], times the
-  // most likely one, before top-k and top-p; 0 drops none.
-  float minP = 0.0f;
-
-  bool operator==(const SamplingParameters &) const = default;
-};
-
-// One image in the prompt: the run of placeholder tokens it occupies (one per
-// merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the frontend's resized pixels, and a 128-bit digest of that content.
-// Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens.
-struct ImageSpanFrame {
-  uint32_t offset = 0;
-  uint32_t tokens = 0;
-  uint32_t gridHeight = 0;
-  uint32_t gridWidth = 0;
-  uint64_t digestLo = 0;
-  uint64_t digestHi = 0;
-
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
-  }
-  bool operator==(const ImageSpanFrame &) const = default;
 };
 
 // A request payload starts with these fields, at these byte offsets:
@@ -175,9 +131,8 @@ struct ImageSpanFrame {
 //   27 u32 logicalMaxOutputTokens
 //   31 u32 prompt token count
 //   35 u32 image span count
-//   39 f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
-//      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP
-//   67 u64 seed
+//   39 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
+//      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP, u64 seed
 //   75 u8  returnProgress
 //   76 u32 score token count
 //   80 u32 generationPromptTokens
@@ -201,10 +156,11 @@ struct RequestFrame {
   // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
   // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
   // Both are empty for text-only requests.
-  std::vector<ImageSpanFrame> imageSpans;
+  std::vector<ImageSpan> imageSpans;
   std::vector<uint8_t> imagePixels;
+  // The defaults are greedy selection with nothing changing the logits,
+  // which score requests require (seed aside).
   SamplingParameters sampling;
-  uint64_t seed = 0;
   Cohort cohort = Cohort::Greedy;
   ConstraintMode constraint = ConstraintMode::None;
   bool returnProgress = false;

@@ -129,6 +129,9 @@ public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
          EngineEventSink &events);
 
+  // The request passed protocol::validateRequest; submit checks only what
+  // the engine knows: vocabulary, context window, and vision with the
+  // server's per-image patch cap.
   void submit(EngineRequest request);
   void observePrefill(uint32_t rows, double wallMilliseconds) {
     scheduler_.observePrefill(rows, wallMilliseconds);

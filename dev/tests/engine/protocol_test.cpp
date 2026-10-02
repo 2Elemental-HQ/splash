@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -19,7 +20,9 @@ namespace {
 
 using namespace splash::protocol;
 using splash::ConstraintMode;
+using splash::ImageSpan;
 using splash::RequestIgnoreEndOfSequence;
+using splash::SamplingParameters;
 using splash::engine::EngineFinishReason;
 using splash::engine::RequestPriority;
 
@@ -153,7 +156,7 @@ RequestFrame exampleRequest() {
   request.logicalMaxOutputTokens = 32'768;
   request.promptTokens = {0, 1, 42, 0x80000000U, 0xffffffffU};
   request.sampling = {0.8f, 0.95f, 32};
-  request.seed = 0xfedcba9876543210ULL;
+  request.sampling.seed = 0xfedcba9876543210ULL;
   request.cohort = Cohort::Constrained;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
@@ -181,7 +184,7 @@ RequestFrame exampleScoreRequest() {
   request.logicalMaxOutputTokens = 0;
   request.promptTokens = {1, 2, 3, 4};
   request.sampling = {0.0f, 1.0f, 0};
-  request.seed = 7;
+  request.sampling.seed = 7;
   request.cohort = Cohort::Greedy;
   request.constraint = ConstraintMode::None;
   request.scoreTokens = {32, 65, 97};
@@ -326,6 +329,18 @@ void testScoreRequestAndDoneLogits() {
   sampling.sampling = {0.8f, 0.95f, 32};
   sampling.cohort = Cohort::Sampling;
   expectRequestIssue(sampling, IssueCode::InvalidSampling);
+
+  // A score request reads raw logits: it may carry any seed, and no other
+  // sampling option.
+  RequestFrame seeded = request;
+  seeded.sampling.seed = 99;
+  CHECK(test, roundTrip(seeded) == seeded);
+  RequestFrame topK = request;
+  topK.sampling.topK = 5;
+  expectRequestIssue(topK, IssueCode::InvalidSampling);
+  RequestFrame topP = request;
+  topP.sampling.topP = 0.9f;
+  expectRequestIssue(topP, IssueCode::InvalidSampling);
 
   DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
                    {1.5f, -2.0f, 0.25f}};
@@ -800,18 +815,38 @@ void testPromptAndImageSpanRejections() {
     result.imagePixels.resize(result.imageSpans[0].pixelBytes());
     return result;
   };
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.gridHeight = 3; }),
+  expectIssue(withSpan([](ImageSpan &span) { span.gridHeight = 3; }),
               IssueCode::InvalidCount);
-  expectIssue(withSpan([](ImageSpanFrame &span) {
+  expectIssue(withSpan([](ImageSpan &span) {
                 span.gridHeight = span.gridWidth = span.tokens = 0;
               }),
               IssueCode::InvalidCount);
-  ProtocolLimits onePatch;
-  onePatch.maxImagePatches = 1;
-  expectIssue(image, IssueCode::InvalidCount, onePatch);
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.tokens = 2; }),
+  // A grid at the patch limit, and the smallest even-sided one past it, in
+  // prompts that hold their tokens.
+  auto withGrid = [&](uint32_t gridWidth) {
+    RequestFrame result = withSpan([&](ImageSpan &span) {
+      span.gridHeight = 2;
+      span.gridWidth = gridWidth;
+      span.tokens = gridWidth / 2;
+    });
+    result.promptTokens.resize(1 + result.imageSpans[0].tokens, 7);
+    return result;
+  };
+  CHECK(test, encodeMessage(
+                  Message{withGrid(splash::ops::kMaximumImagePatches / 2)}));
+  expectIssue(withGrid(splash::ops::kMaximumImagePatches / 2 + 2),
               IssueCode::InvalidCount);
-  expectIssue(withSpan([](ImageSpanFrame &span) { span.offset = 3; }),
+  // A grid whose patch count would wrap to zero in 32 bits, as its pixel
+  // bytes do in 64, with no tokens or pixels.
+  const RequestFrame wrapped = withSpan([](ImageSpan &span) {
+    span.gridHeight = span.gridWidth = 1U << 28;
+    span.tokens = 0;
+  });
+  CHECK(test, wrapped.imagePixels.empty());
+  expectIssue(wrapped, IssueCode::InvalidCount);
+  expectIssue(withSpan([](ImageSpan &span) { span.tokens = 2; }),
+              IssueCode::InvalidCount);
+  expectIssue(withSpan([](ImageSpan &span) { span.offset = 3; }),
               IssueCode::InvalidCount);
   RequestFrame overlapping = image;
   overlapping.imageSpans.push_back(image.imageSpans[0]);
@@ -848,7 +883,14 @@ void testPromptAndImageSpanRejections() {
   auto tokensWire = *imageWire.value;
   storeU32(tokensWire, spanOffset + 4, 2);
   expectDecodeIssue(tokensWire, IssueCode::InvalidCount);
-  expectDecodeIssue(*imageWire.value, IssueCode::InvalidCount, onePatch);
+  auto wrappedWire = *imageWire.value;
+  storeU64(wrappedWire, 12,
+           loadU64(wrappedWire, 12) - image.imagePixels.size());
+  wrappedWire.resize(wrappedWire.size() - image.imagePixels.size());
+  storeU32(wrappedWire, spanOffset + 4, 0);
+  storeU32(wrappedWire, spanOffset + 8, 1U << 28);
+  storeU32(wrappedWire, spanOffset + 12, 1U << 28);
+  expectDecodeIssue(wrappedWire, IssueCode::InvalidCount);
   auto outsideWire = *imageWire.value;
   storeU32(outsideWire, spanOffset, 3);
   expectDecodeIssue(outsideWire, IssueCode::InvalidCount);
@@ -856,8 +898,9 @@ void testPromptAndImageSpanRejections() {
 
 // The sampling parameters are one block after the image span count:
 // temperature, top_p, top_k, the presence, frequency and repetition
-// penalties, and min_p. Each codec takes any top_k and refuses a penalty or
-// a min_p outside its range, and a score request anything but the defaults.
+// penalties, min_p and the seed. Each codec takes any top_k and refuses a
+// subnormal temperature, a penalty or a min_p outside its range, and a score
+// request anything but the defaults.
 void testSamplingBlock() {
   constexpr std::string_view test = "sampling block";
   RequestFrame request = exampleRequest();
@@ -876,7 +919,7 @@ void testSamplingBlock() {
                            : bits == std::bit_cast<uint32_t>(expected[field]));
   }
   CHECK(test, loadU64(wire, kFrameHeaderBytes + request_offset::seed) ==
-                  request.seed);
+                  request.sampling.seed);
   CHECK(test, roundTrip(request) == request);
 
   auto expectInvalid = [&](const RequestFrame &invalid) {
@@ -885,14 +928,15 @@ void testSamplingBlock() {
     if (encoded.issue)
       CHECK(test, encoded.issue->code == IssueCode::InvalidSampling);
     auto mutated = wire;
-    const float values[] = {invalid.sampling.presencePenalty,
-                            invalid.sampling.frequencyPenalty,
-                            invalid.sampling.repetitionPenalty,
-                            invalid.sampling.minP};
-    for (size_t field = 0; field < 4; ++field)
-      storeU32(mutated,
-               kFrameHeaderBytes + request_offset::presencePenalty + 4 * field,
-               std::bit_cast<uint32_t>(values[field]));
+    const std::pair<size_t, float> fields[] = {
+        {request_offset::temperature, invalid.sampling.temperature},
+        {request_offset::presencePenalty, invalid.sampling.presencePenalty},
+        {request_offset::frequencyPenalty, invalid.sampling.frequencyPenalty},
+        {request_offset::repetitionPenalty, invalid.sampling.repetitionPenalty},
+        {request_offset::minP, invalid.sampling.minP}};
+    for (const auto &[offset, value] : fields)
+      storeU32(mutated, kFrameHeaderBytes + offset,
+               std::bit_cast<uint32_t>(value));
     auto decoded = decodeFrame(decodeSingleFrame(mutated));
     CHECK(test, !decoded);
     if (decoded.issue) {
@@ -902,6 +946,21 @@ void testSamplingBlock() {
   };
   constexpr float nan = std::numeric_limits<float>::quiet_NaN();
   constexpr float inf = std::numeric_limits<float>::infinity();
+  constexpr float normalMinimum = std::numeric_limits<float>::min();
+  // The kernels divide by a sampling temperature, and Metal flushes a
+  // subnormal one to zero.
+  for (const float temperature :
+       {std::numeric_limits<float>::denorm_min(), 1e-40f,
+        std::nextafter(normalMinimum, 0.0f), -1.0f, nan, inf}) {
+    RequestFrame invalid = request;
+    invalid.sampling.temperature = temperature;
+    expectInvalid(invalid);
+  }
+  for (const float temperature : {normalMinimum, 0.0f, -0.0f}) {
+    RequestFrame valid = request;
+    valid.sampling.temperature = temperature;
+    CHECK(test, roundTrip(valid) == valid);
+  }
   for (const float penalty : {-2.01f, 2.01f, nan, -inf}) {
     RequestFrame presence = request;
     presence.sampling.presencePenalty = penalty;

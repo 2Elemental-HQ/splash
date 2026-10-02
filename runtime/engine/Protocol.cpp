@@ -368,32 +368,10 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "image span count exceeds its limit");
   }
-  uint64_t previousSpanEnd = 0;
-  uint64_t pixelBytes = 0;
-  for (const ImageSpanFrame &span : request.imageSpans) {
-    const uint64_t patches = uint64_t{span.gridHeight} * span.gridWidth;
-    if (span.gridHeight < 2 || span.gridWidth < 2 || span.gridHeight % 2 ||
-        span.gridWidth % 2 || patches > limits.maxImagePatches) {
-      return invalid(IssueCode::InvalidCount,
-                     "image grid must be even-sided and within the patch "
-                     "limit");
-    }
-    if (span.tokens != (span.gridHeight / 2) * (span.gridWidth / 2)) {
-      return invalid(IssueCode::InvalidCount,
-                     "image span tokens must equal the merged grid size");
-    }
-    const uint64_t end = uint64_t{span.offset} + span.tokens;
-    if (span.offset < previousSpanEnd || end > request.promptTokens.size()) {
-      return invalid(IssueCode::InvalidCount,
-                     "image spans must be sorted, non-overlapping runs inside "
-                     "the prompt");
-    }
-    previousSpanEnd = end;
-    pixelBytes += span.pixelBytes();
-  }
-  if (request.imagePixels.size() != pixelBytes) {
-    return invalid(IssueCode::InvalidCount,
-                   "image pixels do not match the image grids");
+  if (auto error = imageSpansValidationError(request.imageSpans,
+                                             request.promptTokens.size(),
+                                             request.imagePixels.size())) {
+    return invalid(IssueCode::InvalidCount, std::string(*error));
   }
   if (request.generationPromptTokens >= request.promptTokens.size()) {
     return invalid(IssueCode::InvalidCount,
@@ -418,22 +396,8 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                      "score option token ids must be distinct");
     }
   }
-  const SamplingParameters &sampling = request.sampling;
-  if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
-      !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
-      sampling.topP > 1.0f || !(sampling.minP >= 0.0f) ||
-      sampling.minP > 1.0f) {
-    return invalid(IssueCode::InvalidSampling,
-                   "sampling requires temperature>=0, top_p in (0,1] and "
-                   "min_p in [0,1]");
-  }
-  if (!(std::fabs(sampling.presencePenalty) <= 2.0f) ||
-      !(std::fabs(sampling.frequencyPenalty) <= 2.0f) ||
-      !std::isfinite(sampling.repetitionPenalty) ||
-      sampling.repetitionPenalty <= 0.0f) {
-    return invalid(IssueCode::InvalidSampling,
-                   "sampling requires presence and frequency penalties in "
-                   "[-2,2] and a positive repetition penalty");
+  if (auto error = request.sampling.validationError()) {
+    return invalid(IssueCode::InvalidSampling, std::string(*error));
   }
   Cohort expected = Cohort::Constrained;
   if (request.constraint == ConstraintMode::None) {
@@ -449,7 +413,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
       return invalid(IssueCode::InvalidCohortConstraint,
                      "score requests cannot carry a constraint");
     }
-    if (sampling != SamplingParameters{}) {
+    if (!request.sampling.isNeutral()) {
       return invalid(IssueCode::InvalidSampling,
                      "score requests require greedy default sampling");
     }
@@ -676,14 +640,14 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.f32(request.sampling.frequencyPenalty);
   writer.f32(request.sampling.repetitionPenalty);
   writer.f32(request.sampling.minP);
-  writer.u64(request.seed);
+  writer.u64(request.sampling.seed);
   writer.u8(request.returnProgress);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   writer.u32(request.generationPromptTokens);
   writer.u32(request.flags);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
-  for (const ImageSpanFrame &span : request.imageSpans) {
+  for (const ImageSpan &span : request.imageSpans) {
     writer.u32(span.offset);
     writer.u32(span.tokens);
     writer.u32(span.gridHeight);
@@ -878,9 +842,9 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.presencePenalty) ||
       !reader.f32(request.sampling.frequencyPenalty) ||
       !reader.f32(request.sampling.repetitionPenalty) ||
-      !reader.f32(request.sampling.minP) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
-      !reader.u32(request.generationPromptTokens) ||
+      !reader.f32(request.sampling.minP) ||
+      !reader.u64(request.sampling.seed) || !reader.u8(returnProgress) ||
+      !reader.u32(scoreCount) || !reader.u32(request.generationPromptTokens) ||
       !reader.u32(request.flags)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
@@ -918,7 +882,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   }
   request.imageSpans.resize(imageSpanCount);
   uint64_t pixelBytes = 0;
-  for (ImageSpanFrame &span : request.imageSpans) {
+  for (ImageSpan &span : request.imageSpans) {
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
@@ -1269,8 +1233,7 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   }
   if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
       !limits.maxTokenBatch || !limits.maxSimulationTokens ||
-      !limits.maxMaskWords || !limits.maxImageSpans ||
-      !limits.maxImagePatches) {
+      !limits.maxMaskWords || !limits.maxImageSpans) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
                      "all configured token, mask, and image limits must be "
                      "non-zero");

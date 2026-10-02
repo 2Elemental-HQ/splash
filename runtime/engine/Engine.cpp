@@ -84,62 +84,32 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 }
 
 void Engine::submit(EngineRequest value) {
-  const bool scoring = !value.scoreTokens.empty();
-  if (!value.id || value.prompt.empty() ||
-      value.generationPromptTokens >= value.prompt.size() ||
-      (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
-      value.prompt.size() + value.maxNewTokens > config_.maxContext ||
-      !std::isfinite(value.deadlineMilliseconds) ||
-      value.deadlineMilliseconds <= 0.0) {
-    throw std::invalid_argument("invalid backend request");
+  const auto outOfVocabulary = [&](uint32_t token) {
+    return token >= config_.vocabularySize;
+  };
+  if (value.prompt.size() + value.maxNewTokens > config_.maxContext) {
+    throw std::invalid_argument("request exceeds the context window");
   }
-  if (std::any_of(value.prompt.begin(), value.prompt.end(), [&](uint32_t token) {
-        return token >= config_.vocabularySize;
-      })) {
+  if (std::any_of(value.prompt.begin(), value.prompt.end(), outOfVocabulary)) {
     throw std::invalid_argument("prompt token is out of vocabulary");
+  }
+  if (std::any_of(value.scoreTokens.begin(), value.scoreTokens.end(),
+                  outOfVocabulary)) {
+    throw std::invalid_argument("score token is out of vocabulary");
   }
   if (!value.images.empty() && !config_.maxImagePatches) {
     throw std::invalid_argument("this model is serving without vision");
   }
-  uint64_t previousImageEnd = 0;
-  uint64_t pixelBytes = 0;
-  for (const ImageSpan &image : value.images) {
-    const uint64_t patches = uint64_t{image.gridHeight} * image.gridWidth;
-    if (image.gridHeight < 2 || image.gridWidth < 2 || image.gridHeight % 2 ||
-        image.gridWidth % 2 || patches > config_.maxImagePatches ||
-        image.tokens != (image.gridHeight / 2) * (image.gridWidth / 2) ||
-        image.offset < previousImageEnd ||
-        uint64_t{image.offset} + image.tokens > value.prompt.size()) {
-      throw std::invalid_argument("invalid backend request image span");
-    }
-    previousImageEnd = image.end();
-    pixelBytes += image.pixelBytes();
-  }
-  if (value.imagePixels.size() != pixelBytes) {
-    throw std::invalid_argument("invalid backend request image pixels");
+  // The protocol bounds an image by the most patches the vision encoder
+  // takes; the server's pixel cap may allow fewer.
+  if (std::any_of(value.images.begin(), value.images.end(),
+                  [&](const ImageSpan &image) {
+                    return image.grid().patches() > config_.maxImagePatches;
+                  })) {
+    throw std::invalid_argument(
+        "image has more patches than the server's pixel cap allows");
   }
   const uint64_t id = value.id;
-  if (scoring) {
-    if (value.cohort != BatchCohort::Greedy ||
-        value.constraint != ConstraintMode::None || !value.images.empty() ||
-        value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
-        value.sampling.topK != 0 || value.sampling.penalized() ||
-        value.sampling.minP != 0.0f ||
-        value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
-        value.scoreTokens.size() > model::ExecutionLimits::maximumScoreOptions) {
-      throw std::invalid_argument("invalid score request");
-    }
-    std::vector<uint32_t> distinct(value.scoreTokens.begin(),
-                                   value.scoreTokens.end());
-    std::sort(distinct.begin(), distinct.end());
-    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
-            distinct.end() ||
-        std::any_of(distinct.begin(), distinct.end(), [&](uint32_t token) {
-          return token >= config_.vocabularySize;
-        })) {
-      throw std::invalid_argument("score token is out of vocabulary");
-    }
-  }
   // A request the protocol saw end may still be here, finalized, until the
   // next sweepTerminal; its id is free again.
   if (const auto found = requests_.find(id); found != requests_.end()) {

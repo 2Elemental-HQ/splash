@@ -875,8 +875,8 @@ void extremes(MetalBackend &backend) {
   }
 }
 
-// A penalized lane needs a table row inside the table, and penalties must
-// be finite with a positive repetition. A refused request encodes nothing.
+// A penalized lane needs a table row inside the table. A refused request
+// encodes nothing.
 void invalidPenalties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   Sampling sampling(vocabulary);
@@ -884,7 +884,6 @@ void invalidPenalties(MetalBackend &backend) {
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const SamplingPolicy penalized{1, 0.0F, 1.0F, false, false,
                                  {1.0F, 1.0F, 0.0F}};
-  const std::array<uint32_t, 1> inside{3};
   const std::array<uint32_t, 1> outside{kLanes};
   CommandGraph graph;
   rejects([&] {
@@ -898,19 +897,6 @@ void invalidPenalties(MetalBackend &backend) {
     sampling.addInitial(graph, penalized, batch.buffers, 0, 1, 2,
                         {table, outside});
   }, "an initial table row outside the table");
-  for (const SamplingPenalties invalid :
-       {SamplingPenalties{0.0F, 0.0F, 0.0F},
-        SamplingPenalties{-1.0F, 0.0F, 0.0F},
-        SamplingPenalties{INFINITY, 0.0F, 0.0F},
-        SamplingPenalties{1.0F, NAN, 0.0F},
-        SamplingPenalties{1.0F, 0.0F, INFINITY}}) {
-    SamplingPolicy policy = penalized;
-    policy.penalties = invalid;
-    rejects([&] {
-      sampling.addInitial(graph, policy, batch.buffers, 0, 1, 2,
-                          {table, inside});
-    }, "invalid penalties");
-  }
   require(graph.empty(), "a refused penalty request encoded a dispatch");
   // Unpenalized lanes need no table row.
   const SamplingPolicy greedy{1, 0.0F, 1.0F, false};

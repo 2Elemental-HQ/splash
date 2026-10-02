@@ -224,24 +224,11 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.cohort = mapCohort(request.cohort);
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
-    engineRequest.images.reserve(request.imageSpans.size());
-    for (const protocol::ImageSpanFrame &span : request.imageSpans) {
-      engineRequest.images.push_back({span.offset, span.tokens, span.gridHeight,
-                                      span.gridWidth, span.digestLo,
-                                      span.digestHi});
-    }
+    engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.scoreTokens = std::move(request.scoreTokens);
-    engineRequest.sampling = {
-        .temperature = request.sampling.temperature,
-        .topP = request.sampling.topP,
-        .topK = request.sampling.topK,
-        .seed = request.seed,
-        .presencePenalty = request.sampling.presencePenalty,
-        .frequencyPenalty = request.sampling.frequencyPenalty,
-        .repetitionPenalty = request.sampling.repetitionPenalty,
-        .minP = request.sampling.minP};
+    engineRequest.sampling = request.sampling;
     engineRequest.constraint = request.constraint;
     engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;

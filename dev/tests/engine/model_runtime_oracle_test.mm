@@ -1681,15 +1681,6 @@ int main(int argc, char **argv) {
       const uint32_t otherB = greedy == 7 ? 8u : 7u;
       EngineRequest scored = makeRequest(99, prompt128, 0);
       scored.scoreTokens = {greedy, otherA, otherB};
-      scored.imagePixels = {0};
-      bool pixelsRejected = false;
-      try {
-        beginCold(executor, scored, 0);
-      } catch (const std::invalid_argument &) {
-        pixelsRejected = true;
-      }
-      require(pixelsRejected, "score request accepted image pixels without spans");
-      scored.imagePixels.clear();
       beginCold(executor, scored, 0);
       ModelStepResult scoredResult =
           prefillChunk(executor, 99, 0, prompt128, pageTable);
@@ -1790,7 +1781,8 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> policyPages = pageRange(10, 5);
     EngineRequest partitionedSampling =
         makeRequest(54, promptAligned, 1, BatchCohort::Sampling);
-    partitionedSampling.sampling = {4.0F, 1.0F, 32, 8128};
+    partitionedSampling.sampling = {
+        .temperature = 4.0F, .topP = 1.0F, .topK = 32, .seed = 8128};
     beginCold(executor, partitionedSampling, 0);
     prefillChunk(executor, 54, 0,
                  std::span<const uint32_t>(promptAligned).first(120),
@@ -1993,7 +1985,8 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> samplingPages = pageRange(26, 5);
     EngineRequest samplingSource =
         makeRequest(30, samplingPrefix, 1, BatchCohort::Sampling);
-    samplingSource.sampling = {4.0F, 1.0F, 32, 40106};
+    samplingSource.sampling = {
+        .temperature = 4.0F, .topP = 1.0F, .topK = 32, .seed = 40106};
     beginCold(executor, samplingSource, 0);
     prefillChunk(executor, 30, 0,
                  std::span<const uint32_t>(samplingPrefix).first(120),
@@ -2009,7 +2002,8 @@ int main(int argc, char **argv) {
 
     EngineRequest replayedSampling =
         makeRequest(31, samplingPrompt, 2, BatchCohort::Sampling);
-    replayedSampling.sampling = {4.0F, 1.0F, 32, 91199};
+    replayedSampling.sampling = {
+        .temperature = 4.0F, .topP = 1.0F, .topK = 32, .seed = 91199};
     beginCold(executor, replayedSampling, 0);
     restoreActivePrefix(executor, 31, samplingPrompt.size(), 128,
                         samplingPromptSnapshot);
@@ -2186,7 +2180,8 @@ int main(int argc, char **argv) {
     EngineRequest crossLane0 =
         makeRequest(42, prompt129, 3, BatchCohort::Constrained);
     crossLane0.constraint = ConstraintMode::TokenMask;
-    crossLane0.sampling = {4.0F, 1.0F, 32, 7001};
+    crossLane0.sampling = {
+        .temperature = 4.0F, .topP = 1.0F, .topK = 32, .seed = 7001};
     EngineRequest crossLane1 = crossLane0;
     crossLane1.id = 43;
     crossLane1.sampling.seed = 7002;
@@ -2449,7 +2444,10 @@ int main(int argc, char **argv) {
       auto value = makeRequest(
           id, raggedPrompts[lane], 16,
           sampled ? BatchCohort::Sampling : BatchCohort::Greedy);
-      value.sampling = {sampled ? 0.8F : 0.0F, 0.95F, 20, 731 + lane};
+      value.sampling = {.temperature = sampled ? 0.8F : 0.0F,
+                        .topP = 0.95F,
+                        .topK = 20,
+                        .seed = 731 + lane};
       return value;
     };
     BatchPlan raggedPrefillPlan;
@@ -2800,8 +2798,11 @@ int main(int argc, char **argv) {
       EngineRequest sequence = makeRequest(80, prompt129, 24, cohort);
       sequence.flags = flags;
       if (cohort == BatchCohort::Sampling) {
-        sequence.sampling = {0.8F, topP, topK, 91199};
-        sequence.sampling.minP = minP;
+        sequence.sampling = {.temperature = 0.8F,
+                             .topP = topP,
+                             .topK = topK,
+                             .minP = minP,
+                             .seed = 91199};
       }
       if (cohort == BatchCohort::Constrained)
         sequence.constraint = ConstraintMode::TokenMask;

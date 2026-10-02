@@ -6,12 +6,16 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash {
@@ -42,11 +46,15 @@ enum RequestFlag : uint32_t {
 
 inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 
+// A request's token selection, its fields in the native request frame's
+// order. The defaults are greedy selection with nothing changing the logits.
 struct SamplingParameters final {
+  // Zero selects greedily; sampling divides the logits by it.
   float temperature = 0.0F;
   float topP = 1.0F;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
-  uint64_t seed = 0;
   // The sampling penalties, applied before greedy and sampled selection alike:
   // repetition scales the logits of prompt and output tokens, presence and
   // frequency lower those of output tokens. The defaults change nothing.
@@ -56,10 +64,38 @@ struct SamplingParameters final {
   // Sampling drops the tokens less likely than minP times the most likely
   // one, before top-k and top-p; 0 drops none.
   float minP = 0.0F;
+  uint64_t seed = 0;
 
-  [[nodiscard]] bool penalized() const noexcept {
-    return presencePenalty != 0.0F || frequencyPenalty != 0.0F ||
-           repetitionPenalty != 1.0F;
+  bool operator==(const SamplingParameters &) const = default;
+
+  // The first rule the parameters break, or none. A sampling temperature is
+  // at least FLT_MIN: the kernels divide by it, and Metal flushes a subnormal
+  // one to zero.
+  [[nodiscard]] std::optional<std::string_view>
+  validationError() const noexcept {
+    const bool temperatureValid =
+        temperature == 0.0F ||
+        (std::isfinite(temperature) &&
+         temperature >= std::numeric_limits<float>::min());
+    if (!temperatureValid || !(topP > 0.0F && topP <= 1.0F) ||
+        !(minP >= 0.0F) || minP > 1.0F) {
+      return "sampling requires temperature 0 or at least FLT_MIN, top_p in "
+             "(0,1] and min_p in [0,1]";
+    }
+    if (!(std::fabs(presencePenalty) <= 2.0F) ||
+        !(std::fabs(frequencyPenalty) <= 2.0F) ||
+        !std::isfinite(repetitionPenalty) || repetitionPenalty <= 0.0F) {
+      return "sampling requires presence and frequency penalties in [-2,2] "
+             "and a positive repetition penalty";
+    }
+    return std::nullopt;
+  }
+
+  // Greedy selection with nothing changing the logits, whatever the seed.
+  [[nodiscard]] bool isNeutral() const noexcept {
+    SamplingParameters neutral;
+    neutral.seed = seed;
+    return *this == neutral;
   }
 };
 
@@ -86,6 +122,11 @@ struct ModelRequest final {
   uint32_t restoredTokens = 0;
 };
 
+// One image in the prompt: the run of placeholder tokens it occupies (one per
+// merged 2x2 patch group, row-major over the merged grid), the patch grid of
+// the frontend's resized pixels, and a 128-bit digest of that content.
+// Placeholder token ids are identical for every image, so cache identity keys
+// on the digest as well as the tokens.
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -95,11 +136,42 @@ struct ImageSpan final {
   uint64_t digestHi = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
+  [[nodiscard]] ops::ImageGrid grid() const noexcept {
+    return {gridHeight, gridWidth};
+  }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
+    return grid().pixelBytes();
   }
   bool operator==(const ImageSpan &) const = default;
 };
+
+// The first rule a request's image spans break, or none: each covers a valid
+// grid within the patch limit with one token per merged patch group, the
+// runs are sorted, disjoint and inside the prompt, and the pixels are the
+// grids' own.
+[[nodiscard]] inline std::optional<std::string_view>
+imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
+                          uint64_t pixelBytes) noexcept {
+  uint64_t previousEnd = 0;
+  uint64_t gridPixelBytes = 0;
+  for (const ImageSpan &span : spans) {
+    const ops::ImageGrid grid = span.grid();
+    if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches)
+      return "image grid must be even-sided and within the patch limit";
+    if (span.tokens != grid.mergedTokens())
+      return "image span tokens must equal the merged grid size";
+    const uint64_t end = uint64_t{span.offset} + span.tokens;
+    if (span.offset < previousEnd || end > promptTokens) {
+      return "image spans must be sorted, non-overlapping runs inside the "
+             "prompt";
+    }
+    previousEnd = end;
+    gridPixelBytes += grid.pixelBytes();
+  }
+  if (pixelBytes != gridPixelBytes)
+    return "image pixels do not match the image grids";
+  return std::nullopt;
+}
 
 // Immutable target-recurrent plus draft-context state.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
