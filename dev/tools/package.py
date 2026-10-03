@@ -38,6 +38,7 @@ COMPLETION_FILES = (
     "models",
     "_splash",
     "splash.bash",
+    "splash.fish",
     "official-models.txt",
     "suggested-models.txt",
 )
@@ -145,6 +146,7 @@ class Splash < Formula
     chmod 0755, bin/"splash"
     zsh_completion.install_symlink libexec/"install/completions/_splash"
     bash_completion.install_symlink libexec/"install/completions/splash.bash" => "splash"
+    fish_completion.install_symlink libexec/"install/completions/splash.fish"
   end
 
   def caveats
