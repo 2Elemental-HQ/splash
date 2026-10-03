@@ -22,6 +22,7 @@
 using namespace splash;
 using engine::KvPageTier;
 using engine::KvTransfer;
+using model::DiskBudget;
 using model::SlotFile;
 
 namespace {
@@ -105,7 +106,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
           "test pages were not mapped");
   const uint64_t payload = pages.bytesPerPage();
   const uint64_t slotBytes = SlotFile::slotBytesFor(payload);
-  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));
   KvPageTier tier(pages, file);
   require(tier.slotBytes() == slotBytes, "tier reports another slot size");
 
@@ -165,7 +166,7 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
-  auto file = std::make_shared<SlotFile>(slotBytes, 8 * slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(8 * slotBytes));
   KvPageTier tier(pages, file, 4);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> written;
@@ -180,12 +181,15 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   restores.push_back(tier.restore(empty, 1, {}));
   restores.push_back(tier.restore(written[1], 2, {}));
   require(restores[0] && restores[1] && restores[2], "a restore within the share was refused");
-  require(!tier.restore(written[0], 3, {}), "restores took more than three quarters of the bound");
+  require(!tier.canRestore() && !tier.restore(written[0], 3, {}),
+          "restores took more than three quarters of the bound");
   auto target = tier.acquireSlot();
   auto demotion = tier.demote(9, target, {});
   require(demotion != nullptr, "a burst of restores left no room for a demotion");
   require(!tier.canDemote() && !tier.demote(9, tier.acquireSlot(), {}),
           "the tier took more transfers than its bound");
+  runUntilReady(tier, *restores[0]);
+  require(tier.canRestore(), "a retired restore did not give its room back");
   for (auto &restore : restores) runUntilReady(tier, *restore);
   runUntilReady(tier, *demotion);
   require(restores[0]->finish() && !restores[1]->finish() && restores[2]->finish(),
@@ -220,7 +224,8 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   for (bool restoring : {false, true}) {
     bool completed = false;
     for (int failure = 0; failure < 64; ++failure) {
-      auto file = std::make_shared<SlotFile>(bytes, bytes);
+      auto budget = std::make_shared<DiskBudget>(bytes);
+      auto file = std::make_shared<SlotFile>(bytes, budget);
       KvPageTier tier(pages, file, 1);
       auto slot = tier.acquireSlot();
       const auto payload = fill(pages, 0, 123);
@@ -232,7 +237,9 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
         allocationFailureAfter = -1;
       } catch (const std::bad_alloc &) {
         allocationFailureAfter = -1;
-        require(tier.canDemote() && file->idle(),
+        // No IO holds the slot.
+        slot.reset();
+        require(tier.canDemote() && budget->usedBytes() == 0,
                 "failed transfer submission took room or left untracked IO");
         continue;
       }
@@ -260,7 +267,7 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
-  auto file = std::make_shared<SlotFile>(slotBytes, 4 * slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(4 * slotBytes));
   KvPageTier tier(pages, file);
   auto first = tier.acquireSlot();
   auto stored = tier.demote(0, first, {});
@@ -300,7 +307,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
-  auto file = std::make_shared<SlotFile>(slotBytes, 2 * slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));
   KvPageTier tier(pages, file);
   constexpr uint32_t restored = 16, demoted = 25, neighbours = 8;
   const uint64_t data = layout.dataBytesPerLayerPage();
@@ -411,7 +418,8 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
-  auto file = std::make_shared<SlotFile>(slotBytes, 16 * slotBytes);
+  auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
+  auto file = std::make_shared<SlotFile>(slotBytes, budget);
   {
     KvPageTier tier(pages, file, 16);
     std::vector<std::unique_ptr<KvTransfer>> demotions;
@@ -422,7 +430,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
       require(demotions.back() != nullptr, "a demotion within the share was refused");
     }
   }
-  require(file->idle(), "the tier left its pages with disk IO still running");
+  require(budget->usedBytes() == 0, "the tier left its pages with disk IO still running");
   std::cout << "teardown tests passed\n";
 }
 

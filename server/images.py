@@ -19,7 +19,7 @@ MERGE = 2
 FACTOR = PATCH * MERGE
 # Qwen3-VL's shortest_edge floor; the serving cap below is far below the model's.
 MIN_PIXELS = 65_536
-# Serving default: the engine's vision scratch covers 16,384 patches.
+# Serving default and largest cap: 16,384 patches, the protocol's per-image ceiling.
 MAX_PIXELS = 4_194_304
 # Bound codec work before full-resolution decode, independently of the model's
 # resized input budget. Ordinary screenshots and up to 32 MP photos fit here.
@@ -66,6 +66,12 @@ def decode_data_url(url) -> bytes:
     if len(raw) > MAX_IMAGE_BYTES:
         raise ImageError("image exceeds the size limit")
     return raw
+
+
+def max_patches(max_pixels: int) -> int:
+    """The most patches an image resized within max_pixels can have: its
+    sides are whole merge units, so its patch count is a multiple of 4."""
+    return max_pixels // (PATCH * PATCH) // 4 * 4
 
 
 def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:

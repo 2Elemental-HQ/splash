@@ -672,7 +672,8 @@ def parse_args(argv=None):
     server.add_argument(
         "--max-image-pixels",
         type=_parse_max_image_pixels,
-        help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
+        help="maximum resized pixels per image, 65536–4194304 (default: 4194304); "
+        "bounds the vision scratch one image needs",
     )
     server.add_argument(
         "--request-timeout",

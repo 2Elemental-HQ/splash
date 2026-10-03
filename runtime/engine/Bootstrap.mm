@@ -285,7 +285,8 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       config.nativeLoop.engine.maxContext;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
-  // Images fit the vision scratch; a model without vision admits none.
+  // Images are admitted up to the server's pixel cap; a model without vision
+  // admits none.
   config.nativeLoop.engine.maxImagePatches =
       config.resources.model.hasVision() ? config.resources.maximumImagePatches
                                          : 0;
@@ -351,9 +352,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
-        while (modelPointer->reclaimIdleState(true)) {
+        while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {
         }
-        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, true));
+        static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
         return report;
       },
       *nativeLoop);

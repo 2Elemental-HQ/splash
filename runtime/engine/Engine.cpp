@@ -14,6 +14,9 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
 constexpr int kMaskWaitLimitMilliseconds = 5000;
+// A junction costs a snapshot, a command split and up to a draft window of
+// draft-context rows; a later request must save at least that much prefill.
+constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
 
 // While an active one lives, allocations are memory a request in service
 // needs (EngineConfig::serving).
@@ -533,7 +536,7 @@ bool Engine::admitQueued(double now) {
 
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
   // A later request may not share the generation prompt; generated history
-  // that a resumed lane replays is its own.
+  // that a resumed lane replays is its own: the state there is a checkpoint.
   if (active.replayTokens == active.promptTokens)
     return promptReplayBoundary(active);
   return (active.replayTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;
@@ -571,10 +574,18 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
 
 bool Engine::pendingSharedPrefill(const Request &active,
                                   uint32_t resumeBoundary) const {
+  // A request that ignores the cache uses no producer's state.
+  if (active.skipCache)
+    return false;
   for (const auto &[id, peer] : requests_) {
-    if (!peer.stateCell || peer.finalized || peer.pendingEnd ||
-        peer.request.priority > active.request.priority ||
-        scheduler_.phase(id) != Phase::Prefill)
+    if (!peer.stateCell || peer.request.priority > active.request.priority)
+      continue;
+    // A peer still restoring its prefix from disk has planned its boundaries
+    // at admission; siblings wait for it rather than each reading the same
+    // state. A failed restore discards those boundaries (pollRestores), which
+    // releases them. A restoring producer that was cancelled or expired
+    // publishes nothing; it only waits for its read to drain.
+    if ((scheduler_.phase(id) != Phase::Prefill && !peer.restore) || peer.pendingEnd)
       continue;
     const uint32_t shared = sharedPrefillBoundary(active, peer);
     for (size_t i = peer.stateBoundaryCursor; i < peer.stateBoundaries.size(); ++i) {
@@ -609,17 +620,26 @@ bool Engine::admit(Request &active, double now) {
   active.refusedMemory = false;
   // A request is in service when no other lane is resident
   // (anotherResident): it starts through the host's pause once reuse gives
-  // nothing.
+  // nothing, and reclaims up to what is in use. Beside a resident lane it
+  // takes nothing in use and waits for that lane.
   const bool inService = !anotherResident(active.request.id);
-  // A useful restore remains pinned throughout ordinary eviction. If that
-  // pin is the last obstacle to admitting even one lane, prefer cold
-  // recomputation over waiting forever for our own cache lease.
+  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
+  // The request's own lease goes only when nothing else can free memory
+  // (judge() says Fail: no other lane is resident, nothing is pending, the
+  // host is not refusing). It then starts without the pin rather than wait
+  // for ever, and looks up again once it holds its lane, so a state the
+  // reclaim wrote to disk is restored, not recomputed.
+  bool droppedLease = false;
   const auto state = allocate(
-      [&] { return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest); },
-      inService, [&] {
-        if (!lookup.state)
+      [&] {
+        modelRequest.restoredTokens = lookup.resumeBoundary();
+        return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
+      },
+      inService, upTo, [&](const Denial &denial) {
+        if (!lookup.state || judge(denial, active.request.id) != Verdict::Fail)
           return false;
         lookup = {};
+        droppedLease = true;
         return true;
       });
   if (!state.admission.granted()) {
@@ -639,6 +659,8 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(active.request.id);
   active.stateCell = *state.admission.cell;
   active.admission = ++admissions_;
+  if (droppedLease)
+    lookup = cache_.lookup(modelRequest.prompt, active.request.images);
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -647,14 +669,14 @@ bool Engine::admit(Request &active, double now) {
   // a resident request its pages wait for the host.
   Allocation<TokenAdmission> kv;
   if (lookup.state)
-    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService);
+    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService, upTo);
   const bool restoring =
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
   if (kv.admission.granted() && (resuming || restoring)) {
     const uint64_t workEnd =
         resuming ? active.resumeKvTargetTokens : uint64_t{resumeBoundary} + 1;
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService);
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd); }, inService, upTo);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -679,7 +701,7 @@ bool Engine::admit(Request &active, double now) {
   }
   active.resourceWait = {};
   DraftContextPlan draft = configureDraftStatePlan(
-      active, resumeBoundary, lookup.junctionBoundary());
+      active, resumeBoundary, lookup.junctionBoundary);
   std::unique_ptr<StateRestore> transfer;
   if (lookup.state) {
     transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
@@ -705,18 +727,19 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   active.latestCheckpoint = {};
   if (lookup.state) {
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
-    // A restored endpoint already has the ordinary replay state we need, in
-    // whichever tier holds it: a promotion that found no cache slot leaves
-    // it on disk. Other restored progress points retain their rolling
+    // A restored replay point of the prompt already has the ordinary state
+    // we need, in whichever tier holds it: a promotion that found no cache
+    // slot leaves it on disk. Other restored progress points, the end of a
+    // resumed lane's generated history among them, retain their rolling
     // lifetime.
-    if (active.latestCheckpoint &&
-        resumeBoundary == replayStateBoundary(active)) {
-      if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
-        ++counters_.deduplicatedStatePublications;
-      active.latestCheckpoint = {};
-    }
-    if (resumeBoundary == promptReplayBoundary(active))
+    if (resumeBoundary == promptReplayBoundary(active)) {
+      if (active.latestCheckpoint) {
+        if (cache_.reuseStoredState(active.latestCheckpoint.kvBlock))
+          ++counters_.deduplicatedStatePublications;
+        active.latestCheckpoint = {};
+      }
       active.replayPoint = cache_.useState(lookup.state->kvBlock());
+    }
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
@@ -857,70 +880,56 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     throw std::logic_error("request already has a composite-state plan");
   }
 
-  // The replay state is the last one planned: a lazy junction past it would
-  // lie inside the generation prompt, which a later request may not share.
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
-  const auto addCandidate = [&](uint32_t tokens,
-                                Request::StateBoundary::Purpose purpose) {
-    if (tokens <= stateBoundary || tokens > latestReplayBoundary)
-      return;
-    for (size_t index = 0; index < active.stateBoundaries.size(); ++index) {
-      if (active.stateBoundaries[index].tokens != tokens)
-        continue;
-      if (purpose > active.stateBoundaries[index].purpose)
-        active.stateBoundaries[index].purpose = purpose;
-      return;
-    }
-    active.stateBoundaries.push_back({tokens, purpose});
-  };
-
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
-  if (const uint32_t interval = config_.prefillCheckpointTokens) {
-    for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
-         boundary < latestReplayBoundary; boundary += interval) {
-      addCandidate(static_cast<uint32_t>(boundary),
-                   Request::StateBoundary::Purpose::Checkpoint);
-    }
+  for (const uint32_t checkpoint : plannedCheckpoints(
+           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+    addStateBoundary(active, stateBoundary, checkpoint, true);
   }
-  addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
-  addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
+  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+    addStateBoundary(active, stateBoundary, junctionBoundary, false);
+  addStateBoundary(active, stateBoundary, latestReplayBoundary,
+                   latestReplayBoundary != promptReplayBoundary(active));
   // A resumed lane below its prompt's replay point lost that state; it
   // rebuilds the one its conversation's next turn resumes from on the way.
-  addCandidate(promptReplayBoundary(active), Request::StateBoundary::Purpose::Replay);
-  std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
-            [](const Request::StateBoundary &left,
-               const Request::StateBoundary &right) {
-              return left.tokens < right.tokens;
-            });
+  addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false);
 
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
   return pendingDraftStatePlan(active, stateBoundary);
 }
 
-bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
-  if (active.suspended || active.replaying)
+bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
+                              bool disposable) {
+  // A state past the replay boundary would lie inside the generation prompt,
+  // which a later request may not share.
+  if (tokens <= after || tokens > replayStateBoundary(active))
     return false;
+  const auto found = std::lower_bound(
+      active.stateBoundaries.begin() + active.stateBoundaryCursor,
+      active.stateBoundaries.end(), tokens,
+      [](const Request::StateBoundary &point, uint32_t value) {
+        return point.tokens < value;
+      });
+  if (found != active.stateBoundaries.end() && found->tokens == tokens) {
+    found->disposable = found->disposable && disposable;
+    return false;
+  }
+  active.stateBoundaries.insert(found, {tokens, disposable});
+  return true;
+}
+
+bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
   bool changed = false;
-  const uint32_t replay = replayStateBoundary(active);
   for (const auto &[id, peer] : requests_) {
+    // A request finalized earlier in this admission pass is still listed
+    // until the pass ends. A request that ignores the cache uses no junction.
     if (id == active.request.id || peer.stateCell || peer.suspended ||
-        peer.finalized || peer.pendingEnd ||
+        peer.finalized || peer.skipCache ||
         peer.request.priority < active.request.priority)
       continue;
-    const uint32_t shared = sharedPrefillBoundary(active, peer);
-    if (shared <= after || shared >= replay)
-      continue;
-    auto found = std::lower_bound(
-        active.stateBoundaries.begin(), active.stateBoundaries.end(), shared,
-        [](const auto &point, uint32_t tokens) { return point.tokens < tokens; });
-    if (found == active.stateBoundaries.end() || found->tokens != shared) {
-      active.stateBoundaries.insert(
-          found, {shared, Request::StateBoundary::Purpose::Junction});
-      changed = true;
-    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
-      found->purpose = Request::StateBoundary::Purpose::Junction;
-    }
+    changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false) ||
+              changed;
   }
   return changed;
 }
@@ -978,55 +987,48 @@ void Engine::publishReachedStateBoundaries(Request &active,
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
-    const bool checkpoint =
-        objective.purpose == Request::StateBoundary::Purpose::Checkpoint;
-    const bool junction =
-        objective.purpose == Request::StateBoundary::Purpose::Junction;
+    const bool checkpoint = objective.disposable;
+    // The conversation's next turn resumes from the prompt's replay point. A
+    // rebuilt replay point counts as a replay-state publication, not a
+    // junction.
+    const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
     uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
-                         : junction ? counters_.junctionMaterializationFailures
-                                    : counters_.replayStatePublicationFailures;
+                         : replay   ? counters_.replayStatePublicationFailures
+                                    : counters_.junctionMaterializationFailures;
     uint64_t &publications = checkpoint ? counters_.checkpointPublications
-                             : junction ? counters_.junctionMaterializations
-                                        : counters_.replayStatePublications;
+                             : replay   ? counters_.replayStatePublications
+                                        : counters_.junctionMaterializations;
     // The scheduler ends a command exactly at an armed boundary
     // (Scheduler::planPrefill).
     if (objective.tokens != promptProcessed)
       throw std::logic_error("prefill crossed an armed state boundary");
     materialized = true;
     const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-    // The conversation's next turn resumes here, whatever this boundary's
-    // purpose: the state is in use before any of the ways below keeps it,
-    // so each of them makes room as work in use.
-    if (objective.tokens == promptReplayBoundary(active))
+    // The state is in use before any of the ways below keeps it, so each of
+    // them makes room as work in use.
+    if (replay)
       active.replayPoint = cache_.useState(block);
     if (cache_.reuseCompositeState(block, checkpoint)) {
       ++counters_.deduplicatedStatePublications;
     } else {
-      std::shared_ptr<const CompositeState> state;
-      // A checkpoint close to the final reusable state is only worth
-      // capturing if it fits now. Otherwise keep the previous recovery
-      // point instead of evicting it or writing a short-lived replacement.
-      if (checkpoint && model_.canSnapshotToDisk() &&
-          uint64_t{objective.tokens} + model::ExecutionLimits::prefillTokenBudget >
-              replayStateBoundary(active)) {
-        state = model_.snapshot(active.request.id);
-        if (!state)
-          continue;
-      }
-      // Recycle the previous recovery point before allocating its replacement.
-      // A restore lease can delay this optional publication. A checkpoint
-      // only on disk frees no cache slot for an ordinary state, so it stays
-      // the recovery point until that state is published.
+      // The previous recovery point retires here or after the publication.
+      // Here, before the snapshot, a resident one hands its buffers to its
+      // replacement; room made for the snapshot instead would recycle the
+      // oldest state, perhaps another lane's checkpoint. A restore lease
+      // can delay this optional publication. A checkpoint only on disk
+      // frees no cache slot for an ordinary state, so it stays the recovery
+      // point until that state is published; it retires after the
+      // publication, as does the one a reused state leaves.
       if ((checkpoint || cache_.stateResident(active.latestCheckpoint.kvBlock)) &&
           !retireCheckpoint(active) && checkpoint) {
         ++failures;
         continue;
       }
-      if (!state)
-        state = model_.snapshot(active.request.id);
+      std::shared_ptr<const CompositeState> state = model_.snapshot(active.request.id);
       // Room comes from what this publication's class may take: cached KV
-      // and states in use only for a block in use. A state in use is never
-      // dropped for a busy write slot; this publication gives way instead.
+      // unless it is an optional checkpoint, and states in use only for a
+      // block in use. A state in use is never dropped for a busy write
+      // slot; this publication gives way instead.
       // The command that reached this boundary is consumed and the next one
       // not yet submitted, so KV that empties an extent releases it now. A
       // recycled state hands over its buffers; an extent may hold less
@@ -1068,8 +1070,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         continue;
       }
     }
-    if (active.latestCheckpoint.kvBlock != block)
-      static_cast<void>(retireCheckpoint(active));
+    // The previous recovery point, if the lane still holds one, retires now.
+    static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
   }
@@ -1098,6 +1100,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
   };
   std::vector<Denied> denied;
   denied.reserve(plan.items.size());
+  Request *const yielding = laneToYield();
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.stateCell)
@@ -1109,9 +1112,16 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
             : position + model::ExecutionLimits::targetVerifyRows;
-    // A scheduled lane is resident: it is in service.
+    // A scheduled lane is resident: it grows as a request in service. The
+    // lane that yields first if growth fails takes nothing in use, since its
+    // own suspension, not another conversation's replay point, pays for it.
+    // While other lanes fit, it waits for them instead, resident and denied
+    // each step, as a start a resident lane holds back waits.
+    const ReclaimClass upTo = &active == yielding && anotherResident(active.request.id)
+                                  ? ReclaimClass::Ordinary
+                                  : ReclaimClass::InUse;
     const auto kv = allocate(
-        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true);
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true, upTo);
     if (!kv.admission.granted()) {
       denied.push_back(Denied{active.request.id, kv.admission, workEnd, kv.denial});
       continue;
@@ -1142,26 +1152,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     return Prepared::Runnable;
   }
 
-  // Partial admissions execute at their actual width. If no lane fits, choose
-  // among all runnable residents: an unstarted peer can release its state
-  // cell before completed prefill is discarded.
+  // Partial admissions execute at their actual width. If no lane fits, the
+  // lane to yield is chosen among all runnable residents: an unstarted peer
+  // can release its state cell before completed prefill is discarded.
   if (denied.empty())
     throw std::logic_error("empty resource admission result");
-  const auto completedTokens = [&](const Request &active) -> uint64_t {
-    return scheduler_.phase(active.request.id) == Phase::Prefill
-               ? scheduler_.promptProcessed(active.request.id)
-               : active.exactTokens.size();
-  };
-  const auto yieldsBefore = [&](const Request &a, const Request &b) {
-    if (a.request.priority != b.request.priority)
-      return a.request.priority > b.request.priority;
-    const Phase aPhase = scheduler_.phase(a.request.id);
-    const Phase bPhase = scheduler_.phase(b.request.id);
-    // At equal priority, prefer uninterrupted streaming over less replay work.
-    if (aPhase != bPhase)
-      return aPhase == Phase::Prefill;
-    return completedTokens(a) < completedTokens(b);
-  };
   // Memory on its way back arrives without anyone yielding. The lanes still
   // take a retry deadline: the transfer's completion wakes the engine, and
   // the deadline is what makes the wait end if that wake is ever missed.
@@ -1176,23 +1171,18 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       [&](const Denied &left, const Denied &right) {
         return yieldsBefore(request(left.requestId), request(right.requestId));
       });
-  Request *selected = &request(victim.requestId);
-  uint64_t resumeTarget = victim.workEnd;
-  for (auto &[id, candidate] : requests_) {
-    if (!candidate.stateCell)
-      continue;
-    // Requests enter the scheduler before they can acquire a resident cell.
-    const Phase phase = scheduler_.phase(id);
-    if ((phase == Phase::Prefill || phase == Phase::Decode) &&
-        yieldsBefore(candidate, *selected)) {
-      selected = &candidate;
-      // This peer has not failed a growth attempt. Retain its current KV
-      // capacity as the resume target, not the blocked lane's requirement.
-      resumeTarget =
-          uint64_t{cache_.pageTable(id).pages.size()} * KvCache::pageTokens;
-    }
-  }
-  Request &active = *selected;
+  if (!yielding)
+    throw std::logic_error("no resident lane can yield");
+  Request &active = *yielding;
+  const auto own = std::find_if(denied.begin(), denied.end(), [&](const Denied &entry) {
+    return entry.requestId == active.request.id;
+  });
+  // A peer that has not failed a growth attempt resumes to its current KV
+  // capacity, not to the blocked lane's requirement.
+  const uint64_t resumeTarget =
+      own != denied.end()
+          ? own->workEnd
+          : uint64_t{cache_.pageTable(active.request.id).pages.size()} * KvCache::pageTokens;
   if (judge(victim.denial, active.request.id) == Verdict::Fail)
     settle(request(victim.requestId),
            capacityExhausted("KV target", victim.admission.allocationFailure,
@@ -1201,6 +1191,39 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     suspendForGrowth(active, resumeTarget, victim.admission.allocationFailure,
                      now);
   return Prepared::Yielded;
+}
+
+uint64_t Engine::completedTokens(const Request &active) const {
+  return scheduler_.phase(active.request.id) == Phase::Prefill
+             ? scheduler_.promptProcessed(active.request.id)
+             : active.exactTokens.size();
+}
+
+bool Engine::yieldsBefore(const Request &a, const Request &b) const {
+  if (a.request.priority != b.request.priority)
+    return a.request.priority > b.request.priority;
+  const Phase aPhase = scheduler_.phase(a.request.id);
+  const Phase bPhase = scheduler_.phase(b.request.id);
+  // At equal priority, prefer uninterrupted streaming over less replay work.
+  if (aPhase != bPhase)
+    return aPhase == Phase::Prefill;
+  return completedTokens(a) < completedTokens(b);
+}
+
+Engine::Request *Engine::laneToYield() {
+  Request *yielding = nullptr;
+  for (auto &[id, candidate] : requests_) {
+    if (!candidate.stateCell)
+      continue;
+    // Requests enter the scheduler before they can acquire a resident cell.
+    const Phase phase = scheduler_.phase(id);
+    if (phase != Phase::Prefill && phase != Phase::Decode)
+      continue;
+    if (!yielding || yieldsBefore(candidate, *yielding) ||
+        (!yieldsBefore(*yielding, candidate) && candidate.sequence > yielding->sequence))
+      yielding = &candidate;
+  }
+  return yielding;
 }
 
 bool Engine::anotherResident(uint64_t requestId) const {
@@ -1222,8 +1245,8 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
 }
 
 template <class Attempt>
-auto Engine::allocate(Attempt &&attempt, bool inService,
-                      const std::function<bool()> &fallback)
+auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
+                      const std::function<bool(const Denial &)> &fallback)
     -> Allocation<std::invoke_result_t<Attempt &>> {
   using Admission = std::invoke_result_t<Attempt &>;
   // Set once a request in service has nothing held left to reuse: from then
@@ -1236,7 +1259,6 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
   Allocation<Admission> result{tryOnce(), {}};
   Admission &admission = result.admission;
   Denial &denial = result.denial;
-  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   while (memoryDenied(admission)) {
     const bool paused =
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
@@ -1250,13 +1272,14 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
       admission = tryOnce();
       continue;
     }
+    denial.allocationFailure = admission.allocationFailure;
     denial.pending = reclaimed.pending;
     if (paused && inService && !serving && !reclaimed.pending) {
       serving = true;
       admission = tryOnce();
       continue;
     }
-    if (!paused && fallback && fallback())
+    if (!paused && fallback && fallback(denial))
       continue;
     break;
   }
@@ -1276,8 +1299,9 @@ bool Engine::growthPaused() const {
 
 // The reclaim step for a lane's state the engine's limit refused. The pooled
 // buffers a lane starts from stay for its activation to take: idle model
-// state beyond them goes first, then one empty extent, or else one victim of
-// the cache with the extent it empties.
+// memory beyond them goes first (a pooled buffer, else the idle vision
+// arena, else one rebuildable cache entry), then one empty extent, or else
+// one victim of the cache with the extent it empties.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
@@ -1298,14 +1322,15 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo) {
 CacheReclaimResult Engine::reclaimForKv(uint32_t pages, ReclaimClass upTo) {
   if (reclaimIdleState(false))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages, upTo);
+  const CacheReclaimResult reclaimed =
+      cache_.reclaimForPages(pages, CacheReclaimMode::KeepExtents, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
 }
 
 bool Engine::reclaimIdleState(bool keepLane) noexcept {
-  if (!model_.reclaimIdleState(keepLane))
+  if (!model_.reclaimIdleState(keepLane, model::IdleMemory::BuffersThenCaches))
     return false;
   signalResourceProgress();
   return true;
@@ -1336,11 +1361,13 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
 // the shortfall: never those a request holds, nor, for a start a resident
 // lane holds back, the idle KV that states in use restore through
 // (Cache::reusablePages). Otherwise it survives for later hits, and the
-// request grows if it is in service and waits if it is not. A reclaim that
-// must wait for the transfer in flight makes the request wait with it, as it
-// does without the pause. Idle model state goes first, but not the pooled
-// buffers the next lane starts from: they would not let this request grow,
-// and the paced pass keeps them for the next one.
+// request grows if it is in service and waits if it is not. Only KV goes: a
+// state's buffers give no page while the host refuses growth, unless the
+// state sits on the leaf that goes next (CacheReclaimMode::ReusePages). A
+// reclaim that must wait for the transfer in flight makes the request wait
+// with it, as it does without the pause. Idle model state goes first, but
+// not the pooled buffers the next lane starts from: they would not let this
+// request grow, and the paced pass keeps them for the next one.
 CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
                                                        ReclaimClass upTo) {
   if (reclaimIdleState(true))
@@ -1348,7 +1375,7 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
   if (cache_.reusablePages(upTo) < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimForPages(admission.additionalPages, upTo);
+      cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::ReusePages, upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;
@@ -1392,26 +1419,59 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
   const bool keep = directive.keepServingFootprint;
   uint64_t released = 0;
-  while (const uint64_t idle = model_.reclaimIdleState(keep))
-    released += idle;
-  const uint64_t remaining =
-      released >= directive.targetBytes ? 0 : directive.targetBytes - released;
-  // Even a zero-byte directive may release completely empty KV extents.
-  const uint64_t fromCache =
-      directive.evictAllUnpinnedPrefixes
-          ? cache_.evictAll()
-          : cache_.reclaimCache(remaining, directive.keepResumePoint, keep);
-  released += fromCache;
-  // Evicted states park their buffers in the model's pool; a pressure pass
-  // returns that memory to the host now rather than keeping it warm.
-  while (model_.reclaimIdleState(keep)) {
+  // A reclaim step may free memory that stays in the engine, pages of an
+  // extent that stays or buffers that refill the lane's footprint, and a
+  // waiting request may fit in it all the same.
+  bool reclaimed = false;
+  // Pages whose copies are being written count toward the target.
+  const auto targetUnmet = [&] {
+    return released + cache_.pendingBytes() < directive.targetBytes;
+  };
+  // Evicted states park their buffers in the model's pool, which a pass
+  // returns to the host at once, or uses to refill the buffers it keeps.
+  const auto releaseIdle = [&] {
+    while (const uint64_t idle = model_.reclaimIdleState(keep, model::IdleMemory::Buffers))
+      released += idle;
+  };
+  releaseIdle();
+  // Caches the model can rebuild go only toward a byte target: a pass
+  // without one keeps the embedding rows and the vision encoder.
+  const auto reclaimModelCaches = [&] {
+    while (targetUnmet()) {
+      const uint64_t cache =
+          model_.reclaimIdleState(keep, model::IdleMemory::BuffersThenCaches);
+      if (!cache)
+        break;
+      released += cache;
+    }
+  };
+  reclaimModelCaches();
+  if (directive.evictAllUnpinnedPrefixes) {
+    const CacheReclaimResult evicted = cache_.evictAll();
+    reclaimed = evicted.madeProgress;
+    released += evicted.reclaimedBytes;
+    releaseIdle();
+  } else {
+    // Even a zero-byte directive releases completely empty KV extents.
+    released += cache_.releaseEmptyExtents(keep);
+    while (targetUnmet()) {
+      const CacheReclaimResult step =
+          cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse,
+                            directive.keepResumePoint, keep);
+      if (!step.madeProgress)
+        break;
+      reclaimed = true;
+      released += step.reclaimedBytes;
+      releaseIdle();
+    }
   }
-  if (released)
+  // Image rows only an evicted state held are ordinary cache entries now.
+  reclaimModelCaches();
+  if (released || reclaimed)
     signalResourceProgress();
   if (!directive.targetBytes && !directive.evictAllUnpinnedPrefixes)
     return {released, ReclaimOutcome::Untargeted};
-  if (!directive.evictAllUnpinnedPrefixes &&
-      cache_.reclaimMet(fromCache, remaining))
+  if (!directive.evictAllUnpinnedPrefixes && !targetUnmet())
     return {released, ReclaimOutcome::Met};
   return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
                                                : ReclaimOutcome::Exhausted};
@@ -1638,7 +1698,8 @@ void Engine::release(Request &active) {
     active.suspended = false;
     signalResourceProgress();
   }
-  // Every end comes here; this request's use of its replay point ends.
+  // Every end comes here; this request's use of its replay point ends,
+  // after endRequest, so that the point is stamped newer than its KV tail.
   active.replayPoint.reset();
 }
 

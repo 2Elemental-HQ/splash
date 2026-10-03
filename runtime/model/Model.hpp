@@ -79,6 +79,10 @@ struct ModelRequest final {
   std::span<const uint32_t> scoreTokens{};
   // RequestFlag bits.
   uint32_t flags = 0;
+  // Prompt tokens the lane takes from a cached state. Images that end at or
+  // before it are neither staged nor encoded; their spans still place
+  // rotary positions.
+  uint32_t restoredTokens = 0;
 };
 
 struct ImageSpan final {
@@ -209,6 +213,10 @@ struct StateAdmission final {
   std::optional<uint32_t> cell;
   StateFailure failure = StateFailure::None;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+  // On a refused start: what the attempt matched (cached image rows, the
+  // encoder it would use). The caller keeps it while it reclaims and
+  // retries, so the retry finds them.
+  std::shared_ptr<const void> held{};
 
   [[nodiscard]] bool granted() const noexcept { return cell.has_value(); }
 };
@@ -382,6 +390,14 @@ struct ModelTelemetry final {
   uint64_t draftStateResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
+  // The vision encoder's scratch while it exists, the encoded rows the
+  // embedding cache keeps for reuse, those states in RAM hold to resume
+  // inside an image, and every image's rows anything holds, each counted
+  // once.
+  uint64_t visionArenaBytes = 0;
+  uint64_t embeddingCacheBytes = 0;
+  uint64_t stateHeldImageBytes = 0;
+  uint64_t imageRowsBytes = 0;
   uint32_t lastDecodeWidth = 0;
   uint64_t lastDecodeFusedOperations = 0;
   uint64_t lastDecodeM16Dispatches = 0;
@@ -439,6 +455,14 @@ struct WarmupStepResult final {
   std::vector<WarmupLaneResult> lanes;
 };
 
+// What a reclaim step may release of the model's idle memory.
+enum class IdleMemory : uint8_t {
+  // Pooled state buffers.
+  Buffers,
+  // Pooled state buffers, then caches that can be rebuilt.
+  BuffersThenCaches,
+};
+
 class Model {
 public:
   virtual ~Model() = default;
@@ -486,11 +510,15 @@ public:
   // allocate: each one evicted returns to the pool what a lane takes. Zero
   // when the pool holds a lane's buffers.
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
-  // Releases one unit of idle model state (an unused buffer, then caches
-  // that can be rebuilt) and returns its bytes; zero when nothing is idle.
-  // A denied allocation retries between calls, so it frees only what it
-  // needs. keepLane keeps the pooled buffers one lane starts from.
-  [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane) noexcept = 0;
+  // Releases one unit of idle model memory and returns its bytes; zero when
+  // nothing in scope is idle. A unit is one pooled state buffer (keepLane
+  // keeps those one lane starts from); with BuffersThenCaches, once no
+  // buffer is idle, the vision arena when no image waits for its encode and
+  // nothing holds it, and then one embedding entry nothing else holds,
+  // oldest first. A denied allocation retries between calls, so it frees
+  // only what it needs.
+  [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
+                                                  IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;

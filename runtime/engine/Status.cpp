@@ -179,6 +179,7 @@ std::string runtimeStatusJson(
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
+      << ",\"file_bytes\":" << resources.kvTier.fileBytes
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
@@ -251,6 +252,10 @@ std::string runtimeStatusJson(
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
       << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
+      << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
+      << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
+      << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
+      << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes
       << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources

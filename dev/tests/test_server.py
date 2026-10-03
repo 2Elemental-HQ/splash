@@ -3534,6 +3534,14 @@ class ServerTest(unittest.TestCase):
             api._native_command(share_args)[-3:],
             [str(5 * 1024**3), "--decode-share", "0.0"],
         )
+        # The engine's per-image patch limit follows the pixel cap: the most
+        # patches a resized image can have, a whole number of merge units.
+        self.assertNotIn("--max-image-patches", api._native_command(args))
+        for pixels, patches in (("1048576", "4096"), ("1000000", "3904")):
+            pixel_args = api.parse_args([*required, "--max-image-pixels", pixels])
+            self.assertEqual(
+                api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
+            )
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )

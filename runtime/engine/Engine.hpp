@@ -21,11 +21,14 @@ namespace splash::engine {
 struct EngineConfig final {
   uint32_t maxContext = kv::kMaximumLogicalTokens;
   uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
-  // Two draft windows balance recovery granularity and capture work.
-  // Zero disables progress checkpoints without changing reusable end states.
+  // Two draft windows balance recovery granularity and capture work; none is
+  // planned within one prefill chunk of where the request resumes or of its
+  // replay boundary. Zero disables progress checkpoints without changing
+  // reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
-  // Patches per image the model's vision scratch covers; zero rejects images.
+  // Patches per image the server's --max-image-pixels allows; zero rejects
+  // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Decode time owed for each unit of time a prefill runs while requests of
@@ -42,6 +45,25 @@ struct EngineConfig final {
   // (MemoryGovernor::setServing).
   std::function<void(bool)> serving;
 };
+
+// The progress checkpoints a request plans between the point it resumes from
+// and its replay boundary: the multiples of `interval` at least one prefill
+// chunk past the one and before the other, none when `interval` is zero.
+// They sit at multiples of the interval, so requests over the same prompt
+// share them. A checkpoint within one prefill chunk of either end would cost
+// a command split and a snapshot for less than a chunk of recompute.
+[[nodiscard]] inline std::vector<uint32_t>
+plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t interval) {
+  std::vector<uint32_t> checkpoints;
+  if (!interval)
+    return checkpoints;
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  for (uint64_t boundary =
+           (uint64_t{resumeBoundary} + chunk + interval - 1) / interval * interval;
+       boundary + chunk <= replayBoundary; boundary += interval)
+    checkpoints.push_back(static_cast<uint32_t>(boundary));
+  return checkpoints;
+}
 
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
@@ -122,11 +144,20 @@ public:
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
   // Runs only between commands: throws std::logic_error while a command is
-  // in flight. Returns idle model state first, then reclaims the cache:
-  // Cache::evictAll() under critical pressure, else Cache::reclaimCache,
-  // whose contract (Cache.hpp) gives the order; then returns the buffers
-  // evicted states parked. A warning pass keeps one lane's pooled buffers
-  // and one empty extent (keepServingFootprint).
+  // in flight. Returns the model's idle state buffers first, then the caches
+  // the model can rebuild while the directive's byte target is unmet. Under
+  // critical pressure it then evicts every unpinned cache entry
+  // (Cache::evictAll()). Otherwise it releases empty KV extents and reclaims
+  // the cache one Cache::reclaimOne step at a time, in the order that step's
+  // contract (Cache.hpp) gives, returning the buffers an evicted state handed
+  // back to the model's pool after each step. While the target is still
+  // unmet, it then takes the image rows only evicted states held. A pass
+  // counts only memory that leaves the engine: released KV extents, the
+  // caches and idle buffers the model returns; evicting a state frees nothing
+  // by itself. Pages whose copies are being written count toward the target.
+  // A warning pass keeps one lane's pooled buffers and one empty extent
+  // (keepServingFootprint). Requests waiting for memory retry after any step
+  // that freed some, kept or released.
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is
@@ -161,9 +192,10 @@ private:
 
   struct Request final {
     struct StateBoundary final {
-      enum class Purpose : uint8_t { Checkpoint, Replay, Junction };
       uint32_t tokens = 0;
-      Purpose purpose = Purpose::Replay;
+      // A rolling checkpoint, the lane's own progress, retired when the next
+      // one lands; otherwise a state a later request resumes from.
+      bool disposable = false;
     };
 
     EngineRequest request;
@@ -241,9 +273,11 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
-  // Where the state a later request resumes from is kept: the last whole
-  // page before the replay's final input token and, while the lane replays
-  // only its prompt, before the prompt's generation prompt.
+  // Where the lane's last state is kept: the last whole page before the
+  // replay's final input token and, while the lane replays only its prompt,
+  // before the prompt's generation prompt, where a later request resumes.
+  // Generated history that a resumed lane replays is its own: the state
+  // there is a checkpoint.
   [[nodiscard]] static uint32_t
   replayStateBoundary(const Request &request) noexcept;
   // replayStateBoundary while the lane replays only its prompt.
@@ -258,6 +292,14 @@ private:
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  // Plans a state at `tokens`, past `after` and no later than the replay
+  // boundary, keeping the plan in order; a boundary planned both ways is
+  // reusable. True when it inserted one.
+  bool addStateBoundary(Request &request, uint32_t after, uint32_t tokens,
+                        bool disposable);
+  // Plans a junction at the boundary each queued peer of the same or lower
+  // priority shares with this lane, past `after`, unless the peer ignores the
+  // cache; true when one was added.
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
@@ -272,7 +314,7 @@ private:
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the
-  // class allocate() derives from inService.
+  // class allocate() is given.
   [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
@@ -301,18 +343,30 @@ private:
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
-  // Runs one allocation of a lane's state or of KV pages, reclaiming between
-  // attempts while that makes progress. A request in service is running
-  // work and reclaims up to what is in use; one that a resident lane holds
-  // back takes nothing in use and waits for that lane. A refusal from the
-  // host reuses what the engine holds; when that gives nothing, a request in
-  // service retries as one (EngineConfig::serving), which only the engine's
-  // limit and critical pressure refuse. A refusal from the engine's limit
-  // reclaims cache; when that gives nothing, fallback may let go of what the
-  // request itself pins, and the reclaim goes on.
+  // The prompt rows a lane in prefill has processed, or the tokens a
+  // decoding lane holds.
+  [[nodiscard]] uint64_t completedTokens(const Request &request) const;
+  // Whether lane a gives up its memory before lane b: the lower priority,
+  // then, at equal priority, a lane in prefill before a decoding one, then
+  // the one with fewer completed tokens.
+  [[nodiscard]] bool yieldsBefore(const Request &a, const Request &b) const;
+  // The resident lane in prefill or decode that yields first when every
+  // lane's growth fails (yieldsBefore; on a tie, the later submission), or
+  // nullptr without one. prepare() gates that lane's growth and suspends
+  // that lane.
+  [[nodiscard]] Request *laneToYield();
+  // Runs one allocation of a lane's state or of KV pages, reclaiming cache
+  // up to class upTo between attempts while that makes progress: what is in
+  // use only for running work that would not yield for it, never for a
+  // start a resident lane holds back. A refusal from the host reuses what
+  // the engine holds; when that gives nothing, a request in service retries
+  // as one (EngineConfig::serving), which only the engine's limit and
+  // critical pressure refuse. A refusal from the engine's limit reclaims
+  // cache; when that gives nothing, fallback, given the denial so far, may
+  // let go of what the request itself pins, and the reclaim goes on.
   template <class Attempt>
-  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
-                              const std::function<bool()> &fallback = {})
+  [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
+                              const std::function<bool(const Denial &)> &fallback = {})
       -> Allocation<std::invoke_result_t<Attempt &>>;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,

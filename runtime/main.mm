@@ -54,6 +54,7 @@ struct NativeArguments final {
   uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
+  uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -125,7 +126,8 @@ void printUsage(std::string_view executable) {
       "usage: " + std::string(executable) +
       " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--decode-share SHARE]");
+      " [--kv-format int8|bf16] [--decode-share SHARE]"
+      " [--max-image-patches PATCHES]");
 }
 
 template <typename T>
@@ -154,6 +156,15 @@ uint32_t parseMaxContext(std::string_view value,
     throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
                      std::to_string(capabilities.maximumContextTokens) + "]");
   }
+  return result;
+}
+
+uint32_t parseMaxImagePatches(std::string_view value) {
+  uint32_t result = 0;
+  if (!parsePositive(value, result) || result % 4 ||
+      result > ops::kMaximumImagePatches)
+    throw UsageError("--max-image-patches requires a positive multiple of 4 "
+                     "up to " + std::to_string(ops::kMaximumImagePatches));
   return result;
 }
 
@@ -214,6 +225,8 @@ NativeArguments parseArguments(int argc, char **argv) {
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
+    } else if (option == "--max-image-patches") {
+      result.maxImagePatches = parseMaxImagePatches(value);
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -265,6 +278,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
+  config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   config.nativeLoop.engineInstanceId = engineInstanceId();

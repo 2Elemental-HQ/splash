@@ -141,6 +141,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
                     with (
@@ -289,6 +290,8 @@ class SmokeRealTests(unittest.TestCase):
             red,
             {"images": {"encodes": 1, "embedding_reuses": 0}},
             repeat,
+            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            red,
             {"images": {"encodes": 1, "embedding_reuses": 1}},
             blue,
             {"type": "message", "content": [{"type": "text", "text": "red"}]},

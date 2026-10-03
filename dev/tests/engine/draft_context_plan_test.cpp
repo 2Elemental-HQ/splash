@@ -100,11 +100,14 @@ void testFinalFullBlockBound() {
 void testBenchmarkWorkIncludesRecoveryPoints() {
   const uint32_t interval = engine::EngineConfig{}.prefillCheckpointTokens;
   using benchmark::expectedDraftContextRows;
-  require(expectedDraftContextRows(10000, interval) == 5904,
+  // No checkpoint lies within one prefill chunk of an end: not 8192 before
+  // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K
+  // prompt's at 14080.
+  require(expectedDraftContextRows(10000, interval) == 4112,
           "10K cold benchmark omitted rolling recovery windows");
-  require(expectedDraftContextRows(14096, interval, 9984) == 3856,
-          "4K suffix benchmark omitted its intermediate recovery window");
-  require(expectedDraftContextRows(14096, interval) == 7952,
+  require(expectedDraftContextRows(14096, interval, 9984) == 2064,
+          "4K suffix benchmark planned a checkpoint within a chunk of an end");
+  require(expectedDraftContextRows(14096, interval) == 6160,
           "partial-hit benchmark confused cold work with restored work");
   require(expectedDraftContextRows(10000, 0) == 2064 &&
               expectedDraftContextRows(2048, interval) == 2048 &&

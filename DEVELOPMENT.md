@@ -126,7 +126,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
-| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. |
+| `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
@@ -550,9 +550,9 @@ extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
-use, or startup cleanup. Kernels reach a page through the GPU address in its
-request's page table, so no command binds KV; the residency set makes extents
-resident for every command. The host reaches the same memory
+use or a junction, or startup cleanup. Kernels reach a page through the GPU
+address in its request's page table, so no command binds KV; the residency set
+makes extents resident for every command. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others as soon as they cover the extent that holds
@@ -802,8 +802,12 @@ requests, recovery draining and the oldest current wait age, which for a request
 holding admission closed runs from when its wait began. Memory transitions
 also appear in the console. When macOS runs short of memory, growth that no
 request in service needs pauses and the cache gives memory back, a paced pass at
-a time, down to one lane's state buffers and one KV extent. A request in service
-keeps growing within `--max-memory`, first into cached pages no request holds.
+a time, down to one lane's state buffers and one KV extent. A pass counts only
+memory that leaves the engine; a cached state it evicts first refills the lane's
+state buffers it keeps. A request in service keeps growing within
+`--max-memory`, first into cached pages no request holds: it takes cached KV,
+and a cached state only where it sits on the KV that goes next, since a state's
+buffers give it no page.
 A new request waits while another is in service unless it can start from what
 the engine already holds, and with none in service it starts. A request whose
 start was refused memory, under host pressure or at `--max-memory`, holds back
@@ -973,25 +977,34 @@ its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
 
 Until the request ends, suspended or not, that replay point is in use, and so is
-the KV it restores through. Cache victims come in three classes: checkpoints,
-then ordinary states and KV, then what is in use. No work displaces anything of
-a class above its own. Memory for running requests takes what is in use after
-everything else. A start that a resident lane holds back takes nothing in use:
-it waits for that lane. A publication in use takes cached KV and states in the
-same order, then the oldest state in use; of the KV it takes only leaves whose
-page frees at once, and only while an extent can be emptied; the extent is
-released at once, and the snapshot follows. Other publications recycle only
-states, a disk copy in use may displace the oldest copy in use, and ordinary or
-optional work never displaces anything in use. Nothing in use is pinned, so
-running work that needs the memory still takes it once nothing else is left. A
-resumed lane that lost its prompt's replay point rebuilds it on the way.
+the KV it restores through. When the last request using it ends, the point
+becomes the newest ordinary state; the older points on its chain keep their age.
+Cache victims come in three classes: checkpoints, then ordinary states and KV
+(first the KV no state restores through, which saves no prefill), then what is
+in use. No work displaces anything of a class above its own. Memory for running
+requests takes what is in use after everything else. A start that a resident
+lane holds back takes nothing in use: it waits for that lane. Nor does the lane
+that yields first when no lane's growth fits, such as one just started beside a
+decoding lane: its own suspension pays for the memory, and while other lanes fit
+it waits for them, resident. A publication in use takes cached KV and states in
+the same order, then the oldest state in use; of the KV it takes only leaves
+whose page frees at once, and only while an extent can be emptied; the extent is
+released at once, and the snapshot follows. An ordinary publication (a junction)
+makes room the same way short of what is in use, and an optional checkpoint
+takes only checkpoints; neither drops a state whose write must wait for the
+write in flight. A disk copy in use may displace the oldest copy in use, and
+ordinary or optional work never displaces anything in use. Nothing in use is
+pinned, so running work that needs the memory still takes it once nothing else
+is left. A resumed lane that lost its prompt's replay point rebuilds it on the
+way; the point its generated history reaches is a disposable checkpoint.
 `/status` reports under `state` the replay points unfinished requests hold
 (`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
 
 Requests sharing a cold prefix can wait for a resident request's planned recovery
-point, then enter through the ordinary cache restore path. Waiting requests hold
-no active state cell or KV pages and return to ordinary admission when no useful
-producer remains. Late arrivals can extend the plan at complete state boundaries.
+point, including one whose prefix is still being restored from disk, then enter
+through the ordinary cache restore path. Waiting requests hold no active state
+cell or KV pages and return to ordinary admission when no useful producer
+remains. Late arrivals can extend the plan at complete state boundaries.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
@@ -1008,10 +1021,12 @@ and checkpoints earlier requests left. So a greedy or seeded request repeats
 its output when it runs alone with the same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ.
 
-Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
-prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
-work. While requests of the same or a higher priority decode, each slice owes
-them decode time, `--decode-share` times its own, before the next slice runs.
+Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
+planned within one prefill chunk (2048 tokens) of where the request resumes or
+of its replay boundary. Contended prefill adapts toward a 500 ms slice, keeping
+2048-token chunks for long unopposed work. While requests of the same or a
+higher priority decode, each slice owes them decode time, `--decode-share`
+times its own, before the next slice runs.
 These policies do not extend client deadlines. Memory recovery waits are
 bounded: after a suspension, new work waits for resident requests only while
 memory is still short, and at most for the 30 s resource wait; suspended
@@ -1042,15 +1057,16 @@ once the engine loads. The tier does not raise the context limit.
 Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
-after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. A restored page is read straight into its
-extent. Either way the transfer runs on the file's IO worker beside whatever
-command the model runs: a cached page is never written by a command, and no
-command uses a page before its read has landed. At most 128 KV pages are in
-transfer at a time, demotions at most half of them and restores at most three
-quarters, since one worker serves both in order and a burst of either kind
-must leave the other its share. When the tier takes no more, admission waits
-for a transfer instead of evicting additional victims.
+after the write succeeds. Unneeded tails are dropped without writing, before any
+state, together with any disk copies below them. A restored page is read
+straight into its extent. Either way the transfer runs on the file's IO worker
+beside whatever command the model runs: a cached page is never written by a
+command, and no command uses a page before its read has landed. At most 128 KV
+pages are in transfer at a time, demotions at most half of them and restores at
+most three quarters, since one worker serves both in order and a burst of either
+kind must leave the other its share. When the tier takes no more, leaves that
+need a write stay until a transfer lands, while leaves whose page frees without
+one still go.
 
 A state with no available RAM cache slot can be written directly from its lane.
 When every state in RAM is in use and no cached KV is left to take, a replay
@@ -1058,23 +1074,31 @@ point takes the slot of the oldest by writing that one out, and goes
 unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
-replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
-prefill chunk (2048 tokens) before the final replay boundary is captured only
-if a RAM slot is available without reclamation. Otherwise its predecessor stays
-usable for cancellation recovery; the final reusable state still uses the disk
-tier. Matched KV restores start from the root toward the selected
-state, with the state read alongside. Cancellation drops unsubmitted, unshared
-reads; submitted transfers drain before their buffers can be reused. Restored
-states remain usable even when there is no room to promote them into RAM cache.
+replaced or no longer needed. Matched KV restores start from the root toward
+the selected state, in that order as the tier takes them, with the state read
+alongside. Cancellation drops unsubmitted, unshared reads; submitted transfers
+drain before their buffers can be reused. Restored states remain usable even
+when there is no room to promote them into RAM cache. Promotion takes only the
+RAM of a state that keeps a disk copy.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
 both KV and states. Sole copies of states in use, and the KV they restore
 through, make room only for a copy that is itself in use, and last; an ordinary
 state that finds no other room is dropped. A quota smaller than the working set
-can cause repeated reads and writes; it is not a write-rate limit. Each file
-retains its allocated high-water mark until shutdown, so filesystem space can
-exceed the live-slot quota. Closing the server releases both files.
+can cause repeated reads and writes; it is not a write-rate limit. A freed slot
+returns its quota at once and its blocks to the volume (`F_PUNCHHOLE`) once its
+file's IO worker finishes the transfer it is in, so the two files together
+occupy about the live slots instead of each keeping its high-water mark;
+`/status` reports that as `disk.file_bytes` beside `disk.used_bytes`. Until the
+punch the other file can take that quota, so allocated blocks can briefly exceed
+`--max-cache-disk` by the slots freed but not yet punched, bounded by the
+transfer each file's worker is in: about 2% of a 10G tier in a 25-minute churn
+run on an M5 Max. A volume sized exactly to the quota can therefore fill; the
+write that finds it full stops that file's writes for the rest of the process,
+as below, while serving continues. On a volume that cannot punch holes the
+files keep the blocks of freed slots, which the runtime reports once. Closing
+the server releases both files.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
 whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
@@ -1240,9 +1264,11 @@ root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
 
 Each phase's record keeps what its requests reused of the cache (`reuse`).
-Every request after a phase's first resends the conversation, so a phase other
-than the cancellation phase (`cancel`) that completed two or more requests and
-reused no cached prompt token fails. Replay points of unfinished requests
+Every request after a phase's first resends the conversation, so a phase that
+completed two or more requests and reused no cached prompt token fails. Two
+phases are exempt: the cancellation phase (`cancel`), and the reference wave
+that compacts the conversation, whose summary request and the request after it
+share only the system prompt and tools. Replay points of unfinished requests
 evicted during a phase only print a warning.
 
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
@@ -1383,7 +1409,12 @@ It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
 release check's speed rule and prepared bytes, and saves
-`build/release/http-regression.json`.
+`build/release/http-regression.json`. With `--burst N` it sends N requests of
+each context at once instead, 16 output tokens each, and reports each build's
+replay points lost to the burst (`replay_state_publication_failures`), its
+decode rate and advertised context; `--follow-up`, which a burst run needs to
+pass, then sends each conversation's next turn and compares their time to
+first token and how many resumed at their replay point.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.

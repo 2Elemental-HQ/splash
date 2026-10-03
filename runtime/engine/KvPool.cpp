@@ -135,7 +135,7 @@ uint64_t KvPool::allocatedBytes() const noexcept {
   return uint64_t{allocatedExtents_} * extentPages_ * bytesPerPage();
 }
 
-uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
+uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   uint32_t reclaimed = 0;
   bool kept = false;
   uint32_t extent = reclaimableExtents_.head;
@@ -149,7 +149,7 @@ uint32_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
     }
     extent = next;
   }
-  return reclaimed;
+  return uint64_t{reclaimed} * extentPages_ * bytesPerPage();
 }
 
 metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {

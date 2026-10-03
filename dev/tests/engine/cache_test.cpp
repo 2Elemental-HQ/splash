@@ -60,7 +60,7 @@ void testCanonicalPagesAndSparseState() {
 
   auto lookup = resources.lookup(prompt);
   require(lookup.kvBoundary == 64 && lookup.resumeBoundary() == 64 &&
-              !lookup.junctionBoundary(),
+              !lookup.junctionBoundary,
           "KV-first lookup did not coordinate the sparse state");
   resources.beginRequest(2);
   require(resources.restoreRequest(2, lookup).granted(), "restore pages were denied");
@@ -82,17 +82,23 @@ void testKvDeeperThanStateAndDependencyEviction() {
   resources.endRequest(1);
   auto lookup = resources.lookup(prompt);
   require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 64 &&
-              lookup.junctionBoundary() == 96,
-          "dense KV did not expose the lazy state junction");
+              lookup.junctionBoundary == 0,
+          "KV ending at a chain end requested a lazy junction");
   lookup.state.reset();
-  require(resources.reclaimCache(1, false, false) >= 100,
-          "unreferenced composite state was not reclaimed first");
-  require(resources.snapshot().kvCache.blocks == 2,
-          "LRU reclaim did not remove the older fragmented KV leaf first");
-  require(resources.reclaimCache(1, false, false) != 0,
+  const auto step = [&] {
+    return resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+        .madeProgress;
+  };
+  require(step() && resources.snapshot().kvCache.blocks == 2 &&
+              resources.snapshot().stateCache.entries == 1,
+          "reclaim did not remove the KV leaf no state restores through first");
+  require(step() && resources.snapshot().stateCache.entries == 0 &&
+              resources.snapshot().kvCache.blocks == 2,
+          "unreferenced composite state was not reclaimed before its KV");
+  while (step()) {
+  }
+  require(resources.snapshot().kvCache.blocks == 0 && storage.releasedExtents == 1,
           "KV was not reclaimed after cached state");
-  require(resources.snapshot().stateCache.entries == 0,
-          "composite state outlived its KV dependency");
 }
 
 void testActiveTipProtectsTheContentChain() {
@@ -139,8 +145,11 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   resources.beginRequest(2);
   require(!resources.ensureTokens(2, 1).granted(),
           "growth bypassed engine-coordinated reclaim");
-  require(resources.reclaimCache(1, false, false) != 0 &&
-              resources.ensureTokens(2, 1).granted(),
+  while (!storage.releasedExtents)
+    require(resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                .madeProgress,
+            "explicit reclaim made no progress");
+  require(resources.ensureTokens(2, 1).granted(),
           "explicit reclaim did not release the cached KV extent");
   const auto snapshot = resources.snapshot();
   require(snapshot.kvCache.blocks == 0 && snapshot.pool.pagesAllocated == 4 &&
@@ -192,13 +201,14 @@ void testReplacementKeepsTheExtentItEmpties() {
               pool.snapshot().extentAllocations == 1 && storage.releasedExtents == 0,
           "replacement allocated the reusable extent again");
   resources.endRequest(2);
-  require(resources.reclaimCache(0, false, false) == 4 * 4096 &&
+  require(resources.releaseEmptyExtents(false) == 4 * 4096 &&
               storage.allocatedPages() == 0 && storage.releasedExtents == 1,
           "zero-target shrink did not release the empty extent");
 }
 
-// One reclaim pass releases every empty extent first, however many there
-// are, then evicts the cache and releases the extents that empties.
+// A reclaim pass releases every empty extent first, however many there are,
+// then evicts the cache a step at a time and releases the extents that
+// empties.
 void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t empty = 200;
   test::TestKvStorage storage(4 * (empty + 1), 4096, 4);
@@ -219,13 +229,14 @@ void testReclaimPassReleasesEveryEmptyExtent() {
               resources.snapshot().kvCache.blocks == 1,
           "release setup geometry changed");
 
-  require(resources.reclaimCache(uint64_t{empty} * 4 * 4096, false, false) ==
-                  uint64_t{empty} * 4 * 4096 &&
+  require(resources.releaseEmptyExtents(false) == uint64_t{empty} * 4 * 4096 &&
               storage.releasedExtents == empty &&
               resources.snapshot().pool.reclaimableExtents == 0 &&
               resources.snapshot().kvCache.blocks == 1,
           "a pass did not release every empty extent before evicting");
-  require(resources.reclaimCache(1ULL << 40, false, false) == 4 * 4096 &&
+  const CacheReclaimResult step =
+      resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
+  require(step.madeProgress && step.reclaimedBytes == 4 * 4096 &&
               storage.releasedExtents == empty + 1 &&
               storage.allocatedPages() == 0 &&
               resources.snapshot().kvCache.blocks == 0,

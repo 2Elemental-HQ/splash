@@ -91,12 +91,17 @@ public:
   [[nodiscard]] uint32_t activeReferences(uint32_t page) const;
   [[nodiscard]] bool pageFree(uint32_t page) const;
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
+  // Pages of allocated extents no request holds: free, or held only by the
+  // cache.
+  [[nodiscard]] uint32_t reusablePages() const noexcept {
+    return allocatedExtents_ * extentPages_ - activePages_;
+  }
 
-  // Releases completely unreferenced extents, at most `limit` of them.
-  // keepRunway keeps one empty extent warm, so the next request does not wait
-  // for an allocation; unlike the runway the constructor allocates, it is
-  // always a single extent.
-  [[nodiscard]] uint32_t reclaimEmptyExtents(bool keepRunway, uint32_t limit);
+  // Releases completely unreferenced extents, at most `limit` of them, and
+  // returns the bytes released. keepRunway keeps one empty extent warm, so
+  // the next request does not wait for an allocation; unlike the runway the
+  // constructor allocates, it is always a single extent.
+  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway, uint32_t limit);
   // Empties the allocated extent that holds the fewest pages, by moving each
   // of them to a free page of the other extents that hold pages, fullest
   // first: free pages scattered over the pool become an empty extent, which

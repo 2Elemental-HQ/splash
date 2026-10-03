@@ -113,6 +113,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.max_image_pixels is not None:
+            command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
@@ -212,13 +214,14 @@ def image_data_url(kind: str) -> str:
 
 
 def image_chat_body(model: str, prompt: str, url: str, **extra) -> dict:
+    """A user message that shows the image and then asks the prompt."""
     body = chat_body(model, prompt, **extra)
     body["messages"] = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -232,7 +235,13 @@ def answer_text(chat: dict) -> str:
 
 
 def run_images(port: int, model: str, nonce: str) -> None:
-    question = f"What color is this image? Answer with one word. Request {nonce}."
+    # More than a block of tokens follows the image, so the replay point a
+    # repeat restores lies past it.
+    question = (
+        "What color is the image above? Answer with exactly one lowercase English "
+        "word naming the color, with no punctuation, explanation or other words. "
+        f"Request {nonce}."
+    )
     code, red = request(
         port,
         "POST",
@@ -250,9 +259,11 @@ def run_images(port: int, model: str, nonce: str) -> None:
         flush=True,
     )
 
-    # The same image and prompt reuse the image-aware prefix without running
-    # the vision tower again; a different image behind identical placeholder
-    # tokens must not reuse KV.
+    # The same image and prompt reuse the image-aware prefix, which covers the
+    # image: its rows are neither encoded nor looked up. Behind another system
+    # prompt the same image comes from the embedding cache without the vision
+    # tower. A different image behind identical placeholder tokens must not
+    # reuse KV.
     code, before = request(port, "GET", "/status")
     require(code == 200 and "images" in before, "status lacks image telemetry")
     code, repeat = request(
@@ -274,8 +285,27 @@ def run_images(port: int, model: str, nonce: str) -> None:
     require(
         code == 200
         and after["images"]["encodes"] == before["images"]["encodes"]
-        and after["images"]["embedding_reuses"] > before["images"]["embedding_reuses"],
-        f"repeated image re-ran the vision tower: {before['images']} -> {after['images']}",
+        and after["images"]["embedding_reuses"] == before["images"]["embedding_reuses"],
+        f"a prefix covering the image used its rows: {before['images']} -> "
+        f"{after['images']}",
+    )
+    body = image_chat_body(model, question, image_data_url("red"))
+    body["messages"].insert(
+        0, {"role": "system", "content": "You describe images for a test."}
+    )
+    code, other = request(port, "POST", "/v1/chat/completions", body)
+    require(
+        code == 200 and "red" in answer_text(other),
+        f"the image behind another system prompt failed: {other!r}",
+    )
+    code, reused = request(port, "GET", "/status")
+    require(
+        code == 200
+        and reused["images"]["encodes"] == after["images"]["encodes"]
+        and reused["images"]["embedding_reuses"]
+        == after["images"]["embedding_reuses"] + 1,
+        f"a cached image re-ran the vision tower or was not reused: "
+        f"{after['images']} -> {reused['images']}",
     )
     code, blue = request(
         port,
@@ -1449,6 +1479,7 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 

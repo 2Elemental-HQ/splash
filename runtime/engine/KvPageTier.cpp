@@ -65,6 +65,10 @@ bool KvPageTier::canDemote() const noexcept {
   return demotions_ < demotionLimit_ && inFlight_.size() < transferLimit_ && writable();
 }
 
+bool KvPageTier::canRestore() const noexcept {
+  return restores_ < restoreLimit_ && inFlight_.size() < transferLimit_;
+}
+
 std::shared_ptr<KvDiskSlot> KvPageTier::acquireSlot() {
   auto slot = file_->acquire();
   if (!slot) return {};
@@ -73,9 +77,9 @@ std::shared_ptr<KvDiskSlot> KvPageTier::acquireSlot() {
 
 std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot,
                                                std::function<void()> completion) {
-  auto disk = diskSlot(slot);
   if (!canDemote())
     return {};
+  auto disk = diskSlot(slot);
   const std::vector<std::span<std::byte>> bytes = pages_.spans(page);
   auto transfer = std::make_shared<Transfer>();
   transfer->demotion = true;
@@ -92,9 +96,9 @@ std::unique_ptr<KvTransfer> KvPageTier::demote(uint32_t page, std::shared_ptr<Kv
 
 std::unique_ptr<KvTransfer> KvPageTier::restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
                                                 std::function<void()> completion) {
-  auto disk = diskSlot(slot);
-  if (restores_ >= restoreLimit_ || inFlight_.size() >= transferLimit_)
+  if (!canRestore())
     return {};
+  auto disk = diskSlot(slot);
   auto transfer = std::make_shared<Transfer>();
   auto ticket = std::make_unique<Ticket>(transfer);
   transfer->io = file_->read(disk->slot, pages_.spans(page), std::move(completion));

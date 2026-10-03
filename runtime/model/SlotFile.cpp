@@ -1,5 +1,7 @@
 #include "model/SlotFile.hpp"
 
+#include "StderrLine.hpp"
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -8,9 +10,12 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -20,22 +25,54 @@ struct SlotFile::Backing {
   int descriptor = -1;
   uint64_t slotBytes = 0;
   std::shared_ptr<DiskBudget> budget;
-  uint32_t allocated = 0;
   std::atomic<bool> failed{false};
+  // Guards the slots and the worker's queue.
   std::mutex mutex;
+  std::condition_variable wake;
+  uint32_t allocated = 0;
   std::vector<uint32_t> free;
+  // Freed slots whose blocks go back before the next operation runs.
+  std::vector<uint32_t> punches;
+  std::deque<Work> work;
+  bool stopping = false;
+  // Worker-only: the slots whose blocks the file holds, from a write's first
+  // chunk until a punch returns them.
+  std::vector<bool> backed;
   ~Backing() { if (descriptor >= 0) ::close(descriptor); }
+
+  // Marks a slot's blocks held; true when they were not.
+  bool back(uint32_t index) {
+    if (backed.size() <= index)
+      backed.resize(index + 1);
+    if (backed[index])
+      return false;
+    backed[index] = true;
+    return true;
+  }
 };
 
 SlotFile::Slot::Slot(std::shared_ptr<Backing> backing, uint32_t index)
     : backing_(std::move(backing)), index_(index) {}
 SlotFile::Slot::~Slot() {
   if (!backing_) return;
+  bool punch = false;
   {
     std::lock_guard lock(backing_->mutex);
+    // The punch precedes any write of the index's next holder, which is
+    // submitted after acquire() finds the index on the free list. Once the
+    // file is stopping, its blocks go with it.
+    punch = returnsBlocks_ && !backing_->stopping;
+    if (punch)
+      backing_->punches.push_back(index_);
     backing_->free.push_back(index_);
   }
+  // The quota returns now; the blocks only once the worker has finished the
+  // transfer it is in and punched them. A write to another file of the
+  // budget can take the quota meanwhile, so the files' blocks exceed the
+  // budget by this slot until the punch.
   backing_->budget->release(backing_->slotBytes);
+  if (punch)
+    backing_->wake.notify_one();
 }
 
 bool SlotFile::Operation::ready() const noexcept {
@@ -54,6 +91,15 @@ static_assert(kChunkBytes % SlotFile::kAlignmentBytes == 0);
 
 off_t slotOffset(uint64_t index, uint64_t slotBytes) {
   return static_cast<off_t>(index * slotBytes);
+}
+
+// Once per process: the volume keeps the blocks of freed slots.
+void reportPunchFailure(int error) noexcept {
+  static std::atomic<bool> reported{false};
+  if (!reported.exchange(true, std::memory_order_relaxed))
+    writeStderrLine("Freed cache slots cannot return their blocks on this volume (" +
+                    std::generic_category().message(error) +
+                    "); disk use may exceed --max-cache-disk.");
 }
 
 template <typename Span>
@@ -147,12 +193,7 @@ bool moveChunk(Span chunk, off_t offset, Io io) {
 }
 } // namespace
 
-SlotFile::SlotFile(uint64_t slotBytes, uint64_t capacityBytes,
-                   const std::filesystem::path &directory)
-    : SlotFile(slotBytes, std::make_shared<DiskBudget>(capacityBytes), directory) {}
-
-SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-                   const std::filesystem::path &directory)
+SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
     : backing_(std::make_shared<Backing>()) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
@@ -174,7 +215,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
   struct sigaction fileSize {};
   if (::sigaction(SIGXFSZ, nullptr, &fileSize) == 0 && fileSize.sa_handler == SIG_DFL)
     std::signal(SIGXFSZ, SIG_IGN);
-  std::string name = (directory / "splash-cache-XXXXXX").string();
+  std::string name = (std::filesystem::temp_directory_path() / "splash-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)
     throw std::system_error(errno, std::generic_category(), "create slot file");
@@ -198,21 +239,29 @@ void SlotFile::Free::operator()(std::byte *memory) const noexcept { std::free(me
 
 SlotFile::~SlotFile() {
   {
-    std::lock_guard lock(mutex_);
-    stopping_ = true;
-    for (auto &work : work_) work.operation->cancel();
+    std::lock_guard lock(backing_->mutex);
+    backing_->stopping = true;
+    for (auto &work : backing_->work) work.operation->cancel();
   }
-  wake_.notify_one();
+  backing_->wake.notify_one();
   worker_.join();
 }
 
 std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
   auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
   std::lock_guard lock(backing_->mutex);
-  // Prepare the free list before reserving bytes so allocation failure cannot
-  // strand quota, and returning a slot never needs to allocate.
-  if (backing_->free.empty() && backing_->free.capacity() == backing_->allocated)
-    backing_->free.reserve(std::max<size_t>(1, 2 * backing_->free.capacity()));
+  // A new index needs room in the free and punch lists, made before bytes
+  // are reserved so allocation failure cannot strand quota, and returning a
+  // slot never needs to allocate. An index waits for at most one punch:
+  // freeing it again punches only after a write, which runs once the worker
+  // has taken the earlier punch. Each list grows on its own, so one a failed
+  // reserve left short grows on the next call.
+  if (backing_->free.empty()) {
+    for (std::vector<uint32_t> *list : {&backing_->free, &backing_->punches}) {
+      if (list->capacity() == backing_->allocated)
+        list->reserve(std::max<size_t>(1, 2 * list->capacity()));
+    }
+  }
   if (!backing_->budget->reserve(backing_->slotBytes)) return {};
   uint32_t index;
   if (!backing_->free.empty()) {
@@ -228,57 +277,50 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
 
 uint64_t SlotFile::slotBytes() const noexcept { return backing_->slotBytes; }
 
-uint64_t SlotFile::capacityBytes() const noexcept {
-  return backing_->budget->capacityBytes();
-}
-
-uint64_t SlotFile::usedBytes() const noexcept { return backing_->budget->usedBytes(); }
-uint64_t SlotFile::readBytes() const noexcept { return backing_->budget->readBytes(); }
-uint64_t SlotFile::writtenBytes() const noexcept { return backing_->budget->writtenBytes(); }
-
 bool SlotFile::writable() const noexcept {
   return !backing_->failed.load(std::memory_order_relaxed);
-}
-
-bool SlotFile::idle() const {
-  std::lock_guard lock(mutex_);
-  return work_.empty() && !running_;
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
                                                      std::function<void()> completion) {
   auto operation = std::make_shared<Operation>();
   {
-    std::lock_guard lock(mutex_);
-    if (stopping_)
+    std::lock_guard lock(backing_->mutex);
+    if (backing_->stopping)
       throw std::logic_error("slot file is shutting down");
-    work_.push_back({operation, std::move(run), std::move(completion)});
+    backing_->work.push_back({operation, std::move(run), std::move(completion)});
   }
-  wake_.notify_one();
+  backing_->wake.notify_one();
   return operation;
 }
 
 void SlotFile::run() {
+  Backing &backing = *backing_;
   for (;;) {
     Work work;
     {
-      std::unique_lock lock(mutex_);
-      wake_.wait(lock, [&] { return stopping_ || !work_.empty(); });
-      if (work_.empty()) return;
-      work = std::move(work_.front());
-      work_.pop_front();
-      running_ = true;
+      std::unique_lock lock(backing.mutex);
+      backing.wake.wait(lock, [&] {
+        return backing.stopping || !backing.work.empty() || !backing.punches.empty();
+      });
+      if (!backing.stopping && !backing.punches.empty()) {
+        const uint32_t index = backing.punches.back();
+        backing.punches.pop_back();
+        lock.unlock();
+        punchHole(index);
+        continue;
+      }
+      if (backing.work.empty()) return;
+      work = std::move(backing.work.front());
+      backing.work.pop_front();
     }
     bool success = false;
     try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
     catch (...) { success = false; }
+    // Drop the operation's captures (its slot and the memory it moves)
+    // before it reports, so a waiter wakes to a worker that holds nothing of
+    // it.
     work.run = {};
-    // Idle before the operation reports, so whoever wakes on it sees a worker
-    // that has let go of the memory it moved.
-    {
-      std::lock_guard lock(mutex_);
-      running_ = false;
-    }
     {
       std::lock_guard lock(work.operation->mutex_);
       work.operation->success_ = success;
@@ -293,6 +335,22 @@ void SlotFile::run() {
   }
 }
 
+void SlotFile::punchHole(uint32_t index) noexcept {
+  Backing &backing = *backing_;
+  // A write cancelled before its first chunk took no blocks.
+  if (index >= backing.backed.size() || !backing.backed[index])
+    return;
+  // Slot offsets and sizes are whole alignment units, so whole blocks.
+  fpunchhole_t hole{0, 0, slotOffset(index, backing.slotBytes),
+                    static_cast<off_t>(backing.slotBytes)};
+  if (::fcntl(backing.descriptor, F_PUNCHHOLE, &hole) < 0) {
+    reportPunchFailure(errno);
+    return;
+  }
+  backing.backed[index] = false;
+  backing.budget->file_.fetch_sub(backing.slotBytes, std::memory_order_relaxed);
+}
+
 // A write gathers its spans into the worker's buffer one chunk at a time and
 // zeros the slot past them; a read moves the chunks its spans reach and
 // scatters each into them, ignoring the slot past them. A chunk of a span
@@ -305,6 +363,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
     return nullptr;
+  slot->returnsBlocks_ = true;
   return submit([slot, source = std::move(source)](std::span<std::byte> buffer,
                                                    const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
@@ -319,6 +378,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     Pieces pieces(source);
     for (uint64_t done = 0; done < backing.slotBytes;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
+      if (!done && backing.back(slot->index_))
+        backing.budget->file_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
       std::span<const std::byte> chunk = pieces.directRun();
       if (!chunk.empty()) {
         chunk = chunk.first(kChunkBytes);

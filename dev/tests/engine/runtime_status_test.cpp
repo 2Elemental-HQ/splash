@@ -104,6 +104,7 @@ void testCleanRuntimeStatus() {
   engine.resources.kvTier.restores = 3;
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
+  engine.resources.kvTier.fileBytes = 24680;
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
@@ -169,6 +170,10 @@ void testCleanRuntimeStatus() {
   executorTelemetry.totalDecodeWallSeconds = 1.5;
   executorTelemetry.imageEncodes = 3;
   executorTelemetry.imageEmbeddingReuses = 4;
+  executorTelemetry.visionArenaBytes = 5;
+  executorTelemetry.embeddingCacheBytes = 6;
+  executorTelemetry.stateHeldImageBytes = 7;
+  executorTelemetry.imageRowsBytes = 8;
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
@@ -176,7 +181,8 @@ void testCleanRuntimeStatus() {
               json.find("\"kv_restores\":3") != std::string::npos,
           "disk token accounting must include transfers completed before admission retries");
   require(json.find("\"read_bytes\":12345") != std::string::npos &&
-              json.find("\"written_bytes\":67890") != std::string::npos,
+              json.find("\"written_bytes\":67890") != std::string::npos &&
+              json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
@@ -198,7 +204,9 @@ void testCleanRuntimeStatus() {
   require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
               std::string::npos,
           "status advertised model capacity instead of the active engine limit");
-  require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4}") !=
+  require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4,"
+                    "\"arena_bytes\":5,\"cached_bytes\":6,\"state_held_bytes\":7,"
+                    "\"rows_bytes\":8}") !=
               std::string::npos,
           "image telemetry is missing from status");
   require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","

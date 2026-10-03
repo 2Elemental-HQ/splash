@@ -19,13 +19,39 @@ namespace {
 
 class State final : public CompositeState {
 public:
+  State() = default;
+  // A lane's snapshot: once the cache lets go of it, its buffers return to
+  // the model's pool, as QwenStateStorage's do.
+  explicit State(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
+  ~State() override {
+    if (pool_)
+      *pool_ += bytes();
+  }
   uint64_t bytes() const noexcept override { return 64; }
+
+private:
+  std::shared_ptr<uint64_t> pool_;
 };
 
 class DiskState final : public CompositeState {
 public:
   uint64_t bytes() const noexcept override { return 64; }
   uint64_t residentBytes() const noexcept override { return 0; }
+};
+
+// A state that holds rows its model can rebuild, as a replay point inside an
+// image holds that image's rows: once the cache drops the state, the rows
+// are one more of the model's cache units.
+class RowsHoldingState final : public CompositeState {
+public:
+  RowsHoldingState(std::vector<uint64_t> &cacheUnits, uint64_t rows)
+      : cacheUnits_(cacheUnits), rows_(rows) {}
+  ~RowsHoldingState() override { cacheUnits_.push_back(rows_); }
+  uint64_t bytes() const noexcept override { return 64; }
+
+private:
+  std::vector<uint64_t> &cacheUnits_;
+  uint64_t rows_;
 };
 
 struct OffloadControl {
@@ -48,10 +74,18 @@ private:
   std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
 };
 
+// With a pool, it is a lane's snapshot whose buffers return to the model's
+// pool once the cache lets go of them, like State's.
 class OffloadState final : public CompositeState {
 public:
-  explicit OffloadState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
-  ~OffloadState() override { control_->released = true; }
+  explicit OffloadState(std::shared_ptr<OffloadControl> control,
+                        std::shared_ptr<uint64_t> pool = nullptr)
+      : control_(std::move(control)), pool_(std::move(pool)) {}
+  ~OffloadState() override {
+    control_->released = true;
+    if (pool_)
+      *pool_ += bytes();
+  }
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload() const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
@@ -59,6 +93,7 @@ public:
   }
 private:
   std::shared_ptr<OffloadControl> control_;
+  std::shared_ptr<uint64_t> pool_;
 };
 
 struct RestoreControl {
@@ -139,6 +174,7 @@ public:
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
     lastBeginId = request.id;
+    lastRestoredTokens = request.restoredTokens;
     if (beginObserver) beginObserver();
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
@@ -172,6 +208,7 @@ public:
   }
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
+    lastRestoredTokens = request.restoredTokens;
     if (resumeDenied)
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
@@ -359,7 +396,9 @@ public:
     if (snapshotRoom && !snapshotRoom())
       return nullptr;
     ++snapshots;
-    return std::make_shared<State>();
+    if (stateHeldRows)
+      return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
+    return std::make_shared<State>(evictedStateBytes);
   }
   // Without a cache slot the production model writes the lane's state to
   // the disk tier; the fake has one when `stateTier` is set, with quota for
@@ -372,8 +411,15 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
-  uint64_t reclaimIdleState(bool keepLane) noexcept override {
+  uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
     keptLane = keepLane;
+    // The buffers of states the cache let go of refill the lane's footprint;
+    // the rest is idle.
+    const uint64_t refill = std::min(
+        *evictedStateBytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    pooledLaneBytes += refill;
+    reclaimableIdleStateBytes += *evictedStateBytes - refill;
+    *evictedStateBytes = 0;
     if (!keepLane && pooledLaneBytes)
       return std::exchange(pooledLaneBytes, 0);
     const uint64_t released = reclaimableIdleStateBytes;
@@ -381,7 +427,14 @@ public:
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
       *kvGrowthBlocked = false;
-    return released;
+    if (released || scope == model::IdleMemory::Buffers)
+      return released;
+    ++cacheReclaims;
+    if (cacheUnits.empty())
+      return 0;
+    const uint64_t unit = cacheUnits.back();
+    cacheUnits.pop_back();
+    return unit;
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t>) override {
@@ -448,6 +501,8 @@ public:
   uint32_t beginAttempts = 0;
   // The request of the latest begin(), for hooks that refuse only some.
   uint64_t lastBeginId = 0;
+  // The restored prefix the latest begin() or resume() activated with.
+  uint32_t lastRestoredTokens = 0;
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
@@ -466,11 +521,23 @@ public:
       metal::AllocationFailure::EngineBudget;
   uint64_t reclaimableIdleStateBytes = 0;
   // The pooled buffers a lane starts from; only a reclaim that does not keep
-  // the lane releases them.
+  // the lane releases them. A reclaim first refills them, up to
+  // laneFootprintBytes, from the buffers of evicted states.
   uint64_t pooledLaneBytes = 0;
+  uint64_t laneFootprintBytes = 0;
+  // The buffers of snapshots the cache has let go of, until reclaimIdleState
+  // takes them into the pool.
+  std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
   // The cached states whose buffers the pool lacks for one activation.
   std::function<uint32_t()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
+  // Caches the model can rebuild, one released per reclaim step that may
+  // take them once no buffer is idle; cacheReclaims counts those steps.
+  std::vector<uint64_t> cacheUnits;
+  uint32_t cacheReclaims = 0;
+  // Rows each state snapshotted from then on holds (RowsHoldingState); the
+  // executor must outlive the cache that keeps those states.
+  uint64_t stateHeldRows = 0;
   bool keptLane = false;
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
@@ -878,6 +945,44 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
   }
 }
 
+// A sibling's shared boundary on one of the producer's checkpoints makes that
+// checkpoint a state the sibling resumes from: it is published as a junction
+// and outlives the producer's later progress instead of rolling with it.
+void testSharedJunctionAtACheckpointIsReusable() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  // The producer checkpoints at 4096; the sibling shares its first 4100
+  // tokens.
+  std::vector<uint32_t> prompt(8193);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  auto producer = request(1, prompt);
+  // Admitted first, it plans the sibling's junction on its own checkpoint.
+  producer.priority = RequestPriority::Foreground;
+  engine.submit(std::move(producer));
+  std::vector<uint32_t> sibling(prompt.begin(), prompt.begin() + 4100);
+  sibling.resize(4200, 0);
+  engine.submit(request(2, sibling));
+  runUntilIdle(engine);
+  const auto counters = engine.snapshot();
+  require(events.starts.at(1) ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+              executor.restored == 4096,
+          "the sibling did not resume from the producer's shared boundary");
+  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 0 &&
+              counters.resources.stateCache.checkpointRetirements == 0 &&
+              counters.resources.stateCache.checkpointEntries == 0,
+          "the shared boundary was published as a rolling checkpoint");
+  std::vector<uint32_t> next(prompt.begin(), prompt.begin() + 4100);
+  next.resize(4140, 1);
+  require(resources.lookup(next).resumeBoundary() == 4096,
+          "the producer's later progress retired the shared junction");
+}
+
 void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
@@ -900,7 +1005,42 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
           "capacity failure prevented subsequent service");
 }
 
-void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
+// A request that fails in an admission pass stays listed until the pass
+// ends; a sibling admitted after it in the same pass plans no junction for
+// it.
+void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, cache, executor, events);
+  guardReleases(storage, engine);
+  // 64 shared tokens, then 33 of each one's own.
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  // Alone, the first cannot get its state: it fails at once.
+  executor.deniedBegins = 1;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 64, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(events.capacityExhaustedCount == 1 && events.startIds == std::vector<uint64_t>{2},
+          "the two requests were not admitted in one pass");
+  runUntilIdle(engine);
+  const auto &boundaries = executor.plans.at(2).boundaries;
+  require(std::none_of(boundaries.begin(), boundaries.end(),
+                       [](const DraftBoundaryPlan &boundary) {
+                         return boundary.boundary == 64;
+                       }) &&
+              engine.snapshot().junctionMaterializations == 0 && events.completedCount == 1,
+          "a sibling planned a junction for a request that failed before it");
+}
+
+// A cold request publishes its replay state; once that state is gone, the
+// next request over the same prompt rebuilds it where the KV still matches,
+// as a replay state, and the one after resumes from it.
+void testColdPublishesReplayStateAndRebuildsALostOne() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
@@ -923,17 +1063,18 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
               events.starts[0].first == EngineCacheStatus::Miss,
           "cold request reported a cache hit");
 
-  require(resources.reclaimCache(1, false, false) != 0,
+  require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
   require(executor.restored == 0 && executor.prefillRows == 130 &&
               executor.snapshots == 2 &&
-              engine.snapshot().junctionMaterializations == 1,
-          "second request did not lazily materialize its proven KV junction");
+              engine.snapshot().replayStatePublications == 2 &&
+              engine.snapshot().junctionMaterializations == 0,
+          "second request did not rebuild the lost replay state");
   require(events.starts.size() == 2 &&
               events.starts[1].first == EngineCacheStatus::Miss,
-          "KV-only junction replay was reported as a state hit");
+          "KV-only replay was reported as a state hit");
 
   engine.submit(request(3, prompt));
   runUntilIdle(engine);
@@ -1178,8 +1319,22 @@ void testImageSpansKeyPrefixIdentity() {
           "image request lifecycle did not complete cleanly");
 }
 
+// One prefill chunk that every caller's prompt shares, then 65 tokens of
+// `token`: the replay state lands at 2112. A prompt branching off a cached
+// one at the end of the chunk plans a junction there, a draft window past
+// the start.
+std::vector<uint32_t> branchPrompt(uint32_t token) {
+  std::vector<uint32_t> prompt(model::ExecutionLimits::prefillTokenBudget);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  prompt.resize(prompt.size() + 65, token);
+  return prompt;
+}
+
+// A request branching off a cached conversation that goes on to a state of
+// its own publishes the junction at the branch point, then its own latest
+// replay state.
 void testOneRequestPublishesJunctionAndLatestReplayState() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
@@ -1187,103 +1342,147 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(5, prompt));
+  engine.submit(request(5, branchPrompt(777)));
   runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
-            "test could not leave a KV-only shared prefix");
-  }
-
-  prompt.resize(161, 777);
-  engine.submit(request(6, prompt));
+  engine.submit(request(6, branchPrompt(888)));
   runUntilIdle(engine);
 
   const DraftContextPlan &plan = executor.plans.at(6);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
+  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 2048 &&
+              plan.boundaries[1].boundary == 2112 &&
+              plan.boundaries[2].boundary == 2113,
           "junction, latest replay state, and active end were not ordered");
   require(executor.snapshots == 3 && snapshot.junctionMaterializations == 1 &&
               snapshot.replayStatePublications == 2 &&
-              snapshot.resources.stateCache.entries == 2,
+              snapshot.resources.stateCache.entries == 3,
           "one request did not retain both sparse composite states");
+}
+
+// A junction costs a snapshot, a command split and a draft window of
+// capture, so it is planned only where it saves a later request at least a
+// draft window of prefill: at a branch point that far past the state the
+// request resumes from.
+void testLazyJunctionNeedsADraftWindowOfGain() {
+  test::TestKvStorage storage(256, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> shared(2112);
+  std::iota(shared.begin(), shared.end(), 1);
+  // The shared prefix, then 161 tokens of the conversation's own from
+  // `first` on: its replay state lands at 2272.
+  const auto conversation = [&](uint32_t first) {
+    std::vector<uint32_t> prompt = shared;
+    prompt.resize(shared.size() + 161);
+    std::iota(prompt.begin() + shared.size(), prompt.end(), first);
+    return prompt;
+  };
+  const std::vector<uint32_t> cached = conversation(10'000);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  engine.submit(request(2, conversation(20'000)));
+  runUntilIdle(engine);
+  require(engine.snapshot().junctionMaterializations == 1,
+          "a branch off the cached conversation did not publish its junction");
+  const uint32_t restored = executor.restored;
+  engine.submit(request(3, conversation(30'000)));
+  runUntilIdle(engine);
+  require(executor.restored == restored + 2112 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112},
+          "a third branch did not resume from the junction");
+  // This one follows the cached conversation 96 tokens past the junction,
+  // where that one goes on to its state, and then branches.
+  std::vector<uint32_t> follower = cached;
+  std::iota(follower.begin() + shared.size() + 96, follower.end(), 40'000);
+  engine.submit(request(4, follower));
+  runUntilIdle(engine);
+  const auto &boundaries = executor.plans.at(4).boundaries;
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112} &&
+              std::none_of(boundaries.begin(), boundaries.end(),
+                           [](const DraftBoundaryPlan &boundary) {
+                             return boundary.boundary == 2112 + 96;
+                           }) &&
+              engine.snapshot().junctionMaterializations == 1,
+          "a branch point 96 tokens past the resumed state planned a junction");
 }
 
 // A denied snapshot at the latest replay boundary recycles the least recently
 // used cached state, which is an older unrelated state, not the junction state
 // this same request published one command earlier.
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
   Events events;
-  engine::Engine engine({}, resources, executor, events);
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(7, prompt));
-  runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
-            "test could not remove the old composite state");
-  }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
+  engine.submit(request(7, branchPrompt(777)));
+  runUntilIdle(engine);
   const auto older = resources.snapshot();
-  require(older.stateCache.entries == 1 && older.stateCache.evictions == 1,
+  require(older.stateCache.entries == 2 && older.stateCache.evictions == 0,
           "older unrelated state was not left in the cache");
 
-  prompt.resize(161, 888);
-  engine.submit(request(8, prompt));
+  engine.submit(request(8, branchPrompt(888)));
   require(engine.tick(1) && engine.tick(2),
           "request did not publish its junction state");
   require(engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 2,
+              resources.snapshot().stateCache.entries == 3,
           "lazy junction was not materialized in the first command");
+  // The pages this request held for the cached prefix are free; while the
+  // engine may not grow, a snapshot takes none of them and recycles a state.
+  paused = true;
   executor.deniedSnapshots = 1;
   runUntilIdle(engine);
+  paused = false;
 
   const DraftContextPlan &plan = executor.plans.at(8);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
+  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 2048 &&
+              plan.boundaries[1].boundary == 2112 &&
+              plan.boundaries[2].boundary == 2113,
           "boundaries were not armed without reservation");
   require(executor.deniedSnapshots == 0 &&
               snapshot.recycledStatePublications == 1 &&
               snapshot.replayStatePublications == 3 &&
               snapshot.replayStatePublicationFailures == 0 &&
-              snapshot.resources.stateCache.evictions == 2 &&
-              snapshot.resources.stateCache.entries == 2,
+              snapshot.resources.stateCache.evictions == 1 &&
+              snapshot.resources.stateCache.entries == 3,
           "latest-state denial did not recycle exactly one older state");
 
-  // The junction state survived the recycle: the original prompt resumes
-  // from it, while the recycled prompt is back to a KV-only junction.
+  // The junction state survived the recycle: another branch resumes from
+  // it, while the recycled prompt is back to KV without a state and
+  // publishes its replay state again.
   const uint32_t restored = executor.restored;
-  prompt.resize(97);
-  engine.submit(request(9, prompt));
+  engine.submit(request(9, branchPrompt(999)));
   runUntilIdle(engine);
-  require(executor.restored == restored + 96 &&
+  require(executor.restored == restored + 2048 &&
               events.starts.back() ==
                   std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 96},
+                      EngineCacheStatus::PrefixHit, 2048},
           "latest-state denial discarded the independent junction state");
   engine.submit(request(71, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
   require(events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().junctionMaterializations == 2,
+              engine.snapshot().replayStatePublications == 5 &&
+              engine.snapshot().junctionMaterializations == 1,
           "recycled state was not the older unrelated one");
 }
 
 void testCancellationAfterJunctionDiscardsLaterState() {
-  test::TestKvStorage storage(64, 4096, 4);
+  test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor(1);
@@ -1291,32 +1490,23 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
 
-  std::vector<uint32_t> prompt(97);
-  for (uint32_t index = 0; index < prompt.size(); ++index)
-    prompt[index] = index + 1;
-  engine.submit(request(9, prompt));
+  engine.submit(request(9, branchPrompt(777)));
   runUntilIdle(engine);
-  while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false, false) != 0,
-            "test could not remove the old composite state");
-  }
-
-  prompt.resize(161, 999);
-  engine.submit(request(10, prompt));
+  engine.submit(request(10, branchPrompt(999)));
   require(engine.tick(1) && engine.tick(2),
           "request did not publish its first sparse state");
   const auto published = engine.snapshot();
-  require(published.resources.stateCache.entries == 1 &&
+  require(published.resources.stateCache.entries == 2 &&
               published.junctionMaterializations == 1 &&
               executor.snapshotAttempts == 2,
           "junction publication did not land in the first command");
   engine.cancel(10);
   runUntilIdle(engine);
-  // The armed 160 boundary is dropped with the lane: no snapshot, no
+  // The armed 2112 boundary is dropped with the lane: no snapshot, no
   // failure counted, and the junction state stays cached.
   const auto cancelled = engine.snapshot();
   require(executor.snapshotAttempts == 2 &&
-              cancelled.resources.stateCache.entries == 1 &&
+              cancelled.resources.stateCache.entries == 2 &&
               cancelled.resources.stateCache.publications == 2 &&
               cancelled.replayStatePublications == 1 &&
               cancelled.replayStatePublicationFailures == 0 &&
@@ -1378,27 +1568,28 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
               events.completedCount == 1,
           "latest replay-state denial was counted incorrectly");
 
-  // The first pass left a usable KV chain but no state. The second lookup is
-  // therefore a real lazy junction; its denied snapshot is counted as such
-  // while the request replays through the KV prefix normally.
+  // The first pass left a usable KV chain but no state. The second request
+  // plans its replay state there again; its denied snapshot is counted as a
+  // replay-state failure while the request replays through the KV prefix
+  // normally.
   engine.submit(request(4, prompt));
   runUntilIdle(engine);
   require(executor.snapshotAttempts == 2 && executor.snapshots == 0 &&
-              engine.snapshot().junctionMaterializationFailures == 1 &&
-              engine.snapshot().replayStatePublicationFailures == 1 &&
+              engine.snapshot().junctionMaterializationFailures == 0 &&
+              engine.snapshot().replayStatePublicationFailures == 2 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
               executor.prefillRows == 130 && events.completedCount == 2 &&
               events.failedCount == 0,
-          "denied lazy junction failed the request or was not counted");
+          "denied replay state failed the request or was not counted");
 
   // The denial is transient: the next lane over the same prefix lands it.
   executor.deniedSnapshots = 0;
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   require(executor.snapshots == 1 &&
-              engine.snapshot().junctionMaterializations == 1 &&
+              engine.snapshot().replayStatePublications == 1 &&
               resources.snapshot().stateCache.entries == 1,
-          "junction was not materialized once snapshots were possible");
+          "replay state was not published once snapshots were possible");
 }
 
 // A snapshot the model denies once at a replay boundary lands by recycling
@@ -1437,7 +1628,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
           "recycling changed the cached state footprint");
 
   // The surviving state belongs to the new lane: re-sending its prompt is a
-  // state hit, while the older prompt is back to a KV-only junction.
+  // state hit, while the older prompt is back to KV without a state.
   engine.submit(request(3, newer));
   runUntilIdle(engine);
   require(executor.restored == 64 &&
@@ -1449,7 +1640,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
   runUntilIdle(engine);
   require(executor.restored == 64 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().junctionMaterializations == 1,
+              engine.snapshot().replayStatePublications == 3,
           "recycled state was not the least recently used one");
 }
 
@@ -1674,6 +1865,55 @@ void testKvGrowthDenialKeepsEveryLaneReplayState() {
           "KV growth denial cost a lane its replay state");
 }
 
+// A pressure pass without a byte target keeps the caches the model can
+// rebuild and returns only its idle buffers; a targeted pass takes the
+// caches one at a time and stops once its target is met.
+void testPressurePassKeepsCachesWithoutATarget() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.reclaimableIdleStateBytes = 64;
+  executor.cacheUnits = {100, 100, 100};
+  static_cast<void>(
+      engine.reclaimMemory({.reclaim = true, .keepServingFootprint = true}));
+  require(executor.reclaimedIdleStateBytes == 64 && executor.cacheReclaims == 0 &&
+              executor.cacheUnits.size() == 3,
+          "a pass without a target took the model's caches");
+  const MemoryReclaimResult targeted = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 150, .keepServingFootprint = true});
+  require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
+              targeted.releasedBytes >= 200,
+          "a targeted pass did not stop taking caches at its target");
+}
+
+// Rows only a cached state held become a cache unit once a pass evicts that
+// state, and a pass whose target is still unmet takes them as well.
+void testPressurePassTakesTheRowsItsEvictionsLeave() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  Executor executor(1);
+  engine::Cache resources(pool, CacheNamespace{});
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.stateHeldRows = 100;
+  engine.submit(request(29, std::vector<uint32_t>(65, 29)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.entries == 1 && executor.cacheUnits.empty(),
+          "setup did not cache a state holding rows");
+  const MemoryReclaimResult critical =
+      engine.reclaimMemory({.reclaim = true,
+                            .evictAllUnpinnedPrefixes = true,
+                            .targetBytes = std::numeric_limits<uint64_t>::max()});
+  require(resources.snapshot().stateCache.entries == 0 && executor.cacheUnits.empty() &&
+              critical.releasedBytes >= 164,
+          "a critical pass left the rows of the state it evicted");
+}
+
 void testPressureReclaimRespectsStateLifetimes() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
@@ -1774,6 +2014,72 @@ void testWarningReclaimKeepsTheServingFootprint() {
           "critical pressure kept the serving footprint");
 }
 
+// A pass counts only memory that leaves the engine. A warning pass that
+// evicts a cached state while the lane's pooled buffers are short gains the
+// host nothing: the state's buffers refill them. The pass goes on to the
+// cached KV and releases the extent that empties, keeping the empty one the
+// next request starts from.
+void testWarningReclaimCountsOnlyWhatReachesTheHost() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(129, 1)));
+  runUntilIdle(engine);
+  constexpr uint64_t extentBytes = 4 * 4096;
+  require(resources.snapshot().stateCache.bytes == 64 &&
+              resources.snapshot().pool.allocatedBytes == 2 * extentBytes &&
+              resources.snapshot().pool.reclaimableExtents == 1,
+          "fixture did not cache a state and an extent of KV beside the runway");
+  // The lane's pooled buffers went back to the host earlier.
+  executor.laneFootprintBytes = 64;
+  const MemoryReclaimResult result = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  require(result.releasedBytes == extentBytes && result.outcome == ReclaimOutcome::Met &&
+              executor.pooledLaneBytes == 64 &&
+              resources.snapshot().stateCache.entries == 0 &&
+              resources.snapshot().pool.allocatedBytes == extentBytes,
+          "a warning pass counted a state whose buffers stayed in the engine");
+}
+
+// Memory a pass frees but keeps still wakes the requests waiting for memory.
+// A start the host refused can start from the lane's pooled buffers; a
+// warning pass that refills them from an evicted state releases nothing,
+// and the start retries at once rather than after its backoff.
+void testWarningReclaimWakesARefusedStart() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  require(resources.snapshot().stateCache.bytes == 64, "fixture did not cache a state");
+  executor.laneFootprintBytes = 64;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.pooledLaneBytes == 0; };
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  static_cast<void>(engine.tick(100));
+  require(engine.resourceWaitSnapshot(100).memory == 1 &&
+              engine.nextWakeupMilliseconds() == 200.0,
+          "the host did not refuse the start");
+  const MemoryReclaimResult result = engine.reclaimMemory(
+      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  require(!result.releasedBytes && executor.pooledLaneBytes == 64 &&
+              resources.snapshot().stateCache.entries == 0 &&
+              engine.nextWakeupMilliseconds() == 0.0,
+          "a pass that refilled the lane's buffers did not wake the refused start");
+  for (double now = 101; now < 120 && !idle(engine); ++now)
+    static_cast<void>(engine.tick(now));
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0,
+          "the start did not run from the refilled buffers");
+}
+
 // A KV chain gives up one leaf at a time, each after its copy is written. A
 // pass reports that transfers hold back the rest of its target, and passes
 // with that rest (MemoryPressurePolicy continues it) take the chain as the
@@ -1795,13 +2101,15 @@ void testPressureReclaimFollowsTheChain() {
   const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
-  cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer));
+  cache.publishCompositeState(
+      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes));
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
     return engine.reclaimMemory({.reclaim = true, .targetBytes = target});
   };
-  // The state's RAM, then the chain's leaf, whose parent waits for its copy.
+  // The state's buffers, which the model returns once the cache has written
+  // the state, then the chain's leaf, whose parent waits for its copy.
   MemoryReclaimResult result = reclaim(364);
   require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
               tier.demotions == 1,
@@ -2288,6 +2596,47 @@ void testEngineLimitBindsThroughTheHostPause() {
           "a lone request at the engine's limit waited for the host instead of failing");
 }
 
+// While the host refuses growth, a lane in service short of a page takes
+// cached KV, not the cached states, whose buffers would give it no page: the
+// checkpoint and the ordinary state stay.
+void testPausedPageShortageKeepsCachedStates() {
+  test::TestKvStorage storage(64, 4096, 1);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  EngineConfig config;
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  // Cached: a checkpoint, an ordinary state below it, and KV below both.
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
+  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128));
+  resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
+  resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>());
+  resources.endRequest(900);
+  // The decode needs one more page, at its 57th token.
+  auto running = request(1, std::vector<uint32_t>(33, 1));
+  running.maxNewTokens = 30;
+  engine.submit(std::move(running));
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); },
+            "the request did not decode");
+  host.paused = true;
+  const StateCacheSnapshot before = resources.snapshot().stateCache;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  const StateCacheSnapshot after = resources.snapshot().stateCache;
+  require(events.completedCount == 1 && engine.snapshot().resourceSuspensions == 0 &&
+              host.reusableAtGrowth.empty(),
+          "the lane did not take a cached page under the pause");
+  require(after.entries == before.entries && after.evictions == before.evictions &&
+              after.checkpointEvictions == 0,
+          "a page shortage under the pause evicted cached states");
+}
+
 // A lone request short of pages under host pressure takes idle cached pages
 // of allocated extents instead of being suspended and replaying its prefix
 // later. Reuse only happens when it can cover the shortfall.
@@ -2706,6 +3055,148 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
               engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0 &&
               resources.snapshot().lookup.lookups == 2,
           "admission waited on its own cache pin instead of recomputing cold");
+}
+
+// Activation learns how much of the prompt a restore brings back, so the
+// model can leave out the images inside it; an attempt that gives up its
+// prefix to fit activates with nothing restored.
+void testActivationReceivesTheRestoreBoundary() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 247);
+  engine.submit(request(247, prompt));
+  runUntilIdle(engine);
+  require(executor.lastRestoredTokens == 0, "a cold start activated with a restored prefix");
+  engine.submit(request(248, prompt));
+  runUntilIdle(engine);
+  require(executor.lastRestoredTokens == 64 && executor.restored == 64,
+          "a prefix hit did not activate with its restore boundary");
+  std::vector<uint32_t> attempts;
+  executor.beginObserver = [&] { attempts.push_back(executor.lastRestoredTokens); };
+  executor.beginGrowthBlocked = [&] {
+    return resources.snapshot().stateCache.entries != 0;
+  };
+  engine.submit(request(249, prompt));
+  runUntilIdle(engine);
+  require(attempts.size() >= 2 && attempts.front() == 64 && attempts.back() == 0 &&
+              events.starts.back().first == EngineCacheStatus::Miss,
+          "the retry without its prefix activated with the dropped restore boundary");
+}
+
+// A start refused memory beside a resident lane is held back by that lane
+// (judge() yields): it waits with the state its prompt resumes from still
+// cached, rather than release its lease to the reclaim and evict that state.
+void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  const std::vector<uint32_t> prompt(65, 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  executor.decodeFinishes = false;
+  auto lane = request(2, std::vector<uint32_t>(65, 2));
+  lane.maxNewTokens = 1000;
+  engine.submit(std::move(lane));
+  tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+            "the resident lane did not decode");
+  // The budget refuses the start while the lane is resident.
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 3 && executor.requests.contains(2);
+  };
+  const uint32_t prefillRows = executor.prefillRows;
+  engine.submit(request(3, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(resources.probe(prompt).cachedTokens() == 64 &&
+              engine.resourceWaitSnapshot(now).memory == 1 &&
+              executor.prefillRows == prefillRows,
+          "a start held back by a resident lane gave up its own cached state");
+  executor.decodeFinishes = true;
+  const uint32_t restored = executor.restored;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the held start did not run");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              executor.restored == restored + 64 && events.failedCount == 0,
+          "the held start did not resume from its cached state");
+}
+
+// Memory a state write in flight holds comes back by itself (judge() waits):
+// a start refused memory meanwhile keeps the state its prompt resumes from.
+void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  auto write = std::make_shared<OffloadControl>();
+  resources.beginRequest(999);
+  require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(999, std::vector<uint32_t>(64, 9), 64),
+      std::make_shared<OffloadState>(write));
+  resources.endRequest(999);
+  require(resources.reclaimOneState(false, 0, false) &&
+              resources.snapshot().stateCache.bytes == 0,
+          "the fixture state was not written");
+  double now = 1;
+  const std::vector<uint32_t> prompt(65, 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  executor.beginGrowthBlocked = [&] { return !write->ready; };
+  engine.submit(request(2, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(resources.probe(prompt).cachedTokens() == 64 &&
+              engine.resourceWaitSnapshot(now).memory == 1 && events.startIds.size() == 1,
+          "a start waiting for a write in flight gave up its own cached state");
+  write->ready = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the waiting start did not run");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.failedCount == 0,
+          "the waiting start did not resume from its cached state");
+}
+
+// A start alone with nothing else to free releases its own lease, and the
+// reclaim writes the state to disk; holding its lane, it looks up again and
+// restores that copy instead of recomputing the prefix.
+void testDroppedLeaseLooksUpAgain() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 17);
+  auto write = std::make_shared<OffloadControl>();
+  write->ready = true;
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  cache.publishCompositeState(cache.publishCommittedBlocks(999, prompt, 64),
+                              std::make_shared<OffloadState>(write));
+  cache.endRequest(999);
+  executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.bytes != 0; };
+  executor.restoreControl->ready = true;
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  require(executor.diskReads == 1 && executor.restored == 64 && executor.prefillRows == 1 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.failedCount == 0,
+          "a start that dropped its lease recomputed the state the reclaim wrote");
 }
 
 void testSingletonCapacityFailureTerminatesCleanly() {
@@ -3588,10 +4079,10 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   require(resources.snapshot().stateCache.entries == 0,
           "snapshot denial left a composite state to restore");
 
-  // Retain a KV junction one draft window past the prompt's replay boundary,
-  // whose state is gone. The resumed lane rebuilds that state, where the
-  // conversation's next turn resumes, then captures the junction and the
-  // generated history's end.
+  // Retain the lane's KV one draft window past the prompt's replay boundary,
+  // whose state is gone. That KV ends there, so it is no junction: the
+  // resumed lane rebuilds the state where the conversation's next turn
+  // resumes, then captures the generated history's end.
   constexpr uint32_t retainedKvTokens = 6144;
   while (resources.snapshot().kvCache.blocks >
          retainedKvTokens / KvCache::pageTokens) {
@@ -3602,7 +4093,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
     auto lookup = resources.lookup(history);
     require(lookup.kvBoundary == retainedKvTokens &&
                 lookup.resumeBoundary() == 0,
-            "long replay did not retain the intended stateless KV junction");
+            "long replay did not retain the intended stateless KV");
   }
 
   storage.growthBlocked = false;
@@ -3612,8 +4103,8 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   now += 101;
   require(engine.tick(now++), "long replay did not resume after pressure eased");
   const auto &plan = executor.plans.at(id);
-  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 3 &&
-              plan.boundaries.front().boundary == 4096,
+  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 2 &&
+              plan.boundaries.size() == 3 && plan.boundaries.front().boundary == 4096,
           "resumed draft plan did not rebuild the prompt's replay point first");
   const double finishBy = now + 100;
   for (; now < finishBy && !idle(engine); ++now)
@@ -3643,6 +4134,59 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   require(resources.lookup(next).resumeBoundary() == 4096 &&
               resources.snapshot().stateCache.inUse == 0,
           "the resumed lane did not rebuild the prompt's replay point");
+}
+
+// A sibling that arrives while a producer is suspended waits for it once
+// it resumes, as for any producer, and the resumed producer plans the
+// junction at their shared boundary as any producer does: the sibling
+// resumes there instead of prefilling up to a checkpoint interval of the
+// prefix it shares.
+void testResumedProducerPlansJunctionsForSiblings() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(20001);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(engine, now,
+            [&] { return !engine.commandInFlight() && executor.prefillRows >= 10'000; },
+            "the producer did not pass its checkpoint at 8192");
+  // The host refuses the producer's next pages: it yields its lane.
+  paused = true;
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+            "the producer was not suspended");
+  std::vector<uint32_t> sibling(prompt.begin(), prompt.begin() + 18'000);
+  sibling.resize(18'065, 0);
+  engine.submit(request(2, sibling));
+  const uint32_t rows = executor.prefillRows;
+  paused = false;
+  storage.growthBlocked = false;
+  now += 101;
+  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.waitingPrefix == 1; },
+            "the sibling did not wait for the resumed producer");
+  const auto &boundaries = executor.plans.at(1).boundaries;
+  require(executor.resumptions == 1 && executor.restored == 8192 &&
+              std::any_of(boundaries.begin(), boundaries.end(),
+                          [](const DraftBoundaryPlan &boundary) {
+                            return boundary.boundary == 17'984;
+                          }),
+          "the resumed producer planned no junction at the shared boundary");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 17'984} &&
+              executor.prefillRows - rows == (prompt.size() - 8192) + (sibling.size() - 17'984) &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "the sibling did not resume from the resumed producer's junction");
 }
 
 // The field case of a lane suspended mid-decode: it resumes with its
@@ -3754,9 +4298,11 @@ void testResumedLaneRebuildsItsPointFromCachedKv(uint32_t extentsPerState) {
 }
 
 // A snapshot that extents do not let fit is denied for a reason other than
-// the budget: once the extents its publication released cover one snapshot,
-// the publication ends. It cost the other conversation one extent's worth of
-// KV at most, and the replay point goes unpublished.
+// the budget: once the extents a publication released cover one snapshot,
+// that publication ends. The resumed lane's prompt replay point, in use,
+// costs the other conversation one extent, its last page moved into the
+// free pages; the point its history reaches is a checkpoint, which takes
+// only checkpoints. Neither point is published.
 void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   LostReplayPoint fixture;
   fixture.executor.stateBytes = 4 * 4096;
@@ -3766,9 +4312,42 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
   next.resize(next.size() + 40, 9);
   require(idle(fixture.engine) && fixture.events.completedCount == 1 &&
               fixture.storage.releasedExtents == fixture.releases + 1 &&
-              fixture.resources.lookup(fixture.other).kvBoundary >= 256 - 4 * 32 &&
+              fixture.resources.lookup(fixture.other).kvBoundary == 256 - 32 &&
               fixture.resources.probe(next).cachedTokens() == 0,
           "a denied snapshot took more than one snapshot's worth of extents");
+}
+
+// A shared prefill's junction is an ordinary publication: with no cached
+// state to recycle, it makes room from another conversation's cached KV, an
+// extent at a time, and the sibling resumes from it rather than recompute
+// the shared prefix.
+void testSharedJunctionPublishesFromCachedKv() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  // Another conversation's KV, with no state, fills two whole extents.
+  resources.beginRequest(900);
+  require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
+  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256));
+  resources.endRequest(900);
+  // A snapshot needs memory that only a released extent gives.
+  const uint32_t releases = storage.releasedExtents;
+  executor.snapshotRoom = [&] { return storage.releasedExtents > releases; };
+  for (uint32_t id = 1; id <= 2; ++id) {
+    std::vector<uint32_t> prompt(193, 7);
+    std::fill(prompt.begin() + 160, prompt.end(), id + 10);
+    engine.submit(request(id, prompt));
+  }
+  runUntilIdle(engine);
+  const auto snapshot = engine.snapshot();
+  require(snapshot.junctionMaterializations == 1 &&
+              snapshot.junctionMaterializationFailures == 0 && executor.restored == 160 &&
+              executor.prefillRows == 193 + 33 && events.completedCount == 2,
+          "the shared junction did not make room from cached KV");
 }
 
 // While growth is paused a released extent gives a snapshot nothing, so a
@@ -5086,7 +5665,8 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
     maximumEntries =
         std::max(maximumEntries, resources.snapshot().stateCache.entries);
   }
-  const uint32_t checkpoints = (prompt.size() / defaultCheckpointTokens);
+  // 24576 lies within one prefill chunk of the replay boundary at 24992.
+  const uint32_t checkpoints = 5;
   require(idle(engine) && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
@@ -5245,15 +5825,25 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
           "fixture did not commit past the last recovery point");
   engine.cancel(530);
   runUntilIdle(engine);
+  // Another conversation leaves the prompt at 18432 and goes on to a state
+  // of its own, so the retry's matched KV ends at a branch point.
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 18432);
+  branch.resize(18432 + KvCache::pageTokens, 35);
+  resources.beginRequest(999);
+  require(resources.ensureTokens(999, branch.size()).granted(), "branch fixture KV failed");
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(999, branch, static_cast<uint32_t>(branch.size())),
+      std::make_shared<State>());
+  resources.endRequest(999);
   engine.submit(request(531, prompt));
   require(engine.tick(1) && engine.tick(2) &&
               events.starts.back().second == 16384 &&
               engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry kept an earlier recovery point after publishing its junction");
   runUntilIdle(engine);
-  require(resources.snapshot().stateCache.entries == 2 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry did not retain its normal junction and replay states");
 }
@@ -5273,16 +5863,17 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   require(pinned.resumeBoundary() == defaultCheckpointTokens,
           "fixture did not pin its checkpoint");
   runUntilIdle(engine);
+  // The checkpoints at 8192 and 12288 cannot retire the pinned one; 16384
+  // lies within one prefill chunk of the replay boundary at 17984.
   require(engine.snapshot().checkpointPublications == 1 &&
-              engine.snapshot().checkpointPublicationFailures ==
-                  (prompt.size() / defaultCheckpointTokens) - 1 &&
+              engine.snapshot().checkpointPublicationFailures == 2 &&
               executor.snapshotAttempts == 2 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
-  require(resources.reclaimOneState(false, 0, true) &&
+  require(resources.reclaimOneState(false, 0, false) &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
@@ -5429,7 +6020,9 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   runUntilIdle(engine);
   const std::vector<uint32_t> prompt(18001, 28);
   engine.submit(request(461, prompt));
-  runUntilCheckpoint(engine, (prompt.size() / defaultCheckpointTokens));
+  // The last checkpoint is at 12288: 16384 lies within one prefill chunk of
+  // the replay boundary at 17984.
+  runUntilCheckpoint(engine, 3);
   executor.snapshotObserver = [&] {
     require(resources.snapshot().stateCache.entries == 1 &&
                 resources.lookup(hot).resumeBoundary() == 64,
@@ -5441,7 +6034,9 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
           "final state evicted unrelated hot state before its own checkpoint");
 }
 
-void testFinalJunctionRetiresEarlierProgressPoint() {
+// A junction is an ordinary state: publishing one retires the lane's
+// earlier progress point, as its replay state does.
+void testJunctionRetiresEarlierProgressPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, CacheNamespace{});
@@ -5450,18 +6045,30 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> prompt(20001, 29);
+  // Another conversation leaves the prompt at 18432 and goes on to a state
+  // of its own: the request plans a junction at that branch point, past its
+  // checkpoint at 16384.
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 18432);
+  branch.resize(18432 + KvCache::pageTokens, 30);
   resources.beginRequest(470);
-  require(resources.ensureTokens(470, 20000).granted(),
+  require(resources.ensureTokens(470, branch.size()).granted(),
           "junction fixture could not allocate its KV prefix");
-  static_cast<void>(resources.publishCommittedBlocks(470, prompt, 20000));
+  resources.publishCompositeState(
+      resources.publishCommittedBlocks(470, branch, static_cast<uint32_t>(branch.size())),
+      std::make_shared<State>());
   resources.endRequest(470);
   engine.submit(request(471, prompt));
+  double now = 1;
+  tickUntil(engine, now, [&] { return engine.snapshot().junctionMaterializations == 1; },
+            "the request did not publish its junction");
+  require(engine.snapshot().checkpointPublications == 4 &&
+              resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.snapshot().stateCache.entries == 2,
+          "the junction left a superseded progress checkpoint resident");
   runUntilIdle(engine);
-  require(engine.snapshot().checkpointPublications == (prompt.size() / defaultCheckpointTokens) &&
-              engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 1 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.lookup(prompt).resumeBoundary() == 20000,
-          "prompt-end junction left a superseded progress checkpoint resident");
+          "the request did not publish its replay state after the junction");
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
@@ -5538,7 +6145,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
               events.failedCount == 0,
           "branch replayed before its latest checkpoint or failed completion");
   require(finished.checkpointPublications == 5 &&
-              finished.junctionMaterializations == 1 &&
+              finished.replayStatePublications == 1 &&
               finished.resources.stateCache.entries == 1 &&
               finished.resources.stateCache.checkpointEntries == 0 &&
               finished.resources.stateCache.checkpointRetirements == 5 &&
@@ -5569,6 +6176,56 @@ void testCheckpointIntervalValidationAndDisable() {
   require(engine.snapshot().checkpointPublications == 0 && executor.snapshots == 1 &&
               resources.snapshot().stateCache.entries == 1,
           "disabling checkpoints changed existing replay-state behavior");
+}
+
+// A checkpoint costs a command split and a snapshot, so none is planned
+// within one prefill chunk of where a request resumes or of its replay
+// boundary: not for a follow-up resuming at 2976 whose replay boundary is
+// 4192, nor for one resuming at 4064.
+void testCheckpointsSkipNearResumeAndReplayBoundaries() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto checkpointPlanned = [&](uint64_t id) {
+    const auto &boundaries = executor.plans.at(id).boundaries;
+    return std::any_of(boundaries.begin(), boundaries.end(),
+                       [](const DraftBoundaryPlan &boundary) {
+                         return boundary.boundary == defaultCheckpointTokens;
+                       });
+  };
+  std::vector<uint32_t> prompt(3009);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest first = request(1, prompt);
+  // Its replay point lands at 2976, before the generation prompt.
+  first.generationPromptTokens = 7;
+  engine.submit(std::move(first));
+  runUntilIdle(engine);
+  const uint32_t snapshots = executor.snapshots;
+  prompt.resize(3002);
+  prompt.resize(4201, 500);
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2976} &&
+              !checkpointPlanned(2) && engine.snapshot().checkpointPublications == 0 &&
+              executor.snapshots == snapshots + 1,
+          "a follow-up checkpointed within a chunk of its resume point or replay boundary");
+
+  std::vector<uint32_t> resumed(4065);
+  std::iota(resumed.begin(), resumed.end(), 10'000);
+  engine.submit(request(3, resumed));
+  runUntilIdle(engine);
+  resumed.resize(8193, 600);
+  engine.submit(request(4, resumed));
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4064} &&
+              !checkpointPlanned(4) && engine.snapshot().checkpointPublications == 0,
+          "a request checkpointed within a chunk of the state it resumed from");
 }
 
 void testDecodeShareValidation() {
@@ -5669,9 +6326,9 @@ void testStateWithoutACacheSlotGoesToDisk() {
 }
 
 // A foreground arrival does not wait for a background producer of the same
-// prompt, so both lanes compute it. Without a cache slot the producer's
-// states go to disk, and the other lane's publications at the same blocks
-// find them there: they are deduplicated, not counted as writes.
+// prompt, so both lanes compute it. Without a cache slot the first replay
+// state to land goes to disk, and the other lane's publication at the same
+// block finds it there: it is deduplicated, not counted as a write.
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -5696,9 +6353,8 @@ void testStateAlreadyOnDiskIsDeduplicated() {
               executor.prefillRows == 2 * prompt.size(),
           "both lanes did not compute the prompt");
   const auto counters = engine.snapshot();
-  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+  require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
               counters.replayStatePublications == 1 &&
-              counters.junctionMaterializations == 1 &&
               counters.deduplicatedStatePublications == 1 &&
               counters.resources.stateCache.deduplicatedPublications == 1,
           "a state already on disk was counted as written");
@@ -5820,7 +6476,11 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
   }
 }
 
-void testNearFinalCheckpointAvoidsDiskWrite() {
+// No checkpoint is planned within one prefill chunk of the replay boundary,
+// whether a cache slot would take it or only the disk: the replay state lands
+// in the next command. One a chunk or more away is published, on disk when no
+// cache slot takes it, and the replay state retires it.
+void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
     for (uint32_t remaining : {32u, chunk - 32, chunk}) {
@@ -5838,7 +6498,7 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
       const auto counters = engine.snapshot();
-      const uint64_t checkpoint = !denyRam || remaining >= chunk;
+      const uint64_t checkpoint = remaining >= chunk;
       require(counters.checkpointPublications == checkpoint &&
                   counters.checkpointPublicationFailures == 0 &&
                   counters.replayStatePublications == 1 &&
@@ -5847,7 +6507,8 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   counters.resources.stateCache.entries == 1 &&
                   counters.resources.stateCache.checkpointEntries == 0 &&
                   events.completedCount == 1 && events.failedCount == 0,
-              "near-final disk checkpoint policy changed RAM checkpoints or lost final state");
+              "a checkpoint within a chunk of the replay boundary was planned or the final "
+              "state was lost");
       executor.restoreControl->ready = true;
       engine.submit(request(2, prompt));
       runUntilIdle(engine);
@@ -5855,11 +6516,14 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
                                                        uint32_t(prompt.size() - 1)} &&
                   events.completedCount == 2 && events.failedCount == 0,
-              "skipping a disk checkpoint lost the final reusable prefix");
+              "skipping a checkpoint lost the final reusable prefix");
     }
   }
 }
 
+// The multiple of the interval within one prefill chunk of the replay
+// boundary is not planned: a lane cancelled past it, in RAM or with its
+// checkpoint on disk, resumes from the checkpoint before it.
 void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -5867,7 +6531,6 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     engine::Cache cache(pool, CacheNamespace{});
     Executor executor(1);
     executor.deniedSnapshots = disk ? 1000 : 0;
-    executor.denySnapshotAtBoundary = 2 * defaultCheckpointTokens;
     executor.stateTier = std::make_shared<OffloadControl>();
     executor.stateTier->ready = true;
     executor.restoreControl->ready = true;
@@ -5885,12 +6548,17 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     const auto before = engine.snapshot();
     require(!engine.commandInFlight() &&
                 executor.requests.at(1).position == 2 * defaultCheckpointTokens &&
+                std::none_of(executor.plans.at(1).boundaries.begin(),
+                             executor.plans.at(1).boundaries.end(),
+                             [](const DraftBoundaryPlan &boundary) {
+                               return boundary.boundary == 2 * defaultCheckpointTokens;
+                             }) &&
                 before.checkpointPublications == 1 &&
                 before.checkpointPublicationFailures == 0 &&
                 before.resources.stateCache.checkpointEntries == 1 &&
                 before.resources.stateCache.checkpointRetirements == 0 &&
                 executor.diskSnapshots == (disk ? 1 : 0),
-            "skipped near-final checkpoint retired or rewrote its predecessor");
+            "a near-final checkpoint was planned or replaced its predecessor");
     engine.cancel(1);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
@@ -5987,7 +6655,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
@@ -6062,7 +6730,7 @@ void testPageShortfallDemotesInBulk() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   // The cached blocks fill two extents but two of their pages: those two
@@ -6131,7 +6799,7 @@ void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers() &&
+  require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
 }
@@ -6272,8 +6940,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   const auto block = cache.publishCommittedBlocks(999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 64 &&
-              cache.pollTransfers(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -6305,6 +6972,156 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   require(stats.kvTier.restores == 2 &&
               stats.kvCache.blocks == 2 && stats.kvTier.diskBlocks == 2,
           "restore accounting is off");
+}
+
+// Siblings that share a prefix whose deepest state is on disk wait for the
+// one admitted first while it is still restoring: it planned the junction at
+// their shared boundary at admission, so the state is read once and the
+// shared span prefilled once.
+void testSharedPrefillWaitsForARestoringProducer() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // 64 tokens whose state is on disk, 128 more both share, 34 of their own.
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  publishDiskState(cache, prompt);
+  executor.restoreControl->ready = false;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 192, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(executor.diskReads == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+          "the sibling did not wait for the restoring producer");
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(executor.diskReads == 1 &&
+              events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 192} &&
+              executor.prefillRows == (192 - 64) + 2 * 34 && events.completedCount == 2,
+          "the sibling read the state again or prefilled the shared span");
+}
+
+// A restoring producer that is cancelled keeps its lane until its read has
+// drained, but publishes nothing: its waiting sibling starts at once and
+// restores the prefix itself.
+void testCancelledRestoringProducerReleasesItsWaiter() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  publishDiskState(cache, prompt);
+  const std::shared_ptr<RestoreControl> producerRead = executor.restoreControl;
+  engine.submit(request(1, prompt));
+  std::fill(prompt.begin() + 192, prompt.end(), 7);
+  engine.submit(request(2, prompt));
+  static_cast<void>(engine.tick(1));
+  require(executor.diskReads == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+          "the sibling did not wait for the restoring producer");
+  engine.cancel(1);
+  executor.restoreControl = std::make_shared<RestoreControl>();
+  static_cast<void>(engine.tick(2));
+  require(executor.diskReads == 2 && engine.resourceWaitSnapshot(2).restoring == 2 &&
+              executor.requests.contains(1),
+          "the sibling waited for a cancelled producer's read to drain");
+  producerRead->ready = true;
+  executor.restoreControl->ready = true;
+  runUntilIdle(engine);
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              engine.snapshot().cancelled == 1 && events.completedCount == 2,
+          "the sibling did not restore the prefix itself");
+}
+
+// A request whose restore could not fit ignores the cache until it starts:
+// it uses no producer's state, so it does not wait for one, even for one
+// restoring the same prefix with a boundary planned inside it, and no
+// producer plans a junction for it.
+void testSkipCacheRequestDoesNotWaitForAProducer() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // The state at 64 and both blocks of KV under it are on disk.
+  std::vector<uint32_t> prompt(226);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+  cache.endRequest(999);
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
+          "state was not demoted");
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  while (pool.snapshot().pagesAllocated)
+    require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress,
+            "an empty extent was not released");
+  // Alone, with no page the budget grants, its restore fails: it skips the
+  // cache from then on.
+  storage.growthBlocked = true;
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(engine.resourceWaitSnapshot(1).memory == 1 && executor.diskReads == 0,
+          "the restore that could not fit did not wait for memory");
+  storage.growthBlocked = false;
+  // A foreground request sharing its first 192 tokens is admitted first and
+  // restores the prefix. It plans a junction at 160 for a sibling sharing
+  // that much with it, and none at 192 for the request that skips the cache.
+  std::vector<uint32_t> producer = prompt;
+  std::fill(producer.begin() + 192, producer.end(), 7);
+  auto foreground = request(2, producer);
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  std::vector<uint32_t> sibling = producer;
+  std::fill(sibling.begin() + 160, sibling.end(), 9);
+  engine.submit(request(3, sibling));
+  double now = 101;
+  tickUntil(engine, now,
+            [&] {
+              return std::find(events.startIds.begin(), events.startIds.end(), 1) !=
+                     events.startIds.end();
+            },
+            "the request that skips the cache did not start");
+  require(events.starts.front() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::Miss, 0} &&
+              executor.diskReads == 1 && executor.restored == 0,
+          "the request that skips the cache waited for the restoring producer");
+  executor.restoreControl->ready = true;
+  for (; now < 300 && !idle(engine); ++now) {
+    static_cast<void>(engine.tick(now));
+    tier.complete();
+  }
+  require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
+          "the requests did not finish");
+  const auto &boundaries = executor.plans.at(2).boundaries;
+  require(events.starts.back() ==
+                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 160} &&
+              std::none_of(boundaries.begin(), boundaries.end(),
+                           [](const DraftBoundaryPlan &boundary) {
+                             return boundary.boundary == 192;
+                           }),
+          "the producer planned a junction for the request that skips the cache");
 }
 
 // A request admitted into a restore waits for its disk reads, not for
@@ -6415,7 +7232,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
     const auto block = cache.publishCommittedBlocks(id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "state was not demoted");
   }
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
@@ -6572,7 +7389,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
@@ -6639,7 +7456,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
@@ -6969,9 +7786,11 @@ void testSuspendedRequestKeepsItsReplayPoint() {
           "the next turn lost the replay point its predecessor resumed from");
 }
 
-// A resumed lane keeps using its prompt's replay point: the point its
+// A resumed lane keeps using its prompt's replay point. The point its
 // generated history reaches lies inside the generation prompt, which the
-// conversation's next turn renders anew, so that point stays ordinary.
+// conversation's next turn renders anew: that state is the lane's own
+// progress, a checkpoint, and once the lane has finished, reclaim takes it
+// before the prompt's point.
 void testResumedLaneKeepsThePromptReplayPoint() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
@@ -7000,28 +7819,102 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   for (; now < 400 && resources.snapshot().stateCache.entries < 3; ++now)
     static_cast<void>(engine.tick(now));
   require(executor.resumptions == 1 && executor.restored == 32 &&
-              resources.snapshot().stateCache.entries == 3,
-          "the resumed lane did not publish its history's replay point");
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "the resumed lane did not publish its history's point as a checkpoint");
   // Prompt tokens are the request id.
-  const uint64_t id = executor.resumedPrompts.front().front();
-  require(!events.usage.contains(id), "the resumed lane finished early");
-  while (resources.snapshot().stateCache.entries > 1) {
+  const std::vector<uint32_t> history = executor.resumedPrompts.front();
+  const uint64_t id = history.front();
+  require(!events.usage.contains(id) && resources.probe(history).cachedTokens() == 64,
+          "the resumed lane finished early");
+  for (; now < 400 && !idle(engine); ++now)
+    static_cast<void>(engine.tick(now));
+  require(idle(engine), "the resumed lane did not finish");
+  // The first state reclaim takes is the history's checkpoint.
+  while (resources.snapshot().stateCache.entries == 3) {
     require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "the cache could not be reclaimed");
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.probe(history).cachedTokens() == 32,
+          "the history's point outlasted the prompt's");
+  // A shrink that keeps the resume point keeps the prompt's point.
+  while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse, true)
+             .madeProgress) {
   }
   // The next turn keeps the text before the generation prompt.
   std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
   next.resize(80, 7);
-  require(resources.probe(next).cachedTokens() == 32,
-          "the history's replay point outlasted the prompt's");
-  for (; now < 400 && !idle(engine); ++now)
-    static_cast<void>(engine.tick(now));
+  require(resources.snapshot().stateCache.entries == 1 &&
+              resources.probe(next).cachedTokens() == 32,
+          "the shrink did not keep the prompt's replay point");
   engine.submit(request(266, next));
   for (; now < 500 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && events.starts.back() ==
               std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 32},
           "the next turn did not resume from the prompt's replay point");
+}
+
+// A lane suspended right after publishing the end of its generated history
+// resumes from that checkpoint, which stays one: it is the lane's own
+// progress, not where the conversation's next turn resumes, so once the lane
+// has finished, reclaim takes it before the prompt's replay point.
+void testRestoredHistoryCheckpointStaysDisposable() {
+  test::TestKvStorage storage(64, 4096, 1);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hostPressure = [&](bool refused) {
+    paused = refused;
+    storage.growthBlocked = refused;
+    storage.allocationFailure = refused ? metal::AllocationFailure::HostPressure
+                                        : metal::AllocationFailure::EngineBudget;
+  };
+  auto value = request(1, std::vector<uint32_t>(65, 5));
+  // The prompt's replay point lands at 32; a history of 89 tokens ends at 64.
+  value.generationPromptTokens = 30;
+  value.maxNewTokens = 30;
+  value.priority = RequestPriority::Background;
+  engine.submit(std::move(value));
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); }, "the lane did not decode");
+  // The page its 24th token needs is refused: the lane yields with a history
+  // of 89 tokens, resumes from the prompt's point and checkpoints at 64.
+  hostPressure(true);
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; }, "the lane was not suspended");
+  hostPressure(false);
+  tickUntil(engine, now, [&] { return engine.snapshot().checkpointPublications == 1; },
+            "the resumed lane did not checkpoint its history's end");
+  // A foreground start refused memory makes it yield again at once.
+  hostPressure(true);
+  auto foreground = request(2, std::vector<uint32_t>(65, 9));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  tickUntil(engine, now, [&] { return executor.suspensions == 2; },
+            "the lane did not yield to the foreground start");
+  hostPressure(false);
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
+  const std::vector<uint32_t> history = executor.resumedPrompts.back();
+  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 89 &&
+              events.completedCount == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "the lane did not resume from its history's checkpoint, or made it ordinary");
+  const uint32_t entries = resources.snapshot().stateCache.entries;
+  while (resources.snapshot().stateCache.entries == entries) {
+    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+            "the cache could not be reclaimed");
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.probe(history).cachedTokens() == 32,
+          "the history's checkpoint outlasted the prompt's replay point");
 }
 
 // Requests with the same prompt resume from the same replay point and each
@@ -7250,6 +8143,50 @@ void testHeldBackStartTakesNothingInUse() {
   }
 }
 
+// A lane that has just started beside a decoding one is the first to yield
+// (laneToYield): when its first chunk's pages are refused, it is suspended.
+// The reclaim before that takes nothing in use, so the decoding
+// conversation's replay point is not spent on a lane that does not run.
+void testLaneThatWouldYieldTakesNothingInUse() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  const std::vector<uint32_t> first(65, 1);
+  auto conversation = request(1, first);
+  conversation.maxNewTokens = 1000;
+  engine.submit(std::move(conversation));
+  tickUntil(engine, now, [&] { return events.outputs[1].size() >= 2; },
+            "the conversation did not decode");
+  require(resources.snapshot().stateCache.inUse == 1,
+          "the decode did not use its replay point");
+  while (resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+             .madeProgress) {
+  }
+  storage.growthBlocked = true;
+  engine.submit(request(2, std::vector<uint32_t>(65, 2)));
+  tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+            "the starting lane was not suspended");
+  std::vector<uint32_t> next = first;
+  next.resize(first.size() + 40, 7);
+  require(resources.snapshot().stateCache.inUseEvictions == 0 &&
+              resources.probe(next).cachedTokens() == 64,
+          "the lane that yielded took the decoding conversation's replay point");
+  require(!executor.requests.at(2).resident && executor.requests.at(1).resident &&
+              !events.usage.contains(1),
+          "the starting lane did not yield to the decoding one");
+  executor.decodeFinishes = true;
+  storage.growthBlocked = false;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the suspended lane did not finish");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "the lanes did not both complete");
+}
+
 // Every end of a decoding request releases its replay point: cancellation
 // and failure at once, before the request leaves the engine, the deadline
 // and capacity exhaustion when the engine ends it.
@@ -7357,11 +8294,13 @@ int main() {
     testRunningRequestKeepsItsReplayPoint();
     testSuspendedRequestKeepsItsReplayPoint();
     testResumedLaneKeepsThePromptReplayPoint();
+    testRestoredHistoryCheckpointStaysDisposable();
     testSharedReplayPointCountsEachRequest();
     testRestoredEndpointIsInUse();
     testReplayPointRecyclesAnOlderPointInUse();
     testWarningShrinkKeepsTheFinishedPoint();
     testHeldBackStartTakesNothingInUse();
+    testLaneThatWouldYieldTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
     testScoreRequestsCarryNoSamplingOptions();
@@ -7375,7 +8314,9 @@ int main() {
     testSharedPrefillDoesNotBlockUnrelatedWork();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
+    testSharedJunctionAtACheckpointIsReusable();
     testSharedPrefillCapacityFailureDoesNotDeadlock();
+    testSiblingFailedInTheAdmissionPassGetsNoJunction();
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
@@ -7383,6 +8324,9 @@ int main() {
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
     testRestoringRequestIsNotWaitingForMemory();
+    testSharedPrefillWaitsForARestoringProducer();
+    testCancelledRestoringProducerReleasesItsWaiter();
+    testSkipCacheRequestDoesNotWaitForAProducer();
     testCancelledDiskPrefixStopsQueuedReads();
     testPagesReturnFromDemotionWithoutSuspending();
     testRefusedRestoreClosesAdmission();
@@ -7409,12 +8353,13 @@ int main() {
     testCheckpointRecyclesItsBufferBeforeReplacement();
     testCancelAtCheckpointDoesNotPublishDrainingCommand();
     testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
-    testFinalJunctionRetiresEarlierProgressPoint();
+    testJunctionRetiresEarlierProgressPoint();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
+    testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
-    testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
+    testColdPublishesReplayStateAndRebuildsALostOne();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testReplayStateEndsBeforeTheGenerationPrompt();
     testFollowUpResumesBeforeTheGenerationPrompt();
@@ -7422,6 +8367,7 @@ int main() {
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
+    testLazyJunctionNeedsADraftWindowOfGain();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testPublicationInvariantFailureIsFatal();
@@ -7432,7 +8378,7 @@ int main() {
     testStateAlreadyOnDiskIsDeduplicated();
     testCancelledPrefillRecoversFromItsDiskCheckpoint();
     testFailedFinalStateKeepsTheDiskCheckpoint();
-    testNearFinalCheckpointAvoidsDiskWrite();
+    testNoCheckpointWithinAChunkOfTheReplayBoundary();
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
@@ -7440,7 +8386,11 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testPressurePassKeepsCachesWithoutATarget();
+    testPressurePassTakesTheRowsItsEvictionsLeave();
     testWarningReclaimKeepsTheServingFootprint();
+    testWarningReclaimCountsOnlyWhatReachesTheHost();
+    testWarningReclaimWakesARefusedStart();
     testPressureReclaimFollowsTheChain();
     testFullStateCellsSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();
@@ -7453,6 +8403,7 @@ int main() {
     testSuspendedRequestWaitsForTheHostBesideOneInService();
     testEngineLimitBindsThroughTheHostPause();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
+    testPausedPageShortageKeepsCachedStates();
     testSingletonHostPressureWaitRecoversOrTerminates();
     testAdmissionWaitsOutEarlierLanes();
     testLaterLanesDoNotExtendAResourceWait();
@@ -7462,6 +8413,10 @@ int main() {
     testRequiredWorkDoesNotReserveAnExtraPage();
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
+    testActivationReceivesTheRestoreBoundary();
+    testRefusedStartKeepsItsLeaseBesideAResidentLane();
+    testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
+    testDroppedLeaseLooksUpAgain();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
@@ -7485,9 +8440,11 @@ int main() {
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
+    testResumedProducerPlansJunctionsForSiblings();
     testResumedLaneRebuildsItsPointFromCachedKv(1);
     testResumedLaneRebuildsItsPointFromCachedKv(2);
     testDeniedSnapshotTakesAtMostOneSnapshotOfExtents();
+    testSharedJunctionPublishesFromCachedKv();
     testPausedPublicationInUseTakesNoKv();
     testPreemptedDecodeRestoresItsResidentCompositeState();
     testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt();

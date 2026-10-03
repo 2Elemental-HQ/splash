@@ -159,6 +159,8 @@ def prometheus_metrics(status):
         ),
         "splash_image_encodes_total": ("images", "encodes"),
         "splash_image_embedding_reuses_total": ("images", "embedding_reuses"),
+        "splash_image_arena_bytes": ("images", "arena_bytes"),
+        "splash_image_cached_bytes": ("images", "cached_bytes"),
         "splash_memory_current_bytes": ("memory_actual", "current_bytes"),
         "splash_memory_peak_bytes": ("memory_actual", "peak_bytes"),
         "splash_memory_denied_reservations_total": (
