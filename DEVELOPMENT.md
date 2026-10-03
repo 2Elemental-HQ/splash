@@ -21,7 +21,7 @@ variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
-([Weight preparation](#weight-preparation)) and follows the model's revision
+([Weight loading](#weight-loading)) and follows the model's revision
 ([Revisions](#revisions)). Legacy Splash packages remain loadable
 ([Legacy Splash packages](#legacy-splash-packages)). Public repositories need
 no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
@@ -351,7 +351,7 @@ holds them. A checkpoint is installed only when its configuration states the
 family's draft signature (`Draft.signature`), every field and value native
 loading requires, so a draft of another architecture never replaces one that
 loads. Native loading validates the configuration against the target and
-prepares the draft like a target ([Weight preparation](#weight-preparation)):
+loads the draft like a target ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
 package's packed draft files, `layer-<N>.bin` and `model.bin`, and
 `AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
@@ -424,11 +424,11 @@ GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
 implements (`server/images.py`); it is checked before any weight download and
 not installed.
 
-Both sources prepare the packed `vision/model.bin` layout, which the one BF16
-vision operator reads: BF16 tensors are copied, and F32 or F16 tensors are
-converted under the exact-BF16 rule of [weight preparation](#weight-preparation).
+Both sources are written into the packed `vision/model.bin` layout, which the
+one BF16 vision operator reads: BF16 tensors are copied, and F32 or F16 tensors
+are converted under the exact-BF16 rule of [weight loading](#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
-F32, all of them BF16-exact, and prepares byte-identical to the packed file.
+F32, all of them BF16-exact, and loads byte-identical to the packed file.
 Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
 use are rejected.
 
@@ -443,7 +443,7 @@ turns, tool results and stored Responses history alike. `/status` and
 `/v1/models` report `vision: false` and `input_modalities: ["text"]`, and the
 launchers configure OpenCode, Hermes and Pi without attachments.
 
-### Weight preparation
+### Weight loading
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: an MLX target, the DFlash2
@@ -463,14 +463,14 @@ projections into the same tiles ([Drafts](#drafts)) and computes GDN decay as
 vector from packages produced with MLX's float exponential. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](#gguf-targets)).
 
-Preparation never rounds a target or vision weight, and rounds the draft's
+Loading never rounds a target or vision weight, and rounds the draft's
 projections only as the packages' drafts are rounded. A tensor it converts to
 BF16 (vision tensors stored as F32 or F16, a GGUF's convolution taps and
-time-step bias) must be exactly representable in BF16; otherwise preparation
-fails, naming the tensor and, for a vision tensor, its file. The hashes of the
-images prepared from the test fixtures, in
+time-step bias) must be exactly representable in BF16; otherwise loading fails,
+naming the tensor and, for a vision tensor, its file. The hashes of the images
+written from the test fixtures, in
 `dev/tests/fixtures/weight-goldens/goldens.json`, fail the tests on any change
-of prepared bytes; the README beside it gives the procedure for an intended
+of their bytes; the README beside it gives the procedure for an intended
 change.
 
 `WeightImages` (`WeightImages.hpp`) holds a model's images, each in a Metal
@@ -604,8 +604,8 @@ and lists every unsupported tensor in one error:
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
 - GDN alpha and beta: both of one type, any of the linears' formats (one
-  segment of the GDN input projection), F32 or BF16, which preparation widens
-  to the F32 values it equals.
+  segment of the GDN input projection), F32 or BF16, which loading widens to
+  the F32 values it equals.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B, from UD-IQ1_S up, but UD-Q8_K_XL and BF16, whose BF16 tensors
@@ -690,8 +690,8 @@ fp32, in `kernels/common/sgmatrix.h`.
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
 `runtime/metal/abi/QuantFormat.h`, their decoding in `runtime/metal/kernels/common/quant_formats.h`
-and the decode-only value tables in `runtime/metal/abi/QuantTables.h`, which no prepared byte
-depends on; weight preparation's repack ABI is `runtime/metal/abi/GgufRepack.h`. The tables are
+and the decode-only value tables in `runtime/metal/abi/QuantTables.h`, which no image byte
+depends on; weight loading's repack ABI is `runtime/metal/abi/GgufRepack.h`. The tables are
 llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MIT notice in
 `THIRD_PARTY_NOTICES`, which the package ships.
 
@@ -700,8 +700,8 @@ hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which up
 PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks the planner's
 plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
-production executor and its `gguf_repack` kernel prepare them, bitwise against the reference,
-the prepared alpha/beta, norm, convolution and router bytes and the golden images; then
+production executor and its `gguf_repack` kernel write them, bitwise against the reference,
+the alpha/beta, norm, convolution and router bytes they write and the golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
 the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
@@ -1273,8 +1273,8 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 and runs native CPU tests without a GPU; `make check-native-metal` requires a
 supported Metal device and runs the kernel tests under shader validation, and the Linear pipeline
 resource check without it. They
-include the preparation of small synthetic MLX, GGUF and vision sources and the
-GGUF kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
+include loading small synthetic MLX, GGUF and vision sources and the GGUF
+kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
 
 The real-model targets take `MODEL` exactly as `splash serve --model` does,
 and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
@@ -1312,7 +1312,7 @@ the same way. The models they are run with, one per family and source format:
 | Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-Splash` |
 | Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-Splash` |
 
-The source formats load differently: an MLX target is prepared into the packed
+The source formats load differently: an MLX target is written into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
 kernels, and a package's packed files are read as they are.
 
@@ -1393,9 +1393,9 @@ family, so it runs once on each Mac. Per model, `release-check`:
   at most the larger of 2% and twice the run's own ABBA spread, and a spread
   above 5% fails as inconclusive.
 
-Results go to `build/release/<owner>--<repo>[--VARIANT]/`. Preparation does not
-depend on the GPU, so each model's `weights.json` must be identical on the
-two Macs. The unpinned `verify-models`, run after the pinned ones while the
+Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
+do not depend on the GPU, so each model's `weights.json` must be identical on
+the two Macs. The unpinned `verify-models`, run after the pinned ones while the
 default branch still names the pinned commit, resolves the branch online, and
 its unreachable-Hub restart must fall back with the Hub's reason. The agent
 clients depend on neither the model's format nor the GPU: run the smoke

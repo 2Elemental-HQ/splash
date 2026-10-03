@@ -19,15 +19,15 @@ below with `make all build/engine-tests/<tool>`.
 | 27B `mmproj-BF16.gguf` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` |
 | 35B `mmproj-BF16.gguf` | `356dfaa3111376a4f7165e32e8749713378d1700b37cf52e0c50d9f23322334d` |
 
-Drafts are prepared from each family's DFlash2 repository (`families.FAMILIES`);
+Drafts are loaded from each family's DFlash2 repository (`families.FAMILIES`);
 the ones measured here were `incoai/Qwen3.8-27B-DFlash2` at `015e7956` and
 `incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b69`. The draft images are
 byte-identical to the drafts of the released Qwen3.8-27B and Qwen3.6-35B-A3B
 packages.
 
-## Prepared bytes
+## Image bytes
 
-Preparation changes layout, never values:
+Loading changes layout, never values:
 
 - Affine 35B: every byte of all 40 layers, head and embedding matches the
   released package.
@@ -39,7 +39,8 @@ Preparation changes layout, never values:
 - GGUF: the bounded repack of all eight supported formats, with multiple row
   tiles, wide rows, head permutations and offsets above 4 GiB, matches the CPU
   reference bytewise on the M3 Max and the M5 Pro.
-- Vision: every source prepares the packed `vision/model.bin`, padding included.
+- Vision: every source is written into the packed `vision/model.bin`, padding
+  included.
 
 | Vision source | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -100,7 +101,7 @@ chat-template probe tests over the embedded templates in
 ## Loading time
 
 Every start writes the weight images from their sources, and the first request
-after an idle release writes them again (DEVELOPMENT.md, Weight preparation): a
+after an idle release writes them again (DEVELOPMENT.md, Weight loading): a
 start logs `Weights loaded in N s.`, a restore `Weights restored in N s`.
 Measured in October 2026 on an M5 Max (40 GPU cores, 64 GB), otherwise idle,
 from its internal SSD: the time that log reports, for one load in a process of
