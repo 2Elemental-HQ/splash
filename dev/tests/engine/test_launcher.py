@@ -900,6 +900,50 @@ class LauncherTests(unittest.TestCase):
                 ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
 
+    def test_offline_serve_forbids_the_hub_to_installer_refresh_and_server(self):
+        for offline in (False, True):
+            with (
+                self.subTest(offline=offline),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime = Path(temporary)
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                seen = {}
+
+                def install(selection):
+                    seen["installer"] = os.environ.get("HF_HUB_OFFLINE")
+
+                self.refresh.side_effect = lambda: seen.setdefault(
+                    "refresh", os.environ.get("HF_HUB_OFFLINE")
+                )
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(launcher.socket, "socket"),
+                    mock.patch.object(
+                        launcher, "_ensure_installed", side_effect=install
+                    ),
+                    mock.patch.object(
+                        launcher.model_artifacts,
+                        "selection_link",
+                        return_value=runtime / "selected",
+                    ),
+                    mock.patch.object(launcher.os, "execve") as execute,
+                ):
+                    launcher.main(
+                        [
+                            "serve",
+                            "--model",
+                            MODEL_ID,
+                            *(["--offline"] if offline else []),
+                        ]
+                    )
+                argv, environment = execute.call_args.args[1:]
+                expected = "1" if offline else None
+                self.assertEqual(seen, {"installer": expected, "refresh": expected})
+                self.assertEqual(environment.get("HF_HUB_OFFLINE"), expected)
+                # The server has no such option: the environment carries it.
+                self.assertNotIn("--offline", argv)
+
     def test_server_holds_the_assembly_it_serves(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)
