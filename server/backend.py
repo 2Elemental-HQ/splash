@@ -382,10 +382,11 @@ class NativeBackend:
                     self._relaunch(due)
                 continue
             try:
+                restarts = self.runtime.restart_count
                 event = self.runtime.status(
                     timeout=STATUS_BACKGROUND_TIMEOUT_SECONDS, fail_unanswered=True
                 )
-                self._cache_status(self._decode_status_event(event))
+                self._cache_status(self._decode_status_event(event), restarts)
             except Exception as error:
                 # The snapshot stays. A refresh left unanswered has failed its
                 # engine, whose relaunch is now owed; after any other failure
@@ -441,11 +442,20 @@ class NativeBackend:
             raise ValueError("native status does not match the current schema")
         return snapshot
 
-    def _cache_status(self, snapshot):
+    def _cache_status(self, snapshot, restarts):
+        """Cache `snapshot` unless the engine that answered it has failed or
+        been replaced since `restarts` was read; return whether it was cached."""
         with self.lock:
-            # An answer from an engine that has failed since is no evidence.
-            if self.closing or not self.runtime.ready:
-                return
+            # An answer from an engine that has failed since is no evidence,
+            # even once a relaunched one serves. Ready is read first, so an
+            # unchanged count means the engine found Ready is the one that
+            # answered.
+            if (
+                self.closing
+                or not self.runtime.ready
+                or self.runtime.restart_count != restarts
+            ):
+                return False
             self.status_snapshot = copy.deepcopy(snapshot)
             self.status_snapshot_at = time.monotonic()
             self.status_unanswered_since = None
@@ -453,6 +463,7 @@ class NativeBackend:
             self.engine_error = None
         if restarted:
             print_status("Engine restarted")
+        return True
 
     def status(self, timeout=STATUS_REFRESH_TIMEOUT_SECONDS):
         stale_error = None
@@ -468,6 +479,7 @@ class NativeBackend:
         try:
             if refresh_pending:
                 raise TimeoutError("native status refresh is pending")
+            restarts = self.runtime.restart_count
             event = self.runtime.status(timeout=timeout)
             snapshot = self._decode_status_event(event)
         except Exception as error:
@@ -507,7 +519,8 @@ class NativeBackend:
                     )
                 )
         else:
-            self._cache_status(snapshot)
+            if not self._cache_status(snapshot, restarts):
+                snapshot["ready"] = False
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
             engine_error = self.engine_error
