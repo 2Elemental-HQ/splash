@@ -196,6 +196,9 @@ def serve(args):
     # inherits SIGINT as ignored; take both stop signals from the start.
     for number in STOP_SIGNALS:
         signal.signal(number, _interrupt)
+    if args.offline:
+        # The installer, the catalog refresh and the server all read it.
+        os.environ["HF_HUB_OFFLINE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -417,6 +420,11 @@ def parse_args(argv=None):
         "--language-only",
         action="store_true",
         help="skip vision preparation and loading",
+    )
+    server.add_argument(
+        "--offline",
+        action="store_true",
+        help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
     )
     serve_options.add_serve_arguments(server)
     for name in clients.INSTALL_URLS:

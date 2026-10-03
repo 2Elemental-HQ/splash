@@ -122,6 +122,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
+| `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--host` | `127.0.0.1` | HTTP bind address. |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
 | `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
@@ -296,9 +297,9 @@ whether the Hub is asked:
 - No answer, or a new commit that cannot be installed: the installed model
   starts, with one line naming the Hub's reason or, on stderr, the
   installation attempt that failed.
-- A 40-hex `--revision` never moves, nor does its draft, and
-  `HF_HUB_OFFLINE=1` forbids the Hub: both start a verified installation
-  without a request.
+- A 40-hex `--revision` never moves, nor does its draft, and `--offline`
+  (or `HF_HUB_OFFLINE=1`) forbids the Hub: both start a verified
+  installation without a request.
 
 There is no update flag; to stay on one commit, pass it as `--revision`. A
 missing assembly, or one that no longer verifies, is built again. Without the
