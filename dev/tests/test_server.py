@@ -1124,6 +1124,8 @@ class ServerTest(unittest.TestCase):
                     "admission": {
                         "waiting_memory": 2,
                         "waiting_concurrency": 1,
+                        "held_behind_refusal": 4,
+                        "restoring": 1,
                         "suspended": 1,
                         "oldest_wait_ms": 1250.0,
                     },
@@ -1222,6 +1224,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_scheduler_waiting_prefix 2", metrics)
         self.assertIn("splash_admission_waiting_memory 2", metrics)
         self.assertIn("splash_admission_waiting_concurrency 1", metrics)
+        self.assertIn("splash_admission_held_behind_refusal 4", metrics)
+        self.assertIn("splash_admission_restoring 1", metrics)
         self.assertIn("splash_admission_suspended 1", metrics)
         self.assertIn("splash_admission_oldest_wait_milliseconds 1250.0", metrics)
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)

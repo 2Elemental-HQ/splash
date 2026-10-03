@@ -473,13 +473,15 @@ void testMemoryPressureTelemetry() {
 }
 
 void testResourceWaitDiagnostics() {
-  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .suspended = 1,
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                            .restoring = 1, .suspended = 1,
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
   const std::string json = runtimeStatusJson(
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait);
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
-                    "\"waiting_concurrency\":1,\"suspended\":1,\"draining\":true,"
+                    "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
+                    "\"suspended\":1,\"draining\":true,"
                     "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0}") !=
               std::string::npos,
           "resource wait summary is missing or inaccurate");
@@ -499,6 +501,13 @@ void testResourceWaitDiagnostics() {
   wait.concurrency = 4;
   require(!reporter.update(wait, true).empty(), "end of memory wait was silent");
   require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
+  // The refused request is deferred for scheduling, out of the memory
+  // count, while it still holds the others back.
+  wait.heldBehindRefusal = 2;
+  const std::string held = reporter.update(wait, true);
+  require(held.find("held=2") != std::string::npos &&
+              held.find("cleared") == std::string::npos,
+          "requests held behind a refusal were reported as no wait");
 }
 
 // The server and the runtime share stderr, as `serve > log 2>&1` does: a

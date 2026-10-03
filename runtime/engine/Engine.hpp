@@ -46,6 +46,14 @@ struct EngineConfig final {
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
+  // Requests that admission holds back behind the first one refused memory,
+  // whatever they wait for themselves, and that request itself while a pass
+  // keeps it out of its memory wait. During recovery only suspended
+  // requests are admitted, and only they count.
+  uint32_t heldBehindRefusal = 0;
+  // Requests admitted into a restore of their prefix from disk, waiting for
+  // its reads rather than for memory.
+  uint32_t restoring = 0;
   uint32_t suspended = 0;
   double oldestWaitMilliseconds = 0.0;
   bool draining = false;
@@ -128,9 +136,14 @@ private:
     // What refused the memory at the latest attempt.
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
+    // The admissions counted when the request was first refused memory, and
+    // again when it is suspended: the lanes admitted up to then hold memory
+    // it waits for. A wait for a lane does not record it.
+    std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
-    // The latest tick at which a lane submitted before the request had work
-    // in flight; the limit restarts from it.
+    // The latest tick at which a lane submitted before the request, or one
+    // that admittedBefore counts, had work in flight; the limit restarts from
+    // it.
     double earlierLaneWorkMilliseconds = 0.0;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
@@ -149,6 +162,10 @@ private:
     // Its place in submission order. Earlier requests' lanes hold memory it
     // may wait for, so their work restarts its resource wait's limit.
     uint64_t sequence = 0;
+    // The admissions counted when admit() last gave it a state cell
+    // (admissions_). Lanes admitted before a request was refused memory or
+    // suspended restart its wait's limit too.
+    uint64_t admission = 0;
     std::optional<uint32_t> stateCell;
     bool suspended = false;
     uint32_t promptTokens = 0;
@@ -157,6 +174,12 @@ private:
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
+    // The latest attempt to start it was refused memory. Until it starts,
+    // nothing that comes after it in admission order is admitted, in
+    // ordinary admission or among suspended requests during recovery
+    // (admitQueued); a pass that does not schedule it or a prefix wait
+    // leaves it in place.
+    bool refusedMemory = false;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
@@ -291,10 +314,15 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
+  // Waiting for scheduling or for a prefix does not consume the memory
+  // wait limit, so the wait's record is reset. A request that holds
+  // admission closed (Request::refusedMemory) keeps when its wait began and
+  // which lanes were admitted before it was refused.
+  void deferWait(Request &request) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
-  // limit restarts whenever a lane submitted before the request has work in
-  // flight.
+  // limit restarts whenever a lane submitted before the request, or one
+  // ResourceWait::admittedBefore counts, has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
@@ -318,8 +346,13 @@ private:
   // memory is still short (growth is paused or allocationFailed_), up to the
   // drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
+  // Admission recovers from a suspension: only suspended requests start.
+  [[nodiscard]] bool anySuspended() const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  // The state cells admit() has obtained so far, including those it gave
+  // back when the attempt's pages were refused (Request::admission).
+  uint64_t admissions_ = 0;
   uint64_t resourceEpoch_ = 1;
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.

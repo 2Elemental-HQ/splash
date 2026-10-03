@@ -169,6 +169,8 @@ def prometheus_metrics(status):
         "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
         "splash_admission_waiting_memory": ("admission", "waiting_memory"),
         "splash_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
+        "splash_admission_held_behind_refusal": ("admission", "held_behind_refusal"),
+        "splash_admission_restoring": ("admission", "restoring"),
         "splash_admission_suspended": ("admission", "suspended"),
         "splash_admission_oldest_wait_milliseconds": ("admission", "oldest_wait_ms"),
         "splash_ttft_p50_milliseconds": ("metrics", "ttft_ms", "p50"),
