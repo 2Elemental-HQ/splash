@@ -1,6 +1,7 @@
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
+#include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using benchmark::draftContextRows;
 
 namespace {
 
@@ -182,15 +184,15 @@ public:
       --deniedBegins;
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
-    for (uint32_t slot = 0; slot < maximumCells; ++slot) {
+    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
       const bool used = std::any_of(
-          requests.begin(), requests.end(), [slot](const auto &entry) {
-            return entry.second.resident && entry.second.slot == slot;
+          requests.begin(), requests.end(), [lane](const auto &entry) {
+            return entry.second.resident && entry.second.lane == lane;
           });
       if (!used) {
-        requests.emplace(request.id, Request{slot, 0, true});
+        requests.emplace(request.id, Request{lane, 0, true});
         prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
-        return {slot, StateFailure::None};
+        return {lane, StateFailure::None};
       }
     }
     return {{}, StateFailure::ConcurrencyLimit};
@@ -213,45 +215,36 @@ public:
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
-    for (uint32_t slot = 0; slot < maximumCells; ++slot) {
+    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [&](const auto &candidate) {
             return candidate.first != id && candidate.second.resident &&
-                   candidate.second.slot == slot;
+                   candidate.second.lane == lane;
           });
       if (!used) {
-        entry.slot = slot;
+        entry.lane = lane;
         entry.resident = true;
         entry.position = 0;
         entry.replaying = true;
         resumedPrompts.emplace_back(request.prompt.begin(), request.prompt.end());
         ++resumptions;
-        return {slot, StateFailure::None};
+        return {lane, StateFailure::None};
       }
     }
     return {{}, StateFailure::ConcurrencyLimit};
-  }
-  void restore(uint64_t id, uint32_t length,
-               std::shared_ptr<const CompositeState> state,
-               bool restoreDraftState) override {
-    if (!state)
-      throw std::runtime_error("empty restore state");
-    requests.at(id).position = length;
-    restored += length;
-    restoredDraft = restoreDraftState;
   }
   std::unique_ptr<StateRestore> beginRestore(
       uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
       bool restoreDraft, std::function<void()>) override {
     if (state->residentBytes()) {
-      restore(id, length, std::move(state), restoreDraft);
+      applyRestore(id, length, std::move(state), restoreDraft);
       return {};
     }
     ++diskReads;
     auto ticket = std::make_unique<RestoreTicket>();
     ticket->control = restoreControl;
     ticket->commit = [this, id, length, state, restoreDraft] {
-      restore(id, length, state, restoreDraft);
+      applyRestore(id, length, state, restoreDraft);
     };
     return ticket;
   }
@@ -263,14 +256,14 @@ public:
     prefillWidths.push_back(static_cast<uint32_t>(items.size()));
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
-      requireRows(item, item.promptOffset);
+      requireRows(item, item.logicalPosition);
       if (kv) {
-        const uint32_t end = item.promptOffset + item.tokenCount;
-        for (uint32_t row = (item.promptOffset + KvCache::pageTokens - 1) /
+        const uint64_t end = item.logicalPosition + item.tokenCount;
+        for (uint64_t row = (item.logicalPosition + KvCache::pageTokens - 1) /
                             KvCache::pageTokens * KvCache::pageTokens;
              row < end; row += KvCache::pageTokens) {
           kv->content.at(item.pageTable[row / KvCache::pageTokens]) =
-              rows(row / KvCache::pageTokens, item.inputTokens[row - item.promptOffset]);
+              rows(row / KvCache::pageTokens, item.inputTokens[row - item.logicalPosition]);
         }
       }
       requests.at(item.requestId).position += item.tokenCount;
@@ -467,7 +460,7 @@ public:
   }
 
   struct Request {
-    uint32_t slot = 0;
+    uint32_t lane = 0;
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;
@@ -553,6 +546,17 @@ public:
   std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
   std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
   std::shared_ptr<MaskOverlapState> overlap;
+
+private:
+  void applyRestore(uint64_t id, uint32_t length,
+                    std::shared_ptr<const CompositeState> state,
+                    bool restoreDraftState) {
+    if (!state)
+      throw std::runtime_error("empty restore state");
+    requests.at(id).position = length;
+    restored += length;
+    restoredDraft = restoreDraftState;
+  }
 };
 
 class Events final : public EngineEventSink {
@@ -1319,6 +1323,48 @@ void testImageSpansKeyPrefixIdentity() {
           "image request lifecycle did not complete cleanly");
 }
 
+// Two token-identical prompts share their prefix up to the block that holds
+// the start of the first image on which they differ: the later one waits for
+// the junction there and resumes from it.
+void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
+  const ImageSpan a{40, 16, 8, 8, 0x1111, 0x2222};
+  const ImageSpan b{200, 16, 8, 8, 0x3333, 0x4444};
+  const ImageSpan c{200, 16, 8, 8, 0x5555, 0x6666};
+  ImageSpan otherA = a;
+  otherA.digestLo ^= 1;
+  struct Shape {
+    std::vector<ImageSpan> producer;
+    std::vector<ImageSpan> waiter;
+    uint32_t shared = 0;
+  };
+  for (const Shape &shape : {Shape{{a, b}, {a, c}, 192}, Shape{{a}, {otherA}, 32}}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    guardReleases(storage, engine);
+    const auto withImages = [](uint64_t id, const std::vector<ImageSpan> &images) {
+      EngineRequest result = request(id, std::vector<uint32_t>(289, 248056));
+      result.images = images;
+      for (const ImageSpan &image : images)
+        result.imagePixels.resize(result.imagePixels.size() + image.pixelBytes(), 1);
+      return result;
+    };
+    engine.submit(withImages(1, shape.producer));
+    engine.submit(withImages(2, shape.waiter));
+    static_cast<void>(engine.tick(0));
+    require(model.requests.size() == 1 && engine.snapshot().scheduler.waitingPrefix == 1,
+            "the later request did not wait for the shared prefix");
+    runUntilIdle(engine);
+    require(events.starts.size() == 2 &&
+                events.starts[1] == std::pair{EngineCacheStatus::PrefixHit, shape.shared} &&
+                model.prefillRows == 289 + 289 - shape.shared && events.completedCount == 2,
+            "the shared prefix did not end at the block of the first different image");
+  }
+}
+
 // One prefill chunk that every caller's prompt shares, then 65 tokens of
 // `token`: the replay state lands at 2112. A prompt branching off a cached
 // one at the end of the chunk plans a junction there, a draft window past
@@ -1558,7 +1604,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
   const DraftContextPlan &plan = executor.plans.at(3);
   require(plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64 &&
               plan.boundaries[1].boundary == 65 &&
-              plan.draftContextRows() == prompt.size(),
+              draftContextRows(plan) == prompt.size(),
           "replay boundary was not armed without reservation");
   require(executor.snapshotAttempts == 1 && executor.snapshots == 0 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
@@ -1697,7 +1743,7 @@ void testLongSuffixSkipsDraftRestore() {
   engine.submit(request(11, extended));
   runUntilIdle(engine);
   require(!executor.restoredDraft &&
-              executor.plans.at(11).draftStateRestoreSkipped,
+              !executor.plans.at(11).restoresDraftState,
           "long suffix copied a draft ring that its final window overwrites");
 }
 
@@ -3263,6 +3309,81 @@ void testAdmissionUsesCachedRemainingWork() {
   runUntilIdle(engine);
   require(events.completedCount == 3 && events.failedCount == 0,
           "cache-aware admission failed to finish");
+}
+
+// While a higher priority decodes, a waiting request cannot be selected:
+// admission queues it without hashing its prompt. Once the higher priority
+// is gone, one probe finds its cached prefix and it starts.
+void testUnselectableCandidatesAreNotProbed() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return resources.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> cached(129, 5);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  executor.decodeFinishes = false;
+  auto urgent = request(2, std::vector<uint32_t>(33, 6));
+  urgent.priority = RequestPriority::Foreground;
+  urgent.maxNewTokens = 1000;
+  engine.submit(std::move(urgent));
+  double now = 100;
+  tickUntil(engine, now, [&] { return events.outputs.contains(2); },
+            "the higher priority did not decode");
+  std::vector<uint32_t> prompt(cached.begin(), cached.begin() + 128);
+  prompt.resize(161, 8);
+  engine.submit(request(3, prompt));
+  const uint64_t before = hashed();
+  for (uint32_t step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(hashed() == before && !executor.requests.contains(3) &&
+              engine.snapshot().scheduler.queued == 1,
+          "admission probed a request it could not select");
+  engine.cancel(2);
+  tickUntil(engine, now, [&] { return executor.requests.contains(3); },
+            "the waiting request did not start once the higher priority left");
+  require(hashed() - before == 5 && events.startIds.back() == 3 &&
+              events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 128U},
+          "the request was not probed once, or missed its cached prefix");
+}
+
+// A request that waits beside a shorter resident prefill keeps its probe
+// from pass to pass. Every resident command publishes blocks, a change of
+// the KV graph, yet each pass hashes only the page past the match again.
+void testWaitingCandidateProbeIsRefreshedNotRepeated() {
+  test::TestKvStorage storage(4096, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return resources.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> cached(257, 3);
+  engine.submit(request(1, cached));
+  runUntilIdle(engine);
+  engine.submit(request(2, std::vector<uint32_t>(20'000, 2)));
+  double now = 100;
+  tickUntil(engine, now, [&] { return executor.requests.contains(2); },
+            "the resident prefill did not start");
+  std::vector<uint32_t> prompt(cached.begin(), cached.begin() + 256);
+  prompt.resize(40'000, 4);
+  engine.submit(request(3, prompt));
+  const uint64_t before = hashed();
+  tickUntil(engine, now, [&] { return hashed() != before; },
+            "the waiting request was not probed");
+  require(hashed() - before == 9, "the first probe did not hash its prefix and the page past it");
+  const uint64_t probed = hashed();
+  const size_t commands = executor.prefillWidths.size();
+  for (uint32_t step = 0; step < 6; ++step)
+    static_cast<void>(engine.tick(now++));
+  const size_t passes = executor.prefillWidths.size() - commands;
+  require(passes >= 2 && hashed() - probed == passes && !executor.requests.contains(3),
+          "a kept probe hashed more than the page past its match");
 }
 
 // A request that waits for memory closes admission behind it: the request
@@ -5158,6 +5279,47 @@ EngineRequest constrainedRequest(uint64_t id, double deadline = 10'000.0) {
   return value;
 }
 
+// Two Background lanes: one waits for its initial mask without a command in
+// flight; the other fills the first extent and is suspended at 7, when it
+// must allocate another. The host refuses its growth even as a request in
+// service's or, at the hard limit, the engine's budget refuses it. The
+// resource wait limit, and so the drain, is 1000 ms.
+struct SuspendedBesideAMaskWait {
+  explicit SuspendedBesideAMaskWait(bool hostPause) {
+    guardReleases(storage, engine);
+    auto resident = constrainedRequest(1, 100'000);
+    resident.priority = RequestPriority::Background;
+    engine.submit(std::move(resident));
+    auto growing = request(2, std::vector<uint32_t>(95, 2));
+    growing.priority = RequestPriority::Background;
+    growing.maxNewTokens = 1000;
+    growing.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(growing));
+    for (double now = 1; now <= 6; ++now)
+      static_cast<void>(engine.tick(now));
+    require(events.maskRequests.size() == 1 &&
+                engine.snapshot().scheduler.decoding == 1,
+            "fixture lanes did not reach their mask wait and decode");
+    paused = hostPause;
+    storage.growthBlocked = true;
+    storage.allocationFailure = paused ? metal::AllocationFailure::HostPressure
+                                       : metal::AllocationFailure::EngineBudget;
+    require(engine.tick(7) && executor.suspensions == 1 &&
+                executor.requests.at(1).resident,
+            "denied growth did not suspend the lane beside the resident");
+  }
+
+  test::TestKvStorage storage{64, 4096, 4};
+  KvPool pool{storage, 0};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor;
+  Events events;
+  bool paused = false;
+  engine::Engine engine{{.resourceWaitTimeoutMilliseconds = 1000,
+                         .growthPaused = [this] { return paused; }},
+                        resources, executor, events};
+};
+
 // After a suspension, admission waits for resident lanes only while memory
 // stays short. Once host pressure clears with nothing failing since, the
 // suspended request resumes and new work starts beside the residents. While
@@ -5176,45 +5338,18 @@ void testRecoveryDrainEndsWithItsCause() {
   for (Cause cause : {Cause::PressureClears, Cause::KvStillShort,
                       Cause::StateStillShort, Cause::PressurePersists,
                       Cause::HardLimit}) {
-    test::TestKvStorage storage(64, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
-    Executor executor;
-    Events events;
-    bool paused = false;
-    EngineConfig config;
-    config.resourceWaitTimeoutMilliseconds = 1000;
-    config.growthPaused = [&] { return paused; };
-    engine::Engine engine(config, resources, executor, events);
-    guardReleases(storage, engine);
-    // A resident lane waits for its initial mask without a command in
-    // flight; the other fills the first extent and must allocate another.
-    auto resident = constrainedRequest(1, 100'000);
-    resident.priority = RequestPriority::Background;
-    engine.submit(std::move(resident));
-    auto growing = request(2, std::vector<uint32_t>(95, 2));
-    growing.priority = RequestPriority::Background;
-    growing.maxNewTokens = 1000;
-    growing.deadlineMilliseconds = 100'000;
-    engine.submit(std::move(growing));
-    for (double now = 1; now <= 6; ++now)
-      static_cast<void>(engine.tick(now));
-    require(events.maskRequests.size() == 1 &&
-                engine.snapshot().scheduler.decoding == 1,
-            "fixture lanes did not reach their mask wait and decode");
-    // The host refuses the lane's growth even as a request in service's,
-    // or, at the hard limit, the engine's budget refuses it.
-    paused = cause != Cause::HardLimit;
-    storage.growthBlocked = true;
-    storage.allocationFailure = paused ? metal::AllocationFailure::HostPressure
-                                       : metal::AllocationFailure::EngineBudget;
-    require(engine.tick(7) && executor.suspensions == 1 &&
-                executor.requests.at(1).resident,
-            "denied growth did not suspend the lane beside the resident");
-    auto urgent = request(3, {3});
-    urgent.priority = RequestPriority::Foreground;
-    urgent.deadlineMilliseconds = 100'000;
-    engine.submit(std::move(urgent));
+    SuspendedBesideAMaskWait fixture(cause != Cause::HardLimit);
+    test::TestKvStorage &storage = fixture.storage;
+    engine::Cache &resources = fixture.resources;
+    Executor &executor = fixture.executor;
+    Events &events = fixture.events;
+    bool &paused = fixture.paused;
+    engine::Engine &engine = fixture.engine;
+    // A request of the suspended lane's priority waits behind it.
+    auto later = request(3, {3});
+    later.priority = RequestPriority::Background;
+    later.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(later));
 
     const bool pauseLifts = cause == Cause::PressureClears ||
                             cause == Cause::KvStillShort ||
@@ -5262,6 +5397,271 @@ void testRecoveryDrainEndsWithItsCause() {
       static_cast<void>(engine.tick(now));
     require(idle(engine) && resources.snapshot().activeRequests == 0,
             "recovery drain fixture leaked its lanes");
+  }
+}
+
+// At the engine's limit a prefill is suspended beside two lanes that wait
+// for their masks. When one of them ends, the drain stops waiting for the
+// memory it gave back: the suspended request retries at once and resumes
+// when that memory is enough. When it is not, its refusal starts the drain
+// again.
+void testRecoveryDrainEndsWhenAResidentReleasesMemory() {
+  for (const bool enough : {true, false}) {
+    test::TestKvStorage storage(32, 4096, 4);
+    storage.budgetPages = 16;
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = 1000;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    // The residents hold one page and four: the large one's pages go to the
+    // suspended request once it ends, the small one's page is too little.
+    auto small = constrainedRequest(1, 100'000);
+    auto large = constrainedRequest(3, 100'000);
+    large.prompt.assign(100, 3);
+    engine.submit(std::move(small));
+    engine.submit(std::move(large));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.maskRequests.size() == 2; },
+              "the residents did not wait for their masks");
+    // Its first command, 416 rows, needs thirteen pages of the eleven left
+    // under the engine's limit.
+    auto suspended = request(2, std::vector<uint32_t>(420, 2));
+    suspended.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(suspended));
+    tickUntil(engine, now, [&] { return executor.suspensions == 1; },
+              "the prefill was not suspended at the limit");
+    require(engine.resourceWaitSnapshot(now).draining && executor.resumeAttempts == 0,
+            "the suspension did not start the drain");
+    now += 2;
+    engine.cancel(enough ? 3 : 1);
+    for (uint32_t step = 0; step < 4; ++step)
+      static_cast<void>(engine.tick(now++));
+    if (enough) {
+      require(engine.snapshot().resourceResumptions == 1 && executor.requests.at(2).resident &&
+                  !engine.resourceWaitSnapshot(now).draining,
+              "the drain held after a resident released the memory it waited for");
+    } else {
+      require(executor.resumeAttempts == 1 && engine.snapshot().resourceResumptions == 0 &&
+                  engine.resourceWaitSnapshot(now).draining,
+              "a refusal after a resident ended did not resume the drain");
+    }
+    for (uint64_t id : {1, 2, 3})
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  }
+}
+
+// A request of a strictly higher priority than every suspended one waits
+// for neither the recovery drain nor the suspended lanes: it starts at once
+// and finishes while the suspended lane stays suspended.
+void testHigherPriorityArrivalIsNotHeldByRecovery() {
+  for (const bool hostPause : {true, false}) {
+    SuspendedBesideAMaskWait fixture(hostPause);
+    engine::Engine &engine = fixture.engine;
+    auto urgent = request(3, {3});
+    urgent.priority = RequestPriority::Foreground;
+    urgent.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(urgent));
+    double now = 8;
+    tickUntil(engine, now, [&] { return fixture.events.usage.contains(3); },
+              "the higher priority did not finish");
+    require(now < 20 && fixture.events.startIds == std::vector<uint64_t>({1, 2, 3}) &&
+                fixture.events.failedCount == 0 && !fixture.executor.requests.at(2).resident,
+            "recovery held back a request above every suspended one");
+    for (uint64_t id : {1, 2})
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  }
+}
+
+// Normal requests hold every lane. A Foreground arrival suspends the one that
+// has done the least, without a drain, and starts in its place; once it has
+// finished, the suspended lane resumes. An arrival of the residents' own
+// priority suspends nothing and waits for a lane.
+void testForegroundArrivalPreemptsWhenCellsAreFull() {
+  for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
+    // Lane 3's prompt is the shortest, and the lanes decode together.
+    for (uint64_t id = 1; id <= 4; ++id) {
+      auto lane = request(id, std::vector<uint32_t>(id == 3 ? 33 : 65, static_cast<uint32_t>(id)));
+      lane.maxNewTokens = 1000;
+      engine.submit(std::move(lane));
+    }
+    double now = 1;
+    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 4; },
+              "the lanes did not decode");
+    auto arriving = request(5, std::vector<uint32_t>(9, 5));
+    arriving.priority = arrival;
+    engine.submit(std::move(arriving));
+    if (arrival == RequestPriority::Normal) {
+      for (uint32_t step = 0; step < 8; ++step)
+        static_cast<void>(engine.tick(now++));
+      require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(5) &&
+                  engine.resourceWaitSnapshot(now).concurrency == 1,
+              "an arrival of the residents' priority took a lane");
+    } else {
+      tickUntil(engine, now, [&] { return events.usage.contains(5); },
+                "the Foreground arrival did not finish");
+      require(engine.snapshot().prioritySuspensions == 1 &&
+                  engine.snapshot().resourceSuspensions == 0 && !executor.requests.at(3).resident &&
+                  !engine.resourceWaitSnapshot(now).draining,
+              "the arrival did not take the lane of the least work");
+      tickUntil(engine, now, [&] { return engine.snapshot().resourceResumptions == 1; },
+                "the suspended lane did not resume after the arrival finished");
+    }
+    for (uint64_t id = 1; id <= 5; ++id)
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+    require(events.failedCount == 0, "a lane failed");
+  }
+}
+
+// While a Background lane holds memory, a Normal request's state is refused:
+// the lane is suspended for it, and it starts at the next pass. Once it has
+// finished, the lane resumes.
+void testRefusedHigherPriorityStartPreemptsLowerResident() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  auto background = request(1, std::vector<uint32_t>(65, 1));
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 1000;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1); },
+            "the Background lane did not decode");
+  engine.submit(request(2, std::vector<uint32_t>(9, 2)));
+  tickUntil(engine, now, [&] { return executor.requests.contains(2); },
+            "the refused start did not take the lower lane's memory");
+  require(executor.beginAttempts == 3 && engine.snapshot().prioritySuspensions == 1 &&
+              !executor.requests.at(1).resident && !engine.resourceWaitSnapshot(now).draining,
+          "the refused start did not suspend the lower lane");
+  tickUntil(engine, now, [&] { return engine.snapshot().resourceResumptions == 1; },
+            "the suspended lane did not resume");
+  engine.cancel(1);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.completedCount == 2 && events.failedCount == 0, "a request failed");
+}
+
+// Background lanes hold three lanes and a Normal producer the fourth, with
+// a junction three commands in for a Normal request that shares its prefix.
+// While the request waits for that prefix it takes no lane: the lane it
+// suspended would resume into the cell first and replay for nothing. Once
+// the junction has landed, it takes a Background lane and starts from it.
+void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+  for (uint64_t id = 1; id <= 3; ++id) {
+    auto lane = request(id, {static_cast<uint32_t>(id)});
+    lane.priority = RequestPriority::Background;
+    lane.maxNewTokens = 1000;
+    engine.submit(std::move(lane));
+  }
+  double now = 1;
+  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 3; },
+            "the Background lanes did not decode");
+  std::vector<uint32_t> producer(5000, 7);
+  std::vector<uint32_t> waiter(5000, 7);
+  std::fill(producer.begin() + 4800, producer.end(), 8);
+  std::fill(waiter.begin() + 4800, waiter.end(), 9);
+  auto producing = request(4, producer);
+  producing.maxNewTokens = 1000;
+  engine.submit(std::move(producing));
+  engine.submit(request(5, waiter));
+  // The command that ends at the junction is the last before it lands.
+  tickUntil(engine, now, [&] { return executor.prefillRows == 3 + 4800; },
+            "the producer did not reach the junction");
+  require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(5),
+          "the request took a lane while it waited for a prefix");
+  tickUntil(engine, now, [&] { return events.startIds.back() == 5; },
+            "the request did not start once the prefix landed");
+  require(engine.snapshot().prioritySuspensions == 1 &&
+              events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 4800U},
+          "the request did not take a lane to start from the prefix");
+  for (uint64_t id = 1; id <= 5; ++id)
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.failedCount == 0, "a lane failed");
+}
+
+// A request below the priority of a running lane cannot run before that
+// priority is done, so it takes no lane: with every lane taken it suspends
+// no lower resident, and during recovery it leaves a free lane to the
+// suspended request. It starts once the higher priority is done.
+void testRequestBelowARunningPriorityTakesNoLane() {
+  for (const bool recovering : {false, true}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+    guardReleases(storage, engine);
+    // Lane 3's prompt is the shortest.
+    const uint64_t lanes = recovering ? 4 : 3;
+    for (uint64_t id = 1; id <= lanes; ++id) {
+      auto lane = request(id, std::vector<uint32_t>(id == 3 ? 33 : 65, static_cast<uint32_t>(id)));
+      lane.priority = RequestPriority::Background;
+      lane.maxNewTokens = 1000;
+      engine.submit(std::move(lane));
+    }
+    double now = 1;
+    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == lanes; },
+              "the Background lanes did not decode");
+    // A Foreground stream takes the last lane, during recovery lane 3's.
+    auto stream = request(5, {5});
+    stream.priority = RequestPriority::Foreground;
+    stream.maxNewTokens = 1000;
+    engine.submit(std::move(stream));
+    tickUntil(engine, now, [&] { return events.outputs.contains(5); },
+              "the Foreground stream did not decode");
+    const uint64_t suspended = recovering ? 1 : 0;
+    require(engine.snapshot().prioritySuspensions == suspended,
+            "the Foreground stream did not take its lane");
+    engine.submit(request(6, {6}));
+    if (recovering)
+      engine.cancel(1);
+    for (uint32_t step = 0; step < 8; ++step)
+      static_cast<void>(engine.tick(now++));
+    require(!executor.requests.contains(6) &&
+                engine.snapshot().prioritySuspensions == suspended &&
+                engine.snapshot().resourceResumptions == suspended,
+            "a request below a running priority took a lane");
+    engine.cancel(5);
+    tickUntil(engine, now, [&] { return events.outputs.contains(6); },
+              "the request did not start once the higher priority was done");
+    require(engine.snapshot().prioritySuspensions == suspended,
+            "the request took a lane from a lower resident");
+    for (uint64_t id = 1; id <= 6; ++id)
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+    require(events.failedCount == 0, "a lane failed");
   }
 }
 
@@ -6090,8 +6490,8 @@ void testShortSuffixContinuesCheckpointDraftState() {
   runUntilIdle(engine);
   require(events.starts.back().second == defaultCheckpointTokens &&
               executor.restoredDraft &&
-              executor.plans.at(481).draftContextRows() == 209 &&
-              !executor.plans.at(481).draftStateRestoreSkipped,
+              draftContextRows(executor.plans.at(481)) == 209 &&
+              executor.plans.at(481).restoresDraftState,
           "short checkpoint suffix discarded or rebuilt its restored draft window");
 }
 
@@ -6630,6 +7030,24 @@ void testGrowthWaitsForTheStateWriteInFlight() {
   }
 }
 
+// Caches `count` one-page blocks, each under a state written to disk: their
+// pages stay resident, and evicting one starts a demotion whose page comes
+// back when the copy lands.
+void cacheBlocksUnderDiskStates(engine::Cache &cache, uint32_t count) {
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 900 + count; ++id) {
+    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
+    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
+            "state was not demoted");
+  }
+}
+
 // A lane that cannot run must never leave the engine without a wakeup: the
 // transfer it waits for wakes it, and if that wake is missed the retry
 // deadline does once no command is in flight (a command's completion wakes
@@ -6646,18 +7064,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
   static_cast<void>(engine.tick(1));
   require(tier.demotions == 1 && executor.prefillRows == 0,
@@ -6672,6 +7079,88 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   }
   require(idle(engine) && events.outputs.contains(1) && events.failedCount == 0,
           "the lane never ran");
+}
+
+// A plan whose lanes all wait for pages on their way back leaves the tick
+// to the other lanes: a decode that needs no page runs while a prefill
+// waits, and a prefill that needs none runs while a decode waits. The
+// waiting lanes run once their pages have landed.
+void testWaitingPlanDoesNotIdleRunnableLanes() {
+  const auto runWithTransfers = [](engine::Engine &engine, test::TestKvTier &tier,
+                                   double &now, const std::function<bool()> &done) {
+    for (uint32_t step = 0; step < 200 && !done(); ++step) {
+      tier.complete();
+      static_cast<void>(engine.tick(now++));
+    }
+    require(done(), "the waiting lane did not run once its pages landed");
+  };
+  {
+    test::TestKvStorage storage(12, 4096, 4);
+    storage.budgetPages = 8;
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    cacheBlocksUnderDiskStates(cache, 6);
+    // A stream decodes within its one page, beside a prefill short of two.
+    auto stream = request(2, std::vector<uint32_t>(1, 5));
+    stream.maxNewTokens = 1000;
+    engine.submit(std::move(stream));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.outputs.contains(2); },
+              "the stream did not decode");
+    engine.submit(request(1, std::vector<uint32_t>(97, 7)));
+    const uint64_t decodes = engine.snapshot().scheduler.decodeBatches;
+    tickUntil(engine, now, [&] { return tier.demotions > 0; },
+              "the prefill did not wait for pages");
+    require(engine.commandInFlight() && engine.snapshot().scheduler.decodeBatches == decodes + 1 &&
+                executor.prefillRows == 1,
+            "the stream idled while a prefill waited for its pages");
+    runWithTransfers(engine, tier, now, [&] { return events.outputs.contains(1); });
+    engine.cancel(2);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+    require(events.failedCount == 0 && executor.prefillRows == 98,
+            "the lanes did not finish their prompts");
+  }
+  {
+    test::TestKvStorage storage(72, 4096, 4);
+    storage.budgetPages = 68;
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    Executor executor;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    cacheBlocksUnderDiskStates(cache, 3);
+    // One command takes every page left: the short prompt's 30 rows and
+    // 2018 of the long one's, which stops inside the page that ends at its
+    // replay boundary, 2048. The short prompt's first decode needs a page;
+    // the long one's next 30 rows need none.
+    engine.submit(request(1, std::vector<uint32_t>(2060, 7)));
+    engine.submit(request(2, std::vector<uint32_t>(30, 8)));
+    double now = 1;
+    static_cast<void>(engine.tick(now++));
+    static_cast<void>(engine.tick(now++));
+    require(executor.prefillRows == 2048 && pool.freePageCount() == 0 && !engine.commandInFlight(),
+            "fixture pages are off");
+    const uint64_t prefills = engine.snapshot().scheduler.prefillBatches;
+    static_cast<void>(engine.tick(now++));
+    require(tier.demotions > 0 && engine.commandInFlight() &&
+                engine.snapshot().scheduler.prefillBatches == prefills + 1 &&
+                !events.outputs.contains(2),
+            "the long prompt idled while a decode waited for its page");
+    runWithTransfers(engine, tier, now, [&] { return idle(engine); });
+    require(events.completedCount == 2 && events.failedCount == 0 &&
+                executor.prefillRows == 2090,
+            "the lanes did not finish");
+  }
 }
 
 // Pending means a transfer is in flight. With the tier unwritable and
@@ -6721,18 +7210,7 @@ void testPageShortfallDemotesInBulk() {
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   // The cached blocks fill two extents but two of their pages: those two
   // are free, no other extent is allocated, and the budget admits nothing
   // more. The first command, 160 tokens, falls three pages short; the last
@@ -7124,6 +7602,114 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
           "the producer planned a junction for the request that skips the cache");
 }
 
+// A request whose prefix restore cannot fit even alone ignores the cache
+// until it starts: admission no longer probes it, and it starts cold.
+void testSkipCacheCandidateIsNotProbed() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  const auto hashed = [&] { return cache.snapshot().lookup.probeHashedBlocks; };
+  const std::vector<uint32_t> prompt(65, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
+  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 2; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "KV block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "written block did not land");
+  }
+  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
+              storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+          "the prefix did not move to disk whole");
+  // No page can be allocated until the request starts again.
+  storage.growthBlocked = true;
+  executor.beginObserver = [&] { storage.growthBlocked = executor.beginAttempts < 2; };
+  engine.submit(request(1, prompt));
+  static_cast<void>(engine.tick(1));
+  require(hashed() == 2 && events.starts.empty() && engine.resourceWaitSnapshot(1).memory == 1,
+          "the restore that cannot fit alone did not wait");
+  double now = 2;
+  tickUntil(engine, now, [&] { return !events.starts.empty(); },
+            "the request did not start without its prefix");
+  require(hashed() == 2 && events.starts[0] == std::pair{EngineCacheStatus::Miss, 0U},
+          "a request that ignores the cache was probed or ranked by its prefix");
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.completedCount == 1 && executor.prefillRows == 65 && tier.restores == 0,
+          "the request did not finish cold");
+}
+
+// A Background lane holds the page a Normal request needs to read its
+// prefix back from disk. With nothing else to free, the refused pages
+// suspend the lane, and the request starts at its next attempt. When the
+// page is on its way back, a cached block being written to disk, the
+// request waits for the write and no lane yields.
+void testRefusedPrefixRestorePreemptsLowerResident() {
+  for (const bool written : {false, true}) {
+    test::TestKvStorage storage(64, 4096, 1);
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    engine::Cache cache(pool, CacheNamespace{}, written ? &tier : nullptr);
+    Executor executor;
+    executor.decodeFinishes = false;
+    Events events;
+    engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+    guardReleases(storage, engine);
+    // The prefix's state is on disk and its two pages in memory. Beside it,
+    // another state on disk keeps the page of its block, which a reclaim
+    // writes to disk before it frees it.
+    const std::vector<uint32_t> prompt(65, 17);
+    publishDiskState(cache, prompt);
+    if (written) {
+      cache.beginRequest(998);
+      require(cache.ensureTokens(998, 32).granted(), "fixture KV failed");
+      demoteState(cache, cache.publishCommittedBlocks(998, std::vector<uint32_t>(33, 5), 32));
+      cache.endRequest(998);
+    }
+    // The Background lane's three pages fill the engine's limit.
+    storage.budgetPages = storage.allocatedPages() + 3;
+    auto background = request(1, std::vector<uint32_t>(65, 1));
+    background.priority = RequestPriority::Background;
+    background.maxNewTokens = 1000;
+    engine.submit(std::move(background));
+    double now = 1;
+    tickUntil(engine, now, [&] { return events.outputs.contains(1); },
+              "the Background lane did not decode");
+    // Its state read from disk, the request needs a page beyond its prefix.
+    engine.submit(request(2, prompt));
+    tickUntil(engine, now, [&] { return executor.beginAttempts == 2; },
+              "the request did not try to start");
+    if (written) {
+      require(tier.demotions == 1 && engine.snapshot().prioritySuspensions == 0 &&
+                  executor.requests.at(1).resident,
+              "a lane yielded memory on its way back");
+      tier.complete();
+    } else {
+      require(engine.snapshot().prioritySuspensions == 1 && !executor.requests.at(1).resident,
+              "the refused restore did not suspend the lower lane");
+    }
+    tickUntil(engine, now, [&] { return executor.diskReads == 1; },
+              "the request was not admitted into its restore");
+    require(executor.beginAttempts == 3, "the request did not start at its next attempt");
+    executor.restoreControl->ready = true;
+    tickUntil(engine, now, [&] { return events.startIds.back() == 2; },
+              "the restored request did not start");
+    require(events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 64U} &&
+                engine.snapshot().prioritySuspensions == (written ? 0U : 1U),
+            "the request did not start from its restored prefix");
+    for (uint64_t id : {1, 2})
+      engine.cancel(id);
+    tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+    require(events.failedCount == 0, "a request failed");
+  }
+}
+
 // A request admitted into a restore waits for its disk reads, not for
 // memory, although the host refused its previous attempt: /status counts it
 // as restoring.
@@ -7223,18 +7809,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
   guardReleases(storage, engine);
   // Six cached blocks, each under a state on disk, hold six of eight pages.
-  auto transfer = std::make_shared<OffloadControl>();
-  transfer->ready = true;
-  for (uint64_t id = 900; id < 906; ++id) {
-    std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
-    cache.beginRequest(id);
-    require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
-    cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
-    cache.endRequest(id);
-    require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
-            "state was not demoted");
-  }
+  cacheBlocksUnderDiskStates(cache, 6);
   require(pool.freePageCount() == 2 && tier.demotions == 0, "fixture pages are off");
 
   // The first prefill command ends at the replay boundary, 96 tokens: three
@@ -8323,6 +8898,8 @@ int main() {
     testLimitOutlivedByProgressDoesNotWakeTheLoop();
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();
+    testSkipCacheCandidateIsNotProbed();
+    testRefusedPrefixRestorePreemptsLowerResident();
     testRestoringRequestIsNotWaitingForMemory();
     testSharedPrefillWaitsForARestoringProducer();
     testCancelledRestoringProducerReleasesItsWaiter();
@@ -8335,6 +8912,7 @@ int main() {
     testGrowthWaitsForTheStateWriteInFlight();
     testPageShortfallDemotesInBulk();
     testWaitingLaneAlwaysNamesAWakeup();
+    testWaitingPlanDoesNotIdleRunnableLanes();
     testNothingInFlightIsNotPending();
     testKvGrowthProceedsThroughDemotion();
     testAsyncRestoreLifecycle();
@@ -8366,6 +8944,7 @@ int main() {
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testImageSpansKeyPrefixIdentity();
+    testSharedPrefillBoundaryStopsAtTheFirstDifferentImage();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLazyJunctionNeedsADraftWindowOfGain();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
@@ -8420,6 +8999,8 @@ int main() {
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
+    testUnselectableCandidatesAreNotProbed();
+    testWaitingCandidateProbeIsRefreshedNotRepeated();
     testMemoryWaitHoldsBackLaterArrivals();
     testMemoryWaitClosesAdmissionBesideAResidentLane();
     testClosedAdmissionReopensWhenTheWaitEnds();
@@ -8436,6 +9017,12 @@ int main() {
     testKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testRecoveryDrainEndsWithItsCause();
+    testRecoveryDrainEndsWhenAResidentReleasesMemory();
+    testHigherPriorityArrivalIsNotHeldByRecovery();
+    testForegroundArrivalPreemptsWhenCellsAreFull();
+    testRefusedHigherPriorityStartPreemptsLowerResident();
+    testPrefixWaiterTakesNoLaneUntilThePrefixLands();
+    testRequestBelowARunningPriorityTakesNoLane();
     testPressureRetryIsBackedOffWithoutProgress();
     testAdmissionRetryWakesOnlyWhenTickCanRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();

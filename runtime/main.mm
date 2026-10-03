@@ -285,9 +285,10 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =
       model::ExecutionLimits::maximumStepTokens;
-  config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
+  config.protocolLimits.maxSimulationTokens =
+      model::ExecutionLimits::draftQueryRows;
   config.protocolLimits.maxMaskWords =
-      maskWordsPerToken * (capabilities.draftQueryRows + 1);
+      maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
   return config;
 }
 

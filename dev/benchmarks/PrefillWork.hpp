@@ -5,10 +5,17 @@
 #include "ops/PagedKv.hpp"
 
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 namespace splash::benchmark {
+
+// The draft context rows a plan captures.
+inline uint64_t draftContextRows(const DraftContextPlan &plan) {
+  uint64_t rows = 0;
+  for (const DraftCaptureSpan &span : plan.captureSpans)
+    rows += span.end - span.begin;
+  return rows;
+}
 
 // Work expected by cold and prefix-hit benchmark requests, including the
 // engine's rolling recovery points and final reusable replay state.
@@ -23,12 +30,8 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
       engine::plannedCheckpoints(restoredTokens, replayBoundary, checkpointTokens);
   if (replayBoundary > restoredTokens)
     boundaries.push_back(replayBoundary);
-  return planDraftContext(
-             restoredTokens, promptTokens,
-             restoredTokens ? std::optional<uint32_t>(restoredTokens)
-                            : std::nullopt,
-             boundaries)
-      .draftContextRows();
+  return draftContextRows(
+      planDraftContext(restoredTokens, promptTokens, boundaries));
 }
 
 } // namespace splash::benchmark

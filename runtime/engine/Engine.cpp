@@ -291,7 +291,15 @@ bool Engine::tick(double now) {
 
   progressed = admitQueued(now) || progressed;
   sweepTerminal();
-  if (auto plan = scheduler_.next()) {
+  // Lanes that wait for memory on its way back cannot run before it lands;
+  // the command runs the other lanes meanwhile. A plan whose lanes all wait
+  // adds them, so each attempt plans without at least one more lane.
+  std::vector<uint64_t> excluded;
+  for (const auto &[id, active] : requests_) {
+    if (active.stateCell && active.resourceWait.pending && !resourceRetryReady(active, now))
+      excluded.push_back(id);
+  }
+  while (auto plan = scheduler_.next(excluded)) {
     std::vector<ModelBatchItem> items;
     switch (prepare(*plan, items, now)) {
     case Prepared::Runnable: {
@@ -300,7 +308,7 @@ bool Engine::tick(double now) {
       if (!ticket) {
         throw std::logic_error("model returned an empty command ticket");
       }
-      scheduler_.commit(*plan);
+      scheduler_.commit(*plan, excluded);
       pending_ = Pending{std::move(*plan), std::move(ticket)};
       return true;
     }
@@ -308,7 +316,9 @@ bool Engine::tick(double now) {
       sweepTerminal();
       return true;
     case Prepared::Waiting:
-      break;
+      for (const BatchItem &item : plan->items)
+        excluded.push_back(item.requestId);
+      continue;
     }
   }
   return progressed;
@@ -323,9 +333,20 @@ bool Engine::drainingForRecovery() const {
          (allocationFailed_ || growthPaused());
 }
 
-bool Engine::anySuspended() const {
-  return std::any_of(requests_.begin(), requests_.end(),
-                     [](const auto &entry) { return entry.second.suspended; });
+std::optional<RequestPriority> Engine::suspendedTier() const {
+  std::optional<RequestPriority> tier;
+  for (const auto &[_, active] : requests_) {
+    if (active.suspended && (!tier || active.request.priority < *tier))
+      tier = active.request.priority;
+  }
+  return tier;
+}
+
+bool Engine::admissionTries(const Request &active, std::optional<RequestPriority> tier,
+                            bool draining) noexcept {
+  if (!tier)
+    return !draining;
+  return active.request.priority < *tier || (active.suspended && !draining);
 }
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
@@ -335,11 +356,11 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   const bool draining = drainingForRecovery();
   if (draining && (!result || drainEndMilliseconds_ < *result))
     result = drainEndMilliseconds_;
-  // Admission retries run only between commands, and after a suspension only
-  // for suspended requests; those held behind one refused memory have no
-  // retry time (admitQueued). Other retry times would wake the loop with
-  // nothing to do; the command completion or resumption wakes it instead.
-  const bool recovering = anySuspended();
+  // Admission retries run only between commands, and only for the requests
+  // admission tries; those held behind one refused memory have no retry time
+  // (admitQueued). Other retry times would wake the loop with nothing to do;
+  // the command completion or resumption wakes it instead.
+  const std::optional<RequestPriority> tier = suspendedTier();
   for (const auto &[_, active] : requests_) {
     if (active.finalized || active.pendingEnd)
       continue;
@@ -354,7 +375,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     const double deadline = resourceDeadline(active);
     if (!draining && deadline > 0.0 && (!result || deadline < *result))
       result = deadline;
-    if (draining || pending_ || (recovering && !active.suspended) ||
+    if (pending_ || !admissionTries(active, tier, draining) ||
         active.resourceWait.retryMilliseconds <= 0.0)
       continue;
     const double wakeup = active.resourceWait.epoch == resourceEpoch_
@@ -400,12 +421,13 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
   // As admitQueued tries them: the requests after the first one refused
   // memory are held back behind it, in whatever phase the latest pass left
   // them, and so is that request while a pass defers it for scheduling or a
-  // prefix. During recovery only suspended requests are tried.
-  const bool recovering = anySuspended();
+  // prefix. During recovery only the suspended requests and those above all
+  // of them are tried.
+  const std::optional<RequestPriority> tier = suspendedTier();
   bool closed = false;
   for (uint64_t id : scheduler_.admissionOrder()) {
     const Request &held = requests_.at(id);
-    if (held.finalized || held.restore || (recovering && !held.suspended))
+    if (held.finalized || held.restore || !admissionTries(held, tier, false))
       continue;
     if (closed || (held.refusedMemory && scheduler_.phase(id) != Phase::WaitingResources))
       ++result.heldBehindRefusal;
@@ -415,55 +437,98 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
 }
 
 bool Engine::admitQueued(double now) {
-  const bool recovering = anySuspended();
+  const std::optional<RequestPriority> tier = suspendedTier();
   // Once pressure has preempted work, let resident lanes finish while memory
   // is still short before spending their released headroom on a retry or a
   // new request; this prevents repeated B4 admission/preemption churn. The
   // drain ends when growth is no longer paused and nothing has failed since
-  // the suspension, and at the latest after the resource wait limit;
-  // suspended requests are then admitted before new work, one at a time.
-  if (!recovering)
+  // the suspension or since a resident lane last released its memory, and at
+  // the latest after the resource wait limit; suspended requests are then
+  // admitted before new work of their priority or below, one at a time. A
+  // request of a strictly higher priority than every suspended one waits for
+  // neither.
+  if (!tier)
     drainEndMilliseconds_ = 0.0;
-  if (drainingForRecovery())
-    return false;
+  const bool draining = drainingForRecovery();
   const std::vector<uint64_t> order = scheduler_.admissionOrder();
-  if (recovering) {
-    // Suspended requests come first, one at a time, in admission order; as
-    // in ordinary admission, the first one refused memory holds back the
-    // ones after it. Those are not tried, so they keep no retry time, and
-    // their wait limit starts again at their next attempt.
+  // A request this pass does not start, or that waits behind one refused
+  // memory, waits for scheduling.
+  const auto queue = [&](uint64_t id) {
+    deferWait(request(id));
+    scheduler_.deferAdmission(id);
+  };
+  // A request below the highest priority that prefills or decodes cannot
+  // run before that priority is done. It waits for scheduling, unprobed, and
+  // takes no lane, neither a free one nor a lower resident's: the lanes of
+  // that priority free theirs as they finish.
+  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
+  const auto belowRunnable = [&](const Request &active) {
+    return runnable && active.request.priority > *runnable;
+  };
+  // The tokens a request's start would reuse, from its probe brought up to
+  // date: none for a request that ignores the cache, which is ranked by its
+  // whole prompt.
+  const auto cachedTokens = [&](Request &active) -> uint32_t {
+    if (active.skipCache)
+      return 0;
+    if (active.admissionProbe)
+      cache_.refresh(*active.admissionProbe, active.request.prompt, active.request.images);
+    else
+      active.admissionProbe = cache_.probe(active.request.prompt, active.request.images);
+    return active.admissionProbe->cachedTokens();
+  };
+  // A request starts only in a free state cell. While every cell is
+  // resident, record each wait as a failed admission would. The first
+  // request that waits for a lane and not for a producer's prefix takes one
+  // from the lowest-priority resident below it, if there is one: the order
+  // is by priority, so no later request has one to take. The next pass
+  // admits it, above the lane it suspended. Only the requests up to that
+  // one are probed, to tell a prefix wait: a request waiting for a prefix
+  // would leave the freed cell to the suspended lane, which would resume
+  // into it and replay for nothing.
+  const bool cellsFull =
+      std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
+        return entry.second.stateCell.has_value();
+      }) >= model::ExecutionLimits::maximumBatchWidth;
+  bool laneSought = false;
+  const auto waitForLane = [&](uint64_t id, Request &active) {
+    if (!laneSought && !pendingSharedPrefill(active, cachedTokens(active))) {
+      laneSought = true;
+      if (preemptBelow(active.request.priority, now))
+        return true;
+    }
+    scheduler_.waitForResources(id);
+    deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
+    return false;
+  };
+  if (tier) {
+    // Recovery admits one request at a time, in admission order: those
+    // above every suspended request, then the suspended ones, which resume
+    // below a running priority too. As in ordinary admission, the first one
+    // refused memory holds back the ones after it. Those are not tried, so
+    // they keep no retry time, and their wait limit starts again at their
+    // next attempt.
     bool held = false;
     for (uint64_t id : order) {
       Request &active = request(id);
-      if (!active.suspended || active.restore)
+      if (active.restore || !admissionTries(active, tier, draining))
         continue;
       if (held) {
         active.resourceWait.retryMilliseconds = 0.0;
         active.resourceWait.deadlineMilliseconds = 0.0;
         continue;
       }
-      if (resourceRetryReady(active, now) && admit(active, now))
-        return true;
+      if (resourceRetryReady(active, now)) {
+        if (!active.suspended && belowRunnable(active))
+          queue(id);
+        else if (cellsFull && !active.suspended ? waitForLane(id, active) : admit(active, now))
+          return true;
+      }
       held = active.refusedMemory;
     }
     return false;
   }
 
-  // A request starts only in a free state cell. While every cell is
-  // resident, record each wait as a failed admission would, without hashing
-  // the waiting prompts again.
-  const bool cellsFull =
-      std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
-        return entry.second.stateCell.has_value();
-      }) >= model::ExecutionLimits::maximumBatchWidth;
-  // A request this pass does not start, or that waits behind one refused
-  // memory, waits for scheduling.
-  const auto queue = [&](uint64_t id) {
-    Request &active = request(id);
-    active.admissionProbe.reset();
-    deferWait(active);
-    scheduler_.deferAdmission(id);
-  };
   // A request whose start was refused memory closes admission behind it
   // until it starts: admission is open for order[0, open). What reclaim and
   // finishing lanes free would otherwise keep going to later arrivals that
@@ -472,6 +537,8 @@ bool Engine::admitQueued(double now) {
   // one.
   size_t open = order.size();
   std::vector<PrefillAdmission> candidates;
+  // Each candidate's place in order.
+  std::unordered_map<uint64_t, size_t> positions;
   for (size_t index = 0; index < order.size(); ++index) {
     const uint64_t id = order[index];
     Request &active = request(id);
@@ -484,32 +551,31 @@ bool Engine::admitQueued(double now) {
       open = index + 1;
     if (active.restore || !resourceRetryReady(active, now))
       continue;
-    if (cellsFull) {
-      scheduler_.waitForResources(id);
-      deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
+    if (belowRunnable(active)) {
+      queue(id);
       continue;
     }
-    active.admissionProbe =
-        cache_.probe(active.request.prompt, active.request.images);
-    const uint32_t cached = active.admissionProbe->cachedTokens();
+    if (cellsFull) {
+      if (waitForLane(id, active))
+        return true;
+      continue;
+    }
+    const uint32_t cached = cachedTokens(active);
     if (pendingSharedPrefill(active, cached)) {
-      active.admissionProbe.reset();
       deferWait(active);
       scheduler_.waitForPrefix(id);
       continue;
     }
+    positions.emplace(id, index);
     candidates.push_back({id, cached});
   }
-  const auto position = [&](uint64_t id) {
-    return static_cast<size_t>(std::find(order.begin(), order.end(), id) - order.begin());
-  };
   bool progressed = false;
   while (!candidates.empty()) {
     const auto selected = scheduler_.prefillAdmissionOrder(candidates);
     if (selected.empty())
       break;
     for (uint64_t id : selected) {
-      if (position(id) >= open)
+      if (positions.at(id) >= open)
         continue;
       progressed = admit(request(id), now) || progressed;
       std::erase_if(candidates, [id](const auto &value) {
@@ -517,10 +583,10 @@ bool Engine::admitQueued(double now) {
       });
       // Refused memory in this pass, it closes admission behind it at once.
       if (request(id).refusedMemory)
-        open = std::min(open, position(id) + 1);
+        open = std::min(open, positions.at(id) + 1);
     }
     std::erase_if(candidates, [&](const auto &value) {
-      if (position(value.requestId) < open)
+      if (positions.at(value.requestId) < open)
         return false;
       queue(value.requestId);
       return true;
@@ -562,14 +628,24 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
       static_cast<uint32_t>(end - a.begin()),
       std::min(replayStateBoundary(left), replayStateBoundary(right)));
   boundary -= boundary % KvCache::pageTokens;
-  if (!left.request.images.empty() || !right.request.images.empty()) {
-    for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
-      if (blockImageIdentity(offset, KvCache::pageTokens, left.request.images) !=
-          blockImageIdentity(offset, KvCache::pageTokens, right.request.images))
-        return offset;
-    }
-  }
-  return boundary;
+  // Blocks below the boundary have equal image identities exactly when the
+  // spans that start below it are equal; otherwise the first differing
+  // block holds the earliest start of the first unequal span.
+  const auto startingBelow = [&](const Request &value) {
+    const std::span<const ImageSpan> images = value.request.images;
+    const auto end = std::partition_point(
+        images.begin(), images.end(),
+        [&](const ImageSpan &span) { return span.offset < boundary; });
+    return std::span<const ImageSpan>(images.begin(), end);
+  };
+  const auto leftImages = startingBelow(left);
+  const auto rightImages = startingBelow(right);
+  const auto [leftUnequal, rightUnequal] = std::mismatch(
+      leftImages.begin(), leftImages.end(), rightImages.begin(), rightImages.end());
+  const uint32_t start =
+      std::min(leftUnequal == leftImages.end() ? boundary : leftUnequal->offset,
+               rightUnequal == rightImages.end() ? boundary : rightUnequal->offset);
+  return start - start % KvCache::pageTokens;
 }
 
 bool Engine::pendingSharedPrefill(const Request &active,
@@ -608,7 +684,6 @@ bool Engine::admit(Request &active, double now) {
           : cache_.lookup(modelRequest.prompt, active.request.images,
                           active.admissionProbe ? &*active.admissionProbe
                                                 : nullptr);
-  active.admissionProbe.reset();
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
@@ -654,6 +729,11 @@ bool Engine::admit(Request &active, double now) {
     active.refusedMemory = state.admission.failure == StateFailure::MemoryPressure;
     scheduler_.waitForResources(active.request.id);
     deferResourceRetry(active, now, state.denial, state.admission.failure);
+    // A start refused memory takes it from a resident of a lower priority,
+    // whose suspension makes it retry at the next pass. Memory on its way
+    // back makes no lane yield: the start waits for it.
+    if (active.refusedMemory && !resuming && !state.denial.pending)
+      static_cast<void>(preemptBelow(active.request.priority, now));
     return false;
   }
   cache_.beginRequest(active.request.id);
@@ -692,11 +772,16 @@ bool Engine::admit(Request &active, double now) {
       return true;
     }
     // Release the prefix pin before retrying without its memory footprint.
-    if (verdict == Verdict::Fail)
+    if (verdict == Verdict::Fail) {
       active.skipCache = true;
+      active.admissionProbe.reset();
+    }
     active.refusedMemory = true;
     scheduler_.waitForResources(requestId);
     deferResourceRetry(active, now, kv.denial);
+    // As for a refused state.
+    if (!resuming && !kv.denial.pending)
+      static_cast<void>(preemptBelow(active.request.priority, now));
     return false;
   }
   active.resourceWait = {};
@@ -705,7 +790,7 @@ bool Engine::admit(Request &active, double now) {
   std::unique_ptr<StateRestore> transfer;
   if (lookup.state) {
     transfer = model_.beginRestore(requestId, resumeBoundary, lookup.state->state(),
-                                   !draft.draftStateRestoreSkipped,
+                                   draft.restoresDraftState,
                                    completionNotifier_);
   }
   if (transfer || cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending) {
@@ -721,6 +806,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = active.suspended;
   active.skipCache = false;
+  active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   if (resuming)
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
@@ -940,10 +1026,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(
-      stateBoundary, active.replayTokens,
-      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-      boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -1131,10 +1214,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     active.resourceWait = {};
     ModelBatchItem item;
     item.requestId = active.request.id;
-    item.stateSlot = *active.stateCell;
     item.logicalPosition = position;
-    item.promptOffset =
-        plan.kind == WorkKind::Prefill ? scheduled.promptOffset : 0;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
     item.pageTable = pageTable.pages;
@@ -1180,9 +1260,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
   // A peer that has not failed a growth attempt resumes to its current KV
   // capacity, not to the blocked lane's requirement.
   const uint64_t resumeTarget =
-      own != denied.end()
-          ? own->workEnd
-          : uint64_t{cache_.pageTable(active.request.id).pages.size()} * KvCache::pageTokens;
+      own != denied.end() ? own->workEnd : kvCapacity(active.request.id);
   if (judge(victim.denial, active.request.id) == Verdict::Fail)
     settle(request(victim.requestId),
            capacityExhausted("KV target", victim.admission.allocationFailure,
@@ -1224,6 +1302,24 @@ Engine::Request *Engine::laneToYield() {
       yielding = &candidate;
   }
   return yielding;
+}
+
+uint64_t Engine::kvCapacity(uint64_t requestId) const {
+  return uint64_t{cache_.pageTable(requestId).pages.size()} * KvCache::pageTokens;
+}
+
+bool Engine::preemptBelow(RequestPriority priority, double now) {
+  // The lane that yields first has the lowest priority of all residents.
+  Request *const victim = laneToYield();
+  if (!victim || victim->request.priority <= priority)
+    return false;
+  suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
+              StateFailure::ConcurrencyLimit, now);
+  // What the lane held is free: an earlier failure may fit now.
+  allocationFailed_ = false;
+  ++counters_.prioritySuspensions;
+  signalResourceProgress();
+  return true;
 }
 
 bool Engine::anotherResident(uint64_t requestId) const {
@@ -1381,10 +1477,10 @@ CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &adm
   return reused;
 }
 
-void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
-                              metal::AllocationFailure failure, double now) {
+void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFailure failure,
+                         StateFailure reason, double now) {
   if (!active.stateCell || active.suspended) {
-    throw std::logic_error("request cannot be suspended for growth");
+    throw std::logic_error("request cannot be suspended");
   }
   if (!active.stateBoundaries.empty()) {
     discardPendingStateBoundaries(active);
@@ -1395,17 +1491,22 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
   active.stateCell.reset();
   active.suspended = true;
   active.resumeKvTargetTokens = workEnd;
+  active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
+  scheduler_.suspendForResources(active.request.id);
+  deferResourceRetry(active, now, {.allocationFailure = failure}, reason);
+}
+
+void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
+                              metal::AllocationFailure failure, double now) {
+  suspendLane(active, workEnd, failure, StateFailure::MemoryPressure, now);
+  // Without its lane it waits for the memory of every lane resident now,
+  // also those admitted while it waited to grow.
+  active.resourceWait.admittedBefore = admissions_;
   // Resident lanes drain before admission resumes. Growth the host refused
   // resumes when its pressure lifts; any other limit only once memory is
   // freed, so it counts as a failure the drain waits out.
   drainEndMilliseconds_ = now + config_.resourceWaitTimeoutMilliseconds;
   allocationFailed_ = failure != metal::AllocationFailure::HostPressure;
-  active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
-  scheduler_.suspendForResources(active.request.id);
-  deferResourceRetry(active, now, {.allocationFailure = failure});
-  // Without its lane it waits for the memory of every lane resident now,
-  // also those admitted while it waited to grow.
-  active.resourceWait.admittedBefore = admissions_;
   ++counters_.resourceSuspensions;
 }
 
@@ -1691,6 +1792,10 @@ void Engine::release(Request &active) {
   active.resourceWait = {};
   active.maskRequestedMilliseconds.reset();
   if (active.stateCell || active.suspended) {
+    // A resident lane gives its memory back: what failed for want of it may
+    // fit now, so the recovery drain ends and the next attempt finds out.
+    if (active.stateCell)
+      allocationFailed_ = false;
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);
     cache_.endRequest(active.request.id);

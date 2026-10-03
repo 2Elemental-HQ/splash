@@ -19,15 +19,12 @@ public:
 
   // Direct native-oracle entry point. Production admission uses
   // begin() and installs its cache-aware plan explicitly.
-  void beginColdRequest(const ModelRequest &request, uint32_t stateSlot);
+  void beginColdRequest(const ModelRequest &request, uint32_t stateLane);
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
-  void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                     std::shared_ptr<const CompositeState> restoredState,
-                     bool restoreDraftState) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
       uint64_t requestId, uint32_t boundary,
       std::shared_ptr<const CompositeState> state, bool restoreDraft,
@@ -55,7 +52,6 @@ public:
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;
-  [[nodiscard]] WarmupStepResult warmupDraftVerifyCommit() override;
   [[nodiscard]] WarmupStepResult
   warmupCompositeStateRestore() override;
   [[nodiscard]] ModelMemoryActual
@@ -65,13 +61,13 @@ public:
   telemetry() const noexcept override;
 
 private:
-  // The state slot of a resident request whose committed state can be
-  // snapshotted: page-aligned, with a complete draft window.
-  [[nodiscard]] uint32_t committedStateSlot(uint64_t requestId);
+  // The state lane of a resident request; the storage checks that its
+  // committed state can be cached.
+  [[nodiscard]] uint32_t residentLane(uint64_t requestId);
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
-                                       uint32_t stateSlot);
+                                       uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   prefillAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                std::function<void()> completion);

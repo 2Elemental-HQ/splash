@@ -262,8 +262,11 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {0, StateFailure::None};
   }
-  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
-                     bool) override {}
+  std::unique_ptr<StateRestore> beginRestore(uint64_t, uint32_t,
+                                             std::shared_ptr<const CompositeState>, bool,
+                                             std::function<void()>) override {
+    return {};
+  }
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
   std::vector<ModelStepResult> prefill(const BatchPlan &,
                                           std::span<const ModelBatchItem>) {
@@ -304,11 +307,8 @@ public:
     }
     return warmup(static_cast<int>(width));
   }
-  model::WarmupStepResult warmupDraftVerifyCommit() override {
-    return warmup(5);
-  }
   model::WarmupStepResult warmupCompositeStateRestore() override {
-    return warmup(6);
+    return warmup(5);
   }
   model::ModelMemoryActual actualRuntimeMemory() const override {
     return {1, 1};
@@ -397,7 +397,7 @@ void testAllNativeWarmupsPrecedeReady() {
               report.warmup.ready() && report.memoryAudit.valid &&
               harness.loop().ready() && !harness.output().empty(),
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5, 6}),
+  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
           "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
   require(harness.executor().lastPrefillRows == model::ExecutionLimits::prefillTokenBudget,
           "bootstrap memory warmup did not explicitly use maximum prefill rows");
@@ -451,7 +451,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     std::vector<int> expected{0};
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
-    expected.insert(expected.end(), {5, 6});
+    expected.push_back(5);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
     for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -469,7 +469,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
     for (bool denyRestore : {false, true}) {
       Harness harness(plan);
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
-        if (step == deniedWidth || (step == 6 && denyRestore))
+        if (step == deniedWidth || (step == 5 && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
       };
       const auto report = warmup(harness, plan);
@@ -480,7 +480,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
         expected.push_back(static_cast<int>(width));
       if (deniedWidth >= 0)
         expected.push_back(deniedWidth);
-      expected.insert(expected.end(), {5, 6});
+      expected.push_back(5);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
       for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -577,10 +577,9 @@ void testEveryWarmupFailureIsFailClosed() {
       engine::RuntimeBootstrapStage::DecodeWarmup,
       engine::RuntimeBootstrapStage::DecodeWarmup,
       engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DraftVerifyCommit,
       engine::RuntimeBootstrapStage::CompositeStateRestore,
   };
-  for (int step = 0; step < 7; ++step) {
+  for (int step = 0; step < 6; ++step) {
     Harness harness(plan, step);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
@@ -611,17 +610,16 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
       RuntimeBootstrapStage::DecodeWarmup,
       RuntimeBootstrapStage::DecodeWarmup,
       RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DraftVerifyCommit,
       RuntimeBootstrapStage::CompositeStateRestore,
   };
   const EngineMemoryPlan plan = memoryPlan();
-  for (int step = 0; step < 7; ++step) {
+  for (int step = 0; step < 6; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
                             Failure::General, Failure::MissingPeak,
                             Failure::ZeroTime, Failure::InfiniteTime,
                             Failure::NanTime}) {
       if (failure == Failure::Allocation &&
-          (step == 2 || step == 3 || step == 4 || step == 6))
+          (step == 2 || step == 3 || step == 4 || step == 5))
         continue; // Only these paths may skip a real allocation refusal.
       Harness harness(plan);
       harness.executor().warmupHook =

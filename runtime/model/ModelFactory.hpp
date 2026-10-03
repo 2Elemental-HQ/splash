@@ -8,7 +8,6 @@
 #include "QwenVision.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
-#include "model/SlotFile.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -16,6 +15,8 @@
 #include <variant>
 
 namespace splash::model {
+
+class QwenStateStorage;
 
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
 
@@ -29,8 +30,7 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Layout targetKvLayout(
-      kv::Format format = kv::Format::Int8) const noexcept {
+  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;
     return layout;
@@ -59,13 +59,13 @@ struct ModelPackage final {
   }
 };
 
-// Model execution resources. What a request's start allocates is admitted
-// by the engine through the state storage.
+// Model execution resources, which the engine assembles. What a request's
+// start allocates is admitted through the state storage.
 struct RuntimeContext final {
   metal::MetalBackend &backend;
   const ModelPackage &package;
   kv::PageStorage &kvPages;
-  StateStorage &stateStorage;
+  QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
@@ -93,9 +93,6 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 // is one shared engine and DFlash controller; only model execution differs.
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
-                 const std::filesystem::path &root);
-[[nodiscard]] ModelPackage
-loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
 
@@ -109,14 +106,7 @@ inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format = kv::Format::Int8);
-// The file, when given, holds one state per slot and shares the cache's
-// disk budget.
-[[nodiscard]] std::unique_ptr<StateStorage>
-createStateStorage(metal::MetalBackend &backend,
-                   metal::AllocationAdmission admitAllocation,
-                   const ModelPackage &package,
-                   std::shared_ptr<SlotFile> file = nullptr);
+                     kv::Format format);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

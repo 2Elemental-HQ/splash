@@ -805,7 +805,7 @@ void validateRealPackage(MetalBackend &backend,
     std::string fingerprint;
     std::string name;
     {
-        auto package = loadModelPackage(backend, root);
+        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root));
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(package.draft.files);
         visionBytes = declaredBytes(package.vision.files);

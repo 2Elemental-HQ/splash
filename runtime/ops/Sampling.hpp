@@ -44,9 +44,9 @@ struct SamplingPolicy final {
   [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
 };
 
-// The penalty words of every state slot, one row of vocabulary words each,
-// and the row each lane of a dispatch reads. Lanes follow the batch plan,
-// not slots, so a lane never binds a slot's row by its own index.
+// The penalty words of every state lane, one row of vocabulary words each,
+// and the row each lane of a dispatch reads. Dispatch lanes follow the batch
+// plan, not state lanes, so a lane never binds a row by its own index.
 struct PenaltyTable final {
   metal::MetalBuffer words;
   std::span<const uint32_t> rows;
@@ -139,7 +139,7 @@ public:
   [[nodiscard]] static DraftSelectorWorkspace draftWorkspace(uint32_t positions);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
-  // when it takes a state slot from the history the slot's prefill consumes:
+  // when it takes a state lane from the history the lane's prefill consumes:
   // its prompt, then the generatedTokens outputs it emitted. The prompt bit
   // marks every prompt token when markPrompt, as only repetition reads it,
   // and the counts are of every token the target selected: the emitted

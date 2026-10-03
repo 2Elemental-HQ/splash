@@ -37,6 +37,8 @@ struct CacheLookup final {
 
 class Cache;
 
+// A scheduling probe of one prompt and its images: refresh() and lookup()
+// take the same spans it was made from.
 class CacheProbe final {
 public:
   [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
@@ -45,17 +47,15 @@ private:
   friend class Cache;
 
   std::vector<uint64_t> blocks_;
-  // Only pages examined by matchedBlocks can affect this probe's result.
-  std::vector<uint32_t> checkedTokens_;
-  std::vector<ImageSpan> images_;
   const Cache *owner_ = nullptr;
-  size_t promptSize_ = 0;
   uint64_t kvGeneration_ = 0;
   uint32_t cachedTokens_ = 0;
 };
 
 struct CacheLookupSnapshot final {
   uint64_t lookups = 0;
+  // KV blocks scheduling probes hashed: admission work between commands.
+  uint64_t probeHashedBlocks = 0;
   uint64_t kvHitTokens = 0;
   uint64_t stateHitTokens = 0;
   // Lookups that matched KV past their state at a branch point.
@@ -207,10 +207,17 @@ public:
   // Scheduling probe only: does not pin, touch recency, or count a hit.
   [[nodiscard]] CacheProbe
   probe(std::span<const uint32_t> prompt,
-        std::span<const ImageSpan> images = {}) const;
+        std::span<const ImageSpan> images = {});
+  // Brings a probe this cache made up to date: after a change of the KV
+  // graph its chain is cut at the first block that no longer matches and
+  // matched on from there; its cached tokens follow the states either way.
+  void refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
+               std::span<const ImageSpan> images = {});
 
   // Pin the usable prefix before potentially evicting for active allocations.
   // Accounting is separate: failed admission retries are not extra samples.
+  // A probe of the prompt that has seen the KV graph as it is supplies the
+  // matched chain; otherwise the prompt is matched again.
   [[nodiscard]] CacheLookup lookup(
       std::span<const uint32_t> prompt,
       std::span<const ImageSpan> images = {},
@@ -366,9 +373,12 @@ public:
   [[nodiscard]] CacheSnapshot snapshot() const;
 
 private:
-  [[nodiscard]] std::vector<uint64_t>
-  matchedBlocks(std::span<const uint32_t> prompt,
-                std::span<const ImageSpan> images) const;
+  // Matches the prompt's pages on from blocks.back() (from the root when
+  // empty) and appends each block found; returns the pages it hashed.
+  size_t extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_t> prompt,
+                     std::span<const ImageSpan> images) const;
+  // The tokens up to the deepest of these blocks that holds a state.
+  [[nodiscard]] uint32_t stateTokens(std::span<const uint64_t> blocks) const;
 
   struct Request final {
     std::vector<uint32_t> pages;

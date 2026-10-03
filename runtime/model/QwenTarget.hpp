@@ -73,7 +73,6 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 struct QwenTargetGeometry final {
   static constexpr uint32_t maximumCaptureLayers = 8;
 
-  uint32_t maximumContextTokens = 0;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
@@ -137,26 +136,18 @@ struct QwenTargetGeometry final {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth};
   }
-  // The projection lists hold every projection the weights dispatch, which
-  // each have sizes.
+  // The layout itself was checked by requireQwenLayout when the target
+  // loaded. The projection lists hold every projection the weights dispatch,
+  // which each have sizes.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
         return shape.outputSize && shape.inputSize;
       });
     };
-    return maximumContextTokens && layers && hiddenSize && vocabularySize &&
-           packedGdnWidth && packedFullWidth && convolutionDimension &&
-           gdnKeyHeads && gdnValueHeads && gdnHeadDimension &&
-           attentionWidth && attentionQueryHeads && attentionKvHeads &&
-           attentionHeadDimension && rotaryPairs && rotaryTheta > 0.0F &&
-           captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
-           kvLayout.valid() && stateLayout.valid() &&
+    return captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
            stateLayout.layers + kvLayout.attentionLayers == layers &&
            gdnShape().valid() &&
-           // The GDN value rows are sized with attentionWidth throughout.
-           gdnValueHeads * gdnHeadDimension == attentionWidth &&
-           attentionWidth == attentionQueryHeads * attentionHeadDimension &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
@@ -279,13 +270,9 @@ qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
 class QwenTarget final {
 public:
   template <class Layout, class Layer>
-  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, metal::MetalBackend &backend,
-             const ops::ExecutionPlans &operators,
-             kv::Format format = kv::Format::Int8);
+  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
+             metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
 
-  [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
-    return geometry_;
-  }
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a

@@ -79,6 +79,8 @@ void testCleanRuntimeStatus() {
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
   engine.resourceReplayTokens = 1234;
+  engine.resourceSuspensions = 5;
+  engine.prioritySuspensions = 2;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
@@ -99,7 +101,11 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointRetirements = 3;
   engine.resources.stateCache.inUse = 2;
   engine.resources.stateCache.inUseEvictions = 5;
-  engine.resources.lookup = {.lookups = 3, .kvHitTokens = 128, .stateHitTokens = 64, .lazyJunctions = 1};
+  engine.resources.lookup = {.lookups = 3,
+                             .probeHashedBlocks = 7,
+                             .kvHitTokens = 128,
+                             .stateHitTokens = 64,
+                             .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
   engine.resources.kvTier.readBytes = 12345;
@@ -109,7 +115,6 @@ void testCleanRuntimeStatus() {
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   warmup.maximumPrefillDetail = "packed_rows=2048";
@@ -274,6 +279,10 @@ void testCleanRuntimeStatus() {
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
+          json.find("\"resource_suspensions\":5,\"priority_suspensions\":2,") !=
+              std::string::npos &&
+          json.find("\"cache\":{\"lookups\":3,\"probe_hashed_blocks\":7,") !=
+              std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
                     "\"recycled_state_publications\":1,"
@@ -309,7 +318,6 @@ void testCurrentReadinessAndSimultaneousPeak() {
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   MemoryGovernorSnapshot governor;
@@ -370,14 +378,12 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
   require(!warmup.ready(), "unexecuted warmup was ready");
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.memoryBudgetValidated = true;
   require(warmup.ready(), "complete warmup was not ready");
 
   for (WarmupStepStatus *required : {&warmup.maximumPrefill,
-                                    &warmup.decodeBatches[0],
-                                    &warmup.draftVerifyCommit}) {
+                                    &warmup.decodeBatches[0]}) {
     for (WarmupStepStatus state : {WarmupStepStatus::Pending,
                                   WarmupStepStatus::MemoryLimited}) {
       *required = state;

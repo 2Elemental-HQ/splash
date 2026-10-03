@@ -135,27 +135,12 @@ struct DraftBoundaryPlan final {
 struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
-  std::optional<uint32_t> restoredDraftBoundary;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
-
-  uint64_t targetPrefillRows = 0;
-  uint64_t draftContextRowsActive = 0;
-  uint64_t draftContextRowsMaterialization = 0;
-  uint64_t draftContextRowsAvoided = 0;
-  uint64_t draftStateRestoreSkipped = 0;
-  uint64_t draftStateResets = 0;
-
-  [[nodiscard]] uint64_t draftContextRows() const noexcept {
-    return draftContextRowsActive + draftContextRowsMaterialization;
-  }
-  [[nodiscard]] std::span<const DraftCaptureSpan> captures() const noexcept {
-    return captureSpans;
-  }
-  [[nodiscard]] std::span<const DraftBoundaryPlan>
-  plannedBoundaries() const noexcept {
-    return boundaries;
-  }
+  // The first capture continues the restored draft ring: a non-zero replay
+  // whose first boundary is within one draft window of it. Otherwise the
+  // restore skips the ring.
+  bool restoresDraftState = false;
 };
 
 struct DispatchDraftCaptureSpan final {
@@ -180,9 +165,10 @@ struct DispatchDraftCapturePlan final {
   [[nodiscard]] auto end() const noexcept { return values.begin() + count; }
 };
 
+// A replay from a non-zero boundary starts from the composite state restored
+// there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::optional<uint32_t> restoredDraftBoundary,
                  std::span<const uint32_t> materializationBoundaries);
 
 [[nodiscard]] DispatchDraftCapturePlan
@@ -223,9 +209,7 @@ struct StateAdmission final {
 
 struct ModelBatchItem final {
   uint64_t requestId = 0;
-  uint32_t stateSlot = 0;
   uint64_t logicalPosition = 0;
-  uint32_t promptOffset = 0;
   uint32_t tokenCount = 0;
   std::span<const uint32_t> pageTable;
   // pageTableRevision names the page list and is nonzero; the list equals
@@ -295,16 +279,10 @@ namespace model {
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
-  uint32_t maximumBatchWidth = 0;
-  uint32_t prefillTokenBudget = 0;
-  uint32_t draftQueryRows = 0;
-  uint32_t draftProposalTokens = 0;
-  uint32_t targetVerifyRows = 0;
-  uint32_t draftContextTokens = 0;
 };
 
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
-// target/draft manifests are validated against these capabilities at startup;
+// target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
@@ -334,18 +312,9 @@ static_assert(ExecutionLimits::targetVerifyRows ==
 
 // Shared accounting for model-owned state allocations.  Target and draft
 // implementations may allocate from separate physical pools while the engine
-// observes one byte total through StateStorage.
+// observes one byte total through ModelMemoryActual::stateActualAllocatedBytes.
 struct StateAllocationTracker final {
   std::atomic<uint64_t> bytes{0};
-};
-
-class StateStorage {
-public:
-  virtual ~StateStorage() = default;
-  [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
-  // The buffer a state's write to the disk tier stages through; zero without
-  // a tier.
-  [[nodiscard]] virtual uint64_t stagingBytes() const noexcept = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,
@@ -377,6 +346,9 @@ struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;
   uint64_t sharedPrefillActualAllocatedBytes = 0;
   uint64_t sharedDecodeActualAllocatedBytes = 0;
+  // The buffer a state's write to the disk tier stages through; zero without
+  // a tier.
+  uint64_t stateStagingBytes = 0;
 };
 
 struct ModelTelemetry final {
@@ -473,16 +445,13 @@ public:
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
-  virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
-                       bool restoreDraftState) = 0;
+  // Restores a cached state into the request's lane at `boundary`. A RAM
+  // state is copied now and the call returns null; a disk state returns the
+  // read, whose finish() commits it. `completion` only wakes the engine.
   [[nodiscard]] virtual std::unique_ptr<StateRestore>
   beginRestore(uint64_t requestId, uint32_t boundary,
                std::shared_ptr<const CompositeState> state, bool restoreDraft,
-               std::function<void()>) {
-    restore(requestId, boundary, std::move(state), restoreDraft);
-    return {};
-  }
+               std::function<void()> completion) = 0;
   virtual void setDraftContextPlan(uint64_t requestId,
                                    DraftContextPlan plan) = 0;
   // Optional async wake hook; an immediately ready ticket need not call it.
@@ -533,7 +502,6 @@ public:
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
-  virtual WarmupStepResult warmupDraftVerifyCommit() = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;

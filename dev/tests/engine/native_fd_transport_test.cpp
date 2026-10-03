@@ -52,8 +52,11 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {0, StateFailure::None};
   }
-  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
-                     bool) override {}
+  std::unique_ptr<StateRestore> beginRestore(uint64_t, uint32_t,
+                                             std::shared_ptr<const CompositeState>, bool,
+                                             std::function<void()>) override {
+    return {};
+  }
   void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
   // Prefill consumes its rows; the final chunk selects token 42, which ends
   // the request.

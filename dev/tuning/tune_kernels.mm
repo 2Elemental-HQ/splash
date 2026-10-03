@@ -301,8 +301,8 @@ std::vector<Confirmation> confirm(const std::filesystem::path &metallib,
   const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
-  config.protocolLimits.maxMaskWords = maskWordsPerToken * (capabilities.draftQueryRows + 1);
+  config.protocolLimits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  config.protocolLimits.maxMaskWords = maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
   auto bootstrap = engine::RuntimeBootstrap::start(
       std::move(config), [](std::span<const uint8_t>) {},
       []() -> std::string { throw std::logic_error("no status requests during tuning"); });

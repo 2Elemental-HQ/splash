@@ -144,9 +144,15 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
                                     DraftConvolutionBuffers buffers,
                                     const DraftAttentionPlan &plan,
                                     DraftConvolutionStage stage) {
-  if (stage != DraftConvolutionStage::Prepare &&
-      stage != DraftConvolutionStage::Residual)
-    throw std::invalid_argument("invalid draft convolution stage");
+  // Every stage has a case, so a new one fails -Wswitch here.
+  uint32_t finish = 0;
+  switch (stage) {
+  case DraftConvolutionStage::Prepare:
+    break;
+  case DraftConvolutionStage::Residual:
+    finish = 1;
+    break;
+  }
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t groups = phaseGroups(plan, uint64_t{kRows} * shape.hiddenSize);
@@ -157,8 +163,7 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   requireBuffer(buffers.dynamic, uint64_t{lanes} * kRows * shape.dynamicSize * 2);
   requireBuffer(buffers.weights, uint64_t{4} * shape.hiddenSize * 2);
   const KernelLayout kernel = kernelShape(shape);
-  const DraftConvBatchParams params{
-      groups, stage == DraftConvolutionStage::Residual ? 1U : 0U, lanes};
+  const DraftConvBatchParams params{groups, finish, lanes};
   graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"
                                                : "draft_conv_h2048",
             {std::move(buffers.input), std::move(buffers.dynamic),

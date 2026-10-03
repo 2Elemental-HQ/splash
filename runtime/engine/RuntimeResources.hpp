@@ -7,6 +7,7 @@
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/QwenState.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -203,7 +204,7 @@ private:
                    RuntimeCacheIdentity cacheIdentity,
                    std::unique_ptr<MemoryGovernor> memoryGovernor,
                    std::unique_ptr<kv::PageStorage> kvPages,
-                   std::unique_ptr<model::StateStorage> stateStorage,
+                   std::unique_ptr<model::QwenStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
@@ -217,7 +218,7 @@ private:
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
   std::unique_ptr<kv::PageStorage> kvPages_;
-  std::unique_ptr<model::StateStorage> stateStorage_;
+  std::unique_ptr<model::QwenStateStorage> stateStorage_;
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;

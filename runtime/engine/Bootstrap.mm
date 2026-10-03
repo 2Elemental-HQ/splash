@@ -48,8 +48,6 @@ std::string_view runtimeBootstrapStageName(RuntimeBootstrapStage stage) {
     return "maximum_prefill";
   case RuntimeBootstrapStage::DecodeWarmup:
     return "decode_warmup";
-  case RuntimeBootstrapStage::DraftVerifyCommit:
-    return "draft_verify_commit";
   case RuntimeBootstrapStage::CompositeStateRestore:
     return "composite_state_restore";
   case RuntimeBootstrapStage::MemoryAudit:
@@ -189,8 +187,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
         report.warmup.decodeBatches[width - 1],
         [&] { return modelRuntime.warmupDecodeBatch(width); }, width > 1);
   }
-  run(RuntimeBootstrapStage::DraftVerifyCommit, report.warmup.draftVerifyCommit,
-      [&] { return modelRuntime.warmupDraftVerifyCommit(); });
   run(RuntimeBootstrapStage::CompositeStateRestore,
       report.warmup.compositeStateRestore,
       [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);

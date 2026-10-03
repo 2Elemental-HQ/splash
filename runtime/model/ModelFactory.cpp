@@ -41,11 +41,13 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-ModelPackage loadPackage(metal::MetalBackend &backend,
-                         const std::filesystem::path &root,
-                         ModelDescriptor descriptor, PreparationCheck admitConversion = {}) {
+} // namespace
+
+ModelPackage loadModelPackage(metal::MetalBackend &backend,
+                              const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
   ModelPackage result;
-  result.descriptor = std::move(descriptor);
+  result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
   const PreparationCheck check = [&backend] { backend.checkOperation(); };
@@ -108,19 +110,6 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;
-}
-
-} // namespace
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root) {
-  return loadPackage(backend, root, inspectModelPackage(root));
-}
-
-ModelPackage loadModelPackage(metal::MetalBackend &backend,
-                              const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor, PreparationCheck admitConversion) {
-  return loadPackage(backend, root, descriptor, std::move(admitConversion));
 }
 
 std::unique_ptr<VisionLoader> planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,

@@ -1180,6 +1180,7 @@ class ServerTest(unittest.TestCase):
                         "cold_misses": 4,
                         "reused_tokens": 1024,
                         "lazy_junctions": 2,
+                        "priority_suspensions": 3,
                     },
                     "draft_context": {
                         "target_prefill_rows": 10000,
@@ -1255,6 +1256,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_cache_cold_misses_total 4", metrics)
         self.assertIn("splash_cache_reused_tokens_total 1024", metrics)
         self.assertIn("splash_cache_lazy_junctions_total 2", metrics)
+        self.assertIn("splash_cache_priority_suspensions_total 3", metrics)
         self.assertIn("splash_target_prefill_rows_total 10000", metrics)
         self.assertIn("splash_draft_context_prompt_end_rows_total 2048", metrics)
         self.assertIn("splash_draft_context_avoided_rows_total 7921", metrics)

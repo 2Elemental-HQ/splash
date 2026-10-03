@@ -31,7 +31,6 @@ struct WarmupReport {
   WarmupStepStatus maximumPrefill = WarmupStepStatus::Pending;
   std::array<WarmupStepStatus, model::ExecutionLimits::maximumBatchWidth>
       decodeBatches{};
-  WarmupStepStatus draftVerifyCommit = WarmupStepStatus::Pending;
   WarmupStepStatus compositeStateRestore = WarmupStepStatus::Pending;
   // Exact executor-selected kernel geometry for the fixed 2048-row path.
   std::string maximumPrefillDetail;
@@ -47,7 +46,6 @@ struct WarmupReport {
     return error.empty() && memoryBudgetValidated &&
            maximumPrefill == WarmupStepStatus::Complete &&
            decodeBatches[0] == WarmupStepStatus::Complete &&
-           draftVerifyCommit == WarmupStepStatus::Complete &&
            std::all_of(decodeBatches.begin() + 1, decodeBatches.end(),
                        optionalComplete) &&
            optionalComplete(compositeStateRestore);

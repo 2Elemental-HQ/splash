@@ -151,28 +151,26 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 // commit identical state. Both use the same target arithmetic; compare bytes.
 // The GDN kernel tests independently check each retained count against FP64.
 void requireCommittedStateIdentical(const model::QwenStateStorage &states,
-                                    uint32_t budgetSlot, uint32_t maskedSlot,
+                                    uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
-  const auto &budget = states.metadata(budgetSlot);
-  const auto &masked = states.metadata(maskedSlot);
+  const auto &budget = states.metadata(budgetLane);
+  const auto &masked = states.metadata(maskedLane);
   require(budget.lengths == masked.lengths,
           label + " logical state differs between budget and mask commits");
-  const auto &left = states.buffers(budgetSlot);
-  const auto &right = states.buffers(maskedSlot);
   auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
                        const std::string &part) {
     require(a.sizeBytes() == b.sizeBytes() && a.contents() && b.contents() &&
                 std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
             label + " " + part + " differs between budget and mask commits");
   };
-  identical(left.gdn[budget.activeParity].convolutionBase,
-            right.gdn[masked.activeParity].convolutionBase, "GDN convolution");
-  identical(left.gdn[budget.activeParity].recurrentBase,
-            right.gdn[masked.activeParity].recurrentBase, "GDN recurrent");
+  identical(states.current(budgetLane).stateBase,
+            states.current(maskedLane).stateBase, "GDN state");
+  const auto &left = states.draft(budgetLane);
+  const auto &right = states.draft(maskedLane);
   for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    identical(left.draft[layer].keys, right.draft[layer].keys,
+    identical(left[layer].keys, right[layer].keys,
               "draft keys layer=" + std::to_string(layer));
-    identical(left.draft[layer].values, right.draft[layer].values,
+    identical(left[layer].values, right[layer].values,
               "draft values layer=" + std::to_string(layer));
   }
 }
@@ -189,8 +187,8 @@ EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
 }
 
 void beginCold(model::Runtime &runtime, const EngineRequest &request,
-               uint32_t slot) {
-  runtime.beginColdRequest(request.modelView(), slot);
+               uint32_t lane) {
+  runtime.beginColdRequest(request.modelView(), lane);
 }
 
 // Gives an item the revision of its page list the way the engine's cache
@@ -219,14 +217,13 @@ ModelBatchItem withRevision(ModelBatchItem item) {
 void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          uint32_t promptTokens, uint32_t boundary,
                          const std::shared_ptr<const CompositeState> &state) {
-  executor.restore(requestId, boundary, state, true);
-  executor.setDraftContextPlan(
-      requestId, planDraftContext(boundary, promptTokens, boundary, {}));
+  require(!executor.beginRestore(requestId, boundary, state, true, {}),
+          "resident restore returned a read");
+  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}));
 }
 
 ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
-                             uint32_t slot, uint32_t logicalPosition,
-                             uint32_t promptOffset,
+                             uint32_t logicalPosition,
                              std::span<const uint32_t> inputTokens,
                              const std::vector<uint32_t> &pageTable,
                              BatchCohort cohort = BatchCohort::Greedy,
@@ -236,8 +233,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
                  cohort,
                  {{requestId, tokenCount}},
                  DecodeStage::Regular};
-  ModelBatchItem item = withRevision(
-      {requestId, slot, logicalPosition, promptOffset, tokenCount, pageTable});
+  ModelBatchItem item =
+      withRevision({requestId, logicalPosition, tokenCount, pageTable});
   item.inputTokens = inputTokens;
   auto ticket = executor.submit(
       plan, std::span<const ModelBatchItem>(&item, 1), {});
@@ -259,23 +256,21 @@ void requireOpen(const ModelStepResult &prefilled, const char *section) {
 }
 
 void prefillToken(model::Runtime &executor, uint64_t requestId,
-                  uint32_t slot, uint32_t logicalPosition,
-                  uint32_t promptOffset, uint32_t token,
+                  uint32_t logicalPosition, uint32_t token,
                   const std::vector<uint32_t> &pageTable,
                   BatchCohort cohort = BatchCohort::Greedy) {
   const std::array<uint32_t, 1> input{token};
-  requireOpen(prefillChunk(executor, requestId, slot, logicalPosition,
-                           promptOffset, input, pageTable, cohort),
+  requireOpen(prefillChunk(executor, requestId, logicalPosition, input,
+                           pageTable, cohort),
               "single-token prefill");
 }
 
 ModelStepResult
-decodeOne(model::Runtime &executor, uint64_t requestId, uint32_t slot,
+decodeOne(model::Runtime &executor, uint64_t requestId,
           uint64_t logicalPosition, const std::vector<uint32_t> &pageTable,
           BatchCohort cohort, DecodeStage decodeStage = DecodeStage::Regular) {
   BatchPlan plan{WorkKind::Decode, cohort, {{requestId, 0}}, decodeStage};
-  ModelBatchItem item =
-      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable});
+  ModelBatchItem item = withRevision({requestId, logicalPosition, 0, pageTable});
   auto result =
       executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
   require(result.size() == 1 && result[0].requestId == requestId,
@@ -286,14 +281,12 @@ decodeOne(model::Runtime &executor, uint64_t requestId, uint32_t slot,
 // A stop token or a one-token budget is emitted by prefill itself; otherwise
 // the first output tokens come from one decode cycle.
 ModelStepResult firstStep(model::Runtime &executor, ModelStepResult prefilled,
-                          uint64_t requestId, uint32_t slot,
-                          uint64_t logicalPosition,
+                          uint64_t requestId, uint64_t logicalPosition,
                           const std::vector<uint32_t> &pageTable,
                           BatchCohort cohort) {
   if (!prefilled.outputTokens.empty())
     return prefilled;
-  return decodeOne(executor, requestId, slot, logicalPosition, pageTable,
-                   cohort);
+  return decodeOne(executor, requestId, logicalPosition, pageTable, cohort);
 }
 
 struct PendingMaskedDecode final {
@@ -329,13 +322,12 @@ finishMaskedDecode(PendingMaskedDecode pending) {
 
 PendingMaskedDecode
 beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
-                     uint32_t slot, uint64_t logicalPosition,
+                     uint64_t logicalPosition,
                      const std::vector<uint32_t> &pageTable,
                      DecodeStage decodeStage) {
   BatchPlan plan{WorkKind::Decode, BatchCohort::Constrained,
                  {{requestId, 0}}, decodeStage};
-  const std::array items{
-      withRevision({requestId, slot, logicalPosition, 0, 0, pageTable})};
+  const std::array items{withRevision({requestId, logicalPosition, 0, pageTable})};
   return beginMaskedDecode(executor, plan, items);
 }
 
@@ -367,10 +359,26 @@ void provideMask(model::Runtime &executor, uint64_t requestId,
                          rejected.value_or(""));
 }
 
+// The convolution and recurrent halves of a GDN cell, which hold BF16 and
+// FP32 values.
+metal::MetalBuffer convolutionHalf(const metal::MetalBackend &backend,
+                                   const model::GdnParityBuffers &gdn,
+                                   const model::GdnStateLayout &layout) {
+  return backend.view(gdn.stateBase, 0, layout.convolutionBytes());
+}
+
+metal::MetalBuffer recurrentHalf(const metal::MetalBackend &backend,
+                                 const model::GdnParityBuffers &gdn,
+                                 const model::GdnStateLayout &layout) {
+  return backend.view(gdn.stateBase, layout.convolutionBytes(),
+                      layout.recurrentBytes());
+}
+
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
-StateSamples sampleCommittedState(const model::QwenStateStorage &states,
-                                   uint32_t slot) {
+StateSamples sampleCommittedState(const metal::MetalBackend &backend,
+                                  const model::QwenStateStorage &states,
+                                  uint32_t lane) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
                        bool bfloat) {
@@ -384,20 +392,21 @@ StateSamples sampleCommittedState(const model::QwenStateStorage &states,
     }
     result.emplace_back(std::move(name), std::move(values));
   };
-  const auto &buffers = states.buffers(slot);
-  const auto &gdn = buffers.gdn[states.metadata(slot).activeParity];
-  add("convolution", gdn.convolutionBase, true);
-  add("recurrent", gdn.recurrentBase, false);
+  const auto &gdn = states.current(lane);
+  const auto &target = states.layout().target;
+  add("convolution", convolutionHalf(backend, gdn, target), true);
+  add("recurrent", recurrentHalf(backend, gdn, target), false);
   add("first_convolution", gdn.convolutionLayers.front(), true);
   add("first_recurrent", gdn.recurrentLayers.front(), false);
-  const auto &lengths = states.metadata(slot).lengths;
+  const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
   const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
-  for (uint32_t layer = 0; layer < buffers.draft.size(); ++layer) {
-    const auto *keys = bfloatContents(buffers.draft[layer].keys, "draft keys");
-    const auto *values = bfloatContents(buffers.draft[layer].values, "draft values");
+  const auto &ring = states.draft(lane);
+  for (uint32_t layer = 0; layer < ring.size(); ++layer) {
+    const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
+    const auto *values = bfloatContents(ring[layer].values, "draft values");
     std::vector<float> keySamples, valueSamples;
     for (uint64_t index = 0; index < elements; index += stride) {
       const uint32_t dimension = index % layout.headDimension;
@@ -603,11 +612,9 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "straddling image request was not admitted");
-  const uint32_t slot = *admission.cell;
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()),
-                                   std::nullopt, {}));
-  prefillChunk(executor, request.id, slot, 0, 0,
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+  prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
   // Nothing else is idle, so the pass releases exactly the encoder arena.
@@ -619,7 +626,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
       model.vision.tensors.layout, span.gridHeight * span.gridWidth);
   require(reclaimed == encoderBytes,
           "encoder whose only image is encoded survived reclaim");
-  prefillChunk(executor, request.id, slot, 64, 64,
+  prefillChunk(executor, request.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages,
                BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodesBefore + 1,
@@ -738,23 +745,22 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
               backend.memoryStats().allocatedBytes ==
                   originalBytes + singleImageBytes,
           "repeated placements allocated multiple image buffers");
-  const uint32_t slot = *admitted.cell;
+  const uint32_t lane = *admitted.cell;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, checkpoints));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
   const uint64_t encodes = executor.telemetry().imageEncodes;
-  prefillChunk(executor, request.id, slot, 0, 0,
+  prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "image prefix checkpoint allocation failed");
-  prefillChunk(executor, request.id, slot, 64, 64,
+  prefillChunk(executor, request.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages,
                BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes + 1,
           "repeated image placements encoded more than once");
-  const auto expected = sampleCommittedState(states, slot);
+  const auto expected = sampleCommittedState(backend, states, lane);
   executor.end(request.id);
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -765,13 +771,13 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const StateAdmission restored = executor.begin(request.modelView());
   require(restored.granted(), "repeated image restore was not admitted");
   restoreActivePrefix(executor, request.id, prompt.size(), 64, checkpoint);
-  prefillChunk(executor, request.id, *restored.cell, 64, 64,
+  prefillChunk(executor, request.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages,
                BatchCohort::Greedy, false);
   require(executor.telemetry().imageEncodes == encodes + 2,
           "prefix restore discarded data for a later image placement");
-  compareCommittedSamples(expected, sampleCommittedState(states, *restored.cell),
-                          true);
+  compareCommittedSamples(
+      expected, sampleCommittedState(backend, states, *restored.cell), true);
   executor.end(request.id);
   checkpoint.reset();
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -785,9 +791,10 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // its next transition reads, with 0xFF: NaN, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
-void poisonRecurrentState(const model::QwenStateStorage &states, uint32_t slot) {
-  const metal::MetalBuffer &recurrent =
-      states.buffers(slot).gdn[states.metadata(slot).activeParity].recurrentBase;
+void poisonRecurrentState(const metal::MetalBackend &backend,
+                          const model::QwenStateStorage &states, uint32_t lane) {
+  const metal::MetalBuffer recurrent =
+      recurrentHalf(backend, states.current(lane), states.layout().target);
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
 }
 
@@ -827,17 +834,18 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
 
   beginCold(executor, makeRequest(201, prompt40, 16), 0);
   beginCold(executor, makeRequest(202, prompt40, 16), 1);
-  requireOpen(prefillChunk(executor, 201, 0, 0, 0, prompt40, pagesA),
+  requireOpen(prefillChunk(executor, 201, 0, prompt40, pagesA),
               "non-finite decode fixture");
-  requireOpen(prefillChunk(executor, 202, 1, 0, 0, prompt40, pagesB),
+  requireOpen(prefillChunk(executor, 202, 0, prompt40, pagesB),
               "non-finite decode fixture");
-  poisonRecurrentState(states, 0);
+  poisonRecurrentState(backend, states, 0);
   const BatchPlan plan{WorkKind::Decode,
                        BatchCohort::Greedy,
                        {{201, 0}, {202, 0}},
                        DecodeStage::Regular};
-  const std::array items{withRevision({201, 0, 40, 0, 0, pagesA}),
-                         withRevision({202, 1, 40, 0, 0, pagesB})};
+  const std::array items{
+      withRevision({.requestId = 201, .logicalPosition = 40, .pageTable = pagesA}),
+      withRevision({.requestId = 202, .logicalPosition = 40, .pageTable = pagesB})};
   const std::vector<ModelStepResult> decoded = executor.decode(plan, items);
   require(decoded.size() == 2 && !decoded[0].failure.empty() &&
               decoded[0].outputTokens.empty(),
@@ -847,7 +855,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
           "a non-finite lane disturbed its healthy neighbour");
   executor.end(201);
   const ModelStepResult continued =
-      decodeOne(executor, 202, 1, 40 + decoded[1].outputTokens.size(), pagesB,
+      decodeOne(executor, 202, 40 + decoded[1].outputTokens.size(), pagesB,
                 BatchCohort::Greedy);
   require(continued.failure.empty() && !continued.outputTokens.empty() &&
               inVocabulary(continued),
@@ -856,10 +864,10 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   clearPages(pages, pagesA);
 
   beginCold(executor, makeRequest(203, prompt80, 16), 0);
-  prefillChunk(executor, 203, 0, 0, 0, std::span(prompt80).first(64), pagesC);
-  poisonRecurrentState(states, 0);
+  prefillChunk(executor, 203, 0, std::span(prompt80).first(64), pagesC);
+  poisonRecurrentState(backend, states, 0);
   const ModelStepResult prefilled = prefillChunk(
-      executor, 203, 0, 64, 64, std::span(prompt80).subspan(64), pagesC);
+      executor, 203, 64, std::span(prompt80).subspan(64), pagesC);
   require(!prefilled.failure.empty() && prefilled.outputTokens.empty(),
           "a prefill from a non-finite state did not fail its lane");
   executor.end(203);
@@ -869,12 +877,12 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
       makeRequest(204, prompt80, 16, BatchCohort::Constrained);
   constrained.constraint = ConstraintMode::TokenMask;
   beginCold(executor, constrained, 0);
-  prefillChunk(executor, 204, 0, 0, 0, std::span(prompt80).first(64), pagesC,
+  prefillChunk(executor, 204, 0, std::span(prompt80).first(64), pagesC,
                BatchCohort::Constrained);
-  poisonRecurrentState(states, 0);
-  prefillChunk(executor, 204, 0, 64, 64, std::span(prompt80).subspan(64),
-               pagesC, BatchCohort::Constrained);
-  require(decodeOne(executor, 204, 0, 80, pagesC, BatchCohort::Constrained,
+  poisonRecurrentState(backend, states, 0);
+  prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64), pagesC,
+               BatchCohort::Constrained);
+  require(decodeOne(executor, 204, 80, pagesC, BatchCohort::Constrained,
                     DecodeStage::RequestInitialMask)
                   .nextDecodeStage == DecodeStage::ApplyInitialMask,
           "the non-finite constrained fixture did not request its mask");
@@ -885,7 +893,8 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                         BatchCohort::Constrained,
                         {{204, 0}},
                         DecodeStage::ApplyInitialMask};
-  const std::array applied{withRevision({204, 0, 80, 0, 0, pagesC})};
+  const std::array applied{
+      withRevision({.requestId = 204, .logicalPosition = 80, .pageTable = pagesC})};
   const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(apply, applied, {});
   const std::vector<ModelStepResult> selected =
       ticket->ready() ? ticket->wait() : std::vector<ModelStepResult>{};
@@ -935,13 +944,12 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
   const std::array<std::vector<uint32_t>, 2> pages{pageRange(116, 4), pageRange(120, 4)};
   for (uint32_t lane = 0; lane < 2; ++lane) {
     const EngineRequest &request = lane ? second : first;
-    const uint32_t slot = *(lane ? secondAdmission : firstAdmission).cell;
     executor.setDraftContextPlan(
-        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                                     std::nullopt, {}));
-    plan.items.push_back({request.id, static_cast<uint32_t>(request.prompt.size())});
-    items[lane] = withRevision({request.id, slot, 0, 0,
-                                static_cast<uint32_t>(request.prompt.size()), pages[lane]});
+        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+    const auto tokens = static_cast<uint32_t>(request.prompt.size());
+    plan.items.push_back({request.id, tokens});
+    items[lane] =
+        withRevision({.requestId = request.id, .tokenCount = tokens, .pageTable = pages[lane]});
     items[lane].inputTokens = request.prompt;
   }
   const uint64_t encodes = executor.telemetry().imageEncodes;
@@ -970,17 +978,15 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "suspended image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   const uint64_t encodes = executor.telemetry().imageEncodes;
-  prefillChunk(executor, request.id, *admission.cell, 0, 0, prompt.first(32), pages,
-               BatchCohort::Greedy, false);
+  prefillChunk(executor, request.id, 0, prompt.first(32), pages, BatchCohort::Greedy, false);
   executor.suspend(request.id);
   const StateAdmission resumed = executor.resume(request.modelView());
   require(resumed.granted(), "suspended image request did not resume");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), std::nullopt, {}));
-  prefillChunk(executor, request.id, *resumed.cell, 0, 0, prompt, pages,
-               BatchCohort::Greedy, true);
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+  prefillChunk(executor, request.id, 0, prompt, pages, BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes + 1,
           "a resumed lane encoded its image again");
   executor.end(request.id);
@@ -1002,10 +1008,9 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "reclaimable image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                                   std::nullopt, {}));
-  prefillChunk(executor, request.id, *admission.cell, 0, 0, request.prompt,
-               pageRange(120, 4), BatchCohort::Greedy, false);
+      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+  prefillChunk(executor, request.id, 0, request.prompt, pageRange(120, 4),
+               BatchCohort::Greedy, false);
   const model::ModelTelemetry injected = executor.telemetry();
   require(injected.embeddingCacheBytes && injected.visionArenaBytes &&
               injected.imageRowsBytes == injected.embeddingCacheBytes,
@@ -1045,12 +1050,10 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
   const StateAdmission producer = executor.begin(request.modelView());
   require(producer.granted(), "covered image producer was not admitted");
   const std::array<uint32_t, 2> checkpoints{32, 64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, checkpoints));
-  prefillChunk(executor, request.id, *producer.cell, 0, 0,
-               std::span<const uint32_t>(prompt).first(32), pages);
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  prefillChunk(executor, request.id, 0, std::span<const uint32_t>(prompt).first(32), pages);
   std::shared_ptr<const CompositeState> beforeImage = executor.snapshot(request.id);
-  prefillChunk(executor, request.id, *producer.cell, 32, 32,
+  prefillChunk(executor, request.id, 32,
                std::span<const uint32_t>(prompt).subspan(32, 32), pages,
                BatchCohort::Greedy, false);
   std::shared_ptr<const CompositeState> pastImage = executor.snapshot(request.id);
@@ -1076,7 +1079,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
     if (id == 115) {
       bool refused = false;
       try {
-        executor.restore(id, 32, beforeImage, true);
+        static_cast<void>(executor.beginRestore(id, 32, beforeImage, true, {}));
       } catch (const std::invalid_argument &error) {
         refused = std::string(error.what()) ==
                   "restore stops before images its activation left out";
@@ -1084,7 +1087,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
       require(refused, "a restore before a left-out image was accepted");
     } else {
       restoreActivePrefix(executor, id, prompt.size(), 64, pastImage);
-      prefillChunk(executor, id, *admission.cell, 64, 64,
+      prefillChunk(executor, id, 64,
                    std::span<const uint32_t>(prompt).subspan(64), pages,
                    BatchCohort::Greedy, true);
       require(executor.telemetry().imageEncodes == encodes,
@@ -1133,9 +1136,8 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const StateAdmission admitted = executor.begin(cached.modelView());
   require(admitted.granted(), "refused-start fixture was not admitted");
-  executor.setDraftContextPlan(
-      cached.id, planDraftContext(0, prompt.size(), std::nullopt, {}));
-  prefillChunk(executor, cached.id, *admitted.cell, 0, 0,
+  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}));
+  prefillChunk(executor, cached.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
 
@@ -1161,7 +1163,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   }
   require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == arenaBytes,
           "the idle encoder was not the only cache left");
-  prefillChunk(executor, cached.id, *admitted.cell, 64, 64,
+  prefillChunk(executor, cached.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages,
                BatchCohort::Greedy, true);
   executor.end(cached.id);
@@ -1220,9 +1222,8 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
     request.imagePixels[index] = static_cast<uint8_t>(index * 9 + 4);
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "two-image request was not admitted");
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, {}));
-  prefillChunk(executor, request.id, *admission.cell, 0, 0, prompt, pageRange(120, 4),
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}));
+  prefillChunk(executor, request.id, 0, prompt, pageRange(120, 4),
                BatchCohort::Greedy, false);
   executor.end(request.id);
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
@@ -1263,26 +1264,19 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
   const EngineRequest small = imageRequest(123, {16, 16, 8, 8, 223, 503});
   const EngineRequest smaller = imageRequest(124, {16, 4, 4, 4, 227, 509});
   const EngineRequest large = imageRequest(125, {16, 32, 8, 16, 229, 521});
-  const StateAdmission smallStart = executor.begin(small.modelView());
-  const uint64_t smallArena = executor.telemetry().visionArenaBytes;
-  const StateAdmission smallerStart = executor.begin(smaller.modelView());
-  require(smallStart.granted() && smallArena == scratchBytes(small) &&
-              smallerStart.granted() &&
+  require(executor.begin(small.modelView()).granted() &&
+              executor.telemetry().visionArenaBytes == scratchBytes(small) &&
+              executor.begin(smaller.modelView()).granted() &&
               executor.telemetry().visionArenaBytes == scratchBytes(small),
           "an encoder was not sized for the largest image its start encodes");
-  const StateAdmission largeStart = executor.begin(large.modelView());
-  require(largeStart.granted() &&
+  require(executor.begin(large.modelView()).granted() &&
               executor.telemetry().visionArenaBytes == scratchBytes(large),
           "a larger image did not replace the smaller encoder");
   const uint64_t encodes = executor.telemetry().imageEncodes;
-  for (const auto &[request, start] :
-       {std::pair{&small, &smallStart}, std::pair{&smaller, &smallerStart},
-        std::pair{&large, &largeStart}}) {
+  for (const EngineRequest *request : {&small, &smaller, &large}) {
     executor.setDraftContextPlan(
-        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()),
-                                      std::nullopt, {}));
-    prefillChunk(executor, request->id, *start->cell, 0, 0, request->prompt,
-                 pageRange(120, 4));
+        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {}));
+    prefillChunk(executor, request->id, 0, request->prompt, pageRange(120, 4));
     executor.end(request->id);
   }
   require(executor.telemetry().imageEncodes == encodes + 3,
@@ -1334,9 +1328,8 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   const StateAdmission first = executor.begin(request.modelView());
   require(first.granted(), "replay point image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(
-      request.id, planDraftContext(0, prompt.size(), std::nullopt, boundary));
-  prefillChunk(executor, request.id, *first.cell, 0, 0,
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
+  prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
   std::shared_ptr<const CompositeState> replayPoint = executor.snapshot(request.id);
@@ -1356,7 +1349,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   const StateAdmission next = executor.begin(resumed);
   require(next.granted(), "the next turn was not admitted");
   restoreActivePrefix(executor, request.id, prompt.size(), 64, replayPoint);
-  prefillChunk(executor, request.id, *next.cell, 64, 64,
+  prefillChunk(executor, request.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages,
                BatchCohort::Greedy, true);
   require(executor.telemetry().imageEncodes == encodes &&
@@ -1409,9 +1402,8 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
                   executor.telemetry().lastDecodeWidth == width,
               "prefill EOS skipped the actual decode warmup");
     }
-    require(executor.warmupDraftVerifyCommit().completed &&
-                executor.warmupCompositeStateRestore().completed,
-            "prefill EOS broke commit/restore warmup");
+    require(executor.warmupCompositeStateRestore().completed,
+            "prefill EOS broke the restore warmup");
   }
   setStops(decodeStop);
   {
@@ -1429,10 +1421,10 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     weights.layout = std::get<Layout>(originalTarget);
   }, package.target);
   package.descriptor.target = originalTarget;
-  auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
-  for (uint32_t slot = 0; slot < 4; ++slot)
-    require(!states.metadata(slot).assigned,
-            "EOS warmup left an active state slot");
+  const model::QwenStateStorage &states = context.stateStorage;
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    require(!states.metadata(lane).assigned(),
+            "EOS warmup left an active state lane");
   std::cout << "warmup_eos=PASS prefill_stop=" << prefillStop
             << " decode_stop=" << decodeStop << '\n';
 }
@@ -1586,7 +1578,7 @@ int main(int argc, char **argv) {
       } catch (const std::logic_error &error) {
         rejected = std::string(error.what()).find("runway") != std::string::npos;
       }
-      require(rejected && !states.metadata(0).assigned &&
+      require(rejected && !states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
                   backend.submissionCount() == beforeCommands,
               "real warmup ran without its KV runway or executed/leaked work");
@@ -1638,7 +1630,7 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> pageTable = pageRange(0, 8);
     EngineRequest request = makeRequest(1, prompt128, 16);
     beginCold(executor, request, 0);
-    prefillChunk(executor, 1, 0, 0, 0, prompt128, pageTable);
+    prefillChunk(executor, 1, 0, prompt128, pageTable);
     require(states.metadata(0).lengths.targetTokens == 128 &&
                 states.metadata(0).lengths.hasCompleteDraftWindow(
                     states.layout().draft.tokens),
@@ -1655,7 +1647,7 @@ int main(int argc, char **argv) {
 
     const uint64_t beforeFirstDecode = backend.submissionCount();
     ModelStepResult decoded =
-        decodeOne(executor, 1, 0, 128, pageTable, BatchCohort::Greedy);
+        decodeOne(executor, 1, 128, pageTable, BatchCohort::Greedy);
     require(backend.submissionCount() == beforeFirstDecode + 1,
             "speculative verify and commit were not one Metal command");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
@@ -1702,7 +1694,7 @@ int main(int argc, char **argv) {
       scored.imagePixels.clear();
       beginCold(executor, scored, 0);
       ModelStepResult scoredResult =
-          prefillChunk(executor, 99, 0, 0, 0, prompt128, pageTable);
+          prefillChunk(executor, 99, 0, prompt128, pageTable);
       require(scoredResult.finished && scoredResult.outputTokens.empty() &&
                   scoredResult.scoreLogits.size() == 3,
               "score prefill did not return ordered logits without tokens");
@@ -1713,7 +1705,7 @@ int main(int argc, char **argv) {
               "greedy decode token is not the maximum scored logit");
       bool decodeRejected = false;
       try {
-        decodeOne(executor, 99, 0, 128, pageTable, BatchCohort::Greedy);
+        decodeOne(executor, 99, 128, pageTable, BatchCohort::Greedy);
       } catch (const std::exception &) {
         decodeRejected = true;
       }
@@ -1736,39 +1728,36 @@ int main(int argc, char **argv) {
     EngineRequest partitioned = makeRequest(51, prompt16, 2);
     beginCold(executor, chunkBaseline, 2);
     ModelStepResult baselinePrefill =
-        prefillChunk(executor, 50, 2, 0, 0, prompt16, baselinePages);
+        prefillChunk(executor, 50, 0, prompt16, baselinePages);
     beginCold(executor, partitioned, 3);
-    prefillChunk(executor, 51, 3, 0, 0,
+    prefillChunk(executor, 51, 0,
                  std::span<const uint32_t>(prompt16).first(8),
                  partitionedPages);
     ModelStepResult partitionedPrefill =
-        prefillChunk(executor, 51, 3, 8, 8,
+        prefillChunk(executor, 51, 8,
                      std::span<const uint32_t>(prompt16).subspan(8, 8),
                      partitionedPages);
 
-    const model::QwenSlotMetadata &baselineMetadata = states.metadata(2);
-    const model::QwenSlotMetadata &partitionedMetadata = states.metadata(3);
+    const model::QwenLaneMetadata &baselineMetadata = states.metadata(2);
+    const model::QwenLaneMetadata &partitionedMetadata = states.metadata(3);
     require(baselineMetadata.lengths == partitionedMetadata.lengths &&
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");
-    const model::QwenSlotBuffers &baselineState = states.buffers(2);
-    const model::QwenSlotBuffers &partitionedState = states.buffers(3);
-    const Similarity convolution = compareBfloat(
-        baselineState.gdn[baselineMetadata.activeParity].convolutionBase,
-        partitionedState.gdn[partitionedMetadata.activeParity].convolutionBase);
-    const Similarity recurrent = compareFloat(
-        baselineState.gdn[baselineMetadata.activeParity].recurrentBase,
-        partitionedState.gdn[partitionedMetadata.activeParity].recurrentBase);
+    const model::GdnStateLayout &gdnLayout = states.layout().target;
+    const Similarity convolution =
+        compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
+                      convolutionHalf(backend, states.current(3), gdnLayout));
+    const Similarity recurrent =
+        compareFloat(recurrentHalf(backend, states.current(2), gdnLayout),
+                     recurrentHalf(backend, states.current(3), gdnLayout));
     std::cout
         << "partition_equivalence conv_cos=" << convolution.cosine
         << " parity=" << baselineMetadata.activeParity << '/'
         << partitionedMetadata.activeParity
         << " conv_norms=" << convolution.leftNorm << '/'
         << convolution.rightNorm << " partition_other_conv_norm="
-        << compareBfloat(
-               baselineState.gdn[baselineMetadata.activeParity].convolutionBase,
-               partitionedState.gdn[partitionedMetadata.activeParity ^ 1]
-                   .convolutionBase)
+        << compareBfloat(convolutionHalf(backend, states.current(2), gdnLayout),
+                         convolutionHalf(backend, states.next(3), gdnLayout))
                .rightNorm
         << " recurrent_cos=" << recurrent.cosine
         << " recurrent_norms=" << recurrent.leftNorm << '/'
@@ -1777,10 +1766,10 @@ int main(int argc, char **argv) {
             "partitioned prefill numerical state diverged");
 
     ModelStepResult baselinePending =
-        firstStep(executor, std::move(baselinePrefill), 50, 2,
+        firstStep(executor, std::move(baselinePrefill), 50,
                   prompt16.size(), baselinePages, BatchCohort::Greedy);
     ModelStepResult partitionedPending =
-        firstStep(executor, std::move(partitionedPrefill), 51, 3,
+        firstStep(executor, std::move(partitionedPrefill), 51,
                   prompt16.size(), partitionedPages, BatchCohort::Greedy);
     std::cout << "partition_decisions tokens_equal="
               << (baselinePending.outputTokens == partitionedPending.outputTokens)
@@ -1805,10 +1794,10 @@ int main(int argc, char **argv) {
         makeRequest(54, promptAligned, 1, BatchCohort::Sampling);
     partitionedSampling.sampling = {4.0F, 1.0F, 32, 8128};
     beginCold(executor, partitionedSampling, 0);
-    prefillChunk(executor, 54, 0, 0, 0,
+    prefillChunk(executor, 54, 0,
                  std::span<const uint32_t>(promptAligned).first(120),
                  policyPages, BatchCohort::Sampling);
-    prefillChunk(executor, 54, 0, 120, 120,
+    prefillChunk(executor, 54, 120,
                  std::span<const uint32_t>(promptAligned).subspan(120, 8),
                  policyPages, BatchCohort::Sampling);
     std::shared_ptr<const CompositeState> partitionedSamplingSnapshot =
@@ -1824,30 +1813,29 @@ int main(int argc, char **argv) {
                         promptAligned.size(), partitionedSamplingSnapshot);
     ModelStepResult restoredMicroSample = firstStep(
         executor,
-        prefillChunk(executor, 55, 0, promptAligned.size(),
-                     promptAligned.size(),
+        prefillChunk(executor, 55, promptAligned.size(),
                      std::span<const uint32_t>(policyReplayPrompt).subspan(128,
                                                                           1),
                      policyPages, BatchCohort::Sampling),
-        55, 0, policyReplayPrompt.size(), policyPages, BatchCohort::Sampling);
+        55, policyReplayPrompt.size(), policyPages, BatchCohort::Sampling);
     executor.end(55);
     const std::vector<uint32_t> coldPolicyPages = pageRange(15, 5);
     EngineRequest coldMicroSampling = restoredMicroSampling;
     coldMicroSampling.id = 57;
     beginCold(executor, coldMicroSampling, 0);
-    prefillChunk(executor, 57, 0, 0, 0,
+    prefillChunk(executor, 57, 0,
                  std::span<const uint32_t>(policyReplayPrompt).first(120),
                  coldPolicyPages, BatchCohort::Sampling);
-    prefillChunk(executor, 57, 0, 120, 120,
+    prefillChunk(executor, 57, 120,
                  std::span<const uint32_t>(policyReplayPrompt).subspan(120, 8),
                  coldPolicyPages, BatchCohort::Sampling);
     ModelStepResult coldMicroSample = firstStep(
         executor,
-        prefillChunk(executor, 57, 0, 128, 128,
+        prefillChunk(executor, 57, 128,
                      std::span<const uint32_t>(policyReplayPrompt).subspan(128,
                                                                           1),
                      coldPolicyPages, BatchCohort::Sampling),
-        57, 0, policyReplayPrompt.size(), coldPolicyPages,
+        57, policyReplayPrompt.size(), coldPolicyPages,
         BatchCohort::Sampling);
     require(restoredMicroSample.outputTokens == coldMicroSample.outputTokens,
             "one-token recurrent restore replay diverged from cold prefill");
@@ -1860,17 +1848,17 @@ int main(int argc, char **argv) {
         makeRequest(56, prompt8, 1, BatchCohort::Constrained);
     constrainedShort.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrainedShort, 0);
-    prefillChunk(executor, 56, 0, 0, 0, prompt8, constrainedPages,
+    prefillChunk(executor, 56, 0, prompt8, constrainedPages,
                  BatchCohort::Constrained);
     ModelStepResult microInitialMask =
-        decodeOne(executor, 56, 0, prompt8.size(), constrainedPages,
+        decodeOne(executor, 56, prompt8.size(), constrainedPages,
                   BatchCohort::Constrained, DecodeStage::RequestInitialMask);
     require(microInitialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "constrained short prefill did not preserve mask handshake");
     const std::array<uint32_t, 1> forcedMicroToken{106};
     provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
-        decodeOne(executor, 56, 0, prompt8.size(), constrainedPages,
+        decodeOne(executor, 56, prompt8.size(), constrainedPages,
                   BatchCohort::Constrained, DecodeStage::ApplyInitialMask);
     require(forcedMicro.outputTokens ==
                 std::vector<uint32_t>{forcedMicroToken.front()},
@@ -1891,10 +1879,10 @@ int main(int argc, char **argv) {
       restoreActivePrefix(executor, id, prompt129.size(), 128, promptSnapshot);
       ModelStepResult result = firstStep(
           executor,
-          prefillChunk(executor, id, 0, 128, 128,
+          prefillChunk(executor, id, 128,
                        std::span<const uint32_t>(prompt129).subspan(128, 1),
                        pageTable),
-          id, 0, 129, pageTable, BatchCohort::Greedy);
+          id, 129, pageTable, BatchCohort::Greedy);
       require(result.draftedTokens == 7,
               "oracle prompt ended right after prefill; no cycle to test");
       require(!result.outputTokens.empty() &&
@@ -1920,17 +1908,17 @@ int main(int argc, char **argv) {
       beginCold(executor, replayRequest, 1);
       restoreActivePrefix(executor, replayId, prompt129.size(), 128,
                           promptSnapshot);
-      prefillChunk(executor, replayId, 1, 128, 128,
+      prefillChunk(executor, replayId, 128,
                    std::span<const uint32_t>(prompt129).subspan(128, 1),
                    replayPages, BatchCohort::Constrained);
-      const auto initial = decodeOne(executor, replayId, 1, 129, replayPages,
+      const auto initial = decodeOne(executor, replayId, 129, replayPages,
                                      BatchCohort::Constrained,
                                      DecodeStage::RequestInitialMask);
       require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(firstAnchor));
-      auto pending = beginMaskedDecodeOne(executor, replayId, 1, 129,
+      auto pending = beginMaskedDecodeOne(executor, replayId, 129,
                                           replayPages,
                                           DecodeStage::ApplyInitialMask);
       require(pending.maskRequests.size() == 1 &&
@@ -1967,10 +1955,10 @@ int main(int argc, char **argv) {
     restoreActivePrefix(executor, 20, prompt129.size(), 128, promptSnapshot);
     ModelStepResult extendedResult = firstStep(
         executor,
-        prefillChunk(executor, 20, 0, 128, 128,
+        prefillChunk(executor, 20, 128,
                      std::span<const uint32_t>(prompt129).subspan(128, 1),
                      pageTable),
-        20, 0, 129, pageTable, BatchCohort::Greedy);
+        20, 129, pageTable, BatchCohort::Greedy);
     require(!extendedResult.outputTokens.empty() &&
                 states.metadata(0).lengths.targetTokens ==
                     129 + extendedResult.outputTokens.size() -
@@ -1981,15 +1969,15 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> coldReplayPages = pageRange(21, 5);
     EngineRequest coldExtended = makeRequest(21, prompt129, 2);
     beginCold(executor, coldExtended, 0);
-    prefillChunk(executor, 21, 0, 0, 0,
+    prefillChunk(executor, 21, 0,
                  std::span<const uint32_t>(prompt129).first(128),
                  coldReplayPages);
     ModelStepResult coldExtendedResult = firstStep(
         executor,
-        prefillChunk(executor, 21, 0, 128, 128,
+        prefillChunk(executor, 21, 128,
                      std::span<const uint32_t>(prompt129).subspan(128, 1),
                      coldReplayPages),
-        21, 0, 129, coldReplayPages, BatchCohort::Greedy);
+        21, 129, coldReplayPages, BatchCohort::Greedy);
     require(coldExtendedResult.outputTokens == extendedResult.outputTokens,
             "teacher-forced cached suffix diverged from cold prompt");
     executor.end(21);
@@ -2009,10 +1997,10 @@ int main(int argc, char **argv) {
         makeRequest(30, samplingPrefix, 1, BatchCohort::Sampling);
     samplingSource.sampling = {4.0F, 1.0F, 32, 40106};
     beginCold(executor, samplingSource, 0);
-    prefillChunk(executor, 30, 0, 0, 0,
+    prefillChunk(executor, 30, 0,
                  std::span<const uint32_t>(samplingPrefix).first(120),
                  samplingPages, BatchCohort::Sampling);
-    prefillChunk(executor, 30, 0, 120, 120,
+    prefillChunk(executor, 30, 120,
                  std::span<const uint32_t>(samplingPrefix).subspan(120, 8),
                  samplingPages, BatchCohort::Sampling);
     std::shared_ptr<const CompositeState> samplingPromptSnapshot =
@@ -2029,10 +2017,10 @@ int main(int argc, char **argv) {
                         samplingPromptSnapshot);
     ModelStepResult replayedSample = firstStep(
         executor,
-        prefillChunk(executor, 31, 0, 128, 128,
+        prefillChunk(executor, 31, 128,
                      std::span<const uint32_t>(samplingPrompt).subspan(128, 1),
                      samplingPages, BatchCohort::Sampling),
-        31, 0, samplingPrompt.size(), samplingPages, BatchCohort::Sampling);
+        31, samplingPrompt.size(), samplingPages, BatchCohort::Sampling);
     require(!replayedSample.outputTokens.empty(),
             "replayed sampling hit did not emit an anchor");
     executor.end(31);
@@ -2041,18 +2029,18 @@ int main(int argc, char **argv) {
     EngineRequest coldSampling = replayedSampling;
     coldSampling.id = 32;
     beginCold(executor, coldSampling, 0);
-    prefillChunk(executor, 32, 0, 0, 0,
+    prefillChunk(executor, 32, 0,
                  std::span<const uint32_t>(samplingPrompt).first(120),
                  coldSamplingPages, BatchCohort::Sampling);
-    prefillChunk(executor, 32, 0, 120, 120,
+    prefillChunk(executor, 32, 120,
                  std::span<const uint32_t>(samplingPrompt).subspan(120, 8),
                  coldSamplingPages, BatchCohort::Sampling);
     ModelStepResult coldSample = firstStep(
         executor,
-        prefillChunk(executor, 32, 0, 128, 128,
+        prefillChunk(executor, 32, 128,
                      std::span<const uint32_t>(samplingPrompt).subspan(128, 1),
                      coldSamplingPages, BatchCohort::Sampling),
-        32, 0, samplingPrompt.size(), coldSamplingPages,
+        32, samplingPrompt.size(), coldSamplingPages,
         BatchCohort::Sampling);
     require(coldSample.outputTokens == replayedSample.outputTokens,
             "sampling restore replay reused producer policy state");
@@ -2069,11 +2057,11 @@ int main(int argc, char **argv) {
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
     restoreActivePrefix(executor, 40, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 40, 0, 128, 128,
+    prefillChunk(executor, 40, 128,
                  std::span<const uint32_t>(prompt129).subspan(128, 1),
                  pageTable, BatchCohort::Constrained);
     ModelStepResult initialMask =
-        decodeOne(executor, 40, 0, 129, pageTable, BatchCohort::Constrained,
+        decodeOne(executor, 40, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::RequestInitialMask);
     require(initialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "initial constrained anchor did not request empty simulation");
@@ -2085,7 +2073,7 @@ int main(int argc, char **argv) {
     provideMask(executor, 40, initialWords);
 
     PendingMaskedDecode verify = beginMaskedDecodeOne(
-        executor, 40, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
+        executor, 40, 129, pageTable, DecodeStage::ApplyInitialMask);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
                 verify.maskRequests[0].simulationTokens.size() == 8 &&
@@ -2123,11 +2111,11 @@ int main(int argc, char **argv) {
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
     restoreActivePrefix(executor, 44, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 44, 0, 128, 128,
+    prefillChunk(executor, 44, 128,
                  std::span<const uint32_t>(prompt129).subspan(128, 1),
                  pageTable, BatchCohort::Constrained);
     ModelStepResult perfectInitial =
-        decodeOne(executor, 44, 0, 129, pageTable, BatchCohort::Constrained,
+        decodeOne(executor, 44, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::RequestInitialMask);
     require(perfectInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "perfect constrained accounting skipped its initial mask");
@@ -2135,7 +2123,7 @@ int main(int argc, char **argv) {
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
     provideMask(executor, 44, singletonMasks(perfectInitialTokens));
     PendingMaskedDecode perfectPending = beginMaskedDecodeOne(
-        executor, 44, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
+        executor, 44, 129, pageTable, DecodeStage::ApplyInitialMask);
     require(perfectPending.maskRequests.size() == 1 &&
                 perfectPending.maskRequests[0].simulationTokens.size() == 8,
             "perfect constraint did not overlap its mask request");
@@ -2170,11 +2158,11 @@ int main(int argc, char **argv) {
     alternateConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, alternateConstraint, 0);
     restoreActivePrefix(executor, 41, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 41, 0, 128, 128,
+    prefillChunk(executor, 41, 128,
                  std::span<const uint32_t>(prompt129).subspan(128, 1),
                  pageTable, BatchCohort::Constrained);
     ModelStepResult alternateInitial =
-        decodeOne(executor, 41, 0, 129, pageTable, BatchCohort::Constrained,
+        decodeOne(executor, 41, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::RequestInitialMask);
     require(alternateInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "second exact constrained hit skipped initial mask");
@@ -2182,7 +2170,7 @@ int main(int argc, char **argv) {
     std::array<uint32_t, 1> alternateTokens{anchorC};
     provideMask(executor, 41, singletonMasks(alternateTokens));
     ModelStepResult alternateOutput =
-        decodeOne(executor, 41, 0, 129, pageTable, BatchCohort::Constrained,
+        decodeOne(executor, 41, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::ApplyInitialMask);
     require(!alternateOutput.finished &&
                 alternateOutput.outputTokensWithoutKv == 1 &&
@@ -2194,9 +2182,11 @@ int main(int argc, char **argv) {
 
     // A B2 constrained cycle keeps both lanes reserved while host grammar
     // work overlaps the target forward. No proposal/logit state is copied to
-    // a different arena lane between draft and commit.
+    // a different arena lane between draft and commit. Each lane applies its
+    // initial mask in a plan of its own, as the scheduler issues them; the
+    // B2 cycle continues both.
     EngineRequest crossLane0 =
-        makeRequest(42, prompt129, 2, BatchCohort::Constrained);
+        makeRequest(42, prompt129, 3, BatchCohort::Constrained);
     crossLane0.constraint = ConstraintMode::TokenMask;
     crossLane0.sampling = {4.0F, 1.0F, 32, 7001};
     EngineRequest crossLane1 = crossLane0;
@@ -2213,8 +2203,10 @@ int main(int argc, char **argv) {
                               {{42, 1}, {43, 1}},
                               DecodeStage::Regular};
     std::array<ModelBatchItem, 2> crossReplayItems{
-        withRevision({42, 0, 128, 128, 1, crossPages0}),
-        withRevision({43, 1, 128, 128, 1, crossPages1})};
+        withRevision({.requestId = 42, .logicalPosition = 128, .tokenCount = 1,
+                      .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 128, .tokenCount = 1,
+                      .pageTable = crossPages1})};
     const auto crossReplayToken =
         std::span<const uint32_t>(prompt129).subspan(128, 1);
     crossReplayItems[0].inputTokens = crossReplayToken;
@@ -2229,21 +2221,60 @@ int main(int argc, char **argv) {
                                {{42, 0}, {43, 0}},
                                DecodeStage::RequestInitialMask};
     std::vector<ModelBatchItem> crossItems{
-        withRevision({42, 0, 129, 0, 0, crossPages0}),
-        withRevision({43, 1, 129, 0, 0, crossPages1})};
+        withRevision({.requestId = 42, .logicalPosition = 129, .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 129, .pageTable = crossPages1})};
     auto crossInitial = executor.decode(crossInitialPlan, crossItems);
     require(
         crossInitial.size() == 2 &&
             crossInitial[0].nextDecodeStage == DecodeStage::ApplyInitialMask &&
             crossInitial[1].nextDecodeStage == DecodeStage::ApplyInitialMask,
         "B2 constrained initial masks are not empty simulations");
-    std::array<uint32_t, 1> crossAnchor0{110};
-    std::array<uint32_t, 1> crossAnchor1{111};
-    provideMask(executor, 42, singletonMasks(crossAnchor0));
-    provideMask(executor, 43, singletonMasks(crossAnchor1));
+    const std::array<uint32_t, 2> crossAnchors{110, 111};
+    provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
+    provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
+    // Applying an initial mask can end a request or start drafting it, so a
+    // plan applies one: a wider one is refused before any lane changes.
     crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
+    bool widePlanRejected = false;
+    try {
+      static_cast<void>(executor.decode(crossInitialPlan, crossItems));
+    } catch (const std::invalid_argument &) {
+      widePlanRejected = true;
+    }
+    require(widePlanRejected, "a B2 plan applied two initial masks");
+    // Each lane's initial cycle keeps its anchor; the masked successor that
+    // rejects the second proposal becomes its next anchor.
+    std::array<uint32_t, 2> crossNext{};
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint64_t id = 42 + lane;
+      PendingMaskedDecode initial = beginMaskedDecodeOne(
+          executor, id, 129, lane ? crossPages1 : crossPages0,
+          DecodeStage::ApplyInitialMask);
+      require(initial.maskRequests.size() == 1 &&
+                  initial.maskRequests[0].simulationTokens.front() ==
+                      crossAnchors[lane],
+              "B1 initial constrained cycle did not draft from its anchor");
+      crossNext[lane] =
+          initial.maskRequests[0].simulationTokens[1] == 112 ? 113 : 112;
+      const std::array<uint32_t, 9> verify{
+          crossAnchors[lane], crossNext[lane], 114, 115, 116, 117, 118, 119, 120};
+      provideMask(executor, id, singletonMasks(verify));
+      const auto initialResults = finishMaskedDecode(std::move(initial));
+      require(initialResults.size() == 1 &&
+                  initialResults[0].outputTokens ==
+                      std::vector<uint32_t>{crossAnchors[lane]} &&
+                  initialResults[0].outputTokensWithoutKv == 0,
+              "B1 initial constrained cycle did not keep only its anchor");
+    }
+    BatchPlan crossPlan{WorkKind::Decode,
+                        BatchCohort::Constrained,
+                        {{42, 0}, {43, 0}},
+                        DecodeStage::Regular};
+    const std::vector<ModelBatchItem> crossCycleItems{
+        withRevision({.requestId = 42, .logicalPosition = 130, .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 130, .pageTable = crossPages1})};
     PendingMaskedDecode crossPending =
-        beginMaskedDecode(executor, crossInitialPlan, crossItems);
+        beginMaskedDecode(executor, crossPlan, crossCycleItems);
     require(crossPending.maskRequests.size() == 2 &&
                 crossPending.ticket->ownsMaskWait(42) &&
                 crossPending.ticket->ownsMaskWait(43),
@@ -2252,19 +2283,18 @@ int main(int argc, char **argv) {
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const auto &simulation =
           crossPending.maskRequests[lane].simulationTokens;
-      const uint32_t anchor = lane ? crossAnchor1[0] : crossAnchor0[0];
-      const uint32_t rejected = simulation[1] == 112 ? 113 : 112;
+      const uint32_t rejected = simulation[1] == 121 ? 122 : 121;
       crossVerify[lane] =
-          {anchor, rejected, 114, 115, 116, 117, 118, 119, 120};
+          {crossNext[lane], rejected, 123, 124, 125, 126, 127, 128, 129};
       provideMask(executor, crossPending.maskRequests[lane].requestId,
                   singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
     require(crossResults.size() == 2 &&
                 crossResults[0].outputTokens ==
-                    std::vector<uint32_t>{crossAnchor0[0], crossVerify[0][1]} &&
+                    std::vector<uint32_t>{crossNext[0], crossVerify[0][1]} &&
                 crossResults[1].outputTokens ==
-                    std::vector<uint32_t>{crossAnchor1[0], crossVerify[1][1]} &&
+                    std::vector<uint32_t>{crossNext[1], crossVerify[1][1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
                 crossResults[0].draftedTokens == 7 &&
@@ -2275,9 +2305,9 @@ int main(int argc, char **argv) {
     const model::ModelTelemetry constrainedTelemetry =
         executor.telemetry();
     require(constrainedTelemetry.constrainedMaskOverlapBatches -
-                    beforeConstrained.constrainedMaskOverlapBatches == 3 &&
+                    beforeConstrained.constrainedMaskOverlapBatches == 5 &&
                 constrainedTelemetry.constrainedMaskOverlapRequests -
-                    beforeConstrained.constrainedMaskOverlapRequests == 4 &&
+                    beforeConstrained.constrainedMaskOverlapRequests == 6 &&
                 constrainedTelemetry.totalConstrainedTargetForwardGpuSeconds >
                     beforeConstrained.totalConstrainedTargetForwardGpuSeconds,
             "constrained overlap telemetry does not match B1/B2 execution");
@@ -2285,18 +2315,18 @@ int main(int argc, char **argv) {
     executor.end(43);
 
     // Width three is a real M24 graph, never a B2+B1 decomposition or a
-    // rendezvous for a fourth request. Physical state slots are intentionally
-    // permuted to prove that batch lanes belong to plan order.
+    // rendezvous for a fourth request. State lanes are intentionally permuted
+    // to prove that batch lanes belong to plan order.
     constexpr std::array<uint64_t, 3> b3Ids{60, 61, 62};
-    constexpr std::array<uint32_t, 3> b3Slots{2, 0, 3};
+    constexpr std::array<uint32_t, 3> b3StateLanes{2, 0, 3};
     std::array<std::vector<uint32_t>, 3> b3Pages{std::vector<uint32_t>{40},
                                                  std::vector<uint32_t>{41},
                                                  std::vector<uint32_t>{42}};
     constexpr std::array<uint32_t, 3> b3Words{279, 314, 264};
     for (uint32_t lane = 0; lane < b3Ids.size(); ++lane) {
       beginCold(executor, makeRequest(b3Ids[lane], {b3Words[lane]}, 16),
-                b3Slots[lane]);
-      prefillToken(executor, b3Ids[lane], b3Slots[lane], 0, 0, b3Words[lane],
+                b3StateLanes[lane]);
+      prefillToken(executor, b3Ids[lane], 0, b3Words[lane],
                    b3Pages[lane]);
     }
     BatchPlan b3Plan{WorkKind::Decode,
@@ -2304,9 +2334,9 @@ int main(int argc, char **argv) {
                      {{b3Ids[0], 0}, {b3Ids[1], 0}, {b3Ids[2], 0}},
                      DecodeStage::Regular};
     std::array<ModelBatchItem, 3> b3Items{
-        withRevision({b3Ids[0], b3Slots[0], 1, 0, 0, b3Pages[0]}),
-        withRevision({b3Ids[1], b3Slots[1], 1, 0, 0, b3Pages[1]}),
-        withRevision({b3Ids[2], b3Slots[2], 1, 0, 0, b3Pages[2]})};
+        withRevision({.requestId = b3Ids[0], .logicalPosition = 1, .pageTable = b3Pages[0]}),
+        withRevision({.requestId = b3Ids[1], .logicalPosition = 1, .pageTable = b3Pages[1]}),
+        withRevision({.requestId = b3Ids[2], .logicalPosition = 1, .pageTable = b3Pages[2]})};
     auto b3Decoded = executor.decode(b3Plan, b3Items);
     const model::ModelTelemetry b3Telemetry = executor.telemetry();
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
@@ -2328,7 +2358,7 @@ int main(int argc, char **argv) {
         std::vector<uint32_t>{45}, std::vector<uint32_t>{46}};
     for (uint32_t lane = 0; lane < equivalentIds.size(); ++lane) {
       beginCold(executor, makeRequest(equivalentIds[lane], {279}, 16), lane);
-      prefillToken(executor, equivalentIds[lane], lane, 0, 0, 279,
+      prefillToken(executor, equivalentIds[lane], 0, 279,
                    equivalentPages[lane]);
     }
     BatchPlan equivalentPlan;
@@ -2338,15 +2368,16 @@ int main(int argc, char **argv) {
     for (uint32_t lane = 0; lane < equivalentIds.size(); ++lane) {
       equivalentPlan.items.push_back({equivalentIds[lane], 0});
       equivalentItems[lane] =
-          withRevision({equivalentIds[lane], lane, 1, 0, 0, equivalentPages[lane]});
+          withRevision({.requestId = equivalentIds[lane], .logicalPosition = 1,
+                        .pageTable = equivalentPages[lane]});
     }
     auto equivalentB4 = executor.decode(equivalentPlan, equivalentItems);
     for (uint64_t id : equivalentIds)
       executor.end(id);
     beginCold(executor, makeRequest(68, {279}, 16), 0);
-    prefillToken(executor, 68, 0, 0, 0, 279, {47});
+    prefillToken(executor, 68, 0, 279, {47});
     ModelStepResult equivalentB1 =
-        decodeOne(executor, 68, 0, 1, {47}, BatchCohort::Greedy);
+        decodeOne(executor, 68, 1, {47}, BatchCohort::Greedy);
     require(equivalentB4.size() == 4, "B4 equivalence width mismatch");
     for (const ModelStepResult &lane : equivalentB4) {
       require(!lane.outputTokens.empty() && lane.outputTokens.size() <= 16 &&
@@ -2391,7 +2422,7 @@ int main(int argc, char **argv) {
                              productionSeedTokens.size()]);
     beginCold(executor, makeRequest(70, productionPrefix, 16), 0);
     const std::vector<uint32_t> productionPages{48, 49, 50, 51};
-    prefillChunk(executor, 70, 0, 0, 0, productionPrefix, productionPages);
+    prefillChunk(executor, 70, 0, productionPrefix, productionPages);
     std::shared_ptr<const CompositeState> productionSnapshot =
         executor.snapshot(70);
     require(productionSnapshot != nullptr,
@@ -2402,7 +2433,7 @@ int main(int argc, char **argv) {
     // its M32 decode with permuted lanes proves ragged addressing and state
     // isolation without requiring another batch width's numerical decisions.
     constexpr std::array<uint64_t, 4> raggedIds{100, 101, 102, 103};
-    constexpr std::array<uint32_t, 4> raggedSlots{3, 1, 0, 2};
+    constexpr std::array<uint32_t, 4> raggedStateLanes{3, 1, 0, 2};
     constexpr std::array<uint32_t, 4> raggedRows{1, 31, 257, 1759};
     std::array<std::vector<uint32_t>, 4> raggedPrompts;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
@@ -2430,10 +2461,11 @@ int main(int argc, char **argv) {
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       beginCold(executor,
           raggedRequest(raggedIds[lane], lane),
-          raggedSlots[lane]);
+          raggedStateLanes[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
-      raggedPrefillItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane], 0, 0,
-                                               raggedRows[lane], raggedPages[lane]});
+      raggedPrefillItems[lane] = withRevision({.requestId = raggedIds[lane],
+                                               .tokenCount = raggedRows[lane],
+                                               .pageTable = raggedPages[lane]});
       raggedPrefillItems[lane].inputTokens = raggedPrompts[lane];
     }
     const uint64_t beforeRaggedPrefill = backend.submissionCount();
@@ -2444,7 +2476,7 @@ int main(int argc, char **argv) {
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
-                  states.metadata(raggedSlots[lane]).lengths.targetTokens ==
+                  states.metadata(raggedStateLanes[lane]).lengths.targetTokens ==
                       raggedRows[lane],
               "ragged prefill consumed or addressed the wrong rows");
       requireOpen(raggedPrefill[lane], "ragged prefill");
@@ -2456,8 +2488,9 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> raggedDecodeItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       raggedDecodePlan.items.push_back({raggedIds[lane], 0});
-      raggedDecodeItems[lane] = withRevision({raggedIds[lane], raggedSlots[lane],
-                                              raggedRows[lane], 0, 0, raggedPages[lane]});
+      raggedDecodeItems[lane] = withRevision({.requestId = raggedIds[lane],
+                                              .logicalPosition = raggedRows[lane],
+                                              .pageTable = raggedPages[lane]});
     }
     auto raggedDecoded = executor.decode(raggedDecodePlan, raggedDecodeItems);
     const model::ModelTelemetry raggedDecodeTelemetry =
@@ -2471,11 +2504,11 @@ int main(int argc, char **argv) {
     for (uint64_t id : raggedIds)
       executor.end(id);
 
-    // Re-run the same real M32 workload with request order and state slots
+    // Re-run the same real M32 workload with request order and state lanes
     // permuted. This isolates cross-lane addressing without conflating M32
     // with the independently optimized M8 numerical path.
     constexpr std::array<uint32_t, 4> raggedPermutation{2, 0, 3, 1};
-    constexpr std::array<uint32_t, 4> referenceSlots{1, 3, 0, 2};
+    constexpr std::array<uint32_t, 4> referenceStateLanes{1, 3, 0, 2};
     BatchPlan raggedReferencePrefillPlan;
     raggedReferencePrefillPlan.kind = WorkKind::Prefill;
     raggedReferencePrefillPlan.cohort = BatchCohort::Greedy;
@@ -2485,11 +2518,11 @@ int main(int argc, char **argv) {
       const uint64_t referenceId = 104 + lane;
       beginCold(executor,
           raggedRequest(referenceId, lane),
-          referenceSlots[order]);
+          referenceStateLanes[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
       raggedReferencePrefillItems[order] = withRevision(
-          {referenceId, referenceSlots[order], 0, 0, raggedRows[lane], raggedPages[lane]});
+          {.requestId = referenceId, .tokenCount = raggedRows[lane], .pageTable = raggedPages[lane]});
       raggedReferencePrefillItems[order].inputTokens = raggedPrompts[lane];
     }
     auto raggedReferencePrefill = executor.prefill(raggedReferencePrefillPlan,
@@ -2506,7 +2539,8 @@ int main(int argc, char **argv) {
       const uint64_t referenceId = 104 + lane;
       raggedReferenceDecodePlan.items.push_back({referenceId, 0});
       raggedReferenceDecodeItems[order] = withRevision(
-          {referenceId, referenceSlots[order], raggedRows[lane], 0, 0, raggedPages[lane]});
+          {.requestId = referenceId, .logicalPosition = raggedRows[lane],
+           .pageTable = raggedPages[lane]});
     }
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
@@ -2520,7 +2554,7 @@ int main(int argc, char **argv) {
       require(reference.outputTokens == raggedDecoded[lane].outputTokens &&
                   reference.acceptedDraftTokens ==
                       raggedDecoded[lane].acceptedDraftTokens,
-              "ragged M32 lane changed after order/slot permutation");
+              "ragged M32 lane changed after order/state-lane permutation");
       executor.end(104 + lane);
     }
 
@@ -2547,8 +2581,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 4> productionB4ReplayItems;
     for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
       productionB4ReplayItems[lane] = withRevision(
-          {productionB4Ids[lane], lane, productionPrefix.size(),
-           static_cast<uint32_t>(productionPrefix.size()), 1, productionB4Pages[lane]});
+          {.requestId = productionB4Ids[lane], .logicalPosition = productionPrefix.size(),
+           .tokenCount = 1, .pageTable = productionB4Pages[lane]});
       productionB4ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -2572,9 +2606,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 4> cycleItems;
       for (uint32_t lane = 0; lane < productionB4Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB4Ids[lane], 0});
-        cycleItems[lane] = withRevision({productionB4Ids[lane], lane,
-                                         productionB4Lengths[lane], 0, 0,
-                                         productionB4Pages[lane]});
+        cycleItems[lane] = withRevision({.requestId = productionB4Ids[lane],
+                                         .logicalPosition = productionB4Lengths[lane],
+                                         .pageTable = productionB4Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 4, "production B4 width mismatch");
@@ -2612,14 +2646,14 @@ int main(int argc, char **argv) {
       executor.end(id);
 
     constexpr std::array<uint64_t, 2> productionB2Ids{76, 77};
-    constexpr std::array<uint32_t, 2> productionB2Slots{3, 1};
+    constexpr std::array<uint32_t, 2> productionB2StateLanes{3, 1};
     std::array<std::vector<uint32_t>, 2> productionB2Pages{
         std::vector<uint32_t>{48, 49, 50, 51, 76},
         std::vector<uint32_t>{48, 49, 50, 51, 77}};
     for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
       beginCold(executor,
           makeRequest(productionB2Ids[lane], productionPrompt, 16),
-          productionB2Slots[lane]);
+          productionB2StateLanes[lane]);
       restoreActivePrefix(executor, productionB2Ids[lane],
                           productionPrompt.size(), productionPrefix.size(),
                           productionSnapshot);
@@ -2632,8 +2666,8 @@ int main(int argc, char **argv) {
     std::array<ModelBatchItem, 2> productionB2ReplayItems;
     for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
       productionB2ReplayItems[lane] = withRevision(
-          {productionB2Ids[lane], productionB2Slots[lane], productionPrefix.size(),
-           static_cast<uint32_t>(productionPrefix.size()), 1, productionB2Pages[lane]});
+          {.requestId = productionB2Ids[lane], .logicalPosition = productionPrefix.size(),
+           .tokenCount = 1, .pageTable = productionB2Pages[lane]});
       productionB2ReplayItems[lane].inputTokens =
           std::span<const uint32_t>(productionPrompt)
               .subspan(productionPrefix.size(), 1);
@@ -2656,9 +2690,9 @@ int main(int argc, char **argv) {
       std::array<ModelBatchItem, 2> cycleItems;
       for (uint32_t lane = 0; lane < productionB2Ids.size(); ++lane) {
         cyclePlan.items.push_back({productionB2Ids[lane], 0});
-        cycleItems[lane] = withRevision({productionB2Ids[lane], productionB2Slots[lane],
-                                         productionB2Lengths[lane], 0, 0,
-                                         productionB2Pages[lane]});
+        cycleItems[lane] = withRevision({.requestId = productionB2Ids[lane],
+                                         .logicalPosition = productionB2Lengths[lane],
+                                         .pageTable = productionB2Pages[lane]});
       }
       auto cycleResults = executor.decode(cyclePlan, cycleItems);
       require(cycleResults.size() == 2, "production B2 width mismatch");
@@ -2684,7 +2718,7 @@ int main(int argc, char **argv) {
             cycleResults[lane].acceptedDraftTokens);
         productionB2Lengths[lane] += cycleResults[lane].outputTokens.size() -
                                      cycleResults[lane].outputTokensWithoutKv;
-        require(states.metadata(productionB2Slots[lane]).lengths.targetTokens ==
+        require(states.metadata(productionB2StateLanes[lane]).lengths.targetTokens ==
                     productionB2Lengths[lane],
                 "production B2 committed length differs from its output accounting");
       }
@@ -2699,8 +2733,7 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> productionB1Pages{48, 49, 50, 51, 78};
     restoreActivePrefix(executor, 75, productionPrompt.size(),
                         productionPrefix.size(), productionSnapshot);
-    requireOpen(prefillChunk(executor, 75, 0, productionPrefix.size(),
-                             productionPrefix.size(),
+    requireOpen(prefillChunk(executor, 75, productionPrefix.size(),
                              std::span<const uint32_t>(productionPrompt)
                                  .subspan(productionPrefix.size(), 1),
                              productionB1Pages),
@@ -2711,7 +2744,7 @@ int main(int argc, char **argv) {
     bool productionB1Finished = false;
     for (uint32_t cycle = 0; cycle < 16 && !productionB1Finished; ++cycle) {
       ModelStepResult result =
-          decodeOne(executor, 75, 0, productionB1Length, productionB1Pages,
+          decodeOne(executor, 75, productionB1Length, productionB1Pages,
                     BatchCohort::Greedy);
       require(!result.outputTokens.empty() &&
                   result.outputTokens.size() <= 16 - productionB1Tokens.size() &&
@@ -2778,9 +2811,10 @@ int main(int argc, char **argv) {
       sequence.sampling.frequencyPenalty = penalties.frequency;
       sequence.sampling.repetitionPenalty = penalties.repetition;
       beginCold(executor, sequence, 0);
-      uint32_t slot = 0;
-      // A penalized request resumes in a slot other than lane 0, which it
-      // decodes in: its penalty words follow the slot, not the lane.
+      uint32_t stateLane = 0;
+      // A penalized request resumes in a state lane other than 0 and decodes
+      // in batch lane 0: its penalty words follow the state lane, not the
+      // batch lane.
       const auto resume = [&] {
         std::optional<EngineRequest> holder;
         if (penalties.active()) {
@@ -2796,69 +2830,68 @@ int main(int argc, char **argv) {
       };
       const auto rebuild = [&](bool repeatDuringReplay,
                                 bool deliverInitialMask = false) {
-        const StateSamples before = repeatDuringReplay
-                                        ? sampleCommittedState(states, slot)
-                                        : StateSamples{};
+        const StateSamples before =
+            repeatDuringReplay ? sampleCommittedState(backend, states, stateLane)
+                               : StateSamples{};
         executor.suspend(sequence.id);
-        require(states.actualSlotBytes(slot) == 0,
+        require(!states.metadata(stateLane).assigned(),
                 "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
           provideMask(executor, sequence.id, singletonMasks(anchor));
         }
-        slot = resume();
+        stateLane = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
-        executor.setDraftContextPlan(
-            sequence.id, planDraftContext(0, length, std::nullopt, {}));
+        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
         if (repeatDuringReplay) {
-          requireOpen(prefillChunk(executor, sequence.id, slot, 0, 0,
+          requireOpen(prefillChunk(executor, sequence.id, 0,
                                    std::span(sequence.prompt).first(32),
                                    pageTable, cohort),
                       "interrupted state replay");
           executor.suspend(sequence.id);
-          require(states.actualSlotBytes(slot) == 0,
+          require(!states.metadata(stateLane).assigned(),
                   "repeated preemption retained its state buffers");
-          slot = resume();
-          executor.setDraftContextPlan(
-              sequence.id, planDraftContext(0, length, std::nullopt, {}));
+          stateLane = resume();
+          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
         }
         ModelStepResult replay = prefillChunk(
-            executor, sequence.id, slot, 0, 0, sequence.prompt, pageTable, cohort);
+            executor, sequence.id, 0, sequence.prompt, pageTable, cohort);
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
-          const StateSamples rebuilt = sampleCommittedState(states, slot);
+          const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
           // Decode and prefill use different floating-point graphs. Record
           // that drift, but compare recovery itself to an independent cold
           // teacher-forced execution with the identical history and geometry.
           compareCommittedSamples(before, rebuilt, false);
           EngineRequest teacher = sequence;
           teacher.id = 82;
-          const uint32_t teacherSlot = slot == 0 ? 1 : 0;
+          const uint32_t teacherLane = stateLane == 0 ? 1 : 0;
           const auto teacherPages = pageRange(80, 8);
-          beginCold(executor, teacher, teacherSlot);
-          static_cast<void>(prefillChunk(executor, teacher.id, teacherSlot, 0, 0,
+          beginCold(executor, teacher, teacherLane);
+          static_cast<void>(prefillChunk(executor, teacher.id, 0,
                                         teacher.prompt, teacherPages, cohort));
-          require(states.metadata(slot).lengths == states.metadata(teacherSlot).lengths,
+          require(states.metadata(stateLane).lengths == states.metadata(teacherLane).lengths,
                   "recomputed logical lengths differ from teacher forcing");
-          compareCommittedSamples(rebuilt, sampleCommittedState(states, teacherSlot), true);
+          compareCommittedSamples(
+              rebuilt, sampleCommittedState(backend, states, teacherLane), true);
           executor.end(teacher.id);
         }
         return replay.nextDecodeStage;
       };
       if (preempt) {
-        requireOpen(prefillChunk(executor, sequence.id, slot, 0, 0,
+        requireOpen(prefillChunk(executor, sequence.id, 0,
                                  std::span(sequence.prompt).first(32), pageTable,
                                  cohort),
                     "unfinished prefill before preemption");
         static_cast<void>(rebuild(false));
       } else {
-        requireOpen(prefillChunk(executor, sequence.id, slot, 0, 0,
+        requireOpen(prefillChunk(executor, sequence.id, 0,
                                  sequence.prompt, pageTable, cohort),
                     "preemption prompt");
       }
       DecodeStage stage = DecodeStage::Regular;
       if (cohort == BatchCohort::Constrained) {
-        stage = decodeOne(executor, sequence.id, slot, sequence.prompt.size(),
+        stage = decodeOne(executor, sequence.id, sequence.prompt.size(),
                           pageTable, cohort,
                           DecodeStage::RequestInitialMask).nextDecodeStage;
         require(stage == DecodeStage::ApplyInitialMask,
@@ -2878,7 +2911,7 @@ int main(int argc, char **argv) {
         ModelStepResult result;
         if (cohort == BatchCohort::Constrained) {
           auto pending = beginMaskedDecodeOne(
-              executor, sequence.id, slot, sequence.prompt.size(), pageTable, stage);
+              executor, sequence.id, sequence.prompt.size(), pageTable, stage);
           std::array<uint32_t, 9> forced;
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;
@@ -2888,7 +2921,7 @@ int main(int argc, char **argv) {
             require(row < forced.size() && result.outputTokens[row] == forced[row],
                     "preempted constrained decode violated its provided mask");
         } else {
-          result = decodeOne(executor, sequence.id, slot, sequence.prompt.size(),
+          result = decodeOne(executor, sequence.id, sequence.prompt.size(),
                              pageTable, cohort, stage);
         }
         require(!result.outputTokens.empty(), "preempted decode made no progress");
@@ -2987,7 +3020,7 @@ int main(int argc, char **argv) {
         score.scoreTokens = options;
         beginCold(executor, score, 0);
         const ModelStepResult scored =
-            prefillChunk(executor, score.id, 0, 0, 0, context, pageTable);
+            prefillChunk(executor, score.id, 0, context, pageTable);
         executor.end(score.id);
         require(scored.scoreLogits.size() == options.size(),
                 "score probe returned the wrong logit count");
@@ -3139,6 +3172,105 @@ int main(int argc, char **argv) {
                 << (resumed.transcript == reference.transcript)
                 << " rows=" << reference.transcript.size()
                 << " min_p 1 greedy_rows=" << greedy.transcript.size() << '\n';
+    }
+
+    // Prefill telemetry counts the captures each dispatch makes: a cold
+    // prompt with a checkpoint, prefilled in budget-sized chunks, adds what
+    // its plan's spans and boundaries hold, a skipped gap and two windows
+    // included.
+    {
+      std::vector<uint32_t> prompt(3800);
+      for (uint32_t index = 0; index < prompt.size(); ++index)
+        prompt[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
+      const std::array<uint32_t, 1> checkpoints{1024};
+      const DraftContextPlan plan = planDraftContext(
+          0, static_cast<uint32_t>(prompt.size()), checkpoints);
+      uint64_t capturedRows = 0;
+      uint64_t resets = 0;
+      for (const DraftCaptureSpan &span : plan.captureSpans) {
+        capturedRows += span.end - span.begin;
+        if (span.resetDraftState)
+          ++resets;
+      }
+      uint64_t activeRows = 0;
+      uint64_t materializationRows = 0;
+      for (const DraftBoundaryPlan &boundary : plan.boundaries) {
+        const uint64_t rows = boundary.boundary - boundary.captureBegin;
+        if (boundary.purpose == DraftBoundaryPurpose::Active)
+          activeRows += rows;
+        else
+          materializationRows += rows;
+      }
+      require(resets == 2 && capturedRows < prompt.size(),
+              "draft telemetry fixture neither resets twice nor skips rows");
+      const model::ModelTelemetry before = executor.telemetry();
+      beginCold(executor, makeRequest(91, prompt, 1), 0);
+      executor.setDraftContextPlan(91, plan);
+      const std::vector<uint32_t> pages = pageRange(0, 119);
+      for (uint32_t begin = 0; begin < prompt.size();) {
+        const uint32_t rows =
+            std::min<uint32_t>(model::ExecutionLimits::prefillTokenBudget,
+                               static_cast<uint32_t>(prompt.size()) - begin);
+        prefillChunk(executor, 91, begin,
+                     std::span<const uint32_t>(prompt).subspan(begin, rows),
+                     pages);
+        begin += rows;
+      }
+      executor.end(91);
+      const model::ModelTelemetry after = executor.telemetry();
+      require(after.targetPrefillRows - before.targetPrefillRows ==
+                      prompt.size() &&
+                  after.draftContextRowsActive -
+                          before.draftContextRowsActive ==
+                      activeRows &&
+                  after.draftContextRowsMaterialization -
+                          before.draftContextRowsMaterialization ==
+                      materializationRows &&
+                  after.draftContextRowsAvoided -
+                          before.draftContextRowsAvoided ==
+                      prompt.size() - capturedRows &&
+                  after.draftStateResets - before.draftStateResets == resets,
+              "prefill draft telemetry does not follow the plan");
+      std::cout << "draft_telemetry_follows_plan=PASS\n";
+    }
+
+    // A plan whose first capture continues a draft ring the restore skipped
+    // fails the prefill that would continue the empty ring, rather than
+    // building a shorter window that decode then finds incomplete.
+    {
+      const std::vector<uint32_t> pages = pageRange(0, 8);
+      beginCold(executor, makeRequest(92, prompt128, 1), 0);
+      prefillChunk(executor, 92, 0, prompt128, pages);
+      std::shared_ptr<const CompositeState> state = executor.snapshot(92);
+      require(state != nullptr, "discontinuity fixture snapshot allocation failed");
+      executor.end(92);
+      std::vector<uint32_t> extended = prompt128;
+      extended.insert(extended.end(), prompt128.begin(), prompt128.begin() + 100);
+      beginCold(executor, makeRequest(93, extended, 1), 0);
+      require(!executor.beginRestore(93, 128, state, false, {}),
+              "resident restore returned a read");
+      executor.setDraftContextPlan(
+          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}));
+      BatchPlan plan{WorkKind::Prefill,
+                     BatchCohort::Greedy,
+                     {{93, 100}},
+                     DecodeStage::Regular};
+      ModelBatchItem item = withRevision({.requestId = 93,
+                                          .logicalPosition = 128,
+                                          .tokenCount = 100,
+                                          .pageTable = pages});
+      item.inputTokens = std::span<const uint32_t>(extended).subspan(128, 100);
+      auto ticket =
+          executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
+      bool threw = false;
+      try {
+        static_cast<void>(ticket->wait());
+      } catch (const std::logic_error &) {
+        threw = true;
+      }
+      executor.end(93);
+      require(threw, "a capture continued a draft ring its restore skipped");
+      std::cout << "discontinuous_capture_fails=PASS\n";
     }
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;

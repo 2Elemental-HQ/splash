@@ -192,6 +192,7 @@ std::string runtimeStatusJson(
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
       << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
+      << ",\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
@@ -215,6 +216,7 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_publication_failures\":"
       << core.checkpointPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
+      << ",\"priority_suspensions\":" << core.prioritySuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
@@ -307,7 +309,6 @@ std::string runtimeStatusJson(
       {"decode_b2", warmup.decodeBatches[1]},
       {"decode_b3", warmup.decodeBatches[2]},
       {"decode_b4", warmup.decodeBatches[3]},
-      {"draft_verify_commit", warmup.draftVerifyCommit},
       {"composite_state_restore", warmup.compositeStateRestore},
   };
   out << "},\"warmup\":{";

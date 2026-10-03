@@ -7,6 +7,17 @@
 #include <utility>
 
 namespace splash::engine {
+namespace {
+
+// The spans that can still overlap the block at blockBegin or a later one:
+// sorted and disjoint, a span that ends before a block ends before every
+// later block too.
+std::span<const ImageSpan> spansFrom(std::span<const ImageSpan> images, uint64_t blockBegin) {
+  const auto ended = [&](const ImageSpan &span) { return span.end() <= blockBegin; };
+  return {std::partition_point(images.begin(), images.end(), ended), images.end()};
+}
+
+} // namespace
 
 Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
@@ -50,78 +61,73 @@ void Cache::endRequest(uint64_t requestId) {
   dropPoisoned();
 }
 
-std::vector<uint64_t>
-Cache::matchedBlocks(std::span<const uint32_t> prompt,
-                     std::span<const ImageSpan> images) const {
-  std::vector<uint64_t> blocks;
+size_t Cache::extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_t> prompt,
+                          std::span<const ImageSpan> images) const {
   if (prompt.empty())
-    return blocks;
+    return 0;
   // Leave one real input token to regenerate request-specific anchor logits.
   const size_t maximumBlocks = (prompt.size() - 1) / KvCache::pageTokens;
   blocks.reserve(maximumBlocks);
-  uint64_t parent = 0;
-  for (size_t index = 0; index < maximumBlocks; ++index) {
+  size_t hashed = 0;
+  for (size_t index = blocks.size(); index < maximumBlocks; ++index) {
     const size_t begin = index * KvCache::pageTokens;
-    auto match =
-        kv_.find(parent, prompt.subspan(begin, KvCache::pageTokens),
-                 blockImageIdentity(begin, KvCache::pageTokens, images));
+    const uint64_t parent = blocks.empty() ? 0 : blocks.back();
+    images = spansFrom(images, begin);
+    ++hashed;
+    auto match = kv_.find(parent, prompt.subspan(begin, KvCache::pageTokens),
+                          blockImageIdentity(begin, KvCache::pageTokens, images));
     if (!match)
       break;
-    parent = match->id;
-    blocks.push_back(parent);
+    blocks.push_back(match->id);
   }
-  return blocks;
+  return hashed;
+}
+
+uint32_t Cache::stateTokens(std::span<const uint64_t> blocks) const {
+  for (size_t i = blocks.size(); i > 0; --i) {
+    if (states_.contains(blocks[i - 1]))
+      return static_cast<uint32_t>(i * KvCache::pageTokens);
+  }
+  return 0;
 }
 
 CacheProbe Cache::probe(std::span<const uint32_t> prompt,
-                        std::span<const ImageSpan> images) const {
+                        std::span<const ImageSpan> images) {
   CacheProbe result;
   result.owner_ = this;
-  result.blocks_ = matchedBlocks(prompt, images);
   result.kvGeneration_ = kv_.generation();
-  result.promptSize_ = prompt.size();
-  result.images_.assign(images.begin(), images.end());
-  // Include the first missed page: it may hold different tokens at lookup.
-  const size_t maximumBlocks =
-      prompt.empty() ? 0 : (prompt.size() - 1) / KvCache::pageTokens;
-  const size_t checkedBlocks =
-      std::min(maximumBlocks, result.blocks_.size() + 1);
-  if (checkedBlocks)
-    result.checkedTokens_.assign(
-        prompt.begin(), prompt.begin() + checkedBlocks * KvCache::pageTokens);
-  for (size_t i = result.blocks_.size(); i > 0; --i) {
-    if (states_.contains(result.blocks_[i - 1])) {
-      result.cachedTokens_ = static_cast<uint32_t>(i * KvCache::pageTokens);
-      break;
-    }
-  }
+  lookup_.probeHashedBlocks += extendMatch(result.blocks_, prompt, images);
+  result.cachedTokens_ = stateTokens(result.blocks_);
   return result;
+}
+
+void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
+                    std::span<const ImageSpan> images) {
+  if (probe.owner_ != this)
+    throw std::logic_error("a scheduling probe belongs to another cache");
+  if (probe.kvGeneration_ != kv_.generation()) {
+    // See KvCache's generation: the chain holds up to its first block that
+    // no longer matches.
+    probe.blocks_.erase(std::find_if(probe.blocks_.begin(), probe.blocks_.end(),
+                                     [&](uint64_t block) { return !kv_.matchable(block); }),
+                        probe.blocks_.end());
+    lookup_.probeHashedBlocks += extendMatch(probe.blocks_, prompt, images);
+    probe.kvGeneration_ = kv_.generation();
+  }
+  // States come and go without a change of the KV graph.
+  probe.cachedTokens_ = stateTokens(probe.blocks_);
 }
 
 CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
                           std::span<const ImageSpan> images,
                           const CacheProbe *probe) {
   CacheLookup result;
-  const auto validProbe = [&] {
-    if (!probe || probe->owner_ != this ||
-        probe->kvGeneration_ != kv_.generation() ||
-        probe->promptSize_ != prompt.size() ||
-        !std::equal(probe->checkedTokens_.begin(),
-                    probe->checkedTokens_.end(), prompt.begin()) ||
-        !std::equal(probe->images_.begin(), probe->images_.end(),
-                    images.begin(), images.end()))
-      return false;
-    for (uint64_t block : probe->blocks_)
-      if (!kv_.contains(block))
-        return false;
-    return true;
-  };
   std::vector<uint64_t> fallback;
   std::span<const uint64_t> blocks;
-  if (validProbe()) {
+  if (probe && probe->owner_ == this && probe->kvGeneration_ == kv_.generation()) {
     blocks = probe->blocks_;
   } else {
-    fallback = matchedBlocks(prompt, images);
+    extendMatch(fallback, prompt, images);
     blocks = fallback;
   }
   if (!blocks.empty()) {
@@ -192,6 +198,7 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     const uint32_t logical = static_cast<uint32_t>(active.cachedBlocks.size());
     const uint64_t parent = logical ? active.cachedBlocks.back() : 0;
     const uint32_t begin = logical * KvCache::pageTokens;
+    images = spansFrom(images, begin);
     auto inserted =
         kv_.insert(parent, exactTokens.subspan(begin, KvCache::pageTokens),
                    active.pages[logical],

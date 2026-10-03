@@ -462,7 +462,7 @@ std::span<uint32_t> tableRow(const MetalBuffer &table, uint32_t vocabulary,
           vocabulary};
 }
 
-// A table of kLanes state slots, each row with its own words: prompt bits at
+// A table of kLanes state lanes, each row with its own words: prompt bits at
 // a density of its own, small counts, and a few counts at the 2^20-token
 // output limit.
 MetalBuffer penaltyTable(MetalBackend &backend, uint32_t vocabulary) {
@@ -521,7 +521,7 @@ void requirePenalizedRows(const Batch &batch, const std::vector<float> &original
 }
 
 // Penalized lanes read table rows that are neither their lane indices nor
-// within the batch width. Plan lanes do not follow state slots.
+// within the batch width. Plan lanes do not follow state lanes.
 constexpr std::array<std::array<uint32_t, kLanes>, kLanes> kTableRows{
     {{3}, {2, 0}, {1, 3, 0}, {2, 0, 3, 1}}};
 

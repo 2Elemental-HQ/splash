@@ -39,18 +39,16 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
-  DraftStateLayout draftState;
 
-  [[nodiscard]] static RuntimeGeometry from(
-      const ModelPackage &package, kv::Format format = kv::Format::Int8) {
+  [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package,
+                                            kv::Format format) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = package.draft.layout;
-    result.draftState = result.draft.stateLayout();
-    if (!result.target.valid() || !result.draftState.valid() ||
+    if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
         result.target.capturedHiddenSize() != result.draft.targetHiddenSize) {
@@ -59,6 +57,9 @@ struct RuntimeGeometry final {
     return result;
   }
 
+  [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
+    return draft.attentionHeadDimension / 2;
+  }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return (target.vocabularySize + 31) / 32;
   }
@@ -189,10 +190,9 @@ public:
           std::pow(geometry.target.rotaryTheta,
                    -static_cast<float>(dim) / geometry.target.rotaryPairs);
     }
-    const uint32_t draftRotaryPairs = geometry.draftState.headDimension / 2;
-    for (uint32_t dim = 0; dim < draftRotaryPairs; ++dim) {
+    for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
-                            -static_cast<float>(dim) / draftRotaryPairs);
+                            -static_cast<float>(dim) / geometry.draftRotaryPairs());
     }
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
@@ -280,7 +280,7 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   PageTable,
-  // Indexed by state slot, like PageTable: a penalized request's penalty
+  // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,
   VerifyPackedBase,
@@ -314,7 +314,6 @@ constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
   return isGdnLayerTensor(tensor) || isAttentionLayerTensor(tensor);
 }
 
-[[nodiscard]] uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept;
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators);
@@ -323,6 +322,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
+[[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
+                                          const ops::ExecutionPlans &operators);
 
 class DecodeArena final {
 public:
@@ -376,8 +377,7 @@ public:
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
-    bytes_ = checkedAdd(checkedAdd(baseBytes, denseScratchBytes, "decode arena"),
-                        linearSize.bytes(), "Q4 decode scratch");
+    bytes_ = plannedDecodeBytes(geometry_, operators);
   }
 
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
@@ -440,15 +440,7 @@ public:
     if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
         !isGdnLayerTensor(base))
       throw std::out_of_range("invalid batched GDN layer");
-    const uint32_t index = static_cast<uint32_t>(base);
-    // Each GDN tensor holds one stride per layer per lane; the planner sized
-    // it as layers x stride, so the stride is recovered here, not supplied.
-    const uint64_t stride = sizes_[index] / layers;
-    const uint64_t relative = uint64_t{gdnLayer} * kLaneCount * stride;
-    const uint64_t bytes = uint64_t{lanes} * stride;
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched GDN layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    return layerBatchSlice(base, layers, gdnLayer, lanes);
   }
 
   [[nodiscard]] metal::MetalBuffer gdnStorage(DecodeTensor base) const {
@@ -461,25 +453,28 @@ public:
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,
                                                 uint32_t attentionLayer,
                                                 uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount ||
-        attentionLayer >= geometry_.target.kvLayout.attentionLayers ||
+    const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
+    if (!lanes || lanes > kLaneCount || attentionLayer >= layers ||
         !isAttentionLayerTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
-    const uint32_t index = static_cast<uint32_t>(base);
-    const uint64_t relative =
-        uint64_t{attentionLayer} * kLaneCount *
-        decodeChunkLayerBytes(geometry_);
-    const uint64_t bytes =
-        uint64_t{lanes} * decodeChunkLayerBytes(geometry_);
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched attention layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    return layerBatchSlice(base, layers, attentionLayer, lanes);
   }
 
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
+  // A layer-major tensor holds one stride per lane for each of its `layers`
+  // layers, layer by layer; the planner sized it as layers x stride, so the
+  // stride is recovered here, not supplied.
+  [[nodiscard]] metal::MetalBuffer layerBatchSlice(DecodeTensor base, uint32_t layers,
+                                                   uint32_t layer, uint32_t lanes) const {
+    const uint32_t index = static_cast<uint32_t>(base);
+    const uint64_t stride = sizes_[index] / layers;
+    return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
+                         uint64_t{lanes} * stride);
+  }
+
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
   metal::MetalBuffer base_;
@@ -490,8 +485,5 @@ private:
   ops::LinearScratch linearScratch_;
   uint64_t bytes_ = 0;
 };
-
-[[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
-                                          const ops::ExecutionPlans &operators);
 
 } // namespace splash::model

@@ -20,7 +20,6 @@ enum class RuntimeBootstrapStage {
     ModelCreation,
     MaximumPrefill,
     DecodeWarmup,
-    DraftVerifyCommit,
     CompositeStateRestore,
     MemoryAudit,
     AnnounceReady,
