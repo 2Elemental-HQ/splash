@@ -1,7 +1,7 @@
 // Writes the tiny vision source run_vision_preparation.py writes (depth 2,
 // width 8, 2x2 patches) and prints its image's SHA-256.
 //
-//   vision-preparation mlx|gguf DIRECTORY [EXPECTED]
+//   vision-preparation mlx|gguf DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
@@ -60,8 +60,8 @@ int main(int argc, char **argv) {
       std::cout << "padding zero\n";
       return 0;
     }
-    if (argc < 3 || argc > 4)
-      throw std::runtime_error("usage: vision-preparation mlx|gguf DIRECTORY [EXPECTED] | padding DIRECTORY");
+    if (argc != 4)
+      throw std::runtime_error("usage: vision-preparation mlx|gguf DIRECTORY EXPECTED | padding DIRECTORY");
     const std::string format = argv[1];
     if (format != "mlx" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
     const auto source = format == "mlx" ? model::VisionSource::Mlx
@@ -81,18 +81,16 @@ int main(int argc, char **argv) {
     const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
     std::vector<uint8_t> bytes(image.bytes);
     image.write(bytes, {});
-    if (argc == 4) {
-      const auto expected = test::readFile(argv[3]);
-      const auto differs = std::mismatch(bytes.begin(), bytes.end(), expected.begin(), expected.end());
-      if (differs.first != bytes.end() || differs.second != expected.end())
-        throw std::runtime_error(
-            "prepared bytes differ from the oracle from byte " +
-            std::to_string(differs.first - bytes.begin()) + " (" +
-            std::to_string(bytes.size()) + " prepared, " +
-            std::to_string(expected.size()) + " expected)");
-      if (model::visionImageBytes(layout) != expected.size())
-        throw std::runtime_error("vision size estimate differs from the oracle");
-    }
+    const auto expected = test::readFile(argv[3]);
+    const auto differs = std::mismatch(bytes.begin(), bytes.end(), expected.begin(), expected.end());
+    if (differs.first != bytes.end() || differs.second != expected.end())
+      throw std::runtime_error(
+          "the image differs from the oracle from byte " +
+          std::to_string(differs.first - bytes.begin()) + " (" +
+          std::to_string(bytes.size()) + " written, " +
+          std::to_string(expected.size()) + " expected)");
+    if (model::visionImageBytes(layout) != expected.size())
+      throw std::runtime_error("vision size estimate differs from the oracle");
     std::cout << model::weightDigest(bytes) << '\n';
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

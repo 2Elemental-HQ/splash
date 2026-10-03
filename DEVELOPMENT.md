@@ -733,9 +733,9 @@ that predates upstream loading, and `--model` still accepts them. They contain
 Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
 packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
 use any nonempty manifest model name. Native loading validates geometry, tensor
-sizes, binary headers, tokenizer and target/draft compatibility, and maps the
-packed files without preparation. `install/legacy.py` installs a package as a
-selection link to its verified Hub snapshot, pinned like an assembly's
+sizes, binary headers, tokenizer and target/draft compatibility, and reads the
+packed files into memory as they are. `install/legacy.py` installs a package
+as a selection link to its verified Hub snapshot, pinned like an assembly's
 sources. An installed package starts without a Hub request. A package has no
 variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 `--language-only` and `--draft-model` require an upstream model ID.

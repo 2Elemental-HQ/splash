@@ -23,7 +23,7 @@
 namespace splash::model {
 
 // How a target's files store its tensors; loadQwenTarget pairs each source's
-// files with their format. Affine files, packed or prepared from MLX, hold
+// files with their format. Affine files, packed or written from MLX, hold
 // every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
 struct AffineTargetFormat final {
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
@@ -47,7 +47,7 @@ struct AffineTargetFormat final {
   }
 };
 
-// Prepared GGUF images hold each GGUF tensor as one block-quantized segment,
+// GGUF images hold each GGUF tensor as one block-quantized segment,
 // a fused projection as its tensors in output column order, and the GGUF's
 // F32 norms. The GGUF keeps the GDN output projection's input columns in
 // llama.cpp's tiled value-head order, so the GDN writes its output in it; a

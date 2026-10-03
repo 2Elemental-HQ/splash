@@ -10,8 +10,10 @@ files as they are, so a package's are not compared with theirs. Those that
 prepared an assembly's images into a cache, <cache>/<key>/{weights, sha256,
 source}, have build/engine/WeightPreparationIdentity.hpp: such a baseline
 prepares into a cache of its own, whose images are compared after its rounds.
-Delete IDENTITY_HEADER, baseline_environment and prepared once the release
-baselines of assemblies have weight-digests.
+Once the release baselines of assemblies have weight-digests, delete
+IDENTITY_HEADER, PROVENANCE, DIGEST, baseline_environment and prepared, and
+compare_builds' environment with the baseline environments that the
+regression benchmarks pass it.
 """
 
 from __future__ import annotations

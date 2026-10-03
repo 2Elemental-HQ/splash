@@ -220,7 +220,8 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
 // The rule that keeps users off the startup floor: admission weighs
 // reclaimable memory against the macOS reserve, never against the model.
 // A package far larger than everything reclaimable still starts, because
-// mapped weights become resident page by page under the operation guard.
+// the operation guard checks each image's allocation as loading builds the
+// residency up.
 void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   TemporaryModelRoot root(2 * kGiB);
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);

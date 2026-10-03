@@ -169,7 +169,7 @@ class BackendRegressionTests(unittest.TestCase):
                 self.assertTrue(any("did not repeat" in f for f in summary["failures"]))
 
     def test_identity_is_compared_within_each_build(self):
-        # Different preparation identities load different keys: allowed.
+        # Two builds may load different layouts of one model: allowed.
         self.assertTrue(regression.summarize(rounds(), False)["pass"])
 
         def relayout(document):

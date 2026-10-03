@@ -16,8 +16,9 @@
 namespace splash::model {
 namespace {
 
-// A chunk's rows, columns and plane bytes are within the staging bound, so
-// they fit the repack kernel's 32-bit parameters.
+// A chunk's rows, columns and row bytes are within the staging bound, so they
+// fit the repack kernel's 32-bit parameters; its planes' distances are checked
+// where it is repacked.
 static_assert(kGgufRepackStagingBytes <= std::numeric_limits<uint32_t>::max());
 
 // The source row image row `row` of `rows` is read from.
@@ -145,7 +146,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
   RepackChunk chunk;
   chunk.columns = std::min<uint64_t>(repack.columns,
       kGgufRepackStagingBytes / (QUANT_TILE_ROWS * ggufRowBytes(format, kGgufBlockColumns)) * kGgufBlockColumns);
-  if (!chunk.columns) throw GgufError("weight row exceeds preparation bound");
+  if (!chunk.columns) throw GgufError("weight row exceeds the repack staging");
   const uint64_t tileBytes = QUANT_TILE_ROWS * ggufRowBytes(format, chunk.columns);
   chunk.rows = chunk.columns == repack.columns
       ? std::min<uint64_t>(repack.rows, kGgufRepackStagingBytes / tileBytes * QUANT_TILE_ROWS)

@@ -17,12 +17,12 @@ using namespace splash::model;
 using splash::test::rejects;
 using splash::test::require;
 namespace {
-void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16, uint8_t first = 1) {
+void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16) {
   const uint64_t length = header.size();
   std::vector<uint8_t> file(sizeof length);
   std::memcpy(file.data(), &length, sizeof length);
   file.insert(file.end(), header.begin(), header.end());
-  for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + first));
+  for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + 1));
   splash::test::writeFile(path, file);
 }
 constexpr auto valid = R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})";

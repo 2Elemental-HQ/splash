@@ -118,8 +118,9 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
-# BASELINE is a checkout whose build/ holds another build's splash.metallib
-# and engine-tests/backend-benchmark: this build is compared with it on this
+# BASELINE is a checkout whose build/ holds another build's splash.metallib,
+# engine-tests/backend-benchmark and, for a build that loads the weights into
+# memory, engine-tests/weight-digests: this build is compared with it on this
 # machine in ABBA order, and so are their weight images
 # (dev/benchmarks/backend_regression.py). Without it, the release scenarios
 # characterize this build alone.

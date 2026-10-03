@@ -1,10 +1,12 @@
 #include "ModelDescriptor.hpp"
 #include "QwenVision.hpp"
+#include "WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
 
 #include <array>
 #include <cmath>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>

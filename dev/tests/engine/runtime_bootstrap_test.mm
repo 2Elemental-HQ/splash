@@ -632,7 +632,7 @@ void testStartupRetryWindowOpensAtFirstFailure() {
   RuntimeBootstrapReport failure;
   failure.resourceFailure = RuntimeResourceFailure::HostCapacity;
   StartupRetryWindow window(30s);
-  // A cold start fails for the first time after minutes of preparation.
+  // A slow start fails for the first time minutes in.
   const auto first = StartupRetryWindow::Clock::time_point{} + 5min;
   require(window.retryUntil(failure, first) == first + 30s &&
               window.retryUntil(failure, first + 29s) == first + 30s &&

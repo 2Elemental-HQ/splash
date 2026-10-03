@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
           check(loader.model());
         });
         writeEveryByte(root, model::draftCheckpointImages(layout));
-        // The draft reads the prepared files as it reads a package's.
+        // The draft reads the images as it reads a package's files.
         model::WeightImages images(backend);
         model::DraftCheckpointLoader files(images, root, layout);
         const model::DFlashDraftWeights draft = model::loadDFlashDraftWeights(backend, std::ref(files), layout);
@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
                  affine(layer.qkvProjection, layout.qkvSize, layout.hiddenSize) &&
                  affine(layer.outputProjection, layout.hiddenSize, layout.attentionSize) &&
                  affine(layer.downProjection, layout.hiddenSize, layout.intermediateSize);
-        if (!read) throw std::runtime_error("the draft loader misread the prepared draft files");
+        if (!read) throw std::runtime_error("the draft loader misread the draft images");
         std::cout << "affine preparation: exact independent draft fixture, quantization edge cases, fused qkv, "
                      "restore, draft read PASS\n";
         return 0;
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
         openTarget(loader, check);
       });
       writeEveryByte(root, model::affineTargetImages(layout));
-      // The target loader reads the prepared files as affine Q4 projections of
+      // The target loader reads the images as affine Q4 projections of
       // the layout's sizes with bf16 norms, the head into fp32 logits.
       model::WeightImages images(backend);
       model::AffineTargetLoader files(images, root, layout);
@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
           read = read && affine(std::get<model::QwenAttentionWeights>(layer.mixer).inputProjection,
                                 layout.packedFullWidth, layout.hiddenSize);
       }
-      if (!read) throw std::runtime_error("the target loader misread the prepared affine files");
+      if (!read) throw std::runtime_error("the target loader misread the affine images");
       // The dense layout is checked like the MoE one, before any file is
       // opened: its capture layers and its convolution width against its GDN
       // heads.
