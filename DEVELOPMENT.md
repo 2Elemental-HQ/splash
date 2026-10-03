@@ -74,8 +74,9 @@ stopped reading, past `--request-timeout` too, and the request counts against
 `--queue-size` until then.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
-Source `install/completions/splash.bash` for Bash or
-`install/completions/_splash` for Zsh after `compinit`. Completion suggests
+Source `install/completions/splash.bash` for Bash,
+`install/completions/_splash` for Zsh after `compinit`, or
+`install/completions/splash.fish` for fish. Completion suggests
 commands, the official model IDs (bundled, and as `splash serve` last refreshed
 them), the upstream models the README starts with and installed models, a
 GGUF's `OWNER/REPO:VARIANT` included, without network access.
