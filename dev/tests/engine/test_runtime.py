@@ -269,6 +269,25 @@ def send_success(process, call, *, slot=0, tokens=(10, 11, 12)):
     )
 
 
+def answer_status(process, message):
+    process.send(
+        wire.StatusJsonEvent(
+            message.correlation_id,
+            wire.STATUS_SCHEMA_VERSION,
+            b'{"schema_version":4,"ready":true}',
+        )
+    )
+
+
+def fast_liveness_probe(test):
+    """Probes the loop every 50 ms and fails it after 200 ms without an answer."""
+    return mock.patch.multiple(
+        engine_runtime.MultiplexedRuntime,
+        _liveness_interval_seconds=0.05,
+        _liveness_timeout_seconds=0.2,
+    )(test)
+
+
 class RuntimeTests(unittest.TestCase):
     def test_direct_admission_and_out_of_order_demultiplexing(self):
         factory = FakeFactory()
@@ -1084,13 +1103,7 @@ class RuntimeTests(unittest.TestCase):
 
         def handler(process, message):
             if isinstance(message, wire.StatusRequestFrame) and respond.is_set():
-                process.send(
-                    wire.StatusJsonEvent(
-                        message.correlation_id,
-                        wire.STATUS_SCHEMA_VERSION,
-                        b'{"schema_version":4,"ready":true}',
-                    )
-                )
+                answer_status(process, message)
 
         factory = FakeFactory(handler)
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
@@ -1112,6 +1125,52 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(status.correlation_id, first.correlation_id)
         self.assertEqual(status.json, b'{"schema_version":4,"ready":true}')
         self.assertEqual(runtime.last_status, status)
+        self.assertTrue(runtime.ready)
+
+    @fast_liveness_probe
+    def test_liveness_probe_fails_a_generation_whose_loop_stops_answering(self):
+        alive = threading.Event()
+        alive.set()
+
+        def handler(process, message):
+            if isinstance(message, wire.StatusRequestFrame) and alive.is_set():
+                answer_status(process, message)
+
+        factory = FakeFactory(handler)
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        call = runtime.submit(request(1))
+        # The reader thread keeps taking writes; only the loop stops.
+        factory.processes[0].stdin.wait_for(wire.StatusRequestFrame, count=2)
+        self.assertFalse(call.done)
+        alive.clear()
+        with self.assertRaisesRegex(
+            engine_runtime.EngineUnhealthy, "did not answer status"
+        ):
+            call.result(2.0)
+        self.assertFalse(runtime.ready)
+
+    @fast_liveness_probe
+    def test_liveness_probe_runs_only_while_calls_are_pending(self):
+        def handler(process, message):
+            if isinstance(message, wire.StatusRequestFrame):
+                answer_status(process, message)
+
+        factory = FakeFactory(handler)
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        time.sleep(0.3)
+        self.assertEqual(process.stdin.messages(wire.StatusRequestFrame), [])
+        call = runtime.submit(request(1))
+        process.stdin.wait_for(wire.StatusRequestFrame, count=2, timeout=0.5)
+        send_success(process, call)
+        call.result(1.0)
+        # A probe that saw the call pending may still be writing.
+        time.sleep(0.1)
+        probes = len(process.stdin.messages(wire.StatusRequestFrame))
+        time.sleep(0.3)
+        self.assertEqual(len(process.stdin.messages(wire.StatusRequestFrame)), probes)
         self.assertTrue(runtime.ready)
 
     def test_request_and_capacity_failures_are_scoped(self):

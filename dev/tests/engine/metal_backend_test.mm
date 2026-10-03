@@ -382,6 +382,183 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
 }
 
+// Polls until the backend holds no allocations.
+bool awaitAllocationsReleased(const MetalBackend &backend) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend.memoryStats().allocatedBytes != 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return backend.memoryStats().allocatedBytes == 0;
+}
+
+// A synchronous submission throws once the watchdog gives up on its command,
+// which keeps its allocations until the GPU ends it.
+void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 0.1);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::future<std::string> submitted;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        submitted = std::async(std::launch::async, [&]() -> std::string {
+            try {
+                (void)backend.submitCommand({&dispatch, 1});
+            } catch (const MetalBackendError &error) {
+                return error.what();
+            }
+            return "the command completed";
+        });
+        require(submitted.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "a synchronous wait outlasted the command watchdog");
+    }
+    const std::string failure = submitted.get();
+    require(failure.find("completion timed out") != std::string::npos && !backend.healthy(),
+            "a synchronous wait did not fail with the command timeout: " + failure);
+    dispatch.buffers.clear();
+    buffer = {};
+    require(backend.memoryStats().allocatedBytes != 0,
+            "an abandoned wait released the allocations of a pending command");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(released, "an abandoned command kept its allocations after the GPU ended it");
+    std::cout << "PASS synchronous wait obeys the command watchdog\n";
+}
+
+// Destroying a ticket whose command the watchdog gave up on returns while the
+// command is still pending, and the command completes once the GPU ends it.
+void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath, 0.1);
+    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const uint32_t count = 1, increment = 7;
+    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+    commandWatchdogGate = [device newSharedEvent];
+    std::atomic<bool> completed{false};
+    splash::metal::CommandTicket ticket;
+    {
+        MethodReplacement commit(command, @selector(commit),
+                                 reinterpret_cast<IMP>(commitBehindWatchdogGate));
+        originalCommandCommit = commit.original;
+        ticket = backend.submitAsync(dispatch, [&](uint64_t) { completed = true; });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    requireBackendError([&] { backend.checkHealth(); },
+                        "the watchdog did not give up on a pending command");
+    auto destroyed = std::async(std::launch::async, [&ticket] {
+        splash::metal::CommandTicket dropped = std::move(ticket);
+    });
+    require(destroyed.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+            "destroying an abandoned ticket waited for its command");
+    dispatch.buffers.clear();
+    buffer = {};
+    require(!completed && backend.memoryStats().allocatedBytes != 0,
+            "an abandoned ticket let go of a pending command's allocations");
+    commandWatchdogGate.signaledValue = 1;
+    const bool released = awaitAllocationsReleased(backend);
+    commandWatchdogGate = nil;
+    require(completed && released,
+            "an abandoned command did not complete once the GPU ended it");
+    std::cout << "PASS abandoned ticket returns after the command watchdog\n";
+}
+
+std::atomic<unsigned> blitEncoders{0};
+std::atomic<unsigned> computeEncoders{0};
+IMP originalBlitEncoder = nullptr;
+IMP originalComputeEncoder = nullptr;
+id countBlitEncoder(id command, SEL selector) {
+    ++blitEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalBlitEncoder)(command, selector);
+}
+id countComputeEncoder(id command, SEL selector) {
+    ++computeEncoders;
+    return reinterpret_cast<id (*)(id, SEL)>(originalComputeEncoder)(command, selector);
+}
+
+// A lapsed keep-alive ends residency with one dispatch of a kernel built with
+// the library, never a blit whose driver program compiles at that moment, and
+// destroying a backend that holds its set submits no GPU work at all.
+void residencyEndsWithoutBlits(const std::string &metallibPath) {
+    constexpr double kKeepAliveSeconds = 0.2;
+    id<MTLCommandBuffer> command =
+        [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+    commits = 0;
+    blitEncoders = 0;
+    computeEncoders = 0;
+    MethodReplacement committing(command, @selector(commit),
+                                 reinterpret_cast<IMP>(countCommit));
+    originalCountedCommit = committing.original;
+    MethodReplacement blits(command, @selector(blitCommandEncoder),
+                            reinterpret_cast<IMP>(countBlitEncoder));
+    originalBlitEncoder = blits.original;
+    MethodReplacement computes(command, @selector(computeCommandEncoder),
+                               reinterpret_cast<IMP>(countComputeEncoder));
+    originalComputeEncoder = computes.original;
+    unsigned lapseCommits = 0, lapseComputes = 0;
+    {
+        MetalBackend backend(metallibPath, 120.0, 30000, kKeepAliveSeconds);
+        const uint64_t page = static_cast<uint64_t>(getpagesize());
+        MetalBuffer lapsing = backend.allocateBuffer(page);
+        backend.keepResident(lapsing);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((!backend.lapsedResidentBytes() || !commits) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        lapseCommits = commits.exchange(0);
+        lapseComputes = computeEncoders.exchange(0);
+        // Keeping another buffer holds the set again for the teardown.
+        MetalBuffer held = backend.allocateBuffer(page);
+        backend.keepResident(held);
+        require(backend.lapsedResidentBytes() == 0, "a kept buffer did not hold the set");
+    }
+    require(lapseCommits == 1 && lapseComputes == 1,
+            "a lapsed keep-alive did not end residency with one compute dispatch");
+    require(commits == 0 && computeEncoders == 0,
+            "backend teardown submitted GPU work");
+    require(blitEncoders == 0, "residency encoded a blit");
+    std::cout << "PASS residency ends without blits\n";
+}
+
+// A kept buffer's memory returns once its last view is gone, and a set the
+// backend still holds lets its buffers go with the backend, though the
+// serving thread's autorelease pool, like this one, never drains.
+void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
+    constexpr uint64_t kBytes = 64ull << 20;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    {
+        MetalBackend backend(metallibPath);
+        const uint64_t before = device.currentAllocatedSize;
+        MetalBuffer kept = backend.allocateBuffer(kBytes);
+        backend.keepResident(kept);
+        kept = {};
+        require(device.currentAllocatedSize <= before + (1ull << 20),
+                "a buffer taken out of the residency set kept its memory");
+    }
+    const uint64_t before = device.currentAllocatedSize;
+    {
+        MetalBuffer kept;
+        {
+            MetalBackend backend(metallibPath);
+            kept = backend.allocateBuffer(kBytes);
+            backend.keepResident(kept);
+        }
+    }
+    require(device.currentAllocatedSize <= before + (32ull << 20),
+            "a destroyed backend's residency set kept its buffers");
+    std::cout << "PASS residency returns removed buffers\n";
+}
+
 // Kept buffers stay held until the keep-alive passes without a command, the
 // next command holds them again at once, and a buffer's last view takes it
 // out of the set.
@@ -1444,8 +1621,12 @@ int main(int argc, const char *argv[]) {
             terminalCommandRecovers(argv[1], false, true);
             terminalCommandRecovers(argv[1], true);
             pendingCommandStillTimesOut(argv[1]);
+            synchronousWaitObeysTheWatchdog(argv[1]);
+            abandonedTicketReturnsAfterTheWatchdog(argv[1]);
             keptBuffersStayResident(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
+            residencyEndsWithoutBlits(argv[1]);
+            residencyReturnsRemovedBuffers(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

@@ -62,7 +62,8 @@ std::string runtimeStatusJson(
     const model::ModelTelemetry &executorTelemetry,
     const engine::RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait) {
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -109,6 +110,7 @@ std::string runtimeStatusJson(
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)

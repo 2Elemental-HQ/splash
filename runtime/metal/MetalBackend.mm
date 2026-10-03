@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -145,6 +146,8 @@ constexpr uint64_t kPlacementSparsePageBytes = MetalBackend::kPlacementSparsePag
 constexpr MTLSparsePageSize kPlacementSparsePageSize = MTLSparsePageSize64;
 // Entries of a kernel's buffer argument table on every Apple GPU family.
 constexpr uint32_t kBufferArgumentEntries = 31;
+// How long a ticket waits for its command before it asks the watchdog.
+constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 
 MTLSparsePageSize metalSparsePageSize(uint64_t bytes) {
     if (bytes != kPlacementSparsePageBytes) {
@@ -294,10 +297,13 @@ struct BackendAsyncState {
         return current;
     }
 
-    void ensureHealthy() const {
-        if (healthy.load(std::memory_order_acquire)) return;
+    [[noreturn]] void throwUnhealthy() const {
         std::lock_guard lock(healthMutex);
         throw MetalBackendError("Metal backend is unhealthy: " + healthReason);
+    }
+
+    void ensureHealthy() const {
+        if (!healthy.load(std::memory_order_acquire)) throwUnhealthy();
     }
 
     void markUnhealthy(std::string reason) {
@@ -351,33 +357,49 @@ struct BackendAsyncState {
         commandWatchdog.complete(sequence);
     }
 
-    void checkCommandHealth() {
+    // Runs the command watchdog. A terminal command whose callback is late
+    // is completed here; one still running past its timeout marks the
+    // backend unhealthy, and the answer is then true: the backend gave up on
+    // that command.
+    [[nodiscard]] bool commandAbandoned() noexcept {
         id<MTLCommandBuffer> command = nil;
         std::function<void(id<MTLCommandBuffer>)> complete;
         {
             std::lock_guard lock(gateMutex);
-            if (commandWatchdog.expired(steadySeconds())) {
-                command = activeCommand;
-                const auto status = command ? command.status
-                                            : MTLCommandBufferStatusNotEnqueued;
-                // Recover terminal results even if the driver has not delivered
-                // its callback. Finish outside the gate: it takes the ticket lock.
-                if (command && (status == MTLCommandBufferStatusCompleted ||
-                                status == MTLCommandBufferStatusError)) {
-                    complete = activeCompletion;
-                } else {
+            if (!commandWatchdog.expired(steadySeconds())) return false;
+            command = activeCommand;
+            const auto status = command ? command.status
+                                        : MTLCommandBufferStatusNotEnqueued;
+            // Recover terminal results even if the driver has not delivered
+            // its callback. Finish outside the gate: it takes the ticket lock.
+            if (command && (status == MTLCommandBufferStatusCompleted ||
+                            status == MTLCommandBufferStatusError)) {
+                complete = activeCompletion;
+            } else {
+                // Waits that must not throw run this too: the reason drops
+                // its details when they cannot be formatted.
+                std::string reason = "Metal command completion timed out";
+                try {
                     std::ostringstream message;
-                    message << "Metal command completion timed out after "
+                    message << reason << " after "
                             << commandWatchdog.timeoutSeconds()
                             << " seconds (sequence=" << activeSequence
                             << ", status=" << (command ? commandStatusName(status)
                                                        : "unavailable")
                             << ", dispatches=" << activeDispatchCount << ')';
-                    markUnhealthy(message.str());
+                    reason = message.str();
+                } catch (const std::bad_alloc &) {
                 }
+                markUnhealthy(std::move(reason));
+                return true;
             }
         }
         if (complete) complete(command);
+        return false;
+    }
+
+    void checkCommandHealth() {
+        static_cast<void>(commandAbandoned());
         ensureHealthy();
     }
 
@@ -470,12 +492,28 @@ struct CommandTicket::State {
         }
     }
 
-    void abandon() noexcept {
-        {
-            std::unique_lock lock(mutex);
-            condition.wait(lock, [this] { return completed; });
+    // Waits for the command in kTicketWaitSlice slices. Between them, outside
+    // `mutex` (the watchdog may finish this ticket through finishCommand), it
+    // asks the backend whether to stop. False when the backend gave up on a
+    // command that never completed: the GPU may still use the retained
+    // allocations, which the command's completion handler keeps alive with
+    // this state.
+    [[nodiscard]] bool awaitCompletion() noexcept {
+        std::unique_lock lock(mutex);
+        while (!condition.wait_for(lock, kTicketWaitSlice,
+                                   [this] { return completed; })) {
+            lock.unlock();
+            const bool stop = backend->commandAbandoned();
+            lock.lock();
+            if (stop && !completed) return false;
         }
-        release();
+        return true;
+    }
+
+    // An abandoned command keeps its allocations until its completion
+    // handler lets go of this state; the unhealthy backend admits no more.
+    void abandon() noexcept {
+        if (awaitCompletion()) release();
     }
 };
 
@@ -621,7 +659,13 @@ struct MetalBackend::Impl {
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
+        id<MTLComputePipelineState> result = newPipeline(name);
+        pipelines.emplace(name, result);
+        sampleDeviceMemory();
+        return result;
+    }
 
+    id<MTLComputePipelineState> newPipeline(std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
         id<MTLFunction> function = [library newFunctionWithName:key];
         if (!function) {
@@ -636,8 +680,6 @@ struct MetalBackend::Impl {
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
         }
-        pipelines.emplace(name, result);
-        sampleDeviceMemory();
         return result;
     }
 };
@@ -733,11 +775,16 @@ bool CommandTicket::ready() const noexcept {
 
 CommandTiming CommandTicket::wait() {
     if (!state_) throw MetalBackendError("Metal command ticket is empty");
+    if (!state_->awaitCompletion()) {
+        // Let go first, so that unwinding does not wait again.
+        auto backend = state_->backend;
+        state_.reset();
+        backend->throwUnhealthy();
+    }
     CommandTiming timing;
     std::string error;
     {
-        std::unique_lock lock(state_->mutex);
-        state_->condition.wait(lock, [this] { return state_->completed; });
+        std::lock_guard lock(state_->mutex);
         timing = state_->timing;
         error = state_->error;
     }
@@ -784,8 +831,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
-        impl_->residency = std::make_shared<Residency>(
-            impl_->device, impl_->queue, residencyKeepAliveSeconds);
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
         NSError *error = nil;
@@ -809,6 +854,12 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
                 "unable to load metallib " + metallibPath + ": " +
                 errorDescription(error));
         }
+        // Ending residency dispatches a kernel built here, so no pipeline or
+        // driver program is compiled when a keep-alive lapses.
+        impl_->residency = std::make_shared<Residency>(
+            impl_->device, impl_->queue,
+            impl_->newPipeline(Residency::kKickPipeline),
+            residencyKeepAliveSeconds);
         impl_->sampleDeviceMemory();
 
         readDeviceCapabilities(impl_->device, impl_->capabilities);
@@ -1506,6 +1557,8 @@ CommandTicket MetalBackend::submitCommandAsync(
     // Driver callbacks only complete the ticket. Device-wide memory telemetry
     // is sampled on the host before submission and when consuming the result.
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
+    // The handler holds the ticket's state strongly: once a waiter gives up
+    // on the command, it keeps the retained allocations until the GPU ends.
     [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
         ticketState->finishCommand(completedCommand);
     }];

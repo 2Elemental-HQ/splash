@@ -338,7 +338,8 @@ int runNative(const NativeArguments &arguments) {
         published->modelRuntime().telemetry(), resources.cacheIdentity(),
         resources.memoryGovernor().snapshot(), healthy,
         healthy ? std::string{} : backend.unhealthyReason(),
-        published->nativeLoop().resourceWaitSnapshot());
+        published->nativeLoop().resourceWaitSnapshot(),
+        engine::NativeLoopTiming{transport.maxTickMilliseconds()});
   };
 
   engine::StartupRetryWindow recovery(kStartupMemoryRecoveryTimeout);
@@ -426,11 +427,14 @@ int runNative(const NativeArguments &arguments) {
   case engine::NativeProcessExit::EngineFailure:
     writeStderrLine(
         "error: native transport stopped after an engine failure (" +
-        bootstrap->nativeLoop().engineFailure() + ")");
+        (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
+                                     : transport.failure()) +
+        ")");
     break;
   case engine::NativeProcessExit::IoFailure:
     writeStderrLine(
-        "error: native transport stopped after an I/O failure");
+        "error: native transport stopped after an I/O failure (" +
+        transport.failure() + ")");
     break;
   }
   return static_cast<int>(exit);

@@ -9,6 +9,10 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
+//
+// The comparison library loads into a MetalBackend of its own, which needs
+// residency_kick (kernels/shared/residency.metal) in every library it loads:
+// build baselines from a tree that has that kernel.
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"

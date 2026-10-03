@@ -135,6 +135,9 @@ TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/prefill/attention_q8_store.metal \
 	runtime/metal/kernels/decode/attention_q8_store.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
+# Every library a MetalBackend loads has the kernel that ends its residency;
+# the test libraries built without the production kernels link it in.
+TEST_RESIDENCY_AIR := $(ENGINE_TEST_BUILD)/kernels/shared/residency.air
 TEST_Q8_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/q8-attention.metallib
 TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
@@ -211,7 +214,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
-	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_DEQUANT_AIR)
+	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
+	$(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
@@ -277,8 +281,8 @@ $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal \
 		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
-$(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR)
-	$(RUN_CONFIGURED) $(METALLIB) $< -o $@
+$(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(TEST_DEVICE_QUERIES): dev/tests/engine/device_queries_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
@@ -324,7 +328,7 @@ $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_BOOTSTRAP_TEST): dev/tests/engine/runtime_bootstrap_test.mm \
-		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -374,8 +378,8 @@ $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/E
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
 
-$(TEST_Q8_LIB): $(TEST_Q8_AIR)
-	$(RUN_CONFIGURED) $(METALLIB) $< -o $@
+$(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 		$(KERNEL_HEADERS) \
@@ -383,7 +387,7 @@ $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
 
-$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS) $(TEST_Q8_AIR)
+$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
@@ -529,8 +533,8 @@ $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
 
-$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR)
-	$(RUN_CONFIGURED) $(METALLIB) $< -o $@
+$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 # The production kernels and the test kernels of metal_backend_test.metal in
 # one library, for the kernel tests that order a test copy between production

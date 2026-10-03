@@ -30,7 +30,9 @@ upgrading.
 
 An engine that fails is restarted at once, and failed restarts back off from
 1 to 16 seconds. Meanwhile generation requests get 503 `engine_recovering`,
-whose message names the last failure.
+whose message names the last failure. An engine whose loop stops answering
+while requests are pending is failed after 30 seconds and restarted the same
+way.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -801,6 +803,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+| `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
