@@ -9,6 +9,7 @@ import queue
 import re
 import secrets
 import select
+import shlex
 import signal
 import socket
 import sys
@@ -47,7 +48,12 @@ if __package__:
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend, validate_served_model_name
-    from .http_security import authenticate, validate_api_key, validate_headers
+    from .http_security import (
+        OriginRefused,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
@@ -56,6 +62,7 @@ if __package__:
         timings_dict,
         usage_dict,
     )
+    from .origins import ANY_ORIGIN, parse_allowed_origin
     from .output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -90,7 +97,12 @@ else:
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
     from frontend import Frontend, validate_served_model_name
-    from http_security import authenticate, validate_api_key, validate_headers
+    from http_security import (
+        OriginRefused,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
@@ -99,6 +111,7 @@ else:
         timings_dict,
         usage_dict,
     )
+    from origins import ANY_ORIGIN, parse_allowed_origin
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -192,9 +205,13 @@ def _queue_full():
 
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    methods = "GET, HEAD, POST, DELETE, OPTIONS"
 
     def setup(self):
         self._response_started = False
+        # What the response owes its request's origin, once the request has
+        # passed validate_headers.
+        self._allow_origin = None
         self._unread_body = 0
         self._last_sse_write = time.monotonic()
         super().setup()
@@ -269,7 +286,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             allowed_hosts = self.server.allowed_hosts | {
                 self.connection.getsockname()[0].lower()
             }
-            validate_headers(self.headers, allowed_hosts)
+            self._allow_origin = validate_headers(
+                self.headers, allowed_hosts, self.server.allowed_origins
+            )
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
@@ -278,6 +297,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if not public:
                 authenticate(self.headers, self.server.api_key)
         except APIError as error:
+            if isinstance(error, OriginRefused):
+                self.server.refused_origins.report(error.origin)
             self.close_connection = True
             self._safe_error(
                 error, self.path.partition("?")[0].startswith("/v1/messages"), log=False
@@ -302,6 +323,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
     @property
     def app(self):
         return self.server.app
+
+    def end_headers(self):
+        # A browser hands a page the response from another origin only when
+        # the response names that origin, so every response to an admitted
+        # origin does, errors and event streams too, and exposes the retry
+        # and authentication hints, which CORS hides by default.
+        if self._allow_origin is not None:
+            self.send_header("Access-Control-Allow-Origin", self._allow_origin)
+            if self._allow_origin != ANY_ORIGIN:
+                self.send_header("Vary", "Origin")
+            self.send_header(
+                "Access-Control-Expose-Headers", "Retry-After, WWW-Authenticate"
+            )
+        super().end_headers()
 
     def _send(self, status, data, content_type):
         self.send_response(status)
@@ -439,7 +474,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", self.methods)
+        if (
+            self._allow_origin is not None
+            and "Access-Control-Request-Method" in self.headers
+        ):
+            # A browser's preflight, which asks what the request it holds back
+            # may use: every method the server has and, as in vLLM, any header.
+            self.send_header("Access-Control-Allow-Methods", self.methods)
+            requested = self.headers.get("Access-Control-Request-Headers")
+            if requested is not None and requested.isprintable():
+                self.send_header("Access-Control-Allow-Headers", requested)
+            self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -2051,6 +2097,38 @@ class RequestBodyReservation:
             weakref.finalize(job, self.release)
 
 
+class RefusedOriginLog:
+    """Prints each origin the server refuses, once. Its browser hides the 403
+    from the page, which sees a network error, so the operator learns here
+    which --allowed-origin would admit it. Any client can send any origin, so
+    past LIMIT origins no more are printed, and the flag value is quoted for a
+    shell."""
+
+    LIMIT = 32
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # The origins printed, and the first one past LIMIT.
+        self.origins = set()
+
+    def report(self, origin):
+        # Printing under the lock keeps the closing line last.
+        with self.lock:
+            if origin in self.origins or len(self.origins) > self.LIMIT:
+                return
+            self.origins.add(origin)
+            if len(self.origins) > self.LIMIT:
+                print_status("Refused · further Origins are not logged", error=True)
+                return
+            # Visible ASCII, as parse_origin admits, but of any length.
+            shown = origin[:256]
+            print_status(
+                f"Refused · Origin {shown} · restart with --allowed-origin "
+                f"{shlex.quote(shown)} to accept it",
+                error=True,
+            )
+
+
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -2077,6 +2155,7 @@ class FrontendServer(ThreadingHTTPServer):
         api_key=None,
         webui=True,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        allowed_origins=(),
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
@@ -2098,6 +2177,9 @@ class FrontendServer(ThreadingHTTPServer):
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
             if host not in ("0.0.0.0", "::")
         }
+        # As parse_allowed_origin returns them.
+        self.allowed_origins = frozenset(allowed_origins)
+        self.refused_origins = RefusedOriginLog()
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
@@ -2242,6 +2324,13 @@ def _parse_model_id(value):
     return value
 
 
+def _parse_allowed_origin(value):
+    try:
+        return parse_allowed_origin(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
@@ -2296,6 +2385,13 @@ def parse_args(argv=None):
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        type=_parse_allowed_origin,
+        metavar="ORIGIN",
+    )
     parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
@@ -2383,8 +2479,15 @@ def main():
             api_key=args.api_key,
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
+            allowed_origins=args.allowed_origin,
         )
         server.server_bind()
+        if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
+            print_status(
+                "Warning · --allowed-origin '*' without --api-key lets every web "
+                "page open in a browser that reaches this server use it",
+                error=True,
+            )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
         tokenizer = AutoTokenizer.from_pretrained(

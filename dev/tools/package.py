@@ -63,6 +63,7 @@ SERVER_FILES = (
     "documents.py",
     "document_worker.py",
     "http_security.py",
+    "origins.py",
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",

@@ -337,8 +337,17 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--queue-size") + 1], "64")
                 self.assertEqual(argv[argv.index("--decode-share") + 1], "0.25")
                 self.assertEqual(
-                    argv[-4:],
-                    ["--allowed-host", "splash.local", "--allowed-host", "proxy.local"],
+                    argv[-8:],
+                    [
+                        "--allowed-host",
+                        "splash.local",
+                        "--allowed-host",
+                        "proxy.local",
+                        "--allowed-origin",
+                        "tauri://localhost",
+                        "--allowed-origin",
+                        "*",
+                    ],
                 )
                 self.assertNotIn("start_new_session", environment)
                 self.assertIn("--no-webui", argv)
@@ -391,6 +400,10 @@ class LauncherTests(unittest.TestCase):
                         "splash.local",
                         "--allowed-host",
                         "proxy.local",
+                        "--allowed-origin",
+                        "tauri://localhost",
+                        "--allowed-origin",
+                        "*",
                     ]
                 )
             install.assert_called_once_with(selection(launcher.paths.MODELS))
