@@ -40,7 +40,7 @@ KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
   }
 }
 
-KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
+KvPageAcquisition KvPool::acquirePages(uint32_t count) {
   if (!count)
     return {};
 
@@ -72,12 +72,9 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
   }
 
   for (uint32_t page : selected) {
-    PageRecord &record = pages_[page];
     markUsed(page);
-    uint32_t &references =
-        prefixOwner ? record.prefixReferences : record.activeReferences;
-    references = 1;
-    ++(prefixOwner ? prefixPages_ : activePages_);
+    pages_[page].activeReferences = 1;
+    ++activePages_;
   }
   return {std::move(selected)};
 }
@@ -87,27 +84,30 @@ void KvPool::retainPage(uint32_t page, bool prefixOwner) {
   if (!extents_[extentOf(page)].allocated) {
     throw std::logic_error("cannot retain a KV page of an unallocated extent");
   }
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (references == std::numeric_limits<uint32_t>::max()) {
+  if (prefixOwner && record.prefixOwned)
+    throw std::logic_error("KV page already belongs to a cached block");
+  if (!prefixOwner && record.activeReferences == std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV page reference overflow");
-  }
   if (pageFree(page))
     markUsed(page);
-  if (!references)
-    ++(prefixOwner ? prefixPages_ : activePages_);
-  ++references;
+  if (prefixOwner) {
+    record.prefixOwned = true;
+    ++prefixPages_;
+  } else if (!record.activeReferences++) {
+    ++activePages_;
+  }
 }
 
 void KvPool::releasePage(uint32_t page, bool prefixOwner) {
   PageRecord &record = pages_.at(page);
-  uint32_t &references =
-      prefixOwner ? record.prefixReferences : record.activeReferences;
-  if (!references)
+  if (prefixOwner ? !record.prefixOwned : !record.activeReferences)
     throw std::logic_error("invalid KV page release");
-  --references;
-  if (!references)
-    --(prefixOwner ? prefixPages_ : activePages_);
+  if (prefixOwner) {
+    record.prefixOwned = false;
+    --prefixPages_;
+  } else if (!--record.activeReferences) {
+    --activePages_;
+  }
   if (pageFree(page))
     markFree(page);
 }
@@ -122,13 +122,13 @@ uint64_t KvPool::bytesPerPage() const noexcept {
 
 uint32_t KvPool::freePageCount() const noexcept { return freePages_; }
 
-uint32_t KvPool::activeReferences(uint32_t page) const {
-  return pages_.at(page).activeReferences;
+bool KvPool::pageActive(uint32_t page) const {
+  return pages_.at(page).activeReferences != 0;
 }
 
 bool KvPool::pageFree(uint32_t page) const {
   const PageRecord &record = pages_.at(page);
-  return !record.activeReferences && !record.prefixReferences;
+  return !record.activeReferences && !record.prefixOwned;
 }
 
 uint64_t KvPool::allocatedBytes() const noexcept {
@@ -228,8 +228,7 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed) {
     markUsed(copy.to);
     pages_[copy.to].activeReferences =
         std::exchange(pages_[copy.from].activeReferences, 0);
-    pages_[copy.to].prefixReferences =
-        std::exchange(pages_[copy.from].prefixReferences, 0);
+    pages_[copy.to].prefixOwned = std::exchange(pages_[copy.from].prefixOwned, false);
     markFree(copy.from);
     moves.destinations[copy.from - moves.firstPage] = copy.to;
   }
@@ -245,7 +244,6 @@ KvPoolSnapshot KvPool::snapshot() const {
   result.pagesPrefix = prefixPages_;
   result.pagesFree = freePages_;
   result.allocatedBytes = allocatedBytes();
-  result.reclaimableExtents = reclaimableExtents_.count;
   result.reclaimableBytes =
       uint64_t{reclaimableExtents_.count} * extentPages_ * bytesPerPage();
   result.extentAllocations = extentAllocations_;

@@ -15,7 +15,7 @@ enum class MemoryAuditError {
     BackendAccountingMismatch,
     RuntimeReserveExceeded,
     HardBudgetExceeded,
-    WarmupEstimateDeviation,
+    DevicePeakDeviation,
     ArithmeticOverflow,
 };
 
@@ -39,7 +39,8 @@ struct ActualMemoryReport {
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;
     uint64_t devicePeakAllocatedBytes = 0;
-    uint64_t estimatedWarmupPeakBytes = 0;
+    // The backend's own high-water mark since startup.
+    uint64_t backendPeakAllocatedBytes = 0;
 };
 
 struct MemoryAuditResult {
@@ -50,14 +51,14 @@ struct MemoryAuditResult {
     uint64_t categorizedBytes = 0;
     uint64_t backendUnclassifiedBytes = 0;
     uint64_t deviceUntrackedBytes = 0;
-    uint32_t warmupPeakDeviationBasisPoints = 0;
+    uint32_t devicePeakDeviationBasisPoints = 0;
     uint64_t actualHeadroomBytes = 0;
 
     [[nodiscard]] std::string toStatusJson() const;
     [[nodiscard]] std::string describe() const;
 };
 
-inline constexpr uint32_t kMaximumWarmupDeviationBasisPoints = 500;
+inline constexpr uint32_t kMaximumDevicePeakDeviationBasisPoints = 500;
 
 // Validates actual MTLResource.allocatedSize category totals and Metal's
 // process-wide peak against the immutable plan.

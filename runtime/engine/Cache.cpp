@@ -19,10 +19,10 @@ std::span<const ImageSpan> spansFrom(std::span<const ImageSpan> images, uint64_t
 
 } // namespace
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
+Cache::Cache(KvPool &pool, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
-      kv_(pool, cacheNamespace, recency_),
+      kv_(pool, recency_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }) {}
 
 void Cache::beginRequest(uint64_t requestId) {
@@ -157,11 +157,9 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
 }
 
 void Cache::recordLookup(const CacheLookup &result) {
-  ++lookup_.lookups;
   lookup_.kvHitTokens += result.kvBoundary;
-  lookup_.stateHitTokens += result.resumeBoundary();
-  states_.recordLookup(result.state.has_value(),
-                       result.state && !result.state->state()->residentBytes());
+  if (result.state && !result.state->state()->residentBytes())
+    ++lookup_.stateDiskHits;
   if (result.junctionBoundary)
     ++lookup_.lazyJunctions;
   if (result.lostState)
@@ -178,10 +176,10 @@ void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
   active.firstChangedPage = first;
 }
 
-uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
-                                       std::span<const uint32_t> exactTokens,
-                                       uint32_t committedTokens,
-                                       std::span<const ImageSpan> images) {
+void Cache::publishCommittedBlocks(uint64_t requestId,
+                                   std::span<const uint32_t> exactTokens,
+                                   uint32_t committedTokens,
+                                   std::span<const ImageSpan> images) {
   Request &active = request(requestId);
   if (committedTokens > exactTokens.size()) {
     throw std::invalid_argument("committed KV exceeds exact token history");
@@ -217,7 +215,6 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     if (parent)
       kv_.releaseActive(parent);
   }
-  return active.cachedBlocks.empty() ? 0 : active.cachedBlocks.back();
 }
 
 uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
@@ -286,7 +283,7 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
 }
 
 TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
-  KvPageAcquisition acquired = pool_.acquirePages(count, false);
+  KvPageAcquisition acquired = pool_.acquirePages(count);
   if (!acquired.granted()) {
     // Demoted pages free theirs when their copies land: wait once those on
     // their way cover what the free pages do not, and until then reclaim.
@@ -860,7 +857,7 @@ bool Cache::pollTransfers() {
 CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
   tier.pendingPages = pendingPages();
-  tier.diskBlocks = kv_.snapshot().diskBlocks;
+  tier.diskBlocks = kv_.diskBlocks();
   if (diskBudget_) {
     tier.capacityBytes = diskBudget_->capacityBytes();
     tier.usedBytes = diskBudget_->usedBytes();
@@ -871,7 +868,6 @@ CacheSnapshot Cache::snapshot() const {
   if (tier_)
     tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
   return {pool_.snapshot(),
-          kv_.snapshot(),
           states_.snapshot(),
           tier,
           lookup_,

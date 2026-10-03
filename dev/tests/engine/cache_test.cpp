@@ -1,3 +1,4 @@
+#include "TestCache.hpp"
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
@@ -26,12 +27,6 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-CacheNamespace cacheNamespace() {
-  CacheNamespace result;
-  result.digest.fill(0x5a);
-  return result;
-}
-
 void publish(engine::Cache &resources, uint64_t block,
              uint64_t bytes) {
   resources.publishCompositeState(block, std::make_shared<State>(bytes));
@@ -47,12 +42,12 @@ std::vector<uint32_t> tokens(uint32_t count, uint32_t salt = 0) {
 void testCanonicalPagesAndSparseState() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(65);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, prompt.size()).granted(),
           "request pages were not admitted");
-  uint64_t deepest = resources.publishCommittedBlocks(1, prompt, 64);
+  uint64_t deepest = test::publishBlocks(resources, 1, prompt, 64);
   require(deepest && resources.blockAt(1, 64) == deepest,
           "complete Page32 chain was not published");
   publish(resources, deepest, 100);
@@ -72,11 +67,11 @@ void testCanonicalPagesAndSparseState() {
 void testKvDeeperThanStateAndDependencyEviction() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(97);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 96).granted(), "KV allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 96));
+  resources.publishCommittedBlocks(1, prompt, 96);
   const uint64_t middle = resources.blockAt(1, 64);
   publish(resources, middle, 100);
   resources.endRequest(1);
@@ -89,15 +84,15 @@ void testKvDeeperThanStateAndDependencyEviction() {
     return resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
         .madeProgress;
   };
-  require(step() && resources.snapshot().kvCache.blocks == 2 &&
+  require(step() && resources.snapshot().pool.pagesPrefix == 2 &&
               resources.snapshot().stateCache.entries == 1,
           "reclaim did not remove the KV leaf no state restores through first");
   require(step() && resources.snapshot().stateCache.entries == 0 &&
-              resources.snapshot().kvCache.blocks == 2,
+              resources.snapshot().pool.pagesPrefix == 2,
           "unreferenced composite state was not reclaimed before its KV");
   while (step()) {
   }
-  require(resources.snapshot().kvCache.blocks == 0 && storage.releasedExtents == 1,
+  require(resources.snapshot().pool.pagesPrefix == 0 && storage.releasedExtents == 1,
           "KV was not reclaimed after cached state");
 }
 
@@ -105,19 +100,19 @@ void testActiveTipProtectsTheContentChain() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(97, 1000);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 64).granted(),
           "active request KV allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 64));
+  resources.publishCommittedBlocks(1, prompt, 64);
   resources.beginRequest(2);
 
   engine::TokenAdmission blocked = resources.ensureTokens(2, 96);
   require(
       !blocked.granted() &&
           !resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
-          resources.snapshot().kvCache.blocks == 2,
+          resources.snapshot().pool.pagesPrefix == 2,
       "memory pressure evicted an active request KV tip");
 
   resources.endRequest(1);
@@ -131,14 +126,14 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   auto prompt = tokens(129, 2000);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(),
           "initial KV extent allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 128));
+  resources.publishCommittedBlocks(1, prompt, 128);
   resources.endRequest(1);
-  require(resources.snapshot().kvCache.blocks == 4 &&
+  require(resources.snapshot().pool.pagesPrefix == 4 &&
               resources.snapshot().pool.pagesAllocated == 4,
           "cached extent setup is wrong");
 
@@ -152,7 +147,7 @@ void testGrowthReclaimsOneWholeCachedExtent() {
   require(resources.ensureTokens(2, 1).granted(),
           "explicit reclaim did not release the cached KV extent");
   const auto snapshot = resources.snapshot();
-  require(snapshot.kvCache.blocks == 0 && snapshot.pool.pagesAllocated == 4 &&
+  require(snapshot.pool.pagesPrefix == 0 && snapshot.pool.pagesAllocated == 4 &&
               snapshot.pool.pagesActive == 1,
           "growth reclaim did not atomically replace the cached extent");
   resources.endRequest(2);
@@ -162,11 +157,11 @@ void testFragmentedColdKvPrecedesNewerState() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   const auto prompt = tokens(129);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(), "fixture allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 128));
+  resources.publishCommittedBlocks(1, prompt, 128);
   const uint64_t stateBlock = resources.blockAt(1, 32);
   resources.endRequest(1);
   publish(resources, stateBlock, 100);
@@ -174,7 +169,7 @@ void testFragmentedColdKvPrecedesNewerState() {
   const auto reclaimed =
       resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 3 &&
+              resources.snapshot().pool.pagesPrefix == 3 &&
               resources.snapshot().stateCache.entries == 1 &&
               storage.releasedExtents == 0,
           "released-byte preference evicted newer state before cold KV");
@@ -184,16 +179,16 @@ void testReplacementKeepsTheExtentItEmpties() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   resources.beginRequest(1);
   const auto prompt = tokens(33);
   require(resources.ensureTokens(1, 32).granted(), "fixture allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
+  resources.publishCommittedBlocks(1, prompt, 32);
   resources.endRequest(1);
 
   const auto reclaimed = resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
-              resources.snapshot().kvCache.blocks == 0 &&
+              resources.snapshot().pool.pagesPrefix == 0 &&
               storage.allocatedPages() == 4 && storage.releasedExtents == 0,
           "replacement released the newly reusable extent");
   resources.beginRequest(2);
@@ -213,11 +208,11 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t empty = 200;
   test::TestKvStorage storage(4 * (empty + 1), 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   const auto prompt = tokens(33);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 32).granted(), "cached page allocation failed");
-  static_cast<void>(resources.publishCommittedBlocks(1, prompt, 32));
+  resources.publishCommittedBlocks(1, prompt, 32);
   resources.endRequest(1);
   // Request 2 fills the cached block's extent and every other one, then
   // ends: every extent but the cached block's is empty.
@@ -225,21 +220,21 @@ void testReclaimPassReleasesEveryEmptyExtent() {
   require(resources.ensureTokens(2, 4 * empty * 32 + 3 * 32).granted(),
           "empty extent allocation failed");
   resources.endRequest(2);
-  require(resources.snapshot().pool.reclaimableExtents == empty &&
-              resources.snapshot().kvCache.blocks == 1,
+  require(resources.snapshot().pool.reclaimableBytes == uint64_t{empty} * 4 * 4096 &&
+              resources.snapshot().pool.pagesPrefix == 1,
           "release setup geometry changed");
 
   require(resources.releaseEmptyExtents(false) == uint64_t{empty} * 4 * 4096 &&
               storage.releasedExtents == empty &&
-              resources.snapshot().pool.reclaimableExtents == 0 &&
-              resources.snapshot().kvCache.blocks == 1,
+              resources.snapshot().pool.reclaimableBytes == 0 &&
+              resources.snapshot().pool.pagesPrefix == 1,
           "a pass did not release every empty extent before evicting");
   const CacheReclaimResult step =
       resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 4 * 4096 &&
               storage.releasedExtents == empty + 1 &&
               storage.allocatedPages() == 0 &&
-              resources.snapshot().kvCache.blocks == 0,
+              resources.snapshot().pool.pagesPrefix == 0,
           "a pass did not evict the cache and release its extent");
 }
 
@@ -251,18 +246,17 @@ void testReleaseTimeCoversOneExtent() {
   test::TestKvStorage storage(4 * extents, 4096, 4);
   storage.releaseTime = std::chrono::milliseconds(5);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   for (uint32_t chain = 0; chain < extents; ++chain) {
     const uint64_t id = chain + 1;
     resources.beginRequest(id);
     require(resources.ensureTokens(id, 128).granted(),
             "cached chain allocation failed");
-    static_cast<void>(
-        resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128));
+    resources.publishCommittedBlocks(id, tokens(129, 1000 * chain), 128);
     resources.endRequest(id);
   }
-  require(resources.snapshot().pool.reclaimableExtents == 0 &&
-              resources.snapshot().kvCache.blocks == 4 * extents,
+  require(resources.snapshot().pool.reclaimableBytes == 0 &&
+              resources.snapshot().pool.pagesPrefix == 4 * extents,
           "release time setup geometry changed");
   static_cast<void>(resources.evictAll());
   // The pool's timer runs around one release: no less than the storage saw
@@ -281,38 +275,39 @@ void testReleaseTimeCoversOneExtent() {
 void testPublicationReleasesTheExtentItEmpties() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, cacheNamespace());
+  engine::Cache resources(pool);
   // The publishing request runs on the first extent.
   const auto running = tokens(129);
   resources.beginRequest(1);
   require(resources.ensureTokens(1, 128).granted(), "the running request got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(1, running, 128));
+  resources.publishCommittedBlocks(1, running, 128);
   const uint64_t point = resources.blockAt(1, 128);
   StateUse use = resources.useState(point);
   // Another conversation's chain fills the second extent and half the third.
   const auto other = tokens(193, 1000);
   resources.beginRequest(2);
   require(resources.ensureTokens(2, 192).granted(), "the other chain got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(2, other, 192));
+  resources.publishCommittedBlocks(2, other, 192);
   resources.endRequest(2);
   // A request that cached nothing leaves the fourth extent empty.
   resources.beginRequest(3);
   require(resources.ensureTokens(3, 96).granted(), "the empty extent was not allocated");
   resources.endRequest(3);
-  require(resources.snapshot().pool.reclaimableExtents == 1 && storage.allocatedPages() == 16,
+  require(resources.snapshot().pool.reclaimableBytes == 4 * 4096 &&
+              storage.allocatedPages() == 16,
           "fixture geometry changed");
 
   // An extent is room only for a snapshot that can allocate its bytes.
   require(!resources.reclaimOneState(false, point, false) && storage.releasedExtents == 0 &&
-              resources.snapshot().kvCache.blocks == 10,
+              resources.snapshot().pool.pagesPrefix == 10,
           "a publication that cannot allocate released an extent or took KV");
   StateRoom room = resources.reclaimOneState(false, point, true);
   require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 1 &&
-              resources.snapshot().kvCache.blocks == 10,
+              resources.snapshot().pool.pagesPrefix == 10,
           "the publication did not release the empty extent first");
   room = resources.reclaimOneState(false, point, true);
   require(room && room.extentBytes == 4 * 4096 && storage.releasedExtents == 2 &&
-              storage.allocatedPages() == 8 && resources.snapshot().kvCache.blocks == 8,
+              storage.allocatedPages() == 8 && resources.snapshot().pool.pagesPrefix == 8,
           "the publication took more KV than its extent or kept the extent it emptied");
   resources.endRequest(1);
 }

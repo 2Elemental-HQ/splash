@@ -26,6 +26,12 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
          extentPages * extentPages;
 }
 
+// What one request needs at the least: the fixed bytes, one active state cell
+// and the KV runway in the layout's smallest extents; nullopt on overflow.
+[[nodiscard]] std::optional<uint64_t>
+minimumRequiredBytes(uint64_t fixedBytes, uint64_t activeStateCellBytes,
+                     const kv::Layout &layout) noexcept;
+
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.
@@ -33,11 +39,7 @@ struct ModelMemoryFootprint final {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint64_t activeStateCellBytes = 0;
-  uint64_t sharedPrefillBytes = 0;
-  uint64_t sharedDecodeBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
+  model::ModelMemoryPlan runtime;
   // The buffer a state's write to the disk tier stages through, set aside
   // when the tier's state file opened (a quota that holds one state); zero
   // otherwise.
@@ -53,8 +55,6 @@ struct ModelMemoryProfile final {
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
 };
-
-[[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);
 
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe
@@ -202,10 +202,5 @@ struct EngineMemoryPlanResult {
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
                          uint64_t maximumMemoryBytes = 0);
-
-[[nodiscard]] EngineMemoryPlan
-requireEngineMemoryPlan(const DeviceCapabilities &device,
-                        const ModelMemoryProfile &model,
-                        uint64_t maximumMemoryBytes = 0);
 
 } // namespace splash::engine

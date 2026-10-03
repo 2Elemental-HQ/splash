@@ -94,8 +94,7 @@ class RealServer:
         command = [
             sys.executable,
             str(ROOT / "server/server.py"),
-            str(package / "target"),
-            str(package / "draft"),
+            str(package),
             "--host",
             "127.0.0.1",
             "--port",

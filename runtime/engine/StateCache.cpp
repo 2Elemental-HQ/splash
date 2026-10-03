@@ -96,11 +96,6 @@ std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
   return CompositeStateLease(*this, kvBlock, boundary, copy(entry));
 }
 
-void StateCache::recordLookup(bool hit, bool disk) noexcept {
-  hit ? ++hits_ : ++misses_;
-  if (disk) ++diskHits_;
-}
-
 bool StateCache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
   return stateResident(kvBlock) && reuseStoredState(kvBlock, checkpoint);
 }
@@ -118,7 +113,6 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
   if (!entry.pins)
     entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);
-  ++deduplicatedPublications_;
   return true;
 }
 
@@ -197,11 +191,12 @@ bool StateCache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
   }
   if (publications_ == std::numeric_limits<uint64_t>::max())
     throw std::overflow_error("composite state publication count overflowed");
+  if (contains(kvBlock))
+    throw std::logic_error("a block's state is published once; reuse it through reuseStoredState");
+  // A condemned entry is not contained, but its RAM copy stays while readers
+  // pin it.
   if (stateResident(kvBlock))
     throw std::logic_error("duplicate composite state key");
-  // The state is on disk already; a second copy would add nothing.
-  if (reuseStoredState(kvBlock, checkpoint))
-    return true;
   // A checkpoint replaces older copies like any state: it is the only
   // progress a suspended request keeps once the quota is full.
   std::unique_ptr<StateOffload> transfer = startWrite(kvBlock, write);
@@ -438,7 +433,8 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   // A copy that failed is not the protection giving way.
   if (!target.invalid && inUse(kvBlock))
     ++inUseEvictions_;
-  unlink(target);
+  RecencyOrder::unlink(target.ramNode);
+  RecencyOrder::unlink(target.diskNode);
   entries_.erase(found);
   kv_.countState(kvBlock, false, inUse(kvBlock));
   if (retirement)
@@ -458,13 +454,9 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   result.offloads = offloads_;
   result.offloadFailures = offloadFailures_;
   result.invalidations = invalidations_;
-  result.diskHits = diskHits_;
   result.promotions = promotions_;
   result.promotionsSkipped = promotionsSkipped_;
-  result.hits = hits_;
-  result.misses = misses_;
   result.publications = publications_;
-  result.deduplicatedPublications = deduplicatedPublications_;
   result.evictions = evictions_;
   result.inUse = static_cast<uint32_t>(
       std::min<uint64_t>(uses_.size(), std::numeric_limits<uint32_t>::max()));
@@ -507,8 +499,8 @@ StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
   if (found != entries_.end())
     return found->second;
   Entry fresh;
-  fresh.ramNode = RecencyOrder::allocate(kvBlock);
-  fresh.diskNode = RecencyOrder::allocate(kvBlock);
+  fresh.ramNode = RecencyOrder::allocate();
+  fresh.diskNode = RecencyOrder::allocate();
   fresh.publication = publications_ + 1;
   Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
   kv_.countState(kvBlock, true, inUse(kvBlock));
@@ -558,7 +550,8 @@ void StateCache::beginWrite(uint64_t kvBlock, Entry &target,
 // redundant copies or as the only copy, of a state in use or not. A pinned
 // or invalid entry, or a copy being written, is in no order.
 void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
-  unlink(target);
+  RecencyOrder::unlink(target.ramNode);
+  RecencyOrder::unlink(target.diskNode);
   if (target.pins || target.invalid)
     return;
   const bool used = inUse(kvBlock);
@@ -568,13 +561,6 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   if (target.disk && !writing(kvBlock))
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)
         .link(target.diskNode, target.lastUsed, kvBlock);
-}
-
-void StateCache::unlink(Entry &target) noexcept {
-  if (target.ramNode.linked())
-    RecencyOrder::unlink(target.ramNode);
-  if (target.diskNode.linked())
-    RecencyOrder::unlink(target.diskNode);
 }
 
 void StateCache::discardDisk(Entry &target) noexcept {

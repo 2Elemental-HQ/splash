@@ -16,9 +16,9 @@ struct KvPoolSnapshot {
   uint32_t pagesFree = 0;
   uint32_t pagesActive = 0;
   uint32_t pagesPrefix = 0;
-  // Extents none of whose pages is held, which a reclaim releases at once.
-  uint32_t reclaimableExtents = 0;
   uint64_t allocatedBytes = 0;
+  // The bytes of extents none of whose pages is held, which a reclaim
+  // releases at once.
   uint64_t reclaimableBytes = 0;
   // Extents allocated and released through the pool, and the longest
   // allocation and release of one: what memory costs per extent. The counts
@@ -61,16 +61,17 @@ struct KvPageAcquisition {
   }
 };
 
-// Sole owner of KV page references and of which extents are allocated. It
-// alone allocates and releases extents, starting with the runway its
-// constructor allocates. Resource policy may ask for pages or release
-// references, but cannot directly allocate or release Metal memory. Free
-// pages are handed out from the allocated extent with the most live pages
-// first, so partially used extents fill up, empty extents are touched last,
-// and cold extents drain to empty, the only state in which an extent can be
-// released. Held pages are scattered over the extents all the same;
-// compactExtent() empties one more extent whenever the free pages of the
-// others cover it.
+// Sole owner of KV page references and of which extents are allocated.
+// Requests hold counted references to a page; the cache owns a page once,
+// for the one block on it (prefixOwner). The pool alone allocates and
+// releases extents, starting with the runway its constructor allocates.
+// Resource policy may ask for pages or release references, but cannot
+// directly allocate or release Metal memory. Free pages are handed out from
+// the allocated extent with the most live pages first, so partially used
+// extents fill up, empty extents are touched last, and cold extents drain to
+// empty, the only state in which an extent can be released. Held pages are
+// scattered over the extents all the same; compactExtent() empties one more
+// extent whenever the free pages of the others cover it.
 class KvPool final {
 public:
   // Allocates the runway, the extents that hold pages [0, runwayPages), or
@@ -78,8 +79,8 @@ public:
   // std::invalid_argument for a runway longer than the pool.
   KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
 
-  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count,
-                                               bool prefixOwner);
+  // The pages come with one active reference each, the requester's.
+  [[nodiscard]] KvPageAcquisition acquirePages(uint32_t count);
   void retainPage(uint32_t page, bool prefixOwner);
   void releasePage(uint32_t page, bool prefixOwner);
 
@@ -88,8 +89,9 @@ public:
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
   // Free pages of allocated extents; acquisition hands these out first.
   [[nodiscard]] uint32_t freePageCount() const noexcept;
-  [[nodiscard]] uint32_t activeReferences(uint32_t page) const;
-  [[nodiscard]] bool pageFree(uint32_t page) const;
+  // A request holds the page, as one of its own or as a page of a cached
+  // chain it uses.
+  [[nodiscard]] bool pageActive(uint32_t page) const;
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   // Pages of allocated extents no request holds: free, or held only by the
   // cache.
@@ -117,9 +119,9 @@ private:
 
   struct PageRecord {
     uint32_t activeReferences = 0;
-    uint32_t prefixReferences = 0;
     uint32_t previousFree = noIndex;
     uint32_t nextFree = noIndex;
+    bool prefixOwned = false;
     bool onFreeList = false;
   };
 
@@ -144,6 +146,7 @@ private:
   [[nodiscard]] uint32_t firstPage(uint32_t extent) const noexcept {
     return extent * extentPages_;
   }
+  [[nodiscard]] bool pageFree(uint32_t page) const;
   // The lowest extent that is not allocated; noIndex when all of them are.
   [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
   void insertFree(uint32_t page) noexcept;

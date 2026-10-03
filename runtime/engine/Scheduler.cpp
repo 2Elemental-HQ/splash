@@ -36,10 +36,10 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
       request.phase != Phase::WaitingPrefix) {
     throw std::logic_error("only queued work can be admitted");
   }
-  if (processed > request.spec.promptTokens) {
+  if (processed > request.spec.prefillTokens) {
     throw std::invalid_argument("processed prompt exceeds request");
   }
-  if (request.suspendedForResources) {
+  if (request.suspended) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
@@ -47,7 +47,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
                             ? DecodeStage::RequestInitialMask
                             : DecodeStage::Regular;
   request.phase =
-      processed == request.spec.promptTokens ? Phase::Decode : Phase::Prefill;
+      processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
 }
 
 void Scheduler::suspendForResources(uint64_t id) {
@@ -55,7 +55,7 @@ void Scheduler::suspendForResources(uint64_t id) {
   if (request.phase != Phase::Prefill && request.phase != Phase::Decode) {
     throw std::logic_error("only runnable resident work can be suspended");
   }
-  request.suspendedForResources = true;
+  request.suspended = true;
   request.phase = Phase::WaitingResources;
   dropStaleDecodeDebt();
 }
@@ -63,21 +63,20 @@ void Scheduler::suspendForResources(uint64_t id) {
 void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
                                     uint32_t replayTokens) {
   Request &request = get(id);
-  if (request.phase != Phase::WaitingResources ||
-      !request.suspendedForResources) {
+  if (request.phase != Phase::WaitingResources || !request.suspended) {
     throw std::logic_error("request is not suspended for resources");
   }
   if (processed >= replayTokens)
     throw std::invalid_argument("resource replay must leave an input token");
-  request.spec.promptTokens = replayTokens;
+  request.spec.prefillTokens = replayTokens;
   request.promptProcessed = processed;
   request.phase = Phase::Prefill;
-  request.suspendedForResources = false;
+  request.suspended = false;
 }
 
 void Scheduler::deferAdmission(uint64_t id) {
   Request &request = get(id);
-  if (request.suspendedForResources ||
+  if (request.suspended ||
       (request.phase != Phase::Queued &&
        request.phase != Phase::WaitingResources &&
        request.phase != Phase::WaitingPrefix))
@@ -97,7 +96,7 @@ void Scheduler::waitForResources(uint64_t id) {
 
 void Scheduler::waitForPrefix(uint64_t id) {
   Request &request = get(id);
-  if (request.suspendedForResources ||
+  if (request.suspended ||
       (request.phase != Phase::Queued &&
        request.phase != Phase::WaitingResources &&
        request.phase != Phase::WaitingPrefix)) {
@@ -149,7 +148,7 @@ void Scheduler::setPrefillBoundary(uint64_t id,
                                          std::optional<uint32_t> boundary) {
   Request &request = get(id);
   if (boundary && (*boundary <= request.promptProcessed ||
-                   *boundary > request.spec.promptTokens)) {
+                   *boundary > request.spec.prefillTokens)) {
     throw std::invalid_argument("invalid prefill boundary");
   }
   request.prefillBoundary = boundary;
@@ -198,10 +197,10 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
   pending.reserve(candidates.size());
   for (const auto &candidate : candidates) {
     const Request &value = get(candidate.requestId);
-    if (value.suspendedForResources ||
+    if (value.suspended ||
         (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
          value.phase != Phase::WaitingPrefix) ||
-        candidate.cachedTokens >= value.spec.promptTokens)
+        candidate.cachedTokens >= value.spec.prefillTokens)
       throw std::logic_error("invalid pending prefill admission");
     pending.push_back({&value, candidate.cachedTokens});
   }
@@ -276,7 +275,7 @@ std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> exclud
 }
 
 uint32_t Scheduler::dispatchRemaining(const PrefillRequestView &view) noexcept {
-  uint32_t end = view.request->spec.promptTokens;
+  uint32_t end = view.request->spec.prefillTokens;
   if (view.request->prefillBoundary)
     end = std::min(end, *view.request->prefillBoundary);
   return end - view.promptProcessed;
@@ -299,9 +298,9 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
               if (overdue(a) != overdue(b))
                 return overdue(a);
               const uint32_t remainingA =
-                  a.request->spec.promptTokens - a.promptProcessed;
+                  a.request->spec.prefillTokens - a.promptProcessed;
               const uint32_t remainingB =
-                  b.request->spec.promptTokens - b.promptProcessed;
+                  b.request->spec.prefillTokens - b.promptProcessed;
               if (remainingA != remainingB)
                 return remainingA < remainingB;
               return a.request->order < b.request->order;
@@ -334,7 +333,7 @@ uint32_t Scheduler::prefillBudget(
          rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
     rows /= 2;
   const uint32_t leaderRemaining =
-      leader.request->spec.promptTokens - leader.promptProcessed;
+      leader.request->spec.prefillTokens - leader.promptProcessed;
   const bool leaderFinishing = leaderRemaining <= rows;
   const bool contended = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
@@ -345,7 +344,7 @@ uint32_t Scheduler::prefillBudget(
                            const PrefillRequestView &peer) {
         return peer.request->spec.id != leader.request->spec.id &&
                peer.request->spec.priority <= leader.request->spec.priority &&
-               (leaderFinishing || peer.request->spec.promptTokens -
+               (leaderFinishing || peer.request->spec.prefillTokens -
                                        peer.promptProcessed <= rows);
       });
   // Bound commands for peers that decode or wait for a CPU mask, including
@@ -436,7 +435,7 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
       if (terminal(request.phase) || request.phase == Phase::Decode ||
-          request.phase == Phase::WaitingMask || request.suspendedForResources ||
+          request.phase == Phase::WaitingMask || request.suspended ||
           listed(excluded, id))
         continue;
       const bool served = std::any_of(
@@ -493,7 +492,7 @@ void Scheduler::complete(const BatchPlan &plan,
       }
       // A stop token or a one-token budget is selected by prefill itself.
       request.phase = result.finished ? Phase::Completed
-                      : request.promptProcessed == request.spec.promptTokens
+                      : request.promptProcessed == request.spec.prefillTokens
                           ? Phase::Decode
                           : Phase::Prefill;
     } else {
@@ -561,6 +560,10 @@ void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds) {
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
+
+bool Scheduler::suspended(uint64_t id) const { return get(id).suspended; }
+
+uint64_t Scheduler::submissionOrder(uint64_t id) const { return get(id).order; }
 
 uint32_t Scheduler::promptProcessed(uint64_t id) const {
   return get(id).promptProcessed;

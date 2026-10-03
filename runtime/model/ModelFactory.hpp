@@ -67,8 +67,6 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -95,12 +93,6 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
-
-// Fixed reserves the memory plan carries beside the planned arenas: Metal
-// pipeline objects and encoder scratch, and the process's own runtime
-// overhead. Startup counts them before a model loads.
-inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
-inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

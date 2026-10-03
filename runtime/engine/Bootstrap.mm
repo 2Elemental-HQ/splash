@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -22,7 +21,6 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
   report.resourceFailure = error.failure();
   report.message = error.message();
-  report.warmup.error = report.message;
   report.memoryPlanJson = error.statusJson();
   report.budgetDescription = error.budgetDescription();
   return report;
@@ -32,7 +30,6 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
                        RuntimeBootstrapStage stage, std::string message) {
   report.stage = stage;
   report.message = std::move(message);
-  report.warmup.error = report.message;
   throw RuntimeBootstrapError(std::move(report));
 }
 
@@ -104,12 +101,27 @@ bool memoryMayNotHold(const EngineMemoryPlan &plan,
          contextTokens;
 }
 
+protocol::ProtocolLimits protocolLimitsFor(
+    const model::ModelCapabilities &capabilities, uint32_t maxContext) noexcept {
+  protocol::ProtocolLimits limits;
+  limits.maxPromptTokens = maxContext;
+  limits.maxLogicalOutputTokens = maxContext;
+  limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
+  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
+                        (model::ExecutionLimits::draftQueryRows + 1);
+  return limits;
+}
+
 RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                                    std::unique_ptr<model::RuntimeModel> modelRuntime,
                                    std::unique_ptr<NativeRuntime> nativeLoop,
                                    RuntimeBootstrapReport report)
     : resources_(std::move(resources)), model_(std::move(modelRuntime)),
-      nativeLoop_(std::move(nativeLoop)), report_(std::move(report)) {}
+      nativeLoop_(std::move(nativeLoop)),
+      memoryControl_(resources_->memoryGovernor(), resources_->backend(),
+                     *nativeLoop_),
+      report_(std::move(report)) {}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
   // Refuse new commands before the loop, the model and the resources they
@@ -117,11 +129,24 @@ RuntimeBootstrap::~RuntimeBootstrap() {
   resources_->backend().stop();
 }
 
+std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
+                                         const NativeLoopTiming &loop) {
+  // Status can arrive during GPU work; allocation/command boundaries and
+  // the safe-point pressure monitor already refresh the cached sample.
+  metal::MetalBackend &backend = resources_->backend();
+  const bool healthy = backend.healthy();
+  return runtimeStatusJson(
+      resources_->memoryPlan(), nativeLoop_->snapshot(), backend.memoryStats(),
+      report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
+      resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
+      healthy, healthy ? std::string{} : backend.unhealthyReason(),
+      nativeLoop_->resourceWaitSnapshot(), loop);
+}
+
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime,
     ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
-  uint64_t estimatedPeakBytes = 0;
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
     model::WarmupStepResult result;
@@ -145,16 +170,13 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
            std::string(runtimeBootstrapStageName(stage)) +
                " threw an unknown exception");
     }
-    if (!result.completed || !result.estimatedPeakBytes ||
-        !(result.wallSeconds > 0.0) || !std::isfinite(result.wallSeconds)) {
+    if (!(result.wallSeconds > 0.0) || !std::isfinite(result.wallSeconds)) {
       std::string message = std::string(runtimeBootstrapStageName(stage)) +
                             " did not complete a real measured path";
       if (!result.detail.empty())
         message += ": " + result.detail;
       fail(report, stage, std::move(message));
     }
-    estimatedPeakBytes =
-        std::max(estimatedPeakBytes, result.estimatedPeakBytes);
     status = WarmupStepStatus::Complete;
     return result;
   };
@@ -193,7 +215,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
 
   ActualMemoryReport actual;
   try {
-    actual = memoryReporter(estimatedPeakBytes);
+    actual = memoryReporter();
   } catch (const metal::MetalAllocationError &error) {
     report.resourceFailure = resourceAllocationFailure(error.failure());
     fail(report, RuntimeBootstrapStage::MemoryAudit,
@@ -205,13 +227,11 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          "actual memory reporting failed with an unknown exception");
   }
-  report.warmup.actualPeakBytes = actual.devicePeakAllocatedBytes;
   report.memoryAudit = auditActualMemory(memoryPlan, actual);
   if (!report.memoryAudit.valid) {
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          report.memoryAudit.describe());
   }
-  report.warmup.memoryBudgetValidated = true;
 
   try {
     nativeLoop.announceReady();
@@ -224,7 +244,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   }
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
-  report.warmup.error.clear();
   return report;
 }
 
@@ -273,12 +292,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
                " and replays its prompt. --max-cache-disk SIZE keeps its"
                " progress and cached prefixes on SSD.");
   }
-  // The parser and engine consume the same resolved ceiling. In automatic
-  // mode these limits cannot be known until resource planning has measured
-  // the device and built the immutable page pool.
-  config.protocolLimits.maxPromptTokens = config.nativeLoop.engine.maxContext;
-  config.protocolLimits.maxLogicalOutputTokens =
-      config.nativeLoop.engine.maxContext;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
   // Images are admitted up to the server's pixel cap; a model without vision
@@ -289,26 +302,28 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
-    const model::ModelMemoryPlan &modelMemory =
-        resources->modelMemoryPlan();
-    if (modelMemory.sharedDecodePlannedAllocatedBytes >
-        std::numeric_limits<uint64_t>::max() -
-            modelMemory.sharedPrefillPlannedAllocatedBytes) {
-      throw std::overflow_error(
-          "modelRuntime shared allocation reservation overflows");
-    }
-    const uint64_t modelBytes =
-        modelMemory.sharedPrefillPlannedAllocatedBytes +
-        modelMemory.sharedDecodePlannedAllocatedBytes;
-    metal::AllocationFailure failure;
-    auto reservation = resources->memoryGovernor().tryReserve(modelBytes, &failure);
-    if (!reservation) {
+    // The plan's fixed bytes already proved the arenas' sum fits.
+    const auto &budget = resources->memoryPlan().breakdown();
+    // Admission reports a refusal by its failure alone. One raised while the
+    // runtime allocates keeps its own message, which says what to do.
+    std::string refusal;
+    const metal::AllocationResult arenas =
+        resources->memoryGovernor().allocationAdmission()(
+            budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+              try {
+                modelRuntime = model::createRuntime(resources->modelContext());
+              } catch (const metal::MetalAllocationError &error) {
+                refusal = error.what();
+                throw;
+              }
+            });
+    if (!arenas) {
       throw metal::MetalAllocationError(
-          std::string("unable to reserve model arenas: ") +
-              metal::allocationFailureName(failure), failure);
+          refusal.empty() ? std::string("unable to admit model arenas: ") +
+                                metal::allocationFailureName(arenas.failure)
+                          : refusal,
+          arenas.failure);
     }
-    modelRuntime = model::createRuntime(resources->modelContext());
-    reservation->commit();
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
@@ -323,10 +338,13 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
+    // The parser and engine consume the same resolved ceiling. In automatic
+    // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
         std::move(output), std::move(statusProvider), NativeLoopClocks{},
-        config.protocolLimits);
+        protocolLimitsFor(config.resources.model.capabilities,
+                          config.nativeLoop.engine.maxContext));
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
@@ -340,12 +358,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   model::RuntimeModel *modelPointer = modelRuntime.get();
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime,
-      [resourcesPointer, modelPointer](uint64_t estimatedPeakBytes) {
+      [resourcesPointer, modelPointer] {
         resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
-            modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
+            modelPointer->actualRuntimeMemory());
         // Keep what the first request starts from: one lane's state buffers
         // and one empty KV extent. No cache data is evicted.
         while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {

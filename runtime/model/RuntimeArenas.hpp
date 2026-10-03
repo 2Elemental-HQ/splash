@@ -61,7 +61,7 @@ struct RuntimeGeometry final {
     return draft.attentionHeadDimension / 2;
   }
   [[nodiscard]] uint32_t maskWords() const noexcept {
-    return (target.vocabularySize + 31) / 32;
+    return maskWordsPerToken(target.vocabularySize);
   }
   [[nodiscard]] uint32_t projectionSumsWidth() const noexcept {
     uint32_t maximumInput = std::max(

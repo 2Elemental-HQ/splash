@@ -19,15 +19,6 @@
 
 namespace splash::engine {
 
-// One process owns one loaded target+draft model, executable build and Q8
-// layout. Their canonical SHA-256 is stored once on the cache instance; KV
-// blocks never duplicate strings or layout metadata.
-struct CacheNamespace final {
-  std::array<uint8_t, 32> digest{};
-
-  bool operator==(const CacheNamespace &) const = default;
-};
-
 struct ImageIdentity final {
   uint64_t lo = 0;
   uint64_t hi = 0;
@@ -39,17 +30,6 @@ struct ImageIdentity final {
 [[nodiscard]] ImageIdentity
 blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
                    std::span<const ImageSpan> spans) noexcept;
-
-struct KvBlockKeyView final {
-  uint64_t parentBlock = 0;
-  uint64_t indexHash = 0;
-  std::span<const uint32_t> tokens;
-  ImageIdentity images;
-};
-
-// Hashes filter candidates; equality still requires the complete key.
-[[nodiscard]] bool exactKvBlockKeyMatch(const KvBlockKeyView &stored,
-                                        const KvBlockKeyView &query) noexcept;
 
 // Content-addressed target-KV blocks across two tiers. Matching walks the
 // chained full-page hashes from the root. A block holds a pool page, a disk
@@ -67,25 +47,14 @@ public:
     uint32_t physicalPage = noPage;
   };
 
-  struct InsertResult : BlockMatch {
-    bool inserted = false;
-  };
-
   // Root first; noPage marks a disk-only block.
   struct Chain final {
     std::vector<uint64_t> blocks;
     std::vector<uint32_t> pages;
   };
 
-  struct Snapshot {
-    uint32_t blocks = 0;
-    uint64_t bytes = 0;
-    uint32_t diskBlocks = 0;
-  };
-
-  KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
-      : pool_(pool), cacheNamespace_(cacheNamespace), recency_(recency),
-        blockOnPage_(pool.pageCount()) {}
+  KvCache(KvPool &pool, CacheRecency &recency)
+      : pool_(pool), recency_(recency), blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
@@ -97,10 +66,10 @@ public:
                                                ImageIdentity images = {}) const;
   // Existing content is returned as is; a disk-only block adopts the
   // writer's page, and a block in transfer keeps its own.
-  [[nodiscard]] InsertResult insert(uint64_t parentBlock,
-                                    std::span<const uint32_t> tokens,
-                                    uint32_t physicalPage,
-                                    ImageIdentity images = {});
+  [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
+                                  std::span<const uint32_t> tokens,
+                                  uint32_t physicalPage,
+                                  ImageIdentity images = {});
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
@@ -139,7 +108,6 @@ public:
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks) const;
   // Resident, without resident children or users: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
-  [[nodiscard]] bool transferring(uint64_t blockId) const;
   void setTransferring(uint64_t blockId, bool transferring);
   // Publishes the block's disk copy; a resident block may drop it with null.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
@@ -175,7 +143,9 @@ public:
   // caller handles any composite state attached to it first.
   void erase(uint64_t blockId);
 
-  [[nodiscard]] Snapshot snapshot() const noexcept;
+  // Blocks with a disk copy, resident or not; the pool counts the resident
+  // blocks (KvPoolSnapshot::pagesPrefix).
+  [[nodiscard]] uint32_t diskBlocks() const noexcept { return diskBlocks_; }
 
 private:
   struct Block {
@@ -205,14 +175,10 @@ private:
     RecencyOrder::Node diskNode;
   };
 
-  [[nodiscard]] uint64_t indexHash(uint64_t parentHash,
-                                   std::span<const uint32_t> tokens,
-                                   ImageIdentity images) const noexcept;
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
-  void unlink(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
   // Applies count to every block above this one.
@@ -222,7 +188,6 @@ private:
   void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   KvPool &pool_;
-  CacheNamespace cacheNamespace_;
   CacheRecency &recency_;
   std::unordered_map<uint64_t, Block> blocks_;
   // The resident block on each page, 0 for none. A resident block owns its
@@ -240,7 +205,6 @@ private:
   RecencyOrder ramLeaves_;
   RecencyOrder duplicates_;
   RecencyOrder diskLeaves_;
-  uint32_t residentBlocks_ = 0;
   uint32_t diskBlocks_ = 0;
 };
 

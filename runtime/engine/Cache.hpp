@@ -53,11 +53,11 @@ private:
 };
 
 struct CacheLookupSnapshot final {
-  uint64_t lookups = 0;
   // KV blocks scheduling probes hashed: admission work between commands.
   uint64_t probeHashedBlocks = 0;
   uint64_t kvHitTokens = 0;
-  uint64_t stateHitTokens = 0;
+  // Lookups whose state came from disk.
+  uint64_t stateDiskHits = 0;
   // Lookups that matched KV past their state at a branch point.
   uint64_t lazyJunctions = 0;
   // Lookups that matched KV where a reusable state used to be.
@@ -87,7 +87,6 @@ struct KvTierSnapshot final {
 
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
-  KvCache::Snapshot kvCache;
   StateCacheSnapshot stateCache;
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
@@ -185,7 +184,7 @@ class Cache final {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
   // the states' file can run on it without the tier.
-  Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier = nullptr,
+  Cache(KvPool &pool, KvTier *kvTier = nullptr,
         std::shared_ptr<const model::DiskBudget> diskBudget = nullptr);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
@@ -241,9 +240,10 @@ public:
   // Canonicalizes every newly complete Page32 block. Duplicate content swaps
   // the request to the existing immutable page after the writer command has
   // completed; no active command ever aliases a writable page.
-  [[nodiscard]] uint64_t publishCommittedBlocks(
-      uint64_t requestId, std::span<const uint32_t> exactTokens,
-      uint32_t committedTokens, std::span<const ImageSpan> images = {});
+  void publishCommittedBlocks(uint64_t requestId,
+                              std::span<const uint32_t> exactTokens,
+                              uint32_t committedTokens,
+                              std::span<const ImageSpan> images = {});
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
   // Reuses the state at this block in either tier, as reuseCompositeState()
@@ -255,6 +255,8 @@ public:
   // Publishes the state of the lane at this block straight to disk, for a
   // state no cache slot can hold: `write` starts the write from the lane.
   // False when the tier cannot take the state now; nothing is published then.
+  // The caller reuses a stored state first (reuseStoredState); publishing
+  // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   // The request holding the handle is unfinished and its conversation

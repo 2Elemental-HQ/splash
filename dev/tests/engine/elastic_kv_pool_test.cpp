@@ -41,7 +41,7 @@ uint64_t reclaimEvery(KvPool &pool, bool keepRunway) {
 void testGrowthPacksAllocatedExtents() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 4);
-    auto pages = pool.acquirePages(5, false);
+    auto pages = pool.acquirePages(5);
     require(pages.granted() && pages.pages.size() == 5,
             "elastic pool did not acquire requested pages");
     require(pages.pages[0] == 0 && pages.pages[3] == 3 &&
@@ -58,7 +58,7 @@ void testGrowthPacksAllocatedExtents() {
             "reclaim did not retain exactly one warm runway");
     auto reclaimed = pool.snapshot();
     require(reclaimed.pagesAllocated == 4 &&
-                reclaimed.reclaimableExtents == 1 &&
+                reclaimed.reclaimableBytes == extentBytes &&
                 storage.releasedExtents == 1,
             "empty extent was not returned exactly");
     require(reclaimed.extentAllocations == 2 && reclaimed.extentReleases == 1,
@@ -73,7 +73,7 @@ void testRunwayIsAllocatedThroughThePool() {
     KvPool pool(storage, 6);
     auto status = pool.snapshot();
     require(status.extentAllocations == 2 && status.pagesAllocated == 8 &&
-                status.reclaimableExtents == 2 && storage.allocated(0) &&
+                status.reclaimableBytes == 2 * extentBytes && storage.allocated(0) &&
                 storage.allocated(1) && !storage.allocated(2),
             "the runway was not the extents of its pages, allocated through the pool");
     require(reclaimEvery(pool, true) == extentBytes, "an empty runway extent was not released");
@@ -101,7 +101,7 @@ void testIdExhaustionIsALogicError() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 8);
     requireThrows<std::logic_error>(
-        [&] { static_cast<void>(pool.acquirePages(9, false)); },
+        [&] { static_cast<void>(pool.acquirePages(9)); },
         "running out of page ids was not a logic error");
 }
 
@@ -114,19 +114,19 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
     storage.growthAllowed = [](uint32_t extent) { return extent != 2; };
     KvPool pool(storage, 0);
     const auto before = pool.snapshot().extentReleases;
-    auto pages = pool.acquirePages(9, false);
+    auto pages = pool.acquirePages(9);
     auto status = pool.snapshot();
     require(!pages.granted() && pages.failure == AllocationFailure::EngineBudget &&
                 storage.allocationAttempts == 3 &&
                 storage.releasedExtents == 0 &&
                 pool.snapshot().extentReleases == before &&
-                status.pagesAllocated == 8 && status.reclaimableExtents == 2 &&
+                status.pagesAllocated == 8 && status.reclaimableBytes == 2 * extentBytes &&
                 status.pagesFree == 8 && status.pagesActive == 0 &&
                 status.pagesPrefix == 0 && status.extentAllocations == 2,
             "a failed acquisition was not denied, held pages or did not "
             "keep its extents");
     storage.growthAllowed = nullptr;
-    pages = pool.acquirePages(9, false);
+    pages = pool.acquirePages(9);
     require(pages.granted() && pool.snapshot().extentAllocations == 3 &&
                 storage.releasedExtents == 0,
             "the retry allocated again the extents it was denied with");
@@ -139,20 +139,19 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
 void testPressureReusesFreePagesAndDeniesGrowth() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 4);
-    auto active = pool.acquirePages(2, false);
+    auto active = pool.acquirePages(2);
     require(active.granted() && active.pages.size() == 2,
             "pressure setup did not acquire active pages");
     storage.growthBlocked = true;
-    auto reused = pool.acquirePages(1, false);
+    auto reused = pool.acquirePages(1);
     require(reused.granted() && reused.pages.size() == 1 &&
                 reused.pages.front() == 2,
             "critical pressure rejected a free page of an allocated extent");
-    auto denied = pool.acquirePages(2, false);
+    auto denied = pool.acquirePages(2);
     require(!denied.granted() && denied.failure == AllocationFailure::EngineBudget,
             "critical pressure admitted a new extent");
-    require(pool.activeReferences(active.pages[0]) == 1 &&
-                pool.activeReferences(active.pages[1]) == 1 &&
-                pool.activeReferences(reused.pages.front()) == 1 &&
+    require(pool.pageActive(active.pages[0]) && pool.pageActive(active.pages[1]) &&
+                pool.pageActive(reused.pages.front()) &&
                 pool.snapshot().pagesActive == 3,
             "critical pressure corrupted existing active references");
     release(pool, reused.pages);
@@ -168,17 +167,17 @@ void testPassReleasesEveryEmptyExtent() {
     constexpr uint32_t extents = 200;
     TestKvStorage storage(4 * extents, 100, 4);
     KvPool pool(storage, 4 * extents);
-    auto pages = pool.acquirePages(4 * extents, false);
+    auto pages = pool.acquirePages(4 * extents);
     require(pages.granted() && pool.snapshot().pagesAllocated == 4 * extents,
             "release setup did not acquire every page");
     release(pool, pages.pages);
-    require(pool.snapshot().reclaimableExtents == extents,
+    require(pool.snapshot().reclaimableBytes == extents * extentBytes,
             "every empty extent was not reclaimable");
     const auto before = pool.snapshot().extentReleases;
     require(reclaimEvery(pool, true) == (extents - 1) * extentBytes &&
                 storage.releasedExtents == extents - 1 &&
                 pool.snapshot().extentReleases == before + extents - 1 &&
-                pool.snapshot().reclaimableExtents == 1,
+                pool.snapshot().reclaimableBytes == extentBytes,
             "a pass did not release every empty extent but the runway");
     require(reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 0 &&
@@ -189,28 +188,28 @@ void testPassReleasesEveryEmptyExtent() {
 void testFullestExtentFillsFirstSoColdExtentsDrain() {
     TestKvStorage storage(12, 100, 4);
     KvPool pool(storage, 12);
-    auto all = pool.acquirePages(12, false);
+    auto all = pool.acquirePages(12);
     require(all.granted() && all.pages.size() == 12,
             "fill setup did not acquire every page");
     // Leave extent 0 with three holes, extent 1 with one and extent 2 with two.
     release(pool, {0, 1, 2, 5, 8, 9});
     require(pool.snapshot().pagesFree == 6 &&
-                pool.snapshot().reclaimableExtents == 0,
+                pool.snapshot().reclaimableBytes == 0,
             "partial release accounting is incorrect");
 
     // New pages come from the fullest extents; the coldest keeps its holes.
-    auto refill = pool.acquirePages(2, false);
+    auto refill = pool.acquirePages(2);
     require(refill.granted() && refill.pages.size() == 2 &&
                 refill.pages[0] == 5 &&
                 (refill.pages[1] == 8 || refill.pages[1] == 9),
             "refill did not take pages from the fullest extents first");
-    auto again = pool.acquirePages(1, false);
+    auto again = pool.acquirePages(1);
     require(again.granted() && again.pages.front() / 4 == 2,
             "allocation did not continue with the fullest extent");
 
     // Its last page going cold empties the extent so it can be released.
     release(pool, {3});
-    require(pool.snapshot().reclaimableExtents == 1 &&
+    require(pool.snapshot().reclaimableBytes == extentBytes &&
                 reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 8 &&
                 storage.releasedExtents == 1,
@@ -227,7 +226,7 @@ void testRefusedReleaseChangesNothing() {
                                     "an extent was released while a command was in flight");
     const auto status = pool.snapshot();
     require(status.pagesAllocated == 8 && status.pagesFree == 8 &&
-                status.reclaimableExtents == 2 && status.extentReleases == 0 &&
+                status.reclaimableBytes == 2 * extentBytes && status.extentReleases == 0 &&
                 storage.allocatedPages() == 8,
             "a refused release changed the pool's record of its extent");
     storage.commandInFlight = nullptr;
@@ -238,7 +237,7 @@ void testRefusedReleaseChangesNothing() {
 void testPrefixAndActiveReferencesHoldTheExtent() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 4);
-    auto active = pool.acquirePages(1, false);
+    auto active = pool.acquirePages(1);
     require(active.granted(), "shared reference setup failed");
     pool.retainPage(active.pages.front(), true);
     pool.releasePage(active.pages.front(), false);
@@ -250,13 +249,33 @@ void testPrefixAndActiveReferencesHoldTheExtent() {
             "last prefix release did not make extent reclaimable");
 }
 
+// The cache owns a page once, for the one block on it: a second claim or a
+// second release is a broken invariant, refused before anything changes.
+void testCacheOwnsAPageOnce() {
+    TestKvStorage storage(4, 100, 4);
+    KvPool pool(storage, 4);
+    auto active = pool.acquirePages(1);
+    require(active.granted(), "ownership setup failed");
+    const uint32_t page = active.pages.front();
+    pool.retainPage(page, true);
+    require(pool.snapshot().pagesPrefix == 1, "the cache did not own the page");
+    requireThrows<std::logic_error>([&] { pool.retainPage(page, true); },
+                                    "the cache owned a page twice");
+    pool.releasePage(page, true);
+    requireThrows<std::logic_error>([&] { pool.releasePage(page, true); },
+                                    "the cache gave up a page it did not own");
+    require(pool.snapshot().pagesPrefix == 0 && pool.pageActive(page),
+            "a refused claim or release changed the page's references");
+    pool.releasePage(page, false);
+}
+
 // The pool with every page allocated and held by a request, less the pages
 // in `released`. Every page starts with content of its own.
 KvPool held(TestKvStorage &storage, const std::vector<uint32_t> &released) {
     for (uint32_t page = 0; page < storage.pageCount(); ++page)
         storage.content[page] = 100 + page;
     KvPool pool(storage, storage.pageCount());
-    auto all = pool.acquirePages(storage.pageCount(), false);
+    auto all = pool.acquirePages(storage.pageCount());
     require(all.granted(), "compaction setup did not acquire every page");
     release(pool, released);
     return pool;
@@ -277,18 +296,18 @@ void testCompactionEmptiesTheExtentWithTheFewestPages() {
     require(storage.copies.size() == 1 && storage.copies[0].from == 3 &&
                 storage.copies[0].to == 7 && storage.content[7] == 103,
             "the moved page's content did not follow it");
-    require(pool.pageFree(3) && pool.activeReferences(7) == 1,
+    require(!pool.pageActive(3) && pool.pageActive(7),
             "the moved page's references did not follow it");
     const auto status = pool.snapshot();
     require(status.pagesActive == 6 && status.pagesPrefix == 1 &&
                 status.pagesFree == 6 && status.pagesAllocated == 12 &&
-                status.reclaimableExtents == 1 && status.extentCompactions == 1 &&
+                status.reclaimableBytes == extentBytes && status.extentCompactions == 1 &&
                 status.pagesMoved == 1,
             "compaction changed what is held or did not empty its extent");
     // Both references release on the page it moved to.
     pool.releasePage(7, true);
     pool.releasePage(7, false);
-    require(pool.pageFree(7) && pool.snapshot().pagesPrefix == 0,
+    require(!pool.pageActive(7) && pool.snapshot().pagesPrefix == 0,
             "a moved reference was not released where it went");
     require(reclaimEvery(pool, false) == extentBytes &&
                 pool.snapshot().pagesAllocated == 8 && storage.releasedExtents == 1,
@@ -317,7 +336,7 @@ void testCompactionNeedsFreePagesInExtentsInUse() {
     // Extent 0 keeps one page, extent 1 none, extent 2 all four.
     KvPool pool = held(storage, {1, 2, 3, 4, 5, 6, 7});
     require(pool.compactExtent({}).empty() && storage.copies.empty() &&
-                pool.snapshot().reclaimableExtents == 1 &&
+                pool.snapshot().reclaimableBytes == extentBytes &&
                 pool.snapshot().extentCompactions == 0,
             "compaction filled an empty extent");
     // Each extent holds more than the other has free.
@@ -338,7 +357,7 @@ void testCompactionLeavesFixedPagesInPlace() {
     const std::vector<uint32_t> fixed{9};
     const auto moves = pool.compactExtent(fixed);
     require(moves.firstPage == 12 && moves.follow(12) == 3 && moves.follow(13) == 7 &&
-                moves.follow(9) == 9 && pool.activeReferences(9) == 1,
+                moves.follow(9) == 9 && pool.pageActive(9),
             "compaction did not pass over the extent with a fixed page");
 }
 
@@ -355,9 +374,9 @@ void testCompactionMovesNothingWhenTheStorageRefuses() {
         threw = true;
     }
     const auto status = pool.snapshot();
-    require(threw && pool.activeReferences(3) == 1 && pool.pageFree(7) &&
+    require(threw && pool.pageActive(3) && !pool.pageActive(7) &&
                 status.pagesActive == 6 && status.pagesFree == 6 &&
-                status.reclaimableExtents == 0 && status.extentCompactions == 0,
+                status.reclaimableBytes == 0 && status.extentCompactions == 0,
             "a refused copy left pages moved");
     storage.commandInFlight = nullptr;
     require(pool.compactExtent({}).follow(3) == 7,
@@ -377,6 +396,7 @@ int main() {
         testFullestExtentFillsFirstSoColdExtentsDrain();
         testRefusedReleaseChangesNothing();
         testPrefixAndActiveReferencesHoldTheExtent();
+        testCacheOwnsAPageOnce();
         testCompactionEmptiesTheExtentWithTheFewestPages();
         testCompactionFillsTheFullestExtentsFirst();
         testCompactionNeedsFreePagesInExtentsInUse();

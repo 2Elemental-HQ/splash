@@ -18,7 +18,6 @@ namespace splash::engine {
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   uint64_t engineInstanceId = 1;
-  uint32_t maskWordsPerToken = 1;
   RuntimeMetrics *metrics = nullptr;
 };
 
@@ -84,6 +83,9 @@ public:
   }
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
+  }
+  [[nodiscard]] double monotonicMilliseconds() const {
+    return clocks_.monotonicMilliseconds();
   }
   [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {

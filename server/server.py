@@ -2363,8 +2363,11 @@ def _parse_allowed_origin(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("target")
-    parser.add_argument("draft")
+    parser.add_argument(
+        "model_root",
+        metavar="MODEL_DIRECTORY",
+        help="installed model directory holding target/ and draft/",
+    )
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
@@ -2480,8 +2483,7 @@ def _native_command(args):
     command = [
         args.binary,
         "serve-native",
-        args.target,
-        args.draft,
+        args.model_root,
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]

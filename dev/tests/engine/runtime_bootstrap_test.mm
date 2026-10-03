@@ -158,45 +158,38 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 }
 
-void testRuntimeCacheNamespaceBindsIdentityOnce() {
-  constexpr kv::Layout kvLayout{16, 4, 256};
-  const std::string combinedA(64, 'a');
-  const std::string combinedB(64, 'b');
-  const std::string targetA(64, 'c');
-  const std::string targetB(64, 'd');
-  const engine::RuntimeCacheIdentity first =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity same =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity modelChanged =
-      engine::makeRuntimeCacheIdentity(combinedB, targetA, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity targetChanged =
-      engine::makeRuntimeCacheIdentity(combinedA, targetB, "build-a",
-                                       kvLayout);
-  const engine::RuntimeCacheIdentity buildChanged =
-      engine::makeRuntimeCacheIdentity(combinedA, targetA, "build-b",
-                                       kvLayout);
-  auto bf16Layout = kvLayout;
-  bf16Layout.format = kv::Format::BFloat16;
-  const auto formatChanged = engine::makeRuntimeCacheIdentity(
-      combinedA, targetA, "build-a", bf16Layout);
-  require(first.cacheNamespace != formatChanged.cacheNamespace &&
-              first.namespaceSha256 != formatChanged.namespaceSha256,
-          "INT8 and BF16 aliased the same prefix-cache namespace");
-  require(first.cacheNamespace == same.cacheNamespace &&
-              first.namespaceSha256 == same.namespaceSha256,
-          "runtime cache namespace is not deterministic");
-  require(first.cacheNamespace != modelChanged.cacheNamespace &&
-              first.cacheNamespace != targetChanged.cacheNamespace &&
-              first.cacheNamespace != buildChanged.cacheNamespace,
-          "runtime cache namespace omitted model, layout, or build identity");
-  require(kv::matchesLayout(first.kvLayout, kvLayout) &&
-              first.kvLayout.modelArtifactSha256 !=
-                  targetChanged.kvLayout.modelArtifactSha256,
-          "runtime Q8 layout guard omitted the target artifact");
+// The identity reports the loaded model's digests in lowercase hex and the
+// KV layout as loaded; a malformed digest or a missing build id fails before
+// anything is served.
+void testRuntimeCacheIdentityReportsTheLoadedModel() {
+  constexpr kv::Layout int8Layout{16, 4, 256};
+  constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
+  const std::string combined(64, 'A');
+  const std::string target(64, 'c');
+  const engine::RuntimeCacheIdentity int8 =
+      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout);
+  require(int8.modelLayoutSha256 == std::string(64, 'a') &&
+              int8.targetModelSha256 == target && int8.buildId == "build" &&
+              int8.kvLayout == int8Layout,
+          "the cache identity did not report the loaded model");
+  const engine::RuntimeCacheIdentity bf16 =
+      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout);
+  require(bf16.kvLayout == bf16Layout && bf16.kvLayout.format != int8.kvLayout.format,
+          "the cache identity did not report the KV format");
+  const auto rejected = [&](std::string_view combinedDigest,
+                            std::string_view targetDigest, std::string_view build) {
+    try {
+      static_cast<void>(engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest,
+                                                         build, int8Layout));
+    } catch (const std::invalid_argument &) {
+      return true;
+    }
+    return false;
+  };
+  require(rejected(std::string(63, 'a'), target, "build") &&
+              rejected(combined, std::string(63, 'c') + 'g', "build") &&
+              rejected(combined, target, ""),
+          "a malformed digest or an empty build id was accepted");
 }
 
 DeviceCapabilities device() {
@@ -215,7 +208,7 @@ DeviceCapabilities device() {
 }
 
 EngineMemoryPlan memoryPlan() {
-  return requireEngineMemoryPlan(
+  return test::requireMemoryPlan(
       device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 
@@ -236,10 +229,7 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
       actual.sharedDecodeBytes + actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  // Model warmup estimates add the pipeline and runtime reserves.
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
-                                    budget.pipelineReserveBytes +
-                                    budget.runtimeOverheadReserveBytes;
+  actual.backendPeakAllocatedBytes = actual.backendAllocatedBytes;
   return actual;
 }
 
@@ -250,10 +240,7 @@ public:
 
 class Executor final : public model::RuntimeModel {
 public:
-  explicit Executor(uint64_t estimatedPeak, int failingStep = -1,
-                    int throwingStep = -1)
-      : estimatedPeak_(estimatedPeak), failingStep_(failingStep),
-        throwingStep_(throwingStep) {}
+  explicit Executor(int throwingStep = -1) : throwingStep_(throwingStep) {}
 
   StateAdmission begin(const ModelRequest &) override {
     return {0, StateFailure::None};
@@ -327,26 +314,21 @@ private:
     if (step == throwingStep_) {
       throw std::runtime_error("injected warmup exception");
     }
-    model::WarmupStepResult result{
-        step != failingStep_, estimatedPeak_, "measured", 0.001, {}};
+    model::WarmupStepResult result{"measured", 0.001, {}};
     if (warmupHook)
       warmupHook(step, result);
     return result;
   }
 
-  uint64_t estimatedPeak_ = 0;
-  int failingStep_ = -1;
   int throwingStep_ = -1;
 };
 
 class Harness final {
 public:
-  Harness(const EngineMemoryPlan &plan, int failingStep = -1,
-          int throwingStep = -1, bool failReadyWrite = false)
+  explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16, 4096, 4), pool_(backing_, 16),
-        resources_(pool_, CacheNamespace{}),
-        executor_(validActual(plan).estimatedWarmupPeakBytes, failingStep,
-                  throwingStep),
+        resources_(pool_),
+        executor_(throwingStep),
         loop_(
             loopConfig(), resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
@@ -380,21 +362,13 @@ private:
 
 void testAllNativeWarmupsPrecedeReady() {
   const EngineMemoryPlan plan = memoryPlan();
-  Harness harness(plan);
+  Harness harness;
   require(!harness.loop().ready() && harness.output().empty(),
           "runtime became visible before warmup");
-  ActualMemoryReport actual = validActual(plan);
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(),
-      [&](uint64_t estimate) {
-        require(estimate == actual.estimatedWarmupPeakBytes,
-                "bootstrap lost the maximum measured peak");
-        actual.estimatedWarmupPeakBytes = estimate;
-        return actual;
-      },
+      plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
-  require(report.stage == RuntimeBootstrapStage::Ready &&
-              report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready() && !harness.output().empty(),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
@@ -407,19 +381,13 @@ void testAllNativeWarmupsPrecedeReady() {
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
   return RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(),
-      [&](uint64_t estimate) {
-        auto actual = validActual(plan);
-        actual.estimatedWarmupPeakBytes = estimate;
-        return actual;
-      },
+      plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
 }
 
 void requireReadyWithoutReducingConcurrency(
     Harness &harness, const RuntimeBootstrapReport &report) {
-  require(report.stage == RuntimeBootstrapStage::Ready &&
-              report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready(),
           "memory-limited warmup did not become ready");
   protocol::FrameParser parser;
@@ -442,10 +410,10 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     const uint64_t ceiling = complete.minimumRequiredBytes +
                             (width - 1) * complete.activeStateCellBytes +
                             complete.activeStateCellBytes / 2;
-    const EngineMemoryPlan plan = requireEngineMemoryPlan(
+    const EngineMemoryPlan plan = test::requireMemoryPlan(
         device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB),
         ceiling);
-    Harness harness(plan);
+    Harness harness;
     const auto report = warmup(harness, plan);
     requireReadyWithoutReducingConcurrency(harness, report);
     std::vector<int> expected{0};
@@ -467,7 +435,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
   const EngineMemoryPlan plan = memoryPlan();
   for (int deniedWidth : {-1, 2, 3, 4}) {
     for (bool denyRestore : {false, true}) {
-      Harness harness(plan);
+      Harness harness;
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
         if (step == deniedWidth || (step == 5 && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
@@ -515,7 +483,7 @@ void testResourceFailureClassificationSurvivesBootstrap() {
         const auto &report = error.report();
         require(report.stage == RuntimeBootstrapStage::ResourceAssembly &&
                     report.resourceFailure == failure &&
-                    report.message == message && report.warmup.error == message &&
+                    report.message == message &&
                     report.memoryPlanJson == "{\"budget\":1}" &&
                     report.budgetDescription == "budget details",
                 "bootstrap lost resource failure classification or diagnostics");
@@ -534,7 +502,7 @@ void testRequiredWarmupPreservesAllocationFailure() {
   for (auto failure : {metal::AllocationFailure::HostPressure,
                        metal::AllocationFailure::EngineBudget,
                        metal::AllocationFailure::DriverRejected}) {
-    Harness harness(plan);
+    Harness harness;
     harness.executor().warmupHook =
         [failure](int step, model::WarmupStepResult &) {
           if (step == 0)
@@ -553,11 +521,11 @@ void testRequiredWarmupPreservesAllocationFailure() {
 
 void testFinalHostPressurePreventsReady() {
   const EngineMemoryPlan plan = memoryPlan();
-  Harness harness(plan);
+  Harness harness;
   try {
     static_cast<void>(RuntimeBootstrap::requireWarmupAndAnnounce(
         plan, harness.executor(),
-        [](uint64_t) -> ActualMemoryReport {
+        []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
         }, harness.loop()));
@@ -569,40 +537,9 @@ void testFinalHostPressurePreventsReady() {
   }
 }
 
-void testEveryWarmupFailureIsFailClosed() {
-  const EngineMemoryPlan plan = memoryPlan();
-  constexpr engine::RuntimeBootstrapStage expected[] = {
-      engine::RuntimeBootstrapStage::MaximumPrefill,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::DecodeWarmup,
-      engine::RuntimeBootstrapStage::CompositeStateRestore,
-  };
-  for (int step = 0; step < 6; ++step) {
-    Harness harness(plan, step);
-    try {
-      static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [&](uint64_t estimate) {
-            auto actual = validActual(plan);
-            actual.estimatedWarmupPeakBytes = estimate;
-            return actual;
-          },
-          harness.loop()));
-      throw std::runtime_error("failed warmup announced ready");
-    } catch (const engine::RuntimeBootstrapError &error) {
-      require(error.report().stage == expected[step] &&
-                  error.report().resourceFailure == RuntimeResourceFailure::Other &&
-                  !harness.loop().ready() && harness.output().empty(),
-              "failed warmup escaped the native bootstrap gate");
-    }
-  }
-}
-
 void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   enum class Failure {
-    Allocation, Backend, General, MissingPeak, ZeroTime, InfiniteTime, NanTime
+    Allocation, Backend, General, ZeroTime, InfiniteTime, NanTime
   };
   constexpr RuntimeBootstrapStage stages[] = {
       RuntimeBootstrapStage::MaximumPrefill,
@@ -615,13 +552,12 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   const EngineMemoryPlan plan = memoryPlan();
   for (int step = 0; step < 6; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
-                            Failure::General, Failure::MissingPeak,
-                            Failure::ZeroTime, Failure::InfiniteTime,
-                            Failure::NanTime}) {
+                            Failure::General, Failure::ZeroTime,
+                            Failure::InfiniteTime, Failure::NanTime}) {
       if (failure == Failure::Allocation &&
           (step == 2 || step == 3 || step == 4 || step == 5))
         continue; // Only these paths may skip a real allocation refusal.
-      Harness harness(plan);
+      Harness harness;
       harness.executor().warmupHook =
           [&](int current, model::WarmupStepResult &result) {
             if (current != step)
@@ -633,9 +569,6 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
               throw metal::MetalBackendError("injected GPU command failure");
             case Failure::General:
               throw std::runtime_error("injected general warmup failure");
-            case Failure::MissingPeak:
-              result.estimatedPeakBytes = 0;
-              break;
             case Failure::ZeroTime:
               result.wallSeconds = 0.0;
               break;
@@ -652,7 +585,9 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         throw std::runtime_error("invalid warmup announced ready");
       } catch (const RuntimeBootstrapError &error) {
         require(error.report().stage == stages[step] &&
-                    !error.report().warmup.ready() && !harness.loop().ready() &&
+                    (failure == Failure::Allocation ||
+                     error.report().resourceFailure == RuntimeResourceFailure::Other) &&
+                    !harness.loop().ready() &&
                     harness.output().empty() &&
                     harness.executor().calls.back() == step,
                 "warmup failure was swallowed as a memory-limited success");
@@ -664,11 +599,11 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
 void testExceptionsMemoryAndReadyWriteAreFailClosed() {
   const EngineMemoryPlan plan = memoryPlan();
   {
-    Harness harness(plan, -1, 3);
+    Harness harness(3);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [](uint64_t) { return ActualMemoryReport{}; }, harness.loop()));
+          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          harness.loop()));
       throw std::runtime_error("warmup exception announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -678,11 +613,11 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     }
   }
   {
-    Harness harness(plan);
+    Harness harness;
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [](uint64_t) { return ActualMemoryReport{}; }, harness.loop()));
+          plan, harness.executor(), [] { return ActualMemoryReport{}; },
+          harness.loop()));
       throw std::runtime_error("invalid memory report announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -692,15 +627,10 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     }
   }
   {
-    Harness harness(plan, -1, -1, true);
+    Harness harness(-1, true);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(),
-          [&](uint64_t estimate) {
-            auto actual = validActual(plan);
-            actual.estimatedWarmupPeakBytes = estimate;
-            return actual;
-          },
+          plan, harness.executor(), [&] { return validActual(plan); },
           harness.loop()));
       throw std::runtime_error("failed Ready write left runtime ready");
     } catch (const engine::RuntimeBootstrapError &error) {
@@ -764,24 +694,37 @@ void testMemoryMayNotHoldBeyondHostHeadroom() {
           "the disk tier suggestion does not follow the host's headroom");
 }
 
+// The parser's limits follow the model: prompts and outputs up to the served
+// context, the engine's step and draft query rows, and a mask row of the
+// vocabulary for each draft query and the anchor.
+void testProtocolLimitsFollowTheModel() {
+  model::ModelCapabilities capabilities;
+  capabilities.vocabularySize = 248320;
+  const protocol::ProtocolLimits limits = protocolLimitsFor(capabilities, 4096);
+  require(limits.maxMaskWords == 7760 * 9 && limits.maxSimulationTokens == 8 &&
+              limits.maxTokenBatch == 9 && limits.maxPromptTokens == 4096 &&
+              limits.maxLogicalOutputTokens == 4096,
+          "the protocol limits do not follow the model and the served context");
+}
+
 } // namespace
 
 int main() {
   try {
     testWarmupLaneComparisons();
     testInstalledManifestBindsExecutionGeometry();
-    testRuntimeCacheNamespaceBindsIdentityOnce();
+    testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
     testOptionalAllocationFailuresAreMemoryLimited();
     testResourceFailureClassificationSurvivesBootstrap();
     testRequiredWarmupPreservesAllocationFailure();
     testFinalHostPressurePreventsReady();
-    testEveryWarmupFailureIsFailClosed();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
     testMemoryMayNotHoldBeyondHostHeadroom();
+    testProtocolLimitsFollowTheModel();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

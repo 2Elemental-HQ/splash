@@ -539,8 +539,7 @@ def main_args(**overrides):
     """Parsed command-line arguments for main() tests."""
     return SimpleNamespace(
         **{
-            "target": "target",
-            "draft": "draft",
+            "model_root": "model",
             "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
@@ -1153,7 +1152,6 @@ class ServerTest(unittest.TestCase):
                         },
                     },
                     "kv": {
-                        "blocks": 6,
                         "pages_allocated": 8,
                         "pages_active": 4,
                         "pages_cache": 4,
@@ -1170,8 +1168,6 @@ class ServerTest(unittest.TestCase):
                         "in_use_evictions": 3,
                         "bytes": 4096,
                         "active_cells": 2,
-                        "hits": 7,
-                        "misses": 4,
                         "publications": 3,
                         "evictions": 1,
                     },
@@ -1251,7 +1247,6 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_in_use 1", metrics)
         self.assertIn("splash_state_in_use_evictions_total 3", metrics)
-        self.assertIn("splash_state_hits_total 7", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
         self.assertIn("splash_cache_cold_misses_total 4", metrics)
         self.assertIn("splash_cache_reused_tokens_total 1024", metrics)
@@ -3475,8 +3470,7 @@ class ServerTest(unittest.TestCase):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
         required = [
-            str(package / "target"),
-            str(package / "draft"),
+            str(package),
             "--tokenizer",
             str(package / "tokenizer"),
             "--model",
@@ -3497,8 +3491,7 @@ class ServerTest(unittest.TestCase):
             ):
                 api.parse_args(arguments)
         args = api.parse_args(required)
-        self.assertEqual(Path(args.target), package / "target")
-        self.assertEqual(Path(args.draft), package / "draft")
+        self.assertEqual(Path(args.model_root), package)
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
@@ -3697,8 +3690,7 @@ class ServerTest(unittest.TestCase):
             [
                 "splash",
                 "serve-native",
-                "target",
-                "draft",
+                "model",
                 "auto",
                 "auto",
             ],

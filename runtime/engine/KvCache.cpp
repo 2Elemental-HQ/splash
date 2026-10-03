@@ -14,6 +14,16 @@ uint64_t mix(uint64_t hash, uint64_t value) noexcept {
   return hash;
 }
 
+uint64_t indexHash(uint64_t parentHash, std::span<const uint32_t> tokens,
+                   ImageIdentity images) noexcept {
+  uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentHash);
+  for (uint32_t token : tokens)
+    hash = mix(hash, token);
+  hash = mix(hash, images.lo);
+  hash = mix(hash, images.hi);
+  return hash;
+}
+
 } // namespace
 
 ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
@@ -41,16 +51,6 @@ ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
   return identity;
 }
 
-bool exactKvBlockKeyMatch(const KvBlockKeyView &stored,
-                          const KvBlockKeyView &query) noexcept {
-  return stored.indexHash == query.indexHash &&
-         stored.parentBlock == query.parentBlock &&
-         stored.images == query.images &&
-         stored.tokens.size() == query.tokens.size() &&
-         std::equal(stored.tokens.begin(), stored.tokens.end(),
-                    query.tokens.begin());
-}
-
 KvCache::~KvCache() noexcept {
   for (const auto &[_, entry] : blocks_) {
     if (entry.page == noPage)
@@ -63,19 +63,6 @@ KvCache::~KvCache() noexcept {
   }
 }
 
-uint64_t KvCache::indexHash(uint64_t parentHash,
-                            std::span<const uint32_t> tokens,
-                            ImageIdentity images) const noexcept {
-  uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentHash);
-  for (uint8_t byte : cacheNamespace_.digest)
-    hash = mix(hash, byte);
-  for (uint32_t token : tokens)
-    hash = mix(hash, token);
-  hash = mix(hash, images.lo);
-  hash = mix(hash, images.hi);
-  return hash;
-}
-
 std::optional<KvCache::BlockMatch>
 KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
               ImageIdentity images) const {
@@ -85,23 +72,22 @@ KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
   if (parentBlock && !blocks_.contains(parentBlock))
     return std::nullopt;
   const uint64_t hash = indexHash(parentBlock ? block(parentBlock).indexHash : 0, tokens, images);
-  const KvBlockKeyView query{parentBlock, hash, tokens, images};
   const auto [first, last] = index_.equal_range(hash);
   for (auto candidate = first; candidate != last; ++candidate) {
     const Block &entry = block(candidate->second);
-    const KvBlockKeyView stored{entry.parent, entry.indexHash, entry.tokens,
-                                entry.images};
-    if (!entry.poisoned && exactKvBlockKeyMatch(stored, query)) {
+    // Hashes filter candidates; equality requires the complete key.
+    if (!entry.poisoned && entry.parent == parentBlock && entry.images == images &&
+        std::equal(entry.tokens.begin(), entry.tokens.end(), tokens.begin())) {
       return BlockMatch{entry.id, entry.page};
     }
   }
   return std::nullopt;
 }
 
-KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
-                                      std::span<const uint32_t> tokens,
-                                      uint32_t physicalPage,
-                                      ImageIdentity images) {
+KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
+                                    std::span<const uint32_t> tokens,
+                                    uint32_t physicalPage,
+                                    ImageIdentity images) {
   if (tokens.size() != pageTokens) {
     throw std::invalid_argument("KV cache block must contain one full page");
   }
@@ -109,9 +95,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
     throw std::out_of_range("KV cache physical page is out of range");
   }
   if (auto existing = find(parentBlock, tokens, images)) {
-    InsertResult result;
-    result.id = existing->id;
-    result.physicalPage = existing->physicalPage;
+    BlockMatch result{existing->id, existing->physicalPage};
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
       result.physicalPage = physicalPage;
@@ -145,8 +129,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   entry.images = images;
   entry.page = physicalPage;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
-  entry.ramNode = RecencyOrder::allocate(entry.id);
-  entry.diskNode = RecencyOrder::allocate(entry.id);
+  entry.ramNode = RecencyOrder::allocate();
+  entry.diskNode = RecencyOrder::allocate();
 
   pool_.retainPage(physicalPage, true);
   auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
@@ -154,7 +138,6 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
     throw std::logic_error("duplicate KV cache block id");
   index_.emplace(position->second.indexHash, position->first);
   const uint64_t id = nextBlockId_++;
-  ++residentBlocks_;
   blockOnPage_[physicalPage] = id;
   Block &placed = block(id);
   if (parentBlock) {
@@ -170,11 +153,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   placed.lastUsed = recency_.next();
   reindex(placed);
   ++generation_;
-  InsertResult result;
-  result.id = id;
-  result.physicalPage = physicalPage;
-  result.inserted = true;
-  return result;
+  return {id, physicalPage};
 }
 
 void KvCache::retainActive(uint64_t blockId) {
@@ -295,7 +274,7 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
       const Block &entry = block(blockId);
       if (entry.page != noPage) {
         // The request holding this page holds every page above it too.
-        if (pool_.activeReferences(entry.page))
+        if (pool_.pageActive(entry.page))
           break;
         if (!entry.transferring)
           ++pages;
@@ -311,10 +290,6 @@ bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
          !entry.transferring && !entry.poisoned;
-}
-
-bool KvCache::transferring(uint64_t blockId) const {
-  return block(blockId).transferring;
 }
 
 void KvCache::setTransferring(uint64_t blockId, bool transferring) {
@@ -375,7 +350,6 @@ void KvCache::dropPage(uint64_t blockId) {
   const uint32_t page = entry.page;
   entry.page = noPage;
   blockOnPage_[page] = 0;
-  --residentBlocks_;
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -408,7 +382,6 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
   pool_.retainPage(page, true);
   entry.page = page;
   blockOnPage_[page] = blockId;
-  ++residentBlocks_;
   reindex(entry);
   if (entry.parent) {
     Block &parent = block(entry.parent);
@@ -464,7 +437,7 @@ std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {
 }
 
 void KvCache::erase(uint64_t blockId) {
-  const Block &candidate = block(blockId);
+  Block &candidate = block(blockId);
   if (candidate.children || candidate.activeUsers || candidate.transferring) {
     throw std::logic_error("cannot evict a referenced KV cache block");
   }
@@ -480,14 +453,13 @@ void KvCache::erase(uint64_t blockId) {
       first, last, [&](const auto &value) { return value.second == blockId; });
   if (indexed == last)
     throw std::logic_error("KV cache index is incomplete");
-  unlink(block(blockId));
+  RecencyOrder::unlink(candidate.ramNode);
+  RecencyOrder::unlink(candidate.diskNode);
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
-  if (page != noPage) {
+  if (page != noPage)
     blockOnPage_[page] = 0;
-    --residentBlocks_;
-  }
   if (disk)
     --diskBlocks_;
   if (parentId) {
@@ -505,15 +477,6 @@ void KvCache::erase(uint64_t blockId) {
   }
   if (page != noPage)
     pool_.releasePage(page, true);
-}
-
-KvCache::Snapshot KvCache::snapshot() const noexcept {
-  const uint64_t count = residentBlocks_;
-  const uint64_t bytes =
-      count > std::numeric_limits<uint64_t>::max() / pool_.bytesPerPage()
-          ? std::numeric_limits<uint64_t>::max()
-          : count * pool_.bytesPerPage();
-  return {residentBlocks_, bytes, diskBlocks_};
 }
 
 KvCache::Block &KvCache::block(uint64_t blockId) {
@@ -534,7 +497,8 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 // copies of resident blocks, or disk-only blocks without children. A block a
 // request uses, one in transfer, or a poisoned one is in no order.
 void KvCache::reindex(Block &entry) noexcept {
-  unlink(entry);
+  RecencyOrder::unlink(entry.ramNode);
+  RecencyOrder::unlink(entry.diskNode);
   if (entry.activeUsers || entry.transferring || entry.poisoned)
     return;
   const bool resident = entry.page != noPage;
@@ -544,13 +508,6 @@ void KvCache::reindex(Block &entry) noexcept {
     duplicates_.link(entry.diskNode, entry.lastUsed, entry.id);
   else if (entry.slot && !entry.children)
     diskLeaves_.link(entry.diskNode, entry.lastUsed, entry.id);
-}
-
-void KvCache::unlink(Block &entry) noexcept {
-  if (entry.ramNode.linked())
-    RecencyOrder::unlink(entry.ramNode);
-  if (entry.diskNode.linked())
-    RecencyOrder::unlink(entry.diskNode);
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {

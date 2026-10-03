@@ -27,12 +27,6 @@ void requireThrows(Function &&function, const char *message) {
   throw std::runtime_error(message);
 }
 
-CacheNamespace cacheNamespace(uint8_t salt = 0x5a) {
-  CacheNamespace result;
-  result.digest.fill(salt);
-  return result;
-}
-
 std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
   std::array<uint32_t, KvCache::pageTokens> result{};
   result.fill(token);
@@ -43,8 +37,8 @@ void testImageIdentityKeysBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(2, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(2);
   require(acquired.granted() && acquired.pages.size() == 2,
           "test pages were not acquired");
 
@@ -77,7 +71,6 @@ void testImageIdentityKeysBlocks() {
 
   const auto tokens = page(248056);
   auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);
-  require(redBlock.inserted, "image block was not inserted");
   require(!cache.find(0, tokens), "text-only lookup matched an image block");
   require(!cache.find(0, tokens, blueIdentity),
           "a different image matched a token-identical block");
@@ -85,7 +78,7 @@ void testImageIdentityKeysBlocks() {
   require(found && found->id == redBlock.id,
           "identical image content did not match its block");
   auto blueBlock = cache.insert(0, tokens, acquired.pages[1], blueIdentity);
-  require(blueBlock.inserted && blueBlock.id != redBlock.id,
+  require(blueBlock.id != redBlock.id,
           "token-identical blocks with different images were merged");
   for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
   std::cout << "KV image identity ok\n";
@@ -95,8 +88,8 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(4, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(4);
   require(acquired.granted() && acquired.pages.size() == 4,
           "test pages were not acquired");
 
@@ -108,9 +101,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   auto left = cache.insert(root.id, leftTokens, acquired.pages[1]);
   auto right = cache.insert(root.id, rightTokens, acquired.pages[2]);
   auto other = cache.insert(0, otherTokens, acquired.pages[3]);
-  require(root.inserted && left.inserted && right.inserted && other.inserted &&
-              cache.snapshot().blocks == 4 &&
-              cache.snapshot().bytes == 400,
+  require(pool.snapshot().pagesPrefix == 4,
           "page cache did not retain four physical blocks");
 
   for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
@@ -133,9 +124,9 @@ void testExactChainedBlocksAndPhysicalOwnership() {
           "page cache did not reconstruct the exact parent chain");
 
   auto duplicate = cache.insert(root.id, leftTokens, acquired.pages[1]);
-  require(!duplicate.inserted && duplicate.id == left.id &&
+  require(duplicate.id == left.id &&
               duplicate.physicalPage == acquired.pages[1] &&
-              cache.snapshot().blocks == 4,
+              pool.snapshot().pagesPrefix == 4,
           "exact duplicate created a second KV block");
 
   requireThrows<std::logic_error>([&] { cache.erase(root.id); },
@@ -162,9 +153,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
   cache.erase(left.id);
   cache.erase(root.id);
   cache.erase(other.id);
-  require(cache.snapshot().blocks == 0 &&
-              pool.snapshot().pagesPrefix == 0 &&
-              pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "page cache erase leaked physical references");
 }
 
@@ -172,8 +161,8 @@ void testErasedLeafParentInheritsRecency() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(4, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(4);
   require(acquired.granted() && acquired.pages.size() == 4,
           "test pages were not acquired");
 
@@ -203,7 +192,7 @@ void testErasedLeafParentInheritsRecency() {
               !cache.evictionCandidate(b0.id),
           "last exposed parent was not the sole candidate");
   cache.erase(b0.id);
-  require(cache.snapshot().blocks == 0 &&
+  require(pool.snapshot().pagesPrefix == 0 &&
               pool.freePageCount() == pool.pageCount(),
           "recency test leaked physical references");
 }
@@ -212,8 +201,8 @@ void testInputValidation() {
   test::TestKvStorage storage(2, 100, 1);
   KvPool pool(storage, 2);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(1, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(1);
   require(acquired.granted(), "validation page was not acquired");
   const std::array<uint32_t, 1> shortTokens{1};
   requireThrows<std::invalid_argument>(
@@ -236,8 +225,8 @@ void testCandidateOrderThroughChurn() {
   test::TestKvStorage storage(count, 100, 1);
   KvPool pool(storage, count);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(count, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(count);
   require(acquired.granted(), "churn test pages were not acquired");
   struct Reference {
     uint64_t parent = 0;
@@ -314,7 +303,7 @@ void testCandidateOrderThroughChurn() {
       cache.releaseActive(id);
   }
   while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == count,
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == count,
           "candidate churn leaked a block or physical reference");
 }
 
@@ -326,7 +315,7 @@ void testSubtreeThroughChurn() {
   test::TestKvStorage storage(steps, 100, 1);
   KvPool pool(storage, steps);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
+  KvCache cache(pool, recency);
   struct Reference {
     uint64_t parent = 0;
     bool live = false;
@@ -346,7 +335,7 @@ void testSubtreeThroughChurn() {
       const uint64_t parent = live ? pick : 0;
       const auto result =
           cache.insert(parent, page(step + 1), static_cast<uint32_t>(inserted));
-      require(result.inserted && result.id == ++inserted, "unexpected test block identity");
+      require(result.id == ++inserted, "unexpected test block identity");
       blocks[result.id] = {parent, true};
       break;
     }
@@ -394,21 +383,8 @@ void testSubtreeThroughChurn() {
   for (uint64_t id = 1; id <= inserted; ++id)
     if (blocks[id].live && blocks[id].used) cache.releaseActive(id);
   while (auto candidate = cache.evictionCandidate()) cache.erase(candidate->id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "subtree churn leaked a block or a page reference");
-}
-
-void testHashCollisionStillRequiresExactTokens() {
-  const auto left = page(7);
-  auto right = left;
-  right.back() = 8;
-  constexpr uint64_t forcedCollision = 0x12345678;
-  const KvBlockKeyView stored{11, forcedCollision, left, {}};
-  const KvBlockKeyView colliding{11, forcedCollision, right, {}};
-  const KvBlockKeyView exact{11, forcedCollision, left, {}};
-  require(!exactKvBlockKeyMatch(stored, colliding) &&
-              exactKvBlockKeyMatch(stored, exact),
-          "KV block matching trusted a colliding index hash");
 }
 
 struct FakeSlot final : engine::KvDiskSlot {};
@@ -419,8 +395,8 @@ void testDiskTierTransitions() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(4, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(4);
   require(acquired.granted(), "test pages were not acquired");
   const auto rootTokens = page(21);
   const auto leafTokens = page(22);
@@ -439,10 +415,10 @@ void testDiskTierTransitions() {
   require(cache.diskCandidate(true).value().id == leaf.id &&
               !cache.diskCandidate(false) &&
               cache.evictionCandidate().value().id == leaf.id &&
-              cache.snapshot().blocks == 2 && cache.snapshot().diskBlocks == 1,
+              pool.snapshot().pagesPrefix == 2 && cache.diskBlocks() == 1,
           "a resident block with a disk copy is not a duplicate");
   cache.setSlot(leaf.id, nullptr);
-  require(!cache.diskCandidate(true) && cache.snapshot().diskBlocks == 0,
+  require(!cache.diskCandidate(true) && cache.diskBlocks() == 0,
           "a resident block could not drop its copy");
   cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
 
@@ -450,9 +426,10 @@ void testDiskTierTransitions() {
   // now, no newer than the child was.
   cache.touch(leaf.id);
   const uint64_t leafUsed = cache.evictionCandidate().value().lastUsed;
+  const uint32_t freePages = pool.freePageCount();
   cache.dropPage(leaf.id);
-  require(pool.pageFree(acquired.pages[1]) && cache.snapshot().blocks == 1 &&
-              cache.snapshot().diskBlocks == 1 && cache.page(leaf.id) == KvCache::noPage,
+  require(pool.freePageCount() == freePages + 1 && pool.snapshot().pagesPrefix == 1 &&
+              cache.diskBlocks() == 1 && cache.page(leaf.id) == KvCache::noPage,
           "dropped page did not return to the pool");
   require(cache.evictionCandidate().value().id == root.id &&
               cache.evictionCandidate().value().lastUsed == leafUsed &&
@@ -476,20 +453,22 @@ void testDiskTierTransitions() {
   cache.releaseActive(leaf.id);
   require(cache.diskCandidate(false).value().id == leaf.id, "released disk block left the order");
   cache.setTransferring(leaf.id, true);
-  require(!cache.diskCandidate(false) && cache.transferring(leaf.id),
-          "a block in transfer stayed replaceable");
+  require(!cache.diskCandidate(false), "a block in transfer stayed replaceable");
+  requireThrows<std::logic_error>([&] { cache.setTransferring(leaf.id, true); },
+                                  "a block in transfer was not marked as such");
   requireThrows<std::logic_error>([&] { cache.erase(leaf.id); },
                                   "a block in transfer was erased");
 
   // Adopting a page makes the block resident again while its content is on
   // the way; a writer that recomputes it meanwhile keeps its own page.
   cache.adoptPage(leaf.id, acquired.pages[2]);
+  const uint32_t adoptedFreePages = pool.freePageCount();
   pool.releasePage(acquired.pages[2], false);
   require(cache.page(leaf.id) == acquired.pages[2] && !cache.evictionCandidate() &&
-              cache.snapshot().blocks == 2 && !pool.pageFree(acquired.pages[2]),
+              pool.snapshot().pagesPrefix == 2 && pool.freePageCount() == adoptedFreePages,
           "adopted page was not retained by the block");
   auto writer = cache.insert(root.id, leafTokens, acquired.pages[3]);
-  require(!writer.inserted && writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
+  require(writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
           "a writer was switched to a page still being filled");
   pool.releasePage(acquired.pages[3], false);
   cache.setTransferring(leaf.id, false);
@@ -501,7 +480,7 @@ void testDiskTierTransitions() {
 
   cache.erase(leaf.id);
   cache.erase(root.id);
-  require(cache.snapshot().blocks == 0 && cache.snapshot().diskBlocks == 0 &&
+  require(pool.snapshot().pagesPrefix == 0 && cache.diskBlocks() == 0 &&
               pool.freePageCount() == pool.pageCount(),
           "erasing both tiers leaked a page or a copy");
 }
@@ -513,8 +492,8 @@ void testDiskOnlyAdoptionAndPoison() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(4, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(4);
   require(acquired.granted(), "test pages were not acquired");
   const auto rootTokens = page(31);
   const auto leafTokens = page(32);
@@ -526,13 +505,14 @@ void testDiskOnlyAdoptionAndPoison() {
   cache.dropPage(leaf.id);
 
   auto adopted = cache.insert(root.id, leafTokens, acquired.pages[2]);
-  require(!adopted.inserted && adopted.id == leaf.id &&
+  require(adopted.id == leaf.id &&
               adopted.physicalPage == acquired.pages[2] &&
               cache.page(leaf.id) == acquired.pages[2] &&
               cache.diskCandidate(true).value().id == leaf.id,
           "a disk-only block did not adopt the writer's page");
+  const uint32_t freePages = pool.freePageCount();
   pool.releasePage(acquired.pages[2], false);
-  require(!pool.pageFree(acquired.pages[2]), "adopted page was not retained");
+  require(pool.freePageCount() == freePages, "adopted page was not retained");
 
   // A restore that fails: the block is unmatchable at once, keeps nothing
   // on disk, and a fresh publication of the same content stands beside it.
@@ -543,24 +523,24 @@ void testDiskOnlyAdoptionAndPoison() {
   cache.setTransferring(leaf.id, false);
   cache.poison(leaf.id);
   require(!cache.find(root.id, leafTokens) && cache.contains(leaf.id) &&
-              cache.snapshot().diskBlocks == 0 && !cache.evictionCandidate() &&
+              cache.diskBlocks() == 0 && !cache.evictionCandidate() &&
               !cache.diskCandidate(true) && !cache.diskCandidate(false),
           "poisoned block still matched or waited in an order");
   auto fresh = cache.insert(root.id, leafTokens, acquired.pages[3]);
   pool.releasePage(acquired.pages[3], false);
-  require(fresh.inserted && fresh.id != leaf.id &&
+  require(fresh.id != leaf.id &&
               cache.find(root.id, leafTokens).value().id == fresh.id,
           "poisoned block blocked republication of its content");
   cache.releaseActive(leaf.id);
-  require(!cache.contains(leaf.id) && pool.pageFree(acquired.pages[2]) &&
-              cache.snapshot().blocks == 2,
+  require(!cache.contains(leaf.id) && pool.freePageCount() == freePages + 1 &&
+              pool.snapshot().pagesPrefix == 2,
           "poisoned block outlived its last user");
 
   cache.poison(root.id);
   require(cache.contains(root.id) && !cache.find(0, rootTokens),
           "a poisoned parent left before its child");
   cache.erase(fresh.id);
-  require(cache.snapshot().blocks == 0 && pool.freePageCount() == pool.pageCount(),
+  require(pool.snapshot().pagesPrefix == 0 && pool.freePageCount() == pool.pageCount(),
           "a poisoned parent outlived its subtree");
 }
 
@@ -571,8 +551,8 @@ void testMatchableExcludesPoisonedBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
   CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(2, false);
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(2);
   require(acquired.granted(), "test pages were not acquired");
   auto root = cache.insert(0, page(41), acquired.pages[0]);
   auto leaf = cache.insert(root.id, page(42), acquired.pages[1]);
@@ -600,7 +580,6 @@ int main() {
     testInputValidation();
     testCandidateOrderThroughChurn();
     testSubtreeThroughChurn();
-    testHashCollisionStillRequiresExactTokens();
     testDiskTierTransitions();
     testDiskOnlyAdoptionAndPoison();
     testMatchableExcludesPoisonedBlocks();

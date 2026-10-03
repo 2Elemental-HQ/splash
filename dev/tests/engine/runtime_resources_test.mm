@@ -86,11 +86,11 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // cell and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config,
                       const TemporaryModelRoot &root) {
-  const kv::Layout kvLayout = config.model.targetKvLayout;
-  return root.packageBytes + model::kPipelineReserveBytes +
-         model::kRuntimeOverheadReserveBytes +
-         config.model.stateLayout.activeCellBytes() +
-         kvRunwayPages(kvLayout.minimumExtentPages()) * kvLayout.bytesPerModelPage();
+  return minimumRequiredBytes(root.packageBytes + model::kPipelineReserveBytes +
+                                  model::kRuntimeOverheadReserveBytes,
+                              config.model.stateLayout.activeCellBytes(),
+                              config.model.targetKvLayout)
+      .value();
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
@@ -294,16 +294,17 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
   connectToGovernor(config, governor);
   require(config.growthPaused && config.serving && !config.growthPaused(),
           "the engine was not connected to the governor");
+  const auto admits = [admit = governor.allocationAdmission()] {
+    return static_cast<bool>(admit(1024, [] {}));
+  };
   // Inside the warning margin the host pauses growth that no request in
   // service needs.
   available = hostReserve + kGiB / 2;
-  require(config.growthPaused() && !governor.tryReserve(1024).has_value(),
-          "the engine did not see the host's pause");
+  require(config.growthPaused() && !admits(), "the engine did not see the host's pause");
   config.serving(true);
-  require(governor.tryReserve(1024).has_value(),
-          "the serving mark did not reach the governor");
+  require(admits(), "the serving mark did not reach the governor");
   config.serving(false);
-  require(!governor.tryReserve(1024).has_value(), "the serving mark was not cleared");
+  require(!admits(), "the serving mark was not cleared");
 }
 
 } // namespace

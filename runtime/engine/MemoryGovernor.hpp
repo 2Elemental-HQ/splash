@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <optional>
 
 namespace splash::engine {
@@ -86,24 +85,23 @@ struct MemoryGovernorSnapshot {
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   // Whether the host has room for growth that no request in service needs.
-  // tryReserve still grants what such a request needs while this is false,
-  // short of critical pressure. Allocation need not ask: tryReserve names
+  // Admission still grants what such a request needs while this is false,
+  // short of critical pressure. Allocation need not ask: admission names
   // the host as the cause of every refusal the host shares.
   bool hostGrowthAllowed = true;
 };
 
+// Critical pressure evicts every unpinned entry and takes what a request
+// starts from, one lane's pooled state buffers and the empty KV runway
+// extent, so it has no target. Every other pass keeps those, since growth is
+// paused; targetBytes zero returns only empty extents. keepResumePoint keeps
+// the newest state publication (else the newest checkpoint), the point a
+// follow-up request resumes from; only a shrink nothing waits for can afford
+// to.
 struct MemoryReclaimDirective {
-  bool reclaim = false;
-  bool evictAllUnpinnedPrefixes = false;
+  bool critical = false;
   uint64_t targetBytes = 0;
-  // Keep the newest ordinary state publication (else the newest checkpoint),
-  // the point a follow-up request resumes from. Only a shrink that nothing is
-  // waiting for can afford to.
   bool keepResumePoint = false;
-  // Keep what a request starts from without growing: one lane's pooled state
-  // buffers and one empty KV extent, so the next request starts without
-  // allocating while the host is short. Only critical pressure takes them.
-  bool keepServingFootprint = false;
 };
 
 // What a reclaim pass made of its directive's target.
@@ -128,9 +126,10 @@ struct MemoryReclaimResult {
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
-  // requestWaiting reports whether a request cannot proceed for want of
-  // memory. Without one the pass is speculative and keeps the resume point.
-  [[nodiscard]] MemoryReclaimDirective
+  // The pass to run now; none under normal pressure. requestWaiting reports
+  // whether a request cannot proceed for want of memory. Without one the
+  // pass is speculative and keeps the resume point.
+  [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
   // What the pass of `directive` achieved. The passes up to the next
@@ -147,33 +146,13 @@ private:
 // The sole memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
 // is about to allocate Metal memory. That keeps policy out of MetalBackend
-// and makes every growth operation transactional.
+// and makes every growth operation transactional. Single-threaded: startup,
+// the engine and the control pass all run on the native loop thread; nothing
+// here is synchronized.
 class MemoryGovernor final {
 public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
-
-  class Reservation final {
-  public:
-    Reservation() = default;
-    ~Reservation();
-    Reservation(const Reservation &) = delete;
-    Reservation &operator=(const Reservation &) = delete;
-    Reservation(Reservation &&) noexcept;
-    Reservation &operator=(Reservation &&) noexcept;
-
-    [[nodiscard]] explicit operator bool() const noexcept;
-    void commit();
-
-  private:
-    Reservation(MemoryGovernor *owner, uint64_t bytes);
-    void release() noexcept;
-
-    MemoryGovernor *owner_ = nullptr;
-    uint64_t bytes_ = 0;
-
-    friend class MemoryGovernor;
-  };
 
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes);
@@ -185,17 +164,15 @@ public:
                  HostAvailableMemoryProvider hostAvailableMemory,
                  uint64_t untrackedReserveBytes = 0);
 
-  // Reserves bytes under the limit and the host's headroom, or refuses them
-  // with the cause: HostPressure when the host refuses, whether or not the
-  // limit does too, and EngineBudget when only the limit does. The host
-  // refuses under critical pressure and, unless a request in service needs
-  // the bytes (setServing), inside the warning margin or while it holds for
-  // the recovery margin.
-  [[nodiscard]] std::optional<Reservation> tryReserve(
-      uint64_t bytes, metal::AllocationFailure *failure = nullptr);
-  // Low-level storage/model components receive only this transactional
-  // callback, so allocation stays governed without introducing a
-  // reverse dependency on engine policy.
+  // The only way to reserve memory. Low-level storage/model components
+  // receive only this transactional callback, so allocation stays governed
+  // without introducing a reverse dependency on engine policy. It reserves
+  // the bytes under the limit and the host's headroom while the allocation
+  // runs, or refuses them with the cause: HostPressure when the host refuses,
+  // whether or not the limit does too, and EngineBudget when only the limit
+  // does. The host refuses under critical pressure and, unless a request in
+  // service needs the bytes (setServing), inside the warning margin or while
+  // it holds for the recovery margin.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared. The host's margins do not refuse those: holding
@@ -214,6 +191,30 @@ public:
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
+  // Held while an admitted allocation runs; released when it ends.
+  class Reservation final {
+  public:
+    ~Reservation();
+    Reservation(const Reservation &) = delete;
+    Reservation &operator=(const Reservation &) = delete;
+    Reservation(Reservation &&) noexcept;
+
+    void commit();
+
+  private:
+    Reservation(MemoryGovernor *owner, uint64_t bytes);
+    void release() noexcept;
+
+    MemoryGovernor *owner_ = nullptr;
+    uint64_t bytes_ = 0;
+
+    friend class MemoryGovernor;
+  };
+
+  // allocationAdmission's reservation, or nothing with the cause of the
+  // refusal in failure.
+  [[nodiscard]] std::optional<Reservation>
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
   chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;
@@ -234,7 +235,6 @@ private:
   uint64_t hostReserveBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
   uint64_t untrackedReserveBytes_ = 0;
-  mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
   uint64_t deniedReservations_ = 0;

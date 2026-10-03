@@ -964,10 +964,7 @@ class LauncherTests(unittest.TestCase):
             )
             root.assert_called_once_with(chosen.models_root, MODEL_ID, **options)
             argv = execute.call_args.args[1]
-            self.assertEqual(
-                argv[3:5],
-                [str(runtime / "selected/target"), str(runtime / "selected/draft")],
-            )
+            self.assertEqual(argv[3], str(runtime / "selected"))
 
             with (
                 mock.patch.object(
@@ -1023,7 +1020,7 @@ class LauncherTests(unittest.TestCase):
                 mock.patch.object(launcher.os, "execve", side_effect=execute),
             ):
                 launcher.main(["serve", "--model", MODEL_ID])
-            self.assertEqual(held, [str(assembly.resolve() / "target")])
+            self.assertEqual(held, [str(assembly.resolve())])
 
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.
@@ -1106,7 +1103,7 @@ class LauncherTests(unittest.TestCase):
     def test_programs_take_a_stop_held_from_their_start(self):
         home = self.enterContext(tempfile.TemporaryDirectory())
         # Unstopped, each would go on to fail at its first step.
-        server = ["server/server.py", "target", "draft", "--tokenizer", "tokenizer"]
+        server = ["server/server.py", "model", "--tokenizer", "tokenizer"]
         server += ["--model", MODEL_ID, "--port", "0"]
         installer = ["install/models.py", "--models", home, "--model", MODEL_ID]
         installer.append("prepare")

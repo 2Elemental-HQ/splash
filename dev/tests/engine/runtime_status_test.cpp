@@ -36,7 +36,7 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  return requireEngineMemoryPlan(
+  return test::requireMemoryPlan(
       device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 
@@ -57,10 +57,7 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
       actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  // Model warmup estimates add the pipeline and runtime reserves.
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
-                                    b.pipelineReserveBytes +
-                                    b.runtimeOverheadReserveBytes;
+  actual.backendPeakAllocatedBytes = actual.backendAllocatedBytes;
   return auditActualMemory(memoryPlan, actual);
 }
 
@@ -90,10 +87,9 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
-  engine.resources.pool = {128, 72, 24, 32, 1, 128 * 4096ULL,
+  engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
                            32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
   engine.resources.extentCompactMaxMilliseconds = 1.25;
-  engine.resources.kvCache = {32, 32 * 4096ULL};
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
   engine.resources.stateCache.checkpointBytes = 64;
@@ -101,10 +97,9 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointRetirements = 3;
   engine.resources.stateCache.inUse = 2;
   engine.resources.stateCache.inUseEvictions = 5;
-  engine.resources.lookup = {.lookups = 3,
-                             .probeHashedBlocks = 7,
+  engine.resources.lookup = {.probeHashedBlocks = 7,
                              .kvHitTokens = 128,
-                             .stateHitTokens = 64,
+                             .stateDiskHits = 1,
                              .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
@@ -116,7 +111,6 @@ void testCleanRuntimeStatus() {
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
   warmup.maximumPrefillDetail = "packed_rows=2048";
 
   RuntimeMetricsSnapshot metrics;
@@ -130,9 +124,8 @@ void testCleanRuntimeStatus() {
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
   identity.buildId = "build";
-  identity.kvLayout = kv::makeLayoutGuard({16, 4, 256}, {});
-  identity.kvLayout.modelArtifactSha256.fill(0xbc);
-  identity.namespaceSha256 = std::string(64, 'd');
+  identity.kvLayout = kv::Layout{16, 4, 256};
+  identity.targetModelSha256 = std::string(64, 'b');
 
   metal::MetalMemoryStats metal;
   metal.allocatedBytes = 4 * kGiB;
@@ -181,7 +174,8 @@ void testCleanRuntimeStatus() {
   executorTelemetry.imageRowsBytes = 8;
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true);
+                        metrics, executorTelemetry, identity, governor, true, {},
+                        {}, {});
   require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
               json.find("\"kv_restores\":3") != std::string::npos,
           "disk token accounting must include transfers completed before admission retries");
@@ -192,13 +186,25 @@ void testCleanRuntimeStatus() {
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
           "the memory plan status omitted the disk tier's state staging");
-  require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
-              json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
+  const std::string kvIdentity =
+      "{\"target_model_sha256\":\"" + std::string(64, 'b') +
+      "\",\"format\":\"int8\",\"quantization\":\"symmetric_int8\","
+      "\"scale_type\":\"float32\",\"key_layout\":\"token_major\","
+      "\"value_layout\":\"dimension_major\"}";
+  require(json.find("\"kv\":" + kvIdentity) != std::string::npos &&
+              json.find("\"q8\":" + kvIdentity) != std::string::npos,
           "INT8 status lost its generic or legacy identity");
+  require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
+                    "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
+                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32}") !=
+                  std::string::npos &&
+              json.find("runtime_cache_namespace") == std::string::npos,
+          "status lost the cache identity or reported a cache namespace");
   auto bf16Identity = identity;
-  bf16Identity.kvLayout = kv::makeLayoutGuard({16, 4, 256, kv::Format::BFloat16}, {});
+  bf16Identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, bf16Identity, governor, true);
+                        metrics, executorTelemetry, bf16Identity, governor, true,
+                        {}, {}, {});
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
               bf16Status.find("\"q8\":") == std::string::npos,
@@ -224,7 +230,7 @@ void testCleanRuntimeStatus() {
 
   const std::string unmeasured =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, {}, identity, governor, true);
+                        metrics, {}, identity, governor, true, {}, {}, {});
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0},"
@@ -232,7 +238,8 @@ void testCleanRuntimeStatus() {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
-  require(json.find("\"pages_allocated\":128,\"pages_active\":24,"
+  require(json.find("\"kv\":{\"block_tokens\":32,"
+                    "\"pages_allocated\":128,\"pages_active\":24,"
                     "\"pages_cache\":32,\"pages_free\":72,") !=
               std::string::npos,
           "status lost the KV pool's page counts");
@@ -261,6 +268,14 @@ void testCleanRuntimeStatus() {
   require(json.find("\"pinned\":0,\"in_use\":2,\"in_use_evictions\":5,") !=
               std::string::npos,
           "states unfinished requests use are missing from status");
+  require(json.find("\"cache\":{\"probe_hashed_blocks\":7,\"hits\":1,\"cold_misses\":2,") !=
+              std::string::npos &&
+              json.find("\"disk_hits\":1,") != std::string::npos &&
+              json.find("\"misses\"") == std::string::npos &&
+              json.find("\"lookups\"") == std::string::npos &&
+              json.find("\"state_hit_tokens\"") == std::string::npos &&
+              json.find("\"deduplicated_publications\"") == std::string::npos,
+          "status reported a lookup counter twice");
   require(json.find("\"block_tokens\":32") != std::string::npos &&
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,
@@ -272,7 +287,7 @@ void testCleanRuntimeStatus() {
   idleEngine.scheduler = {};
   const auto idleJson = runtimeStatusJson(
       memoryPlan, idleEngine, metal, warmup, audit(memoryPlan), metrics,
-      executorTelemetry, identity, governor, true);
+      executorTelemetry, identity, governor, true, {}, {}, {});
   require(idleJson.find("\"decode_mixed_greedy_sampling_batches\":0}") !=
               std::string::npos,
           "status omitted the zero mixed decode count");
@@ -280,8 +295,6 @@ void testCleanRuntimeStatus() {
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
           json.find("\"resource_suspensions\":5,\"priority_suspensions\":2,") !=
-              std::string::npos &&
-          json.find("\"cache\":{\"lookups\":3,\"probe_hashed_blocks\":7,") !=
               std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
@@ -302,13 +315,6 @@ void testCleanRuntimeStatus() {
                     "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
               std::string::npos,
       "elastic KV-first status is incomplete");
-
-  warmup.decodeBatches[2] = WarmupStepStatus::Pending;
-  const std::string incomplete =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true);
-  require(incomplete.find("\"ready\":false") != std::string::npos,
-          "missing native B3 warmup did not fail readiness");
 }
 
 void testCurrentReadinessAndSimultaneousPeak() {
@@ -319,7 +325,6 @@ void testCurrentReadinessAndSimultaneousPeak() {
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
@@ -333,7 +338,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, memory, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true);
+                             {}, {}, {}, governor, true, {}, {}, {});
   };
   const std::string healthy = status();
   require(healthy.find("\"ready\":true") != std::string::npos &&
@@ -372,33 +377,19 @@ void testCurrentReadinessAndSimultaneousPeak() {
   governor.hostGrowthAllowed = true;
 }
 
-void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
+void testWarmupStepsReportMeasurementTruth() {
   const EngineMemoryPlan memoryPlan = plan();
   WarmupReport warmup;
-  require(!warmup.ready(), "unexecuted warmup was ready");
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
-  require(warmup.ready(), "complete warmup was not ready");
-
-  for (WarmupStepStatus *required : {&warmup.maximumPrefill,
-                                    &warmup.decodeBatches[0]}) {
-    for (WarmupStepStatus state : {WarmupStepStatus::Pending,
-                                  WarmupStepStatus::MemoryLimited}) {
-      *required = state;
-      require(!warmup.ready(), "required execution was skipped for readiness");
-    }
-    *required = WarmupStepStatus::Complete;
-  }
-
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true);
+                             {}, {}, {}, governor, true, {}, {}, {});
   };
   require(status().find("\"memory_limited_steps\":[]") != std::string::npos,
           "fully measured warmup listed a memory-limited step");
@@ -417,20 +408,16 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
     const std::string key = std::string("\"") + step.name + "\":";
     *step.state = WarmupStepStatus::Pending;
     const std::string pending = status();
-    require(!warmup.ready() &&
-                pending.find("\"ready\":false") != std::string::npos &&
-                pending.find(key + "false") != std::string::npos &&
+    require(pending.find(key + "false") != std::string::npos &&
                 pending.find("\"memory_limited_steps\":[]") != std::string::npos,
             "unexecuted optional warmup was treated as memory-limited");
 
     *step.state = WarmupStepStatus::MemoryLimited;
     const std::string limited = status();
-    require(warmup.ready() &&
-                limited.find("\"ready\":true") != std::string::npos &&
-                limited.find(key + "false") != std::string::npos &&
+    require(limited.find(key + "false") != std::string::npos &&
                 limited.find(std::string("\"memory_limited_steps\":[\"") +
                              step.name + "\"]") != std::string::npos,
-            "memory-limited warmup did not preserve readiness and measurement truth");
+            "memory-limited warmup was reported as measured or not listed");
 
     *step.state = WarmupStepStatus::Complete;
     require(status().find(key + "true") != std::string::npos,
@@ -439,17 +426,11 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
   for (const auto &step : optional)
     *step.state = WarmupStepStatus::MemoryLimited;
   const std::string limited = status();
-  require(warmup.ready() &&
-              limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
-                           "\"decode_b4\",\"composite_state_restore\"]") !=
+  require(limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
+                       "\"decode_b4\",\"composite_state_restore\"]") !=
                   std::string::npos &&
               limited.find("\"decode_b1\":true") != std::string::npos,
-          "single-lane readiness omitted or mislabeled memory-limited steps");
-  warmup.memoryBudgetValidated = false;
-  require(!warmup.ready(), "memory-limited warmup bypassed the memory audit");
-  warmup.memoryBudgetValidated = true;
-  warmup.error = "injected failure";
-  require(!warmup.ready(), "memory-limited warmup ignored an execution error");
+          "single-lane status omitted or mislabeled memory-limited steps");
 }
 
 void testMemoryPressureTelemetry() {
@@ -463,7 +444,8 @@ void testMemoryPressureTelemetry() {
   governor.pressure = MemoryPressure::Critical;
   governor.hostGrowthAllowed = false;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true);
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true, {},
+                             {}, {});
   };
   const std::string hostLimited = status();
   require(hostLimited.find("\"memory_pressure\":\"critical\"") !=
@@ -492,7 +474,7 @@ void testResourceWaitDiagnostics() {
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
   const std::string json = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait);
+      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
@@ -505,23 +487,6 @@ void testResourceWaitDiagnostics() {
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
               ticked.find("\"schema_version\":6") != std::string::npos,
           "the loop's longest tick is missing, or changed the status schema");
-  MemoryStatusReporter reporter;
-  require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");
-  require(!reporter.update(wait, false).empty(), "pressure transition was silent");
-  ++wait.memory;
-  wait.oldestWaitMilliseconds += 1000;
-  require(reporter.update(wait, false).empty(), "pressure retries flooded the log");
-  wait = {};
-  wait.concurrency = 4;
-  require(!reporter.update(wait, true).empty(), "end of memory wait was silent");
-  require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
-  // The refused request is deferred for scheduling, out of the memory
-  // count, while it still holds the others back.
-  wait.heldBehindRefusal = 2;
-  const std::string held = reporter.update(wait, true);
-  require(held.find("held=2") != std::string::npos &&
-              held.find("cleared") == std::string::npos,
-          "requests held behind a refusal were reported as no wait");
 }
 
 // The server and the runtime share stderr, as `serve > log 2>&1` does: a
@@ -561,7 +526,7 @@ int main() {
   try {
     testCleanRuntimeStatus();
     testCurrentReadinessAndSimultaneousPeak();
-    testWarmupStatesPreserveReadinessAndMeasurementTruth();
+    testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
     testStderrLinesStayWhole();

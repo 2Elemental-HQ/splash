@@ -476,7 +476,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 void evictAllCache(engine::Cache &resources) {
   static_cast<void>(resources.evictAll());
   const engine::CacheSnapshot snapshot = resources.snapshot();
-  if (snapshot.stateCache.entries || snapshot.kvCache.blocks)
+  if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
     throw std::logic_error("native benchmark cache did not drain");
 }
 
@@ -804,12 +804,6 @@ int main(int argc, char **argv) {
     config.buildId = SPLASH_BUILD_ID;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
-    const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
-    bootstrapConfig.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-    bootstrapConfig.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-    bootstrapConfig.protocolLimits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
-    bootstrapConfig.protocolLimits.maxMaskWords =
-        maskWordsPerToken * (model::ExecutionLimits::draftQueryRows + 1);
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
@@ -849,9 +843,7 @@ int main(int argc, char **argv) {
     const std::string identity =
         "{\"model_root\":" + json::quote(modelRoot) +
         ",\"loaded_model_layout_sha256\":" +
-        json::quote(cacheIdentity.modelLayoutSha256) +
-        ",\"runtime_cache_namespace\":" +
-        json::quote(cacheIdentity.namespaceSha256) + ",\"device\":" +
+        json::quote(cacheIdentity.modelLayoutSha256) + ",\"device\":" +
         json::quote(resources->backend().capabilities().deviceName) + "}";
     if (progress)
       progress->identity(identity);
@@ -899,8 +891,6 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (!prefillWarmup.completed)
-      throw std::runtime_error("maximum prefill warmup failed");
     if (median(decodeSamples[2]) >
         median(decodeSamples[0]) + median(decodeSamples[1])) {
       performanceFailures.push_back(
@@ -1322,7 +1312,7 @@ int main(int argc, char **argv) {
     std::cout << "],\"final\":{\"cache_hits\":" << snapshot.cacheHits
               << ",\"cold_misses\":" << snapshot.coldMisses
               << ",\"reused_tokens\":" << snapshot.reusedTokens
-              << ",\"kv_blocks\":" << snapshot.resources.kvCache.blocks
+              << ",\"kv_pages_cache\":" << snapshot.resources.pool.pagesPrefix
               << ",\"state_entries\":" << snapshot.resources.stateCache.entries
               << "}}\n";
     if (progress)

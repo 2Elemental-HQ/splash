@@ -29,28 +29,6 @@ void appendBatch(std::ostringstream &out,
 
 } // namespace
 
-std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool hostGrowthAllowed) {
-  const unsigned state = (!hostGrowthAllowed ? 1u : 0u) |
-                         (wait.memory ? 2u : 0u) |
-                         (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u) |
-                         (wait.heldBehindRefusal ? 16u : 0u);
-  if (state == state_)
-    return {};
-  state_ = state;
-  if (!state)
-    return "Memory: growth available; resource wait cleared";
-  std::ostringstream out;
-  out << "Memory: growth " << (hostGrowthAllowed ? "available" : "paused")
-      << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
-  if (wait.heldBehindRefusal)
-    out << "; held=" << wait.heldBehindRefusal;
-  if (wait.draining)
-    out << "; waiting for resident requests to finish";
-  return out.str();
-}
-
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
     const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,
@@ -71,23 +49,23 @@ std::string runtimeStatusJson(
       {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
-  // critical verdict makes host pressure a readiness failure.
+  // critical verdict makes host pressure a readiness failure. A status exists
+  // only after warmup and the memory audit passed.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
-  const bool ready = warmup.ready() && memoryAudit.valid && metalHealthy &&
-                     hostSafe && currentBytes <= plan.breakdown().hardBudgetBytes;
+  const bool ready = metalHealthy && hostSafe &&
+                     currentBytes <= plan.breakdown().hardBudgetBytes;
   const double hitRate =
       core.cacheHits + core.coldMisses
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
           : 0.0;
 
+  const kv::Format kvFormat = cacheIdentity.kvLayout.format;
   std::ostringstream kvIdentity;
-  kvIdentity << "{\"target_model_sha256\":"
-      << json::quote(digestHex(cacheIdentity.kvLayout.modelArtifactSha256))
-      << ",\"format\":" << json::quote(kv::formatName(cacheIdentity.kvLayout.format()))
-      << ",\"quantization\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "symmetric_int8" : "none")
-      << ",\"scale_type\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "float32" : "none")
+  kvIdentity << "{\"target_model_sha256\":" << json::quote(cacheIdentity.targetModelSha256)
+      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
+      << ",\"quantization\":"
+      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
       << ",\"value_layout\":\"dimension_major\"}";
 
@@ -110,14 +88,12 @@ std::string runtimeStatusJson(
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
-      << ",\"runtime_cache_namespace\":"
-      << json::quote(cacheIdentity.namespaceSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(cacheIdentity.kvLayout.format()))
+      << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
       << ",\"block_tokens\":" << kv::kPageTokens
       << "},\"kv\":" << kvIdentity.str();
   // Additive status evolution: retain the previous INT8 identity field.
-  if (cacheIdentity.kvLayout.format() == kv::Format::Int8)
+  if (kvFormat == kv::Format::Int8)
     out << ",\"q8\":" << kvIdentity.str();
   out << "},"
       << "\"memory_plan\":" << plan.toStatusJson()
@@ -138,8 +114,6 @@ std::string runtimeStatusJson(
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
-      << ",\"blocks\":" << resources.kvCache.blocks
-      << ",\"cache_bytes\":" << resources.kvCache.bytes
       << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix
@@ -161,15 +135,13 @@ std::string runtimeStatusJson(
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
       << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
-      << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
       << ",\"publications\":" << state.publications
-      << ",\"deduplicated_publications\":" << state.deduplicatedPublications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
       << ",\"checkpoint_retirements\":" << state.checkpointRetirements
-      << ",\"disk_hits\":" << state.diskHits
+      << ",\"disk_hits\":" << lookup.stateDiskHits
       << ",\"disk_promotions\":" << state.promotions
       << ",\"disk_promotions_skipped\":" << state.promotionsSkipped
       << ",\"disk_bytes\":" << state.diskBytes
@@ -191,13 +163,11 @@ std::string runtimeStatusJson(
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
       << "}"
-      << ",\"cache\":{\"lookups\":" << lookup.lookups
-      << ",\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
+      << ",\"cache\":{\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
       << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
-      << ",\"state_hit_tokens\":" << lookup.stateHitTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
@@ -326,11 +296,7 @@ std::string runtimeStatusJson(
     out << json::quote(name);
     separator = true;
   }
-  out << "],\"memory_budget_validated\":"
-      << boolean(warmup.memoryBudgetValidated)
-      << ",\"actual_peak_bytes\":" << warmup.actualPeakBytes
-      << ",\"detail\":" << json::quote(warmup.maximumPrefillDetail)
-      << ",\"error\":" << json::quote(warmup.error) << "}"
+  out << "],\"detail\":" << json::quote(warmup.maximumPrefillDetail) << "}"
       << ",\"metal\":{\"healthy\":" << boolean(metalHealthy)
       << ",\"failure_reason\":" << json::quote(metalFailureReason) << "}}";
   return out.str();

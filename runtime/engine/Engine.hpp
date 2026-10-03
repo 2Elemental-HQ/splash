@@ -148,19 +148,20 @@ public:
 
   // Runs only between commands: throws std::logic_error while a command is
   // in flight. Returns the model's idle state buffers first, then the caches
-  // the model can rebuild while the directive's byte target is unmet. Under
-  // critical pressure it then evicts every unpinned cache entry
-  // (Cache::evictAll()). Otherwise it releases empty KV extents and reclaims
-  // the cache one Cache::reclaimOne step at a time, in the order that step's
-  // contract (Cache.hpp) gives, returning the buffers an evicted state handed
-  // back to the model's pool after each step. While the target is still
-  // unmet, it then takes the image rows only evicted states held. A pass
-  // counts only memory that leaves the engine: released KV extents, the
-  // caches and idle buffers the model returns; evicting a state frees nothing
-  // by itself. Pages whose copies are being written count toward the target.
-  // A warning pass keeps one lane's pooled buffers and one empty extent
-  // (keepServingFootprint). Requests waiting for memory retry after any step
-  // that freed some, kept or released.
+  // the model can rebuild while the directive's byte target is unmet; a
+  // critical directive has no target and takes them all. Under critical
+  // pressure it then evicts every unpinned cache entry (Cache::evictAll()).
+  // Otherwise it releases empty KV extents and reclaims the cache one
+  // Cache::reclaimOne step at a time, in the order that step's contract
+  // (Cache.hpp) gives, returning the buffers an evicted state handed back to
+  // the model's pool after each step. While the target is still unmet, it
+  // then takes the image rows only evicted states held. A pass counts only
+  // memory that leaves the engine: released KV extents, the caches and idle
+  // buffers the model returns; evicting a state frees nothing by itself.
+  // Pages whose copies are being written count toward the target. A pass
+  // short of critical keeps one lane's pooled buffers and one empty extent.
+  // Requests waiting for memory retry after any step that freed some, kept
+  // or released.
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is
@@ -202,15 +203,11 @@ private:
     };
 
     EngineRequest request;
-    // Its place in submission order. Earlier requests' lanes hold memory it
-    // may wait for, so their work restarts its resource wait's limit.
-    uint64_t sequence = 0;
     // The admissions counted when admit() last gave it a state cell
     // (admissions_). Lanes admitted before a request was refused memory or
-    // suspended restart its wait's limit too.
+    // suspended restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> stateCell;
-    bool suspended = false;
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
@@ -223,8 +220,10 @@ private:
     // (admitQueued); a pass that does not schedule it or a prefix wait
     // leaves it in place.
     bool refusedMemory = false;
+    // The prompt from submit on, then the committed output; request.prompt
+    // is empty.
     std::vector<uint32_t> exactTokens;
-    // Made from request.prompt and request.images, which do not change while
+    // Made from exactTokens and request.images, which do not change while
     // the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;
@@ -310,6 +309,8 @@ private:
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
+  // Arms the next planned boundary, if any, with the scheduler: after
+  // admission, and after the scheduler has taken a command's progress.
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
@@ -433,6 +434,17 @@ private:
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
+  // Gives back what a lane holds: its planned and armed state boundaries,
+  // its state cell (keepContinuation keeps the model's host continuation of
+  // a suspended request) and its KV leases. The caller signals progress
+  // when the memory becomes available to waiting requests: a lane that
+  // held it across passes and ends (release) or fails its restore, or one
+  // suspended for a higher priority (preemptBelow). An admission returning
+  // what it took this pass does not: that memory was available before, and
+  // a signal would count as progress in deferResourceRetry and move the
+  // refused request's own wait limit out on every retry. Nor does a growth
+  // suspension (suspendForGrowth), which starts the recovery drain instead.
+  void vacateLane(Request &request, bool keepContinuation);
   void release(Request &request);
   void sweepTerminal();
 
@@ -453,9 +465,9 @@ private:
   // requests of a strictly higher priority than every suspended one are,
   // and, once the drain is over, the suspended ones; the others wait behind
   // the suspended lanes.
-  [[nodiscard]] static bool admissionTries(const Request &request,
-                                           std::optional<RequestPriority> tier,
-                                           bool draining) noexcept;
+  [[nodiscard]] bool admissionTries(const Request &request,
+                                    std::optional<RequestPriority> tier,
+                                    bool draining) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
   // The state cells admit() has obtained so far, including those it gave

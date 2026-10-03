@@ -667,7 +667,7 @@ class ClientRun:
                             "growth_allowed": governor.get("growth_allowed"),
                             "prefill_rows": scheduler.get("prefill_rows"),
                             "decode_batches": scheduler.get("decode_batches"),
-                            "kv_blocks": current.get("kv", {}).get("blocks"),
+                            "kv_pages_cache": current.get("kv", {}).get("pages_cache"),
                             "state_entries": current.get("state", {}).get("entries"),
                         }
                     if sample["engine_critical"]:

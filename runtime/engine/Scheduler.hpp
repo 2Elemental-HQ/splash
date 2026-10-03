@@ -28,7 +28,9 @@ struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
   BatchCohort cohort = BatchCohort::Greedy;
-  uint32_t promptTokens = 0;
+  // Tokens to prefill: the prompt, and after resumeFromResources the
+  // replayed history.
+  uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
 };
 
@@ -64,8 +66,7 @@ class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
-  explicit Scheduler(double decodeShare = 0.0) noexcept
-      : decodeShare_(decodeShare) {}
+  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
 
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
@@ -82,7 +83,9 @@ public:
   void remove(uint64_t requestId);
 
   // A sparse-state materialization point can stop one sequence without
-  // padding or shortening any peer in the same packed command.
+  // padding or shortening any peer in the same packed command. The boundary
+  // must lie past the request's progress; complete() consumes a boundary its
+  // command reached.
   void setPrefillBoundary(uint64_t requestId,
                           std::optional<uint32_t> absoluteTokens);
 
@@ -103,10 +106,15 @@ public:
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds = 0.0,
-                bool representativePrefillTiming = true);
+                double wallMilliseconds, bool representativePrefillTiming);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
+  // Suspended by suspendForResources and not resumed since; a terminal
+  // phase keeps it until remove(), so the engine can end the request's
+  // continuation.
+  [[nodiscard]] bool suspended(uint64_t requestId) const;
+  // The request's place in submission order.
+  [[nodiscard]] uint64_t submissionOrder(uint64_t requestId) const;
   [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
 
@@ -118,7 +126,7 @@ private:
     std::optional<uint32_t> prefillBoundary;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
-    bool suspendedForResources = false;
+    bool suspended = false;
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;

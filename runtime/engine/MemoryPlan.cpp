@@ -24,7 +24,59 @@ BudgetValidationStatus failure(BudgetErrorCode code, std::string message,
   return {false, code, std::move(message), std::move(breakdown)};
 }
 
+std::string modelStatusJson(const ModelMemoryProfile &model) {
+  std::ostringstream out;
+  out << '{' << "\"model_name\":" << json::quote(model.name) << ','
+      << "\"maximum_context_tokens\":" << model.maximumContextTokens << ','
+      << "\"attention_layers\":" << model.targetKvLayout.attentionLayers << ','
+      << "\"kv_heads\":" << model.targetKvLayout.kvHeads << ','
+      << "\"head_dimension\":" << model.targetKvLayout.headDimension << ','
+      << "\"kv_page_tokens\":" << kv::kPageTokens << ','
+      << "\"kv_quantization_bits\":"
+      << (model.targetKvLayout.format == kv::Format::Int8 ? 8 : 16) << ','
+      << "\"kv_format\":" << json::quote(kv::formatName(model.targetKvLayout.format)) << ','
+      << "\"kv_elements_per_scale\":"
+      << model.targetKvLayout.elementsPerScale() << ','
+      << "\"kv_scale_value_bytes\":"
+      << (model.targetKvLayout.format == kv::Format::Int8 ? sizeof(float) : 0) << ','
+      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
+  // Keep the legacy field for existing INT8 status consumers.
+  if (model.targetKvLayout.format == kv::Format::Int8)
+    out << ",\"q8_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
+  out
+      << ','
+      << "\"memory\":{" << "\"target_weights_bytes\":"
+      << model.footprint.targetWeightsBytes << ','
+      << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
+      << "\"vision_weights_bytes\":" << model.footprint.visionWeightsBytes << ','
+      << "\"active_state_cell_bytes\":"
+      << model.footprint.runtime.activeStateCellPlannedAllocatedBytes << ','
+      << "\"shared_prefill_bytes\":"
+      << model.footprint.runtime.sharedPrefillPlannedAllocatedBytes << ','
+      << "\"shared_decode_bytes\":"
+      << model.footprint.runtime.sharedDecodePlannedAllocatedBytes << ','
+      << "\"pipeline_reserve_bytes\":" << model::kPipelineReserveBytes << ','
+      << "\"runtime_overhead_reserve_bytes\":"
+      << model::kRuntimeOverheadReserveBytes << ','
+      << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
+  return out.str();
+}
+
 } // namespace
+
+std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
+                                             uint64_t activeStateCellBytes,
+                                             const kv::Layout &layout) noexcept {
+  uint64_t runwayBytes = 0;
+  uint64_t dynamicBytes = 0;
+  uint64_t result = 0;
+  if (!checkedMultiply(layout.bytesPerModelPage(),
+                       kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
+      !checkedAdd(activeStateCellBytes, runwayBytes, dynamicBytes) ||
+      !checkedAdd(fixedBytes, dynamicBytes, result))
+    return std::nullopt;
+  return result;
+}
 
 std::string_view budgetErrorCodeName(BudgetErrorCode code) {
   switch (code) {
@@ -71,14 +123,14 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
   if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
-  if (!footprint.activeStateCellBytes) {
+  if (!footprint.runtime.activeStateCellPlannedAllocatedBytes) {
     return "active_state_cell_bytes_required";
   }
-  if (!footprint.sharedPrefillBytes) return "shared_prefill_bytes_required";
-  if (!footprint.sharedDecodeBytes) return "shared_decode_bytes_required";
-  if (!footprint.pipelineReserveBytes) return "pipeline_reserve_required";
-  if (!footprint.runtimeOverheadReserveBytes) {
-    return "runtime_overhead_reserve_required";
+  if (!footprint.runtime.sharedPrefillPlannedAllocatedBytes) {
+    return "shared_prefill_bytes_required";
+  }
+  if (!footprint.runtime.sharedDecodePlannedAllocatedBytes) {
+    return "shared_decode_bytes_required";
   }
   try {
     static_cast<void>(fixedRuntimeBytes());
@@ -92,50 +144,16 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
   uint64_t result = 0;
   for (uint64_t value : {
            footprint.targetWeightsBytes, footprint.draftWeightsBytes,
-           footprint.visionWeightsBytes, footprint.sharedPrefillBytes,
-           footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
-           footprint.runtimeOverheadReserveBytes, footprint.stateStagingBytes}) {
+           footprint.visionWeightsBytes,
+           footprint.runtime.sharedPrefillPlannedAllocatedBytes,
+           footprint.runtime.sharedDecodePlannedAllocatedBytes,
+           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
+           footprint.stateStagingBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
   }
   return result;
-}
-
-std::string modelStatusJson(const ModelMemoryProfile &model) {
-  std::ostringstream out;
-  out << '{' << "\"model_name\":" << json::quote(model.name) << ','
-      << "\"maximum_context_tokens\":" << model.maximumContextTokens << ','
-      << "\"attention_layers\":" << model.targetKvLayout.attentionLayers << ','
-      << "\"kv_heads\":" << model.targetKvLayout.kvHeads << ','
-      << "\"head_dimension\":" << model.targetKvLayout.headDimension << ','
-      << "\"kv_page_tokens\":" << kv::kPageTokens << ','
-      << "\"kv_quantization_bits\":"
-      << (model.targetKvLayout.format == kv::Format::Int8 ? 8 : 16) << ','
-      << "\"kv_format\":" << json::quote(kv::formatName(model.targetKvLayout.format)) << ','
-      << "\"kv_elements_per_scale\":"
-      << model.targetKvLayout.elementsPerScale() << ','
-      << "\"kv_scale_value_bytes\":"
-      << (model.targetKvLayout.format == kv::Format::Int8 ? sizeof(float) : 0) << ','
-      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
-  // Keep the legacy field for existing INT8 status consumers.
-  if (model.targetKvLayout.format == kv::Format::Int8)
-    out << ",\"q8_page_bytes\":" << model.targetKvLayout.bytesPerModelPage();
-  out
-      << ','
-      << "\"memory\":{" << "\"target_weights_bytes\":"
-      << model.footprint.targetWeightsBytes << ','
-      << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
-      << "\"vision_weights_bytes\":" << model.footprint.visionWeightsBytes << ','
-      << "\"active_state_cell_bytes\":"
-      << model.footprint.activeStateCellBytes << ','
-      << "\"shared_prefill_bytes\":" << model.footprint.sharedPrefillBytes << ','
-      << "\"shared_decode_bytes\":" << model.footprint.sharedDecodeBytes << ','
-      << "\"pipeline_reserve_bytes\":" << model.footprint.pipelineReserveBytes
-      << ',' << "\"runtime_overhead_reserve_bytes\":"
-      << model.footprint.runtimeOverheadReserveBytes << ','
-      << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
-  return out.str();
 }
 
 std::string EngineMemoryBreakdown::toStatusJson() const {
@@ -277,12 +295,14 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.targetWeightsBytes = model.footprint.targetWeightsBytes;
   breakdown.draftWeightsBytes = model.footprint.draftWeightsBytes;
   breakdown.visionWeightsBytes = model.footprint.visionWeightsBytes;
-  breakdown.activeStateCellBytes = model.footprint.activeStateCellBytes;
-  breakdown.sharedPrefillBytes = model.footprint.sharedPrefillBytes;
-  breakdown.sharedDecodeBytes = model.footprint.sharedDecodeBytes;
-  breakdown.pipelineReserveBytes = model.footprint.pipelineReserveBytes;
-  breakdown.runtimeOverheadReserveBytes =
-      model.footprint.runtimeOverheadReserveBytes;
+  breakdown.activeStateCellBytes =
+      model.footprint.runtime.activeStateCellPlannedAllocatedBytes;
+  breakdown.sharedPrefillBytes =
+      model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
+  breakdown.sharedDecodeBytes =
+      model.footprint.runtime.sharedDecodePlannedAllocatedBytes;
+  breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
+  breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
@@ -312,21 +332,17 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
-  // The minimum holds one state cell and the KV runway: the whole smallest
-  // extents holding the pages warmup runs on.
-  uint64_t runwayBytes = 0;
-  if (!checkedMultiply(breakdown.kvPageBytes,
-                       kvRunwayPages(model.targetKvLayout.minimumExtentPages()),
-                       runwayBytes) ||
-      !checkedAdd(breakdown.activeStateCellBytes, runwayBytes,
-                  breakdown.minimumDynamicBytes) ||
-      !checkedAdd(breakdown.fixedRuntimeBytes, breakdown.minimumDynamicBytes,
-                  breakdown.minimumRequiredBytes)) {
+  const std::optional<uint64_t> required =
+      minimumRequiredBytes(breakdown.fixedRuntimeBytes,
+                           breakdown.activeStateCellBytes, model.targetKvLayout);
+  if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
                     "minimum elastic runtime footprint overflows uint64",
                     std::move(breakdown))};
   }
+  breakdown.minimumRequiredBytes = *required;
+  breakdown.minimumDynamicBytes = *required - breakdown.fixedRuntimeBytes;
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =
@@ -370,16 +386,6 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                                 "memory plan fits hard budget", breakdown};
   EngineMemoryPlan plan(device, model, breakdown);
   return {std::move(plan), std::move(status)};
-}
-
-EngineMemoryPlan requireEngineMemoryPlan(const DeviceCapabilities &device,
-                                         const ModelMemoryProfile &model,
-                                         uint64_t maximumMemoryBytes) {
-  EngineMemoryPlanResult result =
-      evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
-  if (!result.plan)
-    throw std::runtime_error(result.status.describe());
-  return std::move(*result.plan);
 }
 
 } // namespace splash::engine

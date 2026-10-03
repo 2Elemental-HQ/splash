@@ -281,6 +281,12 @@ struct ModelCapabilities final {
   uint32_t maximumContextTokens = 0;
 };
 
+// A token mask row holds one bit per vocabulary token in 32-bit words.
+[[nodiscard]] constexpr uint32_t
+maskWordsPerToken(uint32_t vocabularySize) noexcept {
+  return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
+}
+
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
 // target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.
@@ -324,23 +330,13 @@ struct ModelMemoryPlan final {
   uint64_t activeStateCellPlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
-
-  [[nodiscard]] std::optional<std::string> validationError() const {
-    if (!activeStateCellPlannedAllocatedBytes)
-      return "active_state_cell_planned_allocated_bytes_required";
-    if (!sharedPrefillPlannedAllocatedBytes)
-      return "shared_prefill_planned_allocated_bytes_required";
-    if (!sharedDecodePlannedAllocatedBytes)
-      return "shared_decode_planned_allocated_bytes_required";
-    if (!pipelineReserveBytes)
-      return "pipeline_reserve_required";
-    if (!runtimeOverheadReserveBytes)
-      return "runtime_overhead_reserve_required";
-    return std::nullopt;
-  }
 };
+
+// Fixed reserves the memory plan carries beside the planned arenas: Metal
+// pipeline objects and encoder scratch, and the process's own runtime
+// overhead. Startup counts them before a model loads.
+inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
+inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 
 struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;
@@ -416,8 +412,6 @@ struct WarmupLaneResult final {
 };
 
 struct WarmupStepResult final {
-  bool completed = false;
-  uint64_t estimatedPeakBytes = 0;
   std::string detail;
   // For prefill/decode-batch warmup, the synchronous production phase
   // including graph construction and result finalization, but not setup,

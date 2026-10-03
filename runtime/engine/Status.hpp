@@ -34,22 +34,6 @@ struct WarmupReport {
   WarmupStepStatus compositeStateRestore = WarmupStepStatus::Pending;
   // Exact executor-selected kernel geometry for the fixed 2048-row path.
   std::string maximumPrefillDetail;
-  uint64_t actualPeakBytes = 0;
-  std::string error;
-  bool memoryBudgetValidated = false;
-
-  [[nodiscard]] bool ready() const noexcept {
-    const auto optionalComplete = [](WarmupStepStatus status) {
-      return status == WarmupStepStatus::Complete ||
-             status == WarmupStepStatus::MemoryLimited;
-    };
-    return error.empty() && memoryBudgetValidated &&
-           maximumPrefill == WarmupStepStatus::Complete &&
-           decodeBatches[0] == WarmupStepStatus::Complete &&
-           std::all_of(decodeBatches.begin() + 1, decodeBatches.end(),
-                       optionalComplete) &&
-           optionalComplete(compositeStateRestore);
-  }
 };
 
 // Most recently completed real batch of one work kind. Status queries during
@@ -244,15 +228,6 @@ inline double RuntimeMetrics::percentile(const std::deque<double> &samples,
   return sorted[std::min(index, sorted.size() - 1)];
 }
 
-// Emits only transitions; retry counts and queue depth do not produce logs.
-class MemoryStatusReporter final {
-public:
-  [[nodiscard]] std::string update(const ResourceWaitSnapshot &wait,
-                                    bool hostGrowthAllowed);
-private:
-  unsigned state_ = 0;
-};
-
 // The native loop's own timing, which its transport measures.
 struct NativeLoopTiming {
   double maxTickMilliseconds = 0.0;
@@ -266,8 +241,7 @@ struct NativeLoopTiming {
     const model::ModelTelemetry &executorTelemetry,
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason = {},
-    const ResourceWaitSnapshot &resourceWait = {},
-    const NativeLoopTiming &loop = {});
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop);
 
 } // namespace splash::engine

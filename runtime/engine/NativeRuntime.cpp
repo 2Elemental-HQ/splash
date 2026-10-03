@@ -90,8 +90,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
       statusProvider_(std::move(statusProvider)), clocks_(std::move(clocks)),
       limits_(limits), parser_(limits_),
       core_(config_.engine, cache, model, *this) {
-  if (!config_.engineInstanceId || !config_.maskWordsPerToken || !output_ ||
-      !statusProvider_) {
+  if (!config_.engineInstanceId || !output_ || !statusProvider_) {
     throw std::invalid_argument("invalid native engine loop config");
   }
   if (auto issue = protocol::validateLimits(limits_))
@@ -488,14 +487,16 @@ void NativeRuntime::maskRequested(uint64_t requestId,
   uint64_t maskRequestId = nextMaskRequestId_++;
   if (!maskRequestId)
     maskRequestId = nextMaskRequestId_++;
+  const uint32_t wordsPerToken =
+      model::maskWordsPerToken(config_.engine.vocabularySize);
   uint64_t maskRows = uint64_t(simulationTokens.size()) + 1;
-  uint64_t expectedWords = uint64_t(config_.maskWordsPerToken) * maskRows;
+  uint64_t expectedWords = uint64_t(wordsPerToken) * maskRows;
   if (!expectedWords || expectedWords > limits_.maxMaskWords) {
     throw std::length_error("token mask dimensions exceed wire limits");
   }
   pendingMasks_.emplace(requestId, PendingMask{maskRequestId, expectedWords});
   send(protocol::MaskRequestEvent{
-      requestId, maskRequestId, config_.maskWordsPerToken,
+      requestId, maskRequestId, wordsPerToken,
       std::vector<uint32_t>(simulationTokens.begin(), simulationTokens.end())});
 }
 

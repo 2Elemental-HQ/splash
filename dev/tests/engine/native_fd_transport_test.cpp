@@ -137,7 +137,7 @@ struct Harness final {
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor;
   engine::FdTransport transport;
   // What the loop answers a status request with.
@@ -376,7 +376,7 @@ void testLoopWakesForAnEngineDeadline() {
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
   std::vector<protocol::ErrorEvent> errors;

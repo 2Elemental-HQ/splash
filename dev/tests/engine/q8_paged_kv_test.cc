@@ -1,7 +1,6 @@
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -63,30 +62,6 @@ void testBFloat16() {
       floatToBFloat16(std::numeric_limits<float>::infinity()))));
   assert(std::isnan(bfloat16ToFloat(
       floatToBFloat16(std::numeric_limits<float>::quiet_NaN()))));
-}
-
-void testLayoutGuard() {
-  std::array<uint8_t, 32> digest{};
-  for (uint32_t i = 0; i < digest.size(); ++i)
-    digest[i] = uint8_t(i);
-  LayoutGuard first = makeLayoutGuard(kOracleLayout, digest);
-  LayoutGuard second = makeLayoutGuard(kOracleLayout, digest);
-  auto bf16 = kOracleLayout;
-  bf16.format = Format::BFloat16;
-  const auto bf16Guard = makeLayoutGuard(bf16, digest);
-  assert(bf16Guard.quantization != first.quantization);
-  assert(bf16Guard.scaleType == uint32_t(ScaleType::None));
-  assert(bf16Guard.elementsPerScale == 0);
-  assert(bf16Guard.quantizedMinimum == 0 && bf16Guard.quantizedMaximum == 0);
-  assert(bf16Guard.modelArtifactSha256 == first.modelArtifactSha256);
-  assert(matchesLayout(first, kOracleLayout));
-  assert(first.modelArtifactSha256 == second.modelArtifactSha256);
-  second.elementsPerScale = 32;
-  assert(!isValidLayoutGuard(second));
-  second = first;
-  ++second.modelArtifactSha256[0];
-  assert(isValidLayoutGuard(second));
-  assert(first.modelArtifactSha256 != second.modelArtifactSha256);
 }
 
 void testQuantization(uint32_t validTokens) {
@@ -160,7 +135,6 @@ int main() {
   testByteAccounting();
   testLayouts();
   testBFloat16();
-  testLayoutGuard();
   testQuantization(kPageTokens);
   testQuantization(17);
   testZeroAndInvalidInputs();

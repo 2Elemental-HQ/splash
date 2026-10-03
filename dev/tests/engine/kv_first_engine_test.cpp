@@ -1,3 +1,4 @@
+#include "TestCache.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
@@ -669,7 +670,7 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
 void testScoreRequestsCarryNoSamplingOptions() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -702,7 +703,7 @@ void testScoreRequestsCarryNoSamplingOptions() {
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -726,7 +727,7 @@ void testConcurrentColdPrefixesComputeOnce() {
 void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -754,7 +755,7 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
 void testSharedPrefillReleasesDifferentJunctionsIndependently() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -778,7 +779,7 @@ void testSharedPrefillReleasesDifferentJunctionsIndependently() {
 void testSharedPrefillEvictedPublicationFallsBack() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -802,7 +803,7 @@ void testSharedPrefillProducerFailureReleasesWaiters() {
   for (bool cancelled : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -829,7 +830,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
   for (bool cancelled : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -846,13 +847,15 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
                 events.outputs[1] == std::vector<uint32_t>{42} &&
                 engine.snapshot().scheduler.waitingPrefix == 0,
             "expired prefix waiter allocated a cell or interrupted its producer");
+    require(!cancelled || events.usage.at(2) == std::pair<uint32_t, uint32_t>{193, 0},
+            "a request cancelled before it started reported other usage");
   }
 }
 
 void testSharedPrefillFailedPublicationFallsBack() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   model.deniedSnapshots = 100;
   Events events;
@@ -870,7 +873,7 @@ void testSharedPrefillDoesNotBlockUnrelatedWork() {
   for (bool images : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -897,7 +900,7 @@ void testSharedPrefillHonorsPriorityAndLateArrival() {
   for (bool foreground : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -927,7 +930,7 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
   for (bool denyCheckpoint : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     if (denyCheckpoint)
       model.denySnapshotAtBoundary = 4096;
@@ -955,7 +958,7 @@ void testLateSharedPrefillExtendsTheProducerPlan() {
 void testSharedJunctionAtACheckpointIsReusable() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -991,7 +994,7 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
   test::TestKvStorage storage(8, 4096, 4);
   storage.budgetPages = 4;
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   engine::Engine engine({}, cache, model, events);
@@ -1015,7 +1018,7 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
 void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -1047,7 +1050,7 @@ void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
 void testColdPublishesReplayStateAndRebuildsALostOne() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, resources, executor, events);
@@ -1097,7 +1100,7 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
 void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1128,7 +1131,7 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
 void testReplayStateEndsBeforeTheGenerationPrompt() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1171,7 +1174,7 @@ void testFollowUpResumesBeforeTheGenerationPrompt() {
   const auto followUp = [](uint32_t generationPromptTokens) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -1206,7 +1209,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
   for (bool concurrent : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -1236,7 +1239,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
 void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1267,7 +1270,7 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
 void testImageSpansKeyPrefixIdentity() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1340,7 +1343,7 @@ void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
   for (const Shape &shape : {Shape{{a, b}, {a, c}, 192}, Shape{{a}, {otherA}, 32}}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor model;
     Events events;
     engine::Engine engine({}, cache, model, events);
@@ -1382,7 +1385,7 @@ std::vector<uint32_t> branchPrompt(uint32_t token) {
 void testOneRequestPublishesJunctionAndLatestReplayState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1412,7 +1415,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
 void testLazyJunctionNeedsADraftWindowOfGain() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1464,7 +1467,7 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   bool paused = false;
@@ -1530,7 +1533,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
 void testCancellationAfterJunctionDiscardsLaterState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1567,7 +1570,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
 void testPublicationInvariantFailureIsFatal() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.snapshotObserver = [] { throw std::logic_error("snapshot invariant"); };
   Events events;
@@ -1591,7 +1594,7 @@ void testPublicationInvariantFailureIsFatal() {
 void testDeniedSnapshotCostsOnlyThatAttempt() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.deniedSnapshots = 100;
   Events events;
@@ -1644,7 +1647,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
 void testDeniedSnapshotRecyclesLruStateAndRetries() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1696,7 +1699,7 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
 void testPersistentSnapshotDenialRecyclesAtMostOneState() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1726,7 +1729,7 @@ void testPersistentSnapshotDenialRecyclesAtMostOneState() {
 void testLongSuffixSkipsDraftRestore() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1753,7 +1756,7 @@ void testLongSuffixSkipsDraftRestore() {
 void testCancellationInFlightAtBoundaryPublishesNoState() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1763,7 +1766,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
   engine.submit(request(4, prompt));
   require(engine.tick(1) && engine.tick(2),
           "long request did not complete its first prefill command");
-  require(resources.snapshot().kvCache.blocks == 64 &&
+  require(resources.snapshot().pool.pagesPrefix == 64 &&
               executor.snapshotAttempts == 0,
           "first prefill command changed the state cache");
   require(engine.tick(3) && engine.commandInFlight(),
@@ -1780,7 +1783,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
               snapshot.replayStatePublicationFailures == 0 &&
               snapshot.cancelled == 1,
           "cancelled command snapshotted or counted its boundary");
-  require(snapshot.resources.kvCache.blocks == 64 &&
+  require(snapshot.resources.pool.pagesPrefix == 64 &&
               snapshot.resources.pool.pagesActive == 0 &&
               snapshot.resources.activeRequests == 0 &&
               executor.requests.empty(),
@@ -1791,7 +1794,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
   for (bool hostPressure : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     EngineConfig config;
@@ -1839,7 +1842,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
                        metal::AllocationFailure::HostPressure}) {
     test::TestKvStorage storage(12, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     EngineConfig config;
@@ -1883,7 +1886,7 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
 void testKvGrowthDenialKeepsEveryLaneReplayState() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1917,20 +1920,18 @@ void testKvGrowthDenialKeepsEveryLaneReplayState() {
 void testPressurePassKeepsCachesWithoutATarget() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
   executor.reclaimableIdleStateBytes = 64;
   executor.cacheUnits = {100, 100, 100};
-  static_cast<void>(
-      engine.reclaimMemory({.reclaim = true, .keepServingFootprint = true}));
+  static_cast<void>(engine.reclaimMemory({}));
   require(executor.reclaimedIdleStateBytes == 64 && executor.cacheReclaims == 0 &&
               executor.cacheUnits.size() == 3,
           "a pass without a target took the model's caches");
-  const MemoryReclaimResult targeted = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 150, .keepServingFootprint = true});
+  const MemoryReclaimResult targeted = engine.reclaimMemory({.targetBytes = 150});
   require(executor.cacheReclaims == 2 && executor.cacheUnits.size() == 1 &&
               targeted.releasedBytes >= 200,
           "a targeted pass did not stop taking caches at its target");
@@ -1942,7 +1943,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
   Executor executor(1);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Events events;
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
@@ -1951,10 +1952,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
   runUntilIdle(engine);
   require(resources.snapshot().stateCache.entries == 1 && executor.cacheUnits.empty(),
           "setup did not cache a state holding rows");
-  const MemoryReclaimResult critical =
-      engine.reclaimMemory({.reclaim = true,
-                            .evictAllUnpinnedPrefixes = true,
-                            .targetBytes = std::numeric_limits<uint64_t>::max()});
+  const MemoryReclaimResult critical = engine.reclaimMemory({.critical = true});
   require(resources.snapshot().stateCache.entries == 0 && executor.cacheUnits.empty() &&
               critical.releasedBytes >= 164,
           "a critical pass left the rows of the state it evicted");
@@ -1963,7 +1961,7 @@ void testPressurePassTakesTheRowsItsEvictionsLeave() {
 void testPressureReclaimRespectsStateLifetimes() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -1972,20 +1970,17 @@ void testPressureReclaimRespectsStateLifetimes() {
   engine.submit(request(27, std::vector<uint32_t>(65, 27)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
-  require(cached.stateCache.entries == 1 && cached.kvCache.blocks == 2,
+  require(cached.stateCache.entries == 1 && cached.pool.pagesPrefix == 2,
           "pressure setup did not retain KV and composite state");
 
   // A shrink that nothing is waiting for stops at the resume point. Freeing
   // its cell gains the host a little; the next request pays a full replay.
-  static_cast<void>(engine.reclaimMemory({.reclaim = true,
-                                          .targetBytes = 64,
-                                          .keepResumePoint = true}));
+  static_cast<void>(engine.reclaimMemory({.targetBytes = 64, .keepResumePoint = true}));
   require(resources.snapshot().stateCache.entries == 1,
           "a speculative shrink discarded the only resume point");
 
   executor.reclaimableIdleStateBytes = 128;
-  const MemoryReclaimResult first = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult first = engine.reclaimMemory({.targetBytes = 64});
   require(first.releasedBytes >= 128 && first.outcome == ReclaimOutcome::Met &&
               executor.reclaimedIdleStateBytes == 128,
           "pressure reclaim did not release idle state buffers first");
@@ -1995,29 +1990,23 @@ void testPressureReclaimRespectsStateLifetimes() {
 
   // Drain the extents the test starts with but does not use, then prove cached
   // state is the next lifecycle selected while its parent KV remains usable.
-  require(engine.reclaimMemory({.reclaim = true}).outcome ==
-              ReclaimOutcome::Untargeted,
+  require(engine.reclaimMemory({}).outcome == ReclaimOutcome::Untargeted,
           "a pass without a target reported one");
-  const MemoryReclaimResult state =
-      engine.reclaimMemory({.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult state = engine.reclaimMemory({.targetBytes = 64});
   require(state.releasedBytes >= 64 && state.outcome == ReclaimOutcome::Met,
           "pressure reclaim did not release immutable cached state");
   const auto stateEvicted = resources.snapshot();
   require(stateEvicted.stateCache.entries == 0 &&
-              stateEvicted.kvCache.blocks == 2,
+              stateEvicted.pool.pagesPrefix == 2,
           "cached-state eviction incorrectly removed target KV");
 
-  require(engine.reclaimMemory({.reclaim = true,
-                                .evictAllUnpinnedPrefixes = true,
-                                .targetBytes = std::numeric_limits<uint64_t>::max()})
-                  .outcome == ReclaimOutcome::Exhausted,
+  require(engine.reclaimMemory({.critical = true}).outcome == ReclaimOutcome::Exhausted,
           "evicting everything left something to reclaim");
   const auto critical = resources.snapshot();
-  require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
+  require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
               critical.pool.allocatedBytes == 0,
           "critical pressure left evictable cached state or KV extents");
-  const MemoryReclaimResult empty =
-      engine.reclaimMemory({.reclaim = true, .targetBytes = 64});
+  const MemoryReclaimResult empty = engine.reclaimMemory({.targetBytes = 64});
   require(!empty.releasedBytes && empty.outcome == ReclaimOutcome::Exhausted,
           "an empty cache did not report reclaim exhausted");
 }
@@ -2029,7 +2018,7 @@ void testPressureReclaimRespectsStateLifetimes() {
 void testWarningReclaimKeepsTheServingFootprint() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2041,20 +2030,15 @@ void testWarningReclaimKeepsTheServingFootprint() {
   require(resources.snapshot().pool.allocatedBytes == extentBytes,
           "footprint setup did not keep one allocated extent of cached KV");
 
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true,
-       .targetBytes = std::numeric_limits<uint64_t>::max(),
-       .keepServingFootprint = true}));
+  static_cast<void>(
+      engine.reclaimMemory({.targetBytes = std::numeric_limits<uint64_t>::max()}));
   const auto warning = resources.snapshot();
   require(executor.keptLane && warning.stateCache.entries == 0 &&
-              warning.kvCache.blocks == 0 &&
+              warning.pool.pagesPrefix == 0 &&
               warning.pool.allocatedBytes == extentBytes,
           "warning pressure did not keep only the serving footprint");
 
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true,
-       .evictAllUnpinnedPrefixes = true,
-       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+  static_cast<void>(engine.reclaimMemory({.critical = true}));
   require(!executor.keptLane &&
               resources.snapshot().pool.allocatedBytes == 0,
           "critical pressure kept the serving footprint");
@@ -2068,7 +2052,7 @@ void testWarningReclaimKeepsTheServingFootprint() {
 void testWarningReclaimCountsOnlyWhatReachesTheHost() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2078,12 +2062,11 @@ void testWarningReclaimCountsOnlyWhatReachesTheHost() {
   constexpr uint64_t extentBytes = 4 * 4096;
   require(resources.snapshot().stateCache.bytes == 64 &&
               resources.snapshot().pool.allocatedBytes == 2 * extentBytes &&
-              resources.snapshot().pool.reclaimableExtents == 1,
+              resources.snapshot().pool.reclaimableBytes == extentBytes,
           "fixture did not cache a state and an extent of KV beside the runway");
   // The lane's pooled buffers went back to the host earlier.
   executor.laneFootprintBytes = 64;
-  const MemoryReclaimResult result = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
   require(result.releasedBytes == extentBytes && result.outcome == ReclaimOutcome::Met &&
               executor.pooledLaneBytes == 64 &&
               resources.snapshot().stateCache.entries == 0 &&
@@ -2098,7 +2081,7 @@ void testWarningReclaimCountsOnlyWhatReachesTheHost() {
 void testWarningReclaimWakesARefusedStart() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2114,8 +2097,7 @@ void testWarningReclaimWakesARefusedStart() {
   require(engine.resourceWaitSnapshot(100).memory == 1 &&
               engine.nextWakeupMilliseconds() == 200.0,
           "the host did not refuse the start");
-  const MemoryReclaimResult result = engine.reclaimMemory(
-      {.reclaim = true, .targetBytes = 64, .keepServingFootprint = true});
+  const MemoryReclaimResult result = engine.reclaimMemory({.targetBytes = 64});
   require(!result.releasedBytes && executor.pooledLaneBytes == 64 &&
               resources.snapshot().stateCache.entries == 0 &&
               engine.nextWakeupMilliseconds() == 0.0,
@@ -2130,12 +2112,13 @@ void testWarningReclaimWakesARefusedStart() {
 // pass reports that transfers hold back the rest of its target, and passes
 // with that rest (MemoryPressurePolicy continues it) take the chain as the
 // copies land, each pass first collecting the copies that landed since the
-// last, each leaf after its child, and stop at the target.
+// last, each leaf after its child, and stop at the target. The first extent
+// the copies empty stays allocated as the runway.
 void testPressureReclaimFollowsTheChain() {
   test::TestKvStorage storage(4, 100, 1);
   KvPool pool(storage, 4);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -2144,7 +2127,7 @@ void testPressureReclaimFollowsTheChain() {
   std::iota(prompt.begin(), prompt.end(), 1000);
   cache.beginRequest(1);
   require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
-  const uint64_t leaf = cache.publishCommittedBlocks(1, prompt, 128);
+  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   cache.publishCompositeState(
@@ -2152,27 +2135,29 @@ void testPressureReclaimFollowsTheChain() {
   cache.endRequest(1);
 
   const auto reclaim = [&](uint64_t target) {
-    return engine.reclaimMemory({.reclaim = true, .targetBytes = target});
+    return engine.reclaimMemory({.targetBytes = target});
   };
   // The state's buffers, which the model returns once the cache has written
   // the state, then the chain's leaf, whose parent waits for its copy.
-  MemoryReclaimResult result = reclaim(364);
+  MemoryReclaimResult result = reclaim(264);
   require(result.releasedBytes == 64 && result.outcome == ReclaimOutcome::Pending &&
               tier.demotions == 1,
           "the leaf's copy did not hold back the rest of the target");
-  uint64_t target = 364 - result.releasedBytes;
-  for (uint32_t demoted = 2; demoted <= 3; ++demoted) {
-    tier.complete();
-    result = reclaim(target);
-    target -= result.releasedBytes;
-    require(result.releasedBytes == 100 && tier.demotions == demoted &&
-                result.outcome == (demoted < 3 ? ReclaimOutcome::Pending : ReclaimOutcome::Met),
-            "the rest of the target did not take the chain leaf by leaf");
-  }
+  const uint64_t target = 264 - result.releasedBytes;
   tier.complete();
-  result = engine.reclaimMemory({.reclaim = true});
+  result = reclaim(target);
+  require(result.releasedBytes == 0 && result.outcome == ReclaimOutcome::Pending &&
+              tier.demotions == 2,
+          "the first extent the copies emptied did not stay as the runway");
+  tier.complete();
+  result = reclaim(target);
+  require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Met &&
+              tier.demotions == 3,
+          "the rest of the target did not take the chain leaf by leaf");
+  tier.complete();
+  result = engine.reclaimMemory({});
   require(result.releasedBytes == 100 && result.outcome == ReclaimOutcome::Untargeted &&
-              tier.demotions == 3 && pool.snapshot().pagesAllocated == 1,
+              tier.demotions == 3 && pool.snapshot().pagesAllocated == 2,
           "reclaim went past its target");
 }
 
@@ -2183,7 +2168,7 @@ void testPressureReclaimFollowsTheChain() {
 void testFullStateCellsSkipAdmissionAttempts() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   // The first pass starts the three short prompts and tries request 5, the
@@ -2234,7 +2219,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
 void testConcurrencyLimitDoesNotEvictCache() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2273,7 +2258,7 @@ void testConcurrencyLimitDoesNotEvictCache() {
 void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2284,6 +2269,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   engine.submit(request(200, std::vector<uint32_t>(65, 200)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
+  const uint64_t cacheHits = engine.snapshot().cacheHits;
   const uint64_t coldMisses = engine.snapshot().coldMisses;
   const uint32_t attempts = executor.beginAttempts;
 
@@ -2296,8 +2282,8 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   require(executor.beginAttempts == attempts + 2 &&
               resources.snapshot().stateCache.entries ==
                   cached.stateCache.entries &&
-              resources.snapshot().kvCache.blocks == cached.kvCache.blocks &&
-              resources.snapshot().lookup.lookups == cached.lookup.lookups &&
+              resources.snapshot().pool.pagesPrefix == cached.pool.pagesPrefix &&
+              engine.snapshot().cacheHits == cacheHits &&
               engine.snapshot().coldMisses == coldMisses &&
               engine.snapshot().scheduler.waitingResources == 1,
           "paused state admission drained the cache or retried without backoff");
@@ -2306,7 +2292,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
   for (double now = 120.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && events.completedCount == 2 &&
-              resources.snapshot().lookup.lookups == cached.lookup.lookups + 1 &&
+              engine.snapshot().cacheHits == cacheHits &&
               engine.snapshot().coldMisses == coldMisses + 1 &&
               events.capacityExhaustedCount == 0 && events.failedCount == 0,
           "state admission did not recover after host pressure cleared");
@@ -2318,7 +2304,7 @@ void testHostPressureDoesNotDrainCacheOnStateAdmission() {
 void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2346,7 +2332,7 @@ void testHostPressureStillRecyclesLruStateForDeniedSnapshot() {
                   cached.stateCache.evictions + 1 &&
               after.resources.stateCache.entries == cached.stateCache.entries &&
               after.resources.stateCache.bytes == cached.stateCache.bytes &&
-              after.resources.kvCache.blocks == cached.kvCache.blocks + 2,
+              after.resources.pool.pagesPrefix == cached.pool.pagesPrefix + 2,
           "recycling under host pressure grew state or drained KV cache");
 }
 
@@ -2385,7 +2371,7 @@ struct HostPause final {
 void testRequestInServiceGrowsThroughTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   HostPause host;
@@ -2396,7 +2382,7 @@ void testRequestInServiceGrowsThroughTheHostPause() {
   // A finished prompt leaves two cached blocks under a state.
   engine.submit(request(1, std::vector<uint32_t>(65, 1)));
   runUntilIdle(engine);
-  require(resources.snapshot().kvCache.blocks == 2 &&
+  require(resources.snapshot().pool.pagesPrefix == 2 &&
               resources.snapshot().stateCache.entries == 1,
           "host pause fixture did not cache the first prompt");
   executor.decodeFinishes = false;
@@ -2431,7 +2417,7 @@ void testRequestInServiceGrowsThroughTheHostPause() {
 void testPausedPageShortfallKeepsTheLaneRunway() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   HostPause host;
@@ -2469,7 +2455,7 @@ void testPausedPageShortfallKeepsTheLaneRunway() {
 void testFirstRequestStartsThroughTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2499,7 +2485,7 @@ void testFirstRequestStartsThroughTheHostPause() {
   static_cast<void>(engine.tick(now++));
   require(!executor.requests.contains(2) && events.startIds.size() == 1 &&
               engine.resourceWaitSnapshot(now).memory == 1 &&
-              resources.snapshot().kvCache.blocks >= before.kvCache.blocks &&
+              resources.snapshot().pool.pagesPrefix >= before.pool.pagesPrefix &&
               resources.snapshot().stateCache.evictions == before.stateCache.evictions,
           "a second request grew, or evicted for the host, beside one in service");
   while (now < 1000 && events.completedCount < 2)
@@ -2515,7 +2501,7 @@ void testFirstRequestStartsThroughTheHostPause() {
 void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2553,7 +2539,7 @@ void testRequestThatNeedsNoGrowthStartsUnderTheHostPause() {
 void testSuspendedRequestWaitsForTheHostBesideOneInService() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -2606,7 +2592,7 @@ void testSuspendedRequestWaitsForTheHostBesideOneInService() {
 void testEngineLimitBindsThroughTheHostPause() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2648,7 +2634,7 @@ void testEngineLimitBindsThroughTheHostPause() {
 void testPausedPageShortageKeepsCachedStates() {
   test::TestKvStorage storage(64, 4096, 1);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -2660,7 +2646,7 @@ void testPausedPageShortageKeepsCachedStates() {
   // Cached: a checkpoint, an ordinary state below it, and KV below both.
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 128).granted(), "fixture KV failed");
-  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128));
+  resources.publishCommittedBlocks(900, std::vector<uint32_t>(129, 9), 128);
   resources.publishCompositeState(resources.blockAt(900, 32), std::make_shared<State>(), true);
   resources.publishCompositeState(resources.blockAt(900, 64), std::make_shared<State>());
   resources.endRequest(900);
@@ -2689,7 +2675,7 @@ void testPausedPageShortageKeepsCachedStates() {
 void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -2700,7 +2686,7 @@ void testSingletonHostPressureReusesIdleCacheInsteadOfSuspending() {
   engine.submit(request(230, std::vector<uint32_t>(65, 230)));
   runUntilIdle(engine);
   const auto cached = resources.snapshot();
-  require(cached.kvCache.blocks >= 1 && cached.pool.pagesPrefix >= 2 &&
+  require(cached.pool.pagesPrefix >= 2 &&
               cached.pool.pagesFree + cached.pool.pagesPrefix >= 3,
           "idle-cache reuse fixture geometry changed");
 
@@ -2728,7 +2714,7 @@ void testAdmissionWaitsOutEarlierLanes() {
   for (const bool hostRecovers : {true, false}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -2773,7 +2759,7 @@ void testAdmissionWaitsOutEarlierLanes() {
 void testLaterLanesDoNotExtendAResourceWait() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   // The host has memory for the later request's state, not the waiting one's.
@@ -2823,7 +2809,7 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
   for (const bool lanesFull : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
@@ -2876,7 +2862,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
   for (uint32_t outcome = 0; outcome < 4; ++outcome) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     MemoryPressure pressure = MemoryPressure::Normal;
@@ -2900,7 +2886,7 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
     // Suspension drops the lane's armed boundary silently: it is neither a
     // snapshot attempt nor a publication failure.
     require(executor.suspensions == 1 && events.capacityExhaustedCount == 0 &&
-                resources.snapshot().kvCache.blocks == cached.kvCache.blocks &&
+                resources.snapshot().pool.pagesPrefix == cached.pool.pagesPrefix &&
                 resources.snapshot().stateCache.evictions ==
                     cached.stateCache.evictions &&
                 executor.snapshotAttempts == 1 &&
@@ -2963,7 +2949,7 @@ void testKvPressureNarrowsTheRealBatch() {
   test::TestKvStorage storage(4, 4096, 1);
   storage.budgetPages = 3;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -2989,7 +2975,7 @@ void testKvPressureNarrowsTheRealBatch() {
 void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   storage.growthAllowed = [&](uint32_t) {
     return resources.snapshot().stateCache.entries == 0;
@@ -3026,7 +3012,7 @@ void testRequiredWorkDoesNotReserveAnExtraPage() {
     test::TestKvStorage storage(2, 4096, 1);
     storage.budgetPages = 1;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -3043,7 +3029,7 @@ void testRequiredWorkDoesNotReserveAnExtraPage() {
 void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3070,14 +3056,14 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
               events.starts.back().first == EngineCacheStatus::PrefixHit &&
               events.starts.back().second == 64 &&
               after.cacheHits == before.cacheHits + 1 &&
-              after.resources.lookup.lookups == before.resources.lookup.lookups + 1,
+              after.coldMisses == before.coldMisses,
           "successful retry failed to restore/count the protected cache state");
 }
 
 void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3098,8 +3084,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
               events.capacityExhaustedCount == 0 && executor.restored == 0 &&
               executor.prefillRows == 130 &&
               events.starts.back().first == EngineCacheStatus::Miss &&
-              engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0 &&
-              resources.snapshot().lookup.lookups == 2,
+              engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0,
           "admission waited on its own cache pin instead of recomputing cold");
 }
 
@@ -3109,7 +3094,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
 void testActivationReceivesTheRestoreBoundary() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3140,7 +3125,7 @@ void testActivationReceivesTheRestoreBoundary() {
 void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3181,7 +3166,7 @@ void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
 void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3190,7 +3175,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
   resources.beginRequest(999);
   require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(999, std::vector<uint32_t>(64, 9), 64),
+      test::publishBlocks(resources, 999, std::vector<uint32_t>(64, 9), 64),
       std::make_shared<OffloadState>(write));
   resources.endRequest(999);
   require(resources.reclaimOneState(false, 0, false) &&
@@ -3221,7 +3206,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
 void testDroppedLeaseLooksUpAgain() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -3231,7 +3216,7 @@ void testDroppedLeaseLooksUpAgain() {
   write->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  cache.publishCompositeState(cache.publishCommittedBlocks(999, prompt, 64),
+  cache.publishCompositeState(test::publishBlocks(cache, 999, prompt, 64),
                               std::make_shared<OffloadState>(write));
   cache.endRequest(999);
   executor.beginGrowthBlocked = [&] { return cache.snapshot().stateCache.bytes != 0; };
@@ -3249,7 +3234,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
   test::TestKvStorage storage(2, 4096, 1);
   storage.budgetPages = 1;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3267,7 +3252,7 @@ void testSingletonCapacityFailureTerminatesCleanly() {
 void testQueuedLongPrefillsLeaveRoomForShortWork() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3292,7 +3277,7 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
 void testAdmissionUsesCachedRemainingWork() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3317,7 +3302,7 @@ void testAdmissionUsesCachedRemainingWork() {
 void testUnselectableCandidatesAreNotProbed() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3357,7 +3342,7 @@ void testUnselectableCandidatesAreNotProbed() {
 void testWaitingCandidateProbeIsRefreshedNotRepeated() {
   test::TestKvStorage storage(4096, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3391,7 +3376,7 @@ void testWaitingCandidateProbeIsRefreshedNotRepeated() {
 void testMemoryWaitHoldsBackLaterArrivals() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3423,7 +3408,7 @@ void testMemoryWaitHoldsBackLaterArrivals() {
 void testMemoryWaitClosesAdmissionBesideAResidentLane() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3468,7 +3453,7 @@ void testMemoryWaitClosesAdmissionBesideAResidentLane() {
 void testClosedAdmissionReopensWhenTheWaitEnds() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3503,7 +3488,7 @@ void testClosedAdmissionReopensWhenTheWaitEnds() {
 void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   // Two lanes: the first two requests take both, so the producer waits for
   // a lane while the host refuses request 4.
   Executor executor(2);
@@ -3557,7 +3542,7 @@ void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
 void testRefusedResumeHoldsBackLaterSuspendedLanes() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -3613,7 +3598,7 @@ void testRefusedResumeHoldsBackLaterSuspendedLanes() {
 void testHeldSuspendedRequestNeitherWakesNorExpires() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -3657,7 +3642,7 @@ void testHeldSuspendedRequestNeitherWakesNorExpires() {
 void testStatusCountsRequestsHeldBehindARefusal() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3710,7 +3695,7 @@ void testStatusCountsRequestsHeldBehindARefusal() {
 void testStatusCountsSuspendedRequestsHeldDuringRecovery() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   bool hostRefuses = true;
@@ -3754,7 +3739,7 @@ void testStatusCountsSuspendedRequestsHeldDuringRecovery() {
 void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
@@ -3786,7 +3771,7 @@ void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
 void testUnadmittedRequestsHonorCancellationAndDeadline() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3813,7 +3798,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
                                    RequestPriority::Background}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -3854,7 +3839,7 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
 void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -3883,7 +3868,7 @@ void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
 void testPrefillGrowthPreservesAnActiveDecodePeer() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -3914,7 +3899,7 @@ void testPrefillGrowthPreservesAnActiveDecodePeer() {
 void testKvPressureSuspendsInsteadOfKillingActiveWork() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   Events events;
@@ -3938,7 +3923,7 @@ void testKvPressureSuspendsInsteadOfKillingActiveWork() {
 void testPressureRetryIsBackedOffWithoutProgress() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -3980,7 +3965,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
     Events events;
@@ -4004,7 +3989,7 @@ void testAdmissionRetryWakesOnlyWhenTickCanRetry() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     bool paused = true;
@@ -4036,7 +4021,7 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
     test::TestKvStorage storage(3, 4096, 1);
     storage.budgetPages = 2;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     executor.decodeFinishes = false;
     Events events;
@@ -4092,7 +4077,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   test::TestKvStorage storage(3, 4096, 1);
   storage.budgetPages = 2;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   // A replay result may carry a previously prepared consumer stage. It is
@@ -4152,8 +4137,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               events.usage.at(251) == std::pair<uint32_t, uint32_t>{24, 4} &&
               events.startIds.size() == 3 &&
               events.maskRequests.empty() &&
-              engine.snapshot().resources.lookup.lookups == 3 &&
-              engine.snapshot().coldMisses == 3,
+              engine.snapshot().cacheHits == 0 && engine.snapshot().coldMisses == 3,
           "resource replay emitted prior output or changed request usage/hits");
   require(executor.requests.empty() && executor.snapshotAttempts == 0 &&
               resources.snapshot().pool.pagesActive == 0 &&
@@ -4164,7 +4148,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
 void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.decodeFinishes = false;
   executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
@@ -4205,7 +4189,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   // resumed lane rebuilds the state where the conversation's next turn
   // resumes, then captures the generated history's end.
   constexpr uint32_t retainedKvTokens = 6144;
-  while (resources.snapshot().kvCache.blocks >
+  while (resources.snapshot().pool.pagesPrefix >
          retainedKvTokens / KvCache::pageTokens) {
     require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "could not reclaim the suspended decode's KV tail");
@@ -4265,7 +4249,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
 void testResumedProducerPlansJunctionsForSiblings() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   bool paused = false;
@@ -4337,14 +4321,14 @@ struct LostReplayPoint {
     while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
                .madeProgress) {
     }
-    require(resources.snapshot().kvCache.blocks == 0 && pool.snapshot().pagesAllocated == 0,
+    require(resources.snapshot().pool.pagesPrefix == 0 && pool.snapshot().pagesAllocated == 0,
             "the suspended lane's KV stayed");
     storage.growthBlocked = false;
     pressure = MemoryPressure::Normal;
     // Another conversation's KV, with no state, fills two whole extents.
     resources.beginRequest(900);
     require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-    static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+    resources.publishCommittedBlocks(900, other, 256);
     resources.endRequest(900);
     releases = storage.releasedExtents;
   }
@@ -4372,7 +4356,7 @@ struct LostReplayPoint {
   const std::vector<uint32_t> other = std::vector<uint32_t>(257, 6);
   test::TestKvStorage storage{1024, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor{1};
   Events events;
   MemoryPressure pressure = MemoryPressure::Normal;
@@ -4445,7 +4429,7 @@ void testDeniedSnapshotTakesAtMostOneSnapshotOfExtents() {
 void testSharedJunctionPublishesFromCachedKv() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -4453,7 +4437,7 @@ void testSharedJunctionPublishesFromCachedKv() {
   // Another conversation's KV, with no state, fills two whole extents.
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256));
+  resources.publishCommittedBlocks(900, std::vector<uint32_t>(257, 6), 256);
   resources.endRequest(900);
   // A snapshot needs memory that only a released extent gives.
   const uint32_t releases = storage.releasedExtents;
@@ -4477,7 +4461,7 @@ void testSharedJunctionPublishesFromCachedKv() {
 void testPausedPublicationInUseTakesNoKv() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   bool paused = false;
@@ -4488,7 +4472,7 @@ void testPausedPublicationInUseTakesNoKv() {
   const std::vector<uint32_t> other(257, 6);
   resources.beginRequest(900);
   require(resources.ensureTokens(900, 256).granted(), "the other conversation got no pages");
-  static_cast<void>(resources.publishCommittedBlocks(900, other, 256));
+  resources.publishCommittedBlocks(900, other, 256);
   resources.endRequest(900);
 
   executor.snapshotRoom = [] { return false; };
@@ -4509,7 +4493,7 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -4523,7 +4507,6 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   // Lookups keep both prompts' states at 64 resident while the lanes contend
   // for pages: the preempted lane then resumes from its own.
   const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {260, 261});
-  const uint64_t lookups = engine.snapshot().resources.lookup.lookups;
   for (double now = 100; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && executor.suspensions == 1 &&
@@ -4537,7 +4520,6 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
               events.outputs.at(260) == std::vector<uint32_t>(30, 42) &&
               events.outputs.at(261) == std::vector<uint32_t>(30, 42) &&
               events.usage.at(260) == std::pair<uint32_t, uint32_t>{65, 30} &&
-              engine.snapshot().resources.lookup.lookups == lookups &&
               engine.snapshot().cacheHits == 0 &&
               engine.snapshot().coldMisses == 2,
           "internal cache restore changed output or request accounting");
@@ -4549,7 +4531,7 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -4583,7 +4565,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
   for (bool cancel : {false, true}) {
     test::TestKvStorage storage(4, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.kvGrowthBlocked = &storage.growthBlocked;
     executor.unblockGrowthOnSuspend = false;
@@ -4609,7 +4591,7 @@ void testRepeatedPreemptionRespectsBackoffAndCancellation() {
             "failed recovery replayed work or ignored retry backoff");
     require(engine.nextWakeupMilliseconds() == 301 &&
                 events.startIds.size() == 1 &&
-                engine.snapshot().resources.lookup.lookups == 1 &&
+                engine.snapshot().cacheHits + engine.snapshot().coldMisses == 1 &&
                 resources.snapshot().pool.pagesActive == 0 &&
                 resources.snapshot().activeRequests == 0,
             "repeated preemption retained KV or duplicated admission counters");
@@ -4635,8 +4617,8 @@ void testBudgetDenialRetriesAfterRelease() {
   for (bool recovers : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
-    auto pages = pool.acquirePages(8, false);
+    engine::Cache cache(pool);
+    auto pages = pool.acquirePages(8);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
       pool.releasePage(page, false);
@@ -4682,7 +4664,7 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
   for (bool state : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor(1);
     executor.pooledLaneBytes = 4096;
     Events events;
@@ -4711,7 +4693,7 @@ void testPausedStateAdmissionReusesCachedStates() {
   for (uint32_t lacked : {1U, 2U}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     bool paused = false;
@@ -4758,7 +4740,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   constexpr uint32_t budgetExtents = 32;
   test::TestKvStorage storage(4 * 128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -4767,8 +4749,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
     const uint64_t id = 5000 + chain;
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 128).granted(), "could not seed a cached prefix");
-    static_cast<void>(cache.publishCommittedBlocks(
-        id, std::vector<uint32_t>(129, 7000 + chain), 128));
+    cache.publishCommittedBlocks(id, std::vector<uint32_t>(129, 7000 + chain), 128);
     cache.endRequest(id);
   }
   storage.growthAllowed = [&](uint32_t) {
@@ -4776,7 +4757,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   };
   const KvPoolSnapshot before = pool.snapshot();
   const uint32_t attemptsBefore = storage.allocationAttempts;
-  const uint32_t blocksBefore = cache.snapshot().kvCache.blocks;
+  const uint32_t blocksBefore = cache.snapshot().pool.pagesPrefix;
   // The first chunk's 64 pages need 16 new extents; the budget has room for
   // 8, and evicting cached prefixes frees the other 32 pages.
   engine.submit(request(286, std::vector<uint32_t>(16 * 4 * 32 + 1, 286)));
@@ -4792,7 +4773,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
   // more, and a retry the free pages cover.
   require(storage.allocationAttempts - attemptsBefore ==
                   budgetExtents - cachedExtents + 1 &&
-              blocksBefore - cache.snapshot().kvCache.blocks == 32,
+              blocksBefore - cache.snapshot().pool.pagesPrefix == 32,
           "the denial was retried per evicted page or evicted more than it lacked");
 }
 
@@ -4803,7 +4784,7 @@ void testDeniedGrowthAllocatesEachExtentOnce() {
 void testGrowthBeyondTheBudgetFailsAtOnce() {
   test::TestKvStorage storage(4 * 32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, cache, executor, events);
@@ -4816,19 +4797,20 @@ void testGrowthBeyondTheBudgetFailsAtOnce() {
               events.failures == std::vector<std::string>{"capacity_exhausted"},
           "a request beyond the budget did not fail at once");
   require(after.extentAllocations == 8 && after.extentReleases == 0 &&
-              after.reclaimableExtents == 8,
+              after.reclaimableBytes == 8 * 4 * 4096,
           "the denied growth did not keep the extents it allocated");
 }
 
 // One reclaim pass releases every empty extent, however many there are,
-// and reports what is left: nothing for a target, no target otherwise.
+// and reports what is left: nothing after a critical pass, no target
+// otherwise. A pass short of critical keeps one extent as the runway.
 void testReclaimPassReleasesEveryEmptyExtent() {
   constexpr uint32_t extents = 200;
-  for (bool targeted : {true, false}) {
+  for (bool critical : {true, false}) {
     test::TestKvStorage storage(4 * extents, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
-    auto pages = pool.acquirePages(4 * extents, false);
+    engine::Cache cache(pool);
+    auto pages = pool.acquirePages(4 * extents);
     require(pages.granted(), "could not seed the KV extents");
     for (uint32_t page : pages.pages)
       pool.releasePage(page, false);
@@ -4836,17 +4818,13 @@ void testReclaimPassReleasesEveryEmptyExtent() {
     Events events;
     engine::Engine engine({}, cache, executor, events);
     guardReleases(storage, engine);
-    MemoryReclaimDirective directive{.reclaim = true};
-    if (targeted) {
-      directive.evictAllUnpinnedPrefixes = true;
-      directive.targetBytes = std::numeric_limits<uint64_t>::max();
-    }
-    const MemoryReclaimResult result = engine.reclaimMemory(directive);
-    require(result.outcome == (targeted ? ReclaimOutcome::Exhausted
+    const MemoryReclaimResult result = engine.reclaimMemory({.critical = critical});
+    const uint32_t kept = critical ? 0 : 1;
+    require(result.outcome == (critical ? ReclaimOutcome::Exhausted
                                         : ReclaimOutcome::Untargeted) &&
-                result.releasedBytes == uint64_t{extents} * 4 * 4096 &&
-                pool.snapshot().pagesAllocated == 0 &&
-                pool.snapshot().reclaimableExtents == 0,
+                result.releasedBytes == uint64_t{extents - kept} * 4 * 4096 &&
+                pool.snapshot().pagesAllocated == kept * 4 &&
+                pool.snapshot().reclaimableBytes == kept * 4 * 4096,
             "a pass did not release every empty extent or report what was left");
   }
 }
@@ -4858,8 +4836,8 @@ void testReclaimPassReleasesEveryEmptyExtent() {
 void testReclaimRefusesACommandInFlight() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
-  auto pages = pool.acquirePages(8, false);
+  engine::Cache cache(pool);
+  auto pages = pool.acquirePages(8);
   require(pages.granted(), "could not seed the KV extents");
   for (uint32_t page : pages.pages)
     pool.releasePage(page, false);
@@ -4872,11 +4850,10 @@ void testReclaimRefusesACommandInFlight() {
   guardReleases(storage, engine);
   engine.submit(request(289, {289}));
   require(engine.tick(1) && engine.commandInFlight() &&
-              pool.snapshot().reclaimableExtents == 1,
+              pool.snapshot().reclaimableBytes == 4 * 4096,
           "the prefill did not stay in flight beside an empty extent");
 
-  const MemoryReclaimDirective directive{.reclaim = true,
-                                         .evictAllUnpinnedPrefixes = true};
+  const MemoryReclaimDirective directive{.critical = true};
   bool refused = false;
   try {
     static_cast<void>(engine.reclaimMemory(directive));
@@ -4885,7 +4862,7 @@ void testReclaimRefusesACommandInFlight() {
   }
   require(refused && executor.reclaimableIdleStateBytes == 64 &&
               pool.snapshot().extentReleases == 0 &&
-              pool.snapshot().reclaimableExtents == 1,
+              pool.snapshot().reclaimableBytes == 4 * 4096,
           "a reclaim ran while a command was in flight");
 
   *executor.holdPrefillUntil = true;
@@ -4948,7 +4925,7 @@ struct ScatteredPages {
 
   test::TestKvStorage storage{16, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache cache{pool, CacheNamespace{}};
+  engine::Cache cache{pool};
   Executor model;
   Events events;
   engine::Engine engine{EngineConfig{}, cache, model, events};
@@ -4973,7 +4950,7 @@ void testStateStartGathersFreePagesBeforeEvicting() {
   require(events.startIds.back() == 5 && fixture.storage.copies.size() == 1 &&
               fixture.storage.copies[0].from == 8 && fixture.storage.copies[0].to == 2 &&
               started.pool.extentCompactions == 1 && started.pool.extentReleases == 1 &&
-              started.kvCache.blocks >= cached.kvCache.blocks &&
+              started.pool.pagesPrefix >= cached.pool.pagesPrefix &&
               started.stateCache.entries >= cached.stateCache.entries,
           "the lane's start evicted instead of gathering the free pages");
   const PageTableView moved = cache.pageTable(4);
@@ -5023,7 +5000,7 @@ void testAllocationCausesRemainDistinct() {
                         metal::AllocationFailure::DriverRejected}) {
       test::TestKvStorage storage(8, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache cache(pool, CacheNamespace{});
+      engine::Cache cache(pool);
       Executor executor(1);
       Events events;
       engine::Engine engine({}, cache, executor, events);
@@ -5060,7 +5037,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
   for (bool sharePrefix : {false, true}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(2);
     executor.unblockGrowthOnSuspend = false;
     executor.kvGrowthBlocked = &storage.growthBlocked;
@@ -5134,7 +5111,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
 void testFailedResumeRestoreKeepsTheKvTarget() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -5165,8 +5142,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   executor.restoreControl->ready = true;
   executor.restoreControl->success = false;
   static_cast<void>(engine.tick(104));
-  static_cast<void>(engine.reclaimMemory(
-      {.reclaim = true, .evictAllUnpinnedPrefixes = true}));
+  static_cast<void>(engine.reclaimMemory({.critical = true}));
   require(cache.snapshot().stateCache.entries == 0 && pool.snapshot().pagesAllocated == 0 &&
               engine.snapshot().resourceResumptions == 0,
           "fixture did not release the failed resumption's memory");
@@ -5193,7 +5169,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -5233,7 +5209,7 @@ void testAdmissionReopensAfterLastSuspendedRequestResumes() {
 void testAdmissionRespectsPriorityBeforeHashOrder() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5311,7 +5287,7 @@ struct SuspendedBesideAMaskWait {
 
   test::TestKvStorage storage{64, 4096, 4};
   KvPool pool{storage, 0};
-  engine::Cache resources{pool, CacheNamespace{}};
+  engine::Cache resources{pool};
   Executor executor;
   Events events;
   bool paused = false;
@@ -5410,7 +5386,7 @@ void testRecoveryDrainEndsWhenAResidentReleasesMemory() {
     test::TestKvStorage storage(32, 4096, 4);
     storage.budgetPages = 16;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     Events events;
     EngineConfig config;
@@ -5486,7 +5462,7 @@ void testForegroundArrivalPreemptsWhenCellsAreFull() {
   for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -5533,7 +5509,7 @@ void testForegroundArrivalPreemptsWhenCellsAreFull() {
 void testRefusedHigherPriorityStartPreemptsLowerResident() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   executor.beginGrowthBlocked = [&] {
@@ -5570,7 +5546,7 @@ void testRefusedHigherPriorityStartPreemptsLowerResident() {
 void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -5617,7 +5593,7 @@ void testRequestBelowARunningPriorityTakesNoLane() {
   for (const bool recovering : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -5668,7 +5644,7 @@ void testRequestBelowARunningPriorityTakesNoLane() {
 void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5687,7 +5663,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5707,7 +5683,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5727,7 +5703,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
 void testUnansweredVerifyMaskFailsOnlyItsRequest() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5770,7 +5746,7 @@ void testUnansweredInitialMaskFails() {
   for (const bool answered : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5802,7 +5778,7 @@ void testUnansweredInitialMaskFails() {
 void testDecodeNearContextCeilingCoversVerifyRows() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   executor.decodeFinishes = false;
   Events events;
@@ -5825,7 +5801,7 @@ void testDecodeNearContextCeilingCoversVerifyRows() {
 void testExpiredMaskWaitFinalizesWhileAnotherCommandRuns() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -5859,7 +5835,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
   for (WorkKind heldKind : {WorkKind::Prefill, WorkKind::Decode}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     Events events;
     engine::Engine engine({}, resources, executor, events);
@@ -5898,7 +5874,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
             "expired ordinary command emitted output or lost its deadline");
     const auto after = resources.snapshot();
     require(after.stateCache.publications == before.stateCache.publications &&
-                after.kvCache.blocks == before.kvCache.blocks &&
+                after.pool.pagesPrefix == before.pool.pagesPrefix &&
                 after.pool.pagesActive == 0 && after.activeRequests == 0,
             "expired ordinary command published cache state or leaked resources");
   }
@@ -5907,7 +5883,7 @@ void testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput() {
 void testStalledSuspensionFailsWithCapacity() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.kvGrowthBlocked = &storage.growthBlocked;
   executor.unblockGrowthOnSuspend = false;
@@ -5936,7 +5912,7 @@ void testTerminalAnchorWithoutKvIsNotCached() {
   for (uint32_t withoutKv : {1U, 0U}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.decodeTokensWithoutKv = withoutKv;
     Events events;
@@ -5949,7 +5925,7 @@ void testTerminalAnchorWithoutKvIsNotCached() {
     runUntilIdle(engine);
     require(events.completedCount == 1 && events.emitted == 1,
             "terminal anchor request did not complete");
-    require(resources.snapshot().kvCache.blocks == (withoutKv ? 0U : 1U),
+    require(resources.snapshot().pool.pagesPrefix == (withoutKv ? 0U : 1U),
             "token without a KV row changed the cached block count");
   }
 }
@@ -5958,7 +5934,7 @@ void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor(1);
     executor.prefillAnchor = stop;
     Events events;
@@ -5980,7 +5956,7 @@ void testPrefillCanCompleteTheRequest() {
 void testOutOfVocabularyOutputFailsLaneOnly() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor model;
   Events events;
   EngineConfig config;
@@ -6022,7 +5998,7 @@ void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
 void testCancelledColdPrefillResumesItsLatestCheckpoint() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6051,7 +6027,7 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
 void testConcurrentProgressRetainsAtMostOnePointPerLane() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6080,7 +6056,7 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
 void testSharedCheckpointSurvivesPeerRollingReplacement() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6107,7 +6083,7 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
 void testRepeatedRetriesRollTheRestoredCheckpoint() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6135,7 +6111,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
 void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6166,7 +6142,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
     for (uint32_t suffix : {1U, 31U}) {
       test::TestKvStorage storage(1024, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache resources(pool, CacheNamespace{});
+      engine::Cache resources(pool);
       Executor executor(1);
       if (disk) {
         executor.deniedSnapshots = 1000;
@@ -6211,7 +6187,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
 void testRetryRetiresCheckpointAtDeeperJunction() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
@@ -6232,7 +6208,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   resources.beginRequest(999);
   require(resources.ensureTokens(999, branch.size()).granted(), "branch fixture KV failed");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(999, branch, static_cast<uint32_t>(branch.size())),
+      test::publishBlocks(resources, 999, branch, static_cast<uint32_t>(branch.size())),
       std::make_shared<State>());
   resources.endRequest(999);
   engine.submit(request(531, prompt));
@@ -6251,7 +6227,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
 void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6282,7 +6258,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6308,7 +6284,7 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
 void testRollingHandleCannotRetirePromotedState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6334,7 +6310,7 @@ void testRollingHandleCannotRetirePromotedState() {
 void testCheckpointDenialPreservesUnrelatedHotState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6358,7 +6334,7 @@ void testCheckpointDenialPreservesUnrelatedHotState() {
 void testCheckpointRecyclesItsBufferBeforeReplacement() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6382,7 +6358,7 @@ void testCheckpointRecyclesItsBufferBeforeReplacement() {
 void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
@@ -6403,14 +6379,14 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
   runUntilIdle(engine);
   require(executor.snapshotAttempts == 0 &&
               engine.snapshot().checkpointPublications == 0 &&
-              resources.snapshot().kvCache.blocks == 6144 / KvCache::pageTokens,
+              resources.snapshot().pool.pagesPrefix == 6144 / KvCache::pageTokens,
           "cancellation published a checkpoint from the draining command");
 }
 
 void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6439,7 +6415,7 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
 void testJunctionRetiresEarlierProgressPoint() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6454,7 +6430,7 @@ void testJunctionRetiresEarlierProgressPoint() {
   require(resources.ensureTokens(470, branch.size()).granted(),
           "junction fixture could not allocate its KV prefix");
   resources.publishCompositeState(
-      resources.publishCommittedBlocks(470, branch, static_cast<uint32_t>(branch.size())),
+      test::publishBlocks(resources, 470, branch, static_cast<uint32_t>(branch.size())),
       std::make_shared<State>());
   resources.endRequest(470);
   engine.submit(request(471, prompt));
@@ -6474,7 +6450,7 @@ void testJunctionRetiresEarlierProgressPoint() {
 void testShortSuffixContinuesCheckpointDraftState() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6498,7 +6474,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
 void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6514,7 +6490,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   const auto committed = engine.snapshot();
   require(!engine.commandInFlight() && executor.prefillRows == 22528 &&
               executor.requests.at(600).position == 22528 &&
-              committed.resources.kvCache.blocks == 22528 / KvCache::pageTokens,
+              committed.resources.pool.pagesPrefix == 22528 / KvCache::pageTokens,
           "fixture did not commit 22528 prompt tokens before cancellation");
   require(committed.checkpointPublications == 5 &&
               committed.checkpointPublicationFailures == 0 &&
@@ -6556,7 +6532,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
 void testCheckpointIntervalValidationAndDisable() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   for (uint32_t invalid : {1U, 2047U, 2049U}) {
@@ -6585,7 +6561,7 @@ void testCheckpointIntervalValidationAndDisable() {
 void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -6631,7 +6607,7 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
 void testDecodeShareValidation() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(1);
   Events events;
   for (double invalid : {-0.5, std::numeric_limits<double>::infinity(),
@@ -6658,7 +6634,7 @@ void testDecodeShareValidation() {
 void testStateWithoutACacheSlotGoesToDisk() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6732,7 +6708,7 @@ void testStateWithoutACacheSlotGoesToDisk() {
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6755,8 +6731,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
   const auto counters = engine.snapshot();
   require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
               counters.replayStatePublications == 1 &&
-              counters.deduplicatedStatePublications == 1 &&
-              counters.resources.stateCache.deduplicatedPublications == 1,
+              counters.deduplicatedStatePublications == 1,
           "a state already on disk was counted as written");
 }
 
@@ -6766,7 +6741,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
 void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor(1);
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
@@ -6818,7 +6793,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
   for (bool cancel : {true, false}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     executor.deniedSnapshots = 1000;
     executor.stateTier = std::make_shared<OffloadControl>();
@@ -6886,7 +6861,7 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
     for (uint32_t remaining : {32u, chunk - 32, chunk}) {
       test::TestKvStorage storage(512, 4096, 4);
       KvPool pool(storage, 0);
-      engine::Cache cache(pool, CacheNamespace{});
+      engine::Cache cache(pool);
       Executor executor;
       executor.deniedSnapshots = denyRam ? 1000 : 0;
       executor.stateTier = std::make_shared<OffloadControl>();
@@ -6928,7 +6903,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor(1);
     executor.deniedSnapshots = disk ? 1000 : 0;
     executor.stateTier = std::make_shared<OffloadControl>();
@@ -6984,7 +6959,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
   for (bool paused : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400, .growthPaused = [paused] { return paused; }},
@@ -6994,7 +6969,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     auto writing = std::make_shared<OffloadControl>();
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-    const auto held = cache.publishCommittedBlocks(999, std::vector<uint32_t>(64, 12), 64);
+    const auto held = test::publishBlocks(cache, 999, std::vector<uint32_t>(64, 12), 64);
     require(cache.publishStateToDisk(held, [&](std::function<void()>) {
               return std::make_unique<OffloadTicket>(writing);
             }),
@@ -7003,8 +6978,7 @@ void testGrowthWaitsForTheStateWriteInFlight() {
     auto cached = std::make_shared<OffloadControl>();
     cache.beginRequest(998);
     require(cache.ensureTokens(998, 64).granted(), "fixture KV failed");
-    const auto cachedBlock =
-        cache.publishCommittedBlocks(998, std::vector<uint32_t>(64, 13), 64);
+    const auto cachedBlock = test::publishBlocks(cache, 998, std::vector<uint32_t>(64, 13), 64);
     cache.publishCompositeState(cachedBlock, std::make_shared<OffloadState>(cached));
     cache.endRequest(998);
     // Every further page needs an extent the budget, or the host, refuses.
@@ -7040,7 +7014,7 @@ void cacheBlocksUnderDiskStates(engine::Cache &cache, uint32_t count) {
     std::vector<uint32_t> prompt(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    const auto block = cache.publishCommittedBlocks(id, prompt, 32);
+    const auto block = test::publishBlocks(cache, id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -7059,7 +7033,7 @@ void testWaitingLaneAlwaysNamesAWakeup() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7100,7 +7074,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -7133,7 +7107,7 @@ void testWaitingPlanDoesNotIdleRunnableLanes() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7171,7 +7145,7 @@ void testNothingInFlightIsNotPending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.writableFile = false;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7185,7 +7159,7 @@ void testNothingInFlightIsNotPending() {
       cache.endRequest(id);
       break;
     }
-    static_cast<void>(cache.publishCommittedBlocks(id, prompt, 32));
+    cache.publishCommittedBlocks(id, prompt, 32);
     cache.endRequest(id);
   }
   engine.submit(request(1, std::vector<uint32_t>(97, 7)));
@@ -7205,7 +7179,7 @@ void testPageShortfallDemotesInBulk() {
   test::TestKvTier tier;
   tier.transferLimit = 8;
   tier.capacity = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7241,7 +7215,7 @@ void testPageShortfallDemotesInBulk() {
 void testKvGrowthProceedsThroughDemotion() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7249,7 +7223,7 @@ void testKvGrowthProceedsThroughDemotion() {
   auto transfer = std::make_shared<OffloadControl>();
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 32).granted(), "offload fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, std::vector<uint32_t>(32, 12), 32);
+  const auto block = test::publishBlocks(cache, 999, std::vector<uint32_t>(32, 12), 32);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   {
@@ -7285,7 +7259,7 @@ void demoteState(engine::Cache &cache, uint64_t block) {
 void publishDiskState(engine::Cache &cache, const std::vector<uint32_t> &prompt) {
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "disk fixture KV allocation failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
 }
 
@@ -7293,7 +7267,7 @@ void testAsyncRestoreLifecycle() {
   for (int outcome = 0; outcome < 4; ++outcome) {
     test::TestKvStorage storage(128, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     Events events;
     engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7336,7 +7310,7 @@ void testAsyncRestoreLifecycle() {
 void testDiskHitWithNoActiveMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7354,7 +7328,7 @@ void testDiskHitWithNoActiveMemory() {
 void testRepeatedDiskHitPromotesToMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7367,7 +7341,7 @@ void testRepeatedDiskHitPromotesToMemory() {
     runUntilIdle(engine);
   }
   require(executor.diskReads == 1 && cache.snapshot().stateCache.promotions == 1 &&
-              cache.snapshot().stateCache.diskHits == 1 && events.failedCount == 0,
+              cache.snapshot().lookup.stateDiskHits == 1 && events.failedCount == 0,
           "hot restored prefix continued to read from disk");
 }
 
@@ -7376,7 +7350,7 @@ void testRepeatedDiskHitPromotesToMemory() {
 void testFailedDiskRestoreKeepsShallowerState() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7384,7 +7358,7 @@ void testFailedDiskRestoreKeepsShallowerState() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  static_cast<void>(cache.publishCommittedBlocks(999, prompt, 64));
+  cache.publishCommittedBlocks(999, prompt, 64);
   demoteState(cache, cache.blockAt(999, 64));
   cache.publishCompositeState(cache.blockAt(999, 32), std::make_shared<State>());
   cache.endRequest(999);
@@ -7405,7 +7379,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7415,7 +7389,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   transfer->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
@@ -7426,7 +7400,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(cache.snapshot().kvCache.blocks == 0 && cache.snapshot().kvTier.diskBlocks == 2,
+  require(cache.snapshot().pool.pagesPrefix == 0 && cache.snapshot().kvTier.diskBlocks == 2,
           "prefix did not move to disk whole");
 
   engine.submit(request(1, prompt));
@@ -7448,7 +7422,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
           "restored prefix was not used");
   const auto stats = cache.snapshot();
   require(stats.kvTier.restores == 2 &&
-              stats.kvCache.blocks == 2 && stats.kvTier.diskBlocks == 2,
+              stats.pool.pagesPrefix == 2 && stats.kvTier.diskBlocks == 2,
           "restore accounting is off");
 }
 
@@ -7459,7 +7433,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
 void testSharedPrefillWaitsForARestoringProducer() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7490,7 +7464,7 @@ void testSharedPrefillWaitsForARestoringProducer() {
 void testCancelledRestoringProducerReleasesItsWaiter() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7529,7 +7503,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7541,7 +7515,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   transfer->ready = true;
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 64);
+  const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer));
   cache.endRequest(999);
   require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
@@ -7609,7 +7583,7 @@ void testSkipCacheCandidateIsNotProbed() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7618,7 +7592,7 @@ void testSkipCacheCandidateIsNotProbed() {
   const std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "KV block was not written");
@@ -7655,7 +7629,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
     test::TestKvStorage storage(64, 4096, 1);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache cache(pool, CacheNamespace{}, written ? &tier : nullptr);
+    engine::Cache cache(pool, written ? &tier : nullptr);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -7669,7 +7643,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
     if (written) {
       cache.beginRequest(998);
       require(cache.ensureTokens(998, 32).granted(), "fixture KV failed");
-      demoteState(cache, cache.publishCommittedBlocks(998, std::vector<uint32_t>(33, 5), 32));
+      demoteState(cache, test::publishBlocks(cache, 998, std::vector<uint32_t>(33, 5), 32));
       cache.endRequest(998);
     }
     // The Background lane's three pages fill the engine's limit.
@@ -7716,7 +7690,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
 void testRestoringRequestIsNotWaitingForMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache cache(pool, CacheNamespace{});
+  engine::Cache cache(pool);
   Executor executor;
   bool hostRefuses = true;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
@@ -7747,7 +7721,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 1;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7755,7 +7729,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   const std::vector<uint32_t> prompt(129, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
-  const auto block = cache.publishCommittedBlocks(999, prompt, 128);
+  const auto block = test::publishBlocks(cache, 999, prompt, 128);
   demoteState(cache, block);
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
@@ -7780,7 +7754,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
               stats.stateCache.pinned == 0 && stats.activeRequests == 0 &&
               executor.requests.empty() && !events.outputs.contains(1),
           "cancelled prefix read unused pages or retained active resources");
-  require(stats.kvTier.diskBlocks == 4 && stats.kvCache.blocks == 1,
+  require(stats.kvTier.diskBlocks == 4 && stats.pool.pagesPrefix == 1,
           "cancellation destroyed reusable disk pages");
   executor.restoreControl = std::make_shared<RestoreControl>();
   executor.restoreControl->ready = true;
@@ -7803,7 +7777,7 @@ void testPagesReturnFromDemotionWithoutSuspending() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7852,7 +7826,7 @@ void testRefusedRestoreClosesAdmission() {
     KvPool pool(storage, 0);
     test::TestKvTier tier;
     tier.transferLimit = 8;
-    engine::Cache cache(pool, CacheNamespace{}, &tier);
+    engine::Cache cache(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     executor.restoreControl->ready = true;
@@ -7863,7 +7837,7 @@ void testRefusedRestoreClosesAdmission() {
     const std::vector<uint32_t> prompt(65, 17);
     cache.beginRequest(999);
     require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-    demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+    demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
     cache.endRequest(999);
     for (uint32_t written = 1; written <= 2; ++written) {
       require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
@@ -7877,8 +7851,8 @@ void testRefusedRestoreClosesAdmission() {
       for (uint64_t id = 900; id < 904; ++id) {
         cache.beginRequest(id);
         require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-        demoteState(cache, cache.publishCommittedBlocks(
-                               id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+        demoteState(cache, test::publishBlocks(
+                               cache, id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
         cache.endRequest(id);
       }
     }
@@ -7937,7 +7911,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -7946,7 +7920,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   std::vector<uint32_t> prompt(97, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 96).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 96));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 3; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -7961,7 +7935,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -7991,6 +7965,68 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
           "resource retries lost or repeated completed KV restores");
 }
 
+// An admission that gives back the lane and leases it took in the same pass
+// returns nothing waiting requests lacked before, so it is no progress: a
+// restore whose pages wait behind a demotion that never lands fails at the
+// limit of its first refused attempt instead of moving it out on every
+// retry.
+void testRolledBackAdmissionKeepsItsWaitLimit() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage(12, 4096, 4);
+  storage.budgetPages = 8;
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  engine::Cache cache(pool, &tier);
+  Executor executor;
+  Events events;
+  engine::Engine engine({.maxContext = 102400}, cache, executor, events);
+  guardReleases(storage, engine);
+  // A three-block prefix and its state move to disk entirely.
+  std::vector<uint32_t> prompt(97, 17);
+  cache.beginRequest(999);
+  require(cache.ensureTokens(999, 96).granted(), "fixture KV failed");
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
+  cache.endRequest(999);
+  for (uint32_t written = 1; written <= 3; ++written) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+            "prefix block was not written");
+    tier.complete();
+    require(cache.pollTransfers(), "prefix block did not land");
+  }
+  // Six cached blocks under disk states hold six of the eight pages.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  for (uint64_t id = 900; id < 906; ++id) {
+    std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
+                                std::make_shared<OffloadState>(transfer));
+    cache.endRequest(id);
+    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+            "filler state was not demoted");
+  }
+  require(pool.freePageCount() == 2, "fixture pages are off");
+
+  // The demotion that would free the restore's third page never lands.
+  tier.transferLimit = 1;
+  EngineRequest waiting = request(1, prompt);
+  waiting.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(waiting));
+  constexpr double firstAttempt = 1.0;
+  double failedAt = 0.0;
+  for (double now = firstAttempt; now < firstAttempt + 40000.0 && !events.failedCount;
+       now += 100.0) {
+    static_cast<void>(engine.tick(now));
+    failedAt = now;
+  }
+  require(events.failures == std::vector<std::string>{"resource_timeout"} &&
+              failedAt - firstAttempt >= 30000.0 && failedAt - firstAttempt <= 30200.0 &&
+              executor.suspensions == 0,
+          "a rolled-back admission moved its own wait limit out");
+}
+
 // Pages that land while a command runs keep a waiting lane past its limit
 // until its next attempt, after the command. Until then that limit is no
 // wake-up: tick() does not act on it, and the native loop would poll
@@ -8003,7 +8039,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   test::TestKvTier tier;
   tier.capacity = 64;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8013,7 +8049,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   std::vector<uint32_t> prompt(257, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 256).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 256));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 256));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 8; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8028,7 +8064,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     std::vector<uint32_t> filler(32, static_cast<uint32_t>(id));
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "filler KV failed");
-    cache.publishCompositeState(cache.publishCommittedBlocks(id, filler, 32),
+    cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer));
     cache.endRequest(id);
     require(cache.reclaimOneState(false, 0, false) && cache.pollTransfers(),
@@ -8090,7 +8126,7 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8102,8 +8138,8 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   for (uint64_t id = 900; id < 904; ++id) {
     cache.beginRequest(id);
     require(cache.ensureTokens(id, 32).granted(), "fixture KV failed");
-    demoteState(cache, cache.publishCommittedBlocks(
-                           id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
+    demoteState(cache, test::publishBlocks(
+                           cache, id, std::vector<uint32_t>(32, static_cast<uint32_t>(id)), 32));
     cache.endRequest(id);
   }
   // Request 1's first command needs seven of the eight pages; its last needs
@@ -8148,7 +8184,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   KvPool pool(storage, 0);
   test::TestKvTier tier;
   tier.transferLimit = 8;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   Events events;
   engine::Engine engine({.maxContext = 102400}, cache, executor, events);
@@ -8157,7 +8193,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8200,7 +8236,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
-  engine::Cache cache(pool, CacheNamespace{}, &tier);
+  engine::Cache cache(pool, &tier);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8210,7 +8246,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   std::vector<uint32_t> prompt(65, 17);
   cache.beginRequest(999);
   require(cache.ensureTokens(999, 64).granted(), "fixture KV failed");
-  demoteState(cache, cache.publishCommittedBlocks(999, prompt, 64));
+  demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
     require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
@@ -8256,7 +8292,7 @@ void testRunningRequestKeepsItsReplayPoint() {
   test::TestKvStorage storage(16, 4096, 4);
   storage.budgetPages = 12;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8307,7 +8343,7 @@ void testRunningRequestKeepsItsReplayPoint() {
 void testSuspendedRequestKeepsItsReplayPoint() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(3);
   executor.decodeFinishes = false;
   Events events;
@@ -8370,7 +8406,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   test::TestKvStorage storage(8, 4096, 2);
   storage.budgetPages = 6;
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8438,7 +8474,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
 void testRestoredHistoryCheckpointStaysDisposable() {
   test::TestKvStorage storage(64, 4096, 1);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8497,7 +8533,7 @@ void testRestoredHistoryCheckpointStaysDisposable() {
 void testSharedReplayPointCountsEachRequest() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8527,7 +8563,7 @@ void testSharedReplayPointCountsEachRequest() {
 void testRestoredEndpointIsInUse() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -8558,7 +8594,7 @@ void testRestoredEndpointIsInUse() {
 void testReplayPointRecyclesAnOlderPointInUse() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.decodeFinishes = false;
   Events events;
@@ -8595,7 +8631,7 @@ void testReplayPointRecyclesAnOlderPointInUse() {
 void testWarningShrinkKeepsTheFinishedPoint() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   Events events;
   engine::Engine engine({}, resources, executor, events);
@@ -8618,10 +8654,8 @@ void testWarningShrinkKeepsTheFinishedPoint() {
               resources.snapshot().stateCache.inUse == 1,
           "the fixture did not cache three replay points, one in use");
 
-  static_cast<void>(engine.reclaimMemory({.reclaim = true,
-                                          .targetBytes = std::numeric_limits<uint64_t>::max(),
-                                          .keepResumePoint = true,
-                                          .keepServingFootprint = true}));
+  static_cast<void>(engine.reclaimMemory(
+      {.targetBytes = std::numeric_limits<uint64_t>::max(), .keepResumePoint = true}));
   const auto cachedTokens = [&](uint32_t token) {
     std::vector<uint32_t> next(65, token);
     next.resize(80, 9);
@@ -8645,7 +8679,7 @@ void testHeldBackStartTakesNothingInUse() {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
-    engine::Cache resources(pool, CacheNamespace{}, &tier);
+    engine::Cache resources(pool, &tier);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -8657,7 +8691,7 @@ void testHeldBackStartTakesNothingInUse() {
       // budget holds no extent beyond the one the running lane fills.
       resources.beginRequest(999);
       require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
-      demoteState(resources, resources.publishCommittedBlocks(999, held, 64));
+      demoteState(resources, test::publishBlocks(resources, 999, held, 64));
       resources.endRequest(999);
       for (uint32_t written = 1; written <= 2; ++written) {
         require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
@@ -8725,7 +8759,7 @@ void testHeldBackStartTakesNothingInUse() {
 void testLaneThatWouldYieldTakesNothingInUse() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
   Events events;
@@ -8775,7 +8809,7 @@ void testEveryEndReleasesTheReplayPoint() {
     if (end == End::Capacity)
       storage.budgetPages = 3;
     KvPool pool(storage, 0);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.decodeFinishes = false;
     Events events;
@@ -8816,7 +8850,7 @@ void testWaitingEndsReleaseTheReplayPoint() {
                         End::CancelAfterFailedRead}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
-    engine::Cache cache(pool, CacheNamespace{});
+    engine::Cache cache(pool);
     Executor executor;
     executor.deniedSnapshots = 1000;
     executor.stateTier = std::make_shared<OffloadControl>();
@@ -8895,6 +8929,7 @@ int main() {
     testRestoringLaneWaitsForResidentLanes();
     testRestoreCompletesWhileAConstrainedLaneDecodes();
     testWaitWithProgressOutlivesTheResourceLimit();
+    testRolledBackAdmissionKeepsItsWaitLimit();
     testLimitOutlivedByProgressDoesNotWakeTheLoop();
     testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen();
     testDiskKvPrefixIsRestoredBeforeTheLaneRuns();

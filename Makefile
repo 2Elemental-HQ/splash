@@ -243,6 +243,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp \
 	runtime/engine/MemoryGovernor.cpp \
+	runtime/engine/MemoryControl.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/KvPageTier.cpp \

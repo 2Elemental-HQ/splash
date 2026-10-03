@@ -1,7 +1,9 @@
 #include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestMetalMemory.hpp"
 #include "engine/Cache.hpp"
+#include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
 
@@ -230,7 +232,7 @@ void runUntilIdle(engine::NativeRuntime &loop) {
 void testPromptProgress() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -335,7 +337,7 @@ void testPromptProgress() {
 void testWireLifecycleAndCacheHit() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -411,7 +413,7 @@ void testWireLifecycleAndCacheHit() {
 void testGenerationPromptBoundsTheReplayState() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   double monotonic = 100.0;
@@ -447,7 +449,7 @@ void testGenerationPromptBoundsTheReplayState() {
 void testRequestFlagsReachTheModel() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   double monotonic = 100.0;
   engine::NativeLoopConfig config;
@@ -476,7 +478,7 @@ void testRequestFlagsReachTheModel() {
 void testSamplingReachesTheModel() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   double monotonic = 100.0;
   engine::NativeLoopConfig config;
@@ -516,7 +518,7 @@ void testSamplingReachesTheModel() {
 void testFatalFramingClosesConnection() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 8);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeRuntime loop(
@@ -538,7 +540,7 @@ void testFatalFramingClosesConnection() {
 void testRequestErrorKeepsFraming() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -604,7 +606,7 @@ void testCapacityFailureHasOneTerminalFrame() {
   test::TestKvStorage storage(4, 4096, 1);
   storage.budgetPages = 1;
   KvPool pool(storage, 1);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -660,7 +662,7 @@ void testCommandWatchdogAndPendingHealthWake() {
   for (bool gpuCompleted : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
     double now = 0.0;
@@ -722,7 +724,7 @@ void testCommandWatchdogAndPendingHealthWake() {
 
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
@@ -736,7 +738,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   for (bool malformed : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     protocol::ProtocolLimits limits;
@@ -777,7 +779,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 void testCancelledIdIsReusableInTheSameInput() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeRuntime loop(
@@ -820,7 +822,7 @@ void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeRuntime loop(
@@ -862,7 +864,7 @@ void testFrameFailureUsesExecutionBoundary() {
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
@@ -909,7 +911,7 @@ void testFrameFailureUsesExecutionBoundary() {
 void testInvalidLimitsAreRejectedAtConstruction() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 8);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   protocol::ProtocolLimits limits;
   limits.maxMaskWords = 0;
@@ -930,7 +932,7 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 void testAdmissionExceptionStopsTheEngineOnce() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.onBegin = [] { throw std::runtime_error("begin failed"); };
   std::vector<uint8_t> output;
@@ -966,7 +968,7 @@ void testEngineFailureNamesItsReason() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     const std::system_error closed(EPIPE, std::generic_category(),
                                    "write(native output)");
@@ -993,7 +995,7 @@ void testEngineFailureNamesItsReason() {
   {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeRuntime loop(
@@ -1035,7 +1037,7 @@ void testEngineFailureNamesItsReason() {
 void testInvalidPromptTokensStayRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1083,7 +1085,7 @@ void testInvalidPromptTokensStayRequestScoped() {
 uint64_t announcedFeatures(uint32_t maxImagePatches) {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1119,7 +1121,7 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
 void testImageRequestWithoutVisionStaysRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1163,7 +1165,7 @@ void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
     std::vector<uint8_t> output;
@@ -1226,7 +1228,7 @@ protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
 void testScoreRequestCompletesAfterFullPrompt() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
@@ -1271,7 +1273,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
 void testCancelledScoreReturnsEmptyLogits() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
   std::vector<uint8_t> output;
@@ -1332,7 +1334,7 @@ struct ScoreBesideChat final {
 ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
-  engine::Cache resources(pool, CacheNamespace{});
+  engine::Cache resources(pool);
   Executor executor;
   if (invalidScore)
     executor.invalidScores.insert(21);
@@ -1363,7 +1365,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   runUntilIdle(loop);
 
   ScoreBesideChat result;
-  result.publishedBlocks = resources.snapshot().kvCache.blocks;
+  result.publishedBlocks = resources.snapshot().pool.pagesPrefix;
   result.healthy = loop.engineHealthy() && !loop.connectionMustClose();
   result.slotsReleased = !executor.holdsSlot(21) && !executor.holdsSlot(22);
   result.scoreChunks = executor.prefillChunks[21];
@@ -1442,12 +1444,13 @@ void testConstrainedMaskExchange() {
         Reply::AfterTimeout}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
-    engine::Cache resources(pool, CacheNamespace{});
+    engine::Cache resources(pool);
     Executor executor;
     std::vector<uint8_t> output;
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
-    config.maskWordsPerToken = 2;
+    // Three mask words per token; the prompt's tokens stay in vocabulary.
+    config.engine.vocabularySize = 96;
     double now = 100.0;
     engine::NativeRuntime loop(
         config, resources, executor,
@@ -1478,16 +1481,16 @@ void testConstrainedMaskExchange() {
         asked = *event;
     }
     require(asked && asked->requestId == 7 && asked->maskRequestId &&
-                asked->wordsPerMask == 2 && asked->simulationTokens.empty(),
+                asked->wordsPerMask == 3 && asked->simulationTokens.empty(),
             "constrained request did not ask for one initial mask row");
 
-    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0}};
+    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0, 0}};
     if (reply == Reply::WrongMaskId)
       ++response.maskRequestId;
     if (reply == Reply::WrongWordCount)
       response.maskWords.push_back(0);
     if (reply == Reply::EmptyRow)
-      response.maskWords = {0, 0};
+      response.maskWords = {0, 0, 0};
     if (reply == Reply::AfterCancel) {
       send(protocol::CancelFrame{7});
       runUntilIdle(loop);
@@ -1551,6 +1554,91 @@ void testConstrainedMaskExchange() {
   }
 }
 
+// Between commands the control pass runs what the host's pressure asks for:
+// a paced pass toward the recovery margin, which keeps the resume point and
+// the empty runway extent; nothing once the host recovers; and under critical
+// pressure every cache entry and extent. None waits for a transfer.
+void testControlPassReclaimsUnderHostPressure() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool);
+  Executor executor;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor, [](std::span<const uint8_t>) {},
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  loop.announceReady();
+  // Two finished requests with different prompts leave two replay states.
+  for (uint64_t id : {1, 2}) {
+    auto input = request(id);
+    for (uint32_t &token : input.promptTokens)
+      token += static_cast<uint32_t>(100 * id);
+    auto wire = protocol::serializeMessage(protocol::Message{input});
+    require(wire && loop.receive(*wire.value), "control pass request failed");
+    runUntilIdle(loop);
+  }
+  require(resources.snapshot().stateCache.entries == 2,
+          "the fixture did not cache two replay states");
+
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  std::optional<uint64_t> available = hostReserve + kHostWarningMarginBytes / 2;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
+                          [&available] { return available; });
+  MemoryControl control(governor, backend, loop);
+  require(!control.run(MemoryPressure::Normal), "a paced pass waited for a transfer");
+  const auto paced = resources.snapshot();
+  require(paced.stateCache.entries == 1 && paced.stateCache.evictions == 1 &&
+              paced.pool.reclaimableBytes == 4 * 4096,
+          "host pressure did not evict toward its target, keeping the resume "
+          "point and the runway extent");
+
+  available = hostReserve + kHostRecoveryMarginBytes + kHostWarningMarginBytes;
+  const uint64_t releases = pool.snapshot().extentReleases;
+  // The host's recovery lifts the pressure, so no pass runs: the untargeted
+  // pass the settle window would otherwise run finds nothing to take either.
+  require(!control.run(MemoryPressure::Normal) &&
+              governor.snapshot().pressure == MemoryPressure::Normal &&
+              resources.snapshot().stateCache.entries == 1 &&
+              pool.snapshot().extentReleases == releases,
+          "a recovered host still reclaimed");
+
+  require(!control.run(MemoryPressure::Critical), "a critical pass waited for a transfer");
+  const auto critical = resources.snapshot();
+  require(critical.stateCache.entries == 0 && critical.pool.pagesPrefix == 0 &&
+              critical.pool.pagesAllocated == 0,
+          "critical pressure did not empty the cache and release every extent");
+}
+
+// The reporter logs a change in what requests wait for, never a retry or the
+// depth of a queue.
+void testMemoryStatusReporterLogsTransitionsOnly() {
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                            .restoring = 1, .suspended = 1,
+                            .oldestWaitMilliseconds = 1250.0, .draining = true};
+  MemoryStatusReporter reporter;
+  require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");
+  require(!reporter.update(wait, false).empty(), "pressure transition was silent");
+  ++wait.memory;
+  wait.oldestWaitMilliseconds += 1000;
+  require(reporter.update(wait, false).empty(), "pressure retries flooded the log");
+  wait = {};
+  wait.concurrency = 4;
+  require(!reporter.update(wait, true).empty(), "end of memory wait was silent");
+  require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
+  // The refused request is deferred for scheduling, out of the memory
+  // count, while it still holds the others back.
+  wait.heldBehindRefusal = 2;
+  const std::string held = reporter.update(wait, true);
+  require(held.find("held=2") != std::string::npos &&
+              held.find("cleared") == std::string::npos,
+          "requests held behind a refusal were reported as no wait");
+}
+
 } // namespace
 
 int main() {
@@ -1579,6 +1667,8 @@ int main() {
     testCancelledScoreReturnsEmptyLogits();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
+    testControlPassReclaimsUnderHostPressure();
+    testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -32,21 +32,18 @@ public:
   CompositeStateLease &operator=(CompositeStateLease &&other) noexcept;
   ~CompositeStateLease() noexcept;
 
-  [[nodiscard]] explicit operator bool() const noexcept {
-    return owner_ != nullptr;
-  }
   [[nodiscard]] uint64_t kvBlock() const noexcept { return kvBlock_; }
   [[nodiscard]] uint32_t boundary() const noexcept { return boundary_; }
   [[nodiscard]] const std::shared_ptr<const CompositeState> &
   state() const noexcept {
     return state_;
   }
-  void reset() noexcept;
 
 private:
   friend class StateCache;
   CompositeStateLease(StateCache &owner, uint64_t kvBlock, uint32_t boundary,
                       std::shared_ptr<const CompositeState> state) noexcept;
+  void reset() noexcept;
 
   StateCache *owner_ = nullptr;
   uint64_t kvBlock_ = 0;
@@ -83,15 +80,11 @@ struct StateCacheSnapshot {
   uint64_t offloads = 0;
   uint64_t offloadFailures = 0;
   uint64_t invalidations = 0;
-  uint64_t diskHits = 0;
   uint64_t promotions = 0;
   // Restores that left no RAM copy behind: the request runs from the
   // disk copy either way.
   uint64_t promotionsSkipped = 0;
-  uint64_t hits = 0;
-  uint64_t misses = 0;
   uint64_t publications = 0;
-  uint64_t deduplicatedPublications = 0;
   uint64_t evictions = 0;
   // Blocks unfinished requests resume from, whether a state is still
   // cached there or not, and valid states at such a block that left all
@@ -149,13 +142,11 @@ public:
 
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireDeepest(std::span<const uint64_t> kvChain);
-  // Acquisition pins the state; accounting occurs only when admission succeeds.
-  void recordLookup(bool hit, bool disk = false) noexcept;
 
-  // Reuses a RAM copy without a restore pin or lookup accounting. A normal
-  // boundary upgrades a checkpoint; a checkpoint cannot downgrade an
-  // ordinary state. False for a state that is absent or only on disk: the
-  // caller publishes the copy it holds, which is promotion without a read.
+  // Reuses a RAM copy without a restore pin. A normal boundary upgrades a
+  // checkpoint; a checkpoint cannot downgrade an ordinary state. False for a
+  // state that is absent or only on disk: the caller publishes the copy it
+  // holds, which is promotion without a read.
   [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
   // The same for a copy in either tier.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
@@ -164,11 +155,11 @@ public:
   void publishCompositeState(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);
   // Publishes a state that has no RAM copy by writing it from its lane: the
-  // entry is the disk copy the ticket carries, with the write in flight. A
-  // block whose state is on disk already is published as it is. False when
-  // the one write in flight holds the staging buffer, or when the quota
-  // cannot admit the state after makeRoom gave up what it could; nothing is
-  // published then.
+  // entry is the disk copy the ticket carries, with the write in flight.
+  // False when the one write in flight holds the staging buffer, or when the
+  // quota cannot admit the state after makeRoom gave up what it could;
+  // nothing is published then. The caller reuses a stored state first
+  // (reuseStoredState); publishing over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint = false);
   // Publication identity protects replacement states from stale handles.
@@ -298,7 +289,6 @@ private:
   acquireBlock(uint64_t kvBlock);
   // Places the entry in the orders its copies call for.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
-  static void unlink(Entry &entry) noexcept;
   void discardDisk(Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
   // and a checkpoint is upgraded.
@@ -327,11 +317,7 @@ private:
   uint64_t bytes_ = 0;
   uint64_t diskBytes_ = 0;
   uint32_t pinnedEntries_ = 0;
-  uint64_t diskHits_ = 0;
-  uint64_t hits_ = 0;
-  uint64_t misses_ = 0;
   uint64_t publications_ = 0;
-  uint64_t deduplicatedPublications_ = 0;
   uint64_t evictions_ = 0;
   uint64_t checkpointEntries_ = 0;
   uint64_t checkpointBytes_ = 0;
