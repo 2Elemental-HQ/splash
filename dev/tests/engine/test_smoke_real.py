@@ -100,7 +100,7 @@ class FakeServer:
 
 
 class SmokeRealTests(unittest.TestCase):
-    def test_status_checks_selected_kv_format_and_legacy_int8(self):
+    def test_status_checks_selected_kv_format(self):
         for format in ("int8", "bf16"):
             kv = {
                 "format": format,
@@ -118,15 +118,13 @@ class SmokeRealTests(unittest.TestCase):
                 smoke_real.validate_status(
                     status, "bf16" if format == "int8" else "int8"
                 )
-            if format == "int8":
-                old = {k: v for k, v in kv.items() if k != "format"}
-                self.assertEqual(smoke_real.kv_identity({"q8": old}), kv)
-                status["identity"] = {"cache": {"block_tokens": 32}, "q8": old}
-                smoke_real.validate_status(status, "int8")
-            else:
+            if format == "bf16":
                 kv["scale_type"] = "float32"
                 with self.assertRaises(smoke_real.SmokeFailure):
                     smoke_real.validate_status(status, "bf16")
+        status["identity"] = {"cache": {"block_tokens": 32}}
+        with self.assertRaises(smoke_real.SmokeFailure):
+            smoke_real.validate_status(status)
 
     def test_server_paths_are_resolved_from_caller_directory(self):
         with TemporaryDirectory() as directory, contextlib.chdir(directory):

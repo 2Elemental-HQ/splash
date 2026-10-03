@@ -9,11 +9,13 @@ import re
 
 if __package__:
     from . import json_codec
+    from . import protocol as wire
     from .documents import DocumentBudget, document_parts, file_content
     from .errors import APIError
     from .metrics import metrics_dict, timings_dict, usage_dict
 else:  # ``python server/server.py`` from the repo root.
     import json_codec
+    import protocol as wire
     from documents import DocumentBudget, document_parts, file_content
     from errors import APIError
     from metrics import metrics_dict, timings_dict, usage_dict
@@ -595,13 +597,7 @@ def responses_to_chat_body(body, previous_items=()):
     # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
-        "temperature",
-        "top_p",
-        "top_k",
-        "presence_penalty",
-        "frequency_penalty",
-        "repetition_penalty",
-        "min_p",
+        *wire.SAMPLING_FIELDS,
         "logit_bias",
         "seed",
         "timeout",
@@ -1141,17 +1137,17 @@ def responses_item(job, kind, value, index=0, status="completed"):
             "content": [{"type": "output_text", "text": value, "annotations": []}],
         }
     name = value["function"]["name"]
-    wire = job.tool_policy.namespaces.get(name) if job.tool_policy else None
+    namespaced = job.tool_policy.namespaces.get(name) if job.tool_policy else None
     item = {
         "id": f"fc_{public_id}_{index}",
         "type": "function_call",
         "status": status,
         "call_id": value["id"],
-        "name": wire[1] if wire else name,
+        "name": namespaced[1] if namespaced else name,
         "arguments": "" if status == "in_progress" else value["function"]["arguments"],
     }
-    if wire:
-        item["namespace"] = wire[0]
+    if namespaced:
+        item["namespace"] = namespaced[0]
     return item
 
 

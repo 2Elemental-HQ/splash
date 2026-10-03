@@ -60,10 +60,6 @@ def prometheus_metrics(status):
         "splash_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
         "splash_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
         "splash_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
-        "splash_scheduler_decode_mixed_greedy_sampling_batches_total": (
-            "scheduler",
-            "decode_mixed_greedy_sampling_batches",
-        ),
         "splash_scheduler_decode_b1_total": (
             "scheduler",
             "decode_batches_by_width",
@@ -111,7 +107,7 @@ def prometheus_metrics(status):
         "splash_state_in_use": ("state", "in_use"),
         "splash_state_in_use_evictions_total": ("state", "in_use_evictions"),
         "splash_state_bytes": ("state", "bytes"),
-        "splash_state_active_cells": ("state", "active_cells"),
+        "splash_state_active_lanes": ("state", "active_lanes"),
         "splash_state_publications_total": ("state", "publications"),
         "splash_state_evictions_total": ("state", "evictions"),
         "splash_cache_hits_total": ("cache", "hits"),
@@ -286,8 +282,7 @@ def metrics_dict(result):
     cache = {
         "status": cache_info.status,
         "matched_tokens": cache_info.matched_tokens,
-        "capacity": cache_info.capacity,
-        "slot": cache_info.slot if cache_info.slot >= 0 else None,
+        "lane": cache_info.lane if cache_info.lane >= 0 else None,
     }
     metrics = {
         "prefill": {"tokens": result.prefill_tokens},

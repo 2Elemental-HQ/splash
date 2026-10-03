@@ -63,8 +63,7 @@ def remaining_request_time(deadline):
 class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
-    capacity: int = 0
-    slot: int = -1
+    lane: int = -1
 
 
 @dataclass
@@ -258,10 +257,6 @@ class NativeBackend:
     thread.
     """
 
-    _CACHE_NAMES = {
-        wire.CacheDisposition.MISS: "miss",
-        wire.CacheDisposition.PREFIX_HIT: "hit",
-    }
     _FINISH_NAMES = {
         wire.FinishReason.STOP: "stop",
         wire.FinishReason.LENGTH: "length",
@@ -326,8 +321,7 @@ class NativeBackend:
     def _decode_status_event(event):
         snapshot = json_codec.loads(event.json)
         if (
-            event.schema_version != wire.STATUS_SCHEMA_VERSION
-            or not isinstance(snapshot, dict)
+            not isinstance(snapshot, dict)
             or snapshot.get("schema_version") != wire.STATUS_SCHEMA_VERSION
         ):
             raise ValueError("native status does not match the current schema")
@@ -488,15 +482,11 @@ class NativeBackend:
 
     def _generation_request(self, job):
         priority = wire.RequestPriority(job.priority)
-        if job.constraint is not None:
-            cohort = wire.Cohort.CONSTRAINED
-            constraint = wire.ConstraintMode.TOKEN_MASK
-        elif job.sampling.temperature > 0:
-            cohort = wire.Cohort.SAMPLING
-            constraint = wire.ConstraintMode.NONE
-        else:
-            cohort = wire.Cohort.GREEDY
-            constraint = wire.ConstraintMode.NONE
+        constraint = (
+            wire.ConstraintMode.TOKEN_MASK
+            if job.constraint is not None
+            else wire.ConstraintMode.NONE
+        )
         return engine_runtime.GenerationRequest(
             prompt_tokens=tuple(job.prompt_tokens),
             logical_max_output_tokens=job.max_new_tokens,
@@ -504,7 +494,6 @@ class NativeBackend:
             priority=priority,
             sampling=job.sampling,
             seed=job.seed,
-            cohort=cohort,
             constraint=constraint,
             mask_provider=self._mask_provider(job),
             image_spans=job.image_spans,
@@ -636,10 +625,9 @@ class NativeBackend:
         try:
             if isinstance(event, wire.StartEvent):
                 cache = CacheInfo(
-                    self._CACHE_NAMES[event.cache_disposition],
+                    "hit" if event.matched_prompt_tokens else "miss",
                     event.matched_prompt_tokens,
-                    event.capacity_tokens,
-                    event.slot_index,
+                    event.lane,
                 )
                 with self.lock:
                     job.cache = cache
@@ -793,7 +781,7 @@ class NativeBackend:
                 )
             request_codes = {
                 "integer_overflow",
-                "invalid_cohort_constraint",
+                "invalid_constraint",
                 "invalid_deadline",
                 "invalid_enum_value",
                 "invalid_request",

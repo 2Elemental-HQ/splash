@@ -60,14 +60,6 @@ std::string runtimeStatusJson(
           : 0.0;
 
   const kv::Format kvFormat = cacheIdentity.kvLayout.format;
-  std::ostringstream kvIdentity;
-  kvIdentity << "{\"target_model_sha256\":" << json::quote(cacheIdentity.targetModelSha256)
-      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
-      << ",\"quantization\":"
-      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
-      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
-      << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}";
 
   std::ostringstream out;
   out << std::setprecision(10) << '{' << "\"schema_version\":" << protocol::kStatusSchemaVersion << ','
@@ -91,11 +83,14 @@ std::string runtimeStatusJson(
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
       << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
       << ",\"block_tokens\":" << kv::kPageTokens
-      << "},\"kv\":" << kvIdentity.str();
-  // Additive status evolution: retain the previous INT8 identity field.
-  if (kvFormat == kv::Format::Int8)
-    out << ",\"q8\":" << kvIdentity.str();
-  out << "},"
+      << "},\"kv\":{\"target_model_sha256\":"
+      << json::quote(cacheIdentity.targetModelSha256)
+      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
+      << ",\"quantization\":"
+      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
+      << ",\"key_layout\":\"token_major\""
+      << ",\"value_layout\":\"dimension_major\"}},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
@@ -132,9 +127,9 @@ std::string runtimeStatusJson(
       << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
       << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes
       << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
-      << ",\"active_cells\":" << resources.activeRequests
-      << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
-      << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
+      << ",\"active_lanes\":" << resources.activeRequests
+      << ",\"idle_gdn_cells\":" << executorTelemetry.idleGdnCells
+      << ",\"idle_draft_rings\":" << executorTelemetry.idleDraftRings
       << ",\"publications\":" << state.publications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries
@@ -243,9 +238,7 @@ std::string runtimeStatusJson(
       << scheduler.decodeBatchesByWidth[0]
       << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
-      << ",\"decode_mixed_greedy_sampling_batches\":"
-      << scheduler.decodeMixedGreedySamplingBatches << "}"
+      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}"
       << ",\"requests\":{\"submitted\":" << core.submitted
       << ",\"completed\":" << core.completed
       << ",\"cancelled\":" << core.cancelled << ",\"failed\":" << core.failed

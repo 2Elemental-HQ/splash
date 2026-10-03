@@ -281,8 +281,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before preparing or registering its
     // weights. Beside them the plan needs at least the runtime reserves, one
-    // state cell, the KV runway and any disk tier state staging; the full plan
-    // below adds the arenas.
+    // lane's state, the KV runway and any disk tier state staging; the full
+    // plan below adds the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
     uint64_t fixedBytes = 0;
@@ -294,13 +294,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         fixedBytes = std::numeric_limits<uint64_t>::max();
     }
     const uint64_t requiredBytes =
-        minimumRequiredBytes(fixedBytes,
-                             config.model.stateLayout.activeCellBytes(), kvLayout)
+        minimumRequiredBytes(fixedBytes, config.model.stateLayout.laneBytes(),
+                             kvLayout)
             .value_or(std::numeric_limits<uint64_t>::max());
     if (requiredBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
-          "model weights with the runtime reserves, one state cell, the KV "
+          "model weights with the runtime reserves, one lane's state, the KV "
           "runway and any disk tier state staging require " +
               std::to_string(requiredBytes) +
               " bytes but the Metal memory budget is " +
@@ -462,7 +462,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
 
     if (stateStorage->actualAllocatedBytes() != 0) {
-      throw std::runtime_error("state cells were allocated eagerly");
+      throw std::runtime_error("lane state was allocated eagerly");
     }
     metal::MetalMemoryStats memory = backend->memoryStats();
     if (!backend->healthy()) {

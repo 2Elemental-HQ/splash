@@ -171,8 +171,8 @@ private:
 class Executor final : public model::Model {
 public:
   explicit Executor(
-      uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth)
-      : maximumCells(maximumCells) {}
+      uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
+      : maximumLanes(maximumLanes) {}
 
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
@@ -185,7 +185,7 @@ public:
       --deniedBegins;
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
-    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [lane](const auto &entry) {
             return entry.second.resident && entry.second.lane == lane;
@@ -216,7 +216,7 @@ public:
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
-    for (uint32_t lane = 0; lane < maximumCells; ++lane) {
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
       const bool used = std::any_of(
           requests.begin(), requests.end(), [&](const auto &candidate) {
             return candidate.first != id && candidate.second.resident &&
@@ -295,7 +295,7 @@ public:
           item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
-      if (plan.cohort == BatchCohort::Constrained &&
+      if (plan.constrained &&
           plan.decodeStage == DecodeStage::RequestInitialMask) {
         result.push_back({item.requestId,
                           0,
@@ -348,8 +348,7 @@ public:
     checkPageTables(items);
     // Every constrained cycle after the initial mask request waits for its
     // mask inside the ticket, as the production constrained ticket does.
-    if (plan.kind == WorkKind::Decode &&
-        plan.cohort == BatchCohort::Constrained &&
+    if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage != DecodeStage::RequestInitialMask) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
@@ -503,7 +502,7 @@ public:
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   bool resumeDenied = false;
-  uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth;
+  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;
   std::function<void()> snapshotObserver;
   std::function<bool()> snapshotRoom;
@@ -564,10 +563,9 @@ class Events final : public EngineEventSink {
 public:
   void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t, uint32_t,
                       uint32_t, double) override {}
-  void started(uint64_t requestId, EngineCacheStatus cache, uint32_t matched,
-               uint32_t) override {
+  void started(uint64_t requestId, uint32_t matched, uint32_t) override {
     startIds.push_back(requestId);
-    starts.emplace_back(std::move(cache), matched);
+    starts.push_back(matched);
   }
   void promptProgress(uint64_t id, uint32_t processed) override {
     progress[id].push_back(processed);
@@ -597,7 +595,8 @@ public:
   }
 
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
-  std::vector<std::pair<EngineCacheStatus, uint32_t>> starts;
+  // The matched prompt tokens of each start, zero for a cold one.
+  std::vector<uint32_t> starts;
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
@@ -665,41 +664,6 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
   require(done(), message);
 }
 
-// A score request reads raw logits, so the engine refuses one that carries
-// a penalty or a min_p, as it refuses any other sampling.
-void testScoreRequestsCarryNoSamplingOptions() {
-  test::TestKvStorage storage(64, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool);
-  Executor model;
-  Events events;
-  engine::Engine engine({}, cache, model, events);
-  guardReleases(storage, engine);
-  for (uint32_t field = 0; field < 4; ++field) {
-    EngineRequest score = request(1, std::vector<uint32_t>(8, 7));
-    score.maxNewTokens = 0;
-    score.scoreTokens = {3, 4};
-    float *options[] = {&score.sampling.presencePenalty,
-                        &score.sampling.frequencyPenalty,
-                        &score.sampling.repetitionPenalty,
-                        &score.sampling.minP};
-    *options[field] += 0.5F;
-    bool refused = false;
-    try {
-      engine.submit(std::move(score));
-    } catch (const std::invalid_argument &) {
-      refused = true;
-    }
-    require(refused, "a score request with a penalty or min_p was accepted");
-  }
-  require(idle(engine), "a refused score request was queued");
-  EngineRequest neutral = request(1, std::vector<uint32_t>(8, 7));
-  neutral.maxNewTokens = 0;
-  neutral.scoreTokens = {3, 4};
-  engine.submit(std::move(neutral));
-  require(!idle(engine), "a neutral score request was not queued");
-}
-
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
@@ -715,7 +679,7 @@ void testConcurrentColdPrefixesComputeOnce() {
   }
   static_cast<void>(engine.tick(0));
   require(model.requests.size() == 1,
-          "shared cold prefix allocated redundant active state cells");
+          "shared cold prefix allocated redundant lanes");
   runUntilIdle(engine);
   require(model.prefillRows == 160 + 4 * 33 && model.restored == 3 * 160,
           "concurrent cold requests recomputed their shared prefix");
@@ -846,7 +810,7 @@ void testSharedPrefillWaiterCancellationAndDeadline() {
     require(model.beginAttempts == 1 && events.outputs[2].empty() &&
                 events.outputs[1] == std::vector<uint32_t>{42} &&
                 engine.snapshot().scheduler.waitingPrefix == 0,
-            "expired prefix waiter allocated a cell or interrupted its producer");
+            "expired prefix waiter allocated a lane or interrupted its producer");
     require(!cancelled || events.usage.at(2) == std::pair<uint32_t, uint32_t>{193, 0},
             "a request cancelled before it started reported other usage");
   }
@@ -976,8 +940,7 @@ void testSharedJunctionAtACheckpointIsReusable() {
   engine.submit(request(2, sibling));
   runUntilIdle(engine);
   const auto counters = engine.snapshot();
-  require(events.starts.at(1) ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+  require(events.starts.at(1) == 4096 &&
               executor.restored == 4096,
           "the sibling did not resume from the producer's shared boundary");
   require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 0 &&
@@ -1066,8 +1029,7 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
   require(executor.prefillRows == 65 && executor.snapshots == 1 &&
               engine.snapshot().replayStatePublications == 1,
           "cold request did not retain its latest Page32 replay state");
-  require(events.starts.size() == 1 &&
-              events.starts[0].first == EngineCacheStatus::Miss,
+  require(events.starts.size() == 1 && events.starts[0] == 0,
           "cold request reported a cache hit");
 
   require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
@@ -1080,17 +1042,14 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
               engine.snapshot().junctionMaterializations == 0,
           "second request did not rebuild the lost replay state");
   require(events.starts.size() == 2 &&
-              events.starts[1].first == EngineCacheStatus::Miss,
+              events.starts[1] == 0,
           "KV-only replay was reported as a state hit");
 
   engine.submit(request(3, prompt));
   runUntilIdle(engine);
   require(executor.restored == 64 && executor.prefillRows == 131,
           "cache hit did not replay exactly one real input token");
-  require(events.starts.size() == 3 &&
-              events.starts[2] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 64},
+  require(events.starts.size() == 3 && events.starts[2] == 64,
           "state-backed hit accounting is wrong");
   require(events.completedCount == 3 && events.failedCount == 0 &&
               events.emitted == 3,
@@ -1114,7 +1073,7 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   runUntilIdle(engine);
 
   // The second request restores the first publication without reserving a
-  // redundant state cell or capturing the same state again.
+  // redundant lane or capturing the same state again.
   const auto snapshot = engine.snapshot();
   require(executor.snapshotAttempts == 1 && executor.snapshots == 1,
           "duplicate state publication performed a second snapshot capture");
@@ -1155,16 +1114,6 @@ void testReplayStateEndsBeforeTheGenerationPrompt() {
   }
   require(executor.snapshots == 3,
           "a generation prompt within the first page left a replay state");
-
-  EngineRequest whole = request(++id, std::vector<uint32_t>(33, 5));
-  whole.generationPromptTokens = 33;
-  bool rejected = false;
-  try {
-    engine.submit(std::move(whole));
-  } catch (const std::invalid_argument &) {
-    rejected = true;
-  }
-  require(rejected, "a generation prompt leaving no prompt token was admitted");
 }
 
 // A next turn that renders the generation prompt differently diverges inside
@@ -1195,11 +1144,9 @@ void testFollowUpResumesBeforeTheGenerationPrompt() {
   require(plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64 &&
               plan.boundaries[1].boundary == 97,
           "the replay state was not planned before the generation prompt");
-  require(start == std::pair<EngineCacheStatus, uint32_t>{
-                       EngineCacheStatus::PrefixHit, 64},
+  require(start == 64,
           "the follow-up did not resume before the generation prompt");
-  require(followUp(0).second == std::pair<EngineCacheStatus, uint32_t>{
-                                    EngineCacheStatus::Miss, 0},
+  require(followUp(0).second == 0,
           "a replay state past the divergence served the follow-up");
 }
 
@@ -1228,8 +1175,7 @@ void testRetryPublishesNoStateInsideTheGenerationPrompt() {
     require(executor.snapshotAttempts == 1 &&
                 snapshot.junctionMaterializations == 0 &&
                 snapshot.resources.stateCache.entries == 1 &&
-                events.starts.at(1) == std::pair<EngineCacheStatus, uint32_t>{
-                                           EngineCacheStatus::PrefixHit, 64},
+                events.starts.at(1) == 64,
             "a retry published a state inside the generation prompt");
   }
 }
@@ -1260,10 +1206,8 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   prompt.resize(133, 500);
   engine.submit(request(3, prompt));
   runUntilIdle(engine);
-  const std::pair<EngineCacheStatus, uint32_t> hit{EngineCacheStatus::PrefixHit,
-                                                   64};
-  require(events.starts.size() == 3 && events.starts[1] == hit &&
-              events.starts[2] == hit,
+  require(events.starts.size() == 3 && events.starts[1] == 64 &&
+              events.starts[2] == 64,
           "the shared junction was not the waiter's reusable state");
 }
 
@@ -1287,41 +1231,20 @@ void testImageSpansKeyPrefixIdentity() {
 
   engine.submit(withImage(1, 0x1111));
   runUntilIdle(engine);
-  require(events.starts.size() == 1 &&
-              events.starts[0].first == EngineCacheStatus::Miss,
+  require(events.starts.size() == 1 && events.starts[0] == 0,
           "image producer unexpectedly hit the cache");
   engine.submit(withImage(2, 0x2222));
   runUntilIdle(engine);
-  require(events.starts.size() == 2 &&
-              events.starts[1] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::Miss, 0},
+  require(events.starts.size() == 2 && events.starts[1] == 0,
           "a different image falsely matched the cached prefix");
   engine.submit(withImage(3, 0x1111));
   runUntilIdle(engine);
-  require(events.starts.size() == 3 &&
-              events.starts[2] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 64},
+  require(events.starts.size() == 3 && events.starts[2] == 64,
           "an identical image did not reuse the cached prefix");
   engine.submit(request(4, prompt));
   runUntilIdle(engine);
-  require(events.starts.size() == 4 &&
-              events.starts[3] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::Miss, 0},
+  require(events.starts.size() == 4 && events.starts[3] == 0,
           "a text-only prompt matched an image-keyed prefix");
-
-  EngineRequest malformed = withImage(5, 0x1111);
-  malformed.images[0].tokens = 15;
-  bool rejected = false;
-  try {
-    engine.submit(std::move(malformed));
-  } catch (const std::invalid_argument &) {
-    rejected = true;
-  }
-  require(rejected,
-          "image span with the wrong merged token count was admitted");
   require(events.completedCount == 4 && events.failedCount == 0,
           "image request lifecycle did not complete cleanly");
 }
@@ -1362,7 +1285,7 @@ void testSharedPrefillBoundaryStopsAtTheFirstDifferentImage() {
             "the later request did not wait for the shared prefix");
     runUntilIdle(engine);
     require(events.starts.size() == 2 &&
-                events.starts[1] == std::pair{EngineCacheStatus::PrefixHit, shape.shared} &&
+                events.starts[1] == shape.shared &&
                 model.prefillRows == 289 + 289 - shape.shared && events.completedCount == 2,
             "the shared prefix did not end at the block of the first different image");
   }
@@ -1441,8 +1364,7 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
   engine.submit(request(3, conversation(30'000)));
   runUntilIdle(engine);
   require(executor.restored == restored + 2112 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112},
+              events.starts.back() == 2112,
           "a third branch did not resume from the junction");
   // This one follows the cached conversation 96 tokens past the junction,
   // where that one goes on to its state, and then branches.
@@ -1451,8 +1373,7 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
   engine.submit(request(4, follower));
   runUntilIdle(engine);
   const auto &boundaries = executor.plans.at(4).boundaries;
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2112} &&
+  require(events.starts.back() == 2112 &&
               std::none_of(boundaries.begin(), boundaries.end(),
                            [](const DraftBoundaryPlan &boundary) {
                              return boundary.boundary == 2112 + 96;
@@ -1518,13 +1439,11 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(9, branchPrompt(999)));
   runUntilIdle(engine);
   require(executor.restored == restored + 2048 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 2048},
+              events.starts.back() == 2048,
           "latest-state denial discarded the independent junction state");
   engine.submit(request(71, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
-  require(events.starts.back().first == EngineCacheStatus::Miss &&
+  require(events.starts.back() == 0 &&
               engine.snapshot().replayStatePublications == 5 &&
               engine.snapshot().junctionMaterializations == 1,
           "recycled state was not the older unrelated one");
@@ -1626,7 +1545,7 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
   require(executor.snapshotAttempts == 2 && executor.snapshots == 0 &&
               engine.snapshot().junctionMaterializationFailures == 0 &&
               engine.snapshot().replayStatePublicationFailures == 2 &&
-              events.starts.back().first == EngineCacheStatus::Miss &&
+              events.starts.back() == 0 &&
               executor.prefillRows == 130 && events.completedCount == 2 &&
               events.failedCount == 0,
           "denied replay state failed the request or was not counted");
@@ -1680,15 +1599,12 @@ void testDeniedSnapshotRecyclesLruStateAndRetries() {
   // state hit, while the older prompt is back to KV without a state.
   engine.submit(request(3, newer));
   runUntilIdle(engine);
-  require(executor.restored == 64 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 64},
+  require(executor.restored == 64 && events.starts.back() == 64,
           "recycled slot does not hold the new lane's state");
   engine.submit(request(4, older));
   runUntilIdle(engine);
   require(executor.restored == 64 &&
-              events.starts.back().first == EngineCacheStatus::Miss &&
+              events.starts.back() == 0 &&
               engine.snapshot().replayStatePublications == 3,
           "recycled state was not the least recently used one");
 }
@@ -1790,7 +1706,7 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
           "cancellation leaked active resources or dropped committed KV");
 }
 
-void testActiveCellGrowthReclaimsCachedStateAndRetries() {
+void testLaneStateGrowthReclaimsCachedStateAndRetries() {
   for (bool hostPressure : {false, true}) {
     test::TestKvStorage storage(16, 4096, 4);
     KvPool pool(storage, 0);
@@ -1823,7 +1739,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
     const auto after = resources.snapshot();
     require(executor.beginAttempts == attempts + 2 &&
                 events.completedCount == 2,
-            "active-cell growth did not reclaim memory and retry");
+            "lane state growth did not reclaim memory and retry");
     if (hostPressure) {
       require(executor.reclaimedIdleStateBytes == 350'224'384 &&
                   !storage.growthBlocked &&
@@ -1832,7 +1748,7 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
               "host-pressure state admission evicted cache or ignored idle memory");
     } else {
       require(after.stateCache.entries == 0,
-              "active-cell growth did not reclaim cached state");
+              "lane state growth did not reclaim cached state");
     }
   }
 }
@@ -2161,11 +2077,11 @@ void testPressureReclaimFollowsTheChain() {
           "reclaim went past its target");
 }
 
-// A request starts only in a free state cell. While every cell is resident,
-// a waiting request is recorded as a concurrency wait without another cache
+// A request starts only in a free lane. While every lane is resident, a
+// waiting request is recorded as a concurrency wait without another cache
 // probe or admission attempt, and, as after a failed attempt, a memory wait
 // it was in no longer counts against the resource wait limit.
-void testFullStateCellsSkipAdmissionAttempts() {
+void testFullLanesSkipAdmissionAttempts() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool);
@@ -2173,7 +2089,7 @@ void testFullStateCellsSkipAdmissionAttempts() {
   executor.decodeFinishes = false;
   // The first pass starts the three short prompts and tries request 5, the
   // fourth of its batch, which meets pressure. Request 4 arrived before it
-  // with a long prompt, so it is not held back and takes the last cell.
+  // with a long prompt, so it is not held back and takes the last lane.
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 4; };
   Events events;
   engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
@@ -2196,24 +2112,24 @@ void testFullStateCellsSkipAdmissionAttempts() {
     static_cast<void>(engine.tick(now));
   require(executor.requests.size() == 4 && executor.requests.contains(4) &&
               executor.beginAttempts == 5,
-          "fixture did not make every state cell resident");
+          "fixture did not make every lane resident");
 
   for (double now : {200.0, 201.0, 1200.0, 1201.0})
     static_cast<void>(engine.tick(now));
   const auto waiting = engine.resourceWaitSnapshot(1201);
   require(executor.beginAttempts == 5 && events.failedCount == 0 &&
               waiting.concurrency == 1 && waiting.memory == 0,
-          "full state cells retried admission or kept the memory wait limit");
+          "full lanes retried admission or kept the memory wait limit");
   engine.cancel(1);
   require(engine.tick(1202) && executor.beginAttempts == 6 &&
               events.startIds.back() == 5,
-          "a released state cell did not admit the waiting request");
+          "a released lane did not admit the waiting request");
   for (uint64_t id : {2, 3, 4, 5})
     engine.cancel(id);
   for (double now = 1203; now < 1220 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && resources.snapshot().activeRequests == 0,
-          "full state cell fixture leaked its lanes");
+          "full-lane fixture leaked its lanes");
 }
 
 void testConcurrencyLimitDoesNotEvictCache() {
@@ -2244,7 +2160,7 @@ void testConcurrencyLimitDoesNotEvictCache() {
   const auto saturated = resources.snapshot();
   require(saturated.stateCache.entries == cached.stateCache.entries &&
               saturated.stateCache.evictions == cached.stateCache.evictions,
-          "active-cell saturation was mistaken for memory pressure");
+          "lane saturation was mistaken for memory pressure");
 
   engine.cancel(23);
   engine.cancel(24);
@@ -2820,7 +2736,7 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
     engine::Engine engine(config, resources, executor, events);
     guardReleases(storage, engine);
     double now = 1;
-    // Lanes in every cell: both requests wait for one until they are
+    // Occupants in every lane: both requests wait for one until they are
     // cancelled.
     const uint64_t occupants = lanesFull ? model::ExecutionLimits::maximumBatchWidth : 0;
     for (uint64_t id = 1; id <= occupants; ++id) {
@@ -3053,8 +2969,7 @@ void testAdmissionPinsDesiredStateAndCountsOnlySuccess() {
   require(pinnedAttempts == 3 && events.completedCount == 3 &&
               after.resources.stateCache.entries == 1 &&
               after.resources.stateCache.pinned == 0 &&
-              events.starts.back().first == EngineCacheStatus::PrefixHit &&
-              events.starts.back().second == 64 &&
+              events.starts.back() == 64 &&
               after.cacheHits == before.cacheHits + 1 &&
               after.coldMisses == before.coldMisses,
           "successful retry failed to restore/count the protected cache state");
@@ -3083,7 +2998,7 @@ void testAdmissionCanDropItsOwnCachePinToMakeProgress() {
   require(events.completedCount == 2 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0 && executor.restored == 0 &&
               executor.prefillRows == 130 &&
-              events.starts.back().first == EngineCacheStatus::Miss &&
+              events.starts.back() == 0 &&
               engine.snapshot().coldMisses == 2 && engine.snapshot().cacheHits == 0,
           "admission waited on its own cache pin instead of recomputing cold");
 }
@@ -3115,7 +3030,7 @@ void testActivationReceivesTheRestoreBoundary() {
   engine.submit(request(249, prompt));
   runUntilIdle(engine);
   require(attempts.size() >= 2 && attempts.front() == 64 && attempts.back() == 0 &&
-              events.starts.back().first == EngineCacheStatus::Miss,
+              events.starts.back() == 0,
           "the retry without its prefix activated with the dropped restore boundary");
 }
 
@@ -3155,8 +3070,7 @@ void testRefusedStartKeepsItsLeaseBesideAResidentLane() {
   executor.decodeFinishes = true;
   const uint32_t restored = executor.restored;
   tickUntil(engine, now, [&] { return idle(engine); }, "the held start did not run");
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+  require(events.starts.back() == 64 &&
               executor.restored == restored + 64 && events.failedCount == 0,
           "the held start did not resume from its cached state");
 }
@@ -3194,8 +3108,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
           "a start waiting for a write in flight gave up its own cached state");
   write->ready = true;
   tickUntil(engine, now, [&] { return idle(engine); }, "the waiting start did not run");
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+  require(events.starts.back() == 64 &&
               events.failedCount == 0,
           "the waiting start did not resume from its cached state");
 }
@@ -3224,8 +3137,7 @@ void testDroppedLeaseLooksUpAgain() {
   engine.submit(request(1, prompt));
   runUntilIdle(engine);
   require(executor.diskReads == 1 && executor.restored == 64 && executor.prefillRows == 1 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.starts.back() == 64 &&
               events.failedCount == 0,
           "a start that dropped its lease recomputed the state the reclaim wrote");
 }
@@ -3261,7 +3173,7 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
     engine.submit(request(id, std::vector<uint32_t>(8193, id)));
   require(engine.tick(1) && engine.tick(2) &&
               executor.requests.size() == 1 && executor.prefillRows == 2048,
-          "long prefills reserved cells without executable work");
+          "long prefills reserved lanes without executable work");
   engine.submit(request(5, std::vector<uint32_t>(65, 5)));
   require(engine.tick(3) && executor.requests.contains(5) &&
               executor.requests.at(5).position > 0 && events.completedCount == 0,
@@ -3332,7 +3244,7 @@ void testUnselectableCandidatesAreNotProbed() {
   tickUntil(engine, now, [&] { return executor.requests.contains(3); },
             "the waiting request did not start once the higher priority left");
   require(hashed() - before == 5 && events.startIds.back() == 3 &&
-              events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 128U},
+              events.starts.back() == 128,
           "the request was not probed once, or missed its cached prefix");
 }
 
@@ -3817,17 +3729,17 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     require(engine.tick(1) && engine.tick(2) &&
                 executor.requests.at(48).position == 2048 &&
                 !executor.requests.contains(49),
-            "unstarted prefill reserved a cell before it had scheduled work");
+            "unstarted prefill reserved a lane before it had scheduled work");
     require(engine.tick(3) && executor.requests.at(48).resident,
             "KV growth discarded completed prefill");
     if (priority == RequestPriority::Normal) {
       // The final prefill slice admits a peer into its remaining row budget;
-      // if that cell prevents KV growth, the unstarted peer must yield.
+      // if that lane prevents KV growth, the unstarted peer must yield.
       require(executor.suspensions == 1 && !executor.requests.at(49).resident,
               "KV growth did not yield the unstarted peer");
     } else {
       require(executor.suspensions == 0 && !executor.requests.contains(49),
-              "lower-priority work reserved a cell before its dispatch");
+              "lower-priority work reserved a lane before its dispatch");
     }
     runUntilIdle(engine);
     require(events.completedCount == 2 && events.failedCount == 0 &&
@@ -4287,8 +4199,7 @@ void testResumedProducerPlansJunctionsForSiblings() {
                           }),
           "the resumed producer planned no junction at the shared boundary");
   tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 17'984} &&
+  require(events.starts.back() == 17'984 &&
               executor.prefillRows - rows == (prompt.size() - 8192) + (sibling.size() - 17'984) &&
               events.completedCount == 2 && events.failedCount == 0,
           "the sibling did not resume from the resumed producer's junction");
@@ -5134,7 +5045,7 @@ void testFailedResumeRestoreKeepsTheKvTarget() {
   require(executor.diskReads == 1 && executor.prefillRows == 128 &&
               engine.snapshot().resourceResumptions == 0,
           "resumption did not wait for its disk state");
-  // The read fails and the host refuses the retry its cell; the pressure
+  // The read fails and the host refuses the retry its lane; the pressure
   // controller's pass then empties the cache and releases the KV extents.
   // Afterwards one extent (128 tokens) can come back: room for replay to
   // start, not for the dispatch that suspended the request.
@@ -5249,7 +5160,6 @@ void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
 EngineRequest constrainedRequest(uint64_t id, double deadline = 10'000.0) {
   EngineRequest value = request(id, {1});
   value.maxNewTokens = 2;
-  value.cohort = BatchCohort::Constrained;
   value.constraint = ConstraintMode::TokenMask;
   value.deadlineMilliseconds = deadline;
   return value;
@@ -5458,7 +5368,7 @@ void testHigherPriorityArrivalIsNotHeldByRecovery() {
 // has done the least, without a drain, and starts in its place; once it has
 // finished, the suspended lane resumes. An arrival of the residents' own
 // priority suspends nothing and waits for a lane.
-void testForegroundArrivalPreemptsWhenCellsAreFull() {
+void testForegroundArrivalPreemptsWhenLanesAreFull() {
   for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
@@ -5540,9 +5450,10 @@ void testRefusedHigherPriorityStartPreemptsLowerResident() {
 
 // Background lanes hold three lanes and a Normal producer the fourth, with
 // a junction three commands in for a Normal request that shares its prefix.
-// While the request waits for that prefix it takes no lane: the lane it
-// suspended would resume into the cell first and replay for nothing. Once
-// the junction has landed, it takes a Background lane and starts from it.
+// While the request waits for that prefix it takes no lane: the request it
+// suspended would resume into the freed lane first and replay for nothing.
+// Once the junction has landed, it takes a Background lane and starts from
+// it.
 void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -5577,7 +5488,7 @@ void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   tickUntil(engine, now, [&] { return events.startIds.back() == 5; },
             "the request did not start once the prefix landed");
   require(engine.snapshot().prioritySuspensions == 1 &&
-              events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 4800U},
+              events.starts.back() == 4800,
           "the request did not take a lane to start from the prefix");
   for (uint64_t id = 1; id <= 5; ++id)
     engine.cancel(id);
@@ -6015,7 +5926,7 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
   engine.submit(request(401, prompt));
   runUntilIdle(engine);
   const uint32_t restored = 2 * defaultCheckpointTokens;
-  require(events.starts.back().second == restored &&
+  require(events.starts.back() == restored &&
               executor.prefillRows - computed == prompt.size() - restored &&
               events.failedCount == 0,
           "cancelled cold prefill was recomputed before its completed checkpoint");
@@ -6092,7 +6003,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   for (uint32_t attempt = 0; attempt < 3; ++attempt) {
     engine.submit(request(500 + attempt, prompt));
     runUntilCheckpoint(engine, attempt + 1);
-    require(events.starts.back().second == attempt * defaultCheckpointTokens &&
+    require(events.starts.back() == attempt * defaultCheckpointTokens &&
                 resources.snapshot().stateCache.entries == 1 &&
                 resources.snapshot().stateCache.checkpointEntries == 1,
             "retry promoted or accumulated intermediate checkpoints");
@@ -6101,7 +6012,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   }
   engine.submit(request(503, prompt));
   runUntilIdle(engine);
-  require(events.starts.back().second == 3 * defaultCheckpointTokens &&
+  require(events.starts.back() == 3 * defaultCheckpointTokens &&
               executor.prefillRows == prompt.size() &&
               resources.snapshot().stateCache.entries == 1 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
@@ -6124,7 +6035,7 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   for (uint32_t id : {511U, 512U}) {
     engine.submit(request(id, prompt));
     require(engine.tick(1) && engine.commandInFlight() &&
-                events.starts.back().second == defaultCheckpointTokens,
+                events.starts.back() == defaultCheckpointTokens,
             "retry did not restore the previous progress point");
     engine.cancel(id);
     runUntilIdle(engine);
@@ -6165,7 +6076,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       engine.submit(request(521, shorter));
       runUntilIdle(engine);
       const auto states = resources.snapshot().stateCache;
-      require(events.starts.back().second == defaultCheckpointTokens &&
+      require(events.starts.back() == defaultCheckpointTokens &&
                   executor.snapshots + executor.diskSnapshots == snapshots &&
                   engine.snapshot().deduplicatedStatePublications == 1 &&
                   states.entries == 1 && states.checkpointEntries == 0 &&
@@ -6213,7 +6124,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   resources.endRequest(999);
   engine.submit(request(531, prompt));
   require(engine.tick(1) && engine.tick(2) &&
-              events.starts.back().second == 16384 &&
+              events.starts.back() == 16384 &&
               engine.snapshot().junctionMaterializations == 1 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
@@ -6464,7 +6375,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
       prompt.begin(), prompt.begin() + defaultCheckpointTokens + 209);
   engine.submit(request(481, shorter));
   runUntilIdle(engine);
-  require(events.starts.back().second == defaultCheckpointTokens &&
+  require(events.starts.back() == defaultCheckpointTokens &&
               executor.restoredDraft &&
               draftContextRows(executor.plans.at(481)) == 209 &&
               executor.plans.at(481).restoresDraftState,
@@ -6515,7 +6426,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
   runUntilIdle(engine);
   const auto finished = engine.snapshot();
   require(events.startIds.back() == 601 &&
-              events.starts.back().second == 20480 &&
+              events.starts.back() == 20480 &&
               executor.prefillRows - 22528 == 2049 &&
               finished.completed == 1 && finished.cancelled == 1 &&
               events.failedCount == 0,
@@ -6585,8 +6496,7 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   prompt.resize(4201, 500);
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 2976} &&
+  require(events.starts.back() == 2976 &&
               !checkpointPlanned(2) && engine.snapshot().checkpointPublications == 0 &&
               executor.snapshots == snapshots + 1,
           "a follow-up checkpointed within a chunk of its resume point or replay boundary");
@@ -6598,8 +6508,7 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   resumed.resize(8193, 600);
   engine.submit(request(4, resumed));
   runUntilIdle(engine);
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4064} &&
+  require(events.starts.back() == 4064 &&
               !checkpointPlanned(4) && engine.snapshot().checkpointPublications == 0,
           "a request checkpointed within a chunk of the state it resumed from");
 }
@@ -6683,8 +6592,7 @@ void testStateWithoutACacheSlotGoesToDisk() {
   executor.restoreControl->ready = true;
   runUntilIdle(engine);
   require(executor.restored == 64 && executor.prefillRows == 131 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+              events.starts.back() == 64 &&
               events.failedCount == 0,
           "the prefix was not restored from the disk state");
   // A rolling checkpoint denied a cache slot goes to disk like any state,
@@ -6775,8 +6683,7 @@ void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
   executor.restoreControl->ready = true;
   runUntilIdle(engine);
   counters = engine.snapshot();
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+  require(events.starts.back() == 4096 &&
               executor.restored == 4096 && executor.prefillRows == 6144 + 2049 &&
               counters.completed == 1 && events.failedCount == 0 &&
               counters.resources.stateCache.checkpointEntries == 0 &&
@@ -6841,8 +6748,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     executor.restoreControl->ready = true;
     runUntilIdle(engine);
     counters = engine.snapshot();
-    require(events.starts.back() ==
-                    std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 4096} &&
+    require(events.starts.back() == 4096 &&
                 executor.restored == 4096 && counters.cancelled == (cancel ? 1U : 0U) &&
                 counters.completed == (cancel ? 2U : 3U) && events.failedCount == 0 &&
                 counters.resources.stateCache.checkpointEntries == 0 &&
@@ -6887,9 +6793,7 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
       executor.restoreControl->ready = true;
       engine.submit(request(2, prompt));
       runUntilIdle(engine);
-      require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
-                                                       uint32_t(prompt.size() - 1)} &&
+      require(events.starts.back() == prompt.size() - 1 &&
                   events.completedCount == 2 && events.failedCount == 0,
               "skipping a checkpoint lost the final reusable prefix");
     }
@@ -6938,9 +6842,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
     runUntilIdle(engine);
-    require(events.starts.back() ==
-                std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit,
-                                                     defaultCheckpointTokens} &&
+    require(events.starts.back() == defaultCheckpointTokens &&
                 engine.snapshot().cancelled == 1 && engine.snapshot().completed == 1 &&
                 events.failedCount == 0 &&
                 cache.snapshot().stateCache.checkpointEntries == 0,
@@ -7417,8 +7319,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   tier.complete();
   runUntilIdle(engine);
   require(executor.restored == 64 && executor.prefillRows == 1 && events.starts.size() == 1 &&
-              events.starts[0].first == EngineCacheStatus::PrefixHit &&
-              events.starts[0].second == 64 && events.failedCount == 0,
+              events.starts[0] == 64 && events.failedCount == 0,
           "restored prefix was not used");
   const auto stats = cache.snapshot();
   require(stats.kvTier.restores == 2 &&
@@ -7452,8 +7353,7 @@ void testSharedPrefillWaitsForARestoringProducer() {
   executor.restoreControl->ready = true;
   runUntilIdle(engine);
   require(executor.diskReads == 1 &&
-              events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 192} &&
+              events.starts.back() == 192 &&
               executor.prefillRows == (192 - 64) + 2 * 34 && events.completedCount == 2,
           "the sibling read the state again or prefilled the shared span");
 }
@@ -7488,8 +7388,7 @@ void testCancelledRestoringProducerReleasesItsWaiter() {
   producerRead->ready = true;
   executor.restoreControl->ready = true;
   runUntilIdle(engine);
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+  require(events.starts.back() == 64 &&
               engine.snapshot().cancelled == 1 && events.completedCount == 2,
           "the sibling did not restore the prefix itself");
 }
@@ -7555,8 +7454,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
                      events.startIds.end();
             },
             "the request that skips the cache did not start");
-  require(events.starts.front() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::Miss, 0} &&
+  require(events.starts.front() == 0 &&
               executor.diskReads == 1 && executor.restored == 0,
           "the request that skips the cache waited for the restoring producer");
   executor.restoreControl->ready = true;
@@ -7567,8 +7465,7 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
           "the requests did not finish");
   const auto &boundaries = executor.plans.at(2).boundaries;
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 160} &&
+  require(events.starts.back() == 160 &&
               std::none_of(boundaries.begin(), boundaries.end(),
                            [](const DraftBoundaryPlan &boundary) {
                              return boundary.boundary == 192;
@@ -7612,7 +7509,7 @@ void testSkipCacheCandidateIsNotProbed() {
   double now = 2;
   tickUntil(engine, now, [&] { return !events.starts.empty(); },
             "the request did not start without its prefix");
-  require(hashed() == 2 && events.starts[0] == std::pair{EngineCacheStatus::Miss, 0U},
+  require(hashed() == 2 && events.starts[0] == 0,
           "a request that ignores the cache was probed or ranked by its prefix");
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.completedCount == 1 && executor.prefillRows == 65 && tier.restores == 0,
@@ -7674,7 +7571,7 @@ void testRefusedPrefixRestorePreemptsLowerResident() {
     executor.restoreControl->ready = true;
     tickUntil(engine, now, [&] { return events.startIds.back() == 2; },
               "the restored request did not start");
-    require(events.starts.back() == std::pair{EngineCacheStatus::PrefixHit, 64U} &&
+    require(events.starts.back() == 64 &&
                 engine.snapshot().prioritySuspensions == (written ? 0U : 1U),
             "the request did not start from its restored prefix");
     for (uint64_t id : {1, 2})
@@ -7957,8 +7854,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   require(idle(engine), "lane did not finish");
   require(now > 90000.0, "the wait did not cross the resource limit");
   require(events.failedCount == 0 && events.starts.size() == 1 &&
-              events.starts[0].first == EngineCacheStatus::PrefixHit &&
-              events.starts[0].second == 96 && executor.restored == 96 &&
+              events.starts[0] == 96 && executor.restored == 96 &&
               executor.prefillRows == 1 && executor.suspensions == 0,
           "a lane whose pages kept landing was failed or lost its prefix");
   require(cache.snapshot().kvTier.restores == 3,
@@ -8110,8 +8006,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   }
   require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
               events.starts.size() == 2 &&
-              events.starts[1].first == EngineCacheStatus::PrefixHit &&
-              events.starts[1].second == 256 && executor.restored == 256,
+              events.starts[1] == 256 && executor.restored == 256,
           "the lane did not run on its prefix after the command");
 }
 
@@ -8223,8 +8118,8 @@ void testRestoringLaneWaitsForResidentLanes() {
     tier.complete();
   }
   require(idle(engine) && events.failedCount == 0 && executor.suspensions == 0 &&
-              events.starts.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
-              events.starts[1].second == 64 && executor.restored == 64,
+              events.starts.size() == 2 && events.starts[1] == 64 &&
+              executor.restored == 64,
           "the restoring lane did not run on its prefix once pages returned");
 }
 
@@ -8277,8 +8172,8 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   restoring.deadlineMilliseconds = 1e9;
   engine.submit(std::move(restoring));
   for (; now < 100 && events.startIds.size() < 2; ++now) step(now);
-  require(events.startIds.size() == 2 && events.starts[1].first == EngineCacheStatus::PrefixHit &&
-              events.starts[1].second == 64 && executor.restored == 64,
+  require(events.startIds.size() == 2 && events.starts[1] == 64 &&
+              executor.restored == 64,
           "the restore waited for the constrained lane to stop decoding");
   require(events.completedCount == 0 && events.failedCount == 0 &&
               cache.snapshot().kvTier.restores == 2,
@@ -8328,8 +8223,7 @@ void testRunningRequestKeepsItsReplayPoint() {
   next.resize(next.size() + 40, 7);
   engine.submit(request(4, next));
   tickUntil(engine, now, [&] { return idle(engine); }, "the next turn did not finish");
-  require(events.starts.back() ==
-              std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64},
+  require(events.starts.back() == 64,
           "the next turn lost the replay point its predecessor ran from");
   const auto state = resources.snapshot().stateCache;
   require(state.inUse == 0 && state.inUseEvictions == 0,
@@ -8391,8 +8285,7 @@ void testSuspendedRequestKeepsItsReplayPoint() {
   next.resize(next.size() + 40, 7);
   engine.submit(request(4, next));
   tickUntil(engine, now, [&] { return idle(engine); }, "the next turn did not finish");
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+  require(events.starts.back() == 64 &&
               resources.snapshot().stateCache.inUse == 0,
           "the next turn lost the replay point its predecessor resumed from");
 }
@@ -8462,8 +8355,7 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   engine.submit(request(266, next));
   for (; now < 500 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
-  require(idle(engine) && events.starts.back() ==
-              std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 32},
+  require(idle(engine) && events.starts.back() == 32,
           "the next turn did not resume from the prompt's replay point");
 }
 
@@ -8578,8 +8470,7 @@ void testRestoredEndpointIsInUse() {
   double now = 100;
   for (; now < 120 && events.outputs[2].size() < 2; ++now)
     static_cast<void>(engine.tick(now));
-  require(events.starts.back() ==
-                  std::pair<EngineCacheStatus, uint32_t>{EngineCacheStatus::PrefixHit, 64} &&
+  require(events.starts.back() == 64 &&
               resources.snapshot().stateCache.inUse == 1,
           "a restored replay point was not in use");
   for (; now < 200 && !idle(engine); ++now)
@@ -8912,7 +8803,6 @@ int main() {
     testLaneThatWouldYieldTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
-    testScoreRequestsCarryNoSamplingOptions();
     testConcurrentColdPrefixesComputeOnce();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();
@@ -8996,7 +8886,7 @@ int main() {
     testSkippedCheckpointKeepsPreviousRecoveryPoint();
     testLongSuffixSkipsDraftRestore();
     testCancellationInFlightAtBoundaryPublishesNoState();
-    testActiveCellGrowthReclaimsCachedStateAndRetries();
+    testLaneStateGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
@@ -9006,7 +8896,7 @@ int main() {
     testWarningReclaimCountsOnlyWhatReachesTheHost();
     testWarningReclaimWakesARefusedStart();
     testPressureReclaimFollowsTheChain();
-    testFullStateCellsSkipAdmissionAttempts();
+    testFullLanesSkipAdmissionAttempts();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
@@ -9054,7 +8944,7 @@ int main() {
     testRecoveryDrainEndsWithItsCause();
     testRecoveryDrainEndsWhenAResidentReleasesMemory();
     testHigherPriorityArrivalIsNotHeldByRecovery();
-    testForegroundArrivalPreemptsWhenCellsAreFull();
+    testForegroundArrivalPreemptsWhenLanesAreFull();
     testRefusedHigherPriorityStartPreemptsLowerResident();
     testPrefixWaiterTakesNoLaneUntilThePrefixLands();
     testRequestBelowARunningPriorityTakesNoLane();

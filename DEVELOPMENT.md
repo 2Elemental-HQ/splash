@@ -530,7 +530,7 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, the KV runway and any disk tier
+pipeline and runtime reserves, one lane's state, the KV runway and any disk tier
 state staging, exceed the hard budget, so a model that can never fit is not
 prepared. File backing does not make Metal-resident pages reclaimable.
 Every buffer the backend allocates or wraps belongs to one residency set
@@ -911,7 +911,7 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Tools and structured output generate
 under a grammar, which decides where the output ends, so combining them with
 `ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word (native wire version 7), which rejects undefined bits.
+frame's flags word, which rejects undefined bits.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -1010,15 +1010,15 @@ way; the point its generated history reaches is a disposable checkpoint.
 
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, including one whose prefix is still being restored from disk, then enter
-through the ordinary cache restore path. Waiting requests hold no active state
-cell or KV pages and return to ordinary admission when no useful producer
-remains. Late arrivals can extend the plan at complete state boundaries.
+through the ordinary cache restore path. Waiting requests hold no lane or KV
+pages and return to ordinary admission when no useful producer remains. Late
+arrivals can extend the plan at complete state boundaries.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
-Greedy and sampled requests can share an unconstrained decode batch; each lane
-keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
-path. Constrained requests use a separate batch for the host mask exchange.
+Greedy and sampled requests share unconstrained decode batches; each lane keeps
+its own sampling policy and RNG, and a greedy lane takes the argmax path in any
+batch. Constrained requests use a separate batch for the host mask exchange.
 A mask request the server leaves unanswered for 5 s fails that request with
 the retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
 batch's command.
@@ -1229,13 +1229,14 @@ entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
-Native wire version 6 appends score-token IDs to requests and selected f32 logits
-to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
-in-vocabulary tokens, no images or generation constraints, and a zero output budget.
-It may use the full context window because no generated token needs a reserved
-position. The final prefill chunk runs the target head but no sampling policy or
-DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
-reports zero decode time. Cancelled requests carry no logits.
+Requests carry the score-token IDs and Done events the selected f32 logits; the
+server and the engine must speak the same native wire version. Scoring requires
+2–255 distinct, in-vocabulary tokens, no images or generation constraints, and a
+zero output budget. It may use the full context window because no generated
+token needs a reserved position. The final prefill chunk runs the target head
+but no sampling policy or DFlash decode. Successful scoring emits no Tokens
+event, finishes with Stop, and reports zero decode time. Cancelled requests
+carry no logits.
 
 A non-finite logit row is a per-request failure, not an engine fault: a score
 logit, or a token the sampling kernels could only select outside the
@@ -1387,6 +1388,12 @@ the three 27B comparisons. A laptop can cap its GPU power during a long
 comparison and so make it inconclusive; rerun `make test-performance-real` for
 that model alone once the Mac has cooled.
 
+When the native wire layout or the status schema changed since the last
+release, bump `kProtocolVersion` (`runtime/engine/Protocol.hpp`) and
+`PROTOCOL_VERSION` (`server/protocol.py`) together: builds between releases
+share a version while its layout changes, and a server refuses an engine of
+another version.
+
 ### Local benchmarks
 
 From a source checkout with the model installed, use the native benchmark for
@@ -1411,8 +1418,10 @@ report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 
-For a same-machine HTTP regression check, retain the previous `splash` binary
-**and its adjacent `splash.metallib`**, then run from the candidate checkout:
+For a same-machine HTTP regression check, retain a `splash` binary **and its
+adjacent `splash.metallib`** built from a checkout with the same native wire
+version and status schema as this one (the server refuses any other), then run
+from the candidate checkout:
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \

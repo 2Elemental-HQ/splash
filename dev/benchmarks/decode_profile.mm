@@ -137,8 +137,9 @@ void prefill(model::Runtime &executor, Lane &lane,
     const uint32_t count = std::min<uint32_t>(
         model::ExecutionLimits::prefillTokenBudget,
         static_cast<uint32_t>(prompt.size()) - offset);
-    BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
-                   {{lane.id, count, offset}}, DecodeStage::Regular};
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{lane.id, count, offset}},
+                   .decodeStage = DecodeStage::Regular};
     ModelBatchItem item{lane.id, offset, count, lane.pages,
                         lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
@@ -166,7 +167,6 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto started = std::chrono::steady_clock::now();
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
-  plan.cohort = BatchCohort::Greedy;
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});

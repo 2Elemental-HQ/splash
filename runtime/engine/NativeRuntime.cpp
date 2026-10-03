@@ -10,76 +10,6 @@
 #include <variant>
 
 namespace splash::engine {
-namespace {
-
-static_assert(protocol::kMaximumScoreOptions ==
-                  model::ExecutionLimits::maximumScoreOptions,
-              "native protocol and model score option bounds must match");
-static_assert(protocol::kMinimumScoreOptions ==
-                  model::ExecutionLimits::minimumScoreOptions,
-              "native protocol and model score option bounds must match");
-static_assert(uint32_t{protocol::RequestIgnoreEndOfSequence} ==
-                      uint32_t{RequestIgnoreEndOfSequence} &&
-                  protocol::kRequestFlagBits == kRequestFlagBits,
-              "native protocol and model request flags must match");
-
-RequestPriority mapPriority(protocol::RequestPriority priority) {
-  switch (priority) {
-  case protocol::RequestPriority::Foreground:
-    return RequestPriority::Foreground;
-  case protocol::RequestPriority::Normal:
-    return RequestPriority::Normal;
-  case protocol::RequestPriority::Background:
-    return RequestPriority::Background;
-  }
-  throw std::invalid_argument("invalid protocol priority");
-}
-
-BatchCohort mapCohort(protocol::Cohort cohort) {
-  switch (cohort) {
-  case protocol::Cohort::Greedy:
-    return BatchCohort::Greedy;
-  case protocol::Cohort::Sampling:
-    return BatchCohort::Sampling;
-  case protocol::Cohort::Constrained:
-    return BatchCohort::Constrained;
-  }
-  throw std::invalid_argument("invalid protocol cohort");
-}
-
-ConstraintMode mapConstraint(protocol::ConstraintMode constraint) {
-  switch (constraint) {
-  case protocol::ConstraintMode::None:
-    return ConstraintMode::None;
-  case protocol::ConstraintMode::TokenMask:
-    return ConstraintMode::TokenMask;
-  }
-  throw std::invalid_argument("invalid protocol constraint mode");
-}
-
-protocol::CacheDisposition mapCacheDisposition(EngineCacheStatus status) {
-  switch (status) {
-  case EngineCacheStatus::Miss:
-    return protocol::CacheDisposition::Miss;
-  case EngineCacheStatus::PrefixHit:
-    return protocol::CacheDisposition::PrefixHit;
-  }
-  throw std::logic_error("invalid engine cache status");
-}
-
-protocol::FinishReason mapFinishReason(EngineFinishReason reason) {
-  switch (reason) {
-  case EngineFinishReason::Stop:
-    return protocol::FinishReason::Stop;
-  case EngineFinishReason::Length:
-    return protocol::FinishReason::Length;
-  case EngineFinishReason::Cancelled:
-    return protocol::FinishReason::Cancelled;
-  }
-  throw std::logic_error("invalid engine finish reason");
-}
-
-} // namespace
 
 NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                              model::Model &model, ByteSink output,
@@ -90,7 +20,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
       statusProvider_(std::move(statusProvider)), clocks_(std::move(clocks)),
       limits_(limits), parser_(limits_),
       core_(config_.engine, cache, model, *this) {
-  if (!config_.engineInstanceId || !output_ || !statusProvider_) {
+  if (!output_ || !statusProvider_) {
     throw std::invalid_argument("invalid native engine loop config");
   }
   if (auto issue = protocol::validateLimits(limits_))
@@ -118,17 +48,18 @@ bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
         continue;
       // The parser is already past a frame it yielded, so a request-scoped
       // decode failure leaves the frames behind it to be processed.
-      auto decoded = protocol::decodeFrame(*step.frame, limits_);
+      const protocol::FrameType type = step.frame->type;
+      auto decoded = protocol::decodeFrame(std::move(*step.frame), limits_);
       if (decoded) {
         if (!handle(*decoded.value))
           return false;
-      } else if (step.frame->type == protocol::FrameType::MaskResponse &&
+      } else if (type == protocol::FrameType::MaskResponse &&
                  decoded.issue->failureClass ==
                      protocol::FailureClass::RequestError) {
         if (!handleMaskIssue(std::move(*decoded.issue)))
           return false;
       } else {
-        if (step.frame->type == protocol::FrameType::Request &&
+        if (type == protocol::FrameType::Request &&
             telemetry_.contains(decoded.issue->requestId)) {
           decoded.issue->failureClass = protocol::FailureClass::ProtocolFatal;
         }
@@ -194,12 +125,9 @@ void NativeRuntime::announceReady() {
   }
   if (ready_)
     throw std::logic_error("ready was already announced");
-  uint64_t features = protocol::kNativeFeatureBits;
-  if (config_.engine.maxImagePatches)
-    features |= protocol::FeatureVision;
-  if (!send(protocol::ReadyEvent{config_.engineInstanceId,
-                                 model::ExecutionLimits::maximumBatchWidth,
-                                 config_.engine.maxContext, features})) {
+  if (!send(protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth,
+                                 config_.engine.maxContext,
+                                 config_.engine.maxImagePatches != 0})) {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;
@@ -215,7 +143,7 @@ std::optional<double> NativeRuntime::millisecondsUntilNextWakeup() const {
   return std::max(0.0, *wakeup - now);
 }
 
-bool NativeRuntime::handle(protocol::Message &message) {
+bool NativeRuntime::handle(protocol::ClientMessage &message) {
   return std::visit(
       [&](auto &typed) -> bool {
         using T = std::decay_t<decltype(typed)>;
@@ -225,14 +153,8 @@ bool NativeRuntime::handle(protocol::Message &message) {
           return handleCancel(typed);
         } else if constexpr (std::is_same_v<T, protocol::MaskResponseFrame>) {
           return handleMask(typed);
-        } else if constexpr (std::is_same_v<T, protocol::StatusRequestFrame>) {
-          return handleStatus(typed);
         } else {
-          protocol::ProtocolIssue issue;
-          issue.failureClass = protocol::FailureClass::ProtocolFatal;
-          issue.code = protocol::IssueCode::InvalidEnumValue;
-          issue.message = "client sent a server-only native protocol message";
-          return handleIssue(std::move(issue));
+          return handleStatus(typed);
         }
       },
       message);
@@ -265,29 +187,15 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   try {
     EngineRequest engineRequest;
     engineRequest.id = request.requestId;
-    engineRequest.priority = mapPriority(request.priority);
-    engineRequest.cohort = mapCohort(request.cohort);
+    engineRequest.priority = request.priority;
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
-    engineRequest.images.reserve(request.imageSpans.size());
-    for (const protocol::ImageSpanFrame &span : request.imageSpans) {
-      engineRequest.images.push_back({span.offset, span.tokens, span.gridHeight,
-                                      span.gridWidth, span.digestLo,
-                                      span.digestHi});
-    }
+    engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.scoreTokens = std::move(request.scoreTokens);
-    engineRequest.sampling = {
-        .temperature = request.sampling.temperature,
-        .topP = request.sampling.topP,
-        .topK = request.sampling.topK,
-        .seed = request.seed,
-        .presencePenalty = request.sampling.presencePenalty,
-        .frequencyPenalty = request.sampling.frequencyPenalty,
-        .repetitionPenalty = request.sampling.repetitionPenalty,
-        .minP = request.sampling.minP};
-    engineRequest.constraint = mapConstraint(request.constraint);
+    engineRequest.sampling = request.sampling;
+    engineRequest.constraint = request.constraint;
     engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;
     engineRequest.deadlineMilliseconds =
@@ -333,8 +241,7 @@ bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
   std::string json = statusProvider_();
   if (json.empty())
     throw std::runtime_error("empty status document");
-  return send(protocol::StatusJsonEvent{
-      status.correlationId, protocol::kStatusSchemaVersion, std::move(json)});
+  return send(protocol::StatusJsonEvent{status.correlationId, std::move(json)});
 }
 
 bool NativeRuntime::handleMaskIssue(protocol::ProtocolIssue issue) {
@@ -389,10 +296,10 @@ void NativeRuntime::engineError(std::string code, std::string message) {
   closeConnection_ = true;
 }
 
-bool NativeRuntime::send(protocol::Message message) {
+bool NativeRuntime::send(const protocol::EngineEvent &event) {
   if (closeConnection_)
     return false;
-  auto serialized = protocol::serializeMessage(message, limits_);
+  auto serialized = protocol::serializeEvent(event, limits_);
   if (!serialized) {
     // An event the engine cannot put on the wire is an engine defect. Report
     // it once and stop the stream, so the client sees the cause instead of a
@@ -401,7 +308,7 @@ bool NativeRuntime::send(protocol::Message message) {
     closeConnection_ = true;
     if (engineFailure_.empty())
       engineFailure_ = "protocol_encode_failed: " + serialized.issue->message;
-    auto report = protocol::serializeMessage(
+    auto report = protocol::serializeEvent(
         protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                              "protocol_encode_failed",
                              serialized.issue->message},
@@ -442,13 +349,11 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
   }
 }
 
-void NativeRuntime::started(uint64_t requestId, EngineCacheStatus cacheStatus,
-                            uint32_t matchedTokens, uint32_t stateSlot) {
+void NativeRuntime::started(uint64_t requestId, uint32_t matchedTokens,
+                            uint32_t lane) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   telemetry.startedMilliseconds = clocks_.monotonicMilliseconds();
-  send(protocol::StartEvent{requestId, mapCacheDisposition(cacheStatus),
-                            static_cast<int32_t>(stateSlot), matchedTokens,
-                            config_.engine.maxContext});
+  send(protocol::StartEvent{requestId, lane, matchedTokens});
 }
 
 void NativeRuntime::promptProgress(uint64_t requestId,
@@ -510,7 +415,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                        : telemetry.arrivedMilliseconds;
   double first = telemetry.firstTokenMilliseconds.value_or(now);
   send(protocol::DoneEvent{
-      requestId, mapFinishReason(reason), promptTokens, completionTokens,
+      requestId, reason, promptTokens, completionTokens,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),

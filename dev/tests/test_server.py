@@ -21,6 +21,7 @@ from unittest import mock
 from openai import OpenAI
 from tokenizers import Tokenizer, decoders, models
 
+from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
 from server import api_shapes, diagnostics, documents, judgments, tool_schema
 from server import backend as backend_api
@@ -378,33 +379,7 @@ class FakeRuntime:
         self.pending_limit = 32
         self.restart_count = 0
         self.last_crash_trace = None
-        self.status_event = native_wire.StatusJsonEvent(
-            1,
-            native_wire.STATUS_SCHEMA_VERSION,
-            json.dumps(
-                {
-                    "schema_version": native_wire.STATUS_SCHEMA_VERSION,
-                    "ready": True,
-                    "memory_pressure": "normal",
-                    "metal": {"healthy": True},
-                    "memory": {
-                        "plan_bytes": 100,
-                        "actual_bytes": 99,
-                        "peak_bytes": 100,
-                        "headroom_bytes": 20,
-                    },
-                    "kv": {
-                        "total_pages": 8,
-                        "free_pages": 8,
-                        "active_pages": 0,
-                        "prefix_pages": 0,
-                        "pinned_pages": 0,
-                    },
-                    "requests": {"queued": 0, "resident": 0, "runnable": 0},
-                },
-                separators=(",", ":"),
-            ).encode(),
-        )
+        self.status_event = native_peer.status_event()
         self.threads = []
 
     @property
@@ -443,19 +418,7 @@ class FakeRuntime:
         plan.start_release.wait(2)
         if call.done:
             return
-        call.emit(
-            native_wire.StartEvent(
-                call.request_id,
-                (
-                    native_wire.CacheDisposition.PREFIX_HIT
-                    if plan.matched_tokens
-                    else native_wire.CacheDisposition.MISS
-                ),
-                0,
-                plan.matched_tokens,
-                8192,
-            )
-        )
+        call.emit(native_wire.StartEvent(call.request_id, 0, plan.matched_tokens))
         plan.started.set()
         plan.release.wait(2)
         if plan.exception:
@@ -1115,105 +1078,94 @@ class ServerTest(unittest.TestCase):
             },
         )
 
-        runtime.status_event = native_wire.StatusJsonEvent(
+        runtime.status_event = native_peer.status_event(
             2,
-            native_wire.STATUS_SCHEMA_VERSION,
-            json.dumps(
-                {
-                    "schema_version": native_wire.STATUS_SCHEMA_VERSION,
-                    "ready": True,
-                    "memory_pressure": "normal",
-                    "metal": {"healthy": True},
-                    "requests": {"submitted": 7, "completed": 5},
-                    "admission": {
-                        "waiting_memory": 2,
-                        "waiting_concurrency": 1,
-                        "held_behind_refusal": 4,
-                        "restoring": 1,
-                        "suspended": 1,
-                        "oldest_wait_ms": 1250.0,
-                    },
-                    "scheduler": {
-                        "queued": 1,
-                        "waiting_resources": 3,
-                        "waiting_prefix": 2,
-                        "prefilling": 2,
-                        "decoding": 1,
-                        "waiting_mask": 0,
-                        "prefill_batches": 10,
-                        "prefill_rows": 2048,
-                        "decode_batches": 7,
-                        "decode_mixed_greedy_sampling_batches": 2,
-                        "decode_batches_by_width": {
-                            "b1": 1,
-                            "b2": 2,
-                            "b3": 3,
-                            "b4": 1,
-                        },
-                    },
-                    "kv": {
-                        "pages_allocated": 8,
-                        "pages_active": 4,
-                        "pages_cache": 4,
-                        "pages_free": 2,
-                        "allocated_bytes": 8192,
-                        "extent_allocate_max_ms": 2.5,
-                        "extent_release_max_ms": 0.75,
-                        "extent_compact_max_ms": 1.5,
-                    },
-                    "state": {
-                        "entries": 2,
-                        "pinned": 1,
-                        "in_use": 1,
-                        "in_use_evictions": 3,
-                        "bytes": 4096,
-                        "active_cells": 2,
-                        "publications": 3,
-                        "evictions": 1,
-                    },
-                    "cache": {
-                        "hits": 7,
-                        "cold_misses": 4,
-                        "reused_tokens": 1024,
-                        "lazy_junctions": 2,
-                        "priority_suspensions": 3,
-                    },
-                    "draft_context": {
-                        "target_prefill_rows": 10000,
-                        "prompt_end_rows": 2048,
-                        "materialization_rows": 31,
-                        "avoided_rows": 7921,
-                        "restore_skipped": 1,
-                        "resets": 2,
-                    },
-                    "constraint_masks": {
-                        "overlap_batches": 5,
-                        "overlap_requests": 8,
-                        "last_target_forward_gpu_ms": 72.5,
-                        "total_target_forward_gpu_ms": 250.0,
-                        "last_residual_wait_ms": 1.5,
-                        "total_residual_wait_ms": 12.0,
-                    },
-                    "memory_actual": {
-                        "current_bytes": 700,
-                        "peak_bytes": 800,
-                    },
-                    "memory_governor": {"limit_bytes": 1000, "headroom_bytes": 200},
-                    "metrics": {
-                        "ttft_ms": {"p50": 10.0, "p95": 12.5, "samples": 5},
-                        "prefill_input_tokens": 2048,
-                        "prefill_wall_ms": 500.0,
-                        "prefill_tokens_per_second": 4096.0,
-                        "decode_output_tokens": 32,
-                        "decode_wall_ms": 64.0,
-                        "decode_tokens_per_second": 500.0,
-                        "draft_acceptance_rate": 0.875,
-                        "capacity_failures": 1,
-                        "metal_failures": 2,
-                    },
+            requests={"submitted": 7, "completed": 5},
+            admission={
+                "waiting_memory": 2,
+                "waiting_concurrency": 1,
+                "held_behind_refusal": 4,
+                "restoring": 1,
+                "suspended": 1,
+                "oldest_wait_ms": 1250.0,
+            },
+            scheduler={
+                "queued": 1,
+                "waiting_resources": 3,
+                "waiting_prefix": 2,
+                "prefilling": 2,
+                "decoding": 1,
+                "waiting_mask": 0,
+                "prefill_batches": 10,
+                "prefill_rows": 2048,
+                "decode_batches": 7,
+                "decode_batches_by_width": {
+                    "b1": 1,
+                    "b2": 2,
+                    "b3": 3,
+                    "b4": 1,
                 },
-                separators=(",", ":"),
-            ).encode(),
+            },
+            kv={
+                "pages_allocated": 8,
+                "pages_active": 4,
+                "pages_cache": 4,
+                "pages_free": 2,
+                "allocated_bytes": 8192,
+                "extent_allocate_max_ms": 2.5,
+                "extent_release_max_ms": 0.75,
+                "extent_compact_max_ms": 1.5,
+            },
+            state={
+                "entries": 2,
+                "pinned": 1,
+                "in_use": 1,
+                "in_use_evictions": 3,
+                "bytes": 4096,
+                "active_lanes": 2,
+                "publications": 3,
+                "evictions": 1,
+            },
+            cache={
+                "hits": 7,
+                "cold_misses": 4,
+                "reused_tokens": 1024,
+                "lazy_junctions": 2,
+                "priority_suspensions": 3,
+            },
+            draft_context={
+                "target_prefill_rows": 10000,
+                "prompt_end_rows": 2048,
+                "materialization_rows": 31,
+                "avoided_rows": 7921,
+                "restore_skipped": 1,
+                "resets": 2,
+            },
+            constraint_masks={
+                "overlap_batches": 5,
+                "overlap_requests": 8,
+                "last_target_forward_gpu_ms": 72.5,
+                "total_target_forward_gpu_ms": 250.0,
+                "last_residual_wait_ms": 1.5,
+                "total_residual_wait_ms": 12.0,
+            },
+            memory_actual={
+                "current_bytes": 700,
+                "peak_bytes": 800,
+            },
+            memory_governor={"limit_bytes": 1000, "headroom_bytes": 200},
+            metrics={
+                "ttft_ms": {"p50": 10.0, "p95": 12.5, "samples": 5},
+                "prefill_input_tokens": 2048,
+                "prefill_wall_ms": 500.0,
+                "prefill_tokens_per_second": 4096.0,
+                "decode_output_tokens": 32,
+                "decode_wall_ms": 64.0,
+                "decode_tokens_per_second": 500.0,
+                "draft_acceptance_rate": 0.875,
+                "capacity_failures": 1,
+                "metal_failures": 2,
+            },
         )
         status, content_type, payload = harness.request("GET", "/metrics")
         self.assertEqual(status, 200)
@@ -1232,10 +1184,6 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_admission_oldest_wait_milliseconds 1250.0", metrics)
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
         self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
-        self.assertIn(
-            "splash_scheduler_decode_mixed_greedy_sampling_batches_total 2",
-            metrics,
-        )
         self.assertIn("splash_kv_pages_allocated 8", metrics)
         self.assertIn("splash_kv_free_allocated_pages 2", metrics)
         self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
@@ -1247,6 +1195,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_in_use 1", metrics)
         self.assertIn("splash_state_in_use_evictions_total 3", metrics)
+        self.assertIn("splash_state_active_lanes 2", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
         self.assertIn("splash_cache_cold_misses_total 4", metrics)
         self.assertIn("splash_cache_reused_tokens_total 1024", metrics)
@@ -1315,7 +1264,7 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("batch", response["metrics"])
         self.assertEqual(
             response["metrics"]["cache"],
-            {"status": "hit", "matched_tokens": 1, "capacity": 8192, "slot": 0},
+            {"status": "hit", "matched_tokens": 1, "lane": 0},
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].seed, 7)
@@ -1960,7 +1909,7 @@ class ServerTest(unittest.TestCase):
 
         class UnmaterializedPixels:
             def __len__(self):
-                return native_wire.ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES
+                return native_wire.MAX_FRAME_PAYLOAD_BYTES
 
         # No huge buffer: trying to concatenate this sentinel raises TypeError.
         # The size guard must reject using lengths alone, before any copy.
@@ -2225,7 +2174,7 @@ class ServerTest(unittest.TestCase):
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
         part = self._image_message()["content"][1]
-        limit = native_wire.ProtocolLimits().max_image_spans
+        limit = native_wire.MAX_IMAGE_SPANS
         messages = [
             {"role": "user", "content": [part] * limit},
             {"role": "tool", "content": [part]},
@@ -2269,7 +2218,7 @@ class ServerTest(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(native_wire, "ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES", 1024),
+            mock.patch.object(native_wire, "MAX_FRAME_PAYLOAD_BYTES", 1024),
             mock.patch.object(app.images, "prepare", return_value=image) as prepare,
             self.assertRaisesRegex(api.APIError, "request size limit"),
         ):
@@ -3622,10 +3571,7 @@ class ServerTest(unittest.TestCase):
         args = main_args()
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
-            engine_instance_id=1,
-            max_concurrent_requests=4,
-            max_context_tokens=262144,
-            feature_bits=15,
+            max_concurrent_requests=4, max_context_tokens=262144, vision=False
         )
         backend = mock.Mock()
         server = mock.Mock(server_port=8000)
@@ -3713,21 +3659,10 @@ class ServerTest(unittest.TestCase):
 
     def test_main_takes_vision_from_the_ready_event(self):
         args = main_args()
-        features = int(
-            native_wire.ReadyFeature.CANCELLATION
-            | native_wire.ReadyFeature.TOKEN_MASKS
-            | native_wire.ReadyFeature.STATUS_JSON
-            | native_wire.ReadyFeature.MULTIPLEXING
-        )
         for vision in (True, False):
             with self.subTest(vision=vision):
                 runtime = mock.Mock()
-                runtime.readiness = native_wire.ReadyEvent(
-                    1,
-                    4,
-                    131072,
-                    features | (native_wire.ReadyFeature.VISION if vision else 0),
-                )
+                runtime.readiness = native_wire.ReadyEvent(4, 131072, vision)
                 with (
                     mock.patch.object(api, "parse_args", return_value=args),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
@@ -3787,10 +3722,7 @@ class ServerTest(unittest.TestCase):
             with self.subTest(origins=origins, key=key):
                 runtime = mock.Mock()
                 runtime.readiness = native_wire.ReadyEvent(
-                    engine_instance_id=1,
-                    max_concurrent_requests=4,
-                    max_context_tokens=131072,
-                    feature_bits=15,
+                    max_concurrent_requests=4, max_context_tokens=131072, vision=False
                 )
                 with (
                     mock.patch.object(
@@ -6536,16 +6468,43 @@ class ServerTest(unittest.TestCase):
                 )
                 self.assertEqual(runtime.requests, [])
 
+    def test_sampling_field_lists_follow_the_wire_dataclass(self):
+        self.assertEqual(
+            set(request_frontend.SAMPLING_NUMBERS) | {"top_k"},
+            set(native_wire.SAMPLING_FIELDS),
+        )
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            self.body(**dict.fromkeys(native_wire.SAMPLING_FIELDS)),
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            runtime.requests[0].sampling,
+            native_wire.SamplingParameters(
+                temperature=1.0,
+                top_p=0.95,
+                top_k=request_frontend.TOP_K_DEFAULT,
+            ),
+        )
+
     def test_responses_forward_the_sampling_fields_chat_validates(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime)
+        # A value apart from its default for every sampling option the frame
+        # carries.
         fields = {
-            "top_k": 20,
+            "temperature": 0.5,
+            "top_p": 0.5,
+            "top_k": 5,
             "presence_penalty": 1.5,
             "frequency_penalty": 0.5,
             "repetition_penalty": 1.05,
             "min_p": 0.25,
         }
+        self.assertEqual(tuple(fields), native_wire.SAMPLING_FIELDS)
         status, _, payload = harness.request(
             "POST", "/v1/responses", self.responses_body(store=False, **fields)
         )
@@ -7683,19 +7642,7 @@ class ServerTest(unittest.TestCase):
         class PressuredRuntime(FakeRuntime):
             def __init__(self):
                 super().__init__()
-                self.status_event = native_wire.StatusJsonEvent(
-                    1,
-                    native_wire.STATUS_SCHEMA_VERSION,
-                    json.dumps(
-                        {
-                            "schema_version": native_wire.STATUS_SCHEMA_VERSION,
-                            "ready": True,
-                            "memory_pressure": "critical",
-                            "metal": {"healthy": True},
-                        },
-                        separators=(",", ":"),
-                    ).encode(),
-                )
+                self.status_event = native_peer.status_event(memory_pressure="critical")
 
         harness = self.harness(PressuredRuntime())
         status, _, payload = harness.request("GET", "/ready")

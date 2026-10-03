@@ -112,10 +112,10 @@ void testLayoutFormulas() {
           "draft tensor formula is wrong");
   require(kDraftState.ringBytes() == 41'943'040,
           "draft state formula is wrong");
-  require(kStateLayout.activeCellBytes() == 350'224'384,
+  require(kStateLayout.laneBytes() == 350'224'384,
           "per-lane byte formula is wrong");
   require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                  kStateLayout.activeCellBytes() ==
+                  kStateLayout.laneBytes() ==
               1'400'897'536,
           "four-lane byte formula is wrong");
   require(kStateLayout.cachedBytes() == 196'083'712,
@@ -413,7 +413,7 @@ void run(const std::string &metallib) {
     QwenStateStorage storage(backend, admitState, kStateLayout);
     require(storage.actualAllocatedBytes() == 0 &&
                 backend.memoryStats().allocatedBytes == beforeStorage,
-            "state cells were allocated eagerly");
+            "lane state was allocated eagerly");
     for (uint32_t lane = 0;
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
@@ -423,9 +423,9 @@ void run(const std::string &metallib) {
         "storage exposed more than four lanes");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
-            "state cell activation failed");
+            "lane activation failed");
     observedLaneActual = storage.actualAllocatedBytes();
-    require(observedLaneActual >= kStateLayout.activeCellBytes(),
+    require(observedLaneActual >= kStateLayout.laneBytes(),
             "activated lane allocation is below declared bytes");
     require(storage.tryActivateLane(1, 202) &&
                 storage.actualAllocatedBytes() == 2 * observedLaneActual,
@@ -572,7 +572,7 @@ void run(const std::string &metallib) {
             "released lane buffers did not return to the pool");
     requireThrows<std::logic_error>([&] { storage.swapParity(0); },
                                     "unassigned lane accepted a parity update");
-    require(static_cast<bool>(storage.tryActivateLane(0, 303)), "state cell reuse failed");
+    require(static_cast<bool>(storage.tryActivateLane(0, 303)), "lane reuse failed");
     require(storage.idleCells() == 0 && storage.idleRings() == 0,
             "reactivation left pooled buffers behind");
     require(storage.current(0).stateBase.contents() == reusableGdnBase &&
@@ -755,10 +755,10 @@ void run(const std::string &metallib) {
           "destroyed state lanes remained in actual allocation count");
 
   std::cout << "qwen state storage tests passed: lane_declared="
-            << kStateLayout.activeCellBytes()
+            << kStateLayout.laneBytes()
             << " lane_actual=" << observedLaneActual << " four_lanes_declared="
             << uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                   kStateLayout.activeCellBytes()
+                   kStateLayout.laneBytes()
             << " four_lanes_actual=" << observedStorageActual
             << " composite_declared=" << kStateLayout.cachedBytes()
             << " prefix_actual=" << observedPrefixActual << '\n';

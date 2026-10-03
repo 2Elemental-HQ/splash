@@ -141,10 +141,10 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                     const MetalBuffer &pixels,
                     const MetalBuffer &embeddings) const {
   const VisionLayout &layout = model_.layout;
-  const uint32_t tokens = grid.patches();
-  if (!grid.valid() || tokens > maximumPatches_) {
+  if (!grid.valid() || grid.patches() > maximumPatches_) {
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
+  const auto tokens = static_cast<uint32_t>(grid.patches());
   if (!pixels || pixels.sizeBytes() < grid.pixelBytes()) {
     throw std::invalid_argument("image pixels do not cover the grid");
   }

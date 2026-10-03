@@ -73,9 +73,12 @@ struct ImageGrid final {
   [[nodiscard]] bool valid() const noexcept {
     return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;
   }
-  [[nodiscard]] uint32_t patches() const noexcept { return height * width; }
+  // Exact for any sides, so a grid past a patch limit cannot wrap under it.
+  [[nodiscard]] uint64_t patches() const noexcept {
+    return uint64_t{height} * width;
+  }
   [[nodiscard]] uint32_t mergedTokens() const noexcept {
-    return patches() / 4;
+    return (height / 2) * (width / 2);
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
     return imagePixelBytes(height, width);

@@ -1,3 +1,4 @@
+#include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
@@ -218,7 +219,7 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   actual.targetWeightsBytes = budget.targetWeightsBytes;
   actual.draftWeightsBytes = budget.draftWeightsBytes;
   actual.visionWeightsBytes = budget.visionWeightsBytes;
-  actual.stateAllocatedBytes = budget.activeStateCellBytes;
+  actual.stateAllocatedBytes = budget.laneStateBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
   actual.kvAllocatedBytes = budget.kvExtentBytes;
@@ -390,14 +391,9 @@ void requireReadyWithoutReducingConcurrency(
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               harness.loop().ready(),
           "memory-limited warmup did not become ready");
-  protocol::FrameParser parser;
-  const auto parsed = parser.consume(harness.output());
-  require(!parsed.issue && parsed.frame &&
-              parsed.consumedBytes == harness.output().size() && !parser.finish(),
-          "bootstrap did not emit one complete Ready frame");
-  const auto message = protocol::decodeFrame(*parsed.frame);
-  const auto *ready = message ? std::get_if<protocol::ReadyEvent>(&*message.value)
-                              : nullptr;
+  const auto events = protocol::peer::decodeEvents(harness.output());
+  require(events.size() == 1, "bootstrap did not emit one complete Ready frame");
+  const auto *ready = std::get_if<protocol::ReadyEvent>(&events.front());
   require(ready && ready->maxConcurrentRequests == 4,
           "startup budget permanently reduced the advertised concurrency");
 }
@@ -405,11 +401,11 @@ void requireReadyWithoutReducingConcurrency(
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
   const auto complete = memoryPlan().breakdown();
   for (uint32_t width : {1U, 2U, 3U}) {
-    // Enough for the requested resident cells and the KV runway, with less
-    // than one extra cell of headroom. This is a valid single-lane plan.
+    // Enough for the requested lanes' state and the KV runway, with less
+    // than one more lane's state to spare. This is a valid single-lane plan.
     const uint64_t ceiling = complete.minimumRequiredBytes +
-                            (width - 1) * complete.activeStateCellBytes +
-                            complete.activeStateCellBytes / 2;
+                            (width - 1) * complete.laneStateBytes +
+                            complete.laneStateBytes / 2;
     const EngineMemoryPlan plan = test::requireMemoryPlan(
         device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB),
         ceiling);

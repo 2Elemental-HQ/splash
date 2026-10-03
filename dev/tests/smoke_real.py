@@ -155,8 +155,7 @@ class RealServer:
 
 
 def kv_identity(identity: dict) -> dict:
-    # Older INT8 builds expose only q8 and have no explicit format field.
-    return {"format": "int8", **identity.get("kv", identity.get("q8", {}))}
+    return identity.get("kv", {})
 
 
 def validate_status(status: dict, kv_format: str | None = None) -> None:
@@ -172,7 +171,7 @@ def validate_status(status: dict, kv_format: str | None = None) -> None:
     )
     identity = status.get("identity", {})
     kv = kv_identity(identity)
-    actual = kv["format"]
+    actual = kv.get("format")
     require(actual in ("int8", "bf16"), "unknown KV format")
     if kv_format is not None:
         require(actual == kv_format, "runtime KV format differs from requested format")
@@ -834,8 +833,8 @@ def run_sampling(port: int, model: str) -> None:
     greedy request repeats itself exactly once its prompt is cached (the first
     run chunks the prompt differently), a sampled request whose min_p of 1
     leaves each row its most likely token answers what a greedy one does, and
-    penalized requests of every cohort finish side by side with an
-    unpenalized one and with sampled ones whose top_k keeps every token or
+    penalized greedy, sampled and constrained requests finish side by side with
+    an unpenalized one and with sampled ones whose top_k keeps every token or
     which min_p cuts."""
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(

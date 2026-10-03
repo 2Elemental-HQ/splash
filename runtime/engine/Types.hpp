@@ -10,6 +10,7 @@
 
 namespace splash::engine {
 
+// Values are the native request frame's priority byte.
 enum class RequestPriority : uint8_t {
   Foreground = 0,
   Normal = 1,
@@ -23,13 +24,16 @@ struct StepResult final {
   DecodeStage nextDecodeStage = DecodeStage::Regular;
 };
 
-enum class EngineFinishReason : uint8_t { Stop, Length, Cancelled };
-enum class EngineCacheStatus : uint8_t { Miss, PrefixHit };
+// Values are the Done event's reason byte.
+enum class EngineFinishReason : uint8_t {
+  Stop = 0,
+  Length = 1,
+  Cancelled = 2,
+};
 
 struct EngineRequest final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  BatchCohort cohort = BatchCohort::Greedy;
   std::vector<uint32_t> prompt;
   // Trailing prompt tokens a later request may not share (a chat template's
   // generation prompt, which the next turn may render differently), so
@@ -51,8 +55,8 @@ struct EngineRequest final {
   uint32_t flags = 0;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
-    return {id,           cohort,   prompt,     images,      imagePixels,
-            maxNewTokens, sampling, constraint, scoreTokens, flags};
+    return {id,       prompt,     images,      imagePixels, maxNewTokens,
+            sampling, constraint, scoreTokens, flags};
   }
 };
 
@@ -105,8 +109,8 @@ public:
   virtual ~EngineEventSink() = default;
   virtual void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t,
                               uint32_t, uint32_t, double) = 0;
-  virtual void started(uint64_t requestId, EngineCacheStatus cacheStatus,
-                       uint32_t matchedTokens, uint32_t stateSlot) = 0;
+  virtual void started(uint64_t requestId, uint32_t matchedTokens,
+                       uint32_t lane) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,

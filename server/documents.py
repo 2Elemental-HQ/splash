@@ -12,15 +12,15 @@ from dataclasses import asdict, dataclass, replace
 
 if __package__:
     from .errors import APIError
-    from .protocol import ProtocolLimits
+    from .protocol import MAX_IMAGE_SPANS
 else:
     from errors import APIError
-    from protocol import ProtocolLimits
+    from protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
 # Every rendered page becomes one image in the native request.
-MAX_PAGES = ProtocolLimits().max_image_spans
+MAX_PAGES = MAX_IMAGE_SPANS
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024

@@ -108,14 +108,18 @@ class CrashTraceRing:
             self._entries.clear()
             self._bytes = 0
 
-    def record_bytes(self, generation: int, direction: str, frame: bytes) -> None:
+    def record_bytes(
+        self, generation: int, direction: str, frame: bytes | bytearray
+    ) -> None:
         if not self.active:
             return
-        encoded = bytes(frame)
         omitted, digest = 0, ""
-        if len(encoded) > MAX_TRACE_BYTES:
-            omitted, digest = len(encoded), hashlib.sha256(encoded).hexdigest()
-            encoded = encoded[: wire.FRAME_HEADER_BYTES]
+        if len(frame) > MAX_TRACE_BYTES:
+            # Only the header is kept, so only the header is copied.
+            omitted, digest = len(frame), hashlib.sha256(frame).hexdigest()
+            encoded = bytes(memoryview(frame)[: wire.FRAME_HEADER_BYTES])
+        else:
+            encoded = bytes(frame)
         with self._lock:
             if generation != self._generation:
                 return

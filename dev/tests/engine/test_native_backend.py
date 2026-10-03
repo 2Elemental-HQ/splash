@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest import mock
 
+from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory
 from dev.tests.test_server import make_frontend
 from server import backend as backend_api
@@ -141,12 +142,7 @@ class FakeRuntime:
         self.ready = True
         self.last_status = None
         self.status_calls = 0
-        self.status_event = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":6,"ready":true,"memory_pressure":"normal",'
-            b'"metal":{"healthy":true}}',
-        )
+        self.status_event = native_peer.status_event()
         self.pending_limit = 8
         self.restart_count = 3
         self.last_crash_trace = None
@@ -226,7 +222,9 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
 
 
 def success_result(call, *, reason=wire.FinishReason.STOP, tokens=()):
-    done = wire.DoneEvent(call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000)
+    done = wire.DoneEvent(
+        call.request_id, reason, 4, len(tokens), 1_250, 2_500, 4_000, ()
+    )
     return runtime.GenerationResult(call.request_id, None, done)
 
 
@@ -256,7 +254,6 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(request.priority, wire.RequestPriority.FOREGROUND)
         self.assertEqual(request.sampling, job.sampling)
         self.assertEqual(request.seed, 0x123456789ABCDEF0)
-        self.assertEqual(request.cohort, wire.Cohort.CONSTRAINED)
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
         self.assertGreater(request.deadline.remaining_micros, 0)
 
@@ -314,7 +311,6 @@ class NativeBackendContractTests(unittest.TestCase):
             wire.SamplingParameters(0.7, 0.8, 13, 1.5, 0.5, 1.05),
         )
         self.assertEqual(request.seed, 99)
-        self.assertEqual(request.cohort, wire.Cohort.SAMPLING)
 
     def test_adapter_through_real_runtime_serializes_request_frame(self):
         factory = FakeFactory()
@@ -343,24 +339,15 @@ class NativeBackendContractTests(unittest.TestCase):
             ),
         )
         self.assertEqual(frame.seed, 0x123456789ABCDEF0)
-        self.assertEqual(frame.cohort, wire.Cohort.SAMPLING)
         self.assertEqual(frame.constraint, wire.ConstraintMode.NONE)
         self.assertGreater(frame.absolute_deadline_unix_micros, 0)
         self.assertGreater(frame.remaining_deadline_micros, 0)
 
-        process.send(
-            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(frame.request_id, 0, 0))
         process.send(wire.TokensEvent(frame.request_id, 0, (7,)))
         process.send(
             wire.DoneEvent(
-                frame.request_id,
-                wire.FinishReason.STOP,
-                4,
-                1,
-                100,
-                200,
-                350,
+                frame.request_id, wire.FinishReason.STOP, 4, 1, 100, 200, 350, ()
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
@@ -409,11 +396,8 @@ class NativeBackendContractTests(unittest.TestCase):
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
         self.assertEqual(frame.score_tokens, (101, 202, 303))
         self.assertEqual(frame.logical_max_output_tokens, 0)
-        self.assertEqual(frame.cohort, wire.Cohort.GREEDY)
 
-        process.send(
-            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(frame.request_id, 0, 0))
         process.send(
             wire.DoneEvent(
                 frame.request_id,
@@ -444,17 +428,8 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertTrue(transport.submit(job))
         process = factory.processes[0]
         request = process.stdin.wait_for(wire.RequestFrame)[0]
-        self.assertEqual(request.cohort, wire.Cohort.CONSTRAINED)
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
-        process.send(
-            wire.StartEvent(
-                request.request_id,
-                wire.CacheDisposition.MISS,
-                0,
-                0,
-                4096,
-            )
-        )
+        process.send(wire.StartEvent(request.request_id, 0, 0))
 
         process.send(wire.MaskRequestEvent(request.request_id, 71, 2, ()))
         initial = process.stdin.wait_for(wire.MaskResponseFrame)[0]
@@ -472,13 +447,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
         process.send(
             wire.DoneEvent(
-                request.request_id,
-                wire.FinishReason.STOP,
-                4,
-                0,
-                100,
-                0,
-                150,
+                request.request_id, wire.FinishReason.STOP, 4, 0, 100, 0, 150, ()
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
@@ -493,16 +462,6 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "constraint_error")
         self.assertIn("expected 24", caught.exception.message)
 
-    def test_greedy_and_sampling_cohorts_follow_temperature(self):
-        transport, _runtime = self.make_transport()
-        greedy = transport._generation_request(make_job(1, temperature=0.0))
-        sampling = transport._generation_request(make_job(2, temperature=0.5))
-
-        self.assertEqual(greedy.cohort, wire.Cohort.GREEDY)
-        self.assertEqual(sampling.cohort, wire.Cohort.SAMPLING)
-        self.assertEqual(greedy.constraint, wire.ConstraintMode.NONE)
-        self.assertEqual(sampling.constraint, wire.ConstraintMode.NONE)
-
     def test_start_tokens_and_done_are_finalized_off_callback_path(self):
         constraint = FakeConstraint()
         transport, runtime = self.make_transport()
@@ -510,9 +469,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertTrue(transport.submit(job))
         call = runtime.calls[0]
 
-        call.emit(
-            wire.StartEvent(call.request_id, wire.CacheDisposition.PREFIX_HIT, 2, 2, 99)
-        )
+        call.emit(wire.StartEvent(call.request_id, 2, 2))
         call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
         call.complete(result=success_result(call, tokens=(7, 8)))
 
@@ -543,12 +500,10 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertTrue(transport.submit(job))
         process = factory.processes[0]
         frame = process.stdin.wait_for(wire.RequestFrame)[0]
-        process.send(
-            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
+        process.send(wire.StartEvent(frame.request_id, 0, 0))
         process.send(
             wire.DoneEvent(
-                frame.request_id, wire.FinishReason.STOP, 4, 0, 100, 200, 350
+                frame.request_id, wire.FinishReason.STOP, 4, 0, 100, 200, 350, ()
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
@@ -791,44 +746,23 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_status_schema_and_memory_pressure_are_fail_closed(self):
         transport, runtime = self.make_transport()
-        runtime.status_event = wire.StatusJsonEvent(
-            1, wire.STATUS_SCHEMA_VERSION, b"[]"
-        )
+        runtime.status_event = wire.StatusJsonEvent(1, b"[]")
         self.assertFalse(transport.is_ready())
 
-        runtime.status_event = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":6,"ready":true,"memory_pressure":"critical",'
-            b'"metal":{"healthy":true}}',
-        )
+        runtime.status_event = native_peer.status_event(memory_pressure="critical")
         self.assertFalse(transport.is_ready())
 
-        runtime.status_event = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":6,"ready":"false",'
-            b'"memory_pressure":"normal","metal":{"healthy":true}}',
-        )
+        runtime.status_event = native_peer.status_event(ready="false")
         self.assertFalse(transport.is_ready())
 
-        runtime.status_event = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":6,"ready":true,"metal":{"healthy":true}}',
-        )
+        runtime.status_event = native_peer.status_event(memory_pressure=None)
         self.assertFalse(transport.is_ready())
 
-        runtime.status_event = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":6,"ready":true,"memory_pressure":"normal",'
-            b'"metal":{"healthy":true}}',
-        )
+        runtime.status_event = native_peer.status_event()
         self.assertTrue(transport.is_ready())
         self.assertEqual(runtime.status_calls, 5)
 
-        runtime.status_event = wire.StatusJsonEvent(1, 1, b'{"schema_version":3}')
+        runtime.status_event = wire.StatusJsonEvent(1, b'{"schema_version":3}')
         status = transport.status()
         self.assertFalse(status["ready"])
         self.assertIn("error", status["transport"])
@@ -886,11 +820,7 @@ class NativeBackendContractTests(unittest.TestCase):
         transport, _runtime = self.make_transport(runtime)
         self.assertFalse(transport.is_ready())
 
-        runtime.last_status = wire.StatusJsonEvent(
-            1,
-            wire.STATUS_SCHEMA_VERSION,
-            b'{"schema_version":4,"ready":true}',
-        )
+        runtime.last_status = native_peer.status_event()
         self.assertFalse(transport.is_ready())
 
     def test_timed_out_status_keeps_one_background_refresh_alive(self):

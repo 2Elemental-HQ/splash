@@ -3,7 +3,6 @@
 #include "metal/abi/Sampling.h"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -113,10 +112,6 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
     const SamplingPenalties &penalties = policies[lane].penalties;
     if (!penalties.active())
       continue;
-    if (!std::isfinite(penalties.repetition) || penalties.repetition <= 0.0F ||
-        !std::isfinite(penalties.presence) ||
-        !std::isfinite(penalties.frequency))
-      throw std::invalid_argument("invalid sampling penalties");
     // The kernel indexes the whole table by this row.
     if (lane >= table.rows.size() ||
         (uint64_t{table.rows[lane]} + 1) * rowBytes > table.words.sizeBytes())

@@ -6,17 +6,20 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash {
 
-enum class BatchCohort : uint8_t { Greedy, Sampling, Constrained };
 enum class WorkKind : uint8_t { Prefill, Decode };
 
 enum class DecodeStage : uint8_t {
@@ -29,23 +32,28 @@ enum class DecodeStage : uint8_t {
   return stage == DecodeStage::ApplyInitialMask;
 }
 
-enum class ConstraintMode : uint8_t { None, TokenMask };
+// Values are the native request frame's constraint byte.
+enum class ConstraintMode : uint8_t { None = 0, TokenMask = 1 };
 
-// Request options, one bit each, as the native protocol's request flags carry
-// them.
+// Request options, one bit each, as the native request frame's flags word
+// carries them; a request with any other bit set is a request error.
 enum RequestFlag : uint32_t {
   // Never select the model's stop tokens, so generation runs to its output
-  // limit. Only unconstrained generation carries it.
+  // limit. Only unconstrained generation can carry it.
   RequestIgnoreEndOfSequence = 1U << 0,
 };
 
 inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 
+// A request's token selection, its fields in the native request frame's
+// order. The defaults are greedy selection with nothing changing the logits.
 struct SamplingParameters final {
+  // Zero selects greedily; sampling divides the logits by it.
   float temperature = 0.0F;
   float topP = 1.0F;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
-  uint64_t seed = 0;
   // The sampling penalties, applied before greedy and sampled selection alike:
   // repetition scales the logits of prompt and output tokens, presence and
   // frequency lower those of output tokens. The defaults change nothing.
@@ -55,10 +63,38 @@ struct SamplingParameters final {
   // Sampling drops the tokens less likely than minP times the most likely
   // one, before top-k and top-p; 0 drops none.
   float minP = 0.0F;
+  uint64_t seed = 0;
 
-  [[nodiscard]] bool penalized() const noexcept {
-    return presencePenalty != 0.0F || frequencyPenalty != 0.0F ||
-           repetitionPenalty != 1.0F;
+  bool operator==(const SamplingParameters &) const = default;
+
+  // The first rule the parameters break, or none. A sampling temperature is
+  // at least FLT_MIN: the kernels divide by it, and Metal flushes a subnormal
+  // one to zero.
+  [[nodiscard]] std::optional<std::string_view>
+  validationError() const noexcept {
+    const bool temperatureValid =
+        temperature == 0.0F ||
+        (std::isfinite(temperature) &&
+         temperature >= std::numeric_limits<float>::min());
+    if (!temperatureValid || !(topP > 0.0F && topP <= 1.0F) ||
+        !(minP >= 0.0F) || minP > 1.0F) {
+      return "sampling requires temperature 0 or at least FLT_MIN, top_p in "
+             "(0,1] and min_p in [0,1]";
+    }
+    if (!(std::fabs(presencePenalty) <= 2.0F) ||
+        !(std::fabs(frequencyPenalty) <= 2.0F) ||
+        !std::isfinite(repetitionPenalty) || repetitionPenalty <= 0.0F) {
+      return "sampling requires presence and frequency penalties in [-2,2] "
+             "and a positive repetition penalty";
+    }
+    return std::nullopt;
+  }
+
+  // Greedy selection with nothing changing the logits, whatever the seed.
+  [[nodiscard]] bool isNeutral() const noexcept {
+    SamplingParameters neutral;
+    neutral.seed = seed;
+    return *this == neutral;
   }
 };
 
@@ -66,7 +102,6 @@ struct SamplingParameters final {
 // priority and deadline policy deliberately do not cross this boundary.
 struct ModelRequest final {
   uint64_t id = 0;
-  BatchCohort cohort = BatchCohort::Greedy;
   std::span<const uint32_t> prompt;
   std::span<const struct ImageSpan> images;
   std::span<const uint8_t> imagePixels;
@@ -85,6 +120,11 @@ struct ModelRequest final {
   uint32_t restoredTokens = 0;
 };
 
+// One image in the prompt: the run of placeholder tokens it occupies (one per
+// merged 2x2 patch group, row-major over the merged grid), the patch grid of
+// the frontend's resized pixels, and a 128-bit digest of that content.
+// Placeholder token ids are identical for every image, so cache identity keys
+// on the digest as well as the tokens.
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -94,11 +134,42 @@ struct ImageSpan final {
   uint64_t digestHi = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
+  [[nodiscard]] ops::ImageGrid grid() const noexcept {
+    return {gridHeight, gridWidth};
+  }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
+    return grid().pixelBytes();
   }
   bool operator==(const ImageSpan &) const = default;
 };
+
+// The first rule a request's image spans break, or none: each covers a valid
+// grid within the patch limit with one token per merged patch group, the
+// runs are sorted, disjoint and inside the prompt, and the pixels are the
+// grids' own.
+[[nodiscard]] inline std::optional<std::string_view>
+imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
+                          uint64_t pixelBytes) noexcept {
+  uint64_t previousEnd = 0;
+  uint64_t gridPixelBytes = 0;
+  for (const ImageSpan &span : spans) {
+    const ops::ImageGrid grid = span.grid();
+    if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches)
+      return "image grid must be even-sided and within the patch limit";
+    if (span.tokens != grid.mergedTokens())
+      return "image span tokens must equal the merged grid size";
+    const uint64_t end = uint64_t{span.offset} + span.tokens;
+    if (span.offset < previousEnd || end > promptTokens) {
+      return "image spans must be sorted, non-overlapping runs inside the "
+             "prompt";
+    }
+    previousEnd = end;
+    gridPixelBytes += grid.pixelBytes();
+  }
+  if (pixelBytes != gridPixelBytes)
+    return "image pixels do not match the image grids";
+  return std::nullopt;
+}
 
 // Immutable target-recurrent plus draft-context state.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
@@ -106,8 +177,8 @@ class CompositeState {
 public:
   virtual ~CompositeState() = default;
   // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  // the lane's state; dropping the reference returns its buffers to the
+  // model's pool, and idle-state reclaim frees them.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
   [[nodiscard]] virtual bool canOffload() const noexcept { return false; }
@@ -183,7 +254,9 @@ struct BatchItem final {
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
-  BatchCohort cohort = BatchCohort::Greedy;
+  // A decode's lanes exchange token masks with the host; constrained and
+  // unconstrained lanes never share a command.
+  bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
 
@@ -196,7 +269,7 @@ struct BatchPlan final {
 enum class StateFailure : uint8_t { None, ConcurrencyLimit, MemoryPressure };
 
 struct StateAdmission final {
-  std::optional<uint32_t> cell;
+  std::optional<uint32_t> lane;
   StateFailure failure = StateFailure::None;
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
   // On a refused start: what the attempt matched (cached image rows, the
@@ -204,7 +277,7 @@ struct StateAdmission final {
   // retries, so the retry finds them.
   std::shared_ptr<const void> held{};
 
-  [[nodiscard]] bool granted() const noexcept { return cell.has_value(); }
+  [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
 struct ModelBatchItem final {
@@ -327,7 +400,7 @@ struct StateAllocationTracker final {
 // not cache or scheduler state. The engine consumes these values without
 // knowing the target or draft architecture that produced them.
 struct ModelMemoryPlan final {
-  uint64_t activeStateCellPlannedAllocatedBytes = 0;
+  uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
 };
@@ -349,7 +422,9 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  uint32_t warmIdleStateCells = 0;
+  // Pooled state buffers no lane holds: GDN parity cells and draft rings.
+  uint32_t idleGdnCells = 0;
+  uint32_t idleDraftRings = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRowsActive = 0;
   uint64_t draftContextRowsMaterialization = 0;
@@ -453,9 +528,9 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
   // Copies the request's committed state at its current page-aligned
-  // boundary into a cache slot. Returns nullptr when no slot is free and the
-  // governor denies a new one; the caller may release a cached state and
-  // retry.
+  // boundary into the cached state's buffers. Returns nullptr when the pool
+  // has none free and the governor denies new ones; the caller may release a
+  // cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
   // The bytes one lane's state snapshot allocates.
@@ -464,9 +539,10 @@ public:
   // and its state file accepts writes. The quota is the write's own concern.
   [[nodiscard]] virtual bool canSnapshotToDisk() const noexcept { return false; }
   // Writes the request's committed state at its current page-aligned
-  // boundary to the disk tier from the lane's own buffers, for a state no
-  // cache slot can hold; the ticket carries its disk copy. Null when the
-  // quota cannot admit another state: the caller may free quota and retry.
+  // boundary to the disk tier from the lane's own buffers, for a state the
+  // pool has no cached state's buffers for; the ticket carries its disk copy.
+  // Null when the quota cannot admit another state: the caller may free quota
+  // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
   // The cached states whose buffers a lane's activation would still have to

@@ -1,4 +1,5 @@
 #include "AllocationFailure.hpp"
+#include "ProtocolPeer.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
@@ -14,9 +15,11 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 using namespace splash;
 using namespace splash::engine;
@@ -115,7 +118,7 @@ public:
     std::vector<ModelStepResult> results;
     for (const auto &item : items) {
       // A constrained request asks for its initial mask before any token.
-      if (plan.cohort == BatchCohort::Constrained &&
+      if (plan.constrained &&
           plan.decodeStage == DecodeStage::RequestInitialMask) {
         results.push_back({item.requestId, 0, {}, false,
                            DecodeStage::ApplyInitialMask, 0, 0});
@@ -187,31 +190,11 @@ bool idle(const engine::NativeRuntime &loop) {
          !loop.commandInFlight();
 }
 
-std::vector<protocol::Message> decodeMessages(std::span<const uint8_t> bytes) {
-  protocol::FrameParser parser;
-  std::vector<protocol::Message> result;
-  size_t offset = 0;
-  while (offset < bytes.size()) {
-    auto step = parser.consume(bytes.subspan(offset));
-    offset += step.consumedBytes;
-    if (step.issue)
-      throw std::runtime_error(step.issue->describe());
-    if (!step.frame)
-      continue;
-    auto decoded = protocol::decodeFrame(*step.frame);
-    if (!decoded)
-      throw std::runtime_error(decoded.issue->describe());
-    result.push_back(std::move(*decoded.value));
-  }
-  return result;
-}
-
 protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
   protocol::RequestFrame result;
   result.requestId = id;
-  result.priority = protocol::RequestPriority::Foreground;
-  result.cohort = protocol::Cohort::Greedy;
-  result.constraint = protocol::ConstraintMode::None;
+  result.priority = RequestPriority::Foreground;
+  result.constraint = ConstraintMode::None;
   result.absoluteDeadlineUnixMicros = 2'000'000;
   result.remainingDeadlineMicros = 1'000'000;
   result.logicalMaxOutputTokens = maxOutputTokens;
@@ -219,6 +202,15 @@ protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
   for (uint32_t i = 0; i < result.promptTokens.size(); ++i) {
     result.promptTokens[i] = i + 1;
   }
+  return result;
+}
+
+protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
+  protocol::RequestFrame result = request(id, 0);
+  result.promptTokens.resize(promptTokens);
+  for (uint32_t i = 0; i < result.promptTokens.size(); ++i)
+    result.promptTokens[i] = i + 1;
+  result.scoreTokens = {10, 20, 30};
   return result;
 }
 
@@ -253,8 +245,8 @@ void testPromptProgress() {
     input.promptTokens.resize(4097);
     for (uint32_t i = 0; i < input.promptTokens.size(); ++i)
       input.promptTokens[i] = i + 1;
-    auto encoded = protocol::serializeMessage(protocol::Message{input});
-    require(encoded && loop.receive(*encoded.value), "progress request failed");
+    require(loop.receive(protocol::peer::serialize(input)),
+            "progress request failed");
   };
 
   executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
@@ -263,7 +255,7 @@ void testPromptProgress() {
   for (int i = 0; i < 3; ++i)
     static_cast<void>(loop.tick());
   uint32_t count = 0;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *event =
             std::get_if<protocol::PromptProgressEvent>(&message)) {
       require(event->processedTokens == 0,
@@ -283,7 +275,7 @@ void testPromptProgress() {
   std::unordered_map<uint64_t, uint64_t> elapsed;
   std::unordered_map<uint64_t, bool> tokensSeen;
   uint32_t coldUpdates = 0;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *event =
             std::get_if<protocol::PromptProgressEvent>(&message)) {
       require(event->requestId != 3, "default path emitted progress");
@@ -317,18 +309,17 @@ void testPromptProgress() {
   submit(4, true);
   require(loop.tick() && loop.commandInFlight(),
           "cancel test needs pending work");
-  auto cancel =
-      protocol::serializeMessage(protocol::Message{protocol::CancelFrame{4}});
-  require(cancel && loop.receive(*cancel.value), "cancel request failed");
+  require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{4})),
+          "cancel request failed");
   *executor.ticketReady = true;
   runUntilIdle(loop);
   count = 0;
   bool cancelled = false;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (std::holds_alternative<protocol::PromptProgressEvent>(message))
       ++count;
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
-      cancelled = event->reason == protocol::FinishReason::Cancelled;
+      cancelled = event->reason == EngineFinishReason::Cancelled;
   }
   require(count == 1 && cancelled,
           "cancelled prefill published further progress");
@@ -353,14 +344,14 @@ void testWireLifecycleAndCacheHit() {
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
-  auto first = protocol::serializeMessage(protocol::Message{request(1)});
-  require(first && loop.receive(*first.value), "cold request wire failed");
+  require(loop.receive(protocol::peer::serialize(request(1))),
+          "cold request wire failed");
   require(loop.tick() && loop.commandInFlight(),
           "status regression requires a pending command");
-  auto status = protocol::serializeMessage(
-      protocol::Message{protocol::StatusRequestFrame{77}});
-  require(status && loop.receive(*status.value), "in-flight status request failed");
-  const auto pendingMessages = decodeMessages(output);
+  require(
+      loop.receive(protocol::peer::serialize(protocol::StatusRequestFrame{77})),
+      "in-flight status request failed");
+  const auto pendingMessages = protocol::peer::decodeEvents(output);
   require(loop.commandInFlight() &&
               std::any_of(pendingMessages.begin(), pendingMessages.end(),
                           [](const auto &message) {
@@ -370,13 +361,13 @@ void testWireLifecycleAndCacheHit() {
                           }),
           "status waited for or drained the pending command");
   runUntilIdle(loop);
-  auto second = protocol::serializeMessage(protocol::Message{request(2)});
-  require(second && loop.receive(*second.value), "junction request wire failed");
+  require(loop.receive(protocol::peer::serialize(request(2))),
+          "junction request wire failed");
   runUntilIdle(loop);
-  auto third = protocol::serializeMessage(protocol::Message{request(3)});
-  require(third && loop.receive(*third.value), "restored request wire failed");
+  require(loop.receive(protocol::peer::serialize(request(3))),
+          "restored request wire failed");
   runUntilIdle(loop);
-  auto messages = decodeMessages(output);
+  auto messages = protocol::peer::decodeEvents(output);
   uint32_t misses = 0;
   uint32_t hits = 0;
   uint32_t tokens = 0;
@@ -384,7 +375,7 @@ void testWireLifecycleAndCacheHit() {
   bool statusSeen = false;
   for (const auto &message : messages) {
     if (const auto *start = std::get_if<protocol::StartEvent>(&message)) {
-      if (start->cacheDisposition == protocol::CacheDisposition::Miss) {
+      if (!start->matchedPromptTokens) {
         ++misses;
       } else {
         ++hits;
@@ -398,8 +389,7 @@ void testWireLifecycleAndCacheHit() {
       ++done;
     } else if (const auto *reported =
                    std::get_if<protocol::StatusJsonEvent>(&message)) {
-      statusSeen = reported->correlationId == 77 &&
-                   reported->schemaVersion == protocol::kStatusSchemaVersion;
+      statusSeen = reported->correlationId == 77;
     }
   }
   require(misses == 1 && hits == 2 && executor.restored() == 128,
@@ -431,13 +421,12 @@ void testGenerationPromptBoundsTheReplayState() {
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
     input.generationPromptTokens = 2;
-    auto encoded = protocol::serializeMessage(protocol::Message{input});
-    require(encoded && loop.receive(*encoded.value),
+    require(loop.receive(protocol::peer::serialize(input)),
             "generation prompt request wire failed");
     runUntilIdle(loop);
   }
   std::vector<uint32_t> matched;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *start = std::get_if<protocol::StartEvent>(&message))
       matched.push_back(start->matchedPromptTokens);
   }
@@ -462,9 +451,9 @@ void testRequestFlagsReachTheModel() {
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
-    input.flags = id == 2 ? protocol::RequestIgnoreEndOfSequence : 0;
-    auto encoded = protocol::serializeMessage(protocol::Message{input});
-    require(encoded && loop.receive(*encoded.value), "flagged request wire failed");
+    input.flags = id == 2 ? RequestIgnoreEndOfSequence : 0;
+    require(loop.receive(protocol::peer::serialize(input)),
+            "flagged request wire failed");
     runUntilIdle(loop);
   }
   require(executor.beganFlags ==
@@ -492,46 +481,51 @@ void testSamplingReachesTheModel() {
   auto greedy = request(1);
   greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
   auto sampled = request(2);
-  sampled.cohort = protocol::Cohort::Sampling;
-  sampled.seed = 77;
   sampled.sampling = {0.7f, 0.8f, 20, -0.5f, 2.0f, 0.9f, 0.05f};
+  sampled.sampling.seed = 77;
   for (const auto &input : {greedy, sampled}) {
-    auto encoded = protocol::serializeMessage(protocol::Message{input});
-    require(encoded && loop.receive(*encoded.value), "sampled request wire failed");
+    require(loop.receive(protocol::peer::serialize(input)),
+            "sampled request wire failed");
     runUntilIdle(loop);
   }
-  const auto matches = [&](uint64_t id, const protocol::RequestFrame &input) {
-    const SamplingParameters &sampling = executor.beganSampling.at(id);
-    const protocol::SamplingParameters &sent = input.sampling;
-    return sampling.temperature == sent.temperature &&
-           sampling.topP == sent.topP && sampling.topK == sent.topK &&
-           sampling.seed == input.seed &&
-           sampling.presencePenalty == sent.presencePenalty &&
-           sampling.frequencyPenalty == sent.frequencyPenalty &&
-           sampling.repetitionPenalty == sent.repetitionPenalty &&
-           sampling.minP == sent.minP;
-  };
-  require(matches(1, greedy) && matches(2, sampled),
-          "a penalty or min_p did not reach the model");
+  require(executor.beganSampling.at(1) == greedy.sampling &&
+              executor.beganSampling.at(2) == sampled.sampling,
+          "a penalty, min_p or the seed did not reach the model");
 }
 
+// A header without the magic, and an event the engine sends itself: neither
+// is a client frame, so framing is lost and the connection closes.
 void testFatalFramingClosesConnection() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 8);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  engine::NativeRuntime loop(
-      {}, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{}"); });
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  const std::array<uint8_t, 24> invalid{};
-  require(!loop.receive(invalid), "bad frame did not close connection");
-  require(loop.connectionMustClose() && loop.engineHealthy(),
-          "protocol failure was misclassified as engine failure");
+  const auto event = protocol::serializeEvent(protocol::StatusJsonEvent{1, "{}"},
+                                              protocol::ProtocolLimits{});
+  require(static_cast<bool>(event), "status event encoding failed");
+  for (const auto &[invalid, code] :
+       {std::pair{std::vector<uint8_t>(24), "bad_magic"},
+        std::pair{*event.value, "unknown_frame_type"}}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
+    engine::Cache resources(pool);
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeRuntime loop(
+        {}, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    require(!loop.receive(invalid), "bad frame did not close connection");
+    require(loop.connectionMustClose() && loop.engineHealthy(),
+            "protocol failure was misclassified as engine failure");
+    const auto events = protocol::peer::decodeEvents(output);
+    const auto *error = events.size() == 1
+                            ? std::get_if<protocol::ErrorEvent>(&events.front())
+                            : nullptr;
+    require(error &&
+                error->failureClass == protocol::FailureClass::ProtocolFatal &&
+                error->code == code,
+            "a frame that is not a client frame was not reported as fatal");
+  }
 }
 
 // A request rejected while it is decoded is a request-scoped error: the
@@ -557,16 +551,12 @@ void testRequestErrorKeepsFraming() {
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
-  const auto wire = [](protocol::Message message) {
-    auto encoded = protocol::serializeMessage(message);
-    require(static_cast<bool>(encoded), "test message wire encoding failed");
-    return *encoded.value;
-  };
   // Errors, completions and status answers so far; every error must be the
   // rejected request's own.
   const auto events = [&] {
     std::array<uint32_t, 3> counts{};
-    for (const protocol::Message &message : decodeMessages(output)) {
+    for (const protocol::EngineEvent &message :
+         protocol::peer::decodeEvents(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->failureClass == protocol::FailureClass::RequestError &&
                     error->requestId == 9,
@@ -579,9 +569,10 @@ void testRequestErrorKeepsFraming() {
     return counts;
   };
 
-  const std::vector<uint8_t> rejected = wire(request(9, 2));
-  const std::vector<uint8_t> first = wire(request(1));
-  const std::vector<uint8_t> status = wire(protocol::StatusRequestFrame{77});
+  const auto rejected = protocol::peer::serialize(request(9, 2));
+  const auto first = protocol::peer::serialize(request(1));
+  const auto status =
+      protocol::peer::serialize(protocol::StatusRequestFrame{77});
   std::vector<uint8_t> read = rejected;
   read.insert(read.end(), first.begin(), first.end());
   read.insert(read.end(), status.begin(), status.end());
@@ -590,7 +581,7 @@ void testRequestErrorKeepsFraming() {
   require(events() == std::array<uint32_t, 3>{1, 1, 1},
           "frames behind a rejected request were dropped");
 
-  const std::vector<uint8_t> second = wire(request(2));
+  const auto second = protocol::peer::serialize(request(2));
   const size_t half = second.size() / 2;
   read = rejected;
   read.insert(read.end(), second.begin(), second.begin() + half);
@@ -621,15 +612,15 @@ void testCapacityFailureHasOneTerminalFrame() {
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
-  auto encoded = protocol::serializeMessage(protocol::Message{request(3)});
-  require(encoded && loop.receive(*encoded.value),
+  require(loop.receive(protocol::peer::serialize(request(3))),
           "capacity request wire failed");
   runUntilIdle(loop);
 
   uint32_t capacity = 0;
   uint32_t errors = 0;
   uint32_t done = 0;
-  for (const protocol::Message &message : decodeMessages(output)) {
+  for (const protocol::EngineEvent &message :
+       protocol::peer::decodeEvents(output)) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++errors;
       capacity += error->failureClass == protocol::FailureClass::RequestError &&
@@ -685,12 +676,9 @@ void testCommandWatchdogAndPendingHealthWake() {
     auto input = request(1);
     input.absoluteDeadlineUnixMicros = 601'000'000;
     input.remainingDeadlineMicros = 600'000'000;
-    const auto wire = protocol::serializeMessage(protocol::Message{input});
-    require(wire && loop.receive(*wire.value) && loop.tick(),
+    require(loop.receive(protocol::peer::serialize(input)) && loop.tick(),
             "watchdog fixture did not submit its command");
-    const auto cancel = protocol::serializeMessage(
-        protocol::Message{protocol::CancelFrame{1}});
-    require(cancel && loop.receive(*cancel.value) &&
+    require(loop.receive(protocol::peer::serialize(protocol::CancelFrame{1})) &&
                 loop.millisecondsUntilNextWakeup() == 1000.0,
             "cancelled in-flight command lost its bounded health wake");
     now = 119'999.0;
@@ -707,7 +695,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       require(loop.tick() && idle(loop), "completed GPU ownership did not drain");
     } else {
       uint32_t errors = 0;
-      for (const auto &message : decodeMessages(output)) {
+      for (const auto &message : protocol::peer::decodeEvents(output)) {
         if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
           require(error->requestId == 0 &&
                       error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -752,16 +740,14 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
-    const auto first = protocol::serializeMessage(protocol::Message{request(1)});
-    require(first && loop.receive(*first.value) && loop.tick(),
+    require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick(),
             "live duplicate fixture did not start");
-    const auto duplicate = protocol::serializeMessage(
-        protocol::Message{request(1, malformed ? 2 : 1)});
-    require(duplicate && !loop.receive(*duplicate.value) &&
+    require(!loop.receive(
+                protocol::peer::serialize(request(1, malformed ? 2 : 1))) &&
                 loop.connectionMustClose() && loop.snapshot().submitted == 1,
             "duplicate live request was accepted");
     uint32_t errors = 0;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::ProtocolFatal,
@@ -791,30 +777,27 @@ void testCancelledIdIsReusableInTheSameInput() {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  const auto first = protocol::serializeMessage(protocol::Message{request(7, 4)});
-  require(first && loop.receive(*first.value) && loop.tick() && loop.tick() &&
-              !loop.commandInFlight(),
+  require(loop.receive(protocol::peer::serialize(request(7, 4))) &&
+              loop.tick() && loop.tick() && !loop.commandInFlight(),
           "the first request did not start");
-  const auto cancel =
-      protocol::serializeMessage(protocol::Message{protocol::CancelFrame{7}});
-  const auto again = protocol::serializeMessage(protocol::Message{request(7)});
-  require(cancel && again, "cancel or request wire failed");
-  std::vector<uint8_t> input = *cancel.value;
-  input.insert(input.end(), again.value->begin(), again.value->end());
+  std::vector<uint8_t> input =
+      protocol::peer::serialize(protocol::CancelFrame{7});
+  const std::vector<uint8_t> again = protocol::peer::serialize(request(7));
+  input.insert(input.end(), again.begin(), again.end());
   require(loop.receive(input),
           "a cancel and a request for one id closed the connection");
   runUntilIdle(loop);
-  std::vector<protocol::FinishReason> done;
+  std::vector<EngineFinishReason> done;
   uint32_t errors = 0;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
       done.push_back(event->reason);
     errors += std::holds_alternative<protocol::ErrorEvent>(message);
   }
   require(errors == 0 &&
-              done == std::vector<protocol::FinishReason>{
-                          protocol::FinishReason::Cancelled,
-                          protocol::FinishReason::Stop},
+              done == std::vector<EngineFinishReason>{
+                          EngineFinishReason::Cancelled,
+                          EngineFinishReason::Stop},
           "a cancelled id was not reusable in the same input");
 }
 
@@ -841,7 +824,7 @@ void testControlFailureUsesExecutionBoundary() {
               throw std::runtime_error("control test");
             }), "failed control work requested another retry");
     uint32_t errors = 0;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -883,13 +866,12 @@ void testFrameFailureUsesExecutionBoundary() {
           throw 42;
         });
     loop.announceReady();
-    const auto status = protocol::serializeMessage(
-        protocol::Message{protocol::StatusRequestFrame{77}});
-    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
-                loop.connectionMustClose(),
+    require(!loop.receive(protocol::peer::serialize(
+                protocol::StatusRequestFrame{77})) &&
+                !loop.engineHealthy() && loop.connectionMustClose(),
             "a failed status frame did not stop the engine");
     uint32_t errors = 0;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -944,12 +926,12 @@ void testAdmissionExceptionStopsTheEngineOnce() {
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   loop.announceReady();
-  const auto wire = protocol::serializeMessage(protocol::Message{request(1)});
-  require(wire && loop.receive(*wire.value), "admission fixture was refused");
+  require(loop.receive(protocol::peer::serialize(request(1))),
+          "admission fixture was refused");
   require(!loop.tick() && !loop.engineHealthy() && loop.connectionMustClose(),
           "an admission exception did not stop the engine");
   uint32_t errors = 0;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       require(error->requestId == 0 &&
                   error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -983,10 +965,9 @@ void testEngineFailureNamesItsReason() {
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     outputClosed = true;
-    auto status = protocol::serializeMessage(
-        protocol::Message{protocol::StatusRequestFrame{77}});
-    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
-                loop.connectionMustClose(),
+    require(!loop.receive(
+                protocol::peer::serialize(protocol::StatusRequestFrame{77})) &&
+                !loop.engineHealthy() && loop.connectionMustClose(),
             "a failed output write did not stop the engine");
     require(loop.engineFailure() ==
                 std::string("output_write_failed: ") + closed.what(),
@@ -1006,16 +987,15 @@ void testEngineFailureNamesItsReason() {
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
-    auto frame = protocol::serializeMessage(protocol::Message{request(1)});
-    require(static_cast<bool>(frame), "request wire failed");
+    const auto frame = protocol::peer::serialize(request(1));
     // A header and one payload byte: the parser's first allocation is the
     // payload buffer, and it fails.
     allocationFailureAfter = 0;
     const bool received = loop.receive(std::span<const uint8_t>(
-        frame.value->data(), protocol::kFrameHeaderBytes + 1));
+        frame.data(), protocol::kFrameHeaderBytes + 1));
     allocationFailureAfter = -1;
     uint32_t errors = 0;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->failureClass ==
                         protocol::FailureClass::EngineUnhealthy &&
@@ -1034,7 +1014,7 @@ void testEngineFailureNamesItsReason() {
   }
 }
 
-void testInvalidPromptTokensStayRequestScoped() {
+void testOutOfVocabularyTokensStayRequestScoped() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
   engine::Cache resources(pool);
@@ -1052,37 +1032,40 @@ void testInvalidPromptTokensStayRequestScoped() {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
+  std::vector<protocol::RequestFrame> invalid;
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
-    auto invalid = request(9);
-    invalid.promptTokens.back() = token;
-    const auto wire = protocol::serializeMessage(protocol::Message{invalid});
-    require(wire && loop.receive(*wire.value),
-            "invalid prompt token closed the native connection");
+    invalid.push_back(request(9));
+    invalid.back().promptTokens.back() = token;
+  }
+  invalid.push_back(scoreRequest(9, 65));
+  invalid.back().scoreTokens.back() = 128;
+  for (const protocol::RequestFrame &frame : invalid) {
+    require(loop.receive(protocol::peer::serialize(frame)),
+            "out-of-vocabulary token closed the native connection");
   }
   auto valid = request(1);
   valid.promptTokens.back() = 127;
-  const auto wire = protocol::serializeMessage(protocol::Message{valid});
-  require(wire && loop.receive(*wire.value),
+  require(loop.receive(protocol::peer::serialize(valid)),
           "valid request after invalid tokens was rejected");
   runUntilIdle(loop);
   uint32_t errors = 0, done = 0;
-  for (const auto &message : decodeMessages(output)) {
+  for (const auto &message : protocol::peer::decodeEvents(output)) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       require(error->requestId == 9 && error->code == "invalid_request" &&
                   error->failureClass == protocol::FailureClass::RequestError,
-              "invalid prompt token did not produce its own request error");
+              "out-of-vocabulary token did not produce its own request error");
       ++errors;
     }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
-  require(errors == 2 && done == 1 && loop.engineHealthy() &&
+  require(errors == invalid.size() && done == 1 && loop.engineHealthy() &&
               loop.snapshot().submitted == 1,
           "invalid tokens reached admission or prevented subsequent completion");
 }
 
-// The feature bits Ready announces for an engine admitting images of up to
+// Whether Ready announces vision for an engine admitting images of up to
 // `maxImagePatches` patches.
-uint64_t announcedFeatures(uint32_t maxImagePatches) {
+bool announcedVision(uint32_t maxImagePatches) {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 32);
   engine::Cache resources(pool);
@@ -1100,65 +1083,70 @@ uint64_t announcedFeatures(uint32_t maxImagePatches) {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  const auto announced = decodeMessages(output);
+  const auto announced = protocol::peer::decodeEvents(output);
   const auto *ready = announced.size() == 1
                           ? std::get_if<protocol::ReadyEvent>(&announced.front())
                           : nullptr;
   require(ready, "announceReady did not send exactly one Ready event");
-  return ready->featureBits;
+  return ready->vision;
 }
 
 void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
-  require(announcedFeatures(ops::kMaximumImagePatches) ==
-              (protocol::kNativeFeatureBits | protocol::FeatureVision),
+  require(announcedVision(ops::kMaximumImagePatches),
           "Ready did not announce vision for an engine that admits images");
-  require(announcedFeatures(0) == protocol::kNativeFeatureBits,
+  require(!announcedVision(0),
           "Ready announced vision for an engine serving without it");
 }
 
-// Without vision an image request fails by itself and the engine keeps
-// serving.
-void testImageRequestWithoutVisionStaysRequestScoped() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  engine::NativeLoopConfig config;
-  config.engine.maxContext = 1024;
-  config.engine.maxImagePatches = 0;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  loop.announceReady();
-  auto image = request(9);
-  image.imageSpans = {{8, 16, 8, 8, 1, 2}};
-  image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
-  for (const protocol::RequestFrame &frame : {image, request(1)}) {
-    const auto wire = protocol::serializeMessage(protocol::Message{frame});
-    require(wire && loop.receive(*wire.value),
-            "image request closed the native connection");
-  }
-  runUntilIdle(loop);
-  uint32_t errors = 0, done = 0;
-  for (const auto &message : decodeMessages(output)) {
-    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
-      require(error->requestId == 9 && error->code == "invalid_request" &&
-                  error->failureClass == protocol::FailureClass::RequestError &&
-                  error->message == "this model is serving without vision",
-              "image request did not produce its own vision error");
-      ++errors;
+// Without vision, or past the server's per-image patch cap, an image request
+// fails by itself and the engine keeps serving.
+void testImageRequestBeyondVisionStaysRequestScoped() {
+  // The image below has 64 patches.
+  const std::pair<uint32_t, std::string_view> cases[] = {
+      {0, "this model is serving without vision"},
+      {32, "image has more patches than the server's pixel cap allows"}};
+  for (const auto &[maxImagePatches, expected] : cases) {
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
+    engine::Cache resources(pool);
+    Executor executor;
+    std::vector<uint8_t> output;
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    config.engine.maxImagePatches = maxImagePatches;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    loop.announceReady();
+    auto image = request(9);
+    image.imageSpans = {{8, 16, 8, 8, 1, 2}};
+    image.imagePixels.assign(image.imageSpans[0].pixelBytes(), 1);
+    for (const protocol::RequestFrame &frame : {image, request(1)}) {
+      require(loop.receive(protocol::peer::serialize(frame)),
+              "image request closed the native connection");
     }
-    done += std::holds_alternative<protocol::DoneEvent>(message);
+    runUntilIdle(loop);
+    uint32_t errors = 0, done = 0;
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 9 && error->code == "invalid_request" &&
+                    error->failureClass ==
+                        protocol::FailureClass::RequestError &&
+                    error->message == expected,
+                "image request did not produce its own vision error");
+        ++errors;
+      }
+      done += std::holds_alternative<protocol::DoneEvent>(message);
+    }
+    require(errors == 1 && done == 1 && loop.engineHealthy() &&
+                loop.snapshot().submitted == 1,
+            "image request reached admission or stopped the engine");
   }
-  require(errors == 1 && done == 1 && loop.engineHealthy() &&
-              loop.snapshot().submitted == 1,
-          "image request reached admission or stopped the engine");
 }
 
 void testStepTokensFitTheWire() {
@@ -1183,15 +1171,16 @@ void testStepTokensFitTheWire() {
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
     loop.announceReady();
-    auto encoded = protocol::serializeMessage(
-        protocol::Message{request(5, executor.stepTokens)});
-    require(encoded && loop.receive(*encoded.value), "step request wire failed");
+    require(loop.receive(
+                protocol::peer::serialize(request(5, executor.stepTokens))),
+            "step request wire failed");
     runUntilIdle(loop);
 
     uint32_t streamed = 0;
     std::optional<uint32_t> completion;
     uint32_t encodeErrors = 0;
-    for (const protocol::Message &message : decodeMessages(output)) {
+    for (const protocol::EngineEvent &message :
+         protocol::peer::decodeEvents(output)) {
       if (const auto *emitted = std::get_if<protocol::TokensEvent>(&message)) {
         streamed += emitted->tokens.size();
       } else if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
@@ -1216,15 +1205,6 @@ void testStepTokensFitTheWire() {
   }
 }
 
-protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
-  protocol::RequestFrame result = request(id, 0);
-  result.promptTokens.resize(promptTokens);
-  for (uint32_t i = 0; i < result.promptTokens.size(); ++i)
-    result.promptTokens[i] = i + 1;
-  result.scoreTokens = {10, 20, 30};
-  return result;
-}
-
 void testScoreRequestCompletesAfterFullPrompt() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 512);
@@ -1242,14 +1222,14 @@ void testScoreRequestCompletesAfterFullPrompt() {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  auto encoded = protocol::serializeMessage(
-      protocol::Message{scoreRequest(9, 3000)});
-  require(encoded && loop.receive(*encoded.value), "score request failed");
+  require(loop.receive(protocol::peer::serialize(scoreRequest(9, 3000))),
+          "score request failed");
   runUntilIdle(loop);
 
   uint32_t tokensEvents = 0;
   uint32_t doneCount = 0;
-  for (const protocol::Message &message : decodeMessages(output)) {
+  for (const protocol::EngineEvent &message :
+       protocol::peer::decodeEvents(output)) {
     if (std::holds_alternative<protocol::TokensEvent>(message))
       ++tokensEvents;
     if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
@@ -1262,7 +1242,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
       require(done->optionLogits[0] == 0.5f && done->optionLogits[1] == 1.5f &&
                   done->optionLogits[2] == 2.5f,
               "score done logits are not in request order");
-      require(done->reason == protocol::FinishReason::Stop,
+      require(done->reason == EngineFinishReason::Stop,
               "score done reason is not stop");
     }
   }
@@ -1288,21 +1268,21 @@ void testCancelledScoreReturnsEmptyLogits() {
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  auto encoded = protocol::serializeMessage(
-      protocol::Message{scoreRequest(11, 65)});
-  require(encoded && loop.receive(*encoded.value), "cancel-score request failed");
+  require(loop.receive(protocol::peer::serialize(scoreRequest(11, 65))),
+          "cancel-score request failed");
   require(loop.tick() && loop.commandInFlight(), "score prefill was not held");
   protocol::CancelFrame cancel{11};
-  auto cancelWire = protocol::serializeMessage(protocol::Message{cancel});
-  require(cancelWire && loop.receive(*cancelWire.value), "score cancel failed");
+  require(loop.receive(protocol::peer::serialize(cancel)),
+          "score cancel failed");
   *executor.ticketReady = true;
   runUntilIdle(loop);
 
   uint32_t doneCount = 0;
-  for (const protocol::Message &message : decodeMessages(output)) {
+  for (const protocol::EngineEvent &message :
+       protocol::peer::decodeEvents(output)) {
     if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
       ++doneCount;
-      require(done->reason == protocol::FinishReason::Cancelled,
+      require(done->reason == EngineFinishReason::Cancelled,
               "cancelled score did not report Cancelled");
       require(done->optionLogits.empty(),
               "cancelled score returned logits");
@@ -1356,11 +1336,9 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   auto scored = scoreRequest(21, 4 * KvCache::pageTokens);
   for (uint32_t index = 0; index < scored.promptTokens.size(); ++index)
     scored.promptTokens[index] = 1000 + index;
-  auto scoredWire = protocol::serializeMessage(protocol::Message{scored});
-  require(scoredWire && loop.receive(*scoredWire.value),
+  require(loop.receive(protocol::peer::serialize(scored)),
           "score request wire failed");
-  auto chatWire = protocol::serializeMessage(protocol::Message{request(22)});
-  require(chatWire && loop.receive(*chatWire.value),
+  require(loop.receive(protocol::peer::serialize(request(22))),
           "batched chat request wire failed");
   runUntilIdle(loop);
 
@@ -1371,12 +1349,12 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   result.scoreChunks = executor.prefillChunks[21];
   result.widestBatch = executor.widestBatch;
 
-  auto laterWire = protocol::serializeMessage(protocol::Message{request(23)});
-  require(laterWire && loop.receive(*laterWire.value),
+  require(loop.receive(protocol::peer::serialize(request(23))),
           "post-batch request wire failed");
   runUntilIdle(loop);
 
-  for (const protocol::Message &message : decodeMessages(output)) {
+  for (const protocol::EngineEvent &message :
+       protocol::peer::decodeEvents(output)) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++result.failures;
       result.failedRequest = error->requestId;
@@ -1461,22 +1439,20 @@ void testConstrainedMaskExchange() {
         {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
-    const auto send = [&](protocol::Message message) {
-      auto wire = protocol::serializeMessage(message);
-      require(wire && loop.receive(*wire.value),
+    const auto send = [&](const protocol::ClientMessage &message) {
+      require(loop.receive(protocol::peer::serialize(message)),
               "mask exchange message closed the connection");
     };
     auto constrained = request(7);
-    constrained.priority = protocol::RequestPriority::Background;
-    constrained.cohort = protocol::Cohort::Constrained;
-    constrained.constraint = protocol::ConstraintMode::TokenMask;
+    constrained.priority = RequestPriority::Background;
+    constrained.constraint = ConstraintMode::TokenMask;
     constrained.absoluteDeadlineUnixMicros = 601'000'000;
     constrained.remainingDeadlineMicros = 600'000'000;
     send(constrained);
     while (loop.tick()) {
     }
     std::optional<protocol::MaskRequestEvent> asked;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *event = std::get_if<protocol::MaskRequestEvent>(&message))
         asked = *event;
     }
@@ -1501,21 +1477,20 @@ void testConstrainedMaskExchange() {
     }
     if (reply == Reply::Malformed) {
       // The frame claims one more mask word than it carries.
-      auto wire = protocol::serializeMessage(protocol::Message{response});
-      require(static_cast<bool>(wire), "mask response encoding failed");
-      ++(*wire.value)[protocol::kFrameHeaderBytes + 16];
-      require(loop.receive(*wire.value),
+      auto wire = protocol::peer::serialize(response);
+      ++wire[protocol::kFrameHeaderBytes + 16];
+      require(loop.receive(wire),
               "malformed mask response closed the connection");
     } else {
       send(response);
     }
     runUntilIdle(loop);
 
-    std::optional<protocol::FinishReason> done;
+    std::optional<EngineFinishReason> done;
     std::vector<std::string> errors;
     std::string errorMessage;
     uint32_t maskRequests = 0;
-    for (const auto &message : decodeMessages(output)) {
+    for (const auto &message : protocol::peer::decodeEvents(output)) {
       if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
         done = event->reason;
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
@@ -1531,11 +1506,11 @@ void testConstrainedMaskExchange() {
                 !loop.connectionMustClose() && !executor.holdsSlot(7),
             "mask exchange stopped the engine or kept the request's slot");
     if (reply == Reply::Valid) {
-      require(done == protocol::FinishReason::Stop && errors.empty() &&
+      require(done == EngineFinishReason::Stop && errors.empty() &&
                   executor.providedMasks == 1,
               "valid initial mask did not let the request finish");
     } else if (reply == Reply::AfterCancel) {
-      require(done == protocol::FinishReason::Cancelled && errors.empty() &&
+      require(done == EngineFinishReason::Cancelled && errors.empty() &&
                   executor.providedMasks == 0,
               "mask response after cancellation was not ignored");
     } else if (reply == Reply::AfterTimeout) {
@@ -1576,8 +1551,8 @@ void testControlPassReclaimsUnderHostPressure() {
     auto input = request(id);
     for (uint32_t &token : input.promptTokens)
       token += static_cast<uint32_t>(100 * id);
-    auto wire = protocol::serializeMessage(protocol::Message{input});
-    require(wire && loop.receive(*wire.value), "control pass request failed");
+    require(loop.receive(protocol::peer::serialize(input)),
+            "control pass request failed");
     runUntilIdle(loop);
   }
   require(resources.snapshot().stateCache.entries == 2,
@@ -1659,9 +1634,9 @@ int main() {
     testAdmissionExceptionStopsTheEngineOnce();
     testFrameFailureUsesExecutionBoundary();
     testEngineFailureNamesItsReason();
-    testInvalidPromptTokensStayRequestScoped();
+    testOutOfVocabularyTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
-    testImageRequestWithoutVisionStaysRequestScoped();
+    testImageRequestBeyondVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();

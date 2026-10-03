@@ -1,3 +1,4 @@
+#include "ProtocolPeer.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
@@ -148,12 +149,6 @@ struct Harness final {
                              [this] { return status(); }};
 };
 
-std::vector<uint8_t> wire(const protocol::Message &message) {
-  auto bytes = protocol::serializeMessage(message);
-  require(static_cast<bool>(bytes), "message encoding failed");
-  return *bytes.value;
-}
-
 // A request for three prompt tokens and one output token: its wall-clock
 // deadline is a minute away, its remaining budget `remainingMicros`.
 protocol::RequestFrame requestFrame(uint64_t id, uint64_t remainingMicros) {
@@ -201,7 +196,7 @@ size_t writeAvailable(int fd, std::span<const uint8_t> bytes) {
 // Reads the loop's output until it answers status request `correlationId`.
 bool awaitStatus(int fd, uint64_t correlationId, std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  protocol::FrameParser parser;
+  protocol::peer::EventReader reader;
   std::array<uint8_t, 4096> buffer{};
   while (true) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -212,22 +207,11 @@ bool awaitStatus(int fd, uint64_t correlationId, std::chrono::milliseconds timeo
     const ssize_t count = read(fd, buffer.data(), buffer.size());
     if (count <= 0)
       return false;
-    auto bytes = std::span<const uint8_t>(buffer.data(), static_cast<size_t>(count));
-    while (!bytes.empty()) {
-      const auto step = parser.consume(bytes);
-      if (step.issue)
-        return false;
-      bytes = bytes.subspan(step.consumedBytes);
-      if (step.frame) {
-        const auto message = protocol::decodeFrame(*step.frame);
-        if (message &&
-            std::holds_alternative<protocol::StatusJsonEvent>(*message.value) &&
-            std::get<protocol::StatusJsonEvent>(*message.value).correlationId ==
-                correlationId)
-          return true;
-      } else if (!step.consumedBytes) {
-        break;
-      }
+    for (const auto &event : reader.feed(std::span<const uint8_t>(
+             buffer.data(), static_cast<size_t>(count)))) {
+      const auto *status = std::get_if<protocol::StatusJsonEvent>(&event);
+      if (status && status->correlationId == correlationId)
+        return true;
     }
   }
 }
@@ -276,7 +260,8 @@ engine::NativeProcessExit run(std::span<const uint8_t> input) {
 }
 
 void wakeWithStatusRequest(Harness &harness, uint64_t id) {
-  writeAll(harness.pipes.input[1], wire(protocol::Message{protocol::StatusRequestFrame{id}}));
+  writeAll(harness.pipes.input[1],
+           protocol::peer::serialize(protocol::StatusRequestFrame{id}));
 }
 
 // A shutdown request ends run() with a clean exit while the input is still
@@ -327,7 +312,7 @@ void testControlWaitsForTheCommandInFlight() {
   });
   harness.loop.announceReady();
   writeAll(harness.pipes.input[1],
-           wire(protocol::Message{requestFrame(7, 30'000'000)}));
+           protocol::peer::serialize(requestFrame(7, 30'000'000)));
   auto loop = start(harness);
   if (submitted.get_future().wait_for(std::chrono::seconds(10)) !=
       std::future_status::ready)
@@ -383,26 +368,19 @@ void testLoopWakesForAnEngineDeadline() {
   engine::NativeRuntime loop{
       {}, resources, executor,
       [&](std::span<const uint8_t> bytes) {
-        // Each call carries one whole frame.
-        protocol::FrameParser parser;
-        auto step = parser.consume(bytes);
-        if (!step.frame)
-          return;
-        auto message = protocol::decodeFrame(*step.frame);
-        if (message &&
-            std::holds_alternative<protocol::ErrorEvent>(*message.value)) {
-          errors.push_back(std::get<protocol::ErrorEvent>(*message.value));
-          transport.requestShutdown();
+        for (const auto &event : protocol::peer::decodeEvents(bytes)) {
+          if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {
+            errors.push_back(*error);
+            transport.requestShutdown();
+          }
         }
       },
       [] { return std::string("{\"schema_version\":5}"); }};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
-  auto wire = protocol::serializeMessage(
-      protocol::Message{requestFrame(5, 20'000)});
-  require(static_cast<bool>(wire), "request encoding failed");
-  require(write(pipes.input[1], wire.value->data(), wire.value->size()) ==
-              static_cast<ssize_t>(wire.value->size()),
+  const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));
+  require(write(pipes.input[1], wire.data(), wire.size()) ==
+              static_cast<ssize_t>(wire.size()),
           "failed to send the request");
   // The input stays open. The alarm turns a missed wake-up into a failure
   // instead of a hang.
@@ -430,9 +408,10 @@ void testReaderReadsWhileTheLoopIsBusy() {
   mask.requestId = 77;
   mask.maskRequestId = 1;
   mask.maskWords.assign(262'144, 0);
-  std::vector<uint8_t> input = wire(protocol::Message{mask});
+  std::vector<uint8_t> input = protocol::peer::serialize(mask);
   require(input.size() > 1024 * 1024, "the test frame is smaller than 1 MiB");
-  const auto status = wire(protocol::Message{protocol::StatusRequestFrame{9}});
+  const auto status =
+      protocol::peer::serialize(protocol::StatusRequestFrame{9});
   input.insert(input.end(), status.begin(), status.end());
   auto writer = std::async(std::launch::async,
                            [&] { writeAll(harness.pipes.input[1], input); });
@@ -463,11 +442,12 @@ void testQueueBoundStopsTheWriter() {
       std::future_status::ready)
     abandon("the loop did not enter its control pass");
   // Cancels of a request that does not exist are accepted and dropped.
-  const auto cancel = wire(protocol::Message{protocol::CancelFrame{99}});
+  const auto cancel = protocol::peer::serialize(protocol::CancelFrame{99});
   std::vector<uint8_t> input;
   while (input.size() < 4 * kBound)
     input.insert(input.end(), cancel.begin(), cancel.end());
-  const auto status = wire(protocol::Message{protocol::StatusRequestFrame{10}});
+  const auto status =
+      protocol::peer::serialize(protocol::StatusRequestFrame{10});
   input.insert(input.end(), status.begin(), status.end());
   const int writer = harness.pipes.input[1];
   require(fcntl(writer, F_SETFL, fcntl(writer, F_GETFL) | O_NONBLOCK) == 0,
@@ -539,7 +519,8 @@ void testShutdownJoinsTheReader() {
 // The input's end and a read error reach the loop after the bytes read
 // before them: a status request sent just before either is answered.
 void testInputEndsAfterItsBytes() {
-  const auto status = wire(protocol::Message{protocol::StatusRequestFrame{11}});
+  const auto status =
+      protocol::peer::serialize(protocol::StatusRequestFrame{11});
   {
     Harness harness;
     writeAll(harness.pipes.input[1], status);

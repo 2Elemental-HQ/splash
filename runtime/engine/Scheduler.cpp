@@ -43,7 +43,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
-  request.decodeStage = request.spec.cohort == BatchCohort::Constrained
+  request.decodeStage = request.spec.constrained
                             ? DecodeStage::RequestInitialMask
                             : DecodeStage::Regular;
   request.phase =
@@ -377,12 +377,11 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
       return a->lastDecodeDispatch < b->lastDecodeDispatch;
     return a->order < b->order;
   });
-  const BatchCohort cohort = ready.front()->spec.cohort;
   const DecodeStage decodeStage = ready.front()->decodeStage;
   const RequestPriority selectedPriority = ready.front()->spec.priority;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
-  plan.cohort = cohort;
+  plan.constrained = ready.front()->spec.constrained;
   plan.decodeStage = decodeStage;
   // Applying the initial mask can terminate a request or start drafting.
   // Classify that branch one request at a time; regular decode can batch.
@@ -392,12 +391,9 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
           : model::ExecutionLimits::maximumBatchWidth;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
-        (request->spec.cohort == BatchCohort::Constrained) !=
-            (cohort == BatchCohort::Constrained) ||
+        request->spec.constrained != plan.constrained ||
         request->decodeStage != decodeStage)
       continue;
-    if (request->spec.cohort == BatchCohort::Sampling)
-      plan.cohort = BatchCohort::Sampling;
     plan.items.push_back({request->spec.id, 0, 0});
     if (plan.width() == maximumWidth)
       break;
@@ -448,19 +444,10 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
     }
   } else {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
-    bool hasGreedy = false;
-    bool hasSampling = false;
-    for (const BatchItem &item : plan.items) {
-      Request &request = get(item.requestId);
-      request.lastDecodeDispatch = dispatchOrder;
-      const BatchCohort cohort = request.spec.cohort;
-      hasGreedy = hasGreedy || cohort == BatchCohort::Greedy;
-      hasSampling = hasSampling || cohort == BatchCohort::Sampling;
-    }
+    for (const BatchItem &item : plan.items)
+      get(item.requestId).lastDecodeDispatch = dispatchOrder;
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
-    if (hasGreedy && hasSampling)
-      ++counters_.decodeMixedGreedySamplingBatches;
   }
 }
 

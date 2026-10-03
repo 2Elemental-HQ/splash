@@ -82,13 +82,13 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
   }
 }
 
-// Beside its weights a model needs at least the runtime reserves, one state
-// cell and the KV runway.
+// Beside its weights a model needs at least the runtime reserves, one lane's
+// state and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config,
                       const TemporaryModelRoot &root) {
   return minimumRequiredBytes(root.packageBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
-                              config.model.stateLayout.activeCellBytes(),
+                              config.model.stateLayout.laneBytes(),
                               config.model.targetKvLayout)
       .value();
 }

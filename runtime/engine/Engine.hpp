@@ -129,6 +129,9 @@ public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
          EngineEventSink &events);
 
+  // The request passed protocol::validateRequest; submit checks only what
+  // the engine knows: vocabulary, context window, and vision with the
+  // server's per-image patch cap.
   void submit(EngineRequest request);
   void observePrefill(uint32_t rows, double wallMilliseconds) {
     scheduler_.observePrefill(rows, wallMilliseconds);
@@ -203,11 +206,11 @@ private:
     };
 
     EngineRequest request;
-    // The admissions counted when admit() last gave it a state cell
-    // (admissions_). Lanes admitted before a request was refused memory or
-    // suspended restart its wait's limit.
+    // The admissions counted when admit() last gave it a lane (admissions_).
+    // Lanes admitted before a request was refused memory or suspended restart
+    // its wait's limit.
     uint64_t admission = 0;
-    std::optional<uint32_t> stateCell;
+    std::optional<uint32_t> lane;
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
@@ -376,7 +379,7 @@ private:
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {})
       -> Allocation<std::invoke_result_t<Attempt &>>;
-  // Takes a resident request's lane: its state cell and KV pages go back,
+  // Takes a resident request's lane: its state and KV pages go back,
   // and it waits, for `reason`, until admission resumes it with room for
   // workEnd tokens of KV to replay its history from the cache.
   void suspendLane(Request &request, uint64_t workEnd, metal::AllocationFailure failure,
@@ -435,8 +438,8 @@ private:
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
   // Gives back what a lane holds: its planned and armed state boundaries,
-  // its state cell (keepContinuation keeps the model's host continuation of
-  // a suspended request) and its KV leases. The caller signals progress
+  // its state (keepContinuation keeps the model's host continuation of a
+  // suspended request) and its KV leases. The caller signals progress
   // when the memory becomes available to waiting requests: a lane that
   // held it across passes and ends (release) or fails its restore, or one
   // suspended for a higher priority (preemptBelow). An admission returning
@@ -454,9 +457,8 @@ private:
   EngineEventSink &events_;
   Scheduler scheduler_;
   std::unordered_map<uint64_t, Request> requests_;
-  // Pressure preempted work, a resident lane still holds its state cell, and
-  // memory is still short (growth is paused or allocationFailed_), up to the
-  // drain's end.
+  // Pressure preempted work, a lane is still resident, and memory is still
+  // short (growth is paused or allocationFailed_), up to the drain's end.
   [[nodiscard]] bool drainingForRecovery() const;
   // The highest priority among suspended requests: admission recovers from a
   // suspension while there is one.
@@ -470,8 +472,8 @@ private:
                                     bool draining) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
-  // The state cells admit() has obtained so far, including those it gave
-  // back when the attempt's pages were refused (Request::admission).
+  // The lanes admit() has obtained so far, including those it gave back when
+  // the attempt's pages were refused (Request::admission).
   uint64_t admissions_ = 0;
   uint64_t resourceEpoch_ = 1;
   // The resource wait limit after the latest suspension; zero once passed
