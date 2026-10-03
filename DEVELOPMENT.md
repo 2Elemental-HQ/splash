@@ -814,10 +814,44 @@ special tokens such as a BOS and recognizing special-token strings, or one array
 of token IDs from its vocabulary. No chat template, reasoning split, tools or
 images apply: `text` is the generated text, decoded without special tokens.
 `max_tokens` defaults to 16, OpenAI's default for the endpoint as in vLLM and
-SGLang, or to what the context leaves when that is less. `temperature`,
-`top_p`, `top_k`, `seed`, `stop`, `priority`, `timeout` and `stream` with
+SGLang, or to what the context leaves when that is less. The sampling fields
+below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `stream_options.include_usage` work as in Chat. Batched prompts, `suffix`,
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
+
+Chat, text completions and Responses sample with `temperature` (default 1.0,
+in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p`
+(0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
+`repetition_penalty` (1, positive); the defaults are Qwen's generation config,
+which sets no penalties, so its recommended `presence_penalty` of 1.5 for
+non-thinking use must be sent explicitly. Each field that is out of range
+returns 400 naming it. As in vLLM, a nonzero temperature below 0.01 samples at
+0.01, and the penalties rewrite the raw logits before temperature, for greedy
+requests too: repetition divides a positive logit and multiplies a negative
+one for every token of the prompt or of the output so far, and presence and
+frequency lower the logit of every output token by `presence_penalty` plus
+`frequency_penalty` times its count. Speculative decoding stays exact: each
+verified draft position counts the draft tokens before it, so a penalized
+request samples as it would without a draft. Splash does not implement
+`logit_bias`: a non-empty one returns 400; `null` and `{}` are accepted. Like
+vLLM and HF, repetition counts every prompt token: with the Qwen templates
+that includes the tool-call syntax every tool-enabled system prompt carries,
+earlier tool calls and reasoning, and the `<think>` markers of the generation
+prompt, so a `repetition_penalty` above 1 can delay tool calls and the end of
+reasoning and change names copied from the context. Anthropic Messages defines
+no penalties and no `min_p`.
+
+In vLLM's order, after temperature `min_p` first drops every token less
+likely than `min_p` times the most likely one, `top_k` then keeps the most
+likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
+`top_p` then the fewest of those whose probabilities, renormalized over them,
+sum past it. All three apply to the whole vocabulary, exactly, for the first
+token, the verified draft positions and their corrections alike: the sampler
+sums each row's softmax denominator, finds where its distribution ends
+without sorting the vocabulary, and draws over every token the distribution
+keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
+it is one more cut of the target distribution, which acceptance and
+correction read as they read the others, so sampling stays exact.
 
 Chat's `max_completion_tokens` or `max_tokens` and Responses'
 `max_output_tokens` bound a response's output. Omitted, the output may use

@@ -46,6 +46,20 @@ struct SamplingParameters final {
   float topP = 1.0F;
   uint32_t topK = 0;
   uint64_t seed = 0;
+  // The sampling penalties, applied before greedy and sampled selection alike:
+  // repetition scales the logits of prompt and output tokens, presence and
+  // frequency lower those of output tokens. The defaults change nothing.
+  float presencePenalty = 0.0F;
+  float frequencyPenalty = 0.0F;
+  float repetitionPenalty = 1.0F;
+  // Sampling drops the tokens less likely than minP times the most likely
+  // one, before top-k and top-p; 0 drops none.
+  float minP = 0.0F;
+
+  [[nodiscard]] bool penalized() const noexcept {
+    return presencePenalty != 0.0F || frequencyPenalty != 0.0F ||
+           repetitionPenalty != 1.0F;
+  }
 };
 
 // Immutable view of the fields a model needs to activate a sequence.  Engine

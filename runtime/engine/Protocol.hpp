@@ -146,10 +146,23 @@ enum RequestFlag : uint32_t {
 
 inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
 
+// The defaults are greedy selection with nothing changing the logits, which
+// score requests require.
 struct SamplingParameters {
   float temperature = 0.0f;
   float topP = 1.0f;
+  // Sampling keeps the topK most likely tokens; 0 keeps every token, as does
+  // a topK past the vocabulary.
   uint32_t topK = 0;
+  // The penalties: presence and frequency in [-2, 2] lower the logits of
+  // output tokens; a positive repetition scales those of prompt and output
+  // tokens.
+  float presencePenalty = 0.0f;
+  float frequencyPenalty = 0.0f;
+  float repetitionPenalty = 1.0f;
+  // Sampling drops the tokens less likely than minP, in [0, 1], times the
+  // most likely one, before top-k and top-p; 0 drops none.
+  float minP = 0.0f;
 
   bool operator==(const SamplingParameters &) const = default;
 };

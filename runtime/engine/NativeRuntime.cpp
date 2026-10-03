@@ -282,9 +282,15 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.scoreTokens = std::move(request.scoreTokens);
-    engineRequest.sampling = {request.sampling.temperature,
-                              request.sampling.topP, request.sampling.topK,
-                              request.seed};
+    engineRequest.sampling = {
+        .temperature = request.sampling.temperature,
+        .topP = request.sampling.topP,
+        .topK = request.sampling.topK,
+        .seed = request.seed,
+        .presencePenalty = request.sampling.presencePenalty,
+        .frequencyPenalty = request.sampling.frequencyPenalty,
+        .repetitionPenalty = request.sampling.repetitionPenalty,
+        .minP = request.sampling.minP};
     engineRequest.constraint = mapConstraint(request.constraint);
     engineRequest.flags = request.flags;
     engineRequest.returnProgress = request.returnProgress;

@@ -229,7 +229,6 @@ struct Runtime::Impl {
     Request *request = nullptr;
     uint32_t retained = 0;
     uint32_t accepted = 0;
-    uint32_t nextAnchor = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
     bool verify = false;
@@ -253,6 +252,9 @@ struct Runtime::Impl {
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
+  // Every state slot's penalty words, bound whole: a lane reads the row of
+  // its request's slot, which need not be its lane.
+  MetalBuffer penaltyTable;
   std::unordered_map<uint64_t, Request> requests;
   // Allocated for image cache misses and reclaimable once pending encodes
   // finish. Injecting already encoded rows needs no vision arena.
@@ -285,7 +287,7 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
-        sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
+        sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return QwenTarget(weights, value.backend, operators,
@@ -300,6 +302,7 @@ struct Runtime::Impl {
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
   }
 
   Request &request(uint64_t id) {
@@ -693,27 +696,37 @@ struct Runtime::Impl {
     }
   }
 
+  static ops::SamplingPenalties samplingPenalties(const Request &entry) noexcept {
+    return {entry.sampling.repetitionPenalty, entry.sampling.presencePenalty,
+            entry.sampling.frequencyPenalty};
+  }
+
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
     const bool enabled = samplingEnabled(entry);
     return {enabled ? entry.sampling.topK : 1,
             enabled ? entry.sampling.temperature : 0.0F,
             enabled ? entry.sampling.topP : 1.0F,
             entry.constraint == ConstraintMode::TokenMask,
-            (entry.flags & RequestIgnoreEndOfSequence) != 0};
+            (entry.flags & RequestIgnoreEndOfSequence) != 0,
+            samplingPenalties(entry),
+            enabled ? entry.sampling.minP : 0.0F};
   }
 
   template <class Get>
   static ops::SamplingBuffers samplingBuffersWith(Get d) {
     return {d(DecodeTensor::Logits),
-            d(DecodeTensor::TargetTopPartialIds),
-            d(DecodeTensor::TargetTopPartialValues),
-            d(DecodeTensor::TargetTopIds),
-            d(DecodeTensor::TargetTopProbs),
+            d(DecodeTensor::TargetPartialMasses),
+            d(DecodeTensor::TargetVocabularyRows),
             d(DecodeTensor::SamplingUniforms),
             d(DecodeTensor::ConstraintMasks),
             d(DecodeTensor::OutputTokens),
             d(DecodeTensor::ArgmaxValues),
-            d(DecodeTensor::ArgmaxIndices)};
+            d(DecodeTensor::ArgmaxIndices),
+            d(DecodeTensor::InputTokens),
+            d(DecodeTensor::Candidates),
+            d(DecodeTensor::ProposalProbs),
+            d(DecodeTensor::TargetVocabularyRanges),
+            d(DecodeTensor::TargetVocabularyArrivals)};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -726,12 +739,46 @@ struct Runtime::Impl {
         [&](DecodeTensor t) { return decodeArena->get(lane, t); });
   }
 
+  std::span<uint32_t> penaltyWords(uint32_t slot) const {
+    return {contents<uint32_t>(
+                decodeArena->get(slot, DecodeTensor::PenaltyState),
+                "penalty words"),
+            geometry.target.vocabularySize};
+  }
+
+  // Rebuilds a penalized request's penalty words when it takes a state slot,
+  // at activation and at resume, from the history the slot's prefill
+  // consumes. No command reads the slot yet.
+  void bindPenalties(const Request &entry,
+                     std::span<const uint32_t> history) const {
+    const ops::SamplingPenalties penalties = samplingPenalties(entry);
+    if (!penalties.active())
+      return;
+    ops::Sampling::rebuildPenaltyWords(penaltyWords(entry.slot), history,
+                                       entry.generatedTokens,
+                                       entry.pendingToken,
+                                       penalties.repetition != 1.0F);
+  }
+
+  // The one place a token the target selected becomes the pending anchor:
+  // tokens are one step's selections in order, the new anchor last. The
+  // command that selected them has completed, and the next one that reads
+  // the slot's words is encoded after this.
+  void commitSelected(Request &entry, std::span<const uint32_t> tokens) {
+    if (tokens.empty())
+      throw std::logic_error("no selected token to commit");
+    if (samplingPenalties(entry).active())
+      ops::Sampling::countPenaltyTokens(penaltyWords(entry.slot), tokens);
+    entry.pendingToken = tokens.back();
+  }
+
   void addInitialPolicySelection(CommandGraph &graph, Request &entry,
                                  uint32_t lane, uint32_t rowOffset) const {
     sampling.addInitial(graph, samplingPolicy(entry),
                         samplingBuffersForLane(lane), rowOffset,
                         geometry.target.stopTokens[0],
-                        geometry.target.stopTokens[1]);
+                        geometry.target.stopTokens[1],
+                        {penaltyTable, {&entry.slot, 1}});
   }
 
   CommandTiming selectPendingFromFinalHidden(Request &entry, uint32_t lane,
@@ -760,11 +807,12 @@ struct Runtime::Impl {
                         kDecodeRows, decodeArena->linearScratch());
     addInitialPolicySelection(graph, entry, lane, 0);
     CommandTiming timing = backend.submitCommand(graph.dispatches());
-    entry.pendingToken = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
-                                             "restored prefix next token");
-    if (*entry.pendingToken >= geometry.target.vocabularySize) {
+    const uint32_t token = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
+                                               "restored prefix next token");
+    if (token >= geometry.target.vocabularySize) {
       throw std::runtime_error("target policy selected an invalid token");
     }
+    commitSelected(entry, {&token, 1});
     return timing;
   }
 
@@ -1294,14 +1342,17 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target policy batch");
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
+    std::array<uint32_t, kLaneCount> slots{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       if (!entries[lane])
         throw std::invalid_argument("empty target policy lane");
       policies[lane] = samplingPolicy(*entries[lane]);
+      slots[lane] = entries[lane]->slot;
     }
     sampling.addVerify(graph, std::span(policies).first(lanes),
                        samplingBuffers(lanes), geometry.target.stopTokens[0],
-                       geometry.target.stopTokens[1]);
+                       geometry.target.stopTokens[1],
+                       {penaltyTable, std::span(slots).first(lanes)});
   }
 
   void addPrefillPolicy(CommandGraph &graph, Request &entry, uint32_t lane,
@@ -1370,12 +1421,10 @@ struct Runtime::Impl {
         {decodeArena->packed(DecodeTensor::ProposedTokens, width),
          decodeArena->packed(DecodeTensor::Candidates, width),
          decodeArena->packed(DecodeTensor::ProposalProbs, width),
-         decodeArena->packed(DecodeTensor::TargetTopIds, width),
-         decodeArena->packed(DecodeTensor::TargetTopProbs, width),
+         decodeArena->packed(DecodeTensor::TargetVocabularyRows, width),
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
          decodeArena->packed(DecodeTensor::OutputTokens, width),
          decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->packed(DecodeTensor::NextAnchor, width),
          decodeArena->packed(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
@@ -1462,12 +1511,14 @@ struct Runtime::Impl {
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
-      laneResult.nextAnchor =
-          *contents<uint32_t>(d(DecodeTensor::NextAnchor), "GPU next anchor");
       if (!laneResult.retained || laneResult.retained > kDecodeRows)
         throw std::runtime_error("target policy produced invalid retention");
+      // The retained target tokens end with the next anchor.
+      const uint32_t *targetTokens = contents<uint32_t>(
+          d(DecodeTensor::OutputTokens), "target output tokens");
       if (laneResult.accepted > kDraftProposalTokens ||
-          laneResult.nextAnchor >= geometry.target.vocabularySize) {
+          targetTokens[laneResult.retained - 1] >=
+              geometry.target.vocabularySize) {
         throw std::runtime_error(
             "target policy selected an invalid next anchor");
       }
@@ -1497,7 +1548,7 @@ struct Runtime::Impl {
                           {static_cast<uint32_t>(items[lane].logicalPosition),
                            static_cast<uint32_t>(nextLength), 0, false}));
       entry.generatedTokens += laneResult.retained;
-      entry.pendingToken = laneResult.nextAnchor;
+      commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.decodeStage = DecodeStage::Regular;
@@ -1792,6 +1843,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     impl_->adoptImages(entry, std::move(images));
+    impl_->bindPenalties(entry, request.prompt);
   }
   rollback.committed = admission.granted();
   return admission;
@@ -1820,15 +1872,22 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   if (entry.cohort != expected || !std::isfinite(entry.sampling.temperature) ||
       entry.sampling.temperature < 0.0F ||
       !std::isfinite(entry.sampling.topP) || entry.sampling.topP <= 0.0F ||
-      entry.sampling.topP > 1.0F ||
-      entry.sampling.topK > ops::kTargetSamplingCandidates ||
-      (Impl::samplingEnabled(entry) && !entry.sampling.topK)) {
+      entry.sampling.topP > 1.0F || !(entry.sampling.minP >= 0.0F) ||
+      entry.sampling.minP > 1.0F) {
     throw std::invalid_argument("request sampling/cohort contract is invalid");
+  }
+  // The penalties' ranges, as the API takes them.
+  if (!(std::fabs(entry.sampling.presencePenalty) <= 2.0F) ||
+      !(std::fabs(entry.sampling.frequencyPenalty) <= 2.0F) ||
+      !std::isfinite(entry.sampling.repetitionPenalty) ||
+      entry.sampling.repetitionPenalty <= 0.0F) {
+    throw std::invalid_argument("request sampling penalties are invalid");
   }
   if (!request.scoreTokens.empty()) {
     if (request.maxNewTokens != 0 ||
         request.constraint != ConstraintMode::None ||
-        request.cohort != BatchCohort::Greedy || !request.images.empty() ||
+        request.cohort != BatchCohort::Greedy || request.sampling.penalized() ||
+        !request.images.empty() ||
         !request.imagePixels.empty() ||
         request.scoreTokens.size() < ExecutionLimits::minimumScoreOptions ||
         request.scoreTokens.size() > ExecutionLimits::maximumScoreOptions) {
@@ -1857,6 +1916,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.resident = true;
   impl_->adoptImages(entry, std::move(images));
   try {
+    impl_->bindPenalties(entry, request.prompt);
     auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
     if (!inserted) {
       throw std::logic_error("request insertion lost uniqueness");
@@ -2066,15 +2126,14 @@ Runtime::prefillAsync(const BatchPlan &plan,
           }
           result.finished = true;
         } else if (entry.constraint == ConstraintMode::None) {
-          entry.pendingToken = *contents<uint32_t>(
+          const uint32_t token = *contents<uint32_t>(
               impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
               "prefill next token");
-          if (!entry.pendingToken ||
-              *entry.pendingToken >=
-                  impl->geometry.target.vocabularySize) {
+          if (token >= impl->geometry.target.vocabularySize) {
             throw std::runtime_error(
                 "prefill policy selected an invalid token");
           }
+          impl->commitSelected(entry, {&token, 1});
           impl->emitTerminalAnchor(entry, result);
         } else {
           const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);

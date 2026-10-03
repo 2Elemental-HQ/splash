@@ -585,6 +585,41 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
   require(done(), message);
 }
 
+// A score request reads raw logits, so the engine refuses one that carries
+// a penalty or a min_p, as it refuses any other sampling.
+void testScoreRequestsCarryNoSamplingOptions() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+  for (uint32_t field = 0; field < 4; ++field) {
+    EngineRequest score = request(1, std::vector<uint32_t>(8, 7));
+    score.maxNewTokens = 0;
+    score.scoreTokens = {3, 4};
+    float *options[] = {&score.sampling.presencePenalty,
+                        &score.sampling.frequencyPenalty,
+                        &score.sampling.repetitionPenalty,
+                        &score.sampling.minP};
+    *options[field] += 0.5F;
+    bool refused = false;
+    try {
+      engine.submit(std::move(score));
+    } catch (const std::invalid_argument &) {
+      refused = true;
+    }
+    require(refused, "a score request with a penalty or min_p was accepted");
+  }
+  require(engine.idle(), "a refused score request was queued");
+  EngineRequest neutral = request(1, std::vector<uint32_t>(8, 7));
+  neutral.maxNewTokens = 0;
+  neutral.scoreTokens = {3, 4};
+  engine.submit(std::move(neutral));
+  require(!engine.idle(), "a neutral score request was not queued");
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
@@ -7236,6 +7271,7 @@ int main() {
     testHeldBackStartTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
+    testScoreRequestsCarryNoSamplingOptions();
     testConcurrentColdPrefixesComputeOnce();
     testSharedPrefillRebuildsTheMissingJunctionOnce();
     testSharedPrefillReleasesDifferentJunctionsIndependently();

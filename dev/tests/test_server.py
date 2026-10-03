@@ -4153,9 +4153,7 @@ class ServerTest(unittest.TestCase):
             prompt_tokens=[101, 102],
             max_new_tokens=16,
             seed=0,
-            temperature=0,
-            top_p=1,
-            top_k=0,
+            sampling=native_wire.SamplingParameters(),
             deadline=100,
             public_id="prefill-heartbeat",
         )
@@ -6271,9 +6269,6 @@ class ServerTest(unittest.TestCase):
     def test_validation(self):
         harness = self.harness(FakeRuntime())
         invalid = [
-            self.body(temperature=-1),
-            self.body(top_p=0),
-            self.body(top_k=33),
             self.body(stop=""),
             self.body(stop=3),
             self.body(stop=["x"] * 5),
@@ -6283,16 +6278,7 @@ class ServerTest(unittest.TestCase):
             self.body(n=True),
             self.body(n=1.0),
             self.body(logprobs=0),
-            self.body(temperature=1e300),
             self.body(temperature=float("nan")),
-            self.body(temperature=1e-46),
-            self.body(top_p=1e-46),
-            self.body(presence_penalty=1),
-            self.body(presence_penalty=False),
-            self.body(repetition_penalty=1.1),
-            self.body(repetition_penalty=True),
-            self.body(min_p=0.1),
-            self.body(logit_bias={"1": 2}),
             self.body(stream="true"),
             self.body(messages=[{"role": "system", "content": "instructions"}]),
             self.body(messages=[{"role": "assistant", "content": "answer"}]),
@@ -6360,10 +6346,161 @@ class ServerTest(unittest.TestCase):
                 body["stop"] = stop
             status, _, _ = harness.request("POST", "/v1/chat/completions", body)
             self.assertEqual(status, 200)
-        for repetition_penalty in (None, 1):
-            body = self.body(repetition_penalty=repetition_penalty)
-            status, _, _ = harness.request("POST", "/v1/chat/completions", body)
-            self.assertEqual(status, 200)
+
+    def test_sampling_fields_reach_the_engine_and_are_validated_per_field(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        # Qwen's recommended non-thinking sampling, whose min_p of 0 drops
+        # nothing, penalties beyond it, and min_p up to its limit.
+        accepted = (
+            (
+                {
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "presence_penalty": 1.5,
+                    "repetition_penalty": 1.0,
+                },
+                {"min_p": 0.0},
+            ),
+            ({"repetition_penalty": 1.1}, {"min_p": None}),
+            ({"repetition_penalty": 2.5, "frequency_penalty": -2}, {}),
+            (
+                {"presence_penalty": 2, "frequency_penalty": 2, "top_k": 32},
+                {"repetition_penalty": None},
+            ),
+            ({"repetition_penalty": 1e-40, "frequency_penalty": 0.25}, {}),
+            ({"temperature": 0.7, "min_p": 0.25}, {}),
+            ({"min_p": 1}, {}),
+        )
+        for fields, neutral in accepted:
+            with self.subTest(fields=fields):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(**fields, **neutral)
+                )
+                self.assertEqual(status, 200, payload)
+                sampling = runtime.requests[0].sampling
+                for name, value in fields.items():
+                    self.assertEqual(getattr(sampling, name), value)
+        # A nonzero temperature below 0.01 samples at 0.01; zero stays
+        # greedy.
+        for temperature, sampled in (
+            (1e-46, 0.01),
+            (1e-40, 0.01),
+            (2.0**-126, 0.01),
+            (0.005, 0.01),
+            (0.01, 0.01),
+            (0.0, 0.0),
+        ):
+            with self.subTest(temperature=temperature):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(temperature=temperature)
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(runtime.requests[0].sampling.temperature, sampled)
+        refused = (
+            ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
+            ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
+            ({"temperature": 1e300}, "temperature must be a number in [0, 2]"),
+            ({"top_p": 0}, "top_p must be a number in (0, 1]"),
+            ({"top_p": 1e-46}, "top_p must be a number in (0, 1]"),
+            ({"min_p": 1.5}, "min_p must be a number in [0, 1]"),
+            ({"min_p": -0.1}, "min_p must be a number in [0, 1]"),
+            ({"min_p": "0.1"}, "min_p must be a number in [0, 1]"),
+            ({"min_p": True}, "min_p must be a number in [0, 1]"),
+            ({"presence_penalty": 2.5}, "presence_penalty must be a number in [-2, 2]"),
+            (
+                {"presence_penalty": False},
+                "presence_penalty must be a number in [-2, 2]",
+            ),
+            (
+                {"frequency_penalty": -3},
+                "frequency_penalty must be a number in [-2, 2]",
+            ),
+            ({"frequency_penalty": "1"}, "frequency_penalty must be a number"),
+            ({"repetition_penalty": 0}, "repetition_penalty must be a positive number"),
+            (
+                {"repetition_penalty": -1},
+                "repetition_penalty must be a positive number",
+            ),
+            ({"repetition_penalty": 1e-46}, "repetition_penalty must be a positive"),
+            ({"repetition_penalty": 1e39}, "repetition_penalty must be a positive"),
+            (
+                {"repetition_penalty": True},
+                "repetition_penalty must be a positive number",
+            ),
+            ({"logit_bias": {"1": 2}}, "logit_bias is not supported"),
+        )
+        for fields, message in refused:
+            with self.subTest(fields=fields):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(**fields)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(message, json.loads(payload)["error"]["message"])
+                self.assertEqual(runtime.requests, [])
+
+    def test_top_k_takes_any_positive_integer_and_0_or_minus_1_disables_it(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        # 0 and -1 keep every token, which the frame says with 0; a top_k
+        # past the vocabulary keeps every token too, however large.
+        for top_k, sent in (
+            (1, 1),
+            (33, 33),
+            (1000, 1000),
+            (0, 0),
+            (-1, 0),
+            (2**40, 0xFFFFFFFF),
+        ):
+            with self.subTest(top_k=top_k):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(top_k=top_k)
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(runtime.requests[0].sampling.top_k, sent)
+        for top_k in (-2, 2.5, True, "20"):
+            with self.subTest(top_k=top_k):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(top_k=top_k)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    "top_k must be 0 or -1 (disabled) or a positive integer",
+                )
+                self.assertEqual(runtime.requests, [])
+
+    def test_responses_forward_the_sampling_fields_chat_validates(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        fields = {
+            "top_k": 20,
+            "presence_penalty": 1.5,
+            "frequency_penalty": 0.5,
+            "repetition_penalty": 1.05,
+            "min_p": 0.25,
+        }
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", self.responses_body(store=False, **fields)
+        )
+        self.assertEqual(status, 200, payload)
+        sampling = runtime.requests[0].sampling
+        for name, value in fields.items():
+            self.assertEqual(getattr(sampling, name), value)
+        status, _, payload = harness.request(
+            "POST", "/v1/responses", self.responses_body(logit_bias={"1": 2})
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"], "logit_bias is not supported"
+        )
+        self.assertEqual(len(runtime.requests), 1)
 
     def test_frontend_limits_generation_and_token_count_preparation_to_two(self):
         tokenizer = BlockingTokenizer()
@@ -7290,7 +7427,8 @@ class ServerTest(unittest.TestCase):
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
             job, _, _ = app.prepare(body)
         self.assertEqual(
-            (job.temperature, job.top_p, job.top_k, job.seed), (1.0, 0.95, 20, 123)
+            (job.sampling, job.seed),
+            (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
         )
 
     def test_pending_limit_returns_retryable_http_overload(self):
