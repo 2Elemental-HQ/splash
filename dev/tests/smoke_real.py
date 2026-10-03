@@ -386,9 +386,9 @@ def run_images(port: int, model: str, nonce: str) -> None:
                     ],
                 }
             ],
-            # Responses requests reason by default; leave room for the
-            # thinking block before the one-word answer.
-            "max_output_tokens": 256,
+            # Responses requests reason by default, and the thinking before
+            # the one-word answer can take more than 256 tokens.
+            "max_output_tokens": 1024,
             "temperature": 0,
             "store": False,
         },
