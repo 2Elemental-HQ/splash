@@ -30,8 +30,8 @@ void appendBatch(std::ostringstream &out,
 } // namespace
 
 std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool growthAllowed) {
-  const unsigned state = (!growthAllowed ? 1u : 0u) |
+                                         bool hostGrowthAllowed) {
+  const unsigned state = (!hostGrowthAllowed ? 1u : 0u) |
                          (wait.memory ? 2u : 0u) |
                          (wait.suspended ? 4u : 0u) |
                          (wait.draining ? 8u : 0u);
@@ -41,7 +41,7 @@ std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
   if (!state)
     return "Memory: growth available; resource wait cleared";
   std::ostringstream out;
-  out << "Memory: growth " << (growthAllowed ? "available" : "paused")
+  out << "Memory: growth " << (hostGrowthAllowed ? "available" : "paused")
       << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
   if (wait.draining)
     out << "; waiting for resident requests to finish";
@@ -121,10 +121,8 @@ std::string runtimeStatusJson(
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
       << ",\"charged_bytes\":" << memoryGovernor.chargedBytes
-      << ",\"serving_footprint_bytes\":" << memoryGovernor.servingFootprintBytes
-      << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
-      << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
+      << ",\"growth_allowed\":" << boolean(memoryGovernor.hostGrowthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
       << ",\"system_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
@@ -147,6 +145,9 @@ std::string runtimeStatusJson(
       << ",\"extent_releases\":" << pool.extentReleases
       << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
       << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
+      << ",\"extent_compactions\":" << pool.extentCompactions
+      << ",\"pages_moved\":" << pool.pagesMoved
+      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
       << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes

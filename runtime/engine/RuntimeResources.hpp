@@ -22,6 +22,8 @@
 
 namespace splash::engine {
 
+struct EngineConfig;
+
 enum class RuntimeResourceStage {
   Configuration,
   BackendCreation,
@@ -223,5 +225,10 @@ private:
   uint32_t maximumImagePatches_ = 0;
   std::optional<uint64_t> hostAvailableAtStart_;
 };
+
+// Connects an engine to the governor that admits its memory: the engine asks
+// it whether the host pauses growth, and marks the allocations a request in
+// service makes. Every engine that runs against a governor connects through it.
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine

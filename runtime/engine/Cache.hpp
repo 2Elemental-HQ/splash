@@ -87,6 +87,9 @@ struct CacheSnapshot final {
   KvTierSnapshot kvTier;
   CacheLookupSnapshot lookup;
   uint32_t activeRequests = 0;
+  // The longest emptying of one extent by moving its pages, re-pointing the
+  // cached blocks and requests on them included.
+  double extentCompactMaxMilliseconds = 0.0;
 };
 
 enum class TokenAdmissionFailure : uint8_t {
@@ -208,9 +211,12 @@ public:
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
-  // One cache reclaimer for memory growth and pressure warnings. After empty
-  // extents, disposable checkpoints are reclaimed first. Ordinary states and
-  // resident KV leaves share one oldest-first access order. A chosen state
+  // One cache reclaimer for memory growth and pressure warnings. Free pages
+  // return first: empty extents, then the free pages scattered over the
+  // others once they cover the extent that holds the fewest pages, whose
+  // pages move to them (compactExtent). Only then is anything evicted:
+  // disposable checkpoints first, then ordinary states and resident KV
+  // leaves, which share one oldest-first access order. A chosen state
   // keeps its disk copy when it has one, is written when the tier admits it
   // and dropped otherwise; its RAM is free when the call returns. A chosen
   // KV leaf frees its page at once when a disk copy exists, is dropped when
@@ -227,20 +233,25 @@ public:
   // recurrent state. Empty extents, older publications and state-free KV are
   // still reclaimed. keepRunway leaves one empty extent allocated, for the
   // next request.
-  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
-                                      bool keepResumePoint = false,
-                                      bool keepRunway = false);
+  [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes,
+                                      bool keepResumePoint, bool keepRunway);
+  // Evicts every unpinned entry, in reclaimCache's order, and releases every
+  // empty extent, the runway too. Only then does it move pages, those that
+  // requests and pins still hold, so that nothing is copied and then evicted.
+  [[nodiscard]] uint64_t evictAll();
   // reclaimCache's stop rule: releasedBytes and the pages whose copies are
-  // being written meet targetBytes. A pass with evictAll has no target.
-  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
-                                bool evictAll) const noexcept;
+  // being written meet targetBytes.
+  [[nodiscard]] bool reclaimMet(uint64_t releasedBytes,
+                                uint64_t targetBytes) const noexcept;
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine.
   [[nodiscard]] bool transfersInFlight() const noexcept;
   // One bounded reclaim step for an allocation retry: one empty extent, one
-  // state or one KV leaf, so a denied allocation frees only what it needs.
-  // Progress is distinct from released bytes because evicting a KV reference
-  // can make a page reusable without emptying its extent.
+  // extent emptied of its pages, one state or one KV leaf, so a denied
+  // allocation frees only what it needs. Progress is distinct from released
+  // bytes because evicting a KV reference can make a page reusable without
+  // emptying its extent, and the extent a step empties may be the runway
+  // it keeps.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseExtents,
       bool keepResumePoint = false, bool keepRunway = false);
@@ -315,6 +326,8 @@ private:
 
   [[nodiscard]] TokenAdmission admitPages(uint32_t count,
                                           std::vector<uint32_t> &pages);
+  // One eviction in the shared recency order, checkpoints first.
+  [[nodiscard]] CacheReclaimResult evictOne(bool keepResumePoint);
   // Oldest resident KV leaf after `after` whose state, if any, is not in RAM.
   [[nodiscard]] std::optional<CacheEvictionCandidate> oldestKvLeaf(uint64_t after) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
@@ -351,6 +364,11 @@ private:
   [[nodiscard]] uint64_t
   reclaimEmptyExtents(bool keepRunway,
                       uint32_t limit = std::numeric_limits<uint32_t>::max());
+  // Empties one extent that still holds pages (KvPool::compactExtent); the
+  // blocks and requests on its pages follow them. A page a transfer reads or
+  // writes stays where it is until the transfer has landed. False when the
+  // free pages cover no extent.
+  [[nodiscard]] bool compactExtent();
 
   KvPool &pool_;
   KvTier *tier_;
@@ -368,6 +386,7 @@ private:
   std::vector<uint64_t> poisoned_;
   KvTierSnapshot kvTier_;
   CacheLookupSnapshot lookup_;
+  double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };
 

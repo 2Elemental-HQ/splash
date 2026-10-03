@@ -131,6 +131,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   if (!nextBlockId_ || nextBlockId_ == std::numeric_limits<uint64_t>::max()) {
     throw std::overflow_error("KV cache block ids exhausted");
   }
+  if (blockOnPage_[physicalPage])
+    throw std::logic_error("KV cache page already holds a block");
 
   Block entry;
   entry.id = nextBlockId_;
@@ -159,6 +161,7 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   }
   const uint64_t id = nextBlockId_++;
   ++residentBlocks_;
+  blockOnPage_[physicalPage] = id;
   Block &placed = block(id);
   if (parentBlock) {
     Block &parent = block(parentBlock);
@@ -298,6 +301,24 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexc
   entry.slot = std::move(slot);
 }
 
+void KvCache::followPages(const KvPageMoves &moves) noexcept {
+  // Destinations lie in other extents and were free, so no block is on one.
+  for (uint32_t offset = 0; offset < moves.destinations.size(); ++offset) {
+    const uint32_t from = moves.firstPage + offset;
+    const uint32_t to = moves.destinations[offset];
+    if (to == from)
+      continue;
+    const uint64_t id = std::exchange(blockOnPage_[from], 0);
+    if (!id)
+      continue;
+    const auto found = blocks_.find(id);
+    if (found == blocks_.end())
+      std::terminate();
+    found->second.page = to;
+    blockOnPage_[to] = id;
+  }
+}
+
 bool KvCache::abandonRestore(uint64_t blockId) {
   Block &entry = block(blockId);
   if (!entry.transferring || entry.residentChildren || entry.activeUsers)
@@ -315,6 +336,7 @@ void KvCache::dropPage(uint64_t blockId) {
     throw std::logic_error("KV cache block is still in use");
   const uint32_t page = entry.page;
   entry.page = noPage;
+  blockOnPage_[page] = 0;
   --residentBlocks_;
   reindex(entry);
   if (entry.parent) {
@@ -343,8 +365,11 @@ void KvCache::adoptPage(uint64_t blockId, uint32_t page) {
     throw std::out_of_range("KV cache physical page is out of range");
   if (entry.parent && block(entry.parent).page == noPage)
     throw std::logic_error("KV cache parent block has no page");
+  if (blockOnPage_[page])
+    throw std::logic_error("KV cache page already holds a block");
   pool_.retainPage(page, true);
   entry.page = page;
+  blockOnPage_[page] = blockId;
   ++residentBlocks_;
   reindex(entry);
   if (entry.parent) {
@@ -418,8 +443,10 @@ void KvCache::erase(uint64_t blockId) {
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
-  if (page != noPage)
+  if (page != noPage) {
+    blockOnPage_[page] = 0;
     --residentBlocks_;
+  }
   if (disk)
     --diskBlocks_;
   if (parentId) {

@@ -250,7 +250,7 @@ inline double RuntimeMetrics::percentile(const std::deque<double> &samples,
 class MemoryStatusReporter final {
 public:
   [[nodiscard]] std::string update(const ResourceWaitSnapshot &wait,
-                                    bool growthAllowed);
+                                    bool hostGrowthAllowed);
 private:
   unsigned state_ = 0;
 };

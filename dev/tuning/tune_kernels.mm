@@ -404,7 +404,8 @@ int main(int argc, char **argv) {
           engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
-        return state.pressure != engine::MemoryPressure::Normal || !state.growthAllowed ||
+        return state.pressure != engine::MemoryPressure::Normal ||
+               !state.hostGrowthAllowed || !state.headroomBytes ||
                NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious;
       };
       const MeasurementStop stop = [] { return interrupted != 0; };

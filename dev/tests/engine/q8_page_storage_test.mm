@@ -218,7 +218,7 @@ void run(const std::string &metallib) {
             "low availability escalated to destructive system pressure");
     fakeHostAvailable = hostReserve + giB / 2;
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                !bounded.snapshot().growthAllowed &&
+                !bounded.snapshot().hostGrowthAllowed &&
                 !bounded.tryReserve(1).has_value(),
             "low host headroom did not request proactive cache reclaim");
     fakeHostAvailable = hostReserve + 3 * giB / 2;
@@ -226,13 +226,13 @@ void run(const std::string &metallib) {
             "warning pressure recovered without crossing the hysteresis");
     fakeHostAvailable = hostReserve + 3 * giB;
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
-                bounded.snapshot().growthAllowed,
+                bounded.snapshot().hostGrowthAllowed,
             "host recovery did not reopen admission");
     {
         auto reservation = bounded.tryReserve(64 * 1024);
         require(reservation.has_value(), "engine capacity reservation failed");
         const auto full = bounded.snapshot();
-        require(!full.growthAllowed && full.hostGrowthAllowed,
+        require(full.headroomBytes == 0 && full.hostGrowthAllowed,
                 "engine budget exhaustion was confused with host pressure");
     }
     fakeHostAvailable.reset();
@@ -268,13 +268,13 @@ void run(const std::string &metallib) {
             "low reclaimable memory bypassed bounded pressure recovery");
     pressurePages.fileBacked = 3 * giB;
     fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
-    require(bounded.snapshot().growthAllowed &&
+    require(bounded.snapshot().hostGrowthAllowed &&
                 bounded.tryReserve(1).has_value() &&
                 !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaim,
             "reclaimable host recovery did not reopen normal admission");
     bounded.setPressure(MemoryPressure::Warning);
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                bounded.snapshot().growthAllowed &&
+                bounded.snapshot().hostGrowthAllowed &&
                 bounded.tryReserve(1).has_value(),
             "system warning blocked growth despite sufficient host headroom");
     fakeHostAvailable = hostReserve + giB / 2;
@@ -438,6 +438,46 @@ void run(const std::string &metallib) {
             "a released extent could not be allocated again");
     entriesFromFirst(storage, table);
     entriesFollowAReallocatedExtent(backend, storage, table);
+
+    // The pool moves a page by copying it: every tensor of every layer goes
+    // to the other page, in another extent too, and the pages beside both
+    // stay as they were. A command may still write the source, so nothing is
+    // copied while one is in flight, nor when a page has no memory.
+    const auto fill = [&](uint32_t page, uint8_t first) {
+        uint8_t value = first;
+        for (const auto span : storage.spans(page))
+            std::memset(span.data(), value++, span.size());
+    };
+    const auto holds = [&](uint32_t page, uint8_t first) {
+        uint8_t value = first;
+        for (const auto span : storage.spans(page)) {
+            const auto expected = static_cast<std::byte>(value++);
+            if (!std::all_of(span.begin(), span.end(),
+                             [&](std::byte byte) { return byte == expected; }))
+                return false;
+        }
+        return true;
+    };
+    fill(5, 10);
+    fill(6, 60);
+    fill(200, 110);
+    fill(201, 160);
+    fill(255, 210);
+    {
+        const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+        auto ticket = backend.submitAsync(kick);
+        requireThrows<std::logic_error>(
+            [&] { storage.copyPages(std::array<kv::PageCopy, 1>{{{5, 200}}}); },
+            "a page was copied while a command was in flight");
+        (void)ticket.wait();
+    }
+    requireThrows<std::logic_error>(
+        [&] { storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 300}}}); },
+        "a page was copied to an extent that is not allocated");
+    require(holds(200, 110), "a refused copy changed a page");
+    storage.copyPages(std::array<kv::PageCopy, 2>{{{5, 200}, {6, 255}}});
+    require(holds(200, 10) && holds(255, 60) && holds(5, 10) && holds(6, 60) && holds(201, 160),
+            "a copied page does not hold its source's tensors, or its neighbour changed");
 
     kv::PageStorage compactStorage(
         backend, governor.allocationAdmission(), compactLayout, 1024, 512);

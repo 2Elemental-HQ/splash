@@ -347,10 +347,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   }
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
-    config.nativeLoop.engine.growthPaused =
-        [governor = &resources->memoryGovernor()] {
-          return !governor->snapshot().hostGrowthAllowed;
-        };
+    connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
         std::move(output), std::move(statusProvider), NativeLoopClocks{},
@@ -378,8 +375,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         // and one empty KV extent. No cache data is evicted.
         while (modelPointer->reclaimIdleState(true)) {
         }
-        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, false, true));
-        resourcesPointer->memoryGovernor().markServingFootprint();
+        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, true));
         return report;
       },
       *nativeLoop);

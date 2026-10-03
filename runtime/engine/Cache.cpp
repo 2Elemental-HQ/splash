@@ -1,6 +1,7 @@
 #include "engine/Cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -311,15 +312,16 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
   return {};
 }
 
-// Reclaim: one victim at a time in the shared recency order, states and
+// Reclaim: memory returns as whole extents. Free pages go first, an empty
+// extent as it is and the pages scattered over the others once they fill
+// one; then one victim at a time in the shared recency order, states and
 // resident KV leaves alike.
 
-uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
-                             bool keepResumePoint, bool keepRunway) {
-  // Pages whose copies are being written count toward the target.
+uint64_t Cache::reclaimCache(uint64_t targetBytes, bool keepResumePoint,
+                             bool keepRunway) {
   uint64_t released = reclaimEmptyExtents(keepRunway);
-  auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
-  while (needsMore()) {
+  // Pages whose copies are being written count toward the target.
+  while (!reclaimMet(released, targetBytes)) {
     const CacheReclaimResult result = reclaimOne(
         CacheReclaimMode::ReleaseExtents, keepResumePoint, keepRunway);
     if (!result.madeProgress)
@@ -329,13 +331,34 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   return released;
 }
 
+uint64_t Cache::evictAll() {
+  uint64_t released = reclaimEmptyExtents(false);
+  // Everything unpinned goes before anything moves.
+  for (CacheReclaimResult evicted = evictOne(false); evicted.madeProgress;
+       evicted = evictOne(false))
+    released += evicted.reclaimedBytes;
+  do {
+    released += reclaimEmptyExtents(false);
+  } while (compactExtent());
+  return released;
+}
+
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
-  if (mode == CacheReclaimMode::ReleaseExtents) {
+  const bool release = mode == CacheReclaimMode::ReleaseExtents;
+  if (release) {
     if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
       return {true, bytes};
+    if (compactExtent())
+      return {true, reclaimEmptyExtents(keepRunway, 1)};
   }
+  CacheReclaimResult evicted = evictOne(keepResumePoint);
+  if (evicted.madeProgress && release)
+    evicted.reclaimedBytes += reclaimEmptyExtents(keepRunway, 1);
+  return evicted;
+}
 
+CacheReclaimResult Cache::evictOne(bool keepResumePoint) {
   const auto reclaimState = [&](uint64_t block) {
     const StateEviction eviction =
         states_.reclaim(block, completionNotifier_, makeRoom_, true);
@@ -367,9 +390,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
     }
     switch (reclaimKvLeaf(kv->id)) {
     case LeafReclaim::Started:
-      return {true, mode == CacheReclaimMode::ReleaseExtents
-                        ? reclaimEmptyExtents(keepRunway, 1)
-                        : 0};
+      return {true, 0};
     case LeafReclaim::Pending:
       kvOpen = false;
       break;
@@ -486,6 +507,40 @@ uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
   return before >= after ? before - after : 0;
 }
 
+bool Cache::compactExtent() {
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<uint32_t> inTransfer;
+  inTransfer.reserve(demotions_.size() + restores_.size());
+  for (const Demotion &demotion : demotions_)
+    inTransfer.push_back(kv_.page(demotion.block));
+  for (const auto &[block, _] : restores_)
+    inTransfer.push_back(kv_.page(block));
+  const KvPageMoves moves = pool_.compactExtent(inTransfer);
+  if (moves.empty())
+    return false;
+  kv_.followPages(moves);
+  for (auto &[_, active] : requests_) {
+    const size_t pages = active.pages.size();
+    size_t first = pages;
+    for (size_t index = 0; index < pages; ++index) {
+      uint32_t &page = active.pages[index];
+      const uint32_t destination = moves.follow(page);
+      if (destination == page)
+        continue;
+      page = destination;
+      first = std::min(first, index);
+    }
+    if (first < pages)
+      pagesChanged(active, static_cast<uint32_t>(first));
+  }
+  extentCompactMaxMilliseconds_ = std::max(
+      extentCompactMaxMilliseconds_,
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+  return true;
+}
+
 bool Cache::transfersInFlight() const noexcept {
   return !restores_.empty() || !demotions_.empty() || states_.writing();
 }
@@ -494,9 +549,9 @@ uint64_t Cache::pendingBytes() const noexcept {
   return uint64_t{pendingPages()} * pool_.bytesPerPage();
 }
 
-bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
-                       bool evictAll) const noexcept {
-  return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
+bool Cache::reclaimMet(uint64_t releasedBytes,
+                       uint64_t targetBytes) const noexcept {
+  return releasedBytes + pendingBytes() >= targetBytes;
 }
 
 
@@ -748,7 +803,8 @@ CacheSnapshot Cache::snapshot() const {
           states_.snapshot(),
           tier,
           lookup_,
-          static_cast<uint32_t>(requests_.size())};
+          static_cast<uint32_t>(requests_.size()),
+          extentCompactMaxMilliseconds_};
 }
 
 Cache::Request &Cache::request(uint64_t requestId) {

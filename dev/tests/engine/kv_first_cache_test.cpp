@@ -470,7 +470,7 @@ void testByteLruAndPins() {
   // Keep the only KV leaf state-backed so this assertion isolates state LRU;
   // state-free KV leaves otherwise participate in the same global order.
   fixture.publish(3, 150);
-  require(fixture.cache.reclaimCache(1, false) == 150,
+  require(fixture.cache.reclaimCache(1, false, false) == 150,
           "state LRU did not evict one unpinned entry");
   auto missingMiddle = fixture.lookup(65);
   auto newest = fixture.lookup(97);
@@ -481,7 +481,7 @@ void testByteLruAndPins() {
   missingMiddle.state.reset();
   pinned.state.reset();
   newest.state.reset();
-  require(fixture.cache.reclaimCache(1, false) == 150,
+  require(fixture.cache.reclaimCache(1, false, false) == 150,
           "released state pins did not restore LRU eligibility");
 }
 
@@ -493,7 +493,7 @@ void testSpeculativeReclaimKeepsTheResumePoint() {
   fixture.publish(0, 100);
   fixture.publish(2, 100);
   const uint64_t everything = std::numeric_limits<uint64_t>::max();
-  static_cast<void>(fixture.cache.reclaimCache(everything, false, true));
+  static_cast<void>(fixture.cache.reclaimCache(everything, true, false));
   require(fixture.cache.snapshot().stateCache.entries == 1,
           "an unbounded speculative shrink did not stop at the resume point");
   // The chain the kept publication needs survives with it: its own KV block
@@ -529,9 +529,9 @@ void testCheckpointDoesNotOutrankTheResumePoint() {
 void testKvEvictionInvalidatesStateFirst() {
   CacheFixture fixture;
   fixture.publish(3);
-  require(fixture.cache.reclaimCache(1, false) == 100,
+  require(fixture.cache.reclaimCache(1, false, false) == 100,
           "state was not reclaimed before its KV block");
-  require(fixture.cache.reclaimCache(1, false) != 0 &&
+  require(fixture.cache.reclaimCache(1, false, false) != 0 &&
               fixture.cache.lookup(fixture.prompt).kvBoundary == 96,
           "KV leaf eviction did not remove the dependent prefix");
 
@@ -540,7 +540,7 @@ void testKvEvictionInvalidatesStateFirst() {
   auto lease = pinnedFixture.lookup(97);
   require(lease.state.has_value(), "replacement state pin failed");
   static_cast<void>(pinnedFixture.cache.reclaimCache(
-      std::numeric_limits<uint64_t>::max(), false));
+      std::numeric_limits<uint64_t>::max(), false, false));
   require(pinnedFixture.cache.snapshot().kvCache.blocks == 3 &&
               pinnedFixture.cache.snapshot().stateCache.entries == 1,
           "pinned composite state did not protect its KV dependency");
@@ -581,7 +581,7 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
               probed.stateCache.misses == before.stateCache.misses &&
               probed.stateCache.deduplicatedPublications == 1,
           "publication probe polluted restore hit/miss accounting");
-  require(fixture.cache.reclaimCache(1, false) == 200,
+  require(fixture.cache.reclaimCache(1, false, false) == 200,
           "publication probe did not promote the existing state in LRU");
 }
 
@@ -2233,10 +2233,10 @@ void testReclaimCacheCountsPendingPages() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimCache(100, false) == 100 && tier.demotions == 0,
+  require(fixture.cache.reclaimCache(100, false, false) == 100 && tier.demotions == 0,
           "the state's RAM did not satisfy the first target");
   require(fixture.cache.pollTransfers(), "state write was not consumed");
-  require(fixture.cache.reclaimCache(100, false) == 0 && tier.demotions == 1 &&
+  require(fixture.cache.reclaimCache(100, false, false) == 0 && tier.demotions == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 4,
           "reclaim wrote more than the target while a page was on its way back");
 }
@@ -2554,6 +2554,379 @@ void testLargeSharedDiskRestore() {
               stats.kvTier.pendingPages == 0,
           "large shared restore retained a request, state pin, or transfer");
 }
+// Three prompts of three blocks on four-page extents: the first on pages 0
+// to 2, the second on pages 3 to 5 and the third on pages 6 to 8, so the
+// second and third lie across two extents each. Every page holds a value of
+// its own. The first prompt's blocks are plain leaves; the others end in a
+// state.
+struct ExtentFixture {
+  test::TestKvStorage storage;
+  KvPool pool{storage, storage.pageCount()};
+  engine::Cache cache;
+  std::array<std::vector<uint32_t>, 3> prompts;
+  // Each prompt's last block.
+  std::array<uint64_t, 3> lastBlocks{};
+
+  explicit ExtentFixture(uint32_t pages = 16, KvTier *tier = nullptr)
+      : storage(pages, 100, 4), cache(pool, cacheNamespace(), tier) {
+    for (uint32_t prompt = 0; prompt < 3; ++prompt) {
+      for (uint32_t token = 0; token <= 3 * KvCache::pageTokens; ++token)
+        prompts[prompt].push_back(1000 * (prompt + 1) + token);
+      const uint64_t request = prompt + 1;
+      cache.beginRequest(request);
+      require(admitTokens(cache, request, 96).granted(),
+              "extent fixture KV pages were not acquired");
+      const PageTableView table = cache.pageTable(request);
+      for (uint32_t block = 0; block < 3; ++block) {
+        require(table.pages[block] == 3 * prompt + block,
+                "extent fixture pages are not laid out in order");
+        storage.content[table.pages[block]] = content(prompt, block);
+      }
+      lastBlocks[prompt] = cache.publishCommittedBlocks(request, prompts[prompt], 96);
+      if (prompt)
+        cache.publishCompositeState(lastBlocks[prompt], std::make_shared<TestState>(100));
+      cache.endRequest(request);
+    }
+  }
+
+  static uint64_t content(uint32_t prompt, uint32_t block) {
+    return 10 * (prompt + 1) + block;
+  }
+
+  // Evicts the first prompt's three leaves, the oldest in the cache.
+  void evictFirstPrompt() {
+    for (uint32_t leaf = 0; leaf < 3; ++leaf) {
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+              "the first prompt's leaf was not evicted");
+    }
+    require(cache.snapshot().kvCache.blocks == 6,
+            "eviction did not take exactly the first prompt");
+  }
+};
+
+// A reclaim that releases extents returns free pages before it evicts: an
+// empty extent as it is, then the pages scattered over the others, gathered
+// by moving the only page of the emptiest extent. The request and the block
+// on that page follow it.
+void testCompactionReturnsFreePagesBeforeEvicting() {
+  constexpr auto release = CacheReclaimMode::ReleaseExtents;
+  ExtentFixture fixture;
+  engine::Cache &cache = fixture.cache;
+  auto lookup = cache.lookup(fixture.prompts[1]);
+  cache.beginRequest(4);
+  require(lookup.state && admitRestore(cache, 4, lookup).granted(),
+          "the second prompt was not restored");
+  lookup = {};
+  const uint64_t revision = cache.pageTable(4).revision;
+  // Extent 0 keeps the second prompt's first page, extent 1 is full, extent
+  // 2 keeps the third prompt's last page, extent 3 is empty.
+  fixture.evictFirstPrompt();
+
+  CacheReclaimResult step = cache.reclaimOne(release);
+  require(step.madeProgress && step.reclaimedBytes == 400 &&
+              fixture.storage.copies.empty(),
+          "the empty extent was not released as it is");
+  step = cache.reclaimOne(release);
+  require(step.madeProgress && step.reclaimedBytes == 400 &&
+              fixture.storage.copies.size() == 1 &&
+              fixture.storage.copies[0].from == 3 && fixture.storage.copies[0].to == 9 &&
+              cache.snapshot().kvCache.blocks == 6 &&
+              cache.snapshot().stateCache.entries == 2 &&
+              cache.snapshot().pool.pagesAllocated == 8 &&
+              cache.snapshot().pool.extentCompactions == 1,
+          "scattered free pages were not returned before an eviction");
+  const PageTableView table = cache.pageTable(4);
+  require(table.revision == revision + 1 && table.firstChanged == 0 &&
+              table.pages[0] == 9 && table.pages[1] == 4 && table.pages[2] == 5 &&
+              fixture.storage.content[9] == ExtentFixture::content(1, 0),
+          "the request did not follow its moved page at a new table revision");
+  cache.endRequest(4);
+  lookup = cache.lookup(fixture.prompts[1]);
+  cache.beginRequest(5);
+  require(lookup.state && admitRestore(cache, 5, lookup).granted() &&
+              cache.pageTable(5).pages[0] == 9,
+          "the cached block did not follow its moved page");
+  lookup = {};
+
+  // The free pages left cover no extent: the next step evicts.
+  step = cache.reclaimOne(release);
+  require(step.madeProgress && step.reclaimedBytes == 100 &&
+              cache.snapshot().stateCache.entries == 1 &&
+              fixture.storage.copies.size() == 1,
+          "a step with nothing to gather did not evict");
+  cache.endRequest(5);
+}
+
+// The extent a step empties stays as the runway a pass keeps when it is the
+// only empty one; the step made progress and returned nothing.
+void testCompactionLeavesTheRunway() {
+  ExtentFixture fixture(12);
+  engine::Cache &cache = fixture.cache;
+  fixture.evictFirstPrompt();
+  const CacheReclaimResult step =
+      cache.reclaimOne(CacheReclaimMode::ReleaseExtents, false, true);
+  const KvPoolSnapshot pool = cache.snapshot().pool;
+  require(step.madeProgress && step.reclaimedBytes == 0 &&
+              fixture.storage.copies.size() == 1 && pool.pagesAllocated == 12 &&
+              pool.reclaimableExtents == 1,
+          "the emptied extent did not stay as the runway");
+  // A pass with a target keeps one empty extent and returns the others.
+  ExtentFixture spare;
+  spare.evictFirstPrompt();
+  require(spare.cache.reclaimCache(400, false, true) == 400 &&
+              spare.storage.copies.size() == 1 &&
+              spare.cache.snapshot().pool.pagesAllocated == 12 &&
+              spare.cache.snapshot().pool.reclaimableExtents == 1 &&
+              spare.cache.snapshot().kvCache.blocks == 6,
+          "a pass did not keep one runway and return the extent it emptied");
+}
+
+// Compaction re-points only the blocks on the pages it moves, and a block
+// moved twice is found, and released, where it went last. The first
+// prompt's state is on disk and its blocks are demoted, so they have no page
+// to move.
+void testCompactionFollowsOnlyTheMovedBlocks() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  constexpr auto release = CacheReclaimMode::ReleaseExtents;
+  test::TestKvTier tier;
+  ExtentFixture fixture(16, &tier);
+  engine::Cache &cache = fixture.cache;
+  KvPool &pool = fixture.pool;
+  test::TestKvStorage &storage = fixture.storage;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const StateWriter write = [&](std::function<void()>) { return writeState(control); };
+  require(cache.publishStateToDisk(fixture.lastBlocks[0], write) && cache.pollTransfers(),
+          "the first prompt's state was not written");
+  // Extent 0 keeps the first prompt's first block and the second prompt's
+  // first block; extent 2 keeps the third prompt's last block alone.
+  demoteLeaves(cache, tier, 2);
+  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
+              cache.reclaimOne(release).madeProgress && storage.copies.size() == 1 &&
+              storage.copies[0].from == 8 && storage.copies[0].to == 1,
+          "the third prompt's leaf did not move into extent 0");
+  // The first prompt's first block goes to disk and the second prompt's
+  // state and two upper blocks go, so extents 0 and 1 hold two pages each.
+  demoteLeaves(cache, tier, 1);
+  for (uint32_t victim = 0; victim < 3; ++victim)
+    require(cache.reclaimOne(reuse).madeProgress, "the second prompt was not evicted");
+  require(cache.reclaimOne(release).madeProgress && storage.copies.size() == 3 &&
+              storage.copies[1].from == 1 && storage.copies[1].to == 4 &&
+              storage.copies[2].from == 3 && storage.copies[2].to == 5 &&
+              cache.snapshot().pool.extentCompactions == 2,
+          "extent 0 was not emptied into extent 1");
+
+  auto lookup = cache.lookup(fixture.prompts[2]);
+  cache.beginRequest(4);
+  require(lookup.state && admitRestore(cache, 4, lookup).granted(),
+          "the third prompt was not restored");
+  const PageTableView table = cache.pageTable(4);
+  require(table.pages[0] == 6 && table.pages[1] == 7 && table.pages[2] == 4,
+          "the third prompt's leaf is not where it moved last");
+  for (uint32_t block = 0; block < 3; ++block) {
+    require(storage.content[table.pages[block]] == ExtentFixture::content(2, block),
+            "a block's page does not hold its content");
+  }
+  lookup = {};
+  cache.endRequest(4);
+  // The demoted blocks still have no page: a lookup reads all three from
+  // disk.
+  lookup = cache.lookup(fixture.prompts[0]);
+  cache.beginRequest(5);
+  require(lookup.state && admitRestore(cache, 5, lookup).granted(),
+          "the first prompt was not restored");
+  for (uint32_t i = 0; i < 3 && cache.kvRestoreStatus(5) == KvRestoreStatus::Pending; ++i) {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(cache.kvRestoreStatus(5) == KvRestoreStatus::None && tier.restores == 3,
+          "a demoted block was given a page");
+  lookup = {};
+  cache.endRequest(5);
+
+  // The oldest leaves go: the second prompt's first block, the third
+  // prompt's state, then its leaf, which frees the page it moved to last.
+  require(cache.reclaimOne(reuse).madeProgress && pool.pageFree(5) &&
+              cache.reclaimOne(reuse).madeProgress,
+          "the second prompt's moved block did not free its page");
+  const uint32_t freePages = pool.freePageCount();
+  require(cache.reclaimOne(reuse).madeProgress && pool.pageFree(4) &&
+              pool.freePageCount() == freePages + 1,
+          "the twice-moved leaf did not free the page it moved to last");
+}
+
+// A pass that evicts everything moves pages only once it has: the pages a
+// request still holds are gathered into one extent, and nothing is copied
+// and then evicted.
+void testEvictAllGathersWhatRequestsHold() {
+  ExtentFixture fixture;
+  engine::Cache &cache = fixture.cache;
+  auto lookup = cache.lookup(fixture.prompts[1]);
+  cache.beginRequest(4);
+  require(lookup.state && admitRestore(cache, 4, lookup).granted(),
+          "the second prompt was not restored");
+  lookup = {};
+  fixture.evictFirstPrompt();
+  // Three extents (1200) and the two states (200); the third prompt's pages
+  // are gone before extent 0's page moves into their place.
+  require(cache.evictAll() == 1400 &&
+              fixture.storage.copies.size() == 1 &&
+              fixture.storage.copies[0].from == 3 &&
+              fixture.storage.copies[0].to / 4 == 1,
+          "an evict-all pass moved a page it then evicted, or left extents");
+  const CacheSnapshot stats = cache.snapshot();
+  const PageTableView table = cache.pageTable(4);
+  require(stats.pool.pagesAllocated == 4 && stats.pool.pagesFree == 1 &&
+              stats.kvCache.blocks == 3 && stats.stateCache.entries == 0 &&
+              table.pages[0] / 4 == 1 && table.pages[1] == 4 && table.pages[2] == 5 &&
+              fixture.storage.content[table.pages[0]] == ExtentFixture::content(1, 0),
+          "an evict-all pass did not gather the request's pages into one extent");
+  cache.endRequest(4);
+}
+
+// A page a restore reads into stays where it is: the extent that holds it is
+// passed over although it has the fewest pages, and the next one moves.
+void testCompactionLeavesAPageBeingRestored() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  constexpr auto release = CacheReclaimMode::ReleaseExtents;
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 16};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto prompt = [](uint32_t first, uint32_t blocks) {
+    std::vector<uint32_t> tokens(blocks * KvCache::pageTokens + 1);
+    for (uint32_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = first + i;
+    return tokens;
+  };
+  // One block whose state and page both go to disk.
+  const std::vector<uint32_t> onDisk = prompt(1000, 1);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 32).granted(), "disk prompt KV failed");
+  uint64_t last = cache.publishCommittedBlocks(1, onDisk, 32);
+  cache.endRequest(1);
+  cache.publishCompositeState(last, std::make_shared<TieredState>(control));
+  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  demoteLeaves(cache, tier, 1);
+  // Three plain blocks on pages 0 to 2.
+  const std::vector<uint32_t> plain = prompt(2000, 3);
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 96).granted(), "plain prompt KV failed");
+  static_cast<void>(cache.publishCommittedBlocks(2, plain, 96));
+  cache.endRequest(2);
+  // The restore takes extent 0's last page and stays in flight.
+  auto lookup = cache.lookup(onDisk);
+  cache.beginRequest(3);
+  require(lookup.state && admitRestore(cache, 3, lookup).granted() &&
+              cache.pageTable(3).pages[0] == 3 && tier.restores == 1 &&
+              cache.kvRestoreStatus(3) == KvRestoreStatus::Pending,
+          "the restore did not start on extent 0's last page");
+  // Three blocks on pages 4 to 6 under a state in RAM.
+  const std::vector<uint32_t> kept = prompt(3000, 3);
+  cache.beginRequest(4);
+  require(admitTokens(cache, 4, 96).granted() && cache.pageTable(4).pages[0] == 4,
+          "kept prompt KV failed");
+  for (uint32_t block = 0; block < 3; ++block)
+    storage.content[4 + block] = 40 + block;
+  last = cache.publishCommittedBlocks(4, kept, 96);
+  cache.publishCompositeState(last, std::make_shared<TestState>(100));
+  cache.endRequest(4);
+  // The plain leaves go: extent 0 keeps only the page being read into.
+  for (uint32_t leaf = 0; leaf < 3; ++leaf)
+    require(cache.reclaimOne(reuse).madeProgress, "plain leaf was not evicted");
+  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
+              cache.reclaimOne(release).reclaimedBytes == 400 && storage.copies.empty(),
+          "the empty extents were not released first");
+
+  const CacheReclaimResult step = cache.reclaimOne(release);
+  require(step.madeProgress && step.reclaimedBytes == 400 && storage.copies.size() == 3 &&
+              storage.copies[0].from == 4 && storage.copies[0].to == 0 &&
+              storage.copies[1].from == 5 && storage.copies[1].to == 1 &&
+              storage.copies[2].from == 6 && storage.copies[2].to == 2 &&
+              cache.pageTable(3).pages[0] == 3,
+          "compaction moved a page a restore reads into");
+  tier.complete();
+  require(cache.pollTransfers() && cache.kvRestoreStatus(3) == KvRestoreStatus::None,
+          "the restore did not land on its page");
+  lookup = {};
+  cache.endRequest(3);
+  lookup = cache.lookup(kept);
+  cache.beginRequest(5);
+  require(lookup.state && admitRestore(cache, 5, lookup).granted(), "kept prompt was lost");
+  const PageTableView table = cache.pageTable(5);
+  require(table.pages[0] == 0 && table.pages[1] == 1 && table.pages[2] == 2 &&
+              storage.content[0] == 40 && storage.content[1] == 41 && storage.content[2] == 42,
+          "the kept prompt's blocks did not follow their pages");
+  lookup = {};
+  cache.endRequest(5);
+}
+
+// So does a page being written to disk: its extent is passed over, and the
+// pages of the chain above it move next to it.
+void testCompactionLeavesAPageBeingDemoted() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  constexpr auto release = CacheReclaimMode::ReleaseExtents;
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 16};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  // One plain block on page 0, then four blocks on pages 1 to 4 whose state
+  // is on disk.
+  std::vector<uint32_t> plain(33);
+  std::vector<uint32_t> chained(129);
+  for (uint32_t i = 0; i < chained.size(); ++i) {
+    if (i < plain.size())
+      plain[i] = 1000 + i;
+    chained[i] = 2000 + i;
+  }
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 32).granted(), "plain block KV failed");
+  static_cast<void>(cache.publishCommittedBlocks(1, plain, 32));
+  cache.endRequest(1);
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 128).granted() && cache.pageTable(2).pages[3] == 4,
+          "chain KV failed");
+  for (uint32_t block = 0; block < 4; ++block)
+    storage.content[1 + block] = 20 + block;
+  const uint64_t last = cache.publishCommittedBlocks(2, chained, 128);
+  cache.endRequest(2);
+  cache.publishCompositeState(last, std::make_shared<TieredState>(control));
+  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  // The plain block goes, then the chain's leaf starts to be written.
+  require(cache.reclaimOne(reuse).madeProgress && cache.reclaimOne(reuse).madeProgress &&
+              tier.demotions == 1 && cache.snapshot().kvCache.blocks == 4,
+          "the chain's leaf did not start its demotion");
+  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
+              cache.reclaimOne(release).reclaimedBytes == 400 && storage.copies.empty(),
+          "the empty extents were not released first");
+
+  const CacheReclaimResult step = cache.reclaimOne(release);
+  require(step.madeProgress && step.reclaimedBytes == 400 && storage.copies.size() == 3 &&
+              storage.copies[0].from == 1 && storage.copies[0].to == 5 &&
+              storage.copies[1].from == 2 && storage.copies[1].to == 6 &&
+              storage.copies[2].from == 3 && storage.copies[2].to == 7,
+          "compaction moved a page being written to disk");
+  tier.complete();
+  require(cache.pollTransfers() && cache.snapshot().pool.pagesFree == 1,
+          "the demotion did not land and free its page");
+  auto lookup = cache.lookup(chained);
+  cache.beginRequest(3);
+  require(lookup.state && admitRestore(cache, 3, lookup).granted(), "chain was lost");
+  const PageTableView table = cache.pageTable(3);
+  require(table.pages[0] == 5 && table.pages[1] == 6 && table.pages[2] == 7 &&
+              table.pages[3] == 4 && storage.content[5] == 20 && storage.content[6] == 21 &&
+              storage.content[7] == 22,
+          "the chain's blocks did not follow their pages");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  lookup = {};
+  cache.endRequest(3);
+}
+
 int main() {
   try {
     testLargeSharedDiskRestore();
@@ -2628,6 +3001,12 @@ int main() {
     testDuplicateProbePromotesStateWithoutLookupAccounting();
     testUnifiedRecencyAndReleasedByteAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
+    testCompactionReturnsFreePagesBeforeEvicting();
+    testCompactionFollowsOnlyTheMovedBlocks();
+    testCompactionLeavesTheRunway();
+    testEvictAllGathersWhatRequestsHold();
+    testCompactionLeavesAPageBeingRestored();
+    testCompactionLeavesAPageBeingDemoted();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

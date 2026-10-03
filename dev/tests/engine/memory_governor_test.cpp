@@ -226,14 +226,20 @@ void testHostRefusalStartsReclaim() {
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   const uint64_t stateCell = 350'224'384;
-  std::optional<uint64_t> available = hostReserve + kGiB + 200 * kMiB;
+  std::optional<uint64_t> available = hostReserve + 64 * kGiB;
   MemoryGovernor governor(backend, 40 * kGiB, hostReserve,
                           [&available] { return available; });
   metal::AllocationFailure failure;
   require(!governor.tryReserve(40 * kGiB, &failure) &&
-              failure == metal::AllocationFailure::EngineBudget &&
-              governor.snapshot().pressure == MemoryPressure::Normal,
+              failure == metal::AllocationFailure::EngineBudget,
           "an engine budget refusal was taken for host pressure");
+  // The host refuses the same probe once it has 1.2 GiB of room, and that
+  // is the cause reported; a probe beyond the limit holds no host pressure.
+  available = hostReserve + kGiB + 200 * kMiB;
+  require(!governor.tryReserve(40 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Normal,
+          "a refusal the host shares was reported as the engine's");
   require(!governor.tryReserve(stateCell, &failure) &&
               failure == metal::AllocationFailure::HostPressure,
           "a request beyond the host headroom was admitted");
@@ -251,6 +257,31 @@ void testHostRefusalStartsReclaim() {
   require(governor.tryReserve(stateCell).has_value() &&
               governor.snapshot().pressure == MemoryPressure::Normal,
           "the waiting request did not fit after the reclaim");
+}
+
+// A refusal the host shares with the engine's limit is the host's: it lifts
+// with the host's pressure, the limit's only once memory is freed. For a
+// request in service the host refuses only under critical pressure.
+void testHostRefusalComesBeforeTheEngineLimit() {
+  metal::statistics = {};
+  metal::statistics.allocatedBytes = 14 * kGiB;
+  metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
+  metal::AllocationFailure failure;
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure,
+          "a refusal the host shares was reported as the engine's");
+  governor.setServing(true);
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::EngineBudget,
+          "the host's margins refused a request in service");
+  governor.setPressure(MemoryPressure::Critical);
+  require(!governor.tryReserve(2 * kGiB, &failure) &&
+              failure == metal::AllocationFailure::HostPressure,
+          "critical pressure was reported as the engine's limit");
 }
 
 // The paced passes up to the next measurement continue what transfers held
@@ -319,53 +350,50 @@ void testExhaustedReclaimWaivesTheHold() {
           "an earlier episode's exhausted reclaim waived the hold");
 }
 
-// A pressure pass may release what a request is served from: one lane's
-// state and the KV runway. Growing back to that footprint needs only the
-// host's reserve, even while growth is held for the recovery margin, or an
-// idle server could start no request until other applications gave memory
-// back. Growth beyond it keeps the margin, and critical pressure refuses both.
-void testServingFootprintNeedsOnlyTheReserve() {
+// Host pressure holds back growth that nothing in flight depends on. What a
+// request in service needs is granted while the host is short, into its
+// reserve too: holding it back would strand the request and the memory it
+// already has. Only the engine's limit and critical pressure refuse it, and
+// without the mark the margins apply as before.
+void testRequestInServiceGrowsThroughHostPressure() {
   metal::statistics = {};
   metal::statistics.allocatedBytes = 14 * kGiB;
   metal::statistics.deviceCurrentAllocatedBytes = 14 * kGiB;
   metal::MetalBackend backend("unused");
   const uint64_t hostReserve = 2 * kGiB;
   std::optional<uint64_t> available = hostReserve + kGiB / 2;
-  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; });
-  governor.markServingFootprint();
-  require(governor.snapshot().servingFootprintBytes == 14 * kGiB,
-          "the snapshot did not report the serving footprint");
-  const auto resize = [](int64_t bytes) {
-    metal::statistics.allocatedBytes += bytes;
-    metal::statistics.deviceCurrentAllocatedBytes += bytes;
-  };
-  const auto grow = [&](uint64_t bytes) {
-    auto reservation = governor.tryReserve(bytes);
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, [&available] { return available; });
+  const auto grow = [&](uint64_t bytes, metal::AllocationFailure *failure = nullptr) {
+    auto reservation = governor.tryReserve(bytes, failure);
     if (!reservation)
       return false;
-    resize(static_cast<int64_t>(bytes));
+    metal::statistics.allocatedBytes += bytes;
+    metal::statistics.deviceCurrentAllocatedBytes += bytes;
     reservation->commit();
     return true;
   };
-  resize(-350 * static_cast<int64_t>(kMiB));
   metal::AllocationFailure failure;
-  require(!governor.tryReserve(400 * kMiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure &&
+  require(!grow(400 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure &&
               !governor.snapshot().hostGrowthAllowed,
-          "growth past the serving footprint cleared no warning margin");
-  require(grow(180 * kMiB) && grow(170 * kMiB),
-          "growth back to the serving footprint waited for the warning margin");
-  require(!governor.tryReserve(kMiB, &failure) &&
-              failure == metal::AllocationFailure::HostPressure,
-          "growth past the serving footprint was admitted without the margin");
-  resize(-350 * static_cast<int64_t>(kMiB));
-  available = hostReserve + 100 * kMiB;
-  require(!grow(180 * kMiB), "the serving footprint was regrown into the host's reserve");
-  available = hostReserve + kGiB / 2;
+          "growth that nothing in service needs cleared no warning margin");
+
+  governor.setServing(true);
+  require(grow(400 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "a request in service waited for the warning margin");
+  available = hostReserve / 2;
+  require(grow(100 * kMiB), "a request in service waited for the host's reserve");
+  require(!grow(kGiB, &failure) && failure == metal::AllocationFailure::EngineBudget,
+          "a request in service grew past the engine's limit");
   governor.setPressure(MemoryPressure::Critical);
-  require(!grow(180 * kMiB), "critical pressure admitted the serving footprint");
+  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "critical pressure admitted a request in service");
   governor.setPressure(MemoryPressure::Normal);
-  require(grow(180 * kMiB), "the serving footprint stayed refused after critical pressure");
+  require(grow(100 * kMiB), "a request in service stayed refused after critical pressure");
+
+  governor.setServing(false);
+  available = hostReserve + kGiB / 2;
+  require(!grow(100 * kMiB, &failure) && failure == metal::AllocationFailure::HostPressure,
+          "the mark of a request in service outlived it");
 }
 
 } // namespace
@@ -375,9 +403,10 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testHostRefusalStartsReclaim();
+    testHostRefusalComesBeforeTheEngineLimit();
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
-    testServingFootprintNeedsOnlyTheReserve();
+    testRequestInServiceGrowsThroughHostPressure();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

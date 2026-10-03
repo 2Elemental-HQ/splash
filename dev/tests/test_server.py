@@ -1154,6 +1154,7 @@ class ServerTest(unittest.TestCase):
                         "allocated_bytes": 8192,
                         "extent_allocate_max_ms": 2.5,
                         "extent_release_max_ms": 0.75,
+                        "extent_compact_max_ms": 1.5,
                     },
                     "state": {
                         "entries": 2,
@@ -1233,6 +1234,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_kv_allocated_bytes 8192", metrics)
         self.assertIn("splash_kv_extent_allocate_max_milliseconds 2.5", metrics)
         self.assertIn("splash_kv_extent_release_max_milliseconds 0.75", metrics)
+        self.assertIn("splash_kv_extent_compact_max_milliseconds 1.5", metrics)
         self.assertFalse([line for line in metrics if "_max_ms " in line])
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)

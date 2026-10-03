@@ -89,7 +89,8 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
   engine.resources.pool = {128, 72, 24, 32, 1, 128 * 4096ULL,
-                           32 * 4096ULL, 5, 3, 2.5, 0.75};
+                           32 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
+  engine.resources.extentCompactMaxMilliseconds = 1.25;
   engine.resources.kvCache = {32, 32 * 4096ULL};
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
@@ -134,13 +135,12 @@ void testCleanRuntimeStatus() {
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
   governor.chargedBytes = metal.allocatedBytes;
-  governor.servingFootprintBytes = 3 * kGiB;
   governor.headroomBytes = governor.limitBytes - governor.chargedBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
 
   model::ModelTelemetry executorTelemetry;
   executorTelemetry.stateAllocatedBytes = 350'224'384;
@@ -222,7 +222,9 @@ void testCleanRuntimeStatus() {
               std::string::npos,
           "status lost the KV pool's page counts");
   require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
-                    "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75}") !=
+                    "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75,"
+                    "\"extent_compactions\":2,\"pages_moved\":9,"
+                    "\"extent_compact_max_ms\":1.25}") !=
               std::string::npos,
           "status lost the KV extent growth and release diagnostics");
   require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
@@ -230,9 +232,9 @@ void testCleanRuntimeStatus() {
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
                   std::string::npos,
           "status omitted the host-side growth constraints");
-  require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
-              std::string::npos,
-          "status omitted the serving footprint");
+  require(json.find("\"serving_footprint_bytes\"") == std::string::npos &&
+              json.find("\"reserved_bytes\"") == std::string::npos,
+          "status reported a governor field nothing reads");
   require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
@@ -337,7 +339,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   // governor's critical verdict marks it not ready.
   governor.hostAvailableBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Warning;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   require(status().find("\"ready\":true") != std::string::npos,
           "reaching the host reserve under warning marked the server not ready");
   governor.hostAvailableBytes = 1 * kGiB;
@@ -346,7 +348,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
           "critical memory pressure was marked ready");
   governor.hostAvailableBytes = 8 * kGiB;
   governor.pressure = MemoryPressure::Normal;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
 }
 
 void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
@@ -440,7 +442,7 @@ void testMemoryPressureTelemetry() {
   governor.hostAvailableBytes = 2 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Critical;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true);
   };

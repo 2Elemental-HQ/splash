@@ -527,14 +527,24 @@ pressure, an admission the budget denies, or startup cleanup. Kernels reach a
 page through the GPU address in its request's page table, so no command binds
 KV; the residency set makes extents resident for every command. The host reaches
 the same memory (`PageStorage::spans`), which is how the disk tier moves pages.
-A reclaim pass releases every extent that is empty or that its evictions empty.
+A reclaim returns free pages before it evicts anything: an empty extent as it
+is, and the free pages scattered over the others as soon as they cover the
+extent that holds the fewest pages, whose pages the pool copies to them
+(`KvPool::compactExtent`). The blocks and requests on those pages follow them,
+a page a disk transfer reads or writes stays where it is, and a pass that
+evicts everything copies only what is left afterwards. Every extent a pass
+empties is released.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
-(`allocated_bytes`, `reclaimable_bytes`), and the extents allocated and
-released and the longest allocation and release of one. The counts and the
-longest allocation include the runway allocated at startup, before serving
-begins; how long a whole pass holds the loop shows in `loop.max_tick_ms`.
+(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
+(`extent_allocations`, `extent_releases`) and those emptied by moving pages
+(`extent_compactions`, `pages_moved`), and the longest allocation, release and
+emptying of one (`extent_allocate_max_ms`, `extent_release_max_ms`,
+`extent_compact_max_ms`); the last includes re-pointing the cached blocks and
+requests on the moved pages. The counts and the longest allocation include the
+runway allocated at startup, before serving begins; how long a whole pass holds
+the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -758,8 +768,16 @@ preserves visible history without recovering the private reasoning.
 
 `/status.admission` distinguishes memory and concurrency waits, reports suspended
 requests, recovery draining and the oldest current wait age. Memory transitions
-also appear in the console. Warning pressure can pause growth while `/ready`
-remains healthy for work that fits existing allocations.
+also appear in the console. When macOS runs short of memory, growth that no
+request in service needs pauses and the cache gives memory back, a paced pass at
+a time, down to one lane's state buffers and one KV extent. A request in service
+keeps growing within `--max-memory`, first into cached pages no request holds.
+A new request waits while another is in service unless it can start from what
+the engine already holds, and with none in service it starts. Critical pressure
+evicts every unpinned cache entry and stops all growth. `/ready` stays healthy
+under warning pressure, and reports 503 while macOS reports critical pressure;
+requests already running continue, and one that needs more memory is suspended
+until the pressure lifts.
 
 PDF input supports base64 documents within a shared 64 MiB source/rendering
 budget and the native 64-image limit (one image per page). Model context and

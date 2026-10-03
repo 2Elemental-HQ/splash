@@ -100,6 +100,12 @@ def prometheus_metrics(status):
             "kv",
             "extent_release_max_ms",
         ),
+        "splash_kv_extent_compactions_total": ("kv", "extent_compactions"),
+        "splash_kv_pages_moved_total": ("kv", "pages_moved"),
+        "splash_kv_extent_compact_max_milliseconds": (
+            "kv",
+            "extent_compact_max_ms",
+        ),
         "splash_state_entries": ("state", "entries"),
         "splash_state_pinned": ("state", "pinned"),
         "splash_state_bytes": ("state", "bytes"),
