@@ -66,7 +66,7 @@ public:
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens,
                       uint32_t draftedTokens, uint32_t acceptedDraftTokens,
-                      double) override {
+                      double, double) override {
     lastBatch_ = {kind, width, inputTokens, outputTokens, draftedTokens,
                   acceptedDraftTokens};
     ++batchSequence_;

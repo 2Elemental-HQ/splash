@@ -930,6 +930,8 @@ Proxy consumers can use these fields; additional fields may be added:
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+| `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
+| `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
 | `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
@@ -1433,13 +1435,17 @@ from the candidate checkout:
 It takes any installed model and, for an upstream one, holds its assembly for
 the whole run, so every round serves the same model. It starts isolated servers
 in ABBA order, compares matched cold, exact-prefix and decode requests by the
-release check's speed rule and prepared bytes, and saves
-`build/release/http-regression.json`. With `--burst N` it sends N requests of
-each context at once instead, 16 output tokens each, and reports each build's
-replay points lost to the burst (`replay_state_publication_failures`), its
-decode rate and advertised context; `--follow-up`, which a burst run needs to
-pass, then sends each conversation's next turn and compares their time to
-first token and how many resumed at their replay point.
+release check's speed rule and prepared bytes (decode by
+`metrics.decode_cycle_ms` per output token, so host work between commands
+counts; against a baseline that does not report it, both versions by
+`metrics.decode_wall_ms` per output token, as each comparison's `metric`
+says), and saves `build/release/http-regression.json`. With `--burst N` it
+sends N requests of each context at once instead, 16 output tokens each, and
+reports each build's replay points lost to the burst
+(`replay_state_publication_failures`), its decode rate and advertised context;
+`--follow-up`, which a burst run needs to pass, then sends each conversation's
+next turn and compares their time to first token and how many resumed at their
+replay point.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.

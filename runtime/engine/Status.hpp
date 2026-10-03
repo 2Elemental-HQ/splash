@@ -65,6 +65,10 @@ struct RuntimeMetricsSnapshot {
   double prefillWallMilliseconds = 0.0;
   uint64_t decodeOutputTokens = 0;
   double decodeWallMilliseconds = 0.0;
+  // The engine's time for its decode commands, each from the previous
+  // command's retirement (or its plan after idleness) to its own: the GPU
+  // command plus the host work around it.
+  double decodeCycleMilliseconds = 0.0;
   uint64_t draftedTokens = 0;
   uint64_t acceptedDraftTokens = 0;
   double draftAcceptanceRate = 0.0;
@@ -86,7 +90,8 @@ public:
               uint32_t count, double nowMilliseconds);
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
-                      uint32_t acceptedDraftTokens, double wallMilliseconds);
+                      uint32_t acceptedDraftTokens, double wallMilliseconds,
+                      double cycleMilliseconds);
   void capacityFailed();
   void metalFailed();
 
@@ -103,6 +108,7 @@ private:
   uint64_t decodeTokens_ = 0;
   double prefillWallMilliseconds_ = 0.0;
   double decodeWallMilliseconds_ = 0.0;
+  double decodeCycleMilliseconds_ = 0.0;
   uint64_t draftedTokens_ = 0;
   uint64_t acceptedDraftTokens_ = 0;
   uint64_t capacityFailures_ = 0;
@@ -140,8 +146,10 @@ inline void RuntimeMetrics::tokens(
 inline void RuntimeMetrics::batchCompleted(
     WorkKind kind, uint32_t width, uint32_t inputTokens,
     uint32_t outputTokens, uint32_t draftedTokens,
-    uint32_t acceptedDraftTokens, double wallMilliseconds) {
+    uint32_t acceptedDraftTokens, double wallMilliseconds,
+    double cycleMilliseconds) {
   if (!width || !std::isfinite(wallMilliseconds) || wallMilliseconds < 0.0 ||
+      !std::isfinite(cycleMilliseconds) || cycleMilliseconds < 0.0 ||
       acceptedDraftTokens > draftedTokens) {
     throw std::invalid_argument("invalid completed batch metrics");
   }
@@ -158,6 +166,7 @@ inline void RuntimeMetrics::batchCompleted(
   } else {
     decodeTokens_ += outputTokens;
     decodeWallMilliseconds_ += wallMilliseconds;
+    decodeCycleMilliseconds_ += cycleMilliseconds;
     draftedTokens_ += draftedTokens;
     acceptedDraftTokens_ += acceptedDraftTokens;
     if (wallMilliseconds > 0.0)
@@ -196,6 +205,7 @@ inline RuntimeMetricsSnapshot RuntimeMetrics::snapshot() const {
   result.prefillWallMilliseconds = prefillWallMilliseconds_;
   result.decodeOutputTokens = decodeTokens_;
   result.decodeWallMilliseconds = decodeWallMilliseconds_;
+  result.decodeCycleMilliseconds = decodeCycleMilliseconds_;
   result.draftedTokens = draftedTokens_;
   result.acceptedDraftTokens = acceptedDraftTokens_;
   if (draftedTokens_) {

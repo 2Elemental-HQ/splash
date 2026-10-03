@@ -191,7 +191,12 @@ public:
             return entry.second.resident && entry.second.lane == lane;
           });
       if (!used) {
-        requests.emplace(request.id, Request{lane, 0, true});
+        requests.emplace(
+            request.id,
+            Request{.lane = lane,
+                    .resident = true,
+                    .constrained =
+                        request.constraint == ConstraintMode::TokenMask});
         prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
         return {lane, StateFailure::None};
       }
@@ -267,13 +272,18 @@ public:
               rows(row / KvCache::pageTokens, item.inputTokens[row - item.logicalPosition]);
         }
       }
-      requests.at(item.requestId).position += item.tokenCount;
+      Request &state = requests.at(item.requestId);
+      state.position += item.tokenCount;
       prefillRows += item.tokenCount;
+      // A constrained prompt's end waits for the first mask; a replay never
+      // asks for it again.
+      const bool awaitsMask = state.constrained && !state.replaying &&
+                              state.position == prompts.at(item.requestId).size();
       ModelStepResult step{item.requestId, item.tokenCount, {}, false,
-                           requests.at(item.requestId).replaying
-                               ? replayDecodeStage : DecodeStage::Regular,
+                           awaitsMask ? DecodeStage::ApplyInitialMask
+                                      : DecodeStage::Regular,
                            0, 0};
-      if (prefillAnchor && !requests.at(item.requestId).replaying) {
+      if (prefillAnchor && !state.replaying) {
         // Prefill selected a stop token or the last budgeted token: emitted
         // now, without a KV row, and the request never decodes.
         step.outputTokens = {42};
@@ -295,15 +305,10 @@ public:
           item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
-      if (plan.constrained &&
-          plan.decodeStage == DecodeStage::RequestInitialMask) {
-        result.push_back({item.requestId,
-                          0,
-                          {},
-                          false,
-                          DecodeStage::ApplyInitialMask,
-                          0,
-                          0});
+      if (plan.decodeStage == DecodeStage::ApplyInitialMask) {
+        // Selects the first token under its mask and drafts nothing.
+        result.push_back({item.requestId, 0, {}, false, DecodeStage::Regular,
+                          0, 0});
       } else {
         const std::vector<uint32_t> tokens =
             item.requestId == poisonRequest && poisonToken
@@ -346,10 +351,10 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
-    // Every constrained cycle after the initial mask request waits for its
-    // mask inside the ticket, as the production constrained ticket does.
+    // Every constrained cycle after the first token waits for its mask
+    // inside the ticket, as the production constrained ticket does.
     if (plan.kind == WorkKind::Decode && plan.constrained &&
-        plan.decodeStage != DecodeStage::RequestInitialMask) {
+        plan.decodeStage == DecodeStage::Regular) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
       overlap->finishes = decodeFinishes;
@@ -464,6 +469,7 @@ public:
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;
+    bool constrained = false;
   };
   std::unordered_map<uint64_t, Request> requests;
   // The page list each request's last item named, at its revision.
@@ -535,7 +541,6 @@ public:
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
-  DecodeStage replayDecodeStage = DecodeStage::Regular;
   uint32_t decodeTokensWithoutKv = 0;
   // When set, the decode step emits poisonToken (instead of 42) for
   // poisonRequest, exercising the engine's output validation.
@@ -561,8 +566,10 @@ private:
 
 class Events final : public EngineEventSink {
 public:
-  void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t, uint32_t,
-                      uint32_t, double) override {}
+  void batchCompleted(WorkKind kind, uint32_t, uint32_t, uint32_t, uint32_t,
+                      uint32_t, double, double cycleMilliseconds) override {
+    cycles.emplace_back(kind, cycleMilliseconds);
+  }
   void started(uint64_t requestId, uint32_t matched, uint32_t) override {
     startIds.push_back(requestId);
     starts.push_back(matched);
@@ -607,6 +614,8 @@ public:
   uint32_t failedCount = 0;
   uint32_t capacityExhaustedCount = 0;
   std::vector<std::pair<uint64_t, std::vector<uint32_t>>> maskRequests;
+  // Each completed command's kind and engine cycle.
+  std::vector<std::pair<WorkKind, double>> cycles;
 };
 
 void require(bool value, const char *message) {
@@ -3992,9 +4001,6 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   engine::Cache resources(pool);
   Executor executor(2);
   executor.decodeFinishes = false;
-  // A replay result may carry a previously prepared consumer stage. It is
-  // metadata, not a request to ask the frontend for that initial mask again.
-  executor.replayDecodeStage = DecodeStage::ApplyInitialMask;
   Events events;
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
@@ -5140,7 +5146,7 @@ void testAdmissionRespectsPriorityBeforeHashOrder() {
 
 void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
                                Events &events, uint64_t requestId) {
-  require(engine.tick(1) && engine.tick(2) && engine.tick(3) && engine.tick(4),
+  require(engine.tick(1) && engine.tick(2),
           "constrained request did not reach its initial mask");
   require(events.maskRequests.size() == 1 &&
               events.maskRequests[0].first == requestId &&
@@ -5148,7 +5154,8 @@ void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
           "initial constrained mask request is malformed");
   const std::array<uint32_t, 1> initialMask{1};
   engine.provideMask(requestId, initialMask);
-  require(engine.tick(5) && engine.tick(6),
+  // Its first token is selected, then its first cycle drafts.
+  require(engine.tick(3) && engine.tick(4) && engine.tick(5) && engine.tick(6),
           "constrained request did not launch overlapped verification");
   require(engine.commandInFlight() && executor.overlap &&
               events.maskRequests.size() == 2 &&
@@ -5181,7 +5188,7 @@ struct SuspendedBesideAMaskWait {
     growing.maxNewTokens = 1000;
     growing.deadlineMilliseconds = 100'000;
     engine.submit(std::move(growing));
-    for (double now = 1; now <= 6; ++now)
+    for (double now = 1; now <= 4; ++now)
       static_cast<void>(engine.tick(now));
     require(events.maskRequests.size() == 1 &&
                 engine.snapshot().scheduler.decoding == 1,
@@ -5570,6 +5577,79 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
           "overlapped verify mask did not complete the owning batch");
 }
 
+// A command's engine cycle runs from the previous command's retirement while
+// the engine stays busy, so it covers the host work between commands, and
+// from the command's plan after a tick that found nothing to do.
+void testDecodeCycleCoversHostWork() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool);
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+
+  EngineRequest greedy = request(1, {1});
+  greedy.maxNewTokens = 2;
+  engine.submit(std::move(greedy));
+  // Each command is planned 5 ms after the previous one retires and
+  // retires 10 ms after its plan.
+  for (double now : {10.0, 20.0, 25.0, 35.0, 40.0, 50.0})
+    require(engine.tick(now), "the greedy request stalled");
+  using Cycles = std::vector<std::pair<WorkKind, double>>;
+  require(events.completedCount == 1 &&
+              events.cycles == Cycles{{WorkKind::Prefill, 10.0},
+                                      {WorkKind::Decode, 15.0},
+                                      {WorkKind::Decode, 15.0}},
+          "back-to-back commands were not timed from retirement to retirement");
+  require(!engine.tick(60.0), "a finished request kept the engine busy");
+
+  engine.submit(constrainedRequest(2));
+  require(engine.tick(100.0) && engine.tick(110.0) &&
+              events.maskRequests.size() == 1 && !engine.tick(130.0),
+          "a lane waiting for its first mask kept the engine busy");
+  const std::array<uint32_t, 1> mask{1};
+  engine.provideMask(2, mask);
+  require(engine.tick(140.0) && engine.tick(150.0) &&
+              events.cycles.back() == std::pair{WorkKind::Decode, 10.0},
+          "a decode planned after an idle tick was not timed from its plan");
+}
+
+// A constrained prompt asks for its first mask when its prefill completes
+// and takes no decode slot until the mask arrives; its first token is then
+// selected by a plan of its own, and drafting starts with the next.
+void testConstrainedPrefillRequestsMaskWithoutDecodeSlot() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+
+  engine.submit(constrainedRequest(1));
+  require(engine.tick(1) && engine.tick(2) &&
+              events.maskRequests.size() == 1 &&
+              events.maskRequests[0].first == 1 &&
+              events.maskRequests[0].second.empty(),
+          "the prefill completion did not ask for the first mask");
+  require(events.cycles == std::vector<std::pair<WorkKind, double>>{
+                               {WorkKind::Prefill, 1.0}},
+          "the first mask cost a command");
+  for (double now = 3; now < 10; ++now)
+    require(!engine.tick(now) && !engine.commandInFlight(),
+            "a decode plan ran before the first mask arrived");
+  const std::array<uint32_t, 1> mask{1};
+  engine.provideMask(1, mask);
+  require(engine.tick(10) && engine.tick(11) && events.emitted == 0 &&
+              events.cycles.back().first == WorkKind::Decode &&
+              !executor.overlap,
+          "the first token's selection drafted or emitted a token");
+  require(engine.tick(12) && executor.overlap && engine.commandInFlight(),
+          "the first draft did not follow the selection");
+}
+
 void testConstraintMaskWaitHonorsCancelAndDeadline() {
   {
     test::TestKvStorage storage(8, 4096, 4);
@@ -5663,22 +5743,22 @@ void testUnansweredInitialMaskFails() {
     engine::Engine engine({}, resources, executor, events);
     guardReleases(storage, engine);
     engine.submit(constrainedRequest(205, 100'000.0));
-    require(engine.tick(1) && engine.tick(2) && engine.tick(3) &&
-                engine.tick(4) && events.maskRequests.size() == 1,
+    require(engine.tick(1) && engine.tick(2) &&
+                events.maskRequests.size() == 1,
             "constrained request did not reach its initial mask");
-    require(engine.nextWakeupMilliseconds() == 5004.0,
+    require(engine.nextWakeupMilliseconds() == 5002.0,
             "the initial mask wait did not schedule its limit");
     if (answered) {
       const std::array<uint32_t, 1> initialMask{1};
       engine.provideMask(205, initialMask);
       require(engine.nextWakeupMilliseconds() == 100'000.0 &&
-                  engine.tick(5004.0) && events.failedCount == 0,
+                  engine.tick(5002.0) && events.failedCount == 0,
               "an answered initial mask kept its limit");
       continue;
     }
-    static_cast<void>(engine.tick(5003.0));
+    static_cast<void>(engine.tick(5001.0));
     require(events.failedCount == 0, "an initial mask wait ended early");
-    require(engine.tick(5004.0) &&
+    require(engine.tick(5002.0) &&
                 events.failures == std::vector<std::string>{"mask_timeout"} &&
                 events.failureDetails.front().second &&
                 executor.requests.empty() && idle(engine),
@@ -5719,7 +5799,7 @@ void testExpiredMaskWaitFinalizesWhileAnotherCommandRuns() {
   guardReleases(storage, engine);
 
   engine.submit(constrainedRequest(300, 100.0));
-  require(engine.tick(1) && engine.tick(2) && engine.tick(3) && engine.tick(4),
+  require(engine.tick(1) && engine.tick(2),
           "constrained request did not reach its initial mask wait");
   require(events.maskRequests.size() == 1, "initial mask was not requested");
 
@@ -8979,6 +9059,8 @@ int main() {
     testConstraintMaskWaitHonorsCancelAndDeadline();
     testUnansweredVerifyMaskFailsOnlyItsRequest();
     testUnansweredInitialMaskFails();
+    testDecodeCycleCoversHostWork();
+    testConstrainedPrefillRequestsMaskWithoutDecodeSlot();
     testDecodeNearContextCeilingCoversVerifyRows();
     testExpiredMaskWaitFinalizesWhileAnotherCommandRuns();
     testOrdinaryInFlightDeadlineDrainsWithoutPublishingOrOutput();

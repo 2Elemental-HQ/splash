@@ -73,6 +73,11 @@ struct DFlashDraftLayout final {
             attentionSize / attentionHeadDimension, kvHeads,
             attentionHeadDimension};
   }
+  // The key and value columns of the fused QKV projection, all the context
+  // writers read.
+  [[nodiscard]] constexpr uint32_t contextKvSize() const noexcept {
+    return qkvSize - attentionSize;
+  }
 
   bool operator==(const DFlashDraftLayout &) const = default;
 };
@@ -107,7 +112,7 @@ struct DFlashContextBuffers final {
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer qkv;
+  metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer retainedCounts;
@@ -129,7 +134,7 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer projectionSums;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer qkv;
+  metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
 };
@@ -228,6 +233,9 @@ private:
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::Sampling selector_;
+  // Each layer's key and value rows of its QKV projection, views of its
+  // planes, which the context writers project with.
+  std::vector<ops::Projection> contextKvProjections_;
 };
 
 } // namespace splash::model

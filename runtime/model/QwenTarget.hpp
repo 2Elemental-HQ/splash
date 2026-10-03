@@ -293,9 +293,12 @@ public:
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
       ops::LinearDispatchStats &stats) const;
-  void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
-               metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-               uint32_t normalizedRows, ops::LinearScratch scratch) const;
+  // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
+  // as verify ends: one sweep of the vocabulary projection for every lane.
+  void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
+                    metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+                    uint32_t lanes, ops::LinearScratch scratch,
+                    ops::LinearDispatchStats &stats) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,

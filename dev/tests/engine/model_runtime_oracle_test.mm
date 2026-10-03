@@ -2,6 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
+#include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
@@ -29,6 +30,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using metal::BackendInstrumentation;
 using splash::model::IdleMemory;
 
 namespace {
@@ -323,12 +325,11 @@ finishMaskedDecode(PendingMaskedDecode pending) {
 PendingMaskedDecode
 beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      uint64_t logicalPosition,
-                     const std::vector<uint32_t> &pageTable,
-                     DecodeStage decodeStage) {
+                     const std::vector<uint32_t> &pageTable) {
   BatchPlan plan{.kind = WorkKind::Decode,
                  .constrained = true,
                  .items = {{requestId, 0}},
-                 .decodeStage = decodeStage};
+                 .decodeStage = DecodeStage::Regular};
   const std::array items{withRevision({requestId, logicalPosition, 0, pageTable})};
   return beginMaskedDecode(executor, plan, items);
 }
@@ -458,7 +459,8 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                                  const model::ModelPackage &model,
                                  AllocationFault &fault) {
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
-  const uint64_t originalSubmissions = backend.submissionCount();
+  const uint64_t originalSubmissions =
+      BackendInstrumentation::submittedCommands(backend);
   EngineRequest image = makeRequest(93, {1, 2}, 1);
   image.images = {{0, 1, 2, 2, 139, 431}};
   image.imagePixels.resize(image.images.front().pixelBytes());
@@ -584,7 +586,8 @@ void requireAtomicImageAdmission(model::Runtime &executor,
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "image admission test leaked resources");
   }
-  require(backend.submissionCount() == originalSubmissions,
+  require(BackendInstrumentation::submittedCommands(backend) ==
+              originalSubmissions,
           "image allocation regression unexpectedly submitted GPU work");
   std::cout << "image_admission_atomic_rollback=PASS\n";
 }
@@ -873,25 +876,15 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   beginCold(executor, constrained, 0);
   prefillChunk(executor, 204, 0, std::span(prompt80).first(64), pagesC);
   poisonRecurrentState(backend, states, 0);
-  prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64), pagesC);
-  require(decodeOne(executor, 204, 80, pagesC, true,
-                    DecodeStage::RequestInitialMask)
+  require(prefillChunk(executor, 204, 64, std::span(prompt80).subspan(64),
+                       pagesC)
                   .nextDecodeStage == DecodeStage::ApplyInitialMask,
-          "the non-finite constrained fixture did not request its mask");
+          "the non-finite constrained fixture did not ask for its first mask");
   provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
-  // A failed first selection leaves no anchor to verify, so its decode is
-  // complete at once; one that selected a token would wait for its next mask.
-  const BatchPlan apply{.kind = WorkKind::Decode,
-                        .constrained = true,
-                        .items = {{204, 0}},
-                        .decodeStage = DecodeStage::ApplyInitialMask};
-  const std::array applied{
-      withRevision({.requestId = 204, .logicalPosition = 80, .pageTable = pagesC})};
-  const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(apply, applied, {});
-  const std::vector<ModelStepResult> selected =
-      ticket->ready() ? ticket->wait() : std::vector<ModelStepResult>{};
-  require(selected.size() == 1 && !selected[0].failure.empty() &&
-              selected[0].outputTokens.empty(),
+  const ModelStepResult selected =
+      decodeOne(executor, 204, 80, pagesC, true,
+                DecodeStage::ApplyInitialMask);
+  require(!selected.failure.empty() && selected.outputTokens.empty(),
           "a constrained selection from a non-finite hidden did not fail its lane");
   executor.end(204);
   clearPages(pages, pagesC);
@@ -1553,7 +1546,8 @@ int main(int argc, char **argv) {
     pages.releaseExtent(0);
     {
       const uint64_t beforeWarmupRows = executor.telemetry().targetPrefillRows;
-      const uint64_t beforeCommands = backend.submissionCount();
+      const uint64_t beforeCommands =
+          BackendInstrumentation::submittedCommands(backend);
       bool rejected = false;
       try {
         static_cast<void>(executor.warmupPrefill(1));
@@ -1562,7 +1556,8 @@ int main(int argc, char **argv) {
       }
       require(rejected && !states.metadata(0).assigned() &&
                   executor.telemetry().targetPrefillRows == beforeWarmupRows &&
-                  backend.submissionCount() == beforeCommands,
+                  BackendInstrumentation::submittedCommands(backend) ==
+                      beforeCommands,
               "real warmup ran without its KV runway or executed/leaked work");
     }
     require(static_cast<bool>(pages.allocateExtent(0)),
@@ -1627,9 +1622,11 @@ int main(int argc, char **argv) {
     require(promptSnapshot->bytes() <= predictedPromptSnapshotBytes,
             "prompt snapshot exceeded preflight prediction");
 
-    const uint64_t beforeFirstDecode = backend.submissionCount();
+    const uint64_t beforeFirstDecode =
+        BackendInstrumentation::submittedCommands(backend);
     ModelStepResult decoded = decodeOne(executor, 1, 128, pageTable);
-    require(backend.submissionCount() == beforeFirstDecode + 1,
+    require(BackendInstrumentation::submittedCommands(backend) ==
+                beforeFirstDecode + 1,
             "speculative verify and commit were not one Metal command");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
     require(states.metadata(0).lengths.targetTokens ==
@@ -1650,6 +1647,29 @@ int main(int argc, char **argv) {
     std::cout << "prefill_wall_seconds=" << telemetry.lastPrefillWallSeconds
               << " decode_cycle_wall_seconds="
               << telemetry.lastDecodeWallSeconds << '\n';
+
+    // The runtime builds every policy kernel when it is constructed: after
+    // a greedy first token and verify, a sampled, penalized request's
+    // compile nothing more.
+    {
+      const size_t pipelines = BackendInstrumentation::cachedPipelines(backend);
+      EngineRequest sampled = makeRequest(2, prompt128, 16);
+      sampled.sampling = {
+          .temperature = 1.0F, .topP = 0.95F, .topK = 0, .seed = 4242};
+      sampled.sampling.minP = 0.05F;
+      sampled.sampling.repetitionPenalty = 1.1F;
+      sampled.sampling.presencePenalty = 0.5F;
+      sampled.sampling.frequencyPenalty = 0.5F;
+      beginCold(executor, sampled, 1);
+      const std::vector<uint32_t> sampledPages = pageRange(8, 8);
+      static_cast<void>(firstStep(
+          executor, prefillChunk(executor, 2, 0, prompt128, sampledPages), 2,
+          128, sampledPages));
+      require(BackendInstrumentation::cachedPipelines(backend) == pipelines,
+              "a sampled, penalized request compiled a pipeline the runtime "
+              "had not built at construction");
+      executor.end(2);
+    }
 
     executor.end(1);
     EngineRequest reusedId = makeRequest(1, {1}, 1);
@@ -1818,12 +1838,9 @@ int main(int argc, char **argv) {
     EngineRequest constrainedShort = makeRequest(56, prompt8, 1);
     constrainedShort.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrainedShort, 0);
-    prefillChunk(executor, 56, 0, prompt8, constrainedPages);
-    ModelStepResult microInitialMask =
-        decodeOne(executor, 56, prompt8.size(), constrainedPages, true,
-                  DecodeStage::RequestInitialMask);
-    require(microInitialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
-            "constrained short prefill did not preserve mask handshake");
+    require(prefillChunk(executor, 56, 0, prompt8, constrainedPages)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
+            "constrained short prefill did not ask for its first mask");
     const std::array<uint32_t, 1> forcedMicroToken{106};
     provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
@@ -1876,18 +1893,17 @@ int main(int argc, char **argv) {
       beginCold(executor, replayRequest, 1);
       restoreActivePrefix(executor, replayId, prompt129.size(), 128,
                           promptSnapshot);
-      prefillChunk(executor, replayId, 128,
-                   std::span<const uint32_t>(prompt129).subspan(128, 1),
-                   replayPages);
-      const auto initial = decodeOne(executor, replayId, 129, replayPages, true,
-                                     DecodeStage::RequestInitialMask);
-      require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+      require(prefillChunk(executor, replayId, 128,
+                           std::span<const uint32_t>(prompt129).subspan(128, 1),
+                           replayPages)
+                      .nextDecodeStage == DecodeStage::ApplyInitialMask,
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(firstAnchor));
-      auto pending = beginMaskedDecodeOne(executor, replayId, 129,
-                                          replayPages,
-                                          DecodeStage::ApplyInitialMask);
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+                                  DecodeStage::ApplyInitialMask));
+      auto pending =
+          beginMaskedDecodeOne(executor, replayId, 129, replayPages);
       require(pending.maskRequests.size() == 1 &&
                   pending.maskRequests[0].simulationTokens.size() == 8,
               "replay proposals were not exposed");
@@ -2022,13 +2038,10 @@ int main(int argc, char **argv) {
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
     restoreActivePrefix(executor, 40, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 40, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult initialMask =
-        decodeOne(executor, 40, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(initialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 40, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "initial constrained anchor did not request empty simulation");
     const uint32_t anchorA = 100;
     std::array<uint32_t, 1> initialTokens{anchorA};
@@ -2036,9 +2049,18 @@ int main(int argc, char **argv) {
     require(initialWords.size() == kMaskWords,
             "empty simulation did not produce exactly one mask row");
     provideMask(executor, 40, initialWords);
+    // The first token's selection drafts nothing and, with budget left,
+    // emits nothing: the first cycle emits it.
+    const ModelStepResult anchorSelection =
+        decodeOne(executor, 40, 129, pageTable, true,
+                  DecodeStage::ApplyInitialMask);
+    require(anchorSelection.outputTokens.empty() &&
+                anchorSelection.draftedTokens == 0 &&
+                anchorSelection.nextDecodeStage == DecodeStage::Regular,
+            "the first token's selection drafted or emitted a token");
 
-    PendingMaskedDecode verify = beginMaskedDecodeOne(
-        executor, 40, 129, pageTable, DecodeStage::ApplyInitialMask);
+    PendingMaskedDecode verify =
+        beginMaskedDecodeOne(executor, 40, 129, pageTable);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
                 verify.maskRequests[0].simulationTokens.size() == 8 &&
@@ -2075,19 +2097,18 @@ int main(int argc, char **argv) {
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
     restoreActivePrefix(executor, 44, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 44, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult perfectInitial =
-        decodeOne(executor, 44, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(perfectInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 44, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "perfect constrained accounting skipped its initial mask");
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
     provideMask(executor, 44, singletonMasks(perfectInitialTokens));
-    PendingMaskedDecode perfectPending = beginMaskedDecodeOne(
-        executor, 44, 129, pageTable, DecodeStage::ApplyInitialMask);
+    static_cast<void>(decodeOne(executor, 44, 129, pageTable, true,
+                                DecodeStage::ApplyInitialMask));
+    PendingMaskedDecode perfectPending =
+        beginMaskedDecodeOne(executor, 44, 129, pageTable);
     require(perfectPending.maskRequests.size() == 1 &&
                 perfectPending.maskRequests[0].simulationTokens.size() == 8,
             "perfect constraint did not overlap its mask request");
@@ -2121,13 +2142,10 @@ int main(int argc, char **argv) {
     alternateConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, alternateConstraint, 0);
     restoreActivePrefix(executor, 41, prompt129.size(), 128, promptSnapshot);
-    prefillChunk(executor, 41, 128,
-                 std::span<const uint32_t>(prompt129).subspan(128, 1),
-                 pageTable);
-    ModelStepResult alternateInitial =
-        decodeOne(executor, 41, 129, pageTable, true,
-                  DecodeStage::RequestInitialMask);
-    require(alternateInitial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+    require(prefillChunk(executor, 41, 128,
+                         std::span<const uint32_t>(prompt129).subspan(128, 1),
+                         pageTable)
+                    .nextDecodeStage == DecodeStage::ApplyInitialMask,
             "second exact constrained hit skipped initial mask");
     const uint32_t anchorC = 105;
     std::array<uint32_t, 1> alternateTokens{anchorC};
@@ -2145,9 +2163,9 @@ int main(int argc, char **argv) {
 
     // A B2 constrained cycle keeps both lanes reserved while host grammar
     // work overlaps the target forward. No proposal/logit state is copied to
-    // a different arena lane between draft and commit. Each lane applies its
-    // initial mask in a plan of its own, as the scheduler issues them; the
-    // B2 cycle continues both.
+    // a different arena lane between draft and commit. One B2 plan selects
+    // both lanes' first tokens under their masks; each lane's first cycle
+    // runs alone and the B2 cycle continues both.
     EngineRequest crossLane0 = makeRequest(42, prompt129, 3);
     crossLane0.constraint = ConstraintMode::TokenMask;
     crossLane0.sampling = {
@@ -2176,42 +2194,35 @@ int main(int argc, char **argv) {
     auto crossReplay = executor.prefill(crossReplayPlan, crossReplayItems);
     require(crossReplay.size() == 2 &&
                 crossReplay[0].consumedPromptTokens == 1 &&
-                crossReplay[1].consumedPromptTokens == 1,
+                crossReplay[1].consumedPromptTokens == 1 &&
+                crossReplay[0].nextDecodeStage ==
+                    DecodeStage::ApplyInitialMask &&
+                crossReplay[1].nextDecodeStage ==
+                    DecodeStage::ApplyInitialMask,
             "B2 recurrent restore did not replay one complete token");
-    BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
-                               .constrained = true,
-                               .items = {{42, 0}, {43, 0}},
-                               .decodeStage = DecodeStage::RequestInitialMask};
-    std::vector<ModelBatchItem> crossItems{
-        withRevision({.requestId = 42, .logicalPosition = 129, .pageTable = crossPages0}),
-        withRevision({.requestId = 43, .logicalPosition = 129, .pageTable = crossPages1})};
-    auto crossInitial = executor.decode(crossInitialPlan, crossItems);
-    require(
-        crossInitial.size() == 2 &&
-            crossInitial[0].nextDecodeStage == DecodeStage::ApplyInitialMask &&
-            crossInitial[1].nextDecodeStage == DecodeStage::ApplyInitialMask,
-        "B2 constrained initial masks are not empty simulations");
     const std::array<uint32_t, 2> crossAnchors{110, 111};
     provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
     provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
-    // Applying an initial mask can end a request or start drafting it, so a
-    // plan applies one: a wider one is refused before any lane changes.
-    crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
-    bool widePlanRejected = false;
-    try {
-      static_cast<void>(executor.decode(crossInitialPlan, crossItems));
-    } catch (const std::invalid_argument &) {
-      widePlanRejected = true;
-    }
-    require(widePlanRejected, "a B2 plan applied two initial masks");
-    // Each lane's initial cycle keeps its anchor; the masked successor that
+    const BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
+                                     .constrained = true,
+                                     .items = {{42, 0}, {43, 0}},
+                                     .decodeStage = DecodeStage::ApplyInitialMask};
+    const std::vector<ModelBatchItem> crossItems{
+        withRevision({.requestId = 42, .logicalPosition = 129, .pageTable = crossPages0}),
+        withRevision({.requestId = 43, .logicalPosition = 129, .pageTable = crossPages1})};
+    const auto crossInitial = executor.decode(crossInitialPlan, crossItems);
+    require(crossInitial.size() == 2 && crossInitial[0].outputTokens.empty() &&
+                crossInitial[1].outputTokens.empty() &&
+                crossInitial[0].nextDecodeStage == DecodeStage::Regular &&
+                crossInitial[1].nextDecodeStage == DecodeStage::Regular,
+            "a B2 plan did not select both lanes' first tokens");
+    // Each lane's first cycle keeps its anchor; the masked successor that
     // rejects the second proposal becomes its next anchor.
     std::array<uint32_t, 2> crossNext{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const uint64_t id = 42 + lane;
       PendingMaskedDecode initial = beginMaskedDecodeOne(
-          executor, id, 129, lane ? crossPages1 : crossPages0,
-          DecodeStage::ApplyInitialMask);
+          executor, id, 129, lane ? crossPages1 : crossPages0);
       require(initial.maskRequests.size() == 1 &&
                   initial.maskRequests[0].simulationTokens.front() ==
                       crossAnchors[lane],
@@ -2427,11 +2438,13 @@ int main(int argc, char **argv) {
                                                .pageTable = raggedPages[lane]});
       raggedPrefillItems[lane].inputTokens = raggedPrompts[lane];
     }
-    const uint64_t beforeRaggedPrefill = backend.submissionCount();
+    const uint64_t beforeRaggedPrefill =
+        BackendInstrumentation::submittedCommands(backend);
     auto raggedPrefill =
         executor.prefill(raggedPrefillPlan, raggedPrefillItems);
     require(raggedPrefill.size() == raggedIds.size() &&
-                backend.submissionCount() == beforeRaggedPrefill + 1,
+                BackendInstrumentation::submittedCommands(backend) ==
+                    beforeRaggedPrefill + 1,
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
@@ -2512,6 +2525,98 @@ int main(int argc, char **argv) {
                       raggedDecoded[lane].acceptedDraftTokens,
               "ragged M32 lane changed after order/state-lane permutation");
       executor.end(104 + lane);
+    }
+
+    // Lanes that finish their prompts in one packed prefill share one LM
+    // head and one selection. Each finishing lane must select what it
+    // selects finishing alone and a score lane must read the same logits,
+    // and a lane whose prompt the command does not finish must end it as it
+    // does alone.
+    {
+      constexpr uint32_t kScoredRow = 0, kGreedy = 1, kOpen = 2, kSampled = 3;
+      constexpr std::array<uint32_t, 4> rows{33, 40, 64, 72};
+      constexpr uint32_t openPromptTokens = 200;
+      const auto prompt = [&](uint32_t lane) {
+        std::vector<uint32_t> tokens(lane == kOpen ? openPromptTokens
+                                                   : rows[lane]);
+        for (uint32_t row = 0; row < tokens.size(); ++row)
+          tokens[row] =
+              productionSeedTokens[(row + 3 * lane) % productionSeedTokens.size()];
+        return tokens;
+      };
+      const auto requestFor = [&](uint64_t id, uint32_t lane) {
+        EngineRequest value = makeRequest(id, prompt(lane), 1);
+        if (lane == kScoredRow) {
+          value.maxNewTokens = 0;
+          value.scoreTokens = {11, 220, 1683};
+        } else if (lane == kSampled) {
+          value.sampling = {
+              .temperature = 0.8F, .topP = 0.95F, .topK = 20, .seed = 4099};
+        }
+        return value;
+      };
+      const std::array<std::vector<uint32_t>, 4> pages{
+          pageRange(52, 2), pageRange(54, 2), pageRange(56, 7),
+          pageRange(63, 3)};
+      // The open lane's prompt ends in a command of its own.
+      const auto finishOpen = [&](uint64_t id) {
+        const std::vector<uint32_t> tokens = prompt(kOpen);
+        return prefillChunk(executor, id, rows[kOpen],
+                            std::span(tokens).subspan(rows[kOpen]),
+                            pages[kOpen]);
+      };
+      std::array<ModelStepResult, 4> alone;
+      for (uint32_t lane = 0; lane < alone.size(); ++lane) {
+        const EngineRequest request = requestFor(130 + lane, lane);
+        beginCold(executor, request, 0);
+        alone[lane] = prefillChunk(
+            executor, request.id, 0,
+            std::span(request.prompt).first(rows[lane]), pages[lane]);
+        if (lane == kOpen)
+          alone[lane] = finishOpen(request.id);
+        executor.end(request.id);
+      }
+
+      BatchPlan packedPlan{.kind = WorkKind::Prefill,
+                           .decodeStage = DecodeStage::Regular};
+      std::array<EngineRequest, 4> requests;
+      std::array<ModelBatchItem, 4> items;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        requests[lane] = requestFor(140 + lane, lane);
+        beginCold(executor, requests[lane], lane);
+        packedPlan.items.push_back({requests[lane].id, rows[lane]});
+        items[lane] = withRevision({.requestId = requests[lane].id,
+                                    .tokenCount = rows[lane],
+                                    .pageTable = pages[lane]});
+        items[lane].inputTokens =
+            std::span(requests[lane].prompt).first(rows[lane]);
+      }
+      std::vector<ModelStepResult> packed =
+          executor.prefill(packedPlan, items);
+      require(packed.size() == items.size() &&
+                  packed[kOpen].outputTokens.empty() &&
+                  !packed[kOpen].finished &&
+                  states.metadata(kOpen).lengths.targetTokens == rows[kOpen],
+              "a lane that did not finish its prompt took part in the head");
+      packed[kOpen] = finishOpen(requests[kOpen].id);
+      for (const uint32_t lane : {kGreedy, kOpen, kSampled}) {
+        require(packed[lane].outputTokens == alone[lane].outputTokens &&
+                    packed[lane].outputTokens.size() == 1,
+                "a first token selected beside other lanes differs from the "
+                "one selected alone");
+      }
+      require(packed[kScoredRow].scoreLogits.size() == 3 &&
+                  alone[kScoredRow].scoreLogits.size() == 3,
+              "the score lane of a shared head returned no logits");
+      for (uint32_t option = 0; option < 3; ++option) {
+        const float shared = packed[kScoredRow].scoreLogits[option];
+        const float single = alone[kScoredRow].scoreLogits[option];
+        require(std::fabs(shared - single) <=
+                    1e-3F * std::max(1.0F, std::fabs(single)),
+                "a score lane's logits from a shared head differ from its own");
+      }
+      for (const EngineRequest &request : requests)
+        executor.end(request.id);
     }
 
     constexpr std::array<uint64_t, 4> productionB4Ids{71, 72, 73, 74};
@@ -2834,32 +2939,39 @@ int main(int argc, char **argv) {
         }
         return replay.nextDecodeStage;
       };
+      DecodeStage stage = DecodeStage::Regular;
       if (preempt) {
         requireOpen(prefillChunk(executor, sequence.id, 0,
                                  std::span(sequence.prompt).first(32),
                                  pageTable),
                     "unfinished prefill before preemption");
-        static_cast<void>(rebuild(false));
+        stage = rebuild(false);
       } else {
-        requireOpen(prefillChunk(executor, sequence.id, 0,
-                                 sequence.prompt, pageTable),
-                    "preemption prompt");
+        const ModelStepResult promptEnd = prefillChunk(
+            executor, sequence.id, 0, sequence.prompt, pageTable);
+        requireOpen(promptEnd, "preemption prompt");
+        stage = promptEnd.nextDecodeStage;
       }
-      DecodeStage stage = DecodeStage::Regular;
+      require(stage == (constrained ? DecodeStage::ApplyInitialMask
+                                    : DecodeStage::Regular),
+              "the prompt's end misreported its first mask");
+      // Preempted at its prompt's end, a request replays without asking for
+      // its first mask again; a constrained one is given it meanwhile.
+      if (preempt)
+        require(rebuild(false, constrained) == DecodeStage::Regular,
+                "prompt-end preemption asked for the first mask again");
       if (constrained) {
-        stage = decodeOne(executor, sequence.id, sequence.prompt.size(),
-                          pageTable, true,
-                          DecodeStage::RequestInitialMask).nextDecodeStage;
-        require(stage == DecodeStage::ApplyInitialMask,
-                "preemption fixture did not request initial mask");
         if (!preempt) {
           const std::array<uint32_t, 1> anchor{100};
           provideMask(executor, sequence.id, singletonMasks(anchor));
         }
+        const ModelStepResult selected =
+            decodeOne(executor, sequence.id, sequence.prompt.size(), pageTable,
+                      true, DecodeStage::ApplyInitialMask);
+        require(selected.outputTokens.empty(),
+                "the first token's selection emitted a token with budget left");
+        stage = selected.nextDecodeStage;
       }
-      if (preempt)
-        require(rebuild(false, constrained) == stage,
-                "prompt-end preemption changed decode/mask stage");
       PreemptionRun run;
       auto &transcript = run.transcript;
       bool generationPreempted = false;
@@ -2867,7 +2979,7 @@ int main(int argc, char **argv) {
         ModelStepResult result;
         if (constrained) {
           auto pending = beginMaskedDecodeOne(
-              executor, sequence.id, sequence.prompt.size(), pageTable, stage);
+              executor, sequence.id, sequence.prompt.size(), pageTable);
           std::array<uint32_t, 9> forced;
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;

@@ -225,6 +225,10 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'production_metalflags=$(PROD_METALFLAGS)'
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
+# MetalBackend with the test seam metal/BackendInstrumentation.hpp declares.
+# Only tests and benchmarks link it, ahead of the engine library, whose own
+# MetalBackend object the linker then never pulls.
+ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/Embedding.cpp \
@@ -288,8 +292,10 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
-ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(PRODUCTION_AIRS) \
+	$(LIB) $(TARGET)
+ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -334,6 +340,11 @@ $(ENGINE_BUILD)/%.o: runtime/%.mm
 $(ENGINE_METAL_RUNTIME_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(ENGINE_INSTRUMENTED_METAL_OBJECT): runtime/metal/MetalBackend.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_BACKEND_INSTRUMENTATION=1 -c $< -o $@
 
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)

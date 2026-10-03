@@ -10,6 +10,7 @@
 // its experts from DRAM.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
+#include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -210,11 +211,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, *weights, plan);
-    backend.setDispatchProfiling(true);
-    for (uint32_t i = 0; i < rounds; ++i) static_cast<void>(backend.submitCommand(graph.dispatches()));
-    backend.setDispatchProfiling(false);
     std::map<std::string, double> spent;
-    for (const auto &t : backend.takeDispatchProfile()) spent[t.pipelineName] += t.gpuSeconds * 1e3 / rounds;
+    for (uint32_t i = 0; i < rounds; ++i)
+      for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
+        spent[name] += seconds * 1e3 / rounds;
     printf("  %s:", label);
     for (const auto &[name, ms] : spent) printf(" %s %.3f", name.c_str(), ms);
     printf("\n");

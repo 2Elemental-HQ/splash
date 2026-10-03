@@ -1,6 +1,7 @@
 #include "AffineQ4Fixture.hpp"
 #include "tuning/LinearTuning.hpp"
 
+#include "metal/BackendInstrumentation.hpp"
 #include "metal/abi/QuantFormat.h"
 
 #include <array>
@@ -16,6 +17,7 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 using namespace splash::ops::tuning;
+using splash::metal::BackendInstrumentation;
 using splash::test::deterministicQ4Projection;
 using splash::test::mix;
 
@@ -97,7 +99,7 @@ void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
   const LinearWorkload affine{{projection.outputSize, projection.inputSize}, 8};
   LinearWorkload blocks = affine;
   blocks.weightLayout = WeightLayout::Block32;
-  const uint64_t before = backend.submissionCount();
+  const uint64_t before = BackendInstrumentation::submittedCommands(backend);
   const auto admit = [](uint64_t, const std::function<void()> &) -> metal::AllocationResult {
     throw std::logic_error("invalid tuning input reached admission");
   };
@@ -108,14 +110,14 @@ void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
             "a block tuning input was accepted");
     rejects([&] { std::rethrow_exception(result.failure); });
   }
-  require(backend.submissionCount() == before, "a block tuning input submitted GPU work");
+  require(BackendInstrumentation::submittedCommands(backend) == before, "a block tuning input submitted GPU work");
 }
 
 void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
   const auto baseline = Linear(backend.capabilities()).plan(workload).configuration();
-  const uint64_t before = backend.submissionCount();
+  const uint64_t before = BackendInstrumentation::submittedCommands(backend);
   size_t calls = 0;
   auto admit = [&](uint64_t bytes, const std::function<void()> &allocate) {
     ++calls;
@@ -128,7 +130,7 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
     require(!result.complete && result.choice.configuration == baseline &&
         bool(result.failure) == failure && result.measurements.empty(),
         "early exit lost baseline or failure");
-    require(backend.submissionCount() == before, "early exit submitted GPU work");
+    require(BackendInstrumentation::submittedCommands(backend) == before, "early exit submitted GPU work");
   };
   MeasurementOptions options;
   options.warmupPairs = 0;
@@ -194,7 +196,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
       plan.usesSimdgroup() || plans.front().usesSimdgroup();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
-  const uint64_t before = backend.submissionCount();
+  const uint64_t before = BackendInstrumentation::submittedCommands(backend);
   const uint64_t allocated = backend.memoryStats().allocatedBytes;
   size_t admissions = 0;
   MeasurementOptions options;
@@ -214,7 +216,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
       result.repetitions <= 16 && result.repetitions % projections.size() == 0,
       "timed batch does not cover a bounded complete representative ring");
   require(result.measurements.size() + 1 == plans.size(), "candidate measurement missing");
-  require(backend.submissionCount() - before == plans.size() * (projections.size() + 1) +
+  require(BackendInstrumentation::submittedCommands(backend) - before == plans.size() * (projections.size() + 1) +
       (plans.size() - 1) * 2 * (options.warmupPairs + options.samplePairs) + referenceSubmissions,
       "sweep did not time one full production command per invocation");
   require(backend.memoryStats().allocatedBytes == allocated, "fixture allocation leaked");
@@ -262,9 +264,9 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   MeasurementOptions options;
   options.maximumWallSeconds = 30;
   for (bool pressure : {false, true}) {
-    const uint64_t before = backend.submissionCount();
+    const uint64_t before = BackendInstrumentation::submittedCommands(backend);
     const uint64_t stopAt = before + 2 * plans.size() + 2 * options.warmupPairs + 3;
-    const MeasurementStop stop = [&] { return backend.submissionCount() >= stopAt; };
+    const MeasurementStop stop = [&] { return BackendInstrumentation::submittedCommands(backend) >= stopAt; };
     const auto result = tuneLinear(backend, admit, input, options,
         pressure ? stop : MeasurementStop{}, pressure ? MeasurementStop{} : stop);
     require(!result.complete && !result.failure && result.measurements.size() == 1 &&
@@ -272,26 +274,28 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
         result.measurements[0].status == (pressure ? MeasurementStatus::UnderPressure :
             MeasurementStatus::Cancelled) && result.measurements[0].pairCount == 1 &&
         result.measurements[0].measurement.returnedCalls == 3 &&
-        backend.submissionCount() == stopAt, "interruption fabricated pairs or continued submitting");
+        BackendInstrumentation::submittedCommands(backend) == stopAt,
+        "interruption fabricated pairs or continued submitting");
   }
-  const uint64_t before = backend.submissionCount();
+  const uint64_t before = BackendInstrumentation::submittedCommands(backend);
   const uint64_t failAt = before + 2 * plans.size() + 1;
   const auto result = tuneLinear(backend, admit, input, options, [&] {
-    if (backend.submissionCount() >= failAt) throw std::runtime_error("test pressure callback failure");
+    if (BackendInstrumentation::submittedCommands(backend) >= failAt)
+      throw std::runtime_error("test pressure callback failure");
     return false;
   });
-  require(!result.complete && result.failure && backend.submissionCount() == failAt &&
+  require(!result.complete && result.failure && BackendInstrumentation::submittedCommands(backend) == failAt &&
       result.measurements.size() == 1 && result.measurements[0].failure &&
       result.measurements[0].status == MeasurementStatus::RunFailed,
       "run callback failure was lost or retried");
   auto *scales = static_cast<uint16_t *>(projection.affine().scales.contents());
   const uint16_t saved = scales[0];
   scales[0] = 0x7fc1;
-  const uint64_t beforeInvalid = backend.submissionCount();
+  const uint64_t beforeInvalid = BackendInstrumentation::submittedCommands(backend);
   const auto invalid = tuneLinear(backend, admit, input, options);
   scales[0] = saved;
   require(!invalid.complete && invalid.failure && invalid.measurements.empty() &&
-      backend.submissionCount() == beforeInvalid + 1 && backend.healthy(),
+      BackendInstrumentation::submittedCommands(backend) == beforeInvalid + 1 && backend.healthy(),
       "nonfinite baseline was timed or correctness failure retried");
 }
 
@@ -303,14 +307,14 @@ void gpuEveryRepresentative(metal::MetalBackend &backend,
   auto *scales = static_cast<uint16_t *>(second.affine().scales.contents());
   const auto saved = scales[0];
   scales[0] = 0x7fc1;
-  const auto before = backend.submissionCount();
+  const auto before = BackendInstrumentation::submittedCommands(backend);
   const auto result = tuneLinear(backend, [](uint64_t, const auto &allocate) {
     allocate(); return metal::AllocationResult{};
   }, input);
   scales[0] = saved;
   require(!result.complete && result.failure && result.measurements.empty() &&
       result.representativeCount == 2 && result.repetitions == 0 &&
-      backend.submissionCount() - before == plans.size() + 1,
+      BackendInstrumentation::submittedCommands(backend) - before == plans.size() + 1,
       "a later representative was not qualified before sampling");
 }
 

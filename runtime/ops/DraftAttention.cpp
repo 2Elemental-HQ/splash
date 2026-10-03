@@ -55,14 +55,14 @@ uint64_t ringBytes(DraftAttentionShape shape) {
   return uint64_t{shape.kvHeads} * kWindow * shape.headDimension * 2;
 }
 
-// What the context writers read for `rows` rows: the packed QKV rows, the
-// key norm and the rows' RoPE tables (kernels/common/draft_context_kv.h).
-void requireContextInputs(const metal::MetalBuffer &contextQkv,
+// What the context writers read for `rows` rows: the key and value rows,
+// the key norm and the rows' RoPE tables (kernels/common/draft_context_kv.h).
+void requireContextInputs(const metal::MetalBuffer &contextKv,
                           const metal::MetalBuffer &keyNorm,
                           const metal::MetalBuffer &ropeCos,
                           const metal::MetalBuffer &ropeSin, uint64_t rows,
                           DraftAttentionShape shape) {
-  requireBuffer(contextQkv, rows * shape.qkvSize * 2);
+  requireBuffer(contextKv, rows * (shape.qkvSize - shape.attentionSize) * 2);
   requireBuffer(keyNorm, uint64_t{shape.headDimension} * 2);
   const uint64_t ropeBytes = rows * shape.headDimension / 2 * 4;
   requireBuffer(ropeCos, ropeBytes);
@@ -253,7 +253,7 @@ void DraftAttention::addReorder(metal::CommandGraph &graph,
 }
 
 void DraftAttention::addContextPrefill(
-    metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+    metal::CommandGraph &graph, metal::MetalBuffer contextKv,
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
     metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
     metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
@@ -261,18 +261,18 @@ void DraftAttention::addContextPrefill(
   static_cast<void>(kernelShape(shape));
   if (!tokens || cacheStride != kWindow)
     throw std::invalid_argument("invalid draft context prefill geometry");
-  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin, tokens, shape);
+  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, tokens, shape);
   requireBuffer(keys, ringBytes(shape));
   requireBuffer(values, ringBytes(shape));
   const DraftContextParams params{tokens, cacheStride, startPosition};
   graph.add("prefill_draft_context_kv",
-            {std::move(contextQkv), std::move(keyNorm), std::move(ropeCos),
+            {std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
             params, {uint64_t{tokens} * shape.kvHeads, 1, 1});
 }
 
 void DraftAttention::addContextCommit(
-    metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+    metal::CommandGraph &graph, metal::MetalBuffer contextKv,
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
     metal::MetalBuffer ropeSin,
     std::span<const metal::MetalBuffer> persistentKeys,
@@ -287,7 +287,7 @@ void DraftAttention::addContextCommit(
       persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft context commit geometry");
   // Each lane commits up to its eight verify rows.
-  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin,
+  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
                        uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
   requireBuffer(retainedCounts, uint64_t{lanes} * sizeof(uint32_t));
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -298,7 +298,7 @@ void DraftAttention::addContextCommit(
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
   std::vector<metal::MetalBuffer> bindings{
-      std::move(contextQkv), std::move(keyNorm), std::move(ropeCos),
+      std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
       std::move(ropeSin)};
   bindings.reserve(2 * kMaximumLanes + 5);
   appendLaneBindings(bindings, persistentKeys, persistentValues);

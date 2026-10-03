@@ -1161,6 +1161,7 @@ class ServerTest(unittest.TestCase):
                 "prefill_tokens_per_second": 4096.0,
                 "decode_output_tokens": 32,
                 "decode_wall_ms": 64.0,
+                "decode_cycle_ms": 80.0,
                 "decode_tokens_per_second": 500.0,
                 "draft_acceptance_rate": 0.875,
                 "capacity_failures": 1,
@@ -1214,6 +1215,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_prefill_input_tokens_total 2048", metrics)
         self.assertIn("splash_prefill_tokens_per_second 4096.0", metrics)
         self.assertIn("splash_decode_output_tokens_total 32", metrics)
+        self.assertIn("splash_decode_wall_milliseconds_total 64.0", metrics)
+        self.assertIn("splash_decode_cycle_milliseconds_total 80.0", metrics)
         self.assertIn("splash_decode_tokens_per_second 500.0", metrics)
         self.assertIn("splash_capacity_failures_total 1", metrics)
         self.assertIn("splash_metal_failures_total 2", metrics)

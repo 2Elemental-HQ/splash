@@ -341,11 +341,12 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
                                    uint32_t inputTokens, uint32_t outputTokens,
                                    uint32_t draftedTokens,
                                    uint32_t acceptedDraftTokens,
-                                   double wallMilliseconds) {
+                                   double wallMilliseconds,
+                                   double cycleMilliseconds) {
   if (config_.metrics) {
     config_.metrics->batchCompleted(kind, width, inputTokens, outputTokens,
                                     draftedTokens, acceptedDraftTokens,
-                                    wallMilliseconds);
+                                    wallMilliseconds, cycleMilliseconds);
   }
 }
 

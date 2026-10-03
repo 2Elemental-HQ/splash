@@ -97,8 +97,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
-  put(PrefillTensor::ContextQkv,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.qkvSize));
+  put(PrefillTensor::ContextKv,
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+                         geometry.draft.contextKvSize()));
   put(PrefillTensor::DraftRopeCos,
       bytesFor<float>(uint64_t{kPrefillRows} *
                       geometry.draftRotaryPairs()));
@@ -219,8 +220,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
-  put(DecodeTensor::ContextQkv,
-      bytesFor<uint16_t>(r * geometry.draft.qkvSize));
+  put(DecodeTensor::ContextKv,
+      bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
       bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
@@ -343,7 +344,8 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     if (p.rotated) result.rotated = std::max(result.rotated, ops::rotatedBytes(p.inputSize, kLaneCount * kDecodeRows));
   }
   for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+       {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
     include(matrix, ops::WeightLayout::Affine64);

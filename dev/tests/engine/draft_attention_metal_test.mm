@@ -446,7 +446,8 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // rows (at most eight). The buffers hold exactly what the writers read, and
 // the host rejects another ring stride or a buffer below its rows.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
-  constexpr uint32_t kPacked = 6144, kKeyColumn = 4096, kValueColumn = 5120;
+  // A context row holds its keys, then its values.
+  constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
   constexpr uint16_t kUntouched = 0xC2C2;
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   Random random(0xc0de0000ULL + shape.hiddenSize);
@@ -469,10 +470,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
           sine ? std::sin(float(i) * 0.37F) : std::cos(float(i) * 0.37F);
     return buffer;
   };
-  // Compares one lane's rings with `rows` rows of `qkv` and the RoPE tables
+  // Compares one lane's rings with `rows` rows of `kv` and the RoPE tables
   // written from `start` on.
   const auto check = [&](const MetalBuffer &keys, const MetalBuffer &values,
-                         const uint16_t *qkv, const float *cosines,
+                         const uint16_t *kv, const float *cosines,
                          const float *sines, uint32_t rows, uint32_t start) {
     std::vector<uint16_t> wantValues(ringElements, kUntouched);
     std::vector<float> wantKeys(ringElements, NAN);
@@ -480,9 +481,9 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
       const uint32_t slot = (start + row) % kWindow;
       for (uint32_t head = 0; head < kKvHeads; ++head) {
         const uint16_t *key =
-            qkv + uint64_t{row} * kPacked + kKeyColumn + head * kHeadDim;
+            kv + uint64_t{row} * kRowWidth + kKeyColumn + head * kHeadDim;
         const uint16_t *value =
-            qkv + uint64_t{row} * kPacked + kValueColumn + head * kHeadDim;
+            kv + uint64_t{row} * kRowWidth + kValueColumn + head * kHeadDim;
         float square = 0.0F;
         for (uint32_t d = 0; d < kHeadDim; ++d)
           square += tuning::bf16ToFloat(key[d]) * tuning::bf16ToFloat(key[d]);
@@ -522,17 +523,17 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
 
   // Prefill: 37 rows from position 6130 (slot 2034), across the ring's end.
   constexpr uint32_t kTokens = 37, kStart = 6130;
-  const MetalBuffer qkv = randomBfloat(backend, uint64_t{kTokens} * kPacked,
-                                       random, "draft context qkv");
+  const MetalBuffer kv = randomBfloat(backend, uint64_t{kTokens} * kRowWidth,
+                                      random, "draft context kv");
   const MetalBuffer ropeCos = table(kTokens, false),
                     ropeSin = table(kTokens, true);
   const MetalBuffer keys = ring(), values = ring();
   CommandGraph prefill;
-  DraftAttention::addContextPrefill(prefill, qkv, keyNorm, ropeCos, ropeSin,
+  DraftAttention::addContextPrefill(prefill, kv, keyNorm, ropeCos, ropeSin,
                                     keys, values, kTokens, kWindow, kStart,
                                     shape);
   static_cast<void>(backend.submitCommand(prefill.dispatches()));
-  check(keys, values, static_cast<const uint16_t *>(qkv.contents()),
+  check(keys, values, static_cast<const uint16_t *>(kv.contents()),
         static_cast<const float *>(ropeCos.contents()),
         static_cast<const float *>(ropeSin.contents()), kTokens, kStart);
 
@@ -540,9 +541,9 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t kCommitLanes = 3;
   const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 0};
   const uint32_t retained[kCommitLanes] = {8, 3, 12};
-  const MetalBuffer laneQkv =
-      randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kPacked, random,
-                   "draft lane qkv");
+  const MetalBuffer laneKv =
+      randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
+                   "draft lane kv");
   const MetalBuffer laneCos = table(kCommitLanes * kRows, false),
                     laneSin = table(kCommitLanes * kRows, true);
   MetalBuffer retainedCounts = backend.allocateBuffer(
@@ -554,14 +555,14 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     laneValues[lane] = lane < kCommitLanes ? ring() : laneValues[0];
   }
   CommandGraph commit;
-  DraftAttention::addContextCommit(commit, laneQkv, keyNorm, laneCos, laneSin,
+  DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
                                    kWindow, shape, kCommitLanes);
   static_cast<void>(backend.submitCommand(commit.dispatches()));
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
-          static_cast<const uint16_t *>(laneQkv.contents()) +
-              uint64_t{lane} * kRows * kPacked,
+          static_cast<const uint16_t *>(laneKv.contents()) +
+              uint64_t{lane} * kRows * kRowWidth,
           static_cast<const float *>(laneCos.contents()) +
               uint64_t{lane} * kRows * kHeadDim / 2,
           static_cast<const float *>(laneSin.contents()) +
@@ -580,10 +581,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // A ring of another stride: head h's upper slots would land in head h + 1
   // and the last head's past the ring.
   const MetalBuffer halfRing = backend.view(keys, 0, keys.sizeBytes() / 2);
-  rejects([&] { prefillWith(qkv, ropeSin, halfRing, kWindow / 2); });
-  rejects([&] { prefillWith(qkv, ropeSin, shorter(keys), kWindow); });
-  rejects([&] { prefillWith(shorter(qkv), ropeSin, keys, kWindow); });
-  rejects([&] { prefillWith(qkv, shorter(ropeSin), keys, kWindow); });
+  rejects([&] { prefillWith(kv, ropeSin, halfRing, kWindow / 2); });
+  rejects([&] { prefillWith(kv, ropeSin, shorter(keys), kWindow); });
+  rejects([&] { prefillWith(shorter(kv), ropeSin, keys, kWindow); });
+  rejects([&] { prefillWith(kv, shorter(ropeSin), keys, kWindow); });
   // The last lane's values ring.
   const MetalBuffer lastRing = laneValues[kCommitLanes - 1];
   const auto commitWith = [&](const MetalBuffer &q, const MetalBuffer &counts,
@@ -594,10 +595,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
                                      laneKeys, rings, counts, starts, stride,
                                      shape, kCommitLanes);
   };
-  rejects([&] { commitWith(laneQkv, retainedCounts, lastRing, kWindow / 2); });
-  rejects([&] { commitWith(laneQkv, retainedCounts, shorter(lastRing), kWindow); });
-  rejects([&] { commitWith(shorter(laneQkv), retainedCounts, lastRing, kWindow); });
-  rejects([&] { commitWith(laneQkv, shorter(retainedCounts), lastRing, kWindow); });
+  rejects([&] { commitWith(laneKv, retainedCounts, lastRing, kWindow / 2); });
+  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing), kWindow); });
+  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing, kWindow); });
+  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing, kWindow); });
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
 }

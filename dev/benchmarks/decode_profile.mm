@@ -12,6 +12,7 @@
 #include "engine/Types.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
+#include "metal/BackendInstrumentation.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -35,6 +36,7 @@
 
 using namespace splash;
 using namespace splash::engine;
+using metal::BackendInstrumentation;
 
 namespace {
 
@@ -163,7 +165,8 @@ struct CycleTiming final {
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
                         std::span<Lane> lanes) {
-  const uint64_t submissionsBefore = backend.submissionCount();
+  const uint64_t submissionsBefore =
+      BackendInstrumentation::submittedCommands(backend);
   const auto started = std::chrono::steady_clock::now();
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
@@ -187,7 +190,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          backend.submissionCount() - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
 }
 
 } // namespace
@@ -274,11 +277,12 @@ int main(int argc, char **argv) {
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
-      backend.setDispatchProfiling(true);
+      BackendInstrumentation::setDispatchProfiling(backend, true);
       prefill(executor, lanes[0], prompt);
-      backend.setDispatchProfiling(false);
+      BackendInstrumentation::setDispatchProfiling(backend, false);
       Table prefillTable;
-      accumulate(prefillTable, backend.takeDispatchProfile());
+      accumulate(prefillTable,
+                 BackendInstrumentation::takeDispatchProfile(backend));
       print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
             1.0, prefillFused);
 
@@ -295,12 +299,13 @@ int main(int argc, char **argv) {
                     "command(s) per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands));
-        backend.setDispatchProfiling(true);
+        BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
-        backend.setDispatchProfiling(false);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
         Table table;
-        accumulate(table, backend.takeDispatchProfile());
+        accumulate(table,
+                   BackendInstrumentation::takeDispatchProfile(backend));
         print(title, table, cycles, median.gpuSeconds);
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));

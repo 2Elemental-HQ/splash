@@ -395,7 +395,6 @@ void QwenTarget::addVerify(
   VerifyStep step{graph, buffers, kvLayers, q8, verify, lanes, rows, stats,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout, histories)};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
-  const ops::Linear &linear = operators_.linear();
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -409,13 +408,9 @@ void QwenTarget::addVerify(
                                                  geometry_.hiddenSize, geometry_.capturedHiddenSize());
     }
     requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-    const ops::PreparedInput finalHidden = ops::Normalization::addRms(
-        graph, buffers.hidden[geometry_.layers & 1], weights->finalNorm, buffers.finalHidden,
-        geometry_.hiddenSize, rows, buffers.linearScratch,
-        linear.decodePlan(weights->logitsProjection, lanes).input());
-    linear.addDecodeBatch(graph, buffers.finalHidden, weights->logitsProjection, buffers.logits, lanes, stats,
-                          buffers.linearScratch, finalHidden);
   }, weights_);
+  addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, lanes,
+               buffers.linearScratch, stats);
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -494,20 +489,15 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &la
   ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
 }
 
-void QwenTarget::addHead(metal::CommandGraph &graph,
-                         metal::MetalBuffer hidden,
-                         metal::MetalBuffer finalHidden,
-                         metal::MetalBuffer logits,
-                         uint32_t normalizedRows, ops::LinearScratch scratch) const {
-  if (!normalizedRows ||
-      normalizedRows > ExecutionLimits::targetVerifyRows) {
-    throw std::invalid_argument("invalid Qwen head row count");
-  }
-  ops::Normalization::addRms(graph, std::move(hidden), weightsBase_.finalNorm, finalHidden,
-                             geometry_.hiddenSize, normalizedRows);
-  operators_.linear().addDecode(graph,
-                std::move(finalHidden), vocabularyProjection(),
-                std::move(logits), scratch);
+void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
+                              metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
+                              ops::LinearScratch scratch, ops::LinearDispatchStats &stats) const {
+  const ops::Linear &linear = operators_.linear();
+  const ops::PreparedInput normalized = ops::Normalization::addRms(
+      graph, std::move(hidden), weightsBase_.finalNorm, finalHidden, geometry_.hiddenSize,
+      lanes * ExecutionLimits::targetVerifyRows, scratch, linear.decodePlan(vocabularyProjection(), lanes).input());
+  linear.addDecodeBatch(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, stats,
+                        scratch, normalized);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,

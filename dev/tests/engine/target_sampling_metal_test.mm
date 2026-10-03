@@ -415,13 +415,13 @@ void requireSampledRow(const Batch &batch, uint32_t index,
 }
 
 // The first token after a prompt of a sampled lane, drawn from its row with
-// the lane's first uniform.
-void requireInitialDraw(const Batch &batch, const Distribution &target,
-                        const std::string &label) {
-  requireArrivalsReturned(batch, 0, label);
-  requireMaximum(batch.record(0), target, label);
-  requireDraw(batch.outputTokens()[0], target.probabilities,
-              batch.uniforms()[0], target.ambiguousMass, label);
+// the lane's first uniform; a selection writes one per lane.
+void requireInitialDraw(const Batch &batch, uint32_t lane,
+                        const Distribution &target, const std::string &label) {
+  requireArrivalsReturned(batch, lane, label);
+  requireMaximum(batch.record(lane), target, label);
+  requireDraw(batch.outputTokens()[lane], target.probabilities,
+              batch.uniforms()[lane * 2 * kRows], target.ambiguousMass, label);
 }
 
 // The penalty kernel's arithmetic on the host: the logit of a token the
@@ -615,34 +615,40 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
     }
   }
 
-  // The first token after a prompt: one row of lane 0 at an offset, no draft
-  // tokens; every other row and lane keeps its logits.
+  // The first token after each lane's prompt: one row per lane at an
+  // offset, no draft tokens; every other row keeps its logits.
   constexpr uint32_t kOffset = 5;
   std::copy(original.begin(), original.end(), batch.logits());
   batch.poison();
   CommandGraph initial;
-  sampling.addInitial(initial, policies.front(), batch.buffers, kOffset,
-                      kStopTokens[0], kStopTokens[1], {table, rows.first(1)});
+  sampling.addInitial(initial, policies, batch.buffers, kOffset,
+                      kStopTokens[0], kStopTokens[1], {table, rows});
   static_cast<void>(backend.submitCommand(initial.dispatches()));
-  requirePenalizedRows(batch, original, 0, kOffset, 1, words(0),
-                       policies.front().penalties, false, label + " initial");
-  for (uint32_t lane = 0; lane < lanes; ++lane)
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const SamplingPolicy &policy = policies[lane];
+    const std::string lanePrefix = label + " initial lane " + std::to_string(lane);
+    requirePenalizedRows(batch, original, lane, kOffset, 1, words(lane),
+                         policy.penalties, false, lanePrefix);
     for (uint32_t row = 0; row < kRows; ++row)
-      if (lane || row != kOffset)
+      if (row != kOffset)
         requirePenalizedRows(batch, original, lane, row, 1, {}, {}, false,
-                             label + " initial, unselected row");
-  const SamplingPolicy &first = policies.front();
-  const Admission admits{first.constrained ? batch.masks() : nullptr,
-                         first.excludesStopTokens};
-  if (first.samples())
-    requireInitialDraw(batch,
-                       referenceDistribution(batch.row(kOffset), vocabulary,
-                                             first, admits),
-                       label + " initial");
-  else
-    require(batch.outputTokens()[0] ==
-                referenceArgmax(batch.row(kOffset), vocabulary, admits),
-            label + ": the initial token lost its penalized argmax");
+                             lanePrefix + ", unselected row");
+    const float *selected = batch.row(lane * kRows + kOffset);
+    const Admission admits{
+        policy.constrained
+            ? batch.masks() + uint64_t{lane} * (kRows + 1) * batch.maskWords()
+            : nullptr,
+        policy.excludesStopTokens};
+    if (policy.samples())
+      requireInitialDraw(
+          batch, lane,
+          referenceDistribution(selected, vocabulary, policy, admits),
+          lanePrefix);
+    else
+      require(batch.outputTokens()[lane] ==
+                  referenceArgmax(selected, vocabulary, admits),
+              lanePrefix + ": the initial token lost its penalized argmax");
+  }
 }
 
 // A request's DFlash cycle against a sequential decode. Every verify row of
@@ -848,8 +854,8 @@ void extremes(MetalBackend &backend) {
                                     false,
                                     {c.repetition, 0.0F, 0.0F}};
         CommandGraph graph;
-        sampling.addInitial(graph, policy, batch.buffers, 0, kStopTokens[0],
-                            kStopTokens[1], {table, rows});
+        sampling.addInitial(graph, {&policy, 1}, batch.buffers, 0,
+                            kStopTokens[0], kStopTokens[1], {table, rows});
         static_cast<void>(backend.submitCommand(graph.dispatches()));
         const std::string label =
             "repetition " + std::to_string(c.repetition) + " temperature " +
@@ -894,7 +900,7 @@ void invalidPenalties(MetalBackend &backend) {
                        {table, outside});
   }, "a table row outside the table");
   rejects([&] {
-    sampling.addInitial(graph, penalized, batch.buffers, 0, 1, 2,
+    sampling.addInitial(graph, {&penalized, 1}, batch.buffers, 0, 1, 2,
                         {table, outside});
   }, "an initial table row outside the table");
   require(graph.empty(), "a refused penalty request encoded a dispatch");
@@ -1066,7 +1072,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
       batch.poison();
       batch.uniforms()[0] = 0.5F * (random.unit() + 1.0F);
       CommandGraph initial;
-      sampling.addInitial(initial, policy, batch.buffers, offset,
+      sampling.addInitial(initial, {&policy, 1}, batch.buffers, offset,
                           kStopTokens[0], kStopTokens[1], {});
       static_cast<void>(backend.submitCommand(initial.dispatches()));
       const Admission admits{policy.constrained ? batch.masks() : nullptr,
@@ -1076,7 +1082,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                                    std::to_string(policy.minP) + " offset " +
                                    std::to_string(offset);
       if (policy.samples())
-        requireInitialDraw(batch,
+        requireInitialDraw(batch, 0,
                            referenceDistribution(batch.row(offset), vocabulary,
                                                  policy, admits),
                            rowLabel);
@@ -1151,6 +1157,56 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   }
 }
 
+// The runtime uploads masks for constrained lanes alone, so an unconstrained
+// lane must select the same first token and verify rows over a mask buffer
+// of all zeros as over one of all ones.
+void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t lanes = 2;
+  Sampling sampling(vocabulary);
+  const std::array<SamplingPolicy, lanes> policies{
+      SamplingPolicy{.topK = 1, .temperature = 0.0F},
+      SamplingPolicy{
+          .topK = 0, .temperature = 0.8F, .topP = 0.9F, .minP = 0.05F}};
+  const auto stops = shardEdgeStopTokens(vocabulary);
+  const auto select = [&](uint32_t maskWord) {
+    const Batch batch = makeBatch(backend, vocabulary, lanes);
+    batch.poison();
+    Random random(4127);
+    for (uint32_t row = 0; row < batch.rows; ++row) {
+      fillRow(batch.row(row), vocabulary, random);
+      batch.inputTokens()[row] = random.next() % vocabulary;
+    }
+    auto *candidates =
+        static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
+    auto *proposal =
+        static_cast<float *>(batch.buffers.draftProbabilities.contents());
+    for (uint32_t entry = 0; entry < lanes * kPositions * kDraftCandidates;
+         ++entry) {
+      candidates[entry] = random.next() % vocabulary;
+      proposal[entry] = 0.5F * (random.unit() + 1.0F) / kDraftCandidates;
+    }
+    for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    std::fill_n(batch.masks(), lanes * (kRows + 1) * batch.maskWords(),
+                maskWord);
+    CommandGraph verify;
+    sampling.addVerify(verify, policies, batch.buffers, stops[0], stops[1], {});
+    static_cast<void>(backend.submitCommand(verify.dispatches()));
+    std::vector<uint32_t> tokens(batch.outputTokens(),
+                                 batch.outputTokens() + batch.rows);
+    CommandGraph initial;
+    sampling.addInitial(initial, policies, batch.buffers, 3, stops[0],
+                        stops[1], {});
+    static_cast<void>(backend.submitCommand(initial.dispatches()));
+    tokens.insert(tokens.end(), batch.outputTokens(),
+                  batch.outputTokens() + lanes);
+    return tokens;
+  };
+  require(select(0) == select(std::numeric_limits<uint32_t>::max()),
+          "an unconstrained lane read its constraint mask");
+}
+
 // Constrained greedy lanes (the argmax kernels) and constrained sampled
 // lanes with top-k 1 (a distribution of one token) must agree with a
 // full-vocabulary CPU argmax, including ties, row offsets and masks: the
@@ -1196,16 +1252,17 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
     for (const float temperature : {0.0F, 0.8F}) {
       batch.poison();
       CommandGraph initial;
-      sampling.addInitial(initial, {1, temperature, 0.5F, true}, batch.buffers,
-                          offset, stops[0], stops[1], {});
+      const SamplingPolicy single{1, temperature, 0.5F, true};
+      sampling.addInitial(initial, {&single, 1}, batch.buffers, offset,
+                          stops[0], stops[1], {});
       static_cast<void>(backend.submitCommand(initial.dispatches()));
       require(tokens[0] == expected(offset, 0),
               "initial target differs from masked CPU argmax");
     }
     batch.poison();
     CommandGraph initialArgmax;
-    sampling.addInitial(initialArgmax, greedy, batch.buffers, offset, stops[0],
-                        stops[1], {});
+    sampling.addInitial(initialArgmax, {&greedy, 1}, batch.buffers, offset,
+                        stops[0], stops[1], {});
     static_cast<void>(backend.submitCommand(initialArgmax.dispatches()));
     require(tokens[0] == expected(offset, kUnmasked),
             "initial argmax differs from CPU argmax");
@@ -1282,8 +1339,9 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
         batch.poison();
         uniforms[0] = uniform;
         CommandGraph initial;
-        sampling.addInitial(initial, {32, temperature, 1.0F, false, excludes},
-                            batch.buffers, kRows - 1, stops[0], stops[1], {});
+        const SamplingPolicy policy{32, temperature, 1.0F, false, excludes};
+        sampling.addInitial(initial, {&policy, 1}, batch.buffers, kRows - 1,
+                            stops[0], stops[1], {});
         static_cast<void>(backend.submitCommand(initial.dispatches()));
         if (excludes)
           require(tokens[0] == best(kRows - 1) ||
@@ -1830,7 +1888,7 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
               std::numeric_limits<float>::quiet_NaN());
     batch.poison();
     CommandGraph initial;
-    sampling.addInitial(initial, policy, batch.buffers, 0, kStopTokens[0],
+    sampling.addInitial(initial, {&policy, 1}, batch.buffers, 0, kStopTokens[0],
                         kStopTokens[1], {});
     static_cast<void>(backend.submitCommand(initial.dispatches()));
     require(batch.outputTokens()[0] == kSentinel,
@@ -2008,6 +2066,8 @@ int main(int argc, char **argv) {
     overProposedResidual(backend);
     stage = "extreme searches";
     extremeSearches(backend);
+    stage = "unconstrained rows ignore masks";
+    unconstrainedRowsIgnoreMasks(backend);
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {

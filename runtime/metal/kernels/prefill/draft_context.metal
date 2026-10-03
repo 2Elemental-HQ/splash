@@ -18,7 +18,7 @@ kernel void prefill_gather_last_hidden_rows8(
 }
 
 kernel void
-prefill_draft_context_kv(device const bfloat *context_qkv [[buffer(0)]],
+prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
                          device const bfloat *k_norm [[buffer(1)]],
                          device const float *rope_cos [[buffer(2)]],
                          device const float *rope_sin [[buffer(3)]],
@@ -31,7 +31,7 @@ prefill_draft_context_kv(device const bfloat *context_qkv [[buffer(0)]],
                          uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
-  draft_context_kv_phase(context_qkv, k_norm, rope_cos, rope_sin, keys, values,
+  draft_context_kv_phase(context_kv, k_norm, rope_cos, rope_sin, keys, values,
                          params, params.tokens, task, thread_index, lane,
                          simd_group, reductions, normalized);
 }

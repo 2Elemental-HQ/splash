@@ -23,8 +23,10 @@ namespace splash {
 enum class WorkKind : uint8_t { Prefill, Decode };
 
 enum class DecodeStage : uint8_t {
+  // Drafts and verifies.
   Regular,
-  RequestInitialMask,
+  // A constrained request's prompt is done; it waits for, or holds, the mask
+  // its first token is selected under.
   ApplyInitialMask,
 };
 

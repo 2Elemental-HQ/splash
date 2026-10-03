@@ -1,5 +1,6 @@
 #include "tuning/TuningWorkloads.hpp"
 
+#include "metal/BackendInstrumentation.hpp"
 #include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@ namespace {
 
 using namespace splash::model;
 using namespace splash::ops;
+using splash::metal::BackendInstrumentation;
 
 static_assert(!tuning::kPrefillProbeRows.empty() &&
               tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
@@ -370,7 +372,7 @@ void run() {
 void metadataViews(const char *metallib) {
   using namespace splash::metal;
   MetalBackend backend(metallib);
-  const uint64_t submissions = backend.submissionCount();
+  const uint64_t submissions = BackendInstrumentation::submittedCommands(backend);
   // Metadata-only test: one small allocation, no data access or GPU command.
   // Components are intentionally tiny because no projection is executed.
   const auto backing = backend.allocateBuffer(32 * 1024, BufferStorage::Shared,
@@ -514,7 +516,7 @@ void metadataViews(const char *metallib) {
     require(backend.memoryStats().allocatedBytes == bytes,
             "collecting MoE representatives copied weight backing");
   }
-  require(backend.submissionCount() == submissions,
+  require(BackendInstrumentation::submittedCommands(backend) == submissions,
           "collecting representative metadata submitted GPU work");
 }
 

@@ -255,7 +255,9 @@ bool Engine::tick(double now) {
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command.plan, results, command.ticket->wallMilliseconds(),
+          now - command.startedMilliseconds,
           command.ticket->prefillTimingIsRepresentative(), now);
+    busySinceMilliseconds_ = now;
     sweepTerminal();
     return true;
   }
@@ -280,7 +282,8 @@ bool Engine::tick(double now) {
         throw std::logic_error("model returned an empty command ticket");
       }
       scheduler_.commit(*plan, excluded);
-      pending_ = Pending{std::move(*plan), std::move(ticket)};
+      pending_ = Pending{std::move(*plan), std::move(ticket),
+                         busySinceMilliseconds_.value_or(now)};
       return true;
     }
     case Prepared::Yielded:
@@ -292,6 +295,8 @@ bool Engine::tick(double now) {
       continue;
     }
   }
+  if (!progressed)
+    busySinceMilliseconds_.reset();
   return progressed;
 }
 
@@ -1529,8 +1534,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
 void Engine::apply(const BatchPlan &plan,
                    std::span<const ModelStepResult> results,
-                   double wallMilliseconds, bool representativePrefillTiming,
-                   double now) {
+                   double wallMilliseconds, double cycleMilliseconds,
+                   bool representativePrefillTiming, double now) {
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
@@ -1645,7 +1650,7 @@ void Engine::apply(const BatchPlan &plan,
     }
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
                                 complete, result.nextDecodeStage});
-    if (plan.kind == WorkKind::Decode && waitsForMask(result.nextDecodeStage)) {
+    if (waitsForMask(result.nextDecodeStage)) {
       events_.maskRequested(active.request.id, {});
       active.maskRequestedMilliseconds = now;
     }
@@ -1653,7 +1658,8 @@ void Engine::apply(const BatchPlan &plan,
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
                       representativePrefillTiming);
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
-                         draftedTokens, acceptedDraftTokens, wallMilliseconds);
+                         draftedTokens, acceptedDraftTokens, wallMilliseconds,
+                         cycleMilliseconds);
 
   for (size_t index = 0; index < results.size(); ++index) {
     const ModelStepResult &result = results[index];

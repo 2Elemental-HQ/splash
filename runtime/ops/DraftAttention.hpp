@@ -127,14 +127,17 @@ public:
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,
                          const DraftAttentionPlan &plan);
+  // The context writers. A row of contextKv holds its keys, then its values
+  // (kvHeads * headDimension each); its normalized, rotated keys and its
+  // values go to its position's slot of the ring.
   static void addContextPrefill(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
       uint32_t startPosition, DraftAttentionShape shape);
   static void addContextCommit(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin,
       std::span<const metal::MetalBuffer> persistentKeys,
