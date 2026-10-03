@@ -112,11 +112,6 @@ public:
     observations_[requestId].failure = std::move(code) + ":" + message;
   }
 
-  void capacityExhausted(uint64_t requestId, uint32_t, uint32_t,
-                         uint64_t) override {
-    observations_[requestId].failure = "capacity_exhausted";
-  }
-
   [[nodiscard]] const Observation &get(uint64_t requestId) const {
     auto found = observations_.find(requestId);
     if (found == observations_.end())
@@ -467,46 +462,23 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   return result;
 }
 
-// Physical KV release is paced by the backing: while an earlier extent
-// release is still in flight, Cache::reclaimCache evicts nothing and its
-// caller retries once releaseDeferred() clears. The benchmark drains follow
-// that contract, bounded well above the backing's own release timeout.
-constexpr std::chrono::seconds kDrainDeadline{120};
-
-void awaitDeferredRelease(engine::Cache &resources,
-                          std::chrono::steady_clock::time_point deadline) {
-  while (resources.releaseDeferred()) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::logic_error("native benchmark backing release did not complete");
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-}
-
+// One reclaim pass evicts every unpinned entry and releases the extents it
+// empties.
 void evictAllCache(engine::Cache &resources) {
-  const auto deadline = std::chrono::steady_clock::now() + kDrainDeadline;
-  for (;;) {
-    awaitDeferredRelease(resources, deadline);
-    static_cast<void>(
-        resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
-    const engine::CacheSnapshot snapshot = resources.snapshot();
-    if (!snapshot.stateCache.entries && !snapshot.kvCache.blocks) return;
-    // Evicting KV empties extents whose release is paced; wait and continue.
-    // Entries that remain with no release in flight are a real failure.
-    if (!resources.releaseDeferred())
-      throw std::logic_error("native benchmark cache did not drain");
-  }
+  static_cast<void>(
+      resources.reclaimCache(std::numeric_limits<uint64_t>::max(), true));
+  const engine::CacheSnapshot snapshot = resources.snapshot();
+  if (snapshot.stateCache.entries || snapshot.kvCache.blocks)
+    throw std::logic_error("native benchmark cache did not drain");
 }
 
 void evictAllCompositeState(engine::Cache &resources) {
-  const auto deadline = std::chrono::steady_clock::now() + kDrainDeadline;
   while (resources.snapshot().stateCache.entries) {
-    awaitDeferredRelease(resources, deadline);
     const engine::CacheSnapshot before = resources.snapshot();
     static_cast<void>(resources.reclaimCache(1, false));
     const engine::CacheSnapshot after = resources.snapshot();
     if (after.stateCache.entries >= before.stateCache.entries &&
-        after.pool.residentBackingBytes >= before.pool.residentBackingBytes) {
+        after.pool.allocatedBytes >= before.pool.allocatedBytes) {
       throw std::logic_error("native benchmark state cache made no progress");
     }
   }

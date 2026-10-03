@@ -2,7 +2,6 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 
-#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -18,7 +17,7 @@ MetalMemoryStats statistics;
 } // namespace
 
 struct MetalBackend::Impl {};
-MetalBackend::MetalBackend(std::string, double, uint32_t, double)
+MetalBackend::MetalBackend(std::string, double, double)
     : impl_(std::make_unique<Impl>()) {}
 MetalBackend::~MetalBackend() = default;
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {
@@ -130,23 +129,21 @@ DeviceCapabilities mac(uint64_t physicalGiB, uint64_t numerator,
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   return device;
 }
 
-// Grows one request's KV extent by extent, as PageStorage maps it, and
+// Grows one request's KV extent by extent, as PageStorage allocates it, and
 // returns the pages the governor granted.
 uint32_t grantKvPages(MemoryGovernor &governor,
                       const EngineMemoryBreakdown &budget) {
   uint32_t granted = 0;
-  while (granted < budget.kvVirtualPages) {
-    const uint32_t pages =
-        std::min(budget.kvExtentPages, budget.kvVirtualPages - granted);
+  while (granted < budget.kvCapacityPages) {
+    const uint32_t pages = budget.kvExtentPages;
     const uint64_t bytes = uint64_t{pages} * budget.kvPageBytes;
     auto reservation = governor.tryReserve(bytes);
     if (!reservation)
       break;
-    metal::statistics.sparseResidentBytes += bytes;
+    metal::statistics.allocatedBytes += bytes;
     metal::statistics.deviceCurrentAllocatedBytes += bytes;
     reservation->commit();
     granted += pages;
@@ -169,7 +166,7 @@ void testAdvertisedContextIsGrantable() {
   for (const Machine &machine :
        {Machine{"32 GB INT8", 32, 2, 3, kv::Format::Int8, 69'625},
         Machine{"36 GB INT8", 36, 3, 4, kv::Format::Int8, 253'945},
-        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'241}}) {
+        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'049}}) {
     // The 27B with its draft and vision tower: 16.2 GiB of weights.
     ModelMemoryProfile model =
         test::modelMemoryProfile(15 * kGiB, kGiB / 2, 7 * kGiB / 10);
@@ -204,16 +201,16 @@ void testAdvertisedContextIsGrantable() {
                                   std::to_string(untracked / kMiB) +
                                   " MiB untracked: granted " +
                                   std::to_string(granted) + " of " +
-                                  std::to_string(budget.kvVirtualPages) +
+                                  std::to_string(budget.kvCapacityPages) +
                                   " KV pages";
       require(metal::statistics.deviceCurrentAllocatedBytes <=
                   budget.hardBudgetBytes,
               context + ", beyond the hard budget");
       if (untracked <= reserves)
-        require(granted == budget.kvVirtualPages,
+        require(granted == budget.kvCapacityPages,
                 context + ", short of the advertised context");
       else
-        require(granted < budget.kvVirtualPages,
+        require(granted < budget.kvCapacityPages,
                 context + ", memory beyond the reserves was not charged");
     }
   }
@@ -244,7 +241,7 @@ void testHostRefusalStartsReclaim() {
   MemoryPressurePolicy policy;
   const MemoryReclaimDirective directive = policy.update(refused, 0.0, true);
   require(refused.pressure == MemoryPressure::Warning &&
-              !refused.hostGrowthAllowed && directive.reclaimEmptyKvExtents &&
+              !refused.hostGrowthAllowed && directive.reclaim &&
               !directive.evictAllUnpinnedPrefixes &&
               !directive.keepResumePoint && directive.keepServingFootprint &&
               directive.targetBytes == kGiB - 200 * kMiB,

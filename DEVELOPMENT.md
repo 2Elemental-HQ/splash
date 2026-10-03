@@ -504,13 +504,37 @@ replaced or changed after `prepare` checked it is refused.
 Runtime admission counts prepared weights, draft and vision exactly once
 (`preparedModelWeightBytes`, which `tune-kernels` and the runtime oracle use
 too). Before loading, startup refuses a model whose prepared weights, with the
-pipeline and runtime reserves, one state cell, one KV extent and any disk tier
-KV staging, exceed the hard budget, so a model that can never fit is not
-prepared. File backing does not make Metal-resident pages reclaimable, and
-`WeightFile` keeps its buffer resident (`MetalBackend::keepResident`): the
-weights stay wired between requests until 10 minutes pass without a command,
-and the next command wires them again. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+pipeline and runtime reserves, one state cell, the KV runway and any disk tier
+state staging, exceed the hard budget, so a model that can never fit is not
+prepared. File backing does not make Metal-resident pages reclaimable.
+Every buffer the backend allocates or wraps belongs to one residency set
+attached to its command queue (`MetalBackend::allocateBuffer`): weights, KV
+extents, state cells and draft rings, and scratch alike stay wired between
+requests until 10 minutes pass without a command, and the next command wires
+them again. Memory returns to macOS when the engine releases it, never because
+macOS compressed or dropped an idle buffer. macOS page cache, driver
+allocations and other applications still affect memory pressure and swap.
+
+KV pages live in extents: ordinary shared Metal buffers of one size per pool,
+between half and one and a half times 128 MiB, in which every tensor region of
+each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
+budget's pages unused (`Layout::extentPagesFor`). The pool allocates an extent
+when it needs one of its pages. When it is built it allocates the runway, the
+extents of the first 64 pages, which startup warmup runs on; nothing but the
+pool allocates or releases an extent. An extent whose last page is free stays
+allocated until a reclaim releases it, at once and only between commands: memory
+pressure, an admission the budget denies, or startup cleanup. Kernels reach a
+page through the GPU address in its request's page table, so no command binds
+KV; the residency set makes extents resident for every command. The host reaches
+the same memory (`PageStorage::spans`), which is how the disk tier moves pages.
+A reclaim pass releases every extent that is empty or that its evictions empty.
+`/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
+those requests and the cache hold (`pages_active`, `pages_cache`) and those
+nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
+(`allocated_bytes`, `reclaimable_bytes`), and the extents allocated and
+released and the longest allocation and release of one. The counts and the
+longest allocation include the runway allocated at startup, before serving
+begins; how long a whole pass holds the loop shows in `loop.max_tick_ms`.
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's files
 (`QwenTargetFiles`: packed files, or the files `AffineTargetLoader` or
@@ -809,13 +833,15 @@ Proxy consumers can use these fields; additional fields may be added:
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
 
-`GET /metrics` exposes the same counters in Prometheus text format. Both endpoints
-require the API key when authentication is enabled. Consumers should tolerate
-missing native fields while the engine is unavailable, and counter resets after
-an engine restart. Chat and text completion streams include token usage when
-the request sets `"stream_options":{"include_usage":true}`; their non-streaming
-responses always include usage. A proxy must consume these fields to display
-statistics.
+`GET /metrics` exposes the same counters in Prometheus text format.
+`splash_kv_free_allocated_pages` counts free pages of allocated extents, not
+remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Both
+endpoints require the API key when authentication is enabled. Consumers should
+tolerate missing native fields while the engine is unavailable, and counter
+resets after an engine restart. Chat and text completion streams include token
+usage when the request sets `"stream_options":{"include_usage":true}`; their
+non-streaming responses always include usage. A proxy must consume these fields
+to display statistics.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -881,7 +907,10 @@ requests then resume first, each within its own resource wait. A resource
 wait's limit restarts whenever a lane submitted before the waiting request has
 work in flight, since that lane holds memory the request waits for until it
 finishes; lanes submitted after the request do not extend it. Readiness does
-not guarantee that a request-sized allocation fits.
+not guarantee that a request-sized allocation fits. A request that cannot fit
+even alone, after every cached prefix was evicted, fails with 400
+`capacity_exhausted`, naming `--max-memory` and `--max-context`; retrying it
+fails the same way.
 
 ### Disk cache
 
@@ -899,14 +928,17 @@ The estimate is conservative, since macOS compresses other applications further
 once the engine loads. The tier does not raise the context limit.
 
 Writes happen when RAM reclamation selects a victim. States copy through one
-host staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them copy through a 128-page staging ring and are released
+staging buffer, freeing their RAM immediately. KV leaves needed by a state
+on them or below them are written straight from their extents and released
 after the write succeeds. Unneeded tails are dropped without writing, together
-with any disk copies below them. When staging is busy, admission waits for the
-transfer instead of evicting additional victims.
-Demotions may occupy half the ring and restores three quarters, leaving room
-for the other direction. Copies ride Metal commands, including a copy-only
-command when inference is idle.
+with any disk copies below them. A restored page is read straight into its
+extent. Either way the transfer runs on the file's IO worker beside whatever
+command the model runs: a cached page is never written by a command, and no
+command uses a page before its read has landed. At most 128 KV pages are in
+transfer at a time, demotions at most half of them and restores at most three
+quarters, since one worker serves both in order and a burst of either kind
+must leave the other its share. When the tier takes no more, admission waits
+for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
 Rolling checkpoints replace the least recently used copies like any state, so
@@ -927,14 +959,14 @@ reads and writes; it is not a write-rate limit. Each file retains its allocated
 high-water mark until shutdown, so filesystem space can exceed the live-slot
 quota. Closing the server releases both files.
 
-Transfers use `pread`/`pwrite` with `F_NOCACHE`. The KV staging ring, 128
-pages that the GPU copies through, is Metal memory within `--max-memory`: about
-42 MiB for 35B and 130 MiB for 27B with INT8 KV, 80 MiB and 256 MiB with BF16 KV.
-The memory plan sets it aside whenever the flag is set, even if the tier then
-fails to start, so the KV pool and the advertised context shrink by it.
-The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is host
-memory outside `--max-memory`.
-A quota too small for one state leaves the tier disabled.
+Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
+whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
+the slot (a state's staging buffer and lane buffers) move directly, everything
+else through the file's own 1 MiB buffer. The KV tier takes no Metal memory.
+The state staging buffer, one state (109 MiB for 35B, 187 MiB for 27B), is a
+buffer of the backend's like every other: resident, and set aside by the memory
+plan within `--max-memory` when the tier starts. A quota too small for one
+state leaves the tier disabled and sets nothing aside.
 A failed write disables further writes to that file. Failed KV writes retain
 RAM pages; failed state writes invalidate the disk copy. A failed read
 invalidates its cached data, allowing lookup to fall back to the surviving

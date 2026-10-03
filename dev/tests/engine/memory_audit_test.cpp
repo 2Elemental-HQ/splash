@@ -17,7 +17,7 @@ void require(bool value, const char *message) {
 }
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t kvStagingBytes = 0) {
+                      uint64_t stateStagingBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -29,10 +29,9 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
-  model.footprint.kvStagingBytes = kvStagingBytes;
+  model.footprint.stateStagingBytes = stateStagingBytes;
   return requireEngineMemoryPlan(device, model);
 }
 
@@ -45,15 +44,15 @@ ActualMemoryReport report(const EngineMemoryPlan &memoryPlan,
   result.targetWeightsBytes = b.targetWeightsBytes;
   result.draftWeightsBytes = b.draftWeightsBytes;
   result.visionWeightsBytes = b.visionWeightsBytes;
-  result.stateResidentBytes = b.activeStateCellBytes * 3;
+  result.stateAllocatedBytes = b.activeStateCellBytes * 3;
   result.sharedPrefillBytes = b.sharedPrefillBytes;
   result.sharedDecodeBytes = b.sharedDecodeBytes;
-  result.kvResidentBytes = b.kvExtentBytes;
+  result.kvAllocatedBytes = b.kvExtentBytes;
   result.backendAllocatedBytes =
       result.targetWeightsBytes + result.draftWeightsBytes +
-      result.visionWeightsBytes + result.stateResidentBytes +
+      result.visionWeightsBytes + result.stateAllocatedBytes +
       result.sharedPrefillBytes + result.sharedDecodeBytes +
-      result.kvResidentBytes + unclassifiedBytes;
+      result.kvAllocatedBytes + unclassifiedBytes;
   result.deviceCurrentAllocatedBytes = result.backendAllocatedBytes;
   result.devicePeakAllocatedBytes = result.backendAllocatedBytes + 16 * kMiB;
   // Warmup estimates the categories' peak and adds the reserves.
@@ -74,9 +73,9 @@ void testUnifiedDynamicAudit() {
           "memory audit status does not identify its startup scope");
 
   ActualMemoryReport overflow = actual;
-  overflow.backendAllocatedBytes -= overflow.stateResidentBytes;
-  overflow.stateResidentBytes = memoryPlan.breakdown().dynamicBudgetBytes;
-  overflow.backendAllocatedBytes += overflow.stateResidentBytes;
+  overflow.backendAllocatedBytes -= overflow.stateAllocatedBytes;
+  overflow.stateAllocatedBytes = memoryPlan.breakdown().dynamicBudgetBytes;
+  overflow.backendAllocatedBytes += overflow.stateAllocatedBytes;
   overflow.deviceCurrentAllocatedBytes = overflow.backendAllocatedBytes;
   overflow.devicePeakAllocatedBytes = overflow.backendAllocatedBytes;
   overflow.estimatedWarmupPeakBytes = overflow.backendAllocatedBytes;
@@ -110,32 +109,33 @@ void testUnreportedAllocationsCountAgainstReserves() {
           "unreported allocations beyond the reserves were accepted");
 }
 
-// The plan sets the disk tier's KV staging aside beside the reserves, so the
+// The plan sets the disk tier's state staging aside beside the reserves, so the
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the warmup estimate that includes it.
-void testKvStagingHasItsOwnBound() {
-  const uint64_t ring = 130 * kMiB;
-  const auto memoryPlan = plan(kGiB, ring);
+void testStateStagingHasItsOwnBound() {
+  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  const uint64_t staging = 187 * kMiB;
+  const auto memoryPlan = plan(kGiB, staging);
   const auto &budget = memoryPlan.breakdown();
   const uint64_t reserves =
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
   const auto audit = [&](uint64_t stagingBytes, uint64_t unclassifiedBytes) {
     ActualMemoryReport actual = report(memoryPlan, unclassifiedBytes);
-    actual.kvStagingBytes = stagingBytes;
+    actual.stateStagingBytes = stagingBytes;
     actual.backendAllocatedBytes += stagingBytes;
     actual.deviceCurrentAllocatedBytes += stagingBytes;
     actual.devicePeakAllocatedBytes += stagingBytes;
     actual.estimatedWarmupPeakBytes += stagingBytes;
     return auditActualMemory(memoryPlan, actual);
   };
-  const auto staged = audit(ring, reserves);
+  const auto staged = audit(staging, reserves);
   require(staged.valid && staged.backendUnclassifiedBytes == reserves &&
               staged.warmupPeakDeviationBasisPoints == 0,
-          "KV staging was charged to the reserves or counted twice");
-  require(audit(ring + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
-          "KV staging beyond its plan was accepted");
+          "state staging was charged to the reserves or counted twice");
+  require(audit(staging + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
+          "state staging beyond its plan was accepted");
   require(audit(0, 0).valid,
-          "a plan with KV staging failed without a started disk tier");
+          "a plan with state staging failed without a started disk tier");
 }
 
 void testFixedCategoryAndPeakFailures() {
@@ -175,7 +175,6 @@ void testWarmupDeviationExcludesReserves() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   for (const uint64_t weightsMiB : {16'589, 12'288, 9'216, 6'144}) {
     for (const uint64_t untrackedMiB : {100, 300}) {
       const auto memoryPlan = requireEngineMemoryPlan(
@@ -184,14 +183,14 @@ void testWarmupDeviationExcludesReserves() {
       ActualMemoryReport actual;
       actual.targetWeightsBytes = b.targetWeightsBytes;
       actual.draftWeightsBytes = b.draftWeightsBytes;
-      actual.stateResidentBytes = 4 * b.activeStateCellBytes;
+      actual.stateAllocatedBytes = 4 * b.activeStateCellBytes;
       actual.sharedPrefillBytes = b.sharedPrefillBytes;
       actual.sharedDecodeBytes = b.sharedDecodeBytes;
-      actual.kvResidentBytes = b.kvExtentBytes;
+      actual.kvAllocatedBytes = b.kvExtentBytes;
       actual.backendAllocatedBytes =
           actual.targetWeightsBytes + actual.draftWeightsBytes +
-          actual.stateResidentBytes + actual.sharedPrefillBytes +
-          actual.sharedDecodeBytes + actual.kvResidentBytes;
+          actual.stateAllocatedBytes + actual.sharedPrefillBytes +
+          actual.sharedDecodeBytes + actual.kvAllocatedBytes;
       actual.deviceCurrentAllocatedBytes =
           actual.backendAllocatedBytes + untrackedMiB * kMiB;
       actual.devicePeakAllocatedBytes = actual.deviceCurrentAllocatedBytes;
@@ -220,7 +219,7 @@ int main() {
     testUnifiedDynamicAudit();
     testOptionalVisionAudit();
     testUnreportedAllocationsCountAgainstReserves();
-    testKvStagingHasItsOwnBound();
+    testStateStagingHasItsOwnBound();
     testFixedCategoryAndPeakFailures();
     testWarmupDeviationExcludesReserves();
     std::cout << "elastic memory audit tests passed\n";

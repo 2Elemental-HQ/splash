@@ -12,7 +12,7 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
-  [[nodiscard]] bool needsHealthCheck() const noexcept override;
+  [[nodiscard]] uint32_t statesToActivate() const noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -38,8 +38,6 @@ public:
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;
-  [[nodiscard]] std::unique_ptr<ModelBatchTicket>
-  submitTransfers(std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<const CompositeState>

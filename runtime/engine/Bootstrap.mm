@@ -114,7 +114,8 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
       nativeLoop_(std::move(nativeLoop)), report_(std::move(report)) {}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
-  // Cancel unsubmitted dependency waits before the loop destroys its tickets.
+  // Refuse new commands before the loop, the model and the resources they
+  // reach are destroyed.
   resources_->backend().stop();
 }
 
@@ -186,7 +187,8 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   // serving concurrency limit: the engine still admits lanes dynamically.
   const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
       model::ExecutionLimits::maximumBatchWidth,
-      (budget.dynamicBudgetBytes - budget.kvExtentBytes) /
+      (budget.dynamicBudgetBytes -
+       kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
           budget.activeStateCellBytes));
   for (uint32_t width = 1;
        width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
@@ -369,12 +371,14 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       [resourcesPointer, modelPointer](uint64_t estimatedPeakBytes) {
         resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
-        // Wider batches and cache backing grow on demand after Ready.
+        // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
             modelPointer->actualRuntimeMemory(), estimatedPeakBytes);
-        // Keep one lane's worth of warm buffers for the first request.
-        static_cast<void>(resourcesPointer->stateStorage().releaseIdle(2, 1));
-        resourcesPointer->cache().releaseUnusedKvBacking();
+        // Keep what the first request starts from: one lane's state buffers
+        // and one empty KV extent. No cache data is evicted.
+        while (modelPointer->reclaimIdleState(true)) {
+        }
+        static_cast<void>(resourcesPointer->cache().reclaimCache(0, false, false, true));
         resourcesPointer->memoryGovernor().markServingFootprint();
         return report;
       },

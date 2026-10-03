@@ -19,35 +19,35 @@ void testByteAccounting() {
   constexpr Layout bf16{16, 4, 256, Format::BFloat16};
   static_assert(bf16.valid());
   static_assert(bf16.bytesPerModelPage() == 2'097'152);
-  static_assert(bf16.sparseMappingBatchPages() == 1);
-  static_assert(bf16.backingExtentPages() == 64);
-  static_assert(bf16.storageByteCounts(4096).total == 8ULL * 1024 * 1024 * 1024);
+  static_assert(bf16.extentAlignmentPages() == 1);
+  static_assert(bf16.minimumExtentPages() == 32 && bf16.maximumExtentPages() == 96);
+  static_assert(4096 * bf16.bytesPerModelPage() == 8ULL * 1024 * 1024 * 1024);
   static_assert(bf16.scaleBytesPerLayerPage() == 0);
   constexpr Layout compact{10, 2, 256, Format::BFloat16};
   static_assert(compact.bytesPerModelPage() == 655'360);
-  static_assert(compact.sparseMappingBatchPages() == 2);
-  static_assert(compact.backingExtentPages() == 206);
+  static_assert(compact.extentAlignmentPages() == 2);
+  static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
   static_assert(!Layout{16, 4, 256, static_cast<Format>(0)}.valid());
   static_assert(kBytesPerModelPage == 1'064'960);
-  StorageByteCounts one = storageByteCounts(1);
-  assert(one.keyData == 512 * 1024);
-  assert(one.keyScales == 8 * 1024);
-  assert(one.valueData == 512 * 1024);
-  assert(one.valueScales == 8 * 1024);
-  assert(one.total == 1'064'960);
-  StorageByteCounts production = storageByteCounts(4608);
-  assert(production.total == 4'907'335'680ULL); // 147456 tokens.
+  // One page's keys (or values) and their scales across the layers.
+  static_assert(kOracleLayout.attentionLayers * kKeyDataBytesPerLayerPage == 512 * 1024);
+  static_assert(kOracleLayout.attentionLayers * kKeyScaleBytesPerLayerPage == 8 * 1024);
+  static_assert(kBytesPerModelPage == 2 * (512 + 8) * 1024);
+  static_assert(4608 * kBytesPerModelPage == 4'907'335'680ULL); // 147456 tokens.
 }
 
 void testLayouts() {
-  assert(keyDataIndex(0, 0, 1) == keyDataIndex(0, 0, 0) + 1);
-  assert(keyDataIndex(0, 1, 0) == keyDataIndex(0, 0, 0) + kHeadDimension);
-  assert(valueDataIndex(0, 1, 0) == valueDataIndex(0, 0, 0) + 1);
-  assert(valueDataIndex(0, 0, 1) == valueDataIndex(0, 0, 0) + kPageTokens);
-  assert(keyDataIndex(kKvHeads - 1, kPageTokens - 1, kHeadDimension - 1) ==
-         kElementsPerLayerPage - 1);
-  assert(valueDataIndex(kKvHeads - 1, kPageTokens - 1, kHeadDimension - 1) ==
-         kElementsPerLayerPage - 1);
+  assert(splash_kv_key_element(0, 0, 1) == splash_kv_key_element(0, 0, 0) + 1);
+  assert(splash_kv_key_element(0, 1, 0) ==
+         splash_kv_key_element(0, 0, 0) + kHeadDimension);
+  assert(splash_kv_value_element(0, 1, 0) ==
+         splash_kv_value_element(0, 0, 0) + 1);
+  assert(splash_kv_value_element(0, 0, 1) ==
+         splash_kv_value_element(0, 0, 0) + kPageTokens);
+  assert(splash_kv_key_element(kKvHeads - 1, kPageTokens - 1,
+                               kHeadDimension - 1) == kElementsPerLayerPage - 1);
+  assert(splash_kv_value_element(kKvHeads - 1, kPageTokens - 1,
+                                 kHeadDimension - 1) == kElementsPerLayerPage - 1);
 }
 
 void testBFloat16() {
@@ -115,8 +115,8 @@ void testQuantization(uint32_t validTokens) {
     for (uint32_t head = 0; head < kKvHeads; ++head) {
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
         uint64_t logical = logicalIndex(token, head, dimension);
-        float keyScale = page->keyScales[keyScaleIndex(head, token)];
-        float valueScale = page->valueScales[valueScaleIndex(head, token)];
+        float keyScale = page->keyScales[splash_kv_scale_element(head, token)];
+        float valueScale = page->valueScales[splash_kv_scale_element(head, token)];
         assert(std::abs(decodedKeys[logical] - keys[logical]) <=
                keyScale * 0.51f + 1.0e-7f);
         assert(std::abs(decodedValues[logical] - values[logical]) <=

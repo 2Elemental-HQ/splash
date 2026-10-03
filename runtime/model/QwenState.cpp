@@ -2,7 +2,6 @@
 
 #include <cstring>
 #include <algorithm>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -176,15 +175,20 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
       new QwenCompositeState(layout, lengths, file, disk));
-  std::byte *staged = staging->bytes.get();
+  const std::span<std::byte> staged = staging->bytes();
+  std::byte *cursor = staged.data();
   for (auto span : spans)
-    staged = std::copy(span.begin(), span.end(), staged);
+    cursor = std::copy(span.begin(), span.end(), cursor);
   staging->busy = true;
   std::shared_ptr<SlotFile::Operation> operation;
   try {
     operation = file->write(
-        std::move(disk), {std::span<const std::byte>(staging->bytes.get(), staging->size)},
+        std::move(disk), {std::span<const std::byte>(staged)},
         std::move(completion));
+    // Callers check that the file takes writes, and only a failed write of
+    // its own closes it: none is in flight beside this one.
+    if (!operation)
+      throw std::logic_error("the state file closed with no state write in flight");
     return std::make_unique<FileOffload>(operation, std::move(result), staging);
   } catch (...) {
     if (operation)
@@ -215,18 +219,11 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
       layout_.draft.tokens != ExecutionLimits::draftContextTokens) {
     throw std::invalid_argument("Qwen composite state layout is invalid");
   }
-  if (file && file->slotBytes() != layout_.cachedBytes())
-    throw std::invalid_argument("state file slots do not hold one state");
   if (file) {
     file_ = std::move(file);
     staging_ = std::make_shared<StateStaging>();
-    void *memory = nullptr;
-    if (::posix_memalign(&memory, SlotFile::kAlignmentBytes, layout_.cachedBytes()) != 0)
-      throw std::bad_alloc();
-    staging_->bytes.reset(static_cast<std::byte *>(memory));
-    staging_->size = layout_.cachedBytes();
-    // Touch the pages now rather than on the engine thread at the first write.
-    std::memset(memory, 0, layout_.cachedBytes());
+    staging_->buffer = backend_.allocateBuffer(
+        layout_.cachedBytes(), metal::BufferStorage::Shared, "qwen-state-staging");
   }
 }
 
@@ -244,15 +241,26 @@ const QwenSlotMetadata &QwenStateStorage::metadata(uint32_t index) const {
   return slot(index).metadata;
 }
 
-metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64_t requestId) {
+metal::AllocationResult
+QwenStateStorage::tryActivateSlot(uint32_t index, uint64_t requestId, uint64_t extraBytes,
+                                  const std::function<void()> &allocateExtra) {
   if (!requestId)
     throw std::invalid_argument("request id must be non-zero");
   Slot &current = slot(index);
   if (current.metadata.assigned) {
     throw std::logic_error("Qwen state slot is already assigned");
   }
-  if (auto admission = allocateSlot(index); !admission)
+  if (current.gdn[0] || current.gdn[1] || current.draft) {
+    throw std::logic_error("idle Qwen state slot still owns buffers");
+  }
+  Buffers buffers;
+  if (auto admission = acquire(kLaneCells, "qwen-state-cell-" + std::to_string(index),
+                               buffers, extraBytes, allocateExtra);
+      !admission)
     return admission;
+  current.gdn = std::move(buffers.gdn);
+  current.draft = std::move(buffers.draft);
+  refreshViews(current);
 
   // A fresh recurrent sequence reads parity zero immediately. Parity one is
   // fully overwritten by the first transition. Draft validity is controlled
@@ -260,7 +268,7 @@ metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64
   clear(current.buffers.gdn[0].convolutionBase, "slot convolution state");
   clear(current.buffers.gdn[0].recurrentBase, "slot recurrent state");
   current.metadata = {true, requestId, 0, {}};
-  return true;
+  return {};
 }
 
 void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
@@ -282,13 +290,14 @@ void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
   current.metadata = {};
 }
 
-uint64_t QwenStateStorage::releaseIdle(uint32_t keepCells,
-                                       uint32_t keepRings) noexcept {
+uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
-  while (pool_->cells.size() > keepCells)
+  if (idleCells() > (keepLane ? kLaneCells : 0))
     pool_->cells.pop_back();
-  while (pool_->rings.size() > keepRings)
+  else if (idleRings() > (keepLane ? 1U : 0U))
     pool_->rings.pop_back();
+  else
+    return 0;
   const uint64_t after = backend_.memoryStats().allocatedBytes;
   return before >= after ? before - after : 0;
 }
@@ -301,11 +310,16 @@ uint32_t QwenStateStorage::idleRings() const noexcept {
   return static_cast<uint32_t>(pool_->rings.size());
 }
 
-uint64_t QwenStateStorage::activationBytes() const noexcept {
-  const uint64_t cells = std::tuple_size_v<decltype(Slot::gdn)>;
+uint64_t QwenStateStorage::missingBytes(uint32_t cells) const noexcept {
   const uint64_t missing = cells - std::min<uint64_t>(pool_->cells.size(), cells);
   return missing * layout_.target.cellBytes() +
          (pool_->rings.empty() ? layout_.draft.ringBytes() : 0);
+}
+
+uint32_t QwenStateStorage::statesToActivate() const noexcept {
+  const uint32_t cells = kLaneCells - std::min(idleCells(), kLaneCells);
+  const uint32_t rings = idleRings() ? 0 : 1;
+  return std::max(cells, rings);
 }
 
 void QwenStateStorage::updateLengths(uint32_t index,
@@ -332,19 +346,10 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
   Slot &source = slot(index);
   requireAssigned(source);
   validateLengths(lengths, true);
-  // Pooled buffers first; a denied admission puts a pooled cell back and
-  // drops a fresh one, leaving no trace.
-  QwenCacheSlot cacheSlot;
-  const bool pooledCell = !pool_->cells.empty();
-  cacheSlot.gdn = acquireCell("qwen-state-cache-gdn");
-  if (!cacheSlot.gdn)
+  Buffers buffers;
+  if (!acquire(1, "qwen-state-cache", buffers))
     return nullptr;
-  cacheSlot.draft = acquireRing("qwen-state-cache-draft");
-  if (!cacheSlot.draft) {
-    if (pooledCell)
-      pool_->cells.push_back(std::move(cacheSlot.gdn));
-    return nullptr;
-  }
+  QwenCacheSlot cacheSlot{std::move(buffers.gdn[0]), std::move(buffers.draft)};
   const uint32_t active = source.metadata.activeParity;
   copyExact(cacheSlot.gdn->buffers().stateBase,
             source.gdn[active]->buffers().stateBase, "cached GDN state");
@@ -371,22 +376,45 @@ QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completio
       layout_, source.metadata.lengths, std::move(completion));
 }
 
-std::shared_ptr<QwenGdnCell>
-QwenStateStorage::acquireCell(std::string_view label) {
-  if (pool_->cells.empty())
-    return allocateGdnCell(label);
-  std::shared_ptr<QwenGdnCell> cell = std::move(pool_->cells.back());
-  pool_->cells.pop_back();
-  return cell;
-}
-
-std::shared_ptr<DFlashDraftRing>
-QwenStateStorage::acquireRing(std::string_view label) {
-  if (pool_->rings.empty())
-    return allocateDraftRing(label);
-  std::shared_ptr<DFlashDraftRing> ring = std::move(pool_->rings.back());
-  pool_->rings.pop_back();
-  return ring;
+metal::AllocationResult
+QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffers,
+                          uint64_t extraBytes, const std::function<void()> &allocateExtra) {
+  const uint32_t pooledCells =
+      std::min(cells, static_cast<uint32_t>(pool_->cells.size()));
+  const bool pooledRing = !pool_->rings.empty();
+  Buffers fresh;
+  if (const uint64_t bytes = missingBytes(cells) + extraBytes) {
+    const auto admission = admitAllocation_(bytes, [&] {
+      if (allocateExtra)
+        allocateExtra();
+      for (uint32_t cell = pooledCells; cell < cells; ++cell) {
+        fresh.gdn[cell] = std::shared_ptr<QwenGdnCell>(new QwenGdnCell(
+            backend_, allocations_, layout_.target,
+            std::string(label) + "-gdn-" + std::to_string(cell)));
+      }
+      if (!pooledRing) {
+        fresh.draft = std::shared_ptr<DFlashDraftRing>(new DFlashDraftRing(
+            backend_, allocations_, layout_.draft,
+            std::string(label) + "-draft"));
+      }
+    });
+    // What a driver's refusal left of the attempt goes with `fresh`.
+    if (!admission)
+      return admission;
+  }
+  for (uint32_t cell = 0; cell < pooledCells; ++cell) {
+    buffers.gdn[cell] = std::move(pool_->cells.back());
+    pool_->cells.pop_back();
+  }
+  for (uint32_t cell = pooledCells; cell < cells; ++cell)
+    buffers.gdn[cell] = std::move(fresh.gdn[cell]);
+  if (pooledRing) {
+    buffers.draft = std::move(pool_->rings.back());
+    pool_->rings.pop_back();
+  } else {
+    buffers.draft = std::move(fresh.draft);
+  }
+  return {};
 }
 
 void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
@@ -473,91 +501,6 @@ uint64_t QwenStateStorage::actualSlotBytes(uint32_t index) const {
     result += current.gdn[1]->actualAllocatedBytes();
   if (current.draft)
     result += current.draft->actualAllocatedBytes();
-  return result;
-}
-
-metal::AllocationResult QwenStateStorage::allocateSlot(uint32_t index) {
-  Slot &destination = slot(index);
-  if (destination.gdn[0] || destination.gdn[1] || destination.draft) {
-    throw std::logic_error("idle Qwen state slot still owns buffers");
-  }
-  // Pooled buffers first, then the governor for what the pool lacks. A denied
-  // admission leaves no trace: pooled buffers go back, fresh ones are dropped.
-  std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
-  std::shared_ptr<DFlashDraftRing> draft;
-  metal::AllocationFailure failure = metal::AllocationFailure::None;
-  uint32_t pooledCells = 0;
-  while (pooledCells < gdn.size() && !pool_->cells.empty()) {
-    gdn[pooledCells++] = std::move(pool_->cells.back());
-    pool_->cells.pop_back();
-  }
-  const bool pooledRing = !pool_->rings.empty();
-  if (pooledRing) {
-    draft = std::move(pool_->rings.back());
-    pool_->rings.pop_back();
-  }
-  const auto giveBack = [&] {
-    for (uint32_t parity = pooledCells; parity > 0;)
-      pool_->cells.push_back(std::move(gdn[--parity]));
-    if (pooledRing)
-      pool_->rings.push_back(std::move(draft));
-  };
-  for (uint32_t parity = pooledCells; parity < gdn.size(); ++parity) {
-    gdn[parity] = allocateGdnCell("qwen-state-cell-" + std::to_string(index) +
-                                  "-gdn-" + std::to_string(parity), &failure);
-    if (!gdn[parity]) {
-      giveBack();
-      return failure;
-    }
-  }
-  if (!pooledRing) {
-    draft = allocateDraftRing("qwen-state-cell-" + std::to_string(index) +
-                              "-draft", &failure);
-    if (!draft) {
-      giveBack();
-      return failure;
-    }
-  }
-  destination.gdn = std::move(gdn);
-  destination.draft = std::move(draft);
-  refreshViews(destination);
-  return true;
-}
-
-std::shared_ptr<QwenGdnCell>
-QwenStateStorage::allocateGdnCell(std::string_view label,
-                                     metal::AllocationFailure *failure) {
-  std::shared_ptr<QwenGdnCell> result;
-  const auto admission = admitAllocation_(layout_.target.cellBytes(), [&] {
-        result = std::shared_ptr<QwenGdnCell>(
-            new QwenGdnCell(backend_, allocations_, layout_.target, label));
-      });
-  if (!admission) {
-    if (failure)
-      *failure = admission.failure;
-    return {};
-  }
-  if (!result)
-    throw std::logic_error("state admission skipped GDN allocation");
-  return result;
-}
-
-std::shared_ptr<DFlashDraftRing>
-QwenStateStorage::allocateDraftRing(std::string_view label,
-                                     metal::AllocationFailure *failure) {
-  std::shared_ptr<DFlashDraftRing> result;
-  const auto admission = admitAllocation_(layout_.draft.ringBytes(), [&] {
-        result = std::shared_ptr<DFlashDraftRing>(
-            new DFlashDraftRing(backend_, allocations_, layout_.draft,
-                                label));
-      });
-  if (!admission) {
-    if (failure)
-      *failure = admission.failure;
-    return {};
-  }
-  if (!result)
-    throw std::logic_error("state admission skipped draft allocation");
   return result;
 }
 

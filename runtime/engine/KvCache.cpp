@@ -238,7 +238,7 @@ uint32_t KvCache::chainLength(uint64_t blockId) const {
 
 uint32_t KvCache::page(uint64_t blockId) const { return block(blockId).page; }
 
-std::shared_ptr<model::KvDiskSlot> KvCache::slot(uint64_t blockId) const {
+std::shared_ptr<KvDiskSlot> KvCache::slot(uint64_t blockId) const {
   return block(blockId).slot;
 }
 
@@ -284,7 +284,7 @@ void KvCache::setTransferring(uint64_t blockId, bool transferring) {
   reindex(entry);
 }
 
-void KvCache::setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot) {
+void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
   Block &entry = block(blockId);
   if (!slot && entry.page == noPage)
     throw std::logic_error("a disk-only KV cache block is erased, not stripped");
@@ -292,7 +292,7 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot)
   reindex(entry);
 }
 
-void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot) noexcept {
+void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept {
   if (static_cast<bool>(entry.slot) != static_cast<bool>(slot))
     slot ? ++diskBlocks_ : --diskBlocks_;
   entry.slot = std::move(slot);

@@ -87,22 +87,6 @@ class RequestFailed(EngineRuntimeError):
         )
 
 
-class CapacityExhausted(EngineRuntimeError):
-    retryable = True
-
-    def __init__(self, event: wire.CapacityExhaustedEvent):
-        self.event = event
-        super().__init__(
-            f"request {event.request_id} could not allocate its KV target "
-            f"(target_pages={event.required_kv_pages}, "
-            f"logical_pages_free={event.available_kv_pages}); retry after "
-            "other requests finish or system memory becomes available"
-        )
-
-    def restate(self) -> CapacityExhausted:
-        return CapacityExhausted(self.event)
-
-
 class EngineUnhealthy(EngineRuntimeError):
     pass
 
@@ -732,9 +716,9 @@ class MultiplexedRuntime:
         self._mask_executor.shutdown(wait=True, cancel_futures=True)
 
     def kill(self) -> None:
-        """SIGKILL the engine now, skipping its paced teardown.
+        """SIGKILL the engine now, without waiting for its graceful exit.
 
-        Safe in a signal handler: close() may be waiting for that teardown.
+        Safe in a signal handler: close() may be waiting for that exit.
         """
         process = self._process
         if process is not None:
@@ -1202,11 +1186,6 @@ class MultiplexedRuntime:
             return
         if isinstance(message, wire.ErrorEvent):
             self._dispatch_error(generation, message)
-            return
-        if isinstance(message, wire.CapacityExhaustedEvent):
-            call = self._require_call(generation, message.request_id)
-            call._emit(message)
-            self._finish_call(call, error=CapacityExhausted(message))
             return
         if isinstance(message, wire.StartEvent):
             call = self._require_call(generation, message.request_id)

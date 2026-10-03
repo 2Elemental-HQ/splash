@@ -2,6 +2,7 @@
 
 #include "engine/CacheRecency.hpp"
 #include "engine/KvPool.hpp"
+#include "engine/KvTier.hpp"
 #include "engine/RecencyOrder.hpp"
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
@@ -111,7 +112,7 @@ public:
   // Tiers. A block in transfer is moving between them and is neither
   // evicted nor replaced until the transfer is cleared.
   [[nodiscard]] uint32_t page(uint64_t blockId) const;
-  [[nodiscard]] std::shared_ptr<model::KvDiskSlot> slot(uint64_t blockId) const;
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> slot(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out: a state restores
   // through the KV of every block above its own.
@@ -128,7 +129,7 @@ public:
   [[nodiscard]] bool transferring(uint64_t blockId) const;
   void setTransferring(uint64_t blockId, bool transferring);
   // Publishes the block's disk copy; a resident block may drop it with null.
-  void setSlot(uint64_t blockId, std::shared_ptr<model::KvDiskSlot> slot);
+  void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.
   void dropPage(uint64_t blockId);
   // Gives a disk-only block a page whose content follows, by restore or from
@@ -173,7 +174,7 @@ private:
     std::array<uint32_t, pageTokens> tokens{};
     ImageIdentity images;
     uint32_t page = noPage;
-    std::shared_ptr<model::KvDiskSlot> slot;
+    std::shared_ptr<KvDiskSlot> slot;
     uint32_t children = 0;
     uint32_t residentChildren = 0;
     uint32_t statesBelow = 0;
@@ -195,7 +196,7 @@ private:
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
   void unlink(Block &entry) noexcept;
-  void giveDiskCopy(Block &entry, std::shared_ptr<model::KvDiskSlot> slot) noexcept;
+  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
   // A poisoned block leaves as soon as nothing refers to it.
   void erasePoisonedLeaf(uint64_t blockId) noexcept;

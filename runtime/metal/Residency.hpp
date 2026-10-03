@@ -12,10 +12,10 @@
 
 namespace splash::metal {
 
-// Holds the buffers of one residency set wired between the commands of a
-// command queue. Metal wires them while a command runs and lets them go a few
-// seconds later, and one request holds them only about two seconds, so a
-// heartbeat requests residency every 500 ms. After keepAlive without a command
+// Holds every buffer of a backend in one residency set, wired between the
+// commands of its command queue. Metal wires them while a command runs and
+// lets them go a few seconds later, and one request holds them only about two
+// seconds, so a heartbeat requests residency every 500 ms. After keepAlive without a command
 // it ends residency, which Metal applies at its next GPU operation on any
 // queue: one dispatch of the kick kernel, whose pipeline the backend builds
 // with its library, on a queue of its own, as the runtime keeps exactly one
@@ -63,17 +63,14 @@ public:
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Wires the buffer before returning and restarts the keep-alive.
+  // Adds the buffer to the set and restarts the keep-alive: a held set wires
+  // it at the commit, and a lapsed one is requested again off the caller's
+  // thread (use()).
   void add(id<MTLBuffer> buffer) {
     dispatch_sync(queue_, ^{
       [set_ addAllocation:buffer];
       [set_ commit];
-      [set_ requestResidency];
     });
-    {
-      std::lock_guard lock(mutex_);
-      bytes_ += buffer.allocatedSize;
-    }
     use();
   }
 
@@ -82,8 +79,6 @@ public:
       [set_ removeAllocation:buffer];
       [set_ commit];
     });
-    std::lock_guard lock(mutex_);
-    bytes_ -= buffer.allocatedSize;
   }
 
   // Marks a command. A lapsed set is requested again at once, off the
@@ -92,7 +87,7 @@ public:
     {
       std::lock_guard lock(mutex_);
       lastUse_ = std::chrono::steady_clock::now();
-      if (held_ || !bytes_) return;
+      if (held_) return;
       held_ = true;
     }
     dispatch_async(queue_, ^{
@@ -100,12 +95,6 @@ public:
       dispatch_source_set_timer(heartbeat_, dispatch_time(DISPATCH_TIME_NOW, kBeat),
                                 kBeat, kBeat / 10);
     });
-  }
-
-  // The bytes of the set while it is not held.
-  [[nodiscard]] uint64_t lapsedBytes() const {
-    std::lock_guard lock(mutex_);
-    return held_ ? 0 : bytes_;
   }
 
 private:
@@ -146,10 +135,9 @@ private:
   __strong dispatch_queue_t queue_ = nil;
   __strong dispatch_source_t heartbeat_ = nil;
   const std::chrono::duration<double> keepAlive_;
-  mutable std::mutex mutex_;
+  std::mutex mutex_;
   std::chrono::steady_clock::time_point lastUse_;
   bool held_ = false;
-  uint64_t bytes_ = 0;
 };
 
 } // namespace splash::metal

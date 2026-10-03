@@ -278,10 +278,10 @@ bootstrapConfig(const NativeArguments &arguments) {
 }
 
 // SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
-// process, so the KV backing is released one extent at a time by the normal
-// destructors. An inherited ignored SIGHUP (nohup) stays ignored, as it does
-// for the server. SIGPIPE is ignored: a closed parent pipe surfaces as EPIPE,
-// which the transport already reports as an I/O failure.
+// process, so the normal destructors run. An inherited ignored SIGHUP (nohup)
+// stays ignored, as it does for the server. SIGPIPE is ignored: a closed
+// parent pipe surfaces as EPIPE, which the transport already reports as an
+// I/O failure.
 std::atomic<engine::FdTransport *> gShutdownTransport{nullptr};
 
 void requestShutdownFromSignal(int) {
@@ -402,19 +402,15 @@ int runNative(const NativeArguments &arguments) {
       writeStderrLine(diagnostic);
     engine::MemoryReclaimDirective directive =
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
-    if (!directive.reclaimEmptyKvExtents)
+    if (!directive.reclaim)
       return false;
     const engine::MemoryReclaimResult reclaim =
         published->nativeLoop().reclaimMemory(directive);
     pressurePolicy.reclaimed(directive, reclaim);
     governor.reclaimed(reclaim.outcome);
     static_cast<void>(resources.backend().refreshMemoryStats());
-    // KV backing is returned one extent at a time, and a target that
-    // transfers held back continues as they land. Ask to run again at the
-    // next command-free point meanwhile, so the rest follows without a
-    // burst of kernel work.
-    return published->nativeLoop().reclaimDeferred() ||
-           reclaim.outcome == engine::ReclaimOutcome::Pending;
+    // What transfers held back continues at the next command-free point.
+    return reclaim.outcome == engine::ReclaimOutcome::Pending;
   });
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {

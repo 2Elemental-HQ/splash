@@ -7,7 +7,7 @@
 
 namespace splash::engine {
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, model::KvTier *kvTier,
+Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, KvTier *kvTier,
              std::shared_ptr<const model::DiskBudget> diskBudget)
     : pool_(pool), tier_(kvTier), diskBudget_(std::move(diskBudget)),
       kv_(pool, cacheNamespace, recency_),
@@ -129,6 +129,14 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
   }
   if (!blocks.empty()) {
     kv_.touch(blocks.back());
+    // A chain with a disk suffix keeps its resident boundary as warm as its
+    // tip: a restore adopts the disk blocks below it.
+    const auto resident =
+        std::find_if(blocks.rbegin(), blocks.rend(), [&](uint64_t block) {
+          return kv_.page(block) != KvCache::noPage;
+        });
+    if (resident != blocks.rbegin() && resident != blocks.rend())
+      kv_.touch(*resident);
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
     result.state = states_.acquireDeepest(blocks);
   }
@@ -157,7 +165,12 @@ void Cache::recordLookup(const CacheLookup &result) {
 
 PageTableView Cache::pageTable(uint64_t requestId) const {
   const Request &active = request(requestId);
-  return {active.pages, active.pageTableRevision};
+  return {active.pages, active.pageTableRevision, active.firstChangedPage};
+}
+
+void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
+  ++active.pageTableRevision;
+  active.firstChangedPage = first;
 }
 
 uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
@@ -203,7 +216,7 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     }
     if (replacePage) {
       active.pages[logical] = inserted.physicalPage;
-      ++active.pageTableRevision;
+      pagesChanged(active, logical);
       pool_.releasePage(writerPage, false);
     }
     if (parent)
@@ -254,23 +267,22 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return states_.retireCheckpoint(checkpoint);
 }
 
-// Page admission: pages come from the free list or from evicted resident
-// leaves; a page that must be written first comes back when its copy lands.
+// Page admission: pages come from the pool, which grows by an extent when
+// the governor admits one. Making room is the caller's reclaim; a page that
+// must be written first comes back when its copy lands.
 
 TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
   Request &active = request(requestId);
   const uint64_t needed64 =
       (tokenCount + KvCache::pageTokens - 1) / KvCache::pageTokens;
-  if (needed64 > std::numeric_limits<uint32_t>::max()) {
-    return {KvPageAcquireFailure::LogicalCapacity,
-            std::numeric_limits<uint32_t>::max(), pool_.freePageCount()};
-  }
+  if (needed64 > std::numeric_limits<uint32_t>::max())
+    throw std::invalid_argument("KV target exceeds the page id range");
   const uint32_t needed = static_cast<uint32_t>(needed64);
-  if (needed <= active.pages.size())
+  const auto previousSize = static_cast<uint32_t>(active.pages.size());
+  if (needed <= previousSize)
     return {};
   std::vector<uint32_t> acquired;
-  if (const TokenAdmission admission =
-          admitPages(needed - static_cast<uint32_t>(active.pages.size()), acquired);
+  if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
       !admission.granted())
     return admission;
   try {
@@ -280,68 +292,23 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
       pool_.releasePage(page, false);
     throw;
   }
-  ++active.pageTableRevision;
+  pagesChanged(active, previousSize);
   return {};
 }
 
 TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages) {
-  const Shortfall shortfall = makeLogicalPages(count);
-  if (shortfall != Shortfall::Covered) {
-    return {shortfall == Shortfall::Pending ? KvPageAcquireFailure::Pending
-                                            : KvPageAcquireFailure::LogicalCapacity,
-            count, pool_.freePageCount()};
-  }
   KvPageAcquisition acquired = pool_.acquirePages(count, false);
   if (!acquired.granted()) {
-    // The pool could not map backing for its free pages. Demoted pages carry
-    // their backing back: wait once those on their way cover what the free
-    // backed pages do not, and until then reclaim more.
-    const uint32_t missing = count - std::min(count, pool_.freeResidentPageCount());
+    // Demoted pages free theirs when their copies land: wait once those on
+    // their way cover what the free pages do not, and until then reclaim.
+    const uint32_t missing = count - std::min(count, pool_.freePageCount());
     const uint32_t pending = pendingPages();
     const bool covered = pending > 0 && pending >= missing;
-    return {covered ? KvPageAcquireFailure::Pending : acquired.failure,
-            count, pool_.freePageCount(), acquired.allocationFailure};
+    return {covered ? TokenAdmissionFailure::Pending : TokenAdmissionFailure::Denied,
+            count, pool_.freePageCount(), acquired.failure};
   }
   pages = std::move(acquired.pages);
   return {};
-}
-
-Cache::Shortfall Cache::makeLogicalPages(uint32_t count) {
-  while (pool_.freePageCount() < count) {
-    // Pages already on their way back cover the shortfall: wait for them
-    // rather than demoting more.
-    if (pendingPages() >= count - pool_.freePageCount())
-      return Shortfall::Pending;
-    switch (evictOneKvBlock()) {
-    case Eviction::Evicted:
-      continue;
-    case Eviction::Pending:
-      return Shortfall::Pending;
-    case Eviction::None:
-      // Restores in flight hold their blocks out of the orders; when they
-      // land those blocks are leaves with disk copies, free to give up.
-      return transfersInFlight() ? Shortfall::Pending : Shortfall::Exhausted;
-    }
-  }
-  return Shortfall::Covered;
-}
-
-Cache::Eviction Cache::evictOneKvBlock() {
-  uint64_t previous = 0;
-  while (auto candidate = kv_.evictionCandidate(previous)) {
-    previous = candidate->id;
-    switch (reclaimKvLeaf(candidate->id)) {
-    case LeafReclaim::Started:
-      return Eviction::Evicted;
-    case LeafReclaim::Pending:
-      // The ring, the quota or the state write is busy for every leaf
-      // alike; scanning on would only find the same answer.
-      return Eviction::Pending;
-    case LeafReclaim::Impossible:
-      break;
-    }
-  }
-  return Eviction::None;
 }
 
 // Reclaim: one victim at a time in the shared recency order, states and
@@ -349,17 +316,12 @@ Cache::Eviction Cache::evictOneKvBlock() {
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint, bool keepRunway) {
-  // Empty backing that is waiting behind an in-flight release will satisfy
-  // part of the target by itself; evicting more cache now would only
-  // discard reusable prefixes without returning memory any sooner. Pages
-  // whose copies are being written count the same way.
-  if (releaseDeferred())
-    return 0;
+  // Pages whose copies are being written count toward the target.
   uint64_t released = reclaimEmptyExtents(keepRunway);
   auto needsMore = [&] { return !reclaimMet(released, targetBytes, evictAll); };
-  while (needsMore() && !releaseDeferred()) {
+  while (needsMore()) {
     const CacheReclaimResult result = reclaimOne(
-        CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway);
+        CacheReclaimMode::ReleaseExtents, keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -369,10 +331,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway) {
-  if (mode == CacheReclaimMode::ReleaseBacking) {
-    if (releaseDeferred())
-      return {};
-    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway))
+  if (mode == CacheReclaimMode::ReleaseExtents) {
+    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway, 1))
       return {true, bytes};
   }
 
@@ -392,7 +352,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   }
 
   // Then oldest first across both kinds. A state whose write must wait for
-  // the one in flight stays, as does a KV leaf the ring cannot take now; the
+  // the one in flight stays, as does a KV leaf the tier cannot take now; the
   // other kind may still give, and the next pass takes what waited.
   std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate(keepResumePoint, false);
@@ -407,8 +367,8 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
     }
     switch (reclaimKvLeaf(kv->id)) {
     case LeafReclaim::Started:
-      return {true, mode == CacheReclaimMode::ReleaseBacking
-                        ? reclaimEmptyExtents(keepRunway)
+      return {true, mode == CacheReclaimMode::ReleaseExtents
+                        ? reclaimEmptyExtents(keepRunway, 1)
                         : 0};
     case LeafReclaim::Pending:
       kvOpen = false;
@@ -423,11 +383,36 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   return {false, 0, transfersInFlight()};
 }
 
+CacheReclaimResult Cache::reclaimForPages(uint32_t pages) {
+  CacheReclaimResult total;
+  while (pool_.freePageCount() + pendingPages() < pages) {
+    const CacheReclaimResult step = reclaimOne(CacheReclaimMode::KeepExtents);
+    if (!step.madeProgress) {
+      total.pending = step.pending;
+      break;
+    }
+    total.madeProgress = true;
+    total.reclaimedBytes += step.reclaimedBytes;
+    if (step.reclaimedBytes)
+      break;
+  }
+  return total;
+}
+
 bool Cache::reclaimOneState(bool checkpointsOnly) {
   const std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate();
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
          states_.reclaim(state->id, completionNotifier_, makeRoom_).evicted;
+}
+
+CacheReclaimResult Cache::reclaimStateForLane() {
+  const std::optional<CacheEvictionCandidate> state = states_.evictionCandidate();
+  if (!state)
+    return {false, 0, transfersInFlight()};
+  const StateEviction eviction =
+      states_.reclaim(state->id, completionNotifier_, makeRoom_, true);
+  return {eviction.evicted, eviction.reclaimedBytes, eviction.pending};
 }
 
 std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const {
@@ -440,18 +425,9 @@ std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after) const 
 }
 
 Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block) {
-  // While the KV can stay on disk, through the block's copy or a write the
-  // tier still takes, a state in RAM goes first: to disk when the tier takes
-  // it, away otherwise. Else it leaves with the leaf below, as without a
-  // tier, rather than being written for nothing. A state already on disk
-  // costs nothing and stays; one whose write must wait keeps its leaf until
-  // then.
-  if (states_.resident(block) && (kv_.slot(block) || kvTierWritable())) {
-    const StateEviction eviction =
-        states_.reclaim(block, completionNotifier_, makeRoom_, true);
-    if (!eviction.evicted)
-      return eviction.pending ? LeafReclaim::Pending : LeafReclaim::Impossible;
-  }
+  // No state in RAM sits on the leaf (oldestKvLeaf): one went first, in the
+  // order every victim goes in. A state already on disk costs nothing and
+  // stays while the leaf has a disk copy.
   if (kv_.slot(block)) {
     kv_.dropPage(block);
     return LeafReclaim::Started;
@@ -503,10 +479,10 @@ void Cache::dropPoisoned() {
   });
 }
 
-uint64_t Cache::reclaimEmptyExtents(bool keepRunway) {
-  const uint64_t before = pool_.residentBackingBytes();
-  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway));
-  const uint64_t after = pool_.residentBackingBytes();
+uint64_t Cache::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
+  const uint64_t before = pool_.allocatedBytes();
+  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway, limit));
+  const uint64_t after = pool_.allocatedBytes();
   return before >= after ? before - after : 0;
 }
 
@@ -523,22 +499,6 @@ bool Cache::reclaimMet(uint64_t releasedBytes, uint64_t targetBytes,
   return !evictAll && releasedBytes + pendingBytes() >= targetBytes;
 }
 
-bool Cache::releaseDeferred() const noexcept {
-  return pool_.reclaimableExtentCount() > 0 && !pool_.releaseReady();
-}
-
-bool Cache::releasePending() const noexcept {
-  return !pool_.releaseReady();
-}
-
-uint64_t Cache::releaseGeneration() const noexcept {
-  return pool_.releaseGeneration();
-}
-
-void Cache::releaseUnusedKvBacking() {
-  while (pool_.reclaimEmptyExtents(true))
-    pool_.awaitRelease();
-}
 
 // Disk tier: restores and demotions in flight, the quota they draw on, and
 // states promoted back into RAM.
@@ -555,29 +515,12 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   const auto firstOnDisk = std::find(chain.pages.begin(), chain.pages.end(), KvCache::noPage);
   const auto missing = static_cast<uint32_t>(chain.pages.end() - firstOnDisk);
   std::vector<uint32_t> fresh;
-  // The last resident block has only disk children, so it is a leaf the
-  // eviction that makes room could drop; it stays until its child is adopted.
-  uint64_t extended = 0;
   if (missing) {
     if (!tier_)
       throw std::logic_error("disk-only KV block without a disk tier");
-    if (firstOnDisk != chain.pages.begin()) {
-      extended = chain.blocks[firstOnDisk - chain.pages.begin() - 1];
-      kv_.retainActive(extended);
-    }
-    TokenAdmission admission;
-    try {
-      admission = admitPages(missing, fresh);
-    } catch (...) {
-      if (extended)
-        kv_.releaseActive(extended);
-      throw;
-    }
-    if (!admission.granted()) {
-      if (extended)
-        kv_.releaseActive(extended);
+    const TokenAdmission admission = admitPages(missing, fresh);
+    if (!admission.granted())
       return admission;
-    }
   }
   std::vector<uint32_t> retained;
   retained.reserve(chain.pages.size());
@@ -606,16 +549,12 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     for (uint32_t page : fresh)
       pool_.releasePage(page, false);
     kv_.releaseActive(chain.blocks.back());
-    if (extended)
-      kv_.releaseActive(extended);
     active.pendingRestores = 0;
     throw;
   }
-  if (extended)
-    kv_.releaseActive(extended);
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
-  ++active.pageTableRevision;
+  pagesChanged(active, 0);
   return {};
 }
 
@@ -665,9 +604,9 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
     ++kvTier_.demotionsRefused;
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   }
-  // A quota or a ring that only transfers in flight can release is worth
-  // waiting for; one that nothing will free is not, and the leaf goes.
-  std::shared_ptr<model::KvDiskSlot> slot = acquireDiskSlot();
+  // Room in the quota or the tier that transfers in flight will free is
+  // worth waiting for; room that nothing will free is not, and the leaf goes.
+  std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot();
   if (!slot)
     return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible;
   // Making room may have taken the states the leaf was kept for; it then
@@ -685,7 +624,7 @@ Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
   return LeafReclaim::Started;
 }
 
-std::shared_ptr<model::KvDiskSlot> Cache::acquireDiskSlot() {
+std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot() {
   for (;;) {
     if (auto slot = tier_->acquireSlot())
       return slot;

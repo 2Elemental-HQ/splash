@@ -98,19 +98,15 @@ public:
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
-  // Runs only at a command-completion safe point. Reclaim order follows
-  // ownership and preserves reusable prefixes for as long as possible: idle
-  // model state, unused KV backing, disposable checkpoints, then ordinary
-  // state/KV in LRU order.
-  // Live command buffers are never eviction candidates. Physical KV release
-  // is paced one extent at a time; reclaimDeferred() reports that the pass
-  // stopped behind an in-flight release and should run again shortly. The
-  // result says whether the directive's target is met, waits for transfers
-  // or a release in flight, or finds nothing left to reclaim.
+  // Runs only between commands: throws std::logic_error while a command is
+  // in flight. Reclaim order follows ownership and preserves reusable
+  // prefixes for as long as possible: idle model state, empty KV extents,
+  // disposable checkpoints, then ordinary state/KV in LRU order.
+  // Live command buffers are never eviction candidates. A pass first collects
+  // the transfers that landed, so one that continues a reclaim they held back
+  // takes what they freed. The result says whether the directive's target is
+  // met, waits for transfers in flight, or finds nothing left to reclaim.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
-  [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return cache_.releaseDeferred();
-  }
 
 private:
   struct Failure final {
@@ -179,7 +175,6 @@ private:
     std::optional<Restore> restore;
   };
 
-  // An empty plan carries only KV copies for the disk tier.
   struct Pending final {
     BatchPlan plan;
     std::unique_ptr<ModelBatchTicket> ticket;
@@ -223,10 +218,14 @@ private:
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
                                  double nowMilliseconds);
-  [[nodiscard]] CacheReclaimResult reclaimForGrowth(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
-  [[nodiscard]] bool reclaimIdleState() noexcept;
-  [[nodiscard]] CacheReclaimResult reuseIdleBackingWhilePaused(
+  // The reclaim steps for a lane's state and for KV pages the governor
+  // denied. Idle memory of the kind denied stays for it to reuse; idle memory
+  // of the other kind is released first.
+  [[nodiscard]] CacheReclaimResult reclaimForState();
+  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages);
+  [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
+  [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
       const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
@@ -235,9 +234,6 @@ private:
     // On its way back: pages whose copies are being written, or a reclaim
     // that waits for the transfer in flight. The lane waits; nobody yields.
     bool pending = false;
-    // Still moving: a release or a reclaim in progress, or a budget that
-    // can recover. Waiting or yielding beats failing.
-    bool retryable = false;
   };
   struct KvAdmission {
     TokenAdmission allocation;
@@ -246,16 +242,14 @@ private:
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory, growth is
-  // paused or the budget may recover, a running lane yields its memory and
-  // a lane being admitted waits.
+  // paused or the host is short of memory, a running lane yields its memory
+  // and a lane being admitted waits.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one page admission, reclaiming cache between attempts while that
   // makes progress.
   [[nodiscard]] KvAdmission admitKv(const std::function<TokenAdmission()> &attempt);
-  [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
-                                      uint64_t generation, bool reclaimed) const;
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         metal::AllocationFailure failure,
                         double nowMilliseconds);

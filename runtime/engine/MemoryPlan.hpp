@@ -18,6 +18,14 @@ deviceStatusJson(const DeviceCapabilities &device);
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
+// The pages of the KV runway in extents of extentPages pages: the whole
+// extents that hold the pages startup warmup runs on, which the KV pool
+// allocates when it is built.
+[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
+  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
+         extentPages * extentPages;
+}
+
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.
@@ -30,10 +38,10 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  // Metal staging of the disk tier's KV transfers, set aside whenever
-  // --max-cache-disk is set, even if the tier then fails to start; zero
-  // without the flag.
-  uint64_t kvStagingBytes = 0;
+  // The buffer a state's write to the disk tier stages through, set aside
+  // when the tier's state file opened (a quota that holds one state); zero
+  // otherwise.
+  uint64_t stateStagingBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -113,27 +121,27 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  uint64_t kvStagingBytes = 0;
+  uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
-  // All active state cells, cached composite states, and physical KV
-  // extents grow from this one governor-controlled byte budget. None is
-  // preallocated merely because the address space exists.
+  // All active state cells, cached composite states, and KV extents grow
+  // from this one governor-controlled byte budget; none is preallocated.
   uint64_t dynamicBudgetBytes = 0;
 
   uint32_t kvPageTokens = 0;
   uint64_t kvPageBytes = 0;
-  // Number of logical Page32 blocks mapped in one Metal sparse-buffer
-  // operation. This is allocation alignment, never the cache block size.
-  uint32_t kvSparseMappingBatchPages = 0;
+  // The pool grows and shrinks in extents of kvExtentPages pages, a size
+  // chosen for this pool (kv::Layout::extentPagesFor). This is allocation
+  // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
   uint64_t kvExtentBytes = 0;
-  // Derived from the device's maximum Metal buffer length. Request context
-  // and four-lane execution are independent policy limits.
-  uint32_t maximumKvPages = 0;
-  uint32_t kvVirtualPages = 0;
-  uint64_t kvVirtualBytes = 0;
-  uint64_t kvVirtualTokens = 0;
+  // One request's KV capacity: the whole extents its KV can use within the
+  // budget beside one state cell. The pool's page ids cover more
+  // (RuntimeResources sizes them by the hard budget). Request context and
+  // four-lane execution are independent policy limits.
+  uint32_t kvCapacityPages = 0;
+  uint64_t kvCapacityBytes = 0;
+  uint64_t kvCapacityTokens = 0;
 
   uint64_t minimumDynamicBytes = 0;
   uint64_t minimumRequiredBytes = 0;
@@ -160,9 +168,9 @@ public:
   [[nodiscard]] const EngineMemoryBreakdown &breakdown() const noexcept {
     return breakdown_;
   }
-  // Stable per-request ceiling advertised by the runtime. The physical KV
-  // pool is shared dynamically, but one admitted request is never promised
-  // more than either the model supports or the complete pool can hold.
+  // Stable per-request ceiling advertised by the runtime: never more than the
+  // model supports or one request's KV capacity holds (less the speculative
+  // scratch); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // The ceiling this plan would advertise with at most memoryBytes, within
   // its configured limit; zero when one request cannot fit there.

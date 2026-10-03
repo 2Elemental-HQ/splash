@@ -1,5 +1,4 @@
 #include "model/Runtime.hpp"
-#include "model/KvPageTier.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -22,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -237,29 +237,26 @@ struct Runtime::Impl {
     bool draftComputed = false;
   };
 
+  // What a lane's GPU table was last written from. Its entries stay valid
+  // while the revision does: KvPool never releases the extent of a page a
+  // request holds (PageStorage::releaseExtent).
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
-    uint32_t entries = 0;
   };
 
   MetalBackend &backend;
-  metal::AllocationAdmission admitAllocation;
   const ModelPackage &package;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
-  KvPageTier *kvTier;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
   std::unordered_map<uint64_t, Request> requests;
   // Allocated for image cache misses and reclaimable once pending encodes
   // finish. Injecting already encoded rows needs no vision arena.
   std::unique_ptr<ops::Vision> vision;
-  // Image buffers owned by the current admission attempt until a state cell
-  // is activated. Failed attempts leave no image allocations behind.
-  std::unordered_map<uint64_t, std::vector<ImageState>> stagedImages;
   // Encoded rows retained for reuse, including prefix hits that land inside
   // an image and still need its remaining rows. Byte-bounded LRU; the memory
   // reclaimer drops it entirely.
@@ -280,13 +277,11 @@ struct Runtime::Impl {
   DFlashDraft draftModel;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
-        admitAllocation(std::move(value.admitAllocation)),
         package(value.package),
         geometry(RuntimeGeometry::from(value.package, value.kvPages.layout().format)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(requireQwenStateStorage(value.stateStorage)),
-        kvTier(value.kvTier),
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
@@ -298,9 +293,6 @@ struct Runtime::Impl {
                         },
                         value.package.target)),
         draftModel(value.package.draft, value.backend, operators) {
-    if (!admitAllocation)
-      throw std::invalid_argument(
-          "model runtime requires allocation admission");
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -391,20 +383,11 @@ struct Runtime::Impl {
   // dropping their entry frees nothing until that request ends.
   [[nodiscard]] bool
   embeddingsHeld(const MetalBuffer &embeddings) const noexcept {
-    auto holds = [&](const std::vector<ImageState> &images) {
-      for (const ImageState &image : images) {
+    for (const auto &[_, entry] : requests) {
+      for (const ImageState &image : entry.images) {
         if (image.data && image.data->embeddings.sameView(embeddings))
           return true;
       }
-      return false;
-    };
-    for (const auto &[_, images] : stagedImages) {
-      if (holds(images))
-        return true;
-    }
-    for (const auto &[_, entry] : requests) {
-      if (holds(entry.images))
-        return true;
     }
     return false;
   }
@@ -420,29 +403,29 @@ struct Runtime::Impl {
     return released;
   }
 
-  struct ImageAdmission final {
+  // Drops the encoder a start built unless the start completes: an
+  // admission granted it, but a later step of the start threw.
+  struct VisionRollback final {
     Impl &runtime;
-    uint64_t requestId;
     bool hadVision;
     bool committed = false;
-
-    ImageAdmission(Impl &owner, uint64_t id)
-        : runtime(owner), requestId(id), hadVision(bool(owner.vision)) {}
-    ~ImageAdmission() {
-      if (!committed) {
-        runtime.stagedImages.erase(requestId);
-        if (!hadVision)
-          runtime.vision.reset();
-      }
+    ~VisionRollback() {
+      if (!committed && !hadVision)
+        runtime.vision.reset();
     }
   };
 
-  // Admits the memory an image request needs before its state cell: the
-  // shared vision scratch and per-image pixel and embedding buffers, all
-  // through the governor, preserving the allocation refusal reason.
-  metal::AllocationResult stageImages(const ModelRequest &request) {
-    if (request.images.empty() || stagedImages.contains(request.id))
-      return true;
+  // A request's lane with everything else its start allocates, in one
+  // admission: the shared vision scratch when no encoder exists and the
+  // pixel and embedding buffers of the images not yet encoded. At the budget
+  // the engine retries a denied start after each reclaim step, and a denial
+  // builds nothing, so no encoder arena, image buffer or state cell is built
+  // and dropped every time. The refusal keeps its cause; a grant hands the
+  // request's images to `images`.
+  metal::AllocationResult activate(const ModelRequest &request, uint32_t slot,
+                                   std::vector<ImageState> &images) {
+    if (request.images.empty())
+      return states.tryActivateSlot(slot, request.id);
     // The engine rejects image requests at submission when there is no vision.
     if (!package.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
@@ -473,28 +456,13 @@ struct Runtime::Impl {
                                package.vision.tensors.layout,
                                maximumImagePatches)
                          : 0;
-    // At the budget the engine retries a denied admission after each reclaim
-    // step. Checking the whole attempt first, with the GDN cells and draft
-    // ring the lane needs beyond the idle pool, keeps a denial from building
-    // and dropping the encoder arena and image buffers every time.
-    if (bytes) {
-      if (auto admission = admitAllocation(
-              encoderBytes + bytes + states.activationBytes(), [] {});
-          !admission)
-        return admission;
-    }
-    if (encoderBytes) {
-      std::unique_ptr<ops::Vision> candidate;
-      const auto admission = admitAllocation(encoderBytes, [&] {
-        candidate = std::make_unique<ops::Vision>(
-            backend, package.vision.tensors, maximumImagePatches);
-      });
-      if (!admission)
-        return admission;
-      vision = std::move(candidate);
-    }
+    std::unique_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
-    const auto allocateImages = [&] {
+    const auto allocate = [&] {
+      if (encoderBytes) {
+        encoder = std::make_unique<ops::Vision>(
+            backend, package.vision.tensors, maximumImagePatches);
+      }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
         if (!image.data->embeddings) {
@@ -508,22 +476,20 @@ struct Runtime::Impl {
         pixels += span.pixelBytes();
       }
     };
-    if (bytes) {
-      if (auto admission = admitAllocation(bytes, allocateImages); !admission)
-        return admission;
-    }
-    stagedImages.emplace(request.id, std::move(staged));
-    return true;
+    if (auto admission = states.tryActivateSlot(slot, request.id,
+                                                encoderBytes + bytes, allocate);
+        !admission)
+      return admission;
+    if (encoder)
+      vision = std::move(encoder);
+    images = std::move(staged);
+    return {};
   }
 
-  // Hands an admitted request its staged images. Only then do its embedding
-  // cache hits count as reuses; the engine retries denied admissions.
-  void takeStagedImages(Request &entry) {
-    const auto staged = stagedImages.find(entry.id);
-    if (staged == stagedImages.end())
-      return;
-    entry.images = std::move(staged->second);
-    stagedImages.erase(staged);
+  // Gives an admitted request its images. Only an admitted request's cache
+  // hits count as reuses; the engine retries denied admissions.
+  void adoptImages(Request &entry, std::vector<ImageState> images) {
+    entry.images = std::move(images);
     for (auto image = entry.images.begin(); image != entry.images.end();
          ++image) {
       const bool repeated = std::any_of(
@@ -535,8 +501,6 @@ struct Runtime::Impl {
   }
 
   [[nodiscard]] bool visionIdle() const noexcept {
-    if (!stagedImages.empty())
-      return false;
     for (const auto &[_, entry] : requests) {
       for (const ImageState &image : entry.images) {
         if (image.data && !image.data->encoded && image.data->embeddings)
@@ -604,36 +568,38 @@ struct Runtime::Impl {
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
     add(kvPages.actualAllocatedBytes(), "warmup KV pool");
-    add(kvTier ? kvTier->actualAllocatedBytes() : 0, "warmup KV staging");
     add(pipelineReserveBytes, "warmup pipeline reserve");
     add(runtimeOverheadReserveBytes, "warmup runtime reserve");
     return result;
-  }
-
-  void copyPageTable(const MetalBuffer &destination,
-                     std::span<const uint32_t> pages) const {
-    if (pages.empty() || pages.size() > kMaximumPageTableEntries) {
-      throw std::invalid_argument("request page table has invalid length");
-    }
-    auto *target = contents<uint32_t>(destination, "request page table");
-    std::copy(pages.begin(), pages.end(), target);
   }
 
   [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
                                                   const ModelBatchItem &item) {
     if (entry.slot >= pageTableBindings.size())
       throw std::out_of_range("request state slot is outside page tables");
+    if (item.pageTable.empty() ||
+        item.pageTable.size() > kMaximumPageTableEntries) {
+      throw std::invalid_argument("request page table has invalid length");
+    }
+    if (!item.pageTableRevision)
+      throw std::invalid_argument("request page table has no revision");
     PageTableBinding &binding = pageTableBindings[entry.slot];
     MetalBuffer destination =
         decodeArena->get(entry.slot, DecodeTensor::PageTable);
-    const bool unversioned = item.pageTableRevision == 0;
-    if (unversioned || binding.requestId != entry.id ||
-        binding.revision != item.pageTableRevision ||
-        binding.entries != item.pageTable.size()) {
-      copyPageTable(destination, item.pageTable);
-      binding = {entry.id, item.pageTableRevision,
-                 static_cast<uint32_t>(item.pageTable.size())};
+    // Rewrite only what changed since the table was written: nothing at the
+    // same revision, the entries from the first changed page on at the next
+    // one, and everything after two changes or for another request.
+    const auto size = static_cast<uint32_t>(item.pageTable.size());
+    uint32_t first = 0;
+    if (binding.requestId == entry.id) {
+      if (binding.revision == item.pageTableRevision)
+        first = size;
+      else if (binding.revision + 1 == item.pageTableRevision)
+        first = std::min(item.pageTableFirstChanged, size);
     }
+    if (first < size)
+      kvPages.writeEntries(item.pageTable, first, destination);
+    binding = {entry.id, item.pageTableRevision};
     return destination;
   }
 
@@ -806,7 +772,8 @@ struct Runtime::Impl {
                                   uint32_t chunkTokens, uint32_t chunkStride,
                                   std::span<const uint32_t> pages) const {
     return ops::PagedAttention::prefillParams(
-        logicalPosition, chunkTokens, chunkStride, pages, kvPages.pageCount());
+        logicalPosition, chunkTokens, chunkStride,
+        static_cast<uint32_t>(pages.size()));
   }
 
   struct PackedPrefillSequence final {
@@ -1056,14 +1023,10 @@ struct Runtime::Impl {
     buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
     buffers.chunkValues = p(PrefillTensor::ChunkValues);
     buffers.moe = prefillArena->moeScratch();
-    std::vector<kv::LayerStorage> kvLayers(
-        geometry.target.kvLayout.attentionLayers);
-    for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
-      kvLayers[layer] = kvPages.layer(layer);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvLayers);
+        kvPages.layers());
     addPackedDraftContext(graph, batch);
 
     for (const PackedPrefillSequence &sequence : batch.sequences) {
@@ -1293,8 +1256,7 @@ struct Runtime::Impl {
                           item.pageTable);
       verify[lane] = kv::q8VerifyAttentionParams(
           q8[lane].committed_tokens, q8[lane].chunk_tokens,
-          q8[lane].chunk_stride, q8[lane].page_table_entries,
-          q8[lane].physical_page_count);
+          q8[lane].chunk_stride, q8[lane].page_table_entries);
       if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
         throw std::invalid_argument("invalid batched KV verify geometry");
       Request &entry = laneEntry(entries, lane);
@@ -1316,16 +1278,14 @@ struct Runtime::Impl {
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
           DecodeTensor::VerifyBetaBase, layer, storage);
     }
-    std::vector<kv::LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkKeysBase, layer, storage);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
-      kvLayers[layer] = kvPages.layer(layer);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
-                          lanes, stats);
+    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(), q8,
+                          verify, lanes, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1565,36 +1525,12 @@ struct Runtime::Impl {
     return results;
   }
 
-  // Every asynchronous command the runtime submits goes through here and
-  // carries the KV copies queued so far. The engine sends a copy-only command
-  // only when no batch runs, so a command without them would leave a restore
-  // or demotion waiting for as long as the model stays busy.
-  CommandTicket submitWithCopies(CommandGraph &graph,
-                                 std::function<void()> completion) {
-    // The copies are reported before the engine wakes, so the tick the wake
-    // starts can retire their batch in poll().
-    std::function<void()> report = kvTier ? kvTier->encode(graph) : nullptr;
-    return backend.submitCommandAsync(
-        graph.dispatches(),
-        [report = std::move(report),
-         completion = std::move(completion)](uint64_t) {
-          if (report)
-            report();
-          if (completion)
-            completion();
-        });
-  }
-  [[nodiscard]] bool copiesQueued() const noexcept {
-    return kvTier && kvTier->copiesQueued();
-  }
-
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
   // scheduler batch (and therefore its DecodeArena lanes) owned across that
   // dependency.  All state transitions run on the engine thread; completion
-  // handlers only report their KV copies and wake it, so they capture the
-  // wake hook and never the ticket.
+  // handlers only wake it, so they capture the wake hook and never the ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
@@ -1602,7 +1538,7 @@ struct Runtime::Impl {
                             std::span<const ModelBatchItem> items,
                             const ops::LinearDispatchStats &stats,
                             uint32_t planWidth, CommandTiming priorTiming,
-                            CommandGraph &draft,
+                            const CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), results_(std::move(results)),
           items_(items.begin(), items.end()), stats_(stats),
@@ -1759,11 +1695,12 @@ struct Runtime::Impl {
       Done
     };
 
-    void submit(CommandGraph &graph) {
-      command_ = impl_.submitWithCopies(graph, [wake = wake_] {
-        if (*wake)
-          (*wake)();
-      });
+    void submit(const CommandGraph &graph) {
+      command_ = impl_.backend.submitCommandAsync(
+          graph.dispatches(), [wake = wake_](uint64_t) {
+            if (*wake)
+              (*wake)();
+          });
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -1795,10 +1732,6 @@ Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
-bool Runtime::needsHealthCheck() const noexcept {
-  return impl_->backend.needsHealthCheck();
-}
-
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateSlot) {
   if (auto admission = beginAt(request, stateSlot); !admission) {
@@ -1818,13 +1751,10 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
-  Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
-    if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
-      return imageAdmission;
-    return beginAt(request, slot);
-  });
-  images.committed = admission.granted();
+  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
+  StateAdmission admission = admitIdleSlot(
+      impl_->states, [&](uint32_t slot) { return beginAt(request, slot); });
+  rollback.committed = admission.granted();
   return admission;
 }
 
@@ -1834,7 +1764,6 @@ void Runtime::suspend(uint64_t requestId) {
     throw std::logic_error("Qwen request cannot be suspended");
   }
   impl_->states.releaseSlot(entry.slot, requestId);
-  static_cast<void>(impl_->states.releaseIdle(0, 0));
   impl_->pageTableBindings[entry.slot] = {};
   entry.images.clear();
   entry.draftContextPlan.reset();
@@ -1853,20 +1782,18 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
-  Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission =
-      admitIdleSlot(impl_->states, [&](uint32_t slot) {
-        if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
-          return imageAdmission;
-        return impl_->states.tryActivateSlot(slot, request.id);
-      });
+  Impl::VisionRollback rollback{*impl_, bool(impl_->vision)};
+  std::vector<Impl::ImageState> images;
+  StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
+    return impl_->activate(request, slot, images);
+  });
   if (admission.granted()) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
-    impl_->takeStagedImages(entry);
+    impl_->adoptImages(entry, std::move(images));
   }
-  images.committed = admission.granted();
+  rollback.committed = admission.granted();
   return admission;
 }
 
@@ -1923,12 +1850,12 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
-  if (auto admission = impl_->states.tryActivateSlot(stateSlot, request.id);
-      !admission)
+  std::vector<Impl::ImageState> images;
+  if (auto admission = impl_->activate(request, stateSlot, images); !admission)
     return admission;
   entry.slot = stateSlot;
   entry.resident = true;
-  impl_->takeStagedImages(entry);
+  impl_->adoptImages(entry, std::move(images));
   try {
     auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
     if (!inserted) {
@@ -1938,7 +1865,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
     impl_->states.releaseSlot(stateSlot, request.id);
     throw;
   }
-  return true;
+  return {};
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
@@ -2052,7 +1979,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
+  auto notify = [completion = std::move(completion)](uint64_t) {
+    if (completion)
+      completion();
+  };
+  CommandTicket command =
+      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2342,29 +2274,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 planWidth, timing);
   };
 
-  // A mask stage encodes no work; while copies are queued it still submits a
-  // command for them, and the plan finishes with that command.
-  if (commandGraph.empty() && !impl_->copiesQueued()) {
+  if (commandGraph.empty()) {
     std::vector<ModelStepResult> ready = finish(CommandTiming{});
     return std::make_unique<ReadyModelTicket>(std::move(ready),
                                               priorTiming.wallSeconds * 1000.0);
   }
 
-  CommandTicket command =
-      impl_->submitWithCopies(commandGraph, std::move(completion));
+  auto notify = [completion = std::move(completion)](uint64_t) {
+    if (completion)
+      completion();
+  };
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      commandGraph.dispatches(), std::move(notify));
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), priorTiming.wallSeconds * 1000.0);
-}
-
-std::unique_ptr<ModelBatchTicket>
-Runtime::submitTransfers(std::function<void()> completion) {
-  if (!impl_->copiesQueued())
-    return nullptr;
-  CommandGraph graph;
-  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(
-      std::move(command),
-      [](CommandTiming) { return std::vector<ModelStepResult>{}; });
 }
 
 uint32_t Runtime::committedStateSlot(uint64_t requestId) {
@@ -2392,17 +2315,15 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(committedStateSlot(requestId), std::move(completion));
 }
 
+uint32_t Runtime::statesToActivate() const noexcept {
+  return impl_->states.statesToActivate();
+}
+
 uint64_t Runtime::reclaimIdleState(bool keepLane) noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool has nothing more to give.
-  const uint32_t keptCells = keepLane ? QwenStateStorage::kLaneCells : 0;
-  const uint32_t keptRings = keepLane ? 1 : 0;
-  const uint32_t cells = impl_->states.idleCells();
-  const uint32_t rings = impl_->states.idleRings();
-  if (cells > keptCells)
-    return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings > keptRings)
-    return impl_->states.releaseIdle(cells, rings - 1);
+  if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
+    return buffer;
   uint64_t released = 0;
   released += impl_->dropEmbeddingCache();
   if (impl_->vision && impl_->visionIdle()) {
@@ -2448,7 +2369,6 @@ void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
 }
 
 void Runtime::end(uint64_t requestId) {
-  impl_->stagedImages.erase(requestId);
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
     return;
@@ -2456,6 +2376,7 @@ void Runtime::end(uint64_t requestId) {
     impl_->retainEmbeddings(image);
   if (found->second.resident) {
     impl_->states.releaseSlot(found->second.slot, requestId);
+    impl_->pageTableBindings[found->second.slot] = {};
   }
   impl_->requests.erase(found);
 }
@@ -2473,22 +2394,26 @@ WarmupStepResult warmupResult(uint64_t estimatedPeakBytes, double wallSeconds,
   return {true, estimatedPeakBytes, std::move(detail), wallSeconds, {}};
 }
 
-std::vector<uint32_t> warmupPages(kv::PageStorage &storage, uint32_t first,
-                                  uint32_t count) {
-  if (!count || uint64_t{first} + count > storage.pageCount()) {
-    throw std::invalid_argument("warmup KV page range is unavailable");
-  }
-  std::vector<uint32_t> result(count);
-  for (uint32_t index = 0; index < count; ++index) {
-    const uint32_t page = first + index;
-    if (auto admission = storage.ensureResident(page); !admission) {
-      throw metal::MetalAllocationError(
-          std::string("warmup could not reserve KV page backing: ") +
-              metal::allocationFailureName(admission.failure), admission.failure);
+// Warmup runs on the startup runway the engine's KV pool allocated
+// (ExecutionLimits::warmupKvPages); it never allocates KV.
+void requireRunwayPages(const kv::PageStorage &storage,
+                        std::span<const uint32_t> pages) {
+  for (uint32_t page : pages) {
+    if (page >= ExecutionLimits::warmupKvPages || !storage.isAllocated(page)) {
+      throw std::logic_error("warmup KV page " + std::to_string(page) +
+                             " is outside the startup runway");
     }
-    result[index] = page;
   }
-  return result;
+}
+
+// A warmup request's batch item. Each warmup residency keeps one page list,
+// so its revision stays 1.
+ModelBatchItem warmupItem(uint64_t id, uint32_t slot, uint64_t position,
+                          uint32_t promptOffset, uint32_t tokens,
+                          std::span<const uint32_t> pages) {
+  ModelBatchItem item{id, slot, position, promptOffset, tokens, pages};
+  item.pageTableRevision = 1;
+  return item;
 }
 
 } // namespace
@@ -2520,13 +2445,14 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   request.maxNewTokens = 16;
   beginColdRequest(request, 0);
   try {
-    std::vector<uint32_t> pages = warmupPages(
-        impl_->kvPages, 0, (rows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::vector<uint32_t> pages((rows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::iota(pages.begin(), pages.end(), 0u);
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{WorkKind::Prefill,
                    BatchCohort::Greedy,
                    {{id, rows}},
                    DecodeStage::Regular};
-    ModelBatchItem item{id, 0, 0, 0, rows, pages};
+    ModelBatchItem item = warmupItem(id, 0, 0, 0, rows, pages);
     item.inputTokens = request.prompt;
     const auto phaseStart = Clock::now();
     auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -2569,12 +2495,14 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
       beginColdRequest(request, slotOrder[lane]);
-      pages[lane] = warmupPages(impl_->kvPages, 5 + lane, 1);
+      pages[lane] = {5 + lane};
+      requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{WorkKind::Prefill,
                             BatchCohort::Greedy,
                             {{request.id, 1}},
                             DecodeStage::Regular};
-      ModelBatchItem item{request.id, slotOrder[lane], 0, 0, 1, pages[lane]};
+      ModelBatchItem item =
+          warmupItem(request.id, slotOrder[lane], 0, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
       static_cast<void>(
           prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2586,7 +2514,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     std::vector<ModelBatchItem> items;
     for (uint32_t lane = 0; lane < width; ++lane) {
       plan.items.push_back({firstId + lane, 0});
-      items.push_back({firstId + lane, slotOrder[lane], 1, 0, 0, pages[lane]});
+      items.push_back(
+          warmupItem(firstId + lane, slotOrder[lane], 1, 0, 0, pages[lane]));
     }
     const auto phaseStart = Clock::now();
     auto decoded = decode(plan, items);
@@ -2653,19 +2582,20 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
   request.maxNewTokens = 16;
   beginColdRequest(request, 0);
   try {
-    std::vector<uint32_t> pages = warmupPages(impl_->kvPages, 9, 1);
+    const std::vector<uint32_t> pages{9};
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan prefillPlan{WorkKind::Prefill,
                           BatchCohort::Greedy,
                           {{id, 1}},
                           DecodeStage::Regular};
-    ModelBatchItem prefillItem{id, 0, 0, 0, 1, pages};
+    ModelBatchItem prefillItem = warmupItem(id, 0, 0, 0, 1, pages);
     prefillItem.inputTokens = request.prompt;
     static_cast<void>(
         prefill(prefillPlan, std::span<const ModelBatchItem>(&prefillItem, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem{id, 0, 1, 0, 0, pages};
+    ModelBatchItem decodeItem = warmupItem(id, 0, 1, 0, 0, pages);
     auto result =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const auto &lengths = impl_->states.metadata(0).lengths;
@@ -2701,17 +2631,14 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);
   try {
-    if (impl_->kvPages.pageCount() <= 12) {
-      throw std::runtime_error(
-          "historical prefix warmup requires at least 13 KV pages");
-    }
     // Deliberately non-contiguous physical ids exercise page-table lookup.
     const std::vector<uint32_t> pages{12, 10, 11};
+    requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{WorkKind::Prefill,
                    BatchCohort::Greedy,
                    {{id, prefixTokens}},
                    DecodeStage::Regular};
-    ModelBatchItem item{id, 0, 0, 0, prefixTokens, pages};
+    ModelBatchItem item = warmupItem(id, 0, 0, 0, prefixTokens, pages);
     item.inputTokens =
         std::span<const uint32_t>(request.prompt).first(prefixTokens);
     static_cast<void>(prefill(plan, std::span<const ModelBatchItem>(&item, 1)));
@@ -2741,8 +2668,8 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                          BatchCohort::Greedy,
                          {{id, suffixTokens}},
                          DecodeStage::Regular};
-    ModelBatchItem suffix{id,           1,    prefixTokens, prefixTokens,
-                          suffixTokens, pages};
+    ModelBatchItem suffix =
+        warmupItem(id, 1, prefixTokens, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
     static_cast<void>(
@@ -2753,7 +2680,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += continuationWallSeconds;
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem{id, 1, promptTokens, 0, 0, pages};
+    ModelBatchItem decodeItem = warmupItem(id, 1, promptTokens, 0, 0, pages);
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const double historicalDecodeWallSeconds =
@@ -2787,7 +2714,7 @@ ModelMemoryActual Runtime::actualRuntimeMemory() const {
 
 ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
-  result.stateResidentBytes = impl_->states.actualAllocatedBytes();
+  result.stateAllocatedBytes = impl_->states.actualAllocatedBytes();
   result.warmIdleStateCells = impl_->states.idleCells();
   return result;
 }

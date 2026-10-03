@@ -1147,12 +1147,13 @@ class ServerTest(unittest.TestCase):
                     },
                     "kv": {
                         "blocks": 6,
-                        "pages_total": 32,
-                        "pages_free": 24,
+                        "pages_allocated": 8,
                         "pages_active": 4,
                         "pages_cache": 4,
-                        "pages_resident": 8,
-                        "resident_backing_bytes": 8192,
+                        "pages_free": 2,
+                        "allocated_bytes": 8192,
+                        "extent_allocate_max_ms": 2.5,
+                        "extent_release_max_ms": 0.75,
                     },
                     "state": {
                         "entries": 2,
@@ -1226,7 +1227,13 @@ class ServerTest(unittest.TestCase):
             "splash_scheduler_decode_mixed_greedy_sampling_batches_total 2",
             metrics,
         )
-        self.assertIn("splash_kv_pages_free 24", metrics)
+        self.assertIn("splash_kv_pages_allocated 8", metrics)
+        self.assertIn("splash_kv_free_allocated_pages 2", metrics)
+        self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
+        self.assertIn("splash_kv_allocated_bytes 8192", metrics)
+        self.assertIn("splash_kv_extent_allocate_max_milliseconds 2.5", metrics)
+        self.assertIn("splash_kv_extent_release_max_milliseconds 0.75", metrics)
+        self.assertFalse([line for line in metrics if "_max_ms " in line])
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
         self.assertIn("splash_cache_hits_total 7", metrics)
@@ -3655,7 +3662,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             handlers, {signal.SIGTERM: signal.SIG_IGN, signal.SIGINT: signal.SIG_IGN}
         )
-        # While the engine releases its memory, a second Ctrl+C stops it now.
+        # While the engine exits gracefully, a second Ctrl+C stops it now.
         (closing,) = closing_handlers
         self.assertIs(closing[signal.SIGTERM], signal.SIG_IGN)
         runtime.kill.assert_not_called()
@@ -7426,24 +7433,41 @@ class ServerTest(unittest.TestCase):
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 
-    def test_retryable_capacity_failure_maps_to_503(self):
-        runtime = FakeRuntime(
+    def test_capacity_failure_is_a_bad_request_naming_the_limits(self):
+        native = (
+            "could not allocate KV target: engine memory budget exceeded "
+            "(additional_pages=12, free_pages=0)"
+        )
+        capacity = [
             Plan(
                 exception=api.engine_runtime.RequestFailed(
-                    1,
-                    b"capacity_exhausted",
-                    b"system memory pressure is critical",
-                    retryable=True,
+                    1, b"capacity_exhausted", native.encode(), retryable=False
                 )
-            ),
-            Plan([[4]]),
-        )
-        harness = self.harness(runtime)
-        status, _, payload = harness.request(
-            "POST", "/v1/chat/completions", self.body()
-        )
-        self.assertEqual(status, 503)
-        self.assertEqual(json.loads(payload)["error"]["code"], "capacity_exhausted")
+            )
+            for _ in range(2)
+        ]
+        harness = self.harness(FakeRuntime(*capacity, Plan([[4]])))
+        # Retrying fails the same way, so no response invites a retry.
+        for path, body in (
+            ("/v1/chat/completions", self.body()),
+            ("/v1/messages", self.anthropic_body()),
+        ):
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            self.addCleanup(connection.close)
+            connection.request(
+                "POST", path, json.dumps(body), {"Content-Type": "application/json"}
+            )
+            response = connection.getresponse()
+            error = json.loads(response.read())["error"]
+            self.assertEqual(response.status, 400)
+            self.assertIsNone(response.getheader("Retry-After"))
+            self.assertEqual(error["type"], "invalid_request_error")
+            for text in ("--max-memory", "--max-context", native):
+                self.assertIn(text, error["message"])
+            if path == "/v1/chat/completions":
+                self.assertEqual(error["code"], "capacity_exhausted")
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 

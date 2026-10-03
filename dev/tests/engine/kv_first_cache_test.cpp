@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -90,47 +91,6 @@ struct SharedBudget {
   void release(uint64_t bytes) { used -= bytes; }
 };
 
-class BudgetBacking final : public KvBacking {
-public:
-  explicit BudgetBacking(SharedBudget &budget) : budget_(budget) {}
-  ~BudgetBacking() override {
-    for (bool resident : resident_) {
-      if (resident)
-        budget_.release(bytesPerPage());
-    }
-  }
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 100; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    if (isResident(page))
-      return true;
-    if (!budget_.acquire(bytesPerPage()))
-      return false;
-    resident_[page] = true;
-    return true;
-  }
-  bool releaseBackingForPage(uint32_t page) override {
-    if (!isResident(page))
-      return false;
-    resident_[page] = false;
-    budget_.release(bytesPerPage());
-    return true;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    static_cast<void>(resident_.at(page));
-    return page;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    static_cast<void>(resident_.at(page));
-    return 1;
-  }
-
-private:
-  SharedBudget &budget_;
-  std::array<bool, 4> resident_{};
-};
-
 class BudgetState final : public CompositeState {
 public:
   explicit BudgetState(SharedBudget &budget) : budget_(budget) {
@@ -149,21 +109,50 @@ CacheNamespace cacheNamespace() {
   return result;
 }
 
+// Admits pages the way the engine does: each denial makes room in one
+// reclaim step, until the pages fit, a transfer in flight holds what they
+// need, or nothing more can be reclaimed.
+TokenAdmission admitLikeEngine(engine::Cache &cache,
+                               const std::function<TokenAdmission()> &attempt) {
+  TokenAdmission admission = attempt();
+  while (admission.failure == TokenAdmissionFailure::Denied) {
+    const CacheReclaimResult step = cache.reclaimForPages(admission.additionalPages);
+    if (!step.madeProgress) {
+      if (step.pending)
+        admission.failure = TokenAdmissionFailure::Pending;
+      break;
+    }
+    admission = attempt();
+  }
+  return admission;
+}
+
+TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t tokens) {
+  return admitLikeEngine(cache, [&] { return cache.ensureTokens(requestId, tokens); });
+}
+
+TokenAdmission admitRestore(engine::Cache &cache, uint64_t requestId,
+                            const CacheLookup &lookup) {
+  return admitLikeEngine(cache, [&] { return cache.restoreRequest(requestId, lookup); });
+}
+
+// Four pages, all allocated, and a budget of no more.
 struct CacheFixture {
-  test::TestKvBacking backing{4, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{5, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache;
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  explicit CacheFixture(model::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+  explicit CacheFixture(engine::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+    storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
         prompt.push_back(1000 + block * 100 + row);
     }
     prompt.push_back(9999);
     cache.beginRequest(1);
-    require(cache.ensureTokens(1, 128).granted(),
+    require(admitTokens(cache, 1, 128).granted(),
             "fixture KV pages were not acquired");
     static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
     for (uint32_t boundary = 32; boundary <= 128; boundary += 32)
@@ -185,7 +174,7 @@ struct CacheFixture {
 // starts.
 void demoteLeaves(engine::Cache &cache, test::TestKvTier &tier, uint32_t leaves) {
   for (uint32_t i = 0; i < leaves; ++i) {
-    require(cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress,
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
             "KV demotion did not start");
     tier.complete();
     require(cache.pollTransfers(), "KV demotion did not finish");
@@ -205,7 +194,7 @@ void testSchedulingProbeDoesNotChangeCachePolicy() {
   require(cachedTokens(prefix) == 32 && cachedTokens(fixture.prompt) == 128 &&
               fixture.cache.snapshot().stateCache.pinned == 0 &&
               fixture.cache.snapshot().lookup.lookups == 0,
-          "scheduling probe pinned backing or counted a cache hit");
+          "scheduling probe pinned a lease or counted a cache hit");
   require(fixture.cache.reclaimOneState() && cachedTokens(prefix) == 0 &&
               cachedTokens(fixture.prompt) == 128,
           "scheduling probe refreshed the oldest state's eviction order");
@@ -297,21 +286,21 @@ void testProbeFallsBackWhenKvChanges() {
   CacheFixture fixture;
   fixture.publish(0);
   const CacheProbe probe = fixture.cache.probe(fixture.prompt);
-  require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
               fixture.cache.snapshot().kvCache.blocks == 3,
           "KV eviction fixture did not evict the cached tail");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
   require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 32,
           "admission probe reused an evicted KV block");
 
-  test::TestKvBacking backing{1, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{1, 100, 1};
+  KvPool pool{storage, 1};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt(33, 77);
   const CacheProbe cold = cache.probe(prompt);
   require(cold.cachedTokens() == 0, "cold admission probe found cached work");
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, 32).granted(), "new KV page was not acquired");
+  require(admitTokens(cache, 1, 32).granted(), "new KV page was not acquired");
   const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
   cache.publishCompositeState(block, std::make_shared<TestState>(100));
   cache.endRequest(1);
@@ -322,14 +311,14 @@ void testProbeFallsBackWhenKvChanges() {
 }
 
 void testProbeBindsImageIdentity() {
-  test::TestKvBacking backing{1, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{1, 100, 1};
+  KvPool pool{storage, 1};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt(33, 77);
   ImageSpan image{0, 32, 1, 1, 101, 202};
   const std::span<const ImageSpan> images(&image, 1);
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, 32).granted(), "image KV page was not acquired");
+  require(admitTokens(cache, 1, 32).granted(), "image KV page was not acquired");
   const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32, images);
   cache.publishCompositeState(block, std::make_shared<TestState>(100));
   cache.endRequest(1);
@@ -345,10 +334,10 @@ void testProbeBindsImageIdentity() {
 }
 
 void testProbeCannotCrossCaches() {
-  test::TestKvBacking firstBacking{1, 100};
-  test::TestKvBacking secondBacking{1, 100};
-  KvPool firstPool{firstBacking};
-  KvPool secondPool{secondBacking};
+  test::TestKvStorage firstStorage{1, 100, 1};
+  test::TestKvStorage secondStorage{1, 100, 1};
+  KvPool firstPool{firstStorage, 1};
+  KvPool secondPool{secondStorage, 1};
   engine::Cache first{firstPool, cacheNamespace()};
   engine::Cache second{secondPool, cacheNamespace()};
   const std::vector<uint32_t> firstPrompt(33, 11);
@@ -356,7 +345,7 @@ void testProbeCannotCrossCaches() {
   const auto populate = [](engine::Cache &cache,
                            const std::vector<uint32_t> &prompt) {
     cache.beginRequest(1);
-    require(cache.ensureTokens(1, 32).granted(), "KV page was not acquired");
+    require(admitTokens(cache, 1, 32).granted(), "KV page was not acquired");
     const uint64_t block = cache.publishCommittedBlocks(1, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<TestState>(100));
     cache.endRequest(1);
@@ -367,6 +356,60 @@ void testProbeCannotCrossCaches() {
   const auto lookup = second.lookup(firstPrompt, {}, &probe);
   require(lookup.kvBoundary == 0 && lookup.resumeBoundary() == 0,
           "a probe from another cache reused a colliding block id");
+}
+
+// Every change of a request's page list moves its revision by one and says
+// from which page on the list differs: an append from the length it grew
+// from, a written block swapped for the cached page at its index, a restore
+// from the start. A list that stays the same keeps its revision.
+void testPageTableReportsWhatChanged() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  constexpr uint32_t page = KvCache::pageTokens;
+  std::vector<uint32_t> prompt;
+  for (uint32_t token = 0; token <= 2 * page; ++token)
+    prompt.push_back(1000 + token);
+
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, page).granted() && cache.pageTable(1).revision == 1 &&
+              cache.pageTable(1).firstChanged == 0,
+          "a request's first page did not start its revision");
+  require(admitTokens(cache, 1, 2 * page).granted() && cache.pageTable(1).revision == 2 &&
+              cache.pageTable(1).firstChanged == 1 && cache.pageTable(1).pages.size() == 2,
+          "an append did not report the length it grew from");
+  require(admitTokens(cache, 1, page + 1).granted(), "held pages were denied");
+  static_cast<void>(cache.publishCommittedBlocks(1, prompt, 2 * page));
+  require(cache.pageTable(1).revision == 2,
+          "tokens on held pages or a request's own blocks moved its revision");
+  cache.publishCompositeState(cache.blockAt(1, 2 * page), std::make_shared<TestState>(100));
+
+  // A second request writes the same blocks into pages of its own, and
+  // publishing each swaps it for the cached page.
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 2 * page).granted() && cache.pageTable(2).revision == 1,
+          "a second request's pages were denied");
+  static_cast<void>(cache.publishCommittedBlocks(2, prompt, page));
+  require(cache.pageTable(2).revision == 2 && cache.pageTable(2).firstChanged == 0 &&
+              cache.pageTable(2).pages[0] == cache.pageTable(1).pages[0],
+          "the first swapped block did not report its index");
+  static_cast<void>(cache.publishCommittedBlocks(2, prompt, 2 * page));
+  require(cache.pageTable(2).revision == 3 && cache.pageTable(2).firstChanged == 1 &&
+              cache.pageTable(2).pages[1] == cache.pageTable(1).pages[1] &&
+              cache.pageTable(1).revision == 2,
+          "a swapped block did not report its index or moved the writer's revision");
+  cache.endRequest(2);
+  cache.endRequest(1);
+
+  cache.beginRequest(3);
+  require(admitRestore(cache, 3, cache.lookup(prompt)).granted() &&
+              cache.pageTable(3).revision == 1 && cache.pageTable(3).firstChanged == 0 &&
+              cache.pageTable(3).pages.size() == 2,
+          "a restore did not report its whole list");
+  require(admitTokens(cache, 3, prompt.size()).granted() &&
+              cache.pageTable(3).revision == 2 && cache.pageTable(3).firstChanged == 2,
+          "an append after a restore did not report the restored length");
+  cache.endRequest(3);
 }
 
 void testCacheLookupAndOneTokenReplay() {
@@ -475,7 +518,7 @@ void testCheckpointDoesNotOutrankTheResumePoint() {
   fixture.cache.publishCompositeState(fixture.blocks.at(2),
                                       std::make_shared<TestState>(100), true);
   const CacheReclaimResult step =
-      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseBacking, true);
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, true);
   const auto kept = fixture.cache.snapshot().stateCache;
   require(step.madeProgress && kept.entries == 1 && kept.checkpointEntries == 0,
           "a disposable checkpoint outranked the resume point");
@@ -542,7 +585,7 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
           "publication probe did not promote the existing state in LRU");
 }
 
-void testUnifiedRecencyAndPhysicalReclaimAccounting() {
+void testUnifiedRecencyAndReleasedByteAccounting() {
   {
     CacheFixture fixture;
     fixture.publish(0, 150);
@@ -572,20 +615,20 @@ void testUnifiedRecencyAndPhysicalReclaimAccounting() {
 // than the tail, so the unified LRU evicts the state-free tail leaves first
 // and the state only once its own block is the oldest leaf.
 void testFinishedRequestLeavesTailKvBeforeItsState() {
-  test::TestKvBacking backing{4, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt;
   for (uint32_t token = 0; token < 129; ++token)
     prompt.push_back(5000 + token);
 
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, 64).granted(),
+  require(admitTokens(cache, 1, 64).granted(),
           "prefix pages were not acquired");
   static_cast<void>(cache.publishCommittedBlocks(1, prompt, 64));
   const uint64_t stateBlock = cache.blockAt(1, 64);
   cache.publishCompositeState(stateBlock, std::make_shared<TestState>(100));
-  require(cache.ensureTokens(1, 128).granted(), "tail pages were not acquired");
+  require(admitTokens(cache, 1, 128).granted(), "tail pages were not acquired");
   static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
   cache.endRequest(1);
   require(cache.snapshot().kvCache.blocks == 4 &&
@@ -594,7 +637,7 @@ void testFinishedRequestLeavesTailKvBeforeItsState() {
 
   for (uint32_t remaining : {3U, 2U}) {
     const CacheReclaimResult reclaimed =
-        cache.reclaimOne(CacheReclaimMode::ReuseBacking);
+        cache.reclaimOne(CacheReclaimMode::KeepExtents);
     require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
                 cache.snapshot().kvCache.blocks == remaining &&
                 cache.snapshot().stateCache.entries == 1,
@@ -603,13 +646,13 @@ void testFinishedRequestLeavesTailKvBeforeItsState() {
   require(cache.lookup(prompt).resumeBoundary() == 64,
           "state did not survive the eviction of the decode tail");
   const CacheReclaimResult state =
-      cache.reclaimOne(CacheReclaimMode::ReuseBacking);
+      cache.reclaimOne(CacheReclaimMode::KeepExtents);
   require(state.madeProgress && state.reclaimedBytes == 100 &&
               cache.snapshot().stateCache.entries == 0 &&
               cache.snapshot().kvCache.blocks == 2,
           "state was not evicted once its block became the oldest leaf");
   const CacheReclaimResult leaf =
-      cache.reclaimOne(CacheReclaimMode::ReuseBacking);
+      cache.reclaimOne(CacheReclaimMode::KeepExtents);
   require(leaf.madeProgress && cache.snapshot().kvCache.blocks == 1,
           "state block was not evictable after its state left");
 }
@@ -655,7 +698,7 @@ void testCheckpointRetirementRespectsUseAndPublicationIdentity() {
     auto lookup = fixture.lookup(65);
     require(lookup.resumeBoundary() == 64, "checkpoint could not be restored");
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted(), "restore pages were denied");
+    require(admitRestore(fixture.cache, 2, lookup).granted(), "restore pages were denied");
     fixture.cache.endRequest(2);
     require(!fixture.cache.retireCheckpointState(replacement) &&
                 fixture.cache.snapshot().stateCache.entries == 1,
@@ -690,7 +733,7 @@ void testRestoredCheckpointsKeepTheirEvictionPriority() {
   {
     auto lookup = fixture.lookup(65);
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted(), "restore pages were denied");
+    require(admitRestore(fixture.cache, 2, lookup).granted(), "restore pages were denied");
     fixture.cache.endRequest(2);
   }
 
@@ -776,13 +819,15 @@ void testCheckpointPinsAndBoundaryUpgrade() {
 
 void testCheckpointPressurePreservesHotPrefix() {
   SharedBudget budget;
-  BudgetBacking backing(budget);
-  KvPool pool(backing);
+  test::TestKvStorage storage(4, 100, 1);
+  storage.growthAllowed = [&](uint32_t) { return budget.acquire(100); };
+  storage.released = [&] { budget.release(100); };
+  KvPool pool(storage, 0);
   engine::Cache cache(pool, cacheNamespace());
   const std::vector<uint32_t> hot(33, 11);
   const std::vector<uint32_t> cold(65, 22);
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, 32).granted(), "hot KV admission failed");
+  require(admitTokens(cache, 1, 32).granted(), "hot KV admission failed");
   const uint64_t hotBlock = cache.publishCommittedBlocks(1, hot, 32);
   cache.publishCompositeState(hotBlock, std::make_shared<BudgetState>(budget));
   cache.endRequest(1);
@@ -790,39 +835,27 @@ void testCheckpointPressurePreservesHotPrefix() {
     auto lookup = cache.lookup(hot);
     require(lookup.resumeBoundary() == 32, "hot prefix did not restore");
     cache.beginRequest(2);
-    require(cache.restoreRequest(2, lookup).granted(), "restore pages were denied");
+    require(admitRestore(cache, 2, lookup).granted(), "restore pages were denied");
     cache.endRequest(2);
   }
 
   cache.beginRequest(3);
-  require(cache.ensureTokens(3, 32).granted(), "cold KV admission failed");
+  require(admitTokens(cache, 3, 32).granted(), "cold KV admission failed");
   const uint64_t coldBlock = cache.publishCommittedBlocks(3, cold, 32);
   cache.publishCompositeState(coldBlock, std::make_shared<BudgetState>(budget),
                               true);
   require(budget.used == SharedBudget::capacity,
           "checkpoint did not fill the shared allocation budget");
   const TokenAdmission denied = cache.ensureTokens(3, 64);
-  require(denied.failure == KvPageAcquireFailure::PhysicalCapacity,
-          "necessary KV growth did not reach physical capacity");
-  const auto reclaimed = cache.reclaimOne(CacheReclaimMode::ReuseBacking);
+  require(denied.failure == TokenAdmissionFailure::Denied,
+          "necessary KV growth was not denied by the shared budget");
+  const auto reclaimed = cache.reclaimOne(CacheReclaimMode::KeepExtents);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 200 &&
               cache.ensureTokens(3, 64).granted() &&
               cache.lookup(hot).resumeBoundary() == 32 &&
               cache.lookup(cold).resumeBoundary() == 0 && budget.used == 500,
           "successful checkpoint allocation later displaced the hot prefix");
   cache.endRequest(3);
-}
-
-void testLogicalKvPressureStillReclaimsPages() {
-  CacheFixture fixture;
-  fixture.cache.publishCompositeState(fixture.blocks[0],
-                                      std::make_shared<TestState>(200), true);
-  fixture.cache.beginRequest(2);
-  require(fixture.cache.ensureTokens(2, 32).granted() &&
-              fixture.cache.snapshot().kvCache.blocks == 3 &&
-              fixture.cache.checkpointState(fixture.blocks[0]),
-          "logical page pressure discarded state without freeing a KV page");
-  fixture.cache.endRequest(2);
 }
 
 } // namespace
@@ -848,8 +881,7 @@ void testTieredStateLifecycle() {
   require(snapshot.bytes == 0 && snapshot.diskBytes == 100 && snapshot.entries == 1 &&
               snapshot.offloads == 1 && control->slots == 1,
           "demoted entry did not become its disk copy");
-  require(!fixture.cache.releasePending() && !fixture.cache.pollTransfers(),
-          "unfinished write was reported as pending backing or consumed early");
+  require(!fixture.cache.pollTransfers(), "unfinished write was consumed early");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
   require(fixture.cache.reclaimOne().reclaimedBytes == 100,
           "pending write prevented disposable checkpoint reclamation");
@@ -956,7 +988,7 @@ void testRollingCheckpointsUseTheTier() {
               fixture.cache.checkpointState(fixture.blocks[3]) &&
               !fixture.cache.checkpointState(fixture.blocks[2]),
           "a full quota kept the older checkpoint");
-  require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
           "the checkpoint's leaf was dropped instead of demoted");
 }
@@ -1240,7 +1272,7 @@ void testDiskPublicationLifecycle() {
           "completion changed tier occupancy");
   require(fixture.cache.publishStateToDisk(fixture.blocks[1], write) && control->slots == 2,
           "the next publication did not follow the finished write");
-  require(fixture.cache.reclaimOne(CacheReclaimMode::ReuseBacking).madeProgress &&
+  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
           "the stated leaf was dropped instead of demoted");
 }
@@ -1367,7 +1399,7 @@ void testDiskPublicationMakesRoom() {
 // room drops redundant copies first, KV or state, then the oldest copy that
 // is the only one.
 void testDiskReplacementSpansStatesAndKv() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   tier.capacity = 1;
   CacheFixture fixture(&tier);
@@ -1383,7 +1415,7 @@ void testDiskReplacementSpansStatesAndKv() {
   {
     auto lookup = fixture.lookup(129);
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted(), "restore was denied");
+    require(admitRestore(fixture.cache, 2, lookup).granted(), "restore was denied");
     tier.complete();
     require(fixture.cache.pollTransfers(), "restore did not land");
     PromotionTicket ticket;
@@ -1415,8 +1447,8 @@ void testDiskReplacementSpansStatesAndKv() {
 void testQuotaWithoutTheKvTier() {
   constexpr uint64_t size = model::SlotFile::kAlignmentBytes;
   auto budget = std::make_shared<model::DiskBudget>(4 * size);
-  test::TestKvBacking backing{4, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
   engine::Cache cache(pool, cacheNamespace(), nullptr, budget);
   model::SlotFile states(size, budget);
   auto slot = states.acquire();
@@ -1435,8 +1467,8 @@ void testQuotaWithoutTheKvTier() {
 // without the tier is a hit with it. The disk only adds.
 void testTierOnlyAddsToTierOff() {
   struct Prefixes {
-    test::TestKvBacking backing{4, 100};
-    KvPool pool{backing};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     engine::Cache cache{pool, cacheNamespace()};
     std::array<std::vector<uint32_t>, 4> prompts;
     std::array<uint64_t, 4> blocks{};
@@ -1445,7 +1477,7 @@ void testTierOnlyAddsToTierOff() {
       for (uint32_t i = 0; i < prompts.size(); ++i) {
         prompts[i].assign(KvCache::pageTokens, 1000 + i);
         cache.beginRequest(i + 1);
-        require(cache.ensureTokens(i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
+        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
         blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
         cache.endRequest(i + 1);
         prompts[i].push_back(9999);
@@ -1518,7 +1550,7 @@ void testCancelledRestoreStopsQueuedReads() {
   for (unsigned completed = 0; completed < 4; ++completed) {
     for (unsigned peerBlocks : {0u, 2u, 4u}) {
       test::TestKvTier tier;
-      tier.stagingSlots = 1;
+      tier.transferLimit = 1;
       CacheFixture fixture(&tier);
       auto control = std::make_shared<TransferControl>();
       control->ready = true;
@@ -1535,11 +1567,11 @@ void testCancelledRestoreStopsQueuedReads() {
       demoteLeaves(fixture.cache, tier, 4);
       auto lookup = fixture.lookup(129);
       fixture.cache.beginRequest(2);
-      require(fixture.cache.restoreRequest(2, lookup).granted(), "restore was denied");
+      require(admitRestore(fixture.cache, 2, lookup).granted(), "restore was denied");
       if (peerBlocks) {
         auto peerLookup = fixture.lookup(peerBlocks * KvCache::pageTokens + 1);
         fixture.cache.beginRequest(3);
-        require(peerLookup.state && fixture.cache.restoreRequest(3, peerLookup).granted(),
+        require(peerLookup.state && admitRestore(fixture.cache, 3, peerLookup).granted(),
                 "peer restore was denied");
       }
       for (unsigned i = 0; i < completed; ++i) {
@@ -1566,7 +1598,7 @@ void testCancelledRestoreStopsQueuedReads() {
       }
       auto retry = fixture.lookup(129);
       fixture.cache.beginRequest(4);
-      require(fixture.cache.restoreRequest(4, retry).granted(), "retry restore was denied");
+      require(admitRestore(fixture.cache, 4, retry).granted(), "retry restore was denied");
       for (unsigned i = 0; i < 12; ++i) {
         tier.complete();
         static_cast<void>(fixture.cache.pollTransfers());
@@ -1583,7 +1615,7 @@ void testCancelledRestoreStopsQueuedReads() {
 // rather than dropped and keeps its page until the copy has landed; the
 // prefix then matches through disk, and requests wait for its restore.
 void testKvDemotionAndRestoreLifecycle() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
@@ -1619,7 +1651,7 @@ void testKvDemotionAndRestoreLifecycle() {
                 !lookup.state->state()->residentBytes(),
             "prefix on disk did not match");
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted() &&
+    require(admitRestore(fixture.cache, 2, lookup).granted() &&
                 fixture.cache.kvRestoreStatus(2) == KvRestoreStatus::Pending &&
                 tier.restores == 1 && fixture.pool.freePageCount() == 0 &&
                 fixture.cache.pageTable(2).pages.size() == 4,
@@ -1627,7 +1659,7 @@ void testKvDemotionAndRestoreLifecycle() {
     // A second request on the same prefix waits for the same restore.
     auto again = fixture.lookup(129);
     fixture.cache.beginRequest(3);
-    require(fixture.cache.restoreRequest(3, again).granted() &&
+    require(admitRestore(fixture.cache, 3, again).granted() &&
                 fixture.cache.kvRestoreStatus(3) == KvRestoreStatus::Pending && tier.restores == 1,
             "a second request started its own restore");
     require(!fixture.cache.pollTransfers(), "restore finished before the tier did");
@@ -1657,7 +1689,7 @@ void testKvDemotionAndRestoreLifecycle() {
 // Leaves nothing depends on are dropped, never written; a parent whose child
 // went to disk is written when its turn comes, so the chain stays whole.
 void testTailsDropAndParentsFollowToDisk() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 0 &&
@@ -1688,7 +1720,7 @@ void testTailsDropAndParentsFollowToDisk() {
 // full quota has taken the state a disk child was written for, the parent is
 // not written for that child: both go, and the page returns at once.
 void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   {
     test::TestKvTier tier;
     CacheFixture fixture(&tier);
@@ -1704,7 +1736,7 @@ void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
                 fixture.cache.snapshot().kvTier.diskBlocks == 1,
             "the failed state write left its state, or the leaf did not land");
     fixture.cache.beginRequest(2);
-    require(fixture.cache.ensureTokens(2, 64).granted() && tier.demotions == 1 &&
+    require(admitTokens(fixture.cache, 2, 64).granted() && tier.demotions == 1 &&
                 tier.slots == 0 && fixture.cache.snapshot().kvTier.diskBlocks == 0,
             "a leaf was written for a disk child no state needs");
     fixture.cache.endRequest(2);
@@ -1730,24 +1762,22 @@ void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
   }
 }
 
-// A demotion the ring cannot take right now keeps its leaf: the requester is
-// told to wait, the leaf is written when the ring has room. Only a tier that
-// can never write again lets the leaf go as without a tier.
-// A ring that transfers in flight will free is worth waiting for: the leaf
-// stays and the shortfall is Pending. A ring or a file that nothing will
-// free is not: the leaf goes, exactly as it would without a tier, unless a
-// disk subtree depends on it.
+// A demotion the tier cannot take right now keeps its leaf while transfers
+// in flight will free room: the shortfall is Pending and the leaf is written
+// once the tier has room. Room or a file that nothing will free is not worth
+// waiting for: the leaf goes as without a tier, unless a disk subtree
+// depends on it.
 void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
-  tier.stagingSlots = 1;
+  tier.transferLimit = 1;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers(),
           "state was not demoted first");
-  // One demotion takes the only staging slot and stays in flight.
+  // One demotion is all the tier takes at a time, and it stays in flight.
   require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1 &&
               tier.inFlight() == 1,
           "the first leaf was not written");
@@ -1756,37 +1786,37 @@ void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
   const CacheReclaimResult busy = fixture.cache.reclaimOne(reuse);
   require(!busy.madeProgress && busy.pending && tier.demotions == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 4,
-          "a leaf was dropped or the wait was not reported while the ring was busy");
+          "a leaf was dropped or the wait was not reported while the tier was busy");
   fixture.cache.beginRequest(2);
-  require(fixture.cache.ensureTokens(2, 32).failure == KvPageAcquireFailure::Pending,
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending,
           "a request was failed while a transfer was landing");
   fixture.cache.endRequest(2);
   tier.complete();
   require(fixture.cache.pollTransfers() && tier.inFlight() == 0, "the demotion did not land");
   require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 2,
-          "the leaf was not written once the ring had room");
+          "the leaf was not written once the tier had room");
   tier.complete();
   require(fixture.cache.pollTransfers(), "second leaf did not land");
 }
 
 void testUnusableTierDropsTheLeafInstead() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
-  tier.stagingSlots = 0;
+  tier.transferLimit = 0;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers(),
           "state was not demoted first");
-  // Nothing is in flight and nothing ever frees the ring: waiting would be
+  // Nothing is in flight and nothing ever makes room: waiting would be
   // waiting for nothing, so the leaf and its disk copy go instead.
   require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 0 &&
               fixture.cache.snapshot().kvCache.blocks == 3 &&
               fixture.cache.snapshot().kvTier.demotionsRefused == 1,
           "an unusable tier parked the leaf instead of dropping it");
   fixture.cache.beginRequest(2);
-  require(fixture.cache.ensureTokens(2, 32).granted(),
+  require(admitTokens(fixture.cache, 2, 32).granted(),
           "a request waited although nothing was in flight");
   fixture.cache.endRequest(2);
 
@@ -1816,46 +1846,15 @@ void testUnusableTierDropsTheLeafInstead() {
               deep.cache.snapshot().stateCache.entries == 0,
           "an unwritable tier kept the leaf and its disk subtree");
   deep.cache.beginRequest(2);
-  require(deep.cache.ensureTokens(2, 64).granted(),
+  require(admitTokens(deep.cache, 2, 64).granted(),
           "the dropped leaf's page did not come back");
   deep.cache.endRequest(2);
-}
-
-// With the KV file closed by a failed write, or no KV tier at all, while the
-// state file still takes writes, a leaf's KV cannot stay on disk. A state in
-// RAM on it leaves with it, as without a tier: writing it would replace a
-// usable disk copy to make room, and the next leaf would wait for a write
-// whose copy is thrown away.
-void testStateLeavesWithALeafTheTierCannotKeep() {
-  for (const bool absent : {false, true}) {
-    test::TestKvTier tier;
-    tier.writableFile = false;
-    CacheFixture fixture(absent ? nullptr : &tier);
-    auto control = std::make_shared<TransferControl>();
-    control->capacity = 1;
-    control->ready = true;
-    // The quota holds one state: the first block's, its KV resident.
-    fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers() &&
-                control->slots == 1 && fixture.lookup(33).resumeBoundary() == 32,
-            "the first state did not reach the disk");
-    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control));
-    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-    fixture.cache.beginRequest(2);
-    require(fixture.cache.ensureTokens(2, 64).granted(),
-            "admission waited for a state write the leaf could not keep");
-    const auto stats = fixture.cache.snapshot().stateCache;
-    require(stats.offloads == 1 && stats.entries == 1 && control->slots == 1 &&
-                fixture.lookup(33).resumeBoundary() == 32,
-            "a state was written with a leaf the tier cannot keep, or replaced a usable one");
-    fixture.cache.endRequest(2);
-  }
 }
 
 // The failure seen at 23G: a leaf with disk-only children whose demotion is
 // refused must stay, not be erased under its children.
 void testParentOfDiskChildrenSurvivesRefusal() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
@@ -1866,20 +1865,20 @@ void testParentOfDiskChildrenSurvivesRefusal() {
           "leaf was not written");
   tier.complete();
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "leaf did not land");
-  // With the ring unusable and nothing in flight the parent still stays: its
+  // With the tier unusable and nothing in flight the parent still stays: its
   // disk subtree depends on it. The request is told it cannot have the pages
   // rather than told to wait for something that will never happen.
-  tier.stagingSlots = 0;
+  tier.transferLimit = 0;
   fixture.cache.beginRequest(2);
-  require(fixture.cache.ensureTokens(2, 64).failure == KvPageAcquireFailure::LogicalCapacity &&
+  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Denied &&
               fixture.cache.snapshot().kvCache.blocks == 3 && tier.demotions == 1,
           "the parent of a disk block was dropped, or the request was told to wait");
-  tier.stagingSlots = 8;
-  require(fixture.cache.ensureTokens(2, 64).failure == KvPageAcquireFailure::Pending &&
+  tier.transferLimit = 8;
+  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 2,
-          "the parent was not written once the ring had room");
+          "the parent was not written once the tier had room");
   tier.complete();
-  require(fixture.cache.pollTransfers() && fixture.cache.ensureTokens(2, 64).granted(),
+  require(fixture.cache.pollTransfers() && admitTokens(fixture.cache, 2, 64).granted(),
           "pages did not return to the request");
   fixture.cache.endRequest(2);
 }
@@ -1887,7 +1886,7 @@ void testParentOfDiskChildrenSurvivesRefusal() {
 // While one state write is in flight, a pressure pass keeps the next state
 // in RAM rather than dropping it; the pass after the write takes it.
 void testSecondStateWaitsForTheWrite() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
@@ -1914,7 +1913,7 @@ void testSecondStateWaitsForTheWrite() {
 // flight holds back nothing else: the KV leaves and ordinary states behind
 // it go in recency order meanwhile, and the pass after the write takes it.
 void testWaitingCheckpointHoldsBackNothingElse() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
@@ -1947,22 +1946,23 @@ void testWaitingCheckpointHoldsBackNothingElse() {
           "the checkpoint did not land beside the first write");
 }
 
-// A refusal ends the scan: the ring is full for every leaf alike, so one
+// A refusal ends the scan: the tier is full for every leaf alike, so one
 // attempt costs one refusal, not one per cached block.
-void testRefusedRingStopsTheScan() {
+void testFullTierStopsTheScan() {
   struct Prefixes {
-    test::TestKvBacking backing{4, 100};
-    KvPool pool{backing};
+    test::TestKvStorage storage{5, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     engine::Cache cache{pool, cacheNamespace(), &tier};
     std::array<std::vector<uint32_t>, 4> prompts;
     std::array<uint64_t, 4> blocks{};
 
     Prefixes() {
+      storage.budgetPages = 4;
       for (uint32_t i = 0; i < prompts.size(); ++i) {
         prompts[i].assign(KvCache::pageTokens, 1000 + i);
         cache.beginRequest(i + 1);
-        require(cache.ensureTokens(i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
+        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
         blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
         cache.endRequest(i + 1);
       }
@@ -1975,21 +1975,21 @@ void testRefusedRingStopsTheScan() {
     p.cache.publishCompositeState(block, std::make_shared<TieredState>(control));
     require(p.cache.reclaimOneState() && p.cache.pollTransfers(), "state was not demoted");
   }
-  // One staging slot: the first leaf takes it and the request waits for that
-  // page rather than evicting more.
-  p.tier.stagingSlots = 1;
+  // One transfer at a time: the first leaf takes it and the request waits for
+  // that page rather than evicting more.
+  p.tier.transferLimit = 1;
   p.cache.beginRequest(9);
-  require(p.cache.ensureTokens(9, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(p.cache, 9, 32).failure == TokenAdmissionFailure::Pending &&
               p.tier.demotions == 1 && p.cache.snapshot().kvCache.blocks == 4,
           "the first leaf was not written, or a leaf was dropped");
-  // A larger shortfall meets a ring that the transfer in flight holds. Every
+  // A larger shortfall meets a tier that the transfer in flight fills. Every
   // leaf would answer the same, so the scan asks once and waits.
-  require(p.cache.ensureTokens(9, 64).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(p.cache, 9, 64).failure == TokenAdmissionFailure::Pending &&
               p.cache.snapshot().kvTier.demotionsRefused == 1 &&
               p.cache.snapshot().kvCache.blocks == 4,
-          "a full ring was asked once per leaf, or a leaf was dropped");
+          "a full tier was asked once per leaf, or a leaf was dropped");
   p.tier.complete();
-  require(p.cache.pollTransfers() && p.cache.ensureTokens(9, 32).granted(),
+  require(p.cache.pollTransfers() && admitTokens(p.cache, 9, 32).granted(),
           "the page did not return");
   p.cache.endRequest(9);
 }
@@ -1998,7 +1998,7 @@ void testRefusedRingStopsTheScan() {
 // restored blocks become leaves with disk copies. Pages held by an active
 // request are exhausted for real.
 void testRestoresInFlightMakeAShortfallPending() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
@@ -2011,18 +2011,18 @@ void testRestoresInFlightMakeAShortfallPending() {
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "leaf did not land");
   auto lookup = fixture.lookup(129);
   fixture.cache.beginRequest(2);
-  require(fixture.cache.restoreRequest(2, lookup).granted() && fixture.pool.freePageCount() == 0,
+  require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.pool.freePageCount() == 0,
           "restore did not take the free page");
   fixture.cache.beginRequest(3);
-  require(fixture.cache.ensureTokens(3, 32).failure == KvPageAcquireFailure::Pending,
+  require(admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Pending,
           "a shortfall during a restore was reported as exhausted");
   tier.complete();
   require(fixture.cache.pollTransfers() &&
-              fixture.cache.ensureTokens(3, 32).failure == KvPageAcquireFailure::LogicalCapacity,
+              admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
           "pages held by an active request were not exhausted");
   lookup = {};
   fixture.cache.endRequest(2);
-  require(fixture.cache.ensureTokens(3, 32).granted() && tier.demotions == 1,
+  require(admitTokens(fixture.cache, 3, 32).granted() && tier.demotions == 1,
           "the restored leaf did not give up its page for nothing");
   fixture.cache.endRequest(3);
 }
@@ -2030,10 +2030,10 @@ void testRestoresInFlightMakeAShortfallPending() {
 // A full quota replaces the oldest redundant copy first, then the oldest
 // disk-only leaf; a block whose copy was replaced stays in RAM.
 void testDiskReplacementOrder() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   struct Prefixes {
-    test::TestKvBacking backing{4, 100};
-    KvPool pool{backing};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     engine::Cache cache{pool, cacheNamespace(), &tier};
     std::array<std::vector<uint32_t>, 4> prompts;
@@ -2044,7 +2044,7 @@ void testDiskReplacementOrder() {
       for (uint32_t i = 0; i < prompts.size(); ++i) {
         prompts[i].assign(KvCache::pageTokens, 1000 + i);
         cache.beginRequest(i + 1);
-        require(cache.ensureTokens(i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
+        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
         blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
         cache.endRequest(i + 1);
         prompts[i].push_back(9999);
@@ -2070,7 +2070,7 @@ void testDiskReplacementOrder() {
   {
     auto lookup = p.cache.lookup(p.prompts[0]);
     p.cache.beginRequest(9);
-    require(p.cache.restoreRequest(9, lookup).granted(),
+    require(admitRestore(p.cache, 9, lookup).granted(),
             "A did not restore");
     p.tier.complete();
     require(p.cache.pollTransfers(), "A's restore did not finish");
@@ -2101,15 +2101,15 @@ void testPendingPagesGateAllocation() {
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   fixture.cache.beginRequest(2);
-  require(fixture.cache.ensureTokens(2, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4 &&
               fixture.cache.snapshot().kvTier.pendingPages == 1,
           "allocation evicted past the page on its way back");
-  require(fixture.cache.ensureTokens(2, 32).failure == KvPageAcquireFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
               tier.demotions == 1,
           "a retry before the copy landed demoted more");
   tier.complete();
-  require(fixture.cache.pollTransfers() && fixture.cache.ensureTokens(2, 32).granted() &&
+  require(fixture.cache.pollTransfers() && admitTokens(fixture.cache, 2, 32).granted() &&
               fixture.cache.pageTable(2).pages.size() == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 3,
           "pages did not return to the waiting request");
@@ -2120,7 +2120,7 @@ void testPendingPagesGateAllocation() {
 // that fails removes the block and its state once its requests let go, and
 // the next lookup matches the shallower prefix.
 void testTransferFailures() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   {
     test::TestKvTier tier;
     CacheFixture fixture(&tier);
@@ -2151,7 +2151,7 @@ void testTransferFailures() {
     require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "no disk block");
     auto lookup = fixture.lookup(129);
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted(), "restore was denied");
+    require(admitRestore(fixture.cache, 2, lookup).granted(), "restore was denied");
     tier.complete(false);
     require(fixture.cache.pollTransfers() &&
                 fixture.cache.kvRestoreStatus(2) == KvRestoreStatus::Failed &&
@@ -2172,8 +2172,9 @@ void testTransferFailures() {
 // the request lets go, and the prefix above gives its pages up again, even
 // after the fault has closed the tier.
 void testFailedRestoreDropsTheBlocksBelow() {
-  test::TestKvBacking backing{8, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{9, 100, 1};
+  storage.budgetPages = 8;
+  KvPool pool{storage, 8};
   test::TestKvTier tier;
   engine::Cache cache{pool, cacheNamespace(), &tier};
   auto control = std::make_shared<TransferControl>();
@@ -2188,7 +2189,7 @@ void testFailedRestoreDropsTheBlocksBelow() {
     sibling[i] = 2000 + i;
   for (uint64_t request : {1, 2}) {
     cache.beginRequest(request);
-    require(cache.ensureTokens(request, 128).granted(), "prefix KV failed");
+    require(admitTokens(cache, request, 128).granted(), "prefix KV failed");
     const uint64_t last =
         cache.publishCommittedBlocks(request, request == 1 ? prompt : sibling, 128);
     cache.endRequest(request);
@@ -2199,10 +2200,10 @@ void testFailedRestoreDropsTheBlocksBelow() {
   demoteLeaves(cache, tier, 3);
   // The shared block's read fails and the fault closes the tier; the read
   // queued behind it still lands.
-  tier.stagingSlots = 1;
+  tier.transferLimit = 1;
   auto lookup = cache.lookup(prompt);
   cache.beginRequest(3);
-  require(lookup.state && cache.restoreRequest(3, lookup).granted() && tier.restores == 1,
+  require(lookup.state && admitRestore(cache, 3, lookup).granted() && tier.restores == 1,
           "restore was denied");
   tier.complete(false);
   static_cast<void>(cache.pollTransfers());
@@ -2219,7 +2220,7 @@ void testFailedRestoreDropsTheBlocksBelow() {
           "the blocks below a failed read or their states outlived the request");
   require(cache.lookup(prompt).kvBoundary == 64, "the surviving prefix did not match");
   cache.beginRequest(4);
-  require(cache.ensureTokens(4, 256).granted(),
+  require(admitTokens(cache, 4, 256).granted(),
           "the prefix above a failed read stayed pinned in RAM");
   cache.endRequest(4);
 }
@@ -2240,14 +2241,14 @@ void testReclaimCacheCountsPendingPages() {
           "reclaim wrote more than the target while a page was on its way back");
 }
 
-void testBusyRingPreservesDiskVictim() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+void testBusyTierPreservesDiskVictim() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   for (const bool restored : {false, true}) {
-    test::TestKvBacking backing{4, 100};
-    KvPool pool{backing};
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 4};
     test::TestKvTier tier;
     tier.capacity = 2;
-    tier.stagingSlots = 1;
+    tier.transferLimit = 1;
     engine::Cache cache{pool, cacheNamespace(), &tier};
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
@@ -2256,7 +2257,7 @@ void testBusyRingPreservesDiskVictim() {
     for (uint32_t i = 0; i < prompts.size(); ++i) {
       prompts[i].assign(KvCache::pageTokens, 1000 + i);
       cache.beginRequest(i + 1);
-      require(cache.ensureTokens(i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
+      require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
       auto block = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
       cache.endRequest(i + 1);
       cache.publishCompositeState(block, std::make_shared<TieredState>(control));
@@ -2269,7 +2270,7 @@ void testBusyRingPreservesDiskVictim() {
     if (restored) {
       auto lookup = cache.lookup(prompts[0]);
       cache.beginRequest(9);
-      require(cache.restoreRequest(9, lookup).granted(), "disk prefix did not restore");
+      require(admitRestore(cache, 9, lookup).granted(), "disk prefix did not restore");
       tier.complete();
       require(cache.pollTransfers(), "restore did not finish");
       lookup = {};
@@ -2277,24 +2278,105 @@ void testBusyRingPreservesDiskVictim() {
     }
     require(cache.reclaimOne(reuse).madeProgress && tier.slots == 2,
             "second demotion did not fill quota");
-    require(!cache.reclaimOne(reuse).madeProgress, "busy ring did not wait");
+    require(!cache.reclaimOne(reuse).madeProgress, "busy tier did not wait");
     require(tier.slots == 2 && cache.snapshot().kvTier.diskBlocks == 2 &&
                 cache.lookup(prompts[0]).kvBoundary == KvCache::pageTokens,
-            "busy staging ring discarded a disk prefix without starting a write");
+            "busy tier discarded a disk prefix without starting a write");
     tier.complete();
     require(cache.pollTransfers() && cache.reclaimOne(reuse).madeProgress &&
                 tier.demotions == 3,
-            "disk replacement did not resume after staging became available");
+            "disk replacement did not resume once the tier had room");
     tier.complete();
     require(cache.pollTransfers(), "resumed demotion did not finish");
   }
+}
+
+// A denied admission makes room in one reclaim step: it evicts the leaves
+// that cover the shortfall and no more, and stops once an evicted state has
+// returned memory, which may let the retry grow the pool instead.
+void testReclaimForPagesCoversTheShortfall() {
+  for (bool withState : {false, true}) {
+    test::TestKvStorage storage{16, 100, 1};
+    storage.budgetPages = 8;
+    KvPool pool{storage, 0};
+    engine::Cache cache{pool, cacheNamespace()};
+    // Eight one-page leaves fill the budget; a state on the first is older
+    // than the other seven.
+    for (uint32_t leaf = 0; leaf < 8; ++leaf) {
+      cache.beginRequest(leaf + 1);
+      require(admitTokens(cache, leaf + 1, 32).granted(), "leaf KV admission failed");
+      const uint64_t block = cache.publishCommittedBlocks(
+          leaf + 1, std::vector<uint32_t>(33, 100 + leaf), 32);
+      cache.endRequest(leaf + 1);
+      if (withState && !leaf)
+        cache.publishCompositeState(block, std::make_shared<TestState>(100));
+    }
+    require(pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8,
+            "fixture geometry changed");
+    const CacheReclaimResult reclaimed = cache.reclaimForPages(3);
+    if (withState) {
+      require(reclaimed.madeProgress && reclaimed.reclaimedBytes > 0 &&
+                  pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8 &&
+                  cache.snapshot().stateCache.entries == 0,
+              "the reclaim step went on evicting after a state returned memory");
+    } else {
+      require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
+                  pool.freePageCount() == 3 && cache.snapshot().kvCache.blocks == 5,
+              "the reclaim step did not evict exactly the shortfall");
+    }
+  }
+}
+
+// A lookup touches the resident boundary of a chain with a disk suffix, not
+// only its tip: the boundary is a leaf, and the reclaim that makes room for
+// the restore must take an older one, not the block the restore extends.
+void testLookupKeepsADiskChainsResidentBoundaryWarm() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
+  test::TestKvTier tier;
+  engine::Cache cache{pool, cacheNamespace(), &tier};
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  std::vector<uint32_t> chain(65);
+  for (uint32_t i = 0; i < chain.size(); ++i)
+    chain[i] = 1000 + i;
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 64).granted(), "chain KV admission failed");
+  const uint64_t leaf = cache.publishCommittedBlocks(1, chain, 64);
+  cache.endRequest(1);
+  cache.publishCompositeState(leaf, std::make_shared<TieredState>(control));
+  require(cache.reclaimOne(reuse).madeProgress && cache.pollTransfers(),
+          "the chain's state was not demoted");
+  demoteLeaves(cache, tier, 1);
+  // The chain is its resident root and its leaf on disk. A newer chain
+  // follows.
+  const std::vector<uint32_t> newer(33, 7);
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 32).granted(), "newer KV admission failed");
+  static_cast<void>(cache.publishCommittedBlocks(2, newer, 32));
+  cache.endRequest(2);
+  require(pool.freePageCount() == 2 && tier.demotions == 1,
+          "fixture geometry changed");
+
+  {
+    const auto lookup = cache.lookup(chain);
+    require(lookup.resumeBoundary() == 64, "the disk chain did not match");
+    require(cache.reclaimOne(reuse).madeProgress && pool.freePageCount() == 3 &&
+                tier.demotions == 1,
+            "the reclaim took the chain's resident boundary");
+  }
+  require(cache.lookup(newer).kvBoundary == 0 &&
+              cache.lookup(chain).resumeBoundary() == 64 &&
+              cache.snapshot().kvCache.diskBlocks == 1,
+          "the reclaim did not take the older leaf alone");
 }
 
 // A restore takes its pages before it pins its chain, and the chain's last
 // resident block has only disk children, which makes it a leaf. The eviction
 // that makes room must not take it: the restore adopts pages under it.
 void testRestoreKeepsTheBlockItExtends() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
@@ -2307,7 +2389,7 @@ void testRestoreKeepsTheBlockItExtends() {
   {
     auto lookup = fixture.lookup(129);
     fixture.cache.beginRequest(2);
-    require(fixture.cache.restoreRequest(2, lookup).granted(), "first restore denied");
+    require(admitRestore(fixture.cache, 2, lookup).granted(), "first restore denied");
     tier.complete();
     require(fixture.cache.pollTransfers() &&
                 fixture.cache.kvRestoreStatus(2) == KvRestoreStatus::None,
@@ -2320,24 +2402,31 @@ void testRestoreKeepsTheBlockItExtends() {
   require(fixture.cache.reclaimOne(reuse).madeProgress && fixture.pool.freePageCount() == 1,
           "the restored leaf did not drop its page");
   fixture.cache.beginRequest(3);
-  require(fixture.cache.ensureTokens(3, 32).granted() && fixture.pool.freePageCount() == 0,
+  require(admitTokens(fixture.cache, 3, 32).granted() && fixture.pool.freePageCount() == 0,
           "another request did not take the free page");
   auto lookup = fixture.lookup(129);
   fixture.cache.beginRequest(4);
-  const TokenAdmission refused = fixture.cache.restoreRequest(4, lookup);
-  require(!refused.granted() && refused.failure == KvPageAcquireFailure::LogicalCapacity &&
+  // Making room demotes a leaf: the restore waits for its copy and holds no
+  // page meanwhile.
+  const TokenAdmission waiting = admitRestore(fixture.cache, 4, lookup);
+  require(waiting.failure == TokenAdmissionFailure::Pending &&
               fixture.cache.pageTable(4).pages.empty(),
-          "a restore without a page did not report the shortfall");
+          "a restore without a page did not wait for the room being made");
+  tier.complete();
+  require(fixture.cache.pollTransfers(), "the demotion making room did not land");
   fixture.cache.endRequest(3);
-  require(fixture.cache.restoreRequest(4, lookup).granted(), "the retried restore was denied");
+  require(admitRestore(fixture.cache, 4, lookup).granted(), "the retried restore was denied");
   const auto table = fixture.cache.pageTable(4);
   require(table.pages.size() == 4 &&
               std::none_of(table.pages.begin(), table.pages.end(),
                            [](uint32_t page) { return page == KvCache::noPage; }),
           "the restored chain lost a page");
-  tier.complete();
-  require(fixture.cache.pollTransfers() &&
-              fixture.cache.kvRestoreStatus(4) == KvRestoreStatus::None,
+  // Its copies land with the demotion queued before them.
+  while (tier.inFlight()) {
+    tier.complete();
+    require(fixture.cache.pollTransfers(), "a transfer did not land");
+  }
+  require(fixture.cache.kvRestoreStatus(4) == KvRestoreStatus::None,
           "the retried restore did not land");
   lookup = {};
   fixture.cache.endRequest(4);
@@ -2346,7 +2435,7 @@ void testRestoreKeepsTheBlockItExtends() {
 // A state published in RAM while its block's demotion is in flight keeps the
 // block's page when the write lands: a state in RAM sits on resident KV.
 void testDemotionKeepsThePageUnderANewState() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
   auto control = std::make_shared<TransferControl>();
@@ -2372,9 +2461,9 @@ void testDemotionKeepsThePageUnderANewState() {
 // in RAM sits on resident KV. Its later write into a full quota gives up
 // other copies, never the block under it.
 void testCancelledRestoreKeepsThePageUnderANewState() {
-  constexpr auto reuse = CacheReclaimMode::ReuseBacking;
-  test::TestKvBacking backing{8, 100};
-  KvPool pool{backing};
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
   test::TestKvTier tier;
   engine::Cache cache{pool, cacheNamespace(), &tier};
   auto control = std::make_shared<TransferControl>();
@@ -2383,21 +2472,21 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   for (uint32_t i = 0; i < prompt.size(); ++i)
     prompt[i] = 1000 + i;
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, 128).granted(), "prefix KV failed");
+  require(admitTokens(cache, 1, 128).granted(), "prefix KV failed");
   const uint64_t last = cache.publishCommittedBlocks(1, prompt, 128);
   const uint64_t third = cache.blockAt(1, 96);
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
   require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
   demoteLeaves(cache, tier, 3);
-  // The restore reads the second block; the last two wait for staging.
-  tier.stagingSlots = 1;
+  // The restore reads the second block; the last two wait for their turn.
+  tier.transferLimit = 1;
   auto lookup = cache.lookup(prompt);
   cache.beginRequest(2);
-  require(cache.restoreRequest(2, lookup).granted() && tier.restores == 1,
+  require(admitRestore(cache, 2, lookup).granted() && tier.restores == 1,
           "restore was denied");
   cache.beginRequest(3);
-  require(cache.ensureTokens(3, 97).granted() &&
+  require(admitTokens(cache, 3, 97).granted() &&
               cache.publishCommittedBlocks(3, prompt, 96) == third,
           "the prefill did not reach the block being restored");
   cache.publishCompositeState(third, std::make_shared<TieredState>(control));
@@ -2422,15 +2511,15 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
 void testLargeSharedDiskRestore() {
   constexpr uint32_t pages = 4096;
   constexpr uint32_t tokens = pages * KvCache::pageTokens;
-  test::TestKvBacking backing{pages, 100};
-  KvPool pool{backing};
+  test::TestKvStorage storage{pages, 100, 1};
+  KvPool pool{storage, pages};
   test::TestKvTier tier;
   tier.capacity = pages;
-  tier.stagingSlots = 96;
+  tier.transferLimit = 96;
   engine::Cache cache{pool, cacheNamespace(), &tier};
   std::vector<uint32_t> prompt(tokens, 17);
   cache.beginRequest(1);
-  require(cache.ensureTokens(1, tokens).granted(), "large prefix admission failed");
+  require(admitTokens(cache, 1, tokens).granted(), "large prefix admission failed");
   const auto boundary = cache.publishCommittedBlocks(1, prompt, tokens);
   cache.endRequest(1);
   auto control = std::make_shared<TransferControl>();
@@ -2446,9 +2535,9 @@ void testLargeSharedDiskRestore() {
           "large disk prefix lookup lost its endpoint");
   for (uint64_t id = 2; id <= 5; ++id) {
     cache.beginRequest(id);
-    require(cache.restoreRequest(id, lookup).granted(), "large shared restore denied");
+    require(admitRestore(cache, id, lookup).granted(), "large shared restore denied");
   }
-  require(tier.restores == tier.stagingSlots,
+  require(tier.restores == tier.transferLimit,
           "shared restore exceeded the transfer window");
   lookup = {};
   for (uint64_t id = 2; id < 5; ++id) cache.endRequest(id);
@@ -2468,10 +2557,12 @@ void testLargeSharedDiskRestore() {
 int main() {
   try {
     testLargeSharedDiskRestore();
+    testReclaimForPagesCoversTheShortfall();
+    testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();
     testCancelledRestoreKeepsThePageUnderANewState();
-    testBusyRingPreservesDiskVictim();
+    testBusyTierPreservesDiskVictim();
     testCancelledRestoreStopsQueuedReads();
     testDiskCheckpointRamAccounting();
     testOrdinaryPublicationUpgradesDiskCheckpoint();
@@ -2480,10 +2571,9 @@ int main() {
     testDiskCopiesNoStateNeedsGoWithTheLeaf();
     testRefusedDemotionKeepsTheLeafWhileTransfersLand();
     testUnusableTierDropsTheLeafInstead();
-    testStateLeavesWithALeafTheTierCannotKeep();
     testSecondStateWaitsForTheWrite();
     testWaitingCheckpointHoldsBackNothingElse();
-    testRefusedRingStopsTheScan();
+    testFullTierStopsTheScan();
     testRestoresInFlightMakeAShortfallPending();
     testParentOfDiskChildrenSurvivesRefusal();
     testDiskReplacementOrder();
@@ -2518,7 +2608,6 @@ int main() {
     testOptionalReclaimLeavesOrdinaryStateIntact();
     testCheckpointPinsAndBoundaryUpgrade();
     testCheckpointPressurePreservesHotPrefix();
-    testLogicalKvPressureStillReclaimsPages();
     testSchedulingProbeDoesNotChangeCachePolicy();
     testValidAdmissionProbePreservesLookupAndAccounting();
     testProbeFallsBackWhenPromptChanges();
@@ -2527,6 +2616,7 @@ int main() {
     testProbeFallsBackWhenKvChanges();
     testProbeBindsImageIdentity();
     testProbeCannotCrossCaches();
+    testPageTableReportsWhatChanged();
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
@@ -2536,7 +2626,7 @@ int main() {
     testKvEvictionInvalidatesStateFirst();
     testStatePublicationValidation();
     testDuplicateProbePromotesStateWithoutLookupAccounting();
-    testUnifiedRecencyAndPhysicalReclaimAccounting();
+    testUnifiedRecencyAndReleasedByteAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
     std::cout << "KV-first cache tests passed\n";
     return 0;

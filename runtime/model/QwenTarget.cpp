@@ -194,7 +194,7 @@ struct QwenTarget::PrefillStep {
   const QwenTargetPrefillBuffers &buffers;
   std::span<const QwenTargetPrefillSequence> sequences;
   uint32_t rows;
-  std::span<const kv::LayerStorage> kvLayers;
+  std::span<const SplashKvLayer> kvLayers;
   std::optional<ops::MoePlan> moe{};
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
@@ -203,7 +203,7 @@ struct QwenTarget::PrefillStep {
 struct QwenTarget::VerifyStep {
   metal::CommandGraph &graph;
   const QwenTargetVerifyBuffers &buffers;
-  std::span<const kv::LayerStorage> kvLayers;
+  std::span<const SplashKvLayer> kvLayers;
   std::span<const kv::Q8ChunkedPrefillParams> q8;
   std::span<const kv::Q8VerifyAttentionParams> verify;
   uint32_t lanes;
@@ -218,7 +218,7 @@ struct QwenTarget::VerifyStep {
 metal::MetalBuffer QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::LayerStorage> kvLayers) const {
+    std::span<const SplashKvLayer> kvLayers) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -373,7 +373,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &
 
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-    std::span<const kv::LayerStorage> kvLayers,
+    std::span<const SplashKvLayer> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::LinearDispatchStats &stats) const {

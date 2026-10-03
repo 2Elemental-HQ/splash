@@ -73,7 +73,7 @@ struct StateCacheSnapshot {
   uint32_t checkpointEntries = 0;
   uint64_t checkpointBytes = 0;
   uint64_t checkpointRetirements = 0;
-  // Pressure and logical eviction; rolling retirements are counted separately.
+  // Evictions by a reclaim; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
 };
 
@@ -103,7 +103,7 @@ public:
 
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireDeepest(std::span<const uint64_t> kvChain);
-  // Acquisition pins backing; accounting occurs only when admission succeeds.
+  // Acquisition pins the state; accounting occurs only when admission succeeds.
   void recordLookup(bool hit, bool disk = false) noexcept;
 
   // Reuses a RAM copy without a restore pin or lookup accounting. A normal
@@ -139,6 +139,10 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
   [[nodiscard]] bool resident(uint64_t kvBlock) const noexcept;
+  // The RAM copies a reclaim may free: the unpinned ones.
+  [[nodiscard]] uint32_t evictable() const noexcept {
+    return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size());
+  }
   // Oldest RAM copy to free; unpinned checkpoints precede ordinary states
   // regardless of recency. Without checkpoints, the oldest ordinary state.
   [[nodiscard]] std::optional<CacheEvictionCandidate>

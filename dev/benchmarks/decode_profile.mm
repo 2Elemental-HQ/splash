@@ -121,6 +121,8 @@ struct Lane final {
   uint32_t slot = 0;
   uint64_t position = 0;
   std::vector<uint32_t> pages;
+  // The pages never change, so the page table keeps its first revision.
+  uint64_t pageTableRevision = 1;
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
@@ -137,8 +139,8 @@ void prefill(model::Runtime &executor, Lane &lane,
         static_cast<uint32_t>(prompt.size()) - offset);
     BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
                    {{lane.id, count, offset}}, DecodeStage::Regular};
-    ModelBatchItem item{lane.id, lane.slot, offset, offset, count,
-                           lane.pages};
+    ModelBatchItem item{lane.id, lane.slot, offset, offset, count, lane.pages,
+                        lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
     auto results =
         executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -166,7 +168,8 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});
-    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages});
+    items.push_back({lane.id, lane.slot, lane.position, 0, 0, lane.pages,
+                     lane.pageTableRevision});
   }
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
@@ -225,24 +228,25 @@ int main(int argc, char **argv) {
           (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
+      // Whole extents of the largest size the pool rule picks, as a large
+      // pool's would be.
+      const kv::Layout kvLayout = model.targetKvLayout(format);
+      const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + model.targetKvLayout(format).sparseMappingBatchPages() -
-           1) /
-          model.targetKvLayout(format).sparseMappingBatchPages() *
-          model.targetKvLayout(format).sparseMappingBatchPages();
+          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-      kv::PageStorage pages(backend, governor.allocationAdmission(),
-                              model.targetKvLayout(format), pageCount);
-      for (uint32_t page = 0; page < pageCount; ++page) {
-        if (!pages.ensureResident(page))
+      kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
+                            pageCount, extentPages);
+      for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
+        if (!pages.allocateExtent(extent))
           throw std::runtime_error("could not back the KV pages");
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
                                       model.stateLayout());
       model::RuntimeContext context{
-          backend, governor.allocationAdmission(), model, pages, states, operators,
+          backend, model, pages, states, operators,
           ops::kMaximumImagePatches, executorPlan.pipelineReserveBytes,
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);

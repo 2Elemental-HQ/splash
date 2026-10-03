@@ -36,7 +36,6 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
   return requireEngineMemoryPlan(
       device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
@@ -47,15 +46,15 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   actual.targetWeightsBytes = b.targetWeightsBytes;
   actual.draftWeightsBytes = b.draftWeightsBytes;
   actual.visionWeightsBytes = b.visionWeightsBytes;
-  actual.stateResidentBytes = b.activeStateCellBytes;
+  actual.stateAllocatedBytes = b.activeStateCellBytes;
   actual.sharedPrefillBytes = b.sharedPrefillBytes;
   actual.sharedDecodeBytes = b.sharedDecodeBytes;
-  actual.kvResidentBytes = b.kvExtentBytes;
+  actual.kvAllocatedBytes = b.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
-      actual.visionWeightsBytes + actual.stateResidentBytes +
+      actual.visionWeightsBytes + actual.stateAllocatedBytes +
       actual.sharedPrefillBytes + actual.sharedDecodeBytes +
-      actual.kvResidentBytes;
+      actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
   // Model warmup estimates add the pipeline and runtime reserves.
@@ -89,8 +88,8 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
-  engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
-                           32 * 4096ULL};
+  engine.resources.pool = {128, 72, 24, 32, 1, 128 * 4096ULL,
+                           32 * 4096ULL, 5, 3, 2.5, 0.75};
   engine.resources.kvCache = {32, 32 * 4096ULL};
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
@@ -129,28 +128,14 @@ void testCleanRuntimeStatus() {
   metal::MetalMemoryStats metal;
   metal.allocatedBytes = 4 * kGiB;
   metal.peakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseVirtualBytes = memoryPlan.breakdown().kvVirtualBytes;
-  metal.sparseResidentBytes = memoryPlan.breakdown().kvExtentBytes;
-  metal.peakSparseResidentBytes = metal.sparseResidentBytes;
-  metal.peakResidentBytes = metal.allocatedBytes + metal.sparseResidentBytes;
   metal.deviceCurrentAllocatedBytes = metal.allocatedBytes;
   metal.devicePeakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseTileBytes = 65536;
-  metal.pendingSparseUnmaps = 1;
-  metal.pendingSparseUnmapSeconds = 0.0125;
-  metal.completedSparseUnmaps = 7;
-  metal.lastSparseUnmapSeconds = 0.05;
-  metal.maxSparseUnmapSeconds = 0.3;
-  metal.sparseMapWaitEvent = 149;
-  metal.pendingSparseMapWaitSeconds = 0.5;
-  metal.lastSparseMapWaitSeconds = 0.25;
-  metal.maxSparseMapWaitSeconds = 0.75;
 
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
-  governor.observedResidentBytes = metal.allocatedBytes;
+  governor.chargedBytes = metal.allocatedBytes;
   governor.servingFootprintBytes = 3 * kGiB;
-  governor.headroomBytes = governor.limitBytes - governor.observedResidentBytes;
+  governor.headroomBytes = governor.limitBytes - governor.chargedBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
@@ -158,7 +143,7 @@ void testCleanRuntimeStatus() {
   governor.growthAllowed = true;
 
   model::ModelTelemetry executorTelemetry;
-  executorTelemetry.stateResidentBytes = 350'224'384;
+  executorTelemetry.stateAllocatedBytes = 350'224'384;
   executorTelemetry.warmIdleStateCells = 1;
   executorTelemetry.targetPrefillRows = 10000;
   executorTelemetry.draftContextRowsActive = 2048;
@@ -191,9 +176,9 @@ void testCleanRuntimeStatus() {
   require(json.find("\"read_bytes\":12345") != std::string::npos &&
               json.find("\"written_bytes\":67890") != std::string::npos,
           "disk byte accounting was not exposed");
-  require(json.find("\"kv_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
+  require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
-          "the memory plan status omitted the disk tier's KV staging");
+          "the memory plan status omitted the disk tier's state staging");
   require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
               json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
           "INT8 status lost its generic or legacy identity");
@@ -205,7 +190,7 @@ void testCleanRuntimeStatus() {
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
               bf16Status.find("\"q8\":") == std::string::npos,
           "BF16 cache identity advertised INT8 storage");
-  require(json.find("\"schema_version\":5") != std::string::npos &&
+  require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
   require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
@@ -232,16 +217,14 @@ void testCleanRuntimeStatus() {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
-  require(json.find("\"pages_free\":200,\"pages_free_resident\":72,") !=
+  require(json.find("\"pages_allocated\":128,\"pages_active\":24,"
+                    "\"pages_cache\":32,\"pages_free\":72,") !=
               std::string::npos,
-          "status confused free virtual KV pages with resident free pages");
-  require(json.find("\"sparse_tile_bytes\":65536,\"pending_unmaps\":1,"
-                    "\"pending_unmap_ms\":12.5,\"unmaps_completed\":7,"
-                    "\"unmap_last_ms\":50,\"unmap_max_ms\":300,"
-                    "\"map_wait_event\":149,\"pending_map_wait_ms\":500,"
-                    "\"map_wait_last_ms\":250,\"map_wait_max_ms\":750}") !=
+          "status lost the KV pool's page counts");
+  require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
+                    "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75}") !=
               std::string::npos,
-          "status lost the paced sparse release diagnostics");
+          "status lost the KV extent growth and release diagnostics");
   require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
               json.find("\"host_measurement_valid\":true") != std::string::npos &&
               json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
@@ -250,10 +233,10 @@ void testCleanRuntimeStatus() {
   require(json.find("\"serving_footprint_bytes\":" + std::to_string(3 * kGiB)) !=
               std::string::npos,
           "status omitted the serving footprint");
-  require(json.find("\"resident_bytes\":350224384") != std::string::npos &&
+  require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
               json.find("\"warm_idle_cells\":1") != std::string::npos &&
               json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
-          "live state residency or audit scope is missing from status");
+          "live state memory or audit scope is missing from status");
   require(json.find("\"checkpoint_entries\":1,\"checkpoint_bytes\":64,"
                     "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
               std::string::npos,
@@ -319,13 +302,10 @@ void testCurrentReadinessAndSimultaneousPeak() {
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   metal::MetalMemoryStats memory;
-  // Dense usage previously reached 20 GiB with 2 GiB of KV. It then shrank
-  // to 18 GiB while KV grew to 4 GiB: the simultaneous peak stayed 22 GiB.
-  memory.allocatedBytes = 18 * kGiB;
-  memory.peakAllocatedBytes = 20 * kGiB;
-  memory.sparseResidentBytes = 4 * kGiB;
-  memory.peakSparseResidentBytes = 4 * kGiB;
-  memory.peakResidentBytes = 22 * kGiB;
+  // KV extents are ordinary allocations: their bytes are part of the
+  // backend's current and peak bytes.
+  memory.allocatedBytes = 22 * kGiB;
+  memory.peakAllocatedBytes = 22 * kGiB;
   memory.deviceCurrentAllocatedBytes = 22 * kGiB;
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
@@ -336,15 +316,15 @@ void testCurrentReadinessAndSimultaneousPeak() {
   require(healthy.find("\"ready\":true") != std::string::npos &&
               healthy.find("\"peak_bytes\":" + std::to_string(22 * kGiB)) !=
                   std::string::npos,
-          "disjoint dense/sparse peaks falsely exceeded the budget");
+          "allocations within the budget were not ready or lost their peak");
 
-  memory.allocatedBytes = 20 * kGiB;
-  memory.peakResidentBytes = 24 * kGiB;
+  memory.allocatedBytes = 24 * kGiB;
+  memory.peakAllocatedBytes = 24 * kGiB;
   memory.deviceCurrentAllocatedBytes = 24 * kGiB;
   memory.devicePeakAllocatedBytes = 24 * kGiB;
   require(status().find("\"ready\":false") != std::string::npos,
           "current over-budget allocation was marked ready");
-  memory.allocatedBytes = 18 * kGiB;
+  memory.allocatedBytes = 22 * kGiB;
   memory.deviceCurrentAllocatedBytes = 22 * kGiB;
   const std::string recovered = status();
   require(recovered.find("\"ready\":true") != std::string::npos &&
@@ -500,7 +480,7 @@ void testResourceWaitDiagnostics() {
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
       NativeLoopTiming{1843.25});
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
-              ticked.find("\"schema_version\":5") != std::string::npos,
+              ticked.find("\"schema_version\":6") != std::string::npos,
           "the loop's longest tick is missing, or changed the status schema");
   MemoryStatusReporter reporter;
   require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");

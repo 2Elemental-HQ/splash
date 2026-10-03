@@ -6,31 +6,11 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
 
 enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
-
-// BF16 has no scale buffers or bindings. Keep the existing INT8 argument
-// order; each format has a precompiled entry with its corresponding ABI.
-std::vector<metal::MetalBuffer> kvBuffers(
-    const kv::LayerStorage &layer, kv::Format format,
-    std::initializer_list<metal::MetalBuffer> before,
-    std::span<const metal::MetalBuffer> after) {
-  if (layer.format != format)
-    throw std::invalid_argument("attention plan and KV storage formats differ");
-  std::vector<metal::MetalBuffer> buffers;
-  buffers.reserve(before.size() + after.size() + (format == kv::Format::Int8 ? 4 : 2));
-  buffers.insert(buffers.end(), before.begin(), before.end());
-  buffers.push_back(layer.keyData);
-  if (format == kv::Format::Int8) buffers.push_back(layer.keyScales);
-  buffers.push_back(layer.valueData);
-  if (format == kv::Format::Int8) buffers.push_back(layer.valueScales);
-  buffers.insert(buffers.end(), after.begin(), after.end());
-  return buffers;
-}
 
 bool sameGrid(metal::DispatchSize a, metal::DispatchSize b) noexcept {
   return a.x == b.x && a.y == b.y && a.z == b.z;
@@ -377,22 +357,20 @@ PreparedInput PagedAttention::addVerifyGate(
 
 kv::Q8ChunkedPrefillParams PagedAttention::prefillParams(
     uint64_t logicalPosition, uint32_t chunkTokens, uint32_t chunkStride,
-    std::span<const uint32_t> pageTable, uint32_t physicalPageCount) {
+    uint32_t pageTableEntries) {
   if (logicalPosition > std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV logical position exceeds kernel ABI");
-  kv::Q8ChunkedPrefillParams params{
-      static_cast<uint32_t>(logicalPosition), chunkTokens, chunkStride,
-      static_cast<uint32_t>(pageTable.size()), physicalPageCount, 0, 0, 0};
+  kv::Q8ChunkedPrefillParams params{static_cast<uint32_t>(logicalPosition),
+                                    chunkTokens, chunkStride, pageTableEntries,
+                                    {}};
   const std::string_view error = kv::chunkedPrefillValidationError(params);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
-  if (!kv::chunkedPrefillPageTableInRange(params, pageTable))
-    throw std::invalid_argument("invalid KV chunk page table");
   return params;
 }
 
 void PagedAttention::addPrefillStore(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer chunkKeys, metal::MetalBuffer chunkValues,
     metal::MetalBuffer pageTable,
     const kv::Q8ChunkedPrefillParams &params, kv::Layout layout) {
@@ -400,15 +378,16 @@ void PagedAttention::addPrefillStore(
   const auto store = layout.format == kv::Format::BFloat16
       ? pipeline(kernel, "prefill_attention_bf16_store", "prefill_attention_bf16_store_kv2_g8")
       : pipeline(kernel, "prefill_attention_q8_store", "prefill_attention_q8_store_kv2_g8");
-  auto buffers = kvBuffers(layer, layout.format, {chunkKeys, chunkValues},
-                           std::array{pageTable});
-  graph.add(std::string(store), std::move(buffers),
-            params, {uint64_t{2} * params.chunk_tokens * layout.kvHeads, 1, 1},
+  kv::Q8ChunkedPrefillParams layerParams = params;
+  layerParams.kv = layer;
+  graph.add(std::string(store),
+            {std::move(chunkKeys), std::move(chunkValues), std::move(pageTable)},
+            layerParams, {uint64_t{2} * params.chunk_tokens * layout.kvHeads, 1, 1},
             {layout.headDimension, 1, 1});
 }
 
 void PagedAttention::addPrefill(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer queries, metal::MetalBuffer output,
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::Q8ChunkedPrefillParams &chunk,
@@ -426,10 +405,9 @@ void PagedAttention::addPrefill(
   }
   const kv::Q8PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, chunk.physical_page_count, plan.splits, 0, 0};
-  auto buffers = kvBuffers(layer, plan.format, {queries},
-                           std::array{partials, statistics, pageTable});
-  graph.add(std::string(plan.splitPipeline), std::move(buffers),
+      chunk.page_table_entries, layer, plan.splits};
+  graph.add(std::string(plan.splitPipeline),
+            {std::move(queries), partials, statistics, std::move(pageTable)},
             params, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline),
             {std::move(partials), std::move(statistics), std::move(output)},
@@ -437,7 +415,7 @@ void PagedAttention::addPrefill(
 }
 
 void PagedAttention::addVerify(
-    metal::CommandGraph &graph, const kv::LayerStorage &layer,
+    metal::CommandGraph &graph, SplashKvLayer layer,
     PagedVerifyBuffers buffers,
     std::span<const kv::Q8ChunkedPrefillParams> storeParams,
     std::span<const kv::Q8VerifyAttentionParams> attentionParams,
@@ -467,8 +445,6 @@ void PagedAttention::addVerify(
         stores[lane].committed_tokens != attention[lane].committed_tokens ||
         stores[lane].chunk_stride != attention[lane].chunk_stride ||
         stores[lane].page_table_entries != attention[lane].page_table_entries ||
-        stores[lane].physical_page_count !=
-            attention[lane].physical_page_count ||
         stores[lane].chunk_stride != stores[0].chunk_stride)
       throw std::invalid_argument("inconsistent paged verify lane parameters");
     // The plan scaled each lane's split count from this same committed
@@ -481,15 +457,16 @@ void PagedAttention::addVerify(
                                     kv::kQ8VerifyMaximumRows))
       throw std::invalid_argument("paged verify lane history does not match plan");
   }
-  auto storeBuffers = kvBuffers(layer, plan.format,
-      {buffers.chunkKeys, buffers.chunkValues}, buffers.pageTables);
-  graph.add(std::string(plan.storePipeline_), std::move(storeBuffers), stores,
-            plan.storeGroups_, plan.storeThreads_);
-
-  const std::array tail{buffers.partials, buffers.statistics,
-      buffers.pageTables[0], buffers.pageTables[1], buffers.pageTables[2], buffers.pageTables[3]};
-  auto attentionBuffers = kvBuffers(layer, plan.format, {buffers.queries}, tail);
-  graph.add(std::string(plan.splitPipeline), std::move(attentionBuffers),
+  for (uint32_t lane = 0; lane < maximumLanes; ++lane)
+    stores[lane].kv = attention[lane].kv = layer;
+  const auto &tables = buffers.pageTables;
+  graph.add(std::string(plan.storePipeline_),
+            {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
+             tables[3]},
+            stores, plan.storeGroups_, plan.storeThreads_);
+  graph.add(std::string(plan.splitPipeline),
+            {buffers.queries, buffers.partials, buffers.statistics, tables[0],
+             tables[1], tables[2], tables[3]},
             attention, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline),
             {buffers.partials, buffers.statistics, buffers.output},

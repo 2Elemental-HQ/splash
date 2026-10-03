@@ -1,5 +1,6 @@
 #include "AllocationFailure.hpp"
 #include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
@@ -20,54 +21,16 @@ using namespace splash::engine;
 
 namespace {
 
-class Backing final : public KvBacking {
-public:
-  explicit Backing(uint32_t pages) : resident_(pages, true) {}
-  uint32_t pageCount() const noexcept override { return resident_.size(); }
-  uint64_t bytesPerPage() const noexcept override { return 4096; }
-  bool isResident(uint32_t page) const override { return resident_.at(page); }
-  splash::metal::AllocationResult ensureResident(uint32_t page) override {
-    resident_.at(page) = true;
-    return true;
-  }
-  bool releaseBackingForPage(uint32_t page) override {
-    resident_.at(page) = false;
-    return true;
-  }
-  uint32_t extentFirstPage(uint32_t page) const override {
-    return page - page % 4;
-  }
-  uint32_t extentPageCount(uint32_t page) const override {
-    return std::min<uint32_t>(4, resident_.size() - extentFirstPage(page));
-  }
-private:
-  std::vector<bool> resident_;
-};
-
 class State final : public CompositeState {
 public:
   uint64_t bytes() const noexcept override { return 64; }
 };
 
-class HeldTicket final : public ModelBatchTicket {
-public:
-  HeldTicket(std::vector<ModelStepResult> results, std::shared_ptr<bool> ready)
-      : results_(std::move(results)), ready_(std::move(ready)) {}
-  bool ready() const noexcept override { return *ready_; }
-  std::vector<ModelStepResult> wait() override { return std::move(results_); }
-  double wallMilliseconds() const noexcept override { return 0.0; }
-
-private:
-  std::vector<ModelStepResult> results_;
-  std::shared_ptr<bool> ready_;
-};
-
 class Executor final : public model::Model {
 public:
-  std::shared_ptr<bool> ticketReady;
+  std::shared_ptr<std::atomic<bool>> ticketReady;
   std::function<void()> onSubmit;
   std::function<void()> onHealthCheck;
-  bool pendingHealth = false;
   // Score requests whose final prompt chunk reports a per-lane model failure.
   std::unordered_set<uint64_t> invalidScores;
   // The request flags each request began with.
@@ -80,7 +43,6 @@ public:
     if (onHealthCheck)
       onHealthCheck();
   }
-  bool needsHealthCheck() const noexcept override { return pendingHealth; }
   StateAdmission begin(const ModelRequest &request) override {
     beganFlags[request.id] = request.flags;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
@@ -172,7 +134,8 @@ public:
     auto result = plan.kind == WorkKind::Prefill ? prefill(plan, items)
                                                : decode(plan, items);
     if (ticketReady)
-      return std::make_unique<HeldTicket>(std::move(result), ticketReady);
+      return std::make_unique<test::HeldTicket>(std::move(result), ticketReady,
+                                                0.0);
     return test::immediateTicket(std::move(result), completion);
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
@@ -249,8 +212,8 @@ void runUntilIdle(engine::NativeRuntime &loop) {
 }
 
 void testPromptProgress() {
-  Backing backing(512);
-  KvPool pool(backing);
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 512);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -264,6 +227,7 @@ void testPromptProgress() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto submit = [&](uint64_t id, bool enabled) {
     auto input = request(id);
@@ -275,7 +239,7 @@ void testPromptProgress() {
     require(encoded && loop.receive(*encoded.value), "progress request failed");
   };
 
-  executor.ticketReady = std::make_shared<bool>(false);
+  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
   submit(1, true);
   require(loop.tick() && loop.commandInFlight(), "prefill was not submitted");
   for (int i = 0; i < 3; ++i)
@@ -353,8 +317,8 @@ void testPromptProgress() {
 }
 
 void testWireLifecycleAndCacheHit() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -368,6 +332,7 @@ void testWireLifecycleAndCacheHit() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   auto first = protocol::serializeMessage(protocol::Message{request(1)});
@@ -428,8 +393,8 @@ void testWireLifecycleAndCacheHit() {
 // The request's generation prompt reaches the engine: its replay state, which
 // an identical retry resumes from, ends before it.
 void testGenerationPromptBoundsTheReplayState() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -443,6 +408,7 @@ void testGenerationPromptBoundsTheReplayState() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -463,8 +429,8 @@ void testGenerationPromptBoundsTheReplayState() {
 
 // A request's flags reach the model with the rest of its request.
 void testRequestFlagsReachTheModel() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   double monotonic = 100.0;
@@ -474,6 +440,7 @@ void testRequestFlagsReachTheModel() {
       config, resources, executor, [](std::span<const uint8_t>) {},
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -489,8 +456,8 @@ void testRequestFlagsReachTheModel() {
 }
 
 void testFatalFramingClosesConnection() {
-  Backing backing(8);
-  KvPool pool(backing);
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 8);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -500,6 +467,7 @@ void testFatalFramingClosesConnection() {
         output.insert(output.end(), bytes.begin(), bytes.end());
       },
       [] { return std::string("{}"); });
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   const std::array<uint8_t, 24> invalid{};
   require(!loop.receive(invalid), "bad frame did not close connection");
   require(loop.connectionMustClose() && loop.engineHealthy(),
@@ -510,8 +478,8 @@ void testFatalFramingClosesConnection() {
 // frames behind it in the same read, whole or cut by the read boundary, must
 // still be processed.
 void testRequestErrorKeepsFraming() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -526,6 +494,7 @@ void testRequestErrorKeepsFraming() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   const auto wire = [](protocol::Message message) {
@@ -574,8 +543,9 @@ void testRequestErrorKeepsFraming() {
 }
 
 void testCapacityFailureHasOneTerminalFrame() {
-  Backing backing(1);
-  KvPool pool(backing);
+  test::TestKvStorage storage(4, 4096, 1);
+  storage.budgetPages = 1;
+  KvPool pool(storage, 1);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -588,6 +558,7 @@ void testCapacityFailureHasOneTerminalFrame() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
   loop.announceReady();
   auto encoded = protocol::serializeMessage(protocol::Message{request(3)});
@@ -599,11 +570,14 @@ void testCapacityFailureHasOneTerminalFrame() {
   uint32_t errors = 0;
   uint32_t done = 0;
   for (const protocol::Message &message : decodeMessages(output)) {
-    capacity += std::holds_alternative<protocol::CapacityExhaustedEvent>(message);
-    errors += std::holds_alternative<protocol::ErrorEvent>(message);
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+      ++errors;
+      capacity += error->failureClass == protocol::FailureClass::RequestError &&
+                  !error->retryable && error->code == engine::kCapacityExhausted;
+    }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
-  require(capacity == 1 && errors == 0 && done == 0,
+  require(capacity == 1 && errors == 1 && done == 0,
           "capacity failure emitted more than one terminal frame");
   require(loop.engineHealthy(),
           "request-scoped capacity failure made the engine unhealthy");
@@ -624,11 +598,11 @@ void testCommandWatchdogAndPendingHealthWake() {
           "stale completion cleared a newer command deadline");
 
   for (bool gpuCompleted : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
-    executor.ticketReady = std::make_shared<bool>(false);
+    executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
     double now = 0.0;
     metal::CommandWatchdog watchdog;
     executor.onSubmit = [&] { watchdog.start(1, now / 1000.0); };
@@ -644,6 +618,7 @@ void testCommandWatchdogAndPendingHealthWake() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     auto input = request(1);
     input.absoluteDeadlineUnixMicros = 601'000'000;
@@ -685,26 +660,22 @@ void testCommandWatchdogAndPendingHealthWake() {
     }
   }
 
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
-  executor.pendingHealth = true; // A sparse unmap can outlive all requests.
   engine::NativeRuntime loop({}, resources, executor,
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
-  require(!loop.tick() && loop.idle() &&
-              loop.millisecondsUntilNextWakeup() == 1000.0,
-          "an idle outstanding backend operation lost its health wake");
-  executor.pendingHealth = false;
-  require(!loop.millisecondsUntilNextWakeup(),
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  require(!loop.tick() && loop.idle() && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
 
 void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   for (bool malformed : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -717,6 +688,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto first = protocol::serializeMessage(protocol::Message{request(1)});
     require(first && loop.receive(*first.value) && loop.tick(),
@@ -741,8 +713,8 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 
 void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -752,6 +724,7 @@ void testControlFailureUsesExecutionBoundary() {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     require(loop.runControl([] { return true; }) && loop.engineHealthy(),
             "ordinary deferred control work failed");
@@ -780,8 +753,8 @@ void testControlFailureUsesExecutionBoundary() {
 // only the ones that report through engineError().
 void testEngineFailureNamesItsReason() {
   {
-    Backing backing(8);
-    KvPool pool(backing);
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     const std::system_error closed(EPIPE, std::generic_category(),
@@ -794,6 +767,7 @@ void testEngineFailureNamesItsReason() {
             throw closed;
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     outputClosed = true;
     auto status = protocol::serializeMessage(
@@ -806,8 +780,8 @@ void testEngineFailureNamesItsReason() {
             "a failed output write left the engine failure unnamed");
   }
   {
-    Backing backing(8);
-    KvPool pool(backing);
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -817,6 +791,7 @@ void testEngineFailureNamesItsReason() {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     auto frame = protocol::serializeMessage(protocol::Message{request(1)});
     require(static_cast<bool>(frame), "request wire failed");
@@ -847,8 +822,8 @@ void testEngineFailureNamesItsReason() {
 }
 
 void testInvalidPromptTokensStayRequestScoped() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -862,6 +837,7 @@ void testInvalidPromptTokensStayRequestScoped() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
     auto invalid = request(9);
@@ -894,8 +870,8 @@ void testInvalidPromptTokensStayRequestScoped() {
 // The feature bits Ready announces for an engine admitting images of up to
 // `maxImagePatches` patches.
 uint64_t announcedFeatures(uint32_t maxImagePatches) {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -909,6 +885,7 @@ uint64_t announcedFeatures(uint32_t maxImagePatches) {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   const auto announced = decodeMessages(output);
   const auto *ready = announced.size() == 1
@@ -929,8 +906,8 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
 // Without vision an image request fails by itself and the engine keeps
 // serving.
 void testImageRequestWithoutVisionStaysRequestScoped() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -944,6 +921,7 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto image = request(9);
   image.imageSpans = {{8, 16, 8, 8, 1, 2}};
@@ -972,8 +950,8 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
 
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
@@ -989,6 +967,7 @@ void testStepTokensFitTheWire() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
 
     loop.announceReady();
     auto encoded = protocol::serializeMessage(
@@ -1034,8 +1013,8 @@ protocol::RequestFrame scoreRequest(uint64_t id, uint32_t promptTokens) {
 }
 
 void testScoreRequestCompletesAfterFullPrompt() {
-  Backing backing(512);
-  KvPool pool(backing);
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 512);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   std::vector<uint8_t> output;
@@ -1048,6 +1027,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto encoded = protocol::serializeMessage(
       protocol::Message{scoreRequest(9, 3000)});
@@ -1078,11 +1058,11 @@ void testScoreRequestCompletesAfterFullPrompt() {
 }
 
 void testCancelledScoreReturnsEmptyLogits() {
-  Backing backing(32);
-  KvPool pool(backing);
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
-  executor.ticketReady = std::make_shared<bool>(false);
+  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
   std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -1093,6 +1073,7 @@ void testCancelledScoreReturnsEmptyLogits() {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   auto encoded = protocol::serializeMessage(
       protocol::Message{scoreRequest(11, 65)});
@@ -1138,8 +1119,8 @@ struct ScoreBesideChat final {
 // then a third request afterwards. The score's final prompt chunk either
 // returns logits or reports a non-finite one.
 ScoreBesideChat runScoreBesideChat(bool invalidScore) {
-  Backing backing(512);
-  KvPool pool(backing);
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 512);
   engine::Cache resources(pool, CacheNamespace{});
   Executor executor;
   if (invalidScore)
@@ -1154,6 +1135,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
       },
       [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
 
   // Whole KV pages, so the last prompt chunk is the one that publishes the
@@ -1243,8 +1225,8 @@ void testConstrainedMaskExchange() {
   };
   for (Reply reply : {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
                       Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel}) {
-    Backing backing(32);
-    KvPool pool(backing);
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
     Executor executor;
     std::vector<uint8_t> output;
@@ -1258,6 +1240,7 @@ void testConstrainedMaskExchange() {
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
         {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto send = [&](protocol::Message message) {
       auto wire = protocol::serializeMessage(message);

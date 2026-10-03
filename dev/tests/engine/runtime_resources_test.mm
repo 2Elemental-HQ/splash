@@ -80,6 +80,17 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
   }
 }
 
+// Beside its weights a model needs at least the runtime reserves, one state
+// cell and the KV runway.
+uint64_t minimumBytes(const RuntimeResourcesConfig &config,
+                      const TemporaryModelRoot &root) {
+  const kv::Layout kvLayout = config.model.targetKvLayout;
+  return root.packageBytes + model::kPipelineReserveBytes +
+         model::kRuntimeOverheadReserveBytes +
+         config.model.stateLayout.activeCellBytes() +
+         kvRunwayPages(kvLayout.minimumExtentPages()) * kvLayout.bytesPerModelPage();
+}
+
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
   TemporaryModelRoot root;
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
@@ -99,33 +110,27 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   }
   config.memoryPressure = [] { return MemoryPressure::Warning; };
 
-  // Beside its weights a model needs at least the runtime reserves, one state
-  // cell and one KV extent. The low ceiling is one byte short of all that, so
-  // every directory must be counted. The other ceilings must reach the real
-  // loader, whose expected weight files are deliberately absent. No actual
-  // model package is needed for this test.
-  const kv::Layout kvLayout = config.model.targetKvLayout;
-  const uint64_t minimumBytes =
-      root.packageBytes + model::kPipelineReserveBytes +
-      model::kRuntimeOverheadReserveBytes +
-      config.model.stateLayout.activeCellBytes() +
-      uint64_t{kvLayout.backingExtentPages()} * kvLayout.bytesPerModelPage();
-  for (uint64_t ceiling : {minimumBytes - 1, minimumBytes, uint64_t{0}}) {
+  // The low ceiling is one byte short of the minimum, so every directory
+  // must be counted. The other ceilings must reach the real loader, whose
+  // expected weight files are deliberately absent. No actual model package is
+  // needed for this test.
+  const uint64_t minimum = minimumBytes(config, root);
+  for (uint64_t ceiling : {minimum - 1, minimum, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
     try {
       auto resources = RuntimeResources::create(config);
       throw std::runtime_error("placeholder model unexpectedly loaded");
     } catch (const RuntimeResourcesError &error) {
-      if (ceiling == minimumBytes - 1) {
+      if (ceiling == minimum - 1) {
         require(error.failure() == RuntimeResourceFailure::EngineCapacity,
                 "hard weight budget lost its engine-capacity classification");
         require(std::string(error.what()).find("[memory_planning]") !=
                     std::string::npos &&
                     error.message().find(
-                        "require " + std::to_string(minimumBytes) + " bytes") !=
+                        "require " + std::to_string(minimum) + " bytes") !=
                         std::string::npos &&
                     error.message().find(
-                        "budget is " + std::to_string(minimumBytes - 1) +
+                        "budget is " + std::to_string(minimum - 1) +
                         " bytes") != std::string::npos,
                 "weight loading began before checking the memory ceiling");
       } else {
@@ -138,6 +143,38 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   requireReachesModelLoader(config, root.path,
                             "a sufficient weight budget did not reach the "
                             "model loader");
+}
+
+// A state's write to the disk tier stages through a state-sized buffer the
+// plan sets aside only when the tier starts: a quota that holds no state
+// leaves the tier off and the budget to KV.
+void testStateStagingNeedsAStartedTier(const char *metallibPath) {
+  TemporaryModelRoot root;
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  const uint64_t minimum = minimumBytes(config, root);
+  const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
+  config.maximumMemoryBytes = minimum;
+  config.maximumCacheDiskBytes = stateBytes - 1;
+  requireReachesModelLoader(config, root.path,
+                            "a quota that holds no state set staging aside");
+
+  config.maximumCacheDiskBytes = stateBytes;
+  try {
+    auto resources = RuntimeResources::create(config);
+    throw std::runtime_error("placeholder model unexpectedly loaded");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
+                std::string(error.what()).find("[memory_planning]") !=
+                    std::string::npos &&
+                error.message().find(
+                    "require " + std::to_string(minimum + stateBytes) +
+                    " bytes") != std::string::npos,
+            "a started tier's staging was not counted before loading");
+  }
+  config.maximumMemoryBytes = minimum + stateBytes;
+  requireReachesModelLoader(config, root.path,
+                            "a budget with room for the staging did not "
+                            "reach the model loader");
 }
 
 // A 34.5 GiB model under a 35 GiB budget: the weights alone fit, but not
@@ -227,6 +264,7 @@ int main(int argc, char **argv) {
       require(argc == 2, "expected metallib path");
       testLoadedVisionIsRequiredOnlyWithVision();
       testWeightBudgetBeforeLoading(argv[1]);
+      testStateStagingNeedsAStartedTier(argv[1]);
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
       std::cout << "runtime resources tests passed\n";
