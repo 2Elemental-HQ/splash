@@ -7300,6 +7300,10 @@ class ServerTest(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(harness.request("GET", "/health")[0], 200)
             self._assert_refused(waiting.pop(0))
+            # The answered connection keeps its slot until its thread sees its
+            # client close; a stalled one arriving before then would take the
+            # slot of the longest waiting one.
+            self._wait_for_http_active(harness.server.connections, 2)
             waiting.append(self._stalled(address))
             self._wait_for_http_active(harness.server.connections, 3)
             self._wait_until_read(harness.server)
