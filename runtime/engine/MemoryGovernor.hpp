@@ -29,8 +29,7 @@ struct HostMemoryPages {
 // carve-out, tag storage) is never available. The governor also enforces
 // the engine budget, host reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize,
-    bool compression = false) noexcept;
+    const HostMemoryPages &pages, uint64_t pageSize, bool compression) noexcept;
 // The live estimate, counting compression unless macOS reports critical
 // memory pressure (or none): a Mac that uses its compressor as designed keeps
 // serving, the credit shrinking as the anonymous pages it counts are
@@ -72,7 +71,6 @@ struct MemoryGovernorSnapshot {
   // Charged against the limit: the backend's allocated buffers plus the
   // untracked reserve, or the device's allocation when that is larger.
   uint64_t chargedBytes = 0;
-  uint64_t reservedBytes = 0;
   // Room under the limit beside what is charged and reserved: zero once the
   // engine's limit is reached.
   uint64_t headroomBytes = 0;
@@ -154,15 +152,13 @@ public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
 
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes);
   // Metal memory outside the backend's buffers (pipelines, driver
   // allocations) is charged only beyond untrackedReserveBytes, the part of
   // the limit the caller has set aside for it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes,
                  HostAvailableMemoryProvider hostAvailableMemory,
-                 uint64_t untrackedReserveBytes = 0);
+                 uint64_t untrackedReserveBytes);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed

@@ -1,3 +1,5 @@
+#include "ScopedTestConfig.hpp"
+#include "TestChecks.hpp"
 #include "engine/Status.hpp"
 
 #include <cmath>
@@ -10,15 +12,13 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 bool close(double left, double right) { return std::abs(left - right) < 1e-9; }
 
 void testLatencyWindowAndThroughput() {
-  RuntimeMetrics metrics(3);
+  const test::ScopedTestConfig seam({.metricsLatencyWindow = 3});
+  RuntimeMetrics metrics;
   for (uint64_t id = 1; id <= 4; ++id) {
     double submitted = double(id) * 100.0;
     const double first = submitted + double(id) * 10.0;
@@ -67,17 +67,8 @@ void testLatencyWindowAndThroughput() {
 }
 
 void testValidation() {
-  bool threw = false;
-  try {
-    RuntimeMetrics invalid(0);
-    static_cast<void>(invalid);
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "zero metrics window was accepted");
-
   RuntimeMetrics metrics;
-  threw = false;
+  bool threw = false;
   try {
     metrics.tokens(10.0, 20.0, 1, 19.0);
   } catch (const std::invalid_argument &) {

@@ -63,13 +63,13 @@ public:
   // image content the rows depend on (zero for text-only blocks).
   [[nodiscard]] std::optional<BlockMatch> find(uint64_t parentBlock,
                                                std::span<const uint32_t> tokens,
-                                               ImageIdentity images = {}) const;
+                                               ImageIdentity images) const;
   // Existing content is returned as is; a disk-only block adopts the
   // writer's page, and a block in transfer keeps its own.
   [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
-                                  ImageIdentity images = {});
+                                  ImageIdentity images);
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
@@ -128,7 +128,7 @@ public:
   // Oldest resident leaf (no resident children) that no request uses. Pass
   // the previous candidate to continue the scan without a lookup.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  evictionCandidate(uint64_t after = 0) const;
+  evictionCandidate(uint64_t after) const;
   // Oldest unused holder of a disk copy to replace: with duplicate, a
   // resident block whose copy is redundant; otherwise a disk-only block
   // without children. Pass the previous candidate to continue the scan.

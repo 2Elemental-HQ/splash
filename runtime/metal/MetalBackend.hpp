@@ -198,17 +198,20 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
+// How long a command may run before the backend gives up on it, and how long
+// every buffer stays wired after the last command (see allocateBuffer). Tests
+// substitute shorter ones through TestConfig.
+inline constexpr double kCommandTimeoutSeconds = 120.0;
+inline constexpr double kResidencyKeepAliveSeconds = 600.0;
+static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
 // One thread submits, allocates and looks up pipelines; checkHealth(),
 // healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
 // called from any thread.
 class MetalBackend final {
 public:
-  // Every buffer stays wired until residencyKeepAliveSeconds pass without a
-  // command (see allocateBuffer).
-  explicit MetalBackend(std::string metallibPath,
-                        double commandTimeoutSeconds = 120.0,
-                        double residencyKeepAliveSeconds = 600.0);
+  explicit MetalBackend(std::string metallibPath);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
@@ -241,15 +244,15 @@ public:
   // reach KV extents: residency makes it resident for every command, so no
   // command names it.
   [[nodiscard]] MetalBuffer
-  allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
-                 std::string_view label = {});
+  allocateBuffer(uint64_t bytes, BufferStorage storage,
+                 std::string_view label);
 
   // Wraps page-aligned shared memory without copying it. The lifetime token
   // is retained by Metal's deallocator, including any internal buffer owners
   // that outlive our C++ views and completed tickets.
   [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
                                              std::shared_ptr<void> lifetime,
-                                             std::string_view label = {});
+                                             std::string_view label);
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
 
@@ -265,9 +268,7 @@ public:
   // notifies host control flow; command results and errors are consumed from
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
-  [[nodiscard]] CommandTicket
-  submitAsync(const ComputeDispatch &dispatch,
-              CommandCompletion completion = {});
+  [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});

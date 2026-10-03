@@ -81,7 +81,7 @@ void requireCompatibleModelPackage(const ModelPackage &package);
 // packed vision file or a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader>
 planVisionLoader(metal::MetalBackend &backend, const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
+                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
 // The vision role: prepared by `loader` when there is one, else the packed
 // file; empty weights for a model without vision.
 [[nodiscard]] QwenVisionWeights
@@ -93,7 +93,7 @@ loadVisionWeights(metal::MetalBackend &backend, const std::filesystem::path &roo
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor, PreparationCheck admitConversion = {});
+                 const ModelDescriptor &descriptor, PreparationCheck admitConversion);
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

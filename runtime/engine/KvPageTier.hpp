@@ -24,10 +24,10 @@ public:
     explicit DiskSlot(std::shared_ptr<model::SlotFile::Slot> held) : slot(std::move(held)) {}
     std::shared_ptr<model::SlotFile::Slot> slot;
   };
-  static constexpr uint32_t kDefaultTransfers = 128;
+  // Transfers in flight at once. Tests set another bound through TestConfig.
+  static constexpr uint32_t kTransfers = 128;
 
-  KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file,
-             uint32_t transfers = kDefaultTransfers);
+  KvPageTier(kv::PageStorage &pages, std::shared_ptr<model::SlotFile> file);
   ~KvPageTier() override;
   KvPageTier(const KvPageTier &) = delete;
   KvPageTier &operator=(const KvPageTier &) = delete;

@@ -1,4 +1,5 @@
 #include "engine/Engine.hpp"
+#include "TestConfig.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -64,23 +65,16 @@ std::string pageShortfall(const TokenAdmission &admission) {
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), model_(model), events_(events),
-      scheduler_(config_.decodeShare) {
+    : config_(config),
+      checkpointTokens_(testConfig().prefillCheckpointTokens.value_or(kPrefillCheckpointTokens)),
+      resourceWaitTimeoutMilliseconds_(
+          testConfig().resourceWaitTimeoutMilliseconds.value_or(kResourceWaitTimeoutMilliseconds)),
+      cache_(cache), model_(model), events_(events), scheduler_(config_.decodeShare) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
-  if (!std::isfinite(config_.resourceWaitTimeoutMilliseconds) ||
-      config_.resourceWaitTimeoutMilliseconds <= 0.0)
-    throw std::invalid_argument("resource wait timeout must be positive and finite");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
-  if (config_.prefillCheckpointTokens &&
-      (config_.prefillCheckpointTokens <
-           model::ExecutionLimits::draftContextTokens ||
-       config_.prefillCheckpointTokens % KvCache::pageTokens)) {
-    throw std::invalid_argument(
-        "prefill checkpoint interval must span a draft window and whole KV pages");
-  }
 }
 
 void Engine::submit(EngineRequest value) {
@@ -889,7 +883,7 @@ void Engine::deferResourceRetry(Request &active, double now,
   if (reason == StateFailure::ConcurrencyLimit)
     wait.deadlineMilliseconds = 0.0;
   else if (progressed || wait.deadlineMilliseconds <= 0.0)
-    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+    wait.deadlineMilliseconds = now + resourceWaitTimeoutMilliseconds_;
   wait.epoch = resourceEpoch_;
   wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
 }
@@ -912,7 +906,7 @@ double Engine::resourceDeadline(const Request &active) const noexcept {
   // that takes. Other lanes do not extend it: requests that keep arriving
   // would otherwise hold it until the request's deadline.
   return std::max(wait.deadlineMilliseconds,
-                  wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
+                  wait.earlierLaneWorkMilliseconds + resourceWaitTimeoutMilliseconds_);
 }
 
 void Engine::signalResourceProgress() noexcept {
@@ -931,7 +925,7 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state. Progress points remain disposable after restoration.
   for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+           stateBoundary, latestReplayBoundary, checkpointTokens_)) {
     addStateBoundary(active, stateBoundary, checkpoint, true);
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
@@ -1459,7 +1453,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
   // Resident lanes drain before admission resumes. Growth the host refused
   // resumes when its pressure lifts; any other limit only once memory is
   // freed, so it counts as a failure the drain waits out.
-  drainEndMilliseconds_ = now + config_.resourceWaitTimeoutMilliseconds;
+  drainEndMilliseconds_ = now + resourceWaitTimeoutMilliseconds_;
   allocationFailed_ = failure != metal::AllocationFailure::HostPressure;
   ++counters_.resourceSuspensions;
 }

@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryAudit.hpp"
 
@@ -11,10 +12,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
                       uint64_t stateStagingBytes = 0) {

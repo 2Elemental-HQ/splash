@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
@@ -40,17 +41,14 @@ struct Shape {
 };
 constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 void testContract() {
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
-          "final fixed-eight verification rows exceeded physical KV scratch");
+          "the final cycle's verification rows exceeded physical KV scratch");
   require(verifyAttentionSplits(0) == kVerifySplits &&
               verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
               verifyAttentionSplits(131072) == kVerifyMaximumSplits,

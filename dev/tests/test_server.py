@@ -6533,6 +6533,33 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(status, 400, payload)
                 self.assertIn(message, json.loads(payload)["error"]["message"])
                 self.assertEqual(runtime.requests, [])
+        # Messages has temperature, top_p and top_k, validated as Chat's;
+        # no penalty or min_p, which keep their defaults.
+        for top_k, sent in ((20, 20), (0, 0), (-1, 0)):
+            with self.subTest(api="messages", top_k=top_k):
+                runtime.requests.clear()
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/messages",
+                    self.anthropic_body(temperature=0.7, top_p=0.8, top_k=top_k),
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(
+                    runtime.requests[0].frame.sampling,
+                    native_wire.SamplingParameters(
+                        temperature=0.7, top_p=0.8, top_k=sent
+                    ),
+                )
+        runtime.requests.clear()
+        status, _, payload = harness.request(
+            "POST", "/v1/messages", self.anthropic_body(top_p=0)
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertIn(
+            "top_p must be a number in (0, 1]",
+            json.loads(payload)["error"]["message"],
+        )
+        self.assertEqual(runtime.requests, [])
 
     def test_top_k_takes_any_positive_integer_and_0_or_minus_1_disables_it(self):
         runtime = FakeRuntime()

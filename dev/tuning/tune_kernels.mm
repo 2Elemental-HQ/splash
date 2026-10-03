@@ -214,12 +214,13 @@ int main(int argc, char **argv) {
       const auto &device = backend.capabilities();
       if (const auto error = device.validationError()) throw std::runtime_error(*error);
       const uint64_t budget =
-          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes);
+          engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes, 0);
       if (!budget)
         throw std::runtime_error("device working set does not cover its protected margin");
       engine::MemoryGovernor governor(
           backend, budget,
-          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
+          engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes),
+          engine::queryHostAvailableMemory, 0);
       const MeasurementStop underPressure = [&] {
         const auto state = governor.snapshot();
         return state.pressure != engine::MemoryPressure::Normal ||
@@ -238,7 +239,7 @@ int main(int argc, char **argv) {
       const auto descriptor = model::inspectModelPackage(modelRoot);
       std::optional<model::ModelPackage> package;
       if (!admit(model::preparedModelWeightBytes(modelRoot, descriptor),
-                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor)); }))
+                 [&] { package.emplace(model::loadModelPackage(backend, modelRoot, descriptor, {})); }))
         throw std::runtime_error("model package memory admission denied or interrupted");
       const auto workloads =
           model::collectTuningWorkloads(*package, kPrefillProbeRows, kDecodeProbeWidths);

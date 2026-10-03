@@ -1067,7 +1067,7 @@ int main(int argc, char **argv) {
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
         if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engineConfig.prefillCheckpointTokens)) {
+                length, engine::kPrefillCheckpointTokens)) {
           throw std::runtime_error(
               "cold prefill performed unnecessary draft-context work");
         }
@@ -1113,7 +1113,7 @@ int main(int argc, char **argv) {
             ((partialBase.size() - 1) / kv::kPageTokens) *
             kv::kPageTokens;
         const uint64_t expectedPartialRows = expectedDraftContextRows(
-            partialPrompt.size(), engineConfig.prefillCheckpointTokens,
+            partialPrompt.size(), engine::kPrefillCheckpointTokens,
             partialBoundary);
         if (partialSeed.cacheStatus != "miss" ||
             partialHit.cacheStatus != "prefix_hit" ||

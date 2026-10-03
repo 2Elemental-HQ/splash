@@ -21,7 +21,7 @@ class GgufTargetLoader final {
 public:
   // Plans every image from the GGUF's metadata once.
   GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {});
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 

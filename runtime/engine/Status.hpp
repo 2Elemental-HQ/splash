@@ -5,6 +5,7 @@
 #include "metal/MetalBackend.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "TestConfig.hpp"
 
 #include <algorithm>
 #include <array>
@@ -83,7 +84,11 @@ struct RuntimeMetricsSnapshot {
 // emits the snapshot consumed by runtimeStatusJson().
 class RuntimeMetrics final {
 public:
-  explicit RuntimeMetrics(uint32_t latencyWindow = 4096);
+  // TTFT and ITL samples the percentiles cover. Tests set a smaller window
+  // through TestConfig.
+  static constexpr uint32_t kLatencyWindow = 4096;
+
+  RuntimeMetrics();
 
   void tokens(double submittedMilliseconds,
               std::optional<double> previousTokenMilliseconds,
@@ -117,11 +122,8 @@ private:
   RuntimeBatchMetricsSnapshot currentDecodeBatch_;
 };
 
-inline RuntimeMetrics::RuntimeMetrics(uint32_t latencyWindow)
-    : latencyWindow_(latencyWindow) {
-  if (!latencyWindow_)
-    throw std::invalid_argument("latency window must be non-zero");
-}
+inline RuntimeMetrics::RuntimeMetrics()
+    : latencyWindow_(testConfig().metricsLatencyWindow.value_or(kLatencyWindow)) {}
 
 inline void RuntimeMetrics::tokens(
     double submittedMilliseconds,

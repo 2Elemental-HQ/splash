@@ -1,7 +1,9 @@
 #include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "TestModel.hpp"
@@ -29,10 +31,7 @@ using namespace splash;
 using namespace splash::engine;
 namespace runtime = splash::engine;
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 class TemporaryModelRoot final {
 public:
@@ -294,7 +293,7 @@ class Harness final {
 public:
   explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
       : backing_(16, 4096, 4), pool_(backing_, 16),
-        resources_(pool_),
+        resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
             loopConfig(), resources_, executor_,
@@ -304,7 +303,7 @@ public:
               }
               output_.insert(output_.end(), bytes.begin(), bytes.end());
             },
-            [] { return std::string("{\"schema_version\":5}"); }) {
+            test::readyStatusJson, protocol::ProtocolLimits{}) {
     backing_.commandInFlight = [this] { return loop_.commandInFlight(); };
   }
 

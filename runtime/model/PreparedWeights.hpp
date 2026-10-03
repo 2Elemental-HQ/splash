@@ -179,14 +179,14 @@ public:
   // complete model takes the lock only when it is free, never waiting for it,
   // and a cache it cannot lock or clean does not fail it.
   void requireSpace(std::span<const PreparedWeight> weights,
-                    const PreparationCheck &check = {}) const;
+                    const PreparationCheck &check) const;
   // The complete file of weight: reused, or written now under the converter
   // lock and published atomically; writer failures never publish partial
   // data. The sources are checked unchanged before, after writing and before
   // the path is returned, so no file of a modified source is published or
   // used.
   [[nodiscard]] std::filesystem::path prepare(const PreparedWeight &weight, const WeightWriter &write,
-                                              const PreparationGuards &guards = {}) const;
+                                              const PreparationGuards &guards) const;
 
 private:
   std::filesystem::path root_;

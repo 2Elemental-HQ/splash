@@ -147,13 +147,13 @@ public:
   // checkpoint; a checkpoint cannot downgrade an ordinary state. False for a
   // state that is absent or only on disk: the caller publishes the copy it
   // holds, which is promotion without a read.
-  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint);
   // The same for a copy in either tier.
-  [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint);
 
   // Publishes a RAM copy; a disk copy of the block stays beside it.
   void publishCompositeState(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
-                             bool checkpoint = false);
+                             bool checkpoint);
   // Publishes a state that has no RAM copy by writing it from its lane: the
   // entry is the disk copy the ticket carries, with the write in flight.
   // False when the one write in flight holds the staging buffer, or when the
@@ -161,7 +161,7 @@ public:
   // nothing is published then. The caller reuses a stored state first
   // (reuseStoredState); publishing over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
-                                        bool checkpoint = false);
+                                        bool checkpoint);
   // Publication identity protects replacement states from stale handles.
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // Ensures this publication is no longer a disposable checkpoint. Returns

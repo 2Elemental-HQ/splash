@@ -342,7 +342,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(), *modelRuntime,
-        std::move(output), std::move(statusProvider), NativeLoopClocks{},
+        std::move(output), std::move(statusProvider),
         protocolLimitsFor(config.resources.model.capabilities,
                           config.nativeLoop.engine.maxContext));
   } catch (const metal::MetalAllocationError &error) {

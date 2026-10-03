@@ -75,10 +75,6 @@ struct RuntimeResourcesConfig {
   // boundaries; after Ready the transport control handler keeps it current.
   std::function<MemoryPressure()> memoryPressure;
   std::function<bool()> cancelled;
-  // Reclaimable host memory, sampled at every Metal operation during startup
-  // and by the governor afterwards. Empty means the live vm_statistics64
-  // estimate; tests substitute a fixed value.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory;
 };
 
 enum class RuntimeResourceFailure {

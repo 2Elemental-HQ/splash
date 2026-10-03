@@ -20,11 +20,6 @@ struct NativeLoopConfig {
   RuntimeMetrics *metrics = nullptr;
 };
 
-struct NativeLoopClocks {
-  std::function<uint64_t()> unixMicros;
-  std::function<double()> monotonicMilliseconds;
-};
-
 // Translates native protocol messages and events at the Engine boundary.
 //
 // The engine's failure boundary. Every received frame, tick() and
@@ -40,8 +35,7 @@ public:
 
   NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                 model::Model &model, ByteSink output,
-                StatusProvider statusProvider, NativeLoopClocks clocks = {},
-                protocol::ProtocolLimits limits = {});
+                StatusProvider statusProvider, protocol::ProtocolLimits limits);
 
   // Processes every complete frame in bytes. False means the connection
   // must close. Request-scoped errors return true and preserve framing.
@@ -134,14 +128,20 @@ private:
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 
-  static NativeLoopClocks defaultClocks();
+  // The system clock in microseconds and the steady clock in milliseconds,
+  // or the test seam's (TestConfig).
+  struct Clocks {
+    std::function<uint64_t()> unixMicros;
+    std::function<double()> monotonicMilliseconds;
+  };
+  static Clocks clocks();
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);
 
   NativeLoopConfig config_;
   ByteSink output_;
   StatusProvider statusProvider_;
-  NativeLoopClocks clocks_;
+  Clocks clocks_;
   protocol::ProtocolLimits limits_;
   protocol::FrameParser parser_;
   engine::Engine core_;

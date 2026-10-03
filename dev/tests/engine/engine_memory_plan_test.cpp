@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "TestModel.hpp"
 
@@ -12,10 +13,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
   DeviceCapabilities result;
@@ -211,7 +209,7 @@ void testReservesAreTheModelConstants() {
   ModelMemoryProfile withoutDecode = model();
   withoutDecode.footprint.runtime.sharedDecodePlannedAllocatedBytes = 0;
   const EngineMemoryPlanResult refused =
-      evaluateEngineMemoryPlan(device(), withoutDecode);
+      evaluateEngineMemoryPlan(device(), withoutDecode, 0);
   require(!refused.plan &&
               refused.status.code == BudgetErrorCode::InvalidModelSpec &&
               refused.status.message == "shared_decode_bytes_required",
@@ -219,13 +217,13 @@ void testReservesAreTheModelConstants() {
 }
 
 void testHardBudgetBoundaries() {
-  require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB) == 11 * kGiB &&
+  require(EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 0) == 11 * kGiB &&
               EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 8 * kGiB) ==
                   8 * kGiB &&
               EngineMemoryPolicy::hardBudgetBytes(12 * kGiB, 16 * kGiB) ==
                   11 * kGiB,
           "preflight ceiling disagrees with automatic or explicit policy");
-  require(EngineMemoryPolicy::hardBudgetBytes(0) == 0 &&
+  require(EngineMemoryPolicy::hardBudgetBytes(0, 0) == 0 &&
               EngineMemoryPolicy::hardBudgetBytes(kGiB, 1) == 0,
           "insufficient working set underflowed the preflight ceiling");
   constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();

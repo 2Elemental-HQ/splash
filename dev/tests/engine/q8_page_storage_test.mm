@@ -1,5 +1,7 @@
+#include "TestBuffers.hpp"
 #include "ops/PageStorage.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include <algorithm>
@@ -19,9 +21,7 @@ using splash::test::entryOf;
 
 namespace {
 
-void require(bool condition, const char *message) {
-    if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Exception, typename Function>
 void requireThrows(Function &&function, const char *message) {
@@ -33,39 +33,10 @@ void requireThrows(Function &&function, const char *message) {
     throw std::runtime_error(message);
 }
 
-// A pool's extents hold whole alignment units, so that every tensor region of
-// an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions need
-// 128 pages for four KV heads and 256 for two, BF16 one or two. The size is
-// chosen per pool between half and one and a half times the 128 MiB target,
-// leaving the fewest of its pages over, the one nearest the target on a tie.
 constexpr kv::Layout kvLayout{16, 4, 256};
 constexpr kv::Layout compactLayout{10, 2, 256};
 constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
 constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
-static_assert(kv::kExtentRegionAlignmentBytes == 64 * 1024);
-static_assert(kvLayout.bytesPerModelPage() == 1'064'960);
-static_assert(kvLayout.extentAlignmentPages() == 128);
-static_assert(kvLayout.minimumExtentPages() == 128 && kvLayout.maximumExtentPages() == 128);
-static_assert(kvLayout.extentPagesFor(127) == 0 && kvLayout.extentPagesFor(128) == 128 &&
-              kvLayout.extentPagesFor(1000) == 128);
-static_assert(compactLayout.bytesPerModelPage() == 332'800);
-static_assert(compactLayout.extentAlignmentPages() == 256);
-static_assert(compactLayout.minimumExtentPages() == 256 &&
-              compactLayout.maximumExtentPages() == 512);
-static_assert(compactLayout.extentPagesFor(255) == 0 && compactLayout.extentPagesFor(511) == 256);
-// Both sizes leave nothing over: 512 pages (162.5 MiB) is nearer the target
-// than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
-static_assert(compactLayout.extentPagesFor(10'240) == 512);
-static_assert(compactLayout.extentPagesFor(10'496) == 256);
-static_assert(bf16Layout.extentAlignmentPages() == 1 && bf16Layout.minimumExtentPages() == 32 &&
-              bf16Layout.maximumExtentPages() == 96);
-// 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
-// page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
-static_assert(bf16Layout.extentPagesFor(31) == 0 && bf16Layout.extentPagesFor(448) == 64 &&
-              bf16Layout.extentPagesFor(97) == 48);
-static_assert(compactBf16Layout.extentAlignmentPages() == 2 &&
-              compactBf16Layout.minimumExtentPages() == 104 &&
-              compactBf16Layout.maximumExtentPages() == 306);
 
 // The host reaches a page through spans of its tensors, layer by layer as
 // keys, key scales, values and value scales, BF16 without scales. Kernels
@@ -146,198 +117,11 @@ void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStora
 
 void run(const std::string &metallib) {
     metal::MetalBackend backend(metallib);
-    auto baseline = backend.memoryStats();
-    uint64_t observed = std::max(
-        baseline.allocatedBytes, baseline.deviceCurrentAllocatedBytes);
-    constexpr uint64_t giB = 1ULL << 30;
-    constexpr uint64_t hostReserve = 64 * 1024;
-    std::optional<uint64_t> fakeHostAvailable = hostReserve + 3 * giB;
-    MemoryGovernor bounded(
-        backend, observed + 64 * 1024, hostReserve,
-        [&fakeHostAvailable] {
-            return fakeHostAvailable;
-        });
-    auto admit = bounded.allocationAdmission();
-    // Whether one byte more is admitted.
-    const auto admitsMore = [&admit] { return static_cast<bool>(admit(1, [] {})); };
-    const auto exact = admit(64 * 1024, [&] {
-      require(bounded.snapshot().reservedBytes == 64 * 1024,
-              "memory governor did not reserve exact growth bytes");
-      const auto over = admit(1, [] {});
-      require(!over && over.failure == metal::AllocationFailure::EngineBudget &&
-                  bounded.snapshot().deniedReservations == 1,
-              "memory governor oversold its hard ceiling");
-    });
-    require(static_cast<bool>(exact), "memory governor refused exact growth bytes");
-    const auto driverDenied = admit(1024, [] {
-      throw metal::MetalAllocationError("injected driver allocation denial");
-    });
-    require(!driverDenied &&
-                driverDenied.failure == metal::AllocationFailure::DriverRejected &&
-                bounded.snapshot().reservedBytes == 0,
-            "driver allocation denial did not release its reservation");
-    bool defectPropagated = false;
-    try {
-      (void)admit(1024, [] {
-        throw metal::MetalBackendError("injected backend defect");
-      });
-    } catch (const metal::MetalBackendError &) {
-      defectPropagated = true;
-    }
-    require(defectPropagated && bounded.snapshot().reservedBytes == 0,
-            "admission swallowed a backend defect or leaked its reservation");
-    require(admit(1024, [] {}) && bounded.snapshot().reservedBytes == 0,
-            "driver allocation denial poisoned later admission");
-    // A request may cross the warning margin while the idle headroom still
-    // clears it. Its exact refusal reason must remain retryable, and the
-    // refusal holds host pressure so that paced reclaim starts.
-    fakeHostAvailable = hostReserve + giB + 512;
-    bool allocated = false;
-    const auto hostDenied = admit(1024, [&] { allocated = true; });
-    require(!hostDenied && !allocated &&
-                hostDenied.failure == metal::AllocationFailure::HostPressure &&
-                bounded.snapshot().pressure == MemoryPressure::Warning &&
-                bounded.snapshot().reservedBytes == 0,
-            "request-sized host refusal lost its cause or ran allocation");
-    fakeHostAvailable = hostReserve + 3 * giB;
-    bounded.setPressure(MemoryPressure::Critical);
-    require(!admitsMore(),
-            "critical pressure did not stop new growth");
-    bounded.setPressure(MemoryPressure::Normal);
-    require(admitsMore(),
-            "normal pressure did not reopen admission");
-    fakeHostAvailable = hostReserve;
-    require(!admitsMore(),
-            "host reserve did not stop unified-memory growth");
-    // Reaching the reserve is a warning that sheds cache in paced passes;
-    // only the OS critical verdict drops every evictable entry.
-    require(bounded.snapshot().pressure == MemoryPressure::Warning,
-            "reaching the host reserve was treated as critical");
-    fakeHostAvailable = hostReserve / 2;
-    require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                !admitsMore(),
-            "low availability escalated to destructive system pressure");
-    fakeHostAvailable = hostReserve + giB / 2;
-    require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                !bounded.snapshot().hostGrowthAllowed &&
-                !admitsMore(),
-            "low host headroom did not request proactive cache reclaim");
-    fakeHostAvailable = hostReserve + 3 * giB / 2;
-    require(bounded.snapshot().pressure == MemoryPressure::Warning,
-            "warning pressure recovered without crossing the hysteresis");
-    fakeHostAvailable = hostReserve + 3 * giB;
-    require(bounded.snapshot().pressure == MemoryPressure::Normal &&
-                bounded.snapshot().hostGrowthAllowed,
-            "host recovery did not reopen admission");
-    const auto full = admit(64 * 1024, [&] {
-      const auto snapshot = bounded.snapshot();
-      require(snapshot.headroomBytes == 0 && snapshot.hostGrowthAllowed,
-              "engine budget exhaustion was confused with host pressure");
-    });
-    require(static_cast<bool>(full), "engine capacity reservation failed");
-    fakeHostAvailable.reset();
-    require(!admitsMore() &&
-                !bounded.snapshot().hostMeasurementValid,
-            "missing host memory telemetry did not fail closed");
-    MemoryPressurePolicy missingPolicy;
-    auto missing = bounded.snapshot();
-    auto missingDirective = missingPolicy.update(missing, 0.0, false);
-    require(missing.pressure == MemoryPressure::Warning && missingDirective &&
-                !missingDirective->critical && missingDirective->targetBytes == 0,
-            "missing telemetry discarded valid cache");
-    bounded.setPressure(MemoryPressure::Critical);
-    require(missingPolicy.update(bounded.snapshot(), 1.0, false).value().critical,
-            "missing telemetry hid critical system pressure");
-    bounded.setPressure(MemoryPressure::Normal);
-    fakeHostAvailable = hostReserve + 3 * giB;
-    require(bounded.snapshot().hostHeadroomBytes == 3 * giB,
-            "host memory headroom accounting is wrong");
-
-    // Low reclaimable memory must not reopen growth or suppress
-    // the existing pressure reclaimer. Reclaimable file cache can.
-    HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = giB / 2};
-    fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
-    MemoryPressurePolicy hostPolicy;
-    auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
-    require(!admitsMore() &&
-                bounded.snapshot().pressure == MemoryPressure::Warning &&
-                hostDirective && !hostDirective->critical &&
-                hostDirective->targetBytes == giB,
-            "low reclaimable memory bypassed bounded pressure recovery");
-    pressurePages.fileBacked = 3 * giB;
-    fakeHostAvailable = estimateHostAvailableMemory(pressurePages, 1);
-    require(bounded.snapshot().hostGrowthAllowed &&
-                admitsMore() &&
-                !hostPolicy.update(bounded.snapshot(), 1000.0, false),
-            "reclaimable host recovery did not reopen normal admission");
-    bounded.setPressure(MemoryPressure::Warning);
-    require(bounded.snapshot().pressure == MemoryPressure::Warning &&
-                bounded.snapshot().hostGrowthAllowed &&
-                admitsMore(),
-            "system warning blocked growth despite sufficient host headroom");
-    fakeHostAvailable = hostReserve + giB / 2;
-    require(!admitsMore(),
-            "system warning bypassed insufficient host headroom");
-    fakeHostAvailable = hostReserve + 3 * giB;
-    bounded.setPressure(MemoryPressure::Normal);
-
-    MemoryPressurePolicy policy;
-    MemoryGovernorSnapshot policySnapshot;
-    policySnapshot.pressure = MemoryPressure::Warning;
-    policySnapshot.hostMeasurementValid = true;
-    policySnapshot.systemPressure = MemoryPressure::Warning;
-    policySnapshot.hostHeadroomBytes = 3 * giB / 2;
-    auto firstDirective = policy.update(policySnapshot, 0.0, false);
-    require(firstDirective && !firstDirective->critical &&
-                firstDirective->targetBytes == giB / 2,
-            "warning pressure ignored measured headroom");
-    require(policy.update(policySnapshot, 500.0, false).value().targetBytes == 0 &&
-                policy.update(policySnapshot, 999.0, false).value().targetBytes == 0,
-            "warning pressure reclaimed again before telemetry settled");
-    // Another application consumed more memory in the SAME warning episode.
-    // Earlier reclaimed bytes must not offset this new deficit.
-    policySnapshot.hostHeadroomBytes = giB / 4;
-    require(policy.update(policySnapshot, 1000.0, false).value().targetBytes == giB,
-            "persistent warning did not request a new bounded shrink pass");
-    policySnapshot.systemPressure = MemoryPressure::Normal;
-    policySnapshot.hostHeadroomBytes = 7 * giB / 4;
-    require(policy.update(policySnapshot, 2000.0, false).value().targetBytes == giB / 4,
-            "pressure recovery ignored the current smaller deficit");
-    policySnapshot.pressure = MemoryPressure::Normal;
-    require(!policy.update(policySnapshot, 2100.0, false),
-            "normal pressure requested cache reclaim");
-    policySnapshot.pressure = MemoryPressure::Warning;
-    require(policy.update(policySnapshot, 2101.0, false).value().targetBytes == giB / 4,
-            "a new pressure episode inherited an old cooldown");
-    policySnapshot.systemPressure = MemoryPressure::Warning;
-    policySnapshot.hostHeadroomBytes = 3 * giB;
-    const auto advisory = policy.update(policySnapshot, 3101.0, false);
-    require(advisory && !advisory->critical && advisory->targetBytes == 0,
-            "system warning discarded live cache despite sufficient headroom");
-    // The newest publication is what a follow-up resumes from; rebuilding it
-    // costs a whole prefill, so a shrink nothing is waiting for leaves it and
-    // takes the rest. A waiting request outranks it, and Critical takes all.
-    policySnapshot.systemPressure = MemoryPressure::Warning;
-    policySnapshot.hostHeadroomBytes = giB / 4;
-    const auto speculative = policy.update(policySnapshot, 4101.0, false);
-    require(speculative && speculative->targetBytes == giB &&
-                speculative->keepResumePoint,
-            "a speculative shrink discarded the resume point");
-    const auto demanded = policy.update(policySnapshot, 5101.0, true);
-    require(demanded && demanded->targetBytes == giB &&
-                !demanded->keepResumePoint,
-            "a waiting request could not reach the resume point");
-    policySnapshot.pressure = MemoryPressure::Critical;
-    auto criticalDirective = policy.update(policySnapshot, 2102.0, false);
-    require(criticalDirective && criticalDirective->critical &&
-                !criticalDirective->keepResumePoint,
-            "critical pressure did not request aggressive reclaim");
-
     std::optional<uint64_t> elasticHostAvailable = 2ULL * 1024 * 1024 * 1024;
     MemoryGovernor hostGated(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
         128ULL * 1024 * 1024,
-        [&elasticHostAvailable] { return elasticHostAvailable; });
+        [&elasticHostAvailable] { return elasticHostAvailable; }, 0);
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
@@ -356,7 +140,7 @@ void run(const std::string &metallib) {
             "KV growth did not recover after host memory became available");
 
     MemoryGovernor governor(
-        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, queryHostAvailableMemory, 0);
     requireThrows<std::invalid_argument>(
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
         "a pool of a part of an extent was accepted");
@@ -364,9 +148,9 @@ void run(const std::string &metallib) {
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
         "an extent of a part of an alignment unit was accepted");
 
-    metal::MetalBuffer table = backend.allocateBuffer(4 * sizeof(SplashKvPage));
-    const metal::MetalBuffer probe = backend.allocateBuffer(sizeof(SplashKvPage));
-    metal::MetalBuffer word = backend.allocateBuffer(sizeof(uint32_t));
+    metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(SplashKvPage));
+    const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(SplashKvPage));
+    metal::MetalBuffer word = test::sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
     const uint64_t extentBytes = 128 * kvLayout.bytesPerModelPage();

@@ -1,9 +1,12 @@
+import dataclasses
 import math
 import os
 import select
+import struct
 import subprocess
 import threading
 import time
+import typing
 import unittest
 import weakref
 from array import array
@@ -185,6 +188,21 @@ class FakeFactory:
         return process
 
 
+def f32_sampling(sampling):
+    """The sampling a request frame carries: its float fields as f32."""
+    hints = typing.get_type_hints(wire.SamplingParameters)
+    return dataclasses.replace(
+        sampling,
+        **{
+            field.name: struct.unpack(
+                "<f", struct.pack("<f", getattr(sampling, field.name))
+            )[0]
+            for field in dataclasses.fields(wire.SamplingParameters)
+            if hints[field.name] is float
+        },
+    )
+
+
 def request(
     token,
     *,
@@ -283,7 +301,7 @@ class RuntimeTests(unittest.TestCase):
             ),
             request(
                 200,
-                sampling=wire.SamplingParameters(0.7, 0.9, 16),
+                sampling=wire.SamplingParameters(0.7, 0.9, 16, 0.5, -0.25, 1.1, 0.05),
                 seed=66,
             ),
             request(
@@ -364,15 +382,7 @@ class RuntimeTests(unittest.TestCase):
                 frame.logical_max_output_tokens,
                 source.frame.logical_max_output_tokens,
             )
-            self.assertAlmostEqual(
-                frame.sampling.temperature,
-                source.frame.sampling.temperature,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                frame.sampling.top_p, source.frame.sampling.top_p, places=6
-            )
-            self.assertEqual(frame.sampling.top_k, source.frame.sampling.top_k)
+            self.assertEqual(frame.sampling, f32_sampling(source.frame.sampling))
             self.assertEqual(frame.seed, source.frame.seed)
             self.assertEqual(frame.constraint, source.frame.constraint)
 

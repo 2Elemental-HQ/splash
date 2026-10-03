@@ -1,8 +1,11 @@
 #include "AllocationFailure.hpp"
 #include "ProtocolPeer.hpp"
+#include "ScopedTestConfig.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
+#include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
@@ -183,10 +186,7 @@ private:
   uint32_t restored_ = 0;
 };
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {
@@ -226,23 +226,62 @@ void runUntilIdle(engine::NativeRuntime &loop) {
   require(idle(loop), "native loop did not become idle");
 }
 
-void testPromptProgress() {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 512);
-  engine::Cache resources(pool);
+// The KV pool under the loop: `pages` pages in extents of `extentPages`, of
+// which the first `runwayPages` are allocated up front.
+struct PoolShape {
+  uint32_t pages = 32;
+  uint32_t extentPages = 4;
+  uint32_t runwayPages = pages;
+};
+
+// A native loop over the fake model, collecting the bytes it writes. Its
+// clocks come from the test seam: the unix clock stands still and the steady
+// clock reads `monotonic`, advanced by `clockStep` on every read.
+struct LoopFixture {
+  explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
+                       protocol::ProtocolLimits limits = {})
+      : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
+              .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
+        storage(shape.pages, 4096, shape.extentPages),
+        pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
+        loop(
+            std::move(config), cache, executor,
+            [this](std::span<const uint8_t> bytes) {
+              if (writeFailure)
+                throw *writeFailure;
+              output.insert(output.end(), bytes.begin(), bytes.end());
+            },
+            [this] { return status(); }, limits) {
+    storage.commandInFlight = [this] { return loop.commandInFlight(); };
+  }
+
+  // Every event the loop has written.
+  std::vector<protocol::EngineEvent> events() const {
+    return protocol::peer::decodeEvents(output);
+  }
+
+  test::ScopedTestConfig seam;
+  test::TestKvStorage storage;
+  KvPool pool;
+  engine::Cache cache;
   Executor executor;
   std::vector<uint8_t> output;
+  // Thrown by every write while set, as by a closed output pipe.
+  std::optional<std::system_error> writeFailure;
+  // What the loop answers a status request with.
+  std::function<std::string()> status = test::readyStatusJson;
   double monotonic = 100.0;
+  double clockStep = 0.0;
+  engine::NativeRuntime loop;
+};
+
+void testPromptProgress() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 8192;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config, {.pages = 512});
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  fixture.clockStep = 0.25;
   loop.announceReady();
   auto submit = [&](uint64_t id, bool enabled) {
     auto input = request(id);
@@ -260,7 +299,7 @@ void testPromptProgress() {
   for (int i = 0; i < 3; ++i)
     static_cast<void>(loop.tick());
   uint32_t count = 0;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *event =
             std::get_if<protocol::PromptProgressEvent>(&message)) {
       require(event->processedTokens == 0,
@@ -280,7 +319,7 @@ void testPromptProgress() {
   std::unordered_map<uint64_t, uint64_t> elapsed;
   std::unordered_map<uint64_t, bool> tokensSeen;
   uint32_t coldUpdates = 0;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *event =
             std::get_if<protocol::PromptProgressEvent>(&message)) {
       require(event->requestId != 3, "default path emitted progress");
@@ -309,7 +348,7 @@ void testPromptProgress() {
   require(coldUpdates >= 3 && tokensSeen[1] && tokensSeen[2] && tokensSeen[3],
           "missing incremental progress or terminal output");
 
-  output.clear();
+  fixture.output.clear();
   *executor.ticketReady = false;
   submit(4, true);
   require(loop.tick() && loop.commandInFlight(),
@@ -320,7 +359,7 @@ void testPromptProgress() {
   runUntilIdle(loop);
   count = 0;
   bool cancelled = false;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (std::holds_alternative<protocol::PromptProgressEvent>(message))
       ++count;
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
@@ -331,22 +370,12 @@ void testPromptProgress() {
 }
 
 void testWireLifecycleAndCacheHit() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  double monotonic = 100.0;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  fixture.clockStep = 0.25;
 
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(request(1))),
@@ -356,7 +385,7 @@ void testWireLifecycleAndCacheHit() {
   require(
       loop.receive(protocol::peer::serialize(protocol::StatusRequestFrame{77})),
       "in-flight status request failed");
-  const auto pendingMessages = protocol::peer::decodeEvents(output);
+  const auto pendingMessages = fixture.events();
   require(loop.commandInFlight() &&
               std::any_of(pendingMessages.begin(), pendingMessages.end(),
                           [](const auto &message) {
@@ -372,7 +401,7 @@ void testWireLifecycleAndCacheHit() {
   require(loop.receive(protocol::peer::serialize(request(3))),
           "restored request wire failed");
   runUntilIdle(loop);
-  auto messages = protocol::peer::decodeEvents(output);
+  auto messages = fixture.events();
   uint32_t misses = 0;
   uint32_t hits = 0;
   uint32_t tokens = 0;
@@ -406,22 +435,11 @@ void testWireLifecycleAndCacheHit() {
 // The request's generation prompt reaches the engine: its replay state, which
 // an identical retry resumes from, ends before it.
 void testGenerationPromptBoundsTheReplayState() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  double monotonic = 100.0;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.clockStep = 0.25;
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -431,7 +449,7 @@ void testGenerationPromptBoundsTheReplayState() {
     runUntilIdle(loop);
   }
   std::vector<uint32_t> matched;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *start = std::get_if<protocol::StartEvent>(&message))
       matched.push_back(start->matchedPromptTokens);
   }
@@ -441,18 +459,12 @@ void testGenerationPromptBoundsTheReplayState() {
 
 // A request's flags reach the model with the rest of its request.
 void testRequestFlagsReachTheModel() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  double monotonic = 100.0;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor, [](std::span<const uint8_t>) {},
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  fixture.clockStep = 0.25;
   loop.announceReady();
   for (uint64_t id : {1, 2}) {
     auto input = request(id);
@@ -470,18 +482,12 @@ void testRequestFlagsReachTheModel() {
 // The penalties cross the wire to the model with the rest of the sampling;
 // greedy requests carry them too.
 void testSamplingReachesTheModel() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  double monotonic = 100.0;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor, [](std::span<const uint8_t>) {},
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [&] { return monotonic += 0.25; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  fixture.clockStep = 0.25;
   loop.announceReady();
   auto greedy = request(1);
   greedy.sampling = {0.0f, 1.0f, 0, 1.5f, 0.0f, 1.1f, 0.2f};
@@ -507,22 +513,12 @@ void testFatalFramingClosesConnection() {
   for (const auto &[invalid, code] :
        {std::pair{std::vector<uint8_t>(24), "bad_magic"},
         std::pair{*event.value, "unknown_frame_type"}}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 8);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{}"); });
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture({}, {.pages = 8});
+    engine::NativeRuntime &loop = fixture.loop;
     require(!loop.receive(invalid), "bad frame did not close connection");
     require(loop.connectionMustClose() && loop.engineHealthy(),
             "protocol failure was misclassified as engine failure");
-    const auto events = protocol::peer::decodeEvents(output);
+    const auto events = fixture.events();
     const auto *error = events.size() == 1
                             ? std::get_if<protocol::ErrorEvent>(&events.front())
                             : nullptr;
@@ -537,31 +533,19 @@ void testFatalFramingClosesConnection() {
 // frames behind it in the same read, whole or cut by the read boundary, must
 // still be processed.
 void testRequestErrorKeepsFraming() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   protocol::ProtocolLimits limits;
   limits.maxLogicalOutputTokens = 1;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config, {}, limits);
+  engine::NativeRuntime &loop = fixture.loop;
 
   loop.announceReady();
   // Errors, completions and status answers so far; every error must be the
   // rejected request's own.
   const auto events = [&] {
     std::array<uint32_t, 3> counts{};
-    for (const protocol::EngineEvent &message :
-         protocol::peer::decodeEvents(output)) {
+    for (const protocol::EngineEvent &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->failureClass == protocol::FailureClass::RequestError &&
                     error->requestId == 9,
@@ -599,22 +583,11 @@ void testRequestErrorKeepsFraming() {
 }
 
 void testCapacityFailureHasOneTerminalFrame() {
-  test::TestKvStorage storage(4, 4096, 1);
-  storage.budgetPages = 1;
-  KvPool pool(storage, 1);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config, {.pages = 4, .extentPages = 1, .runwayPages = 1});
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.storage.budgetPages = 1;
 
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(request(3))),
@@ -624,8 +597,7 @@ void testCapacityFailureHasOneTerminalFrame() {
   uint32_t capacity = 0;
   uint32_t errors = 0;
   uint32_t done = 0;
-  for (const protocol::EngineEvent &message :
-       protocol::peer::decodeEvents(output)) {
+  for (const protocol::EngineEvent &message : fixture.events()) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++errors;
       capacity += error->failureClass == protocol::FailureClass::RequestError &&
@@ -641,12 +613,8 @@ void testCapacityFailureHasOneTerminalFrame() {
           "request-scoped capacity failure made the engine unhealthy");
 }
 
-// A verify step can retain every row and add the terminal anchor; the wire
-// limit the production binary derives from ExecutionLimits must carry that
-// step in one TokensEvent, and an event that cannot be encoded must surface
-// as an engine error rather than a silently shorter stream.
 void testCommandWatchdogAndPendingHealthWake() {
-  metal::CommandWatchdog generations;
+  metal::CommandWatchdog generations(120.0);
   generations.start(1, 0.0);
   generations.complete(1);
   require(!generations.expired(1000.0), "completed command retained a deadline");
@@ -656,27 +624,18 @@ void testCommandWatchdogAndPendingHealthWake() {
           "stale completion cleared a newer command deadline");
 
   for (bool gpuCompleted : {false, true}) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
+    LoopFixture fixture;
+    engine::NativeRuntime &loop = fixture.loop;
+    Executor &executor = fixture.executor;
+    double &now = fixture.monotonic;
+    now = 0.0;
     executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
-    double now = 0.0;
-    metal::CommandWatchdog watchdog;
+    metal::CommandWatchdog watchdog(120.0);
     executor.onSubmit = [&] { watchdog.start(1, now / 1000.0); };
     executor.onHealthCheck = [&] {
       if (watchdog.expired(now / 1000.0))
         throw metal::MetalBackendError("test command completion timeout");
     };
-    std::vector<uint8_t> output;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     auto input = request(1);
     input.absoluteDeadlineUnixMicros = 601'000'000;
@@ -700,7 +659,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       require(loop.tick() && idle(loop), "completed GPU ownership did not drain");
     } else {
       uint32_t errors = 0;
-      for (const auto &message : protocol::peer::decodeEvents(output)) {
+      for (const auto &message : fixture.events()) {
         if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
           require(error->requestId == 0 &&
                       error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -715,35 +674,18 @@ void testCommandWatchdogAndPendingHealthWake() {
     }
   }
 
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  engine::NativeRuntime loop({}, resources, executor,
-      [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture;
+  engine::NativeRuntime &loop = fixture.loop;
   require(!loop.tick() && idle(loop) && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
 
 void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   for (bool malformed : {false, true}) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
     protocol::ProtocolLimits limits;
     limits.maxLogicalOutputTokens = 1;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture({}, {}, limits);
+    engine::NativeRuntime &loop = fixture.loop;
     loop.announceReady();
     require(loop.receive(protocol::peer::serialize(request(1))) && loop.tick(),
             "live duplicate fixture did not start");
@@ -752,7 +694,7 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
                 loop.connectionMustClose() && loop.snapshot().submitted == 1,
             "duplicate live request was accepted");
     uint32_t errors = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::ProtocolFatal,
@@ -768,19 +710,8 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
 // for that id in one input start the new request while the engine still
 // holds the cancelled one's finished entry.
 void testCancelledIdIsReusableInTheSameInput() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
-  engine::NativeRuntime loop(
-      {}, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture;
+  engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(request(7, 4))) &&
               loop.tick() && loop.tick() && !loop.commandInFlight(),
@@ -794,7 +725,7 @@ void testCancelledIdIsReusableInTheSameInput() {
   runUntilIdle(loop);
   std::vector<EngineFinishReason> done;
   uint32_t errors = 0;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
       done.push_back(event->reason);
     errors += std::holds_alternative<protocol::ErrorEvent>(message);
@@ -808,18 +739,8 @@ void testCancelledIdIsReusableInTheSameInput() {
 
 void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture;
+    engine::NativeRuntime &loop = fixture.loop;
     loop.announceReady();
     require(loop.runControl([] { return true; }) && loop.engineHealthy(),
             "ordinary deferred control work failed");
@@ -829,7 +750,7 @@ void testControlFailureUsesExecutionBoundary() {
               throw std::runtime_error("control test");
             }), "failed control work requested another retry");
     uint32_t errors = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -850,33 +771,25 @@ void testControlFailureUsesExecutionBoundary() {
 void testFrameFailureUsesExecutionBoundary() {
   enum class Thrown { Standard, Metal, Foreign };
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 8);
-    engine::Cache resources(pool);
-    Executor executor;
     RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
     config.metrics = &metrics;
-    std::vector<uint8_t> output;
-    engine::NativeRuntime loop(
-        config, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [thrown]() -> std::string {
-          if (thrown == Thrown::Standard)
-            throw std::runtime_error("status test");
-          if (thrown == Thrown::Metal)
-            throw metal::MetalBackendError("status test");
-          throw 42;
-        });
+    LoopFixture fixture(config, {.pages = 8});
+    engine::NativeRuntime &loop = fixture.loop;
+    fixture.status = [thrown]() -> std::string {
+      if (thrown == Thrown::Standard)
+        throw std::runtime_error("status test");
+      if (thrown == Thrown::Metal)
+        throw metal::MetalBackendError("status test");
+      throw 42;
+    };
     loop.announceReady();
     require(!loop.receive(protocol::peer::serialize(
                 protocol::StatusRequestFrame{77})) &&
                 !loop.engineHealthy() && loop.connectionMustClose(),
             "a failed status frame did not stop the engine");
     uint32_t errors = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 0 &&
                     error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -896,17 +809,11 @@ void testFrameFailureUsesExecutionBoundary() {
 // The loop checks its protocol limits once, when it is built; the codec and
 // the parser rely on them.
 void testInvalidLimitsAreRejectedAtConstruction() {
-  test::TestKvStorage storage(8, 4096, 4);
-  KvPool pool(storage, 8);
-  engine::Cache resources(pool);
-  Executor executor;
   protocol::ProtocolLimits limits;
   limits.maxMaskWords = 0;
   bool refused = false;
   try {
-    engine::NativeRuntime loop(
-        {}, resources, executor, [](std::span<const uint8_t>) {},
-        [] { return std::string("{}"); }, {}, limits);
+    LoopFixture fixture({}, {.pages = 8}, limits);
   } catch (const std::invalid_argument &error) {
     refused = std::string(error.what()).find("limit_exceeded") !=
               std::string::npos;
@@ -917,26 +824,16 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 // An exception while the engine admits a request is engine-fatal: nothing
 // below the engine rolls back, and the loop reports it once.
 void testAdmissionExceptionStopsTheEngineOnce() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  executor.onBegin = [] { throw std::runtime_error("begin failed"); };
-  std::vector<uint8_t> output;
-  engine::NativeRuntime loop(
-      {}, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  LoopFixture fixture;
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.executor.onBegin = [] { throw std::runtime_error("begin failed"); };
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(request(1))),
           "admission fixture was refused");
   require(!loop.tick() && !loop.engineHealthy() && loop.connectionMustClose(),
           "an admission exception did not stop the engine");
   uint32_t errors = 0;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       require(error->requestId == 0 &&
                   error->failureClass == protocol::FailureClass::EngineUnhealthy &&
@@ -953,23 +850,12 @@ void testAdmissionExceptionStopsTheEngineOnce() {
 // only the ones that report through engineError().
 void testEngineFailureNamesItsReason() {
   {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 8);
-    engine::Cache resources(pool);
-    Executor executor;
+    LoopFixture fixture({}, {.pages = 8});
+    engine::NativeRuntime &loop = fixture.loop;
     const std::system_error closed(EPIPE, std::generic_category(),
                                    "write(native output)");
-    bool outputClosed = false;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t>) {
-          if (outputClosed)
-            throw closed;
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
-    outputClosed = true;
+    fixture.writeFailure = closed;
     require(!loop.receive(
                 protocol::peer::serialize(protocol::StatusRequestFrame{77})) &&
                 !loop.engineHealthy() && loop.connectionMustClose(),
@@ -979,18 +865,8 @@ void testEngineFailureNamesItsReason() {
             "a failed output write left the engine failure unnamed");
   }
   {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 8);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
-    engine::NativeRuntime loop(
-        {}, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); });
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture({}, {.pages = 8});
+    engine::NativeRuntime &loop = fixture.loop;
     loop.announceReady();
     const auto frame = protocol::peer::serialize(request(1));
     // A header and one payload byte: the parser's first allocation is the
@@ -1000,7 +876,7 @@ void testEngineFailureNamesItsReason() {
         frame.data(), protocol::kFrameHeaderBytes + 1));
     allocationFailureAfter = -1;
     uint32_t errors = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->failureClass ==
                         protocol::FailureClass::EngineUnhealthy &&
@@ -1020,22 +896,11 @@ void testEngineFailureNamesItsReason() {
 }
 
 void testOutOfVocabularyTokensStayRequestScoped() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.engine.vocabularySize = 128;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
   std::vector<protocol::RequestFrame> invalid;
   for (uint32_t token : {128U, std::numeric_limits<uint32_t>::max()}) {
@@ -1054,7 +919,7 @@ void testOutOfVocabularyTokensStayRequestScoped() {
           "valid request after invalid tokens was rejected");
   runUntilIdle(loop);
   uint32_t errors = 0, done = 0;
-  for (const auto &message : protocol::peer::decodeEvents(output)) {
+  for (const auto &message : fixture.events()) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       require(error->requestId == 9 && error->code == "invalid_request" &&
                   error->failureClass == protocol::FailureClass::RequestError,
@@ -1071,24 +936,13 @@ void testOutOfVocabularyTokensStayRequestScoped() {
 // Whether Ready announces vision for an engine admitting images of up to
 // `maxImagePatches` patches.
 bool announcedVision(uint32_t maxImagePatches) {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.engine.maxImagePatches = maxImagePatches;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
-  const auto announced = protocol::peer::decodeEvents(output);
+  const auto announced = fixture.events();
   const auto *ready = announced.size() == 1
                           ? std::get_if<protocol::ReadyEvent>(&announced.front())
                           : nullptr;
@@ -1111,22 +965,11 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
       {0, "this model is serving without vision"},
       {32, "image has more patches than the server's pixel cap allows"}};
   for (const auto &[maxImagePatches, expected] : cases) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
     config.engine.maxImagePatches = maxImagePatches;
-    engine::NativeRuntime loop(
-        config, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture(config);
+    engine::NativeRuntime &loop = fixture.loop;
     loop.announceReady();
     auto image = request(9);
     image.imageSpans = {{8, 16, 8, 8, 1, 2}};
@@ -1137,7 +980,7 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
     }
     runUntilIdle(loop);
     uint32_t errors = 0, done = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
         require(error->requestId == 9 && error->code == "invalid_request" &&
                     error->failureClass ==
@@ -1154,26 +997,20 @@ void testImageRequestBeyondVisionStaysRequestScoped() {
   }
 }
 
+// A verify step can retain every row and add the terminal anchor; the wire
+// limit the production binary derives from ExecutionLimits must carry that
+// step in one TokensEvent, and an event that cannot be encoded must surface
+// as an engine error rather than a silently shorter stream.
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
-    executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
-    std::vector<uint8_t> output;
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
     protocol::ProtocolLimits limits;
     limits.maxTokenBatch = limit;
-    engine::NativeRuntime loop(
-        config, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }}, limits);
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture(config, {}, limits);
+    engine::NativeRuntime &loop = fixture.loop;
+    Executor &executor = fixture.executor;
+    executor.stepTokens = model::ExecutionLimits::maximumStepTokens;
 
     loop.announceReady();
     require(loop.receive(
@@ -1184,8 +1021,7 @@ void testStepTokensFitTheWire() {
     uint32_t streamed = 0;
     std::optional<uint32_t> completion;
     uint32_t encodeErrors = 0;
-    for (const protocol::EngineEvent &message :
-         protocol::peer::decodeEvents(output)) {
+    for (const protocol::EngineEvent &message : fixture.events()) {
       if (const auto *emitted = std::get_if<protocol::TokensEvent>(&message)) {
         streamed += emitted->tokens.size();
       } else if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
@@ -1211,21 +1047,10 @@ void testStepTokensFitTheWire() {
 }
 
 void testScoreRequestCompletesAfterFullPrompt() {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 512);
-  engine::Cache resources(pool);
-  Executor executor;
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 8192;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config, {.pages = 512});
+  engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(scoreRequest(9, 3000))),
           "score request failed");
@@ -1233,8 +1058,7 @@ void testScoreRequestCompletesAfterFullPrompt() {
 
   uint32_t tokensEvents = 0;
   uint32_t doneCount = 0;
-  for (const protocol::EngineEvent &message :
-       protocol::peer::decodeEvents(output)) {
+  for (const protocol::EngineEvent &message : fixture.events()) {
     if (std::holds_alternative<protocol::TokensEvent>(message))
       ++tokensEvents;
     if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
@@ -1256,22 +1080,12 @@ void testScoreRequestCompletesAfterFullPrompt() {
 }
 
 void testCancelledScoreReturnsEmptyLogits() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
-  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  executor.ticketReady = std::make_shared<std::atomic<bool>>(false);
   loop.announceReady();
   require(loop.receive(protocol::peer::serialize(scoreRequest(11, 65))),
           "cancel-score request failed");
@@ -1283,8 +1097,7 @@ void testCancelledScoreReturnsEmptyLogits() {
   runUntilIdle(loop);
 
   uint32_t doneCount = 0;
-  for (const protocol::EngineEvent &message :
-       protocol::peer::decodeEvents(output)) {
+  for (const protocol::EngineEvent &message : fixture.events()) {
     if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
       ++doneCount;
       require(done->reason == EngineFinishReason::Cancelled,
@@ -1317,23 +1130,13 @@ struct ScoreBesideChat final {
 // then a third request afterwards. The score's final prompt chunk either
 // returns logits or reports a non-finite one.
 ScoreBesideChat runScoreBesideChat(bool invalidScore) {
-  test::TestKvStorage storage(512, 4096, 4);
-  KvPool pool(storage, 512);
-  engine::Cache resources(pool);
-  Executor executor;
-  if (invalidScore)
-    executor.invalidScores.insert(21);
-  std::vector<uint8_t> output;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 8192;
-  engine::NativeRuntime loop(
-      config, resources, executor,
-      [&](std::span<const uint8_t> bytes) {
-        output.insert(output.end(), bytes.begin(), bytes.end());
-      },
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config, {.pages = 512});
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  if (invalidScore)
+    executor.invalidScores.insert(21);
   loop.announceReady();
 
   // Whole KV pages, so the last prompt chunk is the one that publishes the
@@ -1348,7 +1151,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   runUntilIdle(loop);
 
   ScoreBesideChat result;
-  result.publishedBlocks = resources.snapshot().pool.pagesPrefix;
+  result.publishedBlocks = fixture.cache.snapshot().pool.pagesPrefix;
   result.healthy = loop.engineHealthy() && !loop.connectionMustClose();
   result.slotsReleased = !executor.holdsSlot(21) && !executor.holdsSlot(22);
   result.scoreChunks = executor.prefillChunks[21];
@@ -1358,8 +1161,7 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
           "post-batch request wire failed");
   runUntilIdle(loop);
 
-  for (const protocol::EngineEvent &message :
-       protocol::peer::decodeEvents(output)) {
+  for (const protocol::EngineEvent &message : fixture.events()) {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++result.failures;
       result.failedRequest = error->requestId;
@@ -1425,24 +1227,14 @@ void testConstrainedMaskExchange() {
        {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
         Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel,
         Reply::AfterTimeout}) {
-    test::TestKvStorage storage(32, 4096, 4);
-    KvPool pool(storage, 32);
-    engine::Cache resources(pool);
-    Executor executor;
-    std::vector<uint8_t> output;
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
     // Three mask words per token; the prompt's tokens stay in vocabulary.
     config.engine.vocabularySize = 96;
-    double now = 100.0;
-    engine::NativeRuntime loop(
-        config, resources, executor,
-        [&](std::span<const uint8_t> bytes) {
-          output.insert(output.end(), bytes.begin(), bytes.end());
-        },
-        [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
-    storage.commandInFlight = [&] { return loop.commandInFlight(); };
+    LoopFixture fixture(config);
+    engine::NativeRuntime &loop = fixture.loop;
+    Executor &executor = fixture.executor;
+    double &now = fixture.monotonic;
     loop.announceReady();
     const auto send = [&](const protocol::ClientMessage &message) {
       require(loop.receive(protocol::peer::serialize(message)),
@@ -1457,7 +1249,7 @@ void testConstrainedMaskExchange() {
     while (loop.tick()) {
     }
     std::optional<protocol::MaskRequestEvent> asked;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *event = std::get_if<protocol::MaskRequestEvent>(&message))
         asked = *event;
     }
@@ -1495,7 +1287,7 @@ void testConstrainedMaskExchange() {
     std::vector<std::string> errors;
     std::string errorMessage;
     uint32_t maskRequests = 0;
-    for (const auto &message : protocol::peer::decodeEvents(output)) {
+    for (const auto &message : fixture.events()) {
       if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
         done = event->reason;
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
@@ -1539,17 +1331,12 @@ void testConstrainedMaskExchange() {
 // the empty runway extent; nothing once the host recovers; and under critical
 // pressure every cache entry and extent. None waits for a transfer.
 void testControlPassReclaimsUnderHostPressure() {
-  test::TestKvStorage storage(32, 4096, 4);
-  KvPool pool(storage, 32);
-  engine::Cache resources(pool);
-  Executor executor;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  engine::NativeRuntime loop(
-      config, resources, executor, [](std::span<const uint8_t>) {},
-      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
-  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  const engine::Cache &resources = fixture.cache;
+  const KvPool &pool = fixture.pool;
   loop.announceReady();
   // Two finished requests with different prompts leave two replay states.
   for (uint64_t id : {1, 2}) {
@@ -1568,7 +1355,7 @@ void testControlPassReclaimsUnderHostPressure() {
   constexpr uint64_t hostReserve = 2ULL << 30;
   std::optional<uint64_t> available = hostReserve + kHostWarningMarginBytes / 2;
   MemoryGovernor governor(backend, 40ULL << 30, hostReserve,
-                          [&available] { return available; });
+                          [&available] { return available; }, 0);
   MemoryControl control(governor, backend, loop);
   require(!control.run(MemoryPressure::Normal), "a paced pass waited for a transfer");
   const auto paced = resources.snapshot();

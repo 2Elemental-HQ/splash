@@ -21,6 +21,7 @@
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
@@ -61,10 +62,7 @@ constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
 constexpr std::array<uint32_t, 2> kStopTokens{1, 2};
 
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // Requires function to throw an Error itself, not a subclass of it.
 template <class Error = std::invalid_argument, class Function>

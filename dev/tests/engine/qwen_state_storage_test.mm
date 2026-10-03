@@ -2,7 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
-#include "ops/PageStorage.hpp"
+#include "tests/engine/TestChecks.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -30,10 +30,7 @@ constexpr model::DraftStateLayout kDraftState{5, 8, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <typename Exception = std::exception>
 void requireThrows(const std::function<void()> &operation,
@@ -124,7 +121,8 @@ void testLayoutFormulas() {
 }
 
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -182,7 +180,8 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 }
 
 void testDiskRestore(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -269,7 +268,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
 // cache buffer is taken, the disk copy restores every byte of the active
 // parity, and a full quota refuses until a disk copy is dropped.
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -337,7 +337,8 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1}};
   static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
                 unaligned.cachedBytes() % kHostPageBytes != 0);
-  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -386,7 +387,8 @@ void run(const std::string &metallib) {
   testDirectDiskSnapshot(backend);
   testStateSmallerThanSlot(backend);
   MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+      queryHostAvailableMemory, 0);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;
@@ -401,17 +403,13 @@ void run(const std::string &metallib) {
       ++admissions;
     return result;
   };
-  constexpr kv::Layout kvLayout{16, 4, 256};
-  kv::PageStorage pageStorage(backend, governor.allocationAdmission(),
-                              kvLayout, kvLayout.extentAlignmentPages(),
-                              kvLayout.extentAlignmentPages());
   uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
   uint64_t observedStorageActual = 0;
   uint64_t observedLaneActual = 0;
   uint64_t observedPrefixActual = 0;
 
   {
-    QwenStateStorage storage(backend, admitState, kStateLayout);
+    QwenStateStorage storage(backend, admitState, kStateLayout, nullptr);
     require(storage.actualAllocatedBytes() == 0 &&
                 backend.memoryStats().allocatedBytes == beforeStorage,
             "lane state was allocated eagerly");

@@ -1,5 +1,8 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/ScopedTestConfig.hpp"
+#include "tests/engine/TestBuffers.hpp"
+#include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include "engine/MemoryGovernor.hpp"
@@ -27,9 +30,7 @@ using model::SlotFile;
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 
 std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
   std::vector<std::byte> result(bytes);
@@ -103,7 +104,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const uint32_t pageB = extent;
   require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
               pages.isAllocated(pageB),
-          "test pages were not mapped");
+          "test pages were not allocated");
   const uint64_t payload = pages.bytesPerPage();
   const uint64_t slotBytes = SlotFile::slotBytesFor(payload);
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));
@@ -167,7 +168,8 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(8 * slotBytes));
-  KvPageTier tier(pages, file, 4);
+  const test::ScopedTestConfig seam({.kvTierTransfers = 4});
+  KvPageTier tier(pages, file);
   const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> written;
   for (int index = 0; index < 2; ++index) {
@@ -226,7 +228,8 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
     for (int failure = 0; failure < 64; ++failure) {
       auto budget = std::make_shared<DiskBudget>(bytes);
       auto file = std::make_shared<SlotFile>(bytes, budget);
-      KvPageTier tier(pages, file, 1);
+      const test::ScopedTestConfig seam({.kvTierTransfers = 1});
+      KvPageTier tier(pages, file);
       auto slot = tier.acquireSlot();
       const auto payload = fill(pages, 0, 123);
       require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
@@ -317,7 +320,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   // 0 starts its extent, so its entry is the extent's address.
   std::byte *const base = pages.spans(0).front().data();
   const uint64_t address = test::entryOf(
-      pages, 0, backend.allocateBuffer(sizeof(SplashKvPage)));
+      pages, 0, test::sharedBuffer(backend, sizeof(SplashKvPage)));
   const auto slabs = [&](uint32_t page, std::vector<uint64_t> &table) {
     for (const auto span : pages.spans(page)) {
       if (span.size() == data) table.push_back(address + static_cast<uint64_t>(span.data() - base));
@@ -329,12 +332,12 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
     if (page != restored) slabs(page, around);
   }
   const auto tableOf = [&](const std::vector<uint64_t> &entries) {
-    metal::MetalBuffer table = backend.allocateBuffer(entries.size() * sizeof(uint64_t));
+    metal::MetalBuffer table = test::sharedBuffer(backend, entries.size() * sizeof(uint64_t));
     std::memcpy(table.contents(), entries.data(), entries.size() * sizeof(uint64_t));
     return table;
   };
   const metal::MetalBuffer ownTable = tableOf(own), aroundTable = tableOf(around);
-  metal::MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
+  metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
   auto *mismatched = static_cast<uint32_t *>(mismatches.contents());
   // Writes seed ^ (131071 * entry + word) to every word of every slab of a
   // table, or counts the words that hold something else.
@@ -421,7 +424,8 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
   {
-    KvPageTier tier(pages, file, 16);
+    const test::ScopedTestConfig seam({.kvTierTransfers = 16});
+    KvPageTier tier(pages, file);
     std::vector<std::unique_ptr<KvTransfer>> demotions;
     for (uint32_t page = 0; page < 8; ++page) {
       auto slot = tier.acquireSlot();
@@ -437,7 +441,8 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   engine::MemoryGovernor governor(
-      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+      backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+      engine::queryHostAvailableMemory, 0);
   for (const auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
     roundTrip(backend, governor, kv::Layout{2, 2, 256, format});
     roundTrip(backend, governor, kv::Layout{10, 2, 256, format}); // Qwen3.6-35B

@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
@@ -39,10 +40,7 @@ template <class T> T *contents(const MetalBuffer &buffer) {
   return static_cast<T *>(buffer.contents());
 }
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,

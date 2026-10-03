@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
@@ -10,9 +11,7 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 template <typename Function> void rejects(Function function) {
   bool rejected = false;
   try { function(); }

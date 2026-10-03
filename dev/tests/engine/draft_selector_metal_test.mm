@@ -6,6 +6,7 @@
 // 16-byte vectors and leaves shards with only a few tokens, and one wider
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing.
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/DraftSelector.hpp"
@@ -37,10 +38,7 @@ constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

@@ -49,7 +49,7 @@ public:
   WeightFile &operator=(WeightFile &&) noexcept;
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
-                                            std::string_view label = {});
+                                            std::string_view label);
   // One section of the parts' total bytes, as a view of each part in order.
   [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
                                                       std::string_view label);

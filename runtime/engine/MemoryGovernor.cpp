@@ -100,12 +100,6 @@ void MemoryGovernor::Reservation::release() noexcept {
   bytes_ = 0;
 }
 
-MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend,
-                               uint64_t limitBytes,
-                               uint64_t hostReserveBytes)
-    : MemoryGovernor(backend, limitBytes, hostReserveBytes,
-                     queryHostAvailableMemory) {}
-
 MemoryGovernor::MemoryGovernor(
     metal::MetalBackend &backend, uint64_t limitBytes,
     uint64_t hostReserveBytes,
@@ -262,7 +256,6 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   return {
       limitBytes_,
       observed,
-      reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
       deniedReservations_,

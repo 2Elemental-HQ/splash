@@ -75,7 +75,7 @@ struct EngineMemoryPolicy {
 
   [[nodiscard]] static constexpr uint64_t
   hardBudgetBytes(uint64_t recommendedWorkingSetBytes,
-                  uint64_t maximumMemoryBytes = 0) noexcept {
+                  uint64_t maximumMemoryBytes) noexcept {
     const uint64_t margin = workingSetMarginBytes(recommendedWorkingSetBytes);
     const uint64_t automatic = recommendedWorkingSetBytes > margin
                                    ? recommendedWorkingSetBytes - margin
@@ -201,6 +201,6 @@ struct EngineMemoryPlanResult {
 [[nodiscard]] EngineMemoryPlanResult
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
-                         uint64_t maximumMemoryBytes = 0);
+                         uint64_t maximumMemoryBytes);
 
 } // namespace splash::engine

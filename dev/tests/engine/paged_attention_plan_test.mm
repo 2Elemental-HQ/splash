@@ -1,3 +1,5 @@
+#include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -30,10 +32,7 @@ static_assert(!std::is_aggregate_v<ops::VerifyAttentionPlan> &&
               !std::is_default_constructible_v<ops::VerifyAttentionPlan> &&
               !std::is_copy_assignable_v<ops::VerifyAttentionPlan>);
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -217,7 +216,7 @@ struct Case final {
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   if (!bytes) return {};
-  auto buffer = backend.allocateBuffer(bytes);
+  auto buffer = test::sharedBuffer(backend, bytes);
   std::memset(buffer.contents(), 0, bytes);
   return buffer;
 }

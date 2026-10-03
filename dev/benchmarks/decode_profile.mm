@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
       model::ModelPackage model =
-          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
+          model::loadModelPackage(backend, root, model::inspectModelPackage(root), {});
       ops::ExecutionPlans operators(backend.capabilities());
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
@@ -241,16 +241,17 @@ int main(int argc, char **argv) {
       const uint32_t pageCount =
           (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+          queryHostAvailableMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
                             pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
         if (!pages.allocateExtent(extent))
-          throw std::runtime_error("could not back the KV pages");
+          throw std::runtime_error("could not allocate the KV extents");
       }
       model::QwenStateStorage states(backend,
                                       governor.allocationAdmission(),
-                                      model.stateLayout());
+                                      model.stateLayout(), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
 

@@ -1,4 +1,6 @@
 #include "AffineQ4Fixture.hpp"
+#include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "tuning/LinearTuning.hpp"
 
 #include "metal/BackendInstrumentation.hpp"
@@ -21,9 +23,7 @@ using splash::metal::BackendInstrumentation;
 using splash::test::deterministicQ4Projection;
 using splash::test::mix;
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using splash::test::require;
 template <class Function> void rejects(Function function) {
   try { function(); }
   catch (const std::invalid_argument &) { return; }
@@ -331,7 +331,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   uint64_t gateBytes = 0;
   for (const auto &plan : plans) gateBytes = std::max(gateBytes, plan.gateScratchBytes());
   const auto allocate = [&](uint64_t bytes) {
-    return bytes ? backend.allocateBuffer(bytes) : metal::MetalBuffer{};
+    return bytes ? test::sharedBuffer(backend, bytes) : metal::MetalBuffer{};
   };
   LinearBuffers buffers{
       allocate(uint64_t{baseline.storageRows()} * workload.matrix.inputSize * 2),

@@ -1,5 +1,7 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "ScopedTestConfig.hpp"
+#include "TestBuffers.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -35,6 +37,8 @@ using splash::metal::BytesBinding;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
+using splash::test::ScopedTestConfig;
+using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
 
 [[noreturn]] void fail(const std::string &message) {
@@ -73,7 +77,7 @@ class MethodReplacement final {
 public:
     MethodReplacement(id object, SEL selector, IMP replacement) {
         method_ = class_getInstanceMethod(object_getClass(object), selector);
-        require(method_ != nullptr, "probe fault method is missing");
+        require(method_ != nullptr, "replacement method is missing");
         original = method_setImplementation(method_, replacement);
     }
     ~MethodReplacement() { method_setImplementation(method_, original); }
@@ -112,8 +116,9 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
 }
 
 void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -217,8 +222,9 @@ void delayCompletionNotification(id command, SEL selector, MTLCommandBufferHandl
 
 void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                                    bool pendingNext = false) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -247,7 +253,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
         MethodReplacement completion(command, @selector(addCompletedHandler:),
                                      reinterpret_cast<IMP>(delayCompletionNotification));
         originalCompletedHandler = completion.original;
-        auto ticket = backend.submitAsync(dispatch, [&] { ++notifications; });
+        auto ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { ++notifications; });
         require(gpuDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
                 "GPU did not reach the delayed completion handler");
         require(!ticket.ready(), "test did not delay the completion notification");
@@ -273,7 +279,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
                 "terminal ticket retained allocations until the callback returned");
         splash::metal::CommandTicket next;
         if (!failed) {
-            buffer = backend.allocateBuffer(sizeof(uint32_t));
+            buffer = sharedBuffer(backend, sizeof(uint32_t));
             *static_cast<uint32_t *>(buffer.contents()) = 0;
             dispatch.buffers = {{0, buffer}};
             if (pendingNext) {
@@ -327,8 +333,9 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
 }
 
 void pendingCommandStillTimesOut(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
@@ -381,8 +388,9 @@ bool awaitAllocationsReleased(const MetalBackend &backend) {
 // A synchronous submission throws once the watchdog gives up on its command,
 // which keeps its allocations until the GPU ends it.
 void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -423,8 +431,9 @@ void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
 // Destroying a ticket whose command the watchdog gave up on returns while the
 // command is still pending, and the command completes once the GPU ends it.
 void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 0.1);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.commandTimeoutSeconds = 0.1});
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -438,7 +447,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch, [&] { completed = true; });
+        ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { completed = true; });
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     requireBackendError([&] { backend.checkHealth(); },
@@ -464,7 +473,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
 // stopping is not a failure: the backend stays healthy with nothing in flight.
 void stopRefusesSubmission(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -488,10 +497,10 @@ void stopRefusesSubmission(const std::string &metallibPath) {
 // throws and the backend is unhealthy, and the command keeps its allocations
 // until the GPU ends it.
 void shutdownInterruptsACommandWait(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
+    MetalBackend backend(metallibPath);
     std::atomic<bool> stop{false};
     backend.setWaitInterrupt([&] { return stop.load(); });
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -535,9 +544,9 @@ void shutdownInterruptsACommandWait(const std::string &metallibPath) {
 // wait() gives a command up for a shutdown, and only the watchdog judges the
 // backend's health meanwhile.
 void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
+    MetalBackend backend(metallibPath);
     backend.setWaitInterrupt([] { return true; });
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -572,8 +581,8 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
 // success: the wait gives up only a command still unfinished, so the backend
 // stays healthy.
 void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
-    MetalBackend backend(metallibPath, 120.0);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -596,7 +605,7 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
         originalCommandCommit = commit.original;
-        ticket = backend.submitAsync(dispatch, [&] { completed = true; });
+        ticket = backend.submitCommandAsync({&dispatch, 1}, [&] { completed = true; });
     }
     std::string failure;
     try {
@@ -614,7 +623,7 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
 // included, and hands back a completed ticket with their summed time.
 void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     auto *value = static_cast<uint32_t *>(buffer.contents());
     *value = 0;
     const uint32_t count = 1, increment = 1;
@@ -649,7 +658,7 @@ void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
 // its submission compiles nothing, and rejects what submission would.
 void preparedPipelinesCompileAhead(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
-    auto buffer = backend.allocateBuffer(sizeof(uint32_t));
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     auto *value = static_cast<uint32_t *>(buffer.contents());
     *value = 0;
     const uint32_t count = 1, increment = 1;
@@ -766,15 +775,16 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     ResidencyCalls calls;
     unsigned lapseCommits = 0, lapseComputes = 0;
     {
-        MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
+        const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+        MetalBackend backend(metallibPath);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
-        MetalBuffer lapsing = backend.allocateBuffer(page);
+        MetalBuffer lapsing = sharedBuffer(backend, page);
         (void)waitFor([] { return commits != 0; }, std::chrono::seconds(5));
         lapseCommits = commits.exchange(0);
         lapseComputes = computeEncoders.exchange(0);
         // Allocating another buffer holds the set again for the teardown.
         const unsigned requested = calls.requests;
-        MetalBuffer held = backend.allocateBuffer(page);
+        MetalBuffer held = sharedBuffer(backend, page);
         require(waitFor([&] { return calls.requests > requested; }, std::chrono::seconds(1)),
                 "an allocation did not hold the set");
     }
@@ -795,7 +805,7 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
     {
         MetalBackend backend(metallibPath);
         const uint64_t before = device.currentAllocatedSize;
-        MetalBuffer buffer = backend.allocateBuffer(kBytes);
+        MetalBuffer buffer = sharedBuffer(backend, kBytes);
         buffer = {};
         require(device.currentAllocatedSize <= before + (1ull << 20),
                 "a buffer taken out of the residency set kept its memory");
@@ -805,7 +815,7 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
         MetalBuffer buffer;
         {
             MetalBackend backend(metallibPath);
-            buffer = backend.allocateBuffer(kBytes);
+            buffer = sharedBuffer(backend, kBytes);
         }
     }
     require(device.currentAllocatedSize <= before + (32ull << 20),
@@ -819,15 +829,16 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
 void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     void *address = mmap(nullptr, page, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON, -1, 0);
     require(address != MAP_FAILED, "unable to map memory to wrap");
     std::shared_ptr<void> mapping(address, [page](void *memory) { munmap(memory, page); });
     const auto start = std::chrono::steady_clock::now();
-    MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping), 0, 64);
-    MetalBuffer used = backend.allocateBuffer(page);
+    MetalBuffer dropped = backend.view(backend.wrapSharedMemory(address, page, mapping, {}), 0, 64);
+    MetalBuffer used = sharedBuffer(backend, page);
     const uint64_t each = backend.memoryStats().allocatedBytes / 2;
     require(waitFor([&] { return calls.requests != 0; }, std::chrono::seconds(1)),
             "buffers were not held at once");
@@ -861,9 +872,9 @@ void allocationDoesNotRequestResidency(const std::string &metallibPath) {
     constexpr uint32_t kAllocations = 20;
     constexpr double kBeatSeconds = 0.5;
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, 600.0);
+    MetalBackend backend(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer used = backend.allocateBuffer(page);
+    MetalBuffer used = sharedBuffer(backend, page);
     const uint32_t count = 1, increment = 7;
     const ComputeDispatch dispatch{"test_add_u32", {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
@@ -875,7 +886,7 @@ void allocationDoesNotRequestResidency(const std::string &metallibPath) {
     const auto start = std::chrono::steady_clock::now();
     std::vector<MetalBuffer> buffers;
     for (uint32_t index = 0; index < kAllocations; ++index)
-        buffers.push_back(backend.allocateBuffer(page));
+        buffers.push_back(sharedBuffer(backend, page));
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     const unsigned requests = calls.requests - held;
     require(requests <= 1 + elapsed.count() / kBeatSeconds,
@@ -893,10 +904,10 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
     ResidencyCalls calls;
-    auto backend = std::make_unique<MetalBackend>(metallibPath, 120.0,
-                                                  kKeepAliveSeconds);
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    auto backend = std::make_unique<MetalBackend>(metallibPath);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
-    MetalBuffer used = backend->allocateBuffer(page);
+    MetalBuffer used = sharedBuffer(*backend, page);
     *static_cast<uint32_t *>(used.contents()) = 0;
     std::mutex mutex;
     std::condition_variable ready;
@@ -919,7 +930,7 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
         {1, 1, 1}, {1, 1, 1}};
     int lapses = 0;
     for (int round = 0; round < kRounds; ++round) {
-        MetalBuffer member = backend->allocateBuffer(page);
+        MetalBuffer member = sharedBuffer(*backend, page);
         {
             std::lock_guard lock(mutex);
             handed.push_back(std::move(member));
@@ -960,12 +971,13 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
     ResidencyCalls calls;
-    MetalBackend backend(metallibPath, 120.0, kKeepAliveSeconds);
-    MetalBuffer table = backend.allocateBuffer(kBuffers * sizeof(uint64_t));
-    MetalBuffer mismatches = backend.allocateBuffer(sizeof(uint32_t));
+    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
+    MetalBackend backend(metallibPath);
+    MetalBuffer table = sharedBuffer(backend, kBuffers * sizeof(uint64_t));
+    MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
     std::vector<MetalBuffer> buffers(kBuffers);
-    for (MetalBuffer &buffer : buffers) buffer = backend.allocateBuffer(kBytes);
+    for (MetalBuffer &buffer : buffers) buffer = sharedBuffer(backend, kBytes);
     require(buffers[0].storage() == BufferStorage::Shared && buffers[0].contents() &&
                 buffers[0].sizeBytes() == kBytes &&
                 backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
@@ -1000,7 +1012,7 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
             require(backend.memoryStats().allocatedBytes ==
                         before + (kBuffers - 1) * kBytes,
                     "a released buffer is still counted");
-            buffers[index] = backend.allocateBuffer(kBytes);
+            buffers[index] = sharedBuffer(backend, kBytes);
             entries[index] = buffers[index].gpuAddress();
             ++regrown;
         }
@@ -1051,8 +1063,8 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
 // own offset, in whatever order the dispatch lists them.
 void bindingRunsKeepOffsets(MetalBackend &backend) {
     constexpr uint32_t kWords = 8, count = 4;
-    MetalBuffer source = backend.allocateBuffer(kWords * sizeof(uint32_t));
-    MetalBuffer destination = backend.allocateBuffer(kWords * sizeof(uint32_t));
+    MetalBuffer source = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    MetalBuffer destination = sharedBuffer(backend, kWords * sizeof(uint32_t));
     auto *in = static_cast<uint32_t *>(source.contents());
     auto *out = static_cast<uint32_t *>(destination.contents());
     for (uint32_t word = 0; word < kWords; ++word) {
@@ -1087,13 +1099,13 @@ void sharedMemoryCompletionLifetime(MetalBackend &backend) {
         munmap(memory, bytes);
         gate->ownerReleased.store(true);
     });
-    auto buffer = backend.wrapSharedMemory(address, bytes, owner);
+    auto buffer = backend.wrapSharedMemory(address, bytes, owner, {});
     owner.reset();
     const uint32_t count = 1, increment = 1;
     ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
-    auto ticket = backend.submitAsync(dispatch, [gate] {
+    auto ticket = backend.submitCommandAsync({&dispatch, 1}, [gate] {
         std::unique_lock lock(gate->mutex);
         gate->entered = true;
         gate->condition.notify_all();
@@ -1142,7 +1154,7 @@ void run(const std::string &metallibPath) {
     };
     backend.setOperationGuard(denyOperation);
     try {
-        (void)backend.allocateBuffer(16384, BufferStorage::Shared);
+        (void)sharedBuffer(backend, 16384);
         fail("operation guard admitted an allocation");
     } catch (const MetalAllocationError &error) {
         require(error.failure() == AllocationFailure::HostPressure,
@@ -1257,8 +1269,8 @@ void run(const std::string &metallibPath) {
             } else {
                 std::promise<void> completion;
                 auto notified = completion.get_future();
-                auto ticket = backend.submitAsync(
-                    dispatch, [&] { completion.set_value(); });
+                auto ticket = backend.submitCommandAsync(
+                    {&dispatch, 1}, [&] { completion.set_value(); });
                 requireBackendError(
                     [&] { (void)backend.submit(dispatch); },
                     "a second in-flight command was accepted");

@@ -19,9 +19,9 @@ struct Qwen3_6MoeLayout;
 class AffineTargetLoader final {
 public:
   AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                     const Qwen3_8Layout &layout, PreparationCheck admitConversion = {});
+                     const Qwen3_8Layout &layout, PreparationCheck admitConversion);
   AffineTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &directory,
-                     const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion = {});
+                     const Qwen3_6MoeLayout &layout, PreparationCheck admitConversion);
   ~AffineTargetLoader();
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.

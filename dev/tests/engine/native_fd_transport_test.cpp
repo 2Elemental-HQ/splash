@@ -1,6 +1,9 @@
 #include "ProtocolPeer.hpp"
+#include "ScopedTestConfig.hpp"
+#include "TestChecks.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/FdTransport.hpp"
 
@@ -117,10 +120,7 @@ struct Pipes final {
   }
 };
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 // For a failure that leaves a thread blocked: unwinding would wait for it.
 [[noreturn]] void abandon(const char *message) {
@@ -131,22 +131,21 @@ void require(bool value, const char *message) {
 struct Harness final {
   explicit Harness(size_t inputQueueBytes = engine::FdTransport::kInputQueueBytes,
                    int inputFd = -1)
-      : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
-                  inputQueueBytes) {
+      : seam({.transportInputQueueBytes = inputQueueBytes}),
+        transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1]) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool};
+  engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
+  test::ScopedTestConfig seam;
   engine::FdTransport transport;
   // What the loop answers a status request with.
-  std::function<std::string()> status = [] {
-    return std::string("{\"schema_version\":5}");
-  };
+  std::function<std::string()> status = test::readyStatusJson;
   engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
-                             [this] { return status(); }};
+                             [this] { return status(); }, protocol::ProtocolLimits{}};
 };
 
 // A request for three prompt tokens and one output token: its wall-clock
@@ -361,7 +360,7 @@ void testLoopWakesForAnEngineDeadline() {
   Pipes pipes;
   test::TestKvStorage storage{8, 4096, 1};
   KvPool pool{storage, 8};
-  engine::Cache resources{pool};
+  engine::Cache resources{pool, nullptr, nullptr};
   Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
   std::vector<protocol::ErrorEvent> errors;
@@ -375,7 +374,7 @@ void testLoopWakesForAnEngineDeadline() {
           }
         }
       },
-      [] { return std::string("{\"schema_version\":5}"); }};
+      test::readyStatusJson, protocol::ProtocolLimits{}};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady();
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));
@@ -574,7 +573,7 @@ void testShutdownInterruptsABlockedOutputWrite() {
   std::promise<void> answering;
   harness.status = [&] {
     answering.set_value();
-    return std::string("{\"schema_version\":5}");
+    return test::readyStatusJson();
   };
   // Like the process's own handler, without SA_RESTART: the signal interrupts
   // the write.

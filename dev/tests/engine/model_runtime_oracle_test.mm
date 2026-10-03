@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
@@ -39,10 +40,7 @@ namespace {
   throw std::runtime_error(message);
 }
 
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    fail(message);
-}
+using splash::test::require;
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
@@ -1449,7 +1447,7 @@ int main(int argc, char **argv) {
       stopForHostMemory("the prepared weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::ModelPackage model =
-        model::loadModelPackage(backend, modelRoot, descriptor);
+        model::loadModelPackage(backend, modelRoot, descriptor, {});
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
@@ -1477,7 +1475,8 @@ int main(int argc, char **argv) {
             "runtime reserves consume the oracle Metal budget");
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
-    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
+    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
+                            queryHostAvailableMemory, 0);
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {
@@ -1519,7 +1518,7 @@ int main(int argc, char **argv) {
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
-                                    model.stateLayout());
+                                    model.stateLayout(), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -

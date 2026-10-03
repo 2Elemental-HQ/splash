@@ -165,7 +165,7 @@ void warmLoadDoesNotWaitForTheConverterLock(Cache &cache) {
   char signal = 'x';
   require(read(ready[0], &signal, 1) == 1, "the lock holder exited before taking the converter lock");
   const std::array<PreparedWeight, 1> warm{{cache.entry(1)}};
-  cache.store.requireSpace(warm);
+  cache.store.requireSpace(warm, {});
   static_cast<void>(cache.prepare(1, {{}, noWorkspace}));
   require(write(release[1], &signal, 1) == 1, "release the lock holder");
   for (int end : {ready[0], release[0], release[1]}) close(end);
@@ -183,9 +183,9 @@ void diskChecksKeepTheReserveAndCoverTheModel(Cache &cache) {
   // does not fit.
   const uint64_t available = std::filesystem::space(cache.root).available;
   const std::array<PreparedWeight, 1> reserve{{cache.entry(22, available > kGiB ? available - kGiB : 1)}};
-  rejects([&] { cache.store.requireSpace(reserve); }, "not enough disk space", "disk reserve ignored");
+  rejects([&] { cache.store.requireSpace(reserve, {}); }, "not enough disk space", "disk reserve ignored");
   const std::array<PreparedWeight, 2> tooLarge{{cache.entry(20, UINT64_MAX / 2), cache.entry(21, UINT64_MAX / 2)}};
-  rejects([&] { cache.store.requireSpace(tooLarge); }, "not enough disk space", "model-wide disk budget ignored");
+  rejects([&] { cache.store.requireSpace(tooLarge, {}); }, "not enough disk space", "model-wide disk budget ignored");
   require(!std::filesystem::exists(cache.root / key(20)), "disk preflight wrote a partial model");
 }
 
@@ -201,17 +201,17 @@ void supersededEntriesAreCredited(Cache &cache) {
     model.push_back({key(90 + i), size, component, key(110 + i), "/model"});
     earlier.push_back({key(100 + i), cache.bytes.size(), component, key(110 + i), "/model"});
   }
-  rejects([&] { cache.store.requireSpace(model); }, "not enough disk space", "a new model's budget was credited");
+  rejects([&] { cache.store.requireSpace(model, {}); }, "not enough disk space", "a new model's budget was credited");
   // The earlier generation of each file, as large as its replacement, sparse.
   for (const auto &weight : earlier) {
     const auto path = cache.prepare(weight);
     std::filesystem::permissions(path, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
     std::filesystem::resize_file(path, size);
   }
-  cache.store.requireSpace(model);
+  cache.store.requireSpace(model, {});
   // A file is written while the entry it replaces remains.
   const std::array<PreparedWeight, 1> large{{{key(98), available - kGiB, model[0].component, model[0].inputs, "/model"}}};
-  rejects([&] { cache.store.requireSpace(large); }, "not enough disk space", "a replaced entry was counted free");
+  rejects([&] { cache.store.requireSpace(large, {}); }, "not enough disk space", "a replaced entry was counted free");
   for (const auto &weight : earlier) std::filesystem::remove_all(cache.root / weight.key);
 }
 
@@ -229,7 +229,7 @@ void failedWritesPublishNothing(Cache &cache) {
     static_cast<void>(cache.store.prepare(cache.entry(2), [&](int output, const PreparationCheck &) {
       writeWeightBytes(output, 0, std::span(cache.bytes).first(64));
       throw std::system_error(ENOSPC, std::generic_category(), "fixture disk full");
-    }));
+    }, {}));
   }, "fixture disk full", "failed write accepted");
   require(!std::filesystem::exists(cache.root / key(2)), "partial file published");
   require(cache.buildsOf(2) == 1, "retry after a failed write did not write");
@@ -246,13 +246,13 @@ void crashedWriteIsReclaimed(Cache &cache) {
     static_cast<void>(cache.store.prepare(cache.entry(4), [&](int output, const PreparationCheck &) {
       writeWeightBytes(output, 0, std::span(cache.bytes).first(64));
       _exit(kCrashed);
-    }));
+    }, {}));
     return 0;
   });
   require(exitStatus(crash) == kCrashed, "the writer did not crash");
   require(!std::filesystem::exists(cache.root / key(4)), "crash published partial weights");
   const std::array<PreparedWeight, 1> retry{{cache.entry(4)}};
-  cache.store.requireSpace(retry);
+  cache.store.requireSpace(retry, {});
   require(!std::filesystem::exists(cache.root / (key(4) + ".partial")), "abandoned staging not cleaned");
   require(cache.buildsOf(4) == 1, "retry after a crash did not write");
 }
@@ -266,7 +266,7 @@ void everyLockReclaimsAbandonedStaging(Cache &cache) {
   require(!staged(cache, 60), "a cold preparation left abandoned staging");
   abandonStaging(cache, 60);
   const std::array<PreparedWeight, 1> warm{{cache.entry(61)}};
-  cache.store.requireSpace(warm);
+  cache.store.requireSpace(warm, {});
   require(!staged(cache, 60), "a warm start with the lock free left abandoned staging");
 }
 
@@ -276,12 +276,12 @@ void warmLoadSkipsAReclaimItCannotRun(Cache &cache) {
   const std::array<PreparedWeight, 1> warm{{cache.entry(61)}};
   const auto lock = cache.root / "prepare.lock";
   require(chmod(lock.c_str(), 0400) == 0, "chmod the converter lock");
-  cache.store.requireSpace(warm);
+  cache.store.requireSpace(warm, {});
   require(chmod(lock.c_str(), 0600) == 0, "chmod the converter lock");
   abandonStaging(cache, 60);
   const auto staging = cache.root / (key(60) + ".partial");
   require(chmod(staging.c_str(), 0500) == 0, "chmod abandoned staging");
-  cache.store.requireSpace(warm);
+  cache.store.requireSpace(warm, {});
   require(chmod(staging.c_str(), 0700) == 0, "chmod abandoned staging");
 }
 
@@ -314,10 +314,10 @@ void concurrentMissesWriteOnce(Cache &cache) {
     writeWeightBytes(output, 0, cache.bytes);
   };
   const pid_t child = spawn([&] {
-    static_cast<void>(cache.store.prepare(cache.entry(5), competing));
+    static_cast<void>(cache.store.prepare(cache.entry(5), competing, {}));
     return 0;
   });
-  static_cast<void>(cache.store.prepare(cache.entry(5), competing));
+  static_cast<void>(cache.store.prepare(cache.entry(5), competing, {}));
   require(exitStatus(child) == 0 && std::filesystem::file_size(counter) == 1,
           "concurrent cache miss rebuilt or corrupted weights");
 }

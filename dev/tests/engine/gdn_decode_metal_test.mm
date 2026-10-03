@@ -7,6 +7,8 @@
 // checked at fp32 accuracy from the kernel's own k/v and gates, after those
 // were checked against the reference; the hidden rows from the recurrent rows
 // read from that state with the reference q and rounded to bf16.
+#include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/StateLayout.hpp"
@@ -46,11 +48,6 @@ constexpr uint32_t kLayers = 2;
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
                              GdnShape{16, 32, 128, 8192, 12544}};
-
-void require(bool condition, const std::string &message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
 
 template <class Function> void rejects(Function function) {
   try {
@@ -500,7 +497,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
       "lanes " + std::to_string(lanes) + (float32 ? " f32 norm" : "");
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     require(GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes,
-                           layer, fixture.cell.strides())
+                           layer, fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain)
                     .layout == LinearInput::Plain,
             where + ": plain GDN claimed a table");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -579,9 +576,9 @@ struct PreparedTables final {
       : layout(tableLayout), width(hiddenWidth), lanes(laneCount),
         tableSize(tableBytes(width, lanes * kRows)),
         sumsSize(tableSumsBytes(layout, width, lanes * kRows)),
-        table(backend.allocateBuffer(tableSize)), sums(backend.allocateBuffer(sumsSize)),
-        referenceTable(backend.allocateBuffer(tableSize)),
-        referenceSums(backend.allocateBuffer(sumsSize)) {}
+        table(sharedBuffer(backend, tableSize)), sums(sharedBuffer(backend, sumsSize)),
+        referenceTable(sharedBuffer(backend, tableSize)),
+        referenceSums(sharedBuffer(backend, sumsSize)) {}
 
   LinearScratch scratch() const { return {table, sums, {}, {}}; }
   void addReference(CommandGraph &graph, const MetalBuffer &hidden) const {
@@ -619,7 +616,8 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
     GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
                    GdnHeadOrder::Grouped, layout);
   });
-  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " plain kernel claimed a table");
   tables.addReference(reference, fixture.hidden);
@@ -657,7 +655,8 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
   const std::string what = caseName("tiled GDN", shape, lanes, layout);
   CommandGraph grouped;
-  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides())
+  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+                         GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " grouped reference claimed a table");
   (void)backend.submitCommand(grouped.dispatches());
@@ -673,7 +672,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   CommandGraph tiled;
   if (layout == LinearInput::Plain) {
     require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
-                           GdnHeadOrder::Tiled).layout == LinearInput::Plain,
+                           GdnHeadOrder::Tiled, LinearInput::Plain).layout == LinearInput::Plain,
             what + " claimed a table");
     (void)backend.submitCommand(tiled.dispatches());
   } else {
@@ -696,16 +695,16 @@ void rejectsInvalid(MetalBackend &backend) {
   CommandGraph graph;
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, 0, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0), shape, kMaxLanes + 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addDecode(graph, fixture.decodeBuffers(0),
                    GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
-                   fixture.cell.strides());
+                   fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
   });
   rejects([&] {
     GDN::addCommit(graph, fixture.commitBuffers(), shape, 0, 1,
@@ -713,8 +712,8 @@ void rejectsInvalid(MetalBackend &backend) {
   });
   rejects([&] {
     auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = backend.allocateBuffer(16);
-    buffers.linearScratch.sums = backend.allocateBuffer(4);
+    buffers.linearScratch.input = sharedBuffer(backend, 16);
+    buffers.linearScratch.sums = sharedBuffer(backend, 4);
     GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
                    splash::ops::LinearInput::Table64);
   });
@@ -722,8 +721,8 @@ void rejectsInvalid(MetalBackend &backend) {
     // Sums sized for the affine table are below the GGUF table's.
     const uint32_t width = shape.valueHeads * shape.headDimension;
     auto buffers = fixture.decodeBuffers(0);
-    buffers.linearScratch.input = backend.allocateBuffer(tableBytes(width, kRows));
-    buffers.linearScratch.sums = backend.allocateBuffer(tableSumsBytes(LinearInput::Table64, width, kRows));
+    buffers.linearScratch.input = sharedBuffer(backend, tableBytes(width, kRows));
+    buffers.linearScratch.sums = sharedBuffer(backend, tableSumsBytes(LinearInput::Table64, width, kRows));
     GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
                    LinearInput::Table16);
   });
@@ -731,7 +730,8 @@ void rejectsInvalid(MetalBackend &backend) {
     // F32 weights need twice the bytes of bf16 ones.
     auto buffers = fixture.decodeBuffers(0);
     buffers.mixerNorm.float32 = true;
-    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides());
+    GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Plain);
   });
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }

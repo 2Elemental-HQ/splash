@@ -18,19 +18,24 @@
 
 namespace splash::engine {
 
+// Prefill checkpoints sit at multiples of this many tokens
+// (plannedCheckpoints): two draft windows balance recovery granularity and
+// capture work. Tests substitute another interval through TestConfig.
+inline constexpr uint32_t kPrefillCheckpointTokens =
+    2 * model::ExecutionLimits::draftContextTokens;
+static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
+                  kPrefillCheckpointTokens % KvCache::pageTokens == 0,
+              "a prefill checkpoint interval spans a draft window and whole KV pages");
+// How long a request waits for memory before it fails, and a resident
+// drain lasts. Tests substitute another bound through TestConfig.
+inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
+
 struct EngineConfig final {
   uint32_t maxContext = kv::kMaximumLogicalTokens;
   uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
-  // Two draft windows balance recovery granularity and capture work; none is
-  // planned within one prefill chunk of where the request resumes or of its
-  // replay boundary. Zero disables progress checkpoints without changing
-  // reusable end states.
-  uint32_t prefillCheckpointTokens =
-      2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the server's --max-image-pixels allows; zero rejects
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
-  double resourceWaitTimeoutMilliseconds = 30000.0;
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode. At 0.5 a stream keeps about a third of
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
@@ -455,6 +460,10 @@ private:
   void sweepTerminal();
 
   EngineConfig config_;
+  // kPrefillCheckpointTokens and kResourceWaitTimeoutMilliseconds, or the
+  // test seam's (TestConfig).
+  uint32_t checkpointTokens_;
+  double resourceWaitTimeoutMilliseconds_;
   Cache &cache_;
   model::Model &model_;
   EngineEventSink &events_;

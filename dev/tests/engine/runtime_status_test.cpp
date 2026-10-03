@@ -1,3 +1,4 @@
+#include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "StderrLine.hpp"
@@ -19,10 +20,7 @@ using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 EngineMemoryPlan plan() {
   DeviceCapabilities device;

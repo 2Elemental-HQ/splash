@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
       if (descriptor.visionSource == splash::model::VisionSource::None)
         throw std::runtime_error("the model has no vision role");
       MetalBackend backend(argv[1]);
-      const auto loader = splash::model::planVisionLoader(backend, argv[2], descriptor);
+      const auto loader = splash::model::planVisionLoader(backend, argv[2], descriptor, {});
       const splash::model::QwenVisionWeights model =
           splash::model::loadVisionWeights(backend, argv[2], descriptor, loader.get());
       const std::string fixture = argv[3];

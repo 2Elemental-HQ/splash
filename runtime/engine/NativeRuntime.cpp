@@ -1,4 +1,5 @@
 #include "engine/NativeRuntime.hpp"
+#include "TestConfig.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -14,10 +15,9 @@ namespace splash::engine {
 NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                              model::Model &model, ByteSink output,
                              StatusProvider statusProvider,
-                             NativeLoopClocks clocks,
                              protocol::ProtocolLimits limits)
     : config_(std::move(config)), output_(std::move(output)),
-      statusProvider_(std::move(statusProvider)), clocks_(std::move(clocks)),
+      statusProvider_(std::move(statusProvider)), clocks_(clocks()),
       limits_(limits), parser_(limits_),
       core_(config_.engine, cache, model, *this) {
   if (!output_ || !statusProvider_) {
@@ -25,13 +25,6 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
   }
   if (auto issue = protocol::validateLimits(limits_))
     throw std::invalid_argument(issue->describe());
-  NativeLoopClocks defaults = defaultClocks();
-  if (!clocks_.unixMicros) {
-    clocks_.unixMicros = std::move(defaults.unixMicros);
-  }
-  if (!clocks_.monotonicMilliseconds) {
-    clocks_.monotonicMilliseconds = std::move(defaults.monotonicMilliseconds);
-  }
 }
 
 bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
@@ -436,17 +429,22 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
   telemetry_.erase(requestId);
 }
 
-NativeLoopClocks NativeRuntime::defaultClocks() {
-  return {
-      [] {
-        auto now = std::chrono::system_clock::now().time_since_epoch();
-        return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(now).count());
-      },
-      [] {
-        auto now = std::chrono::steady_clock::now().time_since_epoch();
-        return std::chrono::duration<double, std::milli>(now).count();
-      }};
+NativeRuntime::Clocks NativeRuntime::clocks() {
+  Clocks result{testConfig().unixMicros, testConfig().monotonicMilliseconds};
+  if (!result.unixMicros) {
+    result.unixMicros = [] {
+      auto now = std::chrono::system_clock::now().time_since_epoch();
+      return static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+    };
+  }
+  if (!result.monotonicMilliseconds) {
+    result.monotonicMilliseconds = [] {
+      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      return std::chrono::duration<double, std::milli>(now).count();
+    };
+  }
+  return result;
 }
 
 uint64_t NativeRuntime::durationMicros(double startMilliseconds,

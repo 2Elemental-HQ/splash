@@ -219,8 +219,8 @@ public:
                                      metal::MetalBuffer attention,
                                      metal::MetalBuffer hidden,
                                      uint32_t queryHeads, kv::Layout layout,
-                                     uint32_t lanes, LinearScratch scratch = {},
-                                     LinearInput input = LinearInput::Plain);
+                                     uint32_t lanes, LinearScratch scratch,
+                                     LinearInput input);
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.

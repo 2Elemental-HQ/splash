@@ -252,8 +252,9 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
   // into bf16: both destinations compare as bf16, since an fp32 output rounds
   // to its bf16 plan's.
   const auto sequential = [&](LinearEpilogue epilogue, const Projection &weights, LinearTile tile) {
-    const LinearPlan reference = Linear::plan({c.matrix, kRows, LinearPhase::Decode, epilogue},
-                                              {tile, n / (tile == LinearTile::N256 ? 256 : 128)});
+    const LinearPlan reference =
+        Linear::plan({c.matrix, kRows, LinearPhase::Decode, epilogue},
+                     {tile, n / (tile == LinearTile::N256 ? 256 : 128)}, FloatOutput::BFloat16);
     MetalBuffer output = shared(backend, uint64_t{kRows} * n * 2, "q4-split-reference");
     MetalBuffer gateScratch = shared(backend, std::max<uint64_t>(reference.gateScratchBytes(), 2), "q4-split-gate");
     splash::metal::CommandGraph graph;

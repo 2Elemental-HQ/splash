@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
@@ -48,10 +49,7 @@ uint64_t attentionIndex(uint32_t stride, uint32_t head, uint32_t row,
          dimension;
 }
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::require;
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
   id<MTLBuffer> result =
@@ -888,7 +886,7 @@ void testContract() {
           kPageTokens,
       {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
-          "final fixed-eight verification rows exceeded physical KV scratch");
+          "the final cycle's verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its fixed seven-row allowance");

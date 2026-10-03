@@ -145,7 +145,7 @@ uint64_t loadU64(const uint8_t *bytes) {
 
 class Writer {
 public:
-  explicit Writer(size_t reserveBytes = 0) { bytes_.reserve(reserveBytes); }
+  explicit Writer(size_t reserveBytes) { bytes_.reserve(reserveBytes); }
 
   void u8(uint8_t value) { bytes_.push_back(value); }
 
