@@ -91,6 +91,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--offline` | Start the installed model without contacting Hugging Face. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
+| `--persistent-cache` | Keep that SSD cache for the next server of the same model, so a restart keeps your conversations' prefixes. Off by default. |
 
 On a Mac you also use for other work, `--max-memory` leaves room for other
 applications.
