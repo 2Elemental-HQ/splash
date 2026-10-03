@@ -189,7 +189,8 @@ public:
 };
 
 // A normal capacity failure. Callers may evict cache or return a retryable
-// admission error; the Metal backend remains healthy.
+// admission error; the Metal backend remains healthy. MemoryGovernor's
+// allocationAdmission is the one place it becomes a value (AllocationResult).
 class MetalAllocationError final : public MetalBackendError {
 public:
   explicit MetalAllocationError(
@@ -219,6 +220,11 @@ public:
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
+  // Asked between the slices of a ticket's wait(); true gives up the wait as
+  // the watchdog does and marks the backend unhealthy: the process is
+  // shutting down. Destroying or replacing a ticket still waits for its
+  // command.
+  void setWaitInterrupt(std::function<bool()> shuttingDown);
   void checkOperation() const;
   // Stop new submissions before teardown. Commands already committed to the
   // GPU retain their normal lifetime.

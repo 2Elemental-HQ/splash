@@ -58,17 +58,9 @@ KvPageAcquisition KvPool::acquirePages(uint32_t count, bool prefixOwner) {
     // Page ids cover every extent the hard budget could hold, so the budget
     // refuses growth before they run out.
     const uint32_t extent = unallocatedExtent();
-    if (extent == noIndex) {
-      returnSelected();
+    if (extent == noIndex)
       throw std::logic_error("KV page ids ran out before the memory budget did");
-    }
-    metal::AllocationResult allocated;
-    try {
-      allocated = allocateExtent(extent);
-    } catch (...) {
-      returnSelected();
-      throw;
-    }
+    const metal::AllocationResult allocated = allocateExtent(extent);
     if (!allocated) {
       // The extents this acquisition allocated stay, reclaimable: the
       // budget admitted them, and the retry that follows a reclaim takes

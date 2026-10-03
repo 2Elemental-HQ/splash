@@ -44,12 +44,21 @@ class FakeTokenizer:
 
 
 class FakeConstraint:
-    def __init__(self, words_per_mask=2, *, omit_anchor=False, consume_error=None):
+    def __init__(
+        self,
+        words_per_mask=2,
+        *,
+        omit_anchor=False,
+        commit_error=None,
+        finish_error=None,
+    ):
         self.words_per_mask = words_per_mask
         self.omit_anchor = omit_anchor
-        self.consume_error = consume_error
+        self.commit_error = commit_error
+        self.finish_error = finish_error
         self.mask_calls = []
-        self.consumed = []
+        self.committed = []
+        self.finish_calls = 0
 
     def masks(self, simulation_tokens):
         simulation_tokens = tuple(simulation_tokens)
@@ -58,10 +67,26 @@ class FakeConstraint:
         words = tuple(range(1, rows * self.words_per_mask + 1))
         return struct.pack(f"<{len(words)}I", *words)
 
-    def consume(self, tokens):
-        if self.consume_error is not None:
-            raise self.consume_error
+    def commit(self, tokens):
+        if self.commit_error is not None:
+            raise self.commit_error
+        self.committed.append(tuple(tokens))
+
+    def finish(self):
+        self.finish_calls += 1
+        if self.finish_error is not None:
+            raise self.finish_error
+
+
+class FakeMatcher:
+    """Records the batches a TokenConstraint consumes; accepts every one."""
+
+    def __init__(self):
+        self.consumed = []
+
+    def consume_tokens(self, tokens):
         self.consumed.append(tuple(tokens))
+        return True
 
 
 class FakeCall:
@@ -500,7 +525,8 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(result.start_to_first_token_ms, 1.25)
         self.assertEqual(result.first_token_to_done_ms, 2.5)
         self.assertEqual(result.request_wall_ms, 4.0)
-        self.assertEqual(constraint.consumed, [(7, 8)])
+        self.assertEqual(constraint.committed, [(7, 8)])
+        self.assertEqual(constraint.finish_calls, 1)
         self.assertFalse(transport.active)
 
     def test_finalized_request_returns_its_image_budget(self):
@@ -597,7 +623,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_constraint_callback_error_cancels_and_maps_to_bad_request(self):
         constraint = FakeConstraint(
-            consume_error=api_errors.NativeError("constraint_error", "invalid token")
+            commit_error=api_errors.NativeError("constraint_error", "invalid token")
         )
         transport, runtime = self.make_transport()
         job = make_job(constraint=constraint)
@@ -614,6 +640,51 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "error")
         self.assertEqual(error.status, 400)
         self.assertEqual(error.code, "constraint_error")
+
+    def test_trailing_tokens_the_grammar_rejects_fail_the_request(self):
+        constraint = FakeConstraint(
+            finish_error=api_errors.NativeError("constraint_error", "invalid token")
+        )
+        transport, runtime = self.make_transport()
+        job = make_job(constraint=constraint)
+        self.assertTrue(transport.submit(job))
+        call = runtime.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
+        call.complete(result=success_result(call, tokens=(7,)))
+
+        kind, error = self.terminal(job)
+        self.assertEqual(kind, "error")
+        self.assertEqual(error.status, 400)
+        self.assertEqual(error.code, "constraint_error")
+
+    def test_cancelled_request_skips_the_trailing_grammar_check(self):
+        constraint = FakeConstraint(
+            finish_error=api_errors.NativeError("constraint_error", "invalid token")
+        )
+        transport, runtime = self.make_transport()
+        job = make_job(constraint=constraint)
+        self.assertTrue(transport.submit(job))
+        call = runtime.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
+        call.complete(
+            result=success_result(call, reason=wire.FinishReason.CANCELLED, tokens=(7,))
+        )
+
+        kind, result = self.terminal(job)
+        self.assertEqual(kind, "done")
+        self.assertEqual(result.reason, "cancelled")
+        self.assertEqual(constraint.finish_calls, 0)
+
+    def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
+        matcher = FakeMatcher()
+        constraint = generation_constraints.TokenConstraint(matcher, None)
+        constraint.commit((7, 8))
+        constraint.commit((9,))
+        self.assertEqual(matcher.consumed, [])
+        constraint.finish()
+        self.assertEqual(matcher.consumed, [(7, 8), (9,)])
 
     def test_cancel_is_idempotent_and_preserves_timeout_flag(self):
         transport, runtime = self.make_transport()

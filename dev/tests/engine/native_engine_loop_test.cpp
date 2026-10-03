@@ -29,6 +29,7 @@ public:
 class Executor final : public model::Model {
 public:
   std::shared_ptr<std::atomic<bool>> ticketReady;
+  std::function<void()> onBegin;
   std::function<void()> onSubmit;
   std::function<void()> onHealthCheck;
   // Score requests whose final prompt chunk reports a per-lane model failure.
@@ -45,6 +46,8 @@ public:
       onHealthCheck();
   }
   StateAdmission begin(const ModelRequest &request) override {
+    if (onBegin)
+      onBegin();
     beganFlags[request.id] = request.flags;
     beganSampling[request.id] = request.sampling;
     for (uint32_t slot = 0; slot < model::ExecutionLimits::maximumBatchWidth;
@@ -145,12 +148,14 @@ public:
     return std::make_shared<State>();
   }
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t> words) override {
+  std::optional<std::string>
+  provideMask(uint64_t, std::span<const uint32_t> words) override {
     // As in the model, a mask row must permit some token.
     if (std::none_of(words.begin(), words.end(),
                      [](uint32_t word) { return word != 0; }))
-      throw std::invalid_argument("token mask row permits no vocabulary token");
+      return "token mask row permits no vocabulary token";
     ++providedMasks;
+    return std::nullopt;
   }
   uint32_t providedMasks = 0;
   void end(uint64_t id) override { requests_.erase(id); }
@@ -170,6 +175,13 @@ private:
 void require(bool value, const char *message) {
   if (!value)
     throw std::runtime_error(message);
+}
+
+// Every submitted request has ended and no command is in flight.
+bool idle(const engine::NativeRuntime &loop) {
+  const EngineSnapshot counts = loop.snapshot();
+  return counts.submitted == counts.completed + counts.cancelled + counts.failed &&
+         !loop.commandInFlight();
 }
 
 std::vector<protocol::Message> decodeMessages(std::span<const uint8_t> bytes) {
@@ -208,10 +220,10 @@ protocol::RequestFrame request(uint64_t id, uint32_t maxOutputTokens = 1) {
 }
 
 void runUntilIdle(engine::NativeRuntime &loop) {
-  for (uint32_t step = 0; step < 32 && !loop.idle(); ++step) {
+  for (uint32_t step = 0; step < 32 && !idle(loop); ++step) {
     static_cast<void>(loop.tick());
   }
-  require(loop.idle(), "native loop did not become idle");
+  require(idle(loop), "native loop did not become idle");
 }
 
 void testPromptProgress() {
@@ -618,7 +630,9 @@ void testCapacityFailureHasOneTerminalFrame() {
     if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
       ++errors;
       capacity += error->failureClass == protocol::FailureClass::RequestError &&
-                  !error->retryable && error->code == engine::kCapacityExhausted;
+                  !error->retryable &&
+                  error->code ==
+                      laneOutcomeWire(LaneOutcome::CapacityExhausted).code;
     }
     done += std::holds_alternative<protocol::DoneEvent>(message);
   }
@@ -687,7 +701,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       require(loop.engineHealthy() && loop.commandInFlight(),
               "a model-side wait was mistaken for a pending GPU command");
       *executor.ticketReady = true;
-      require(loop.tick() && loop.idle(), "completed GPU ownership did not drain");
+      require(loop.tick() && idle(loop), "completed GPU ownership did not drain");
     } else {
       uint32_t errors = 0;
       for (const auto &message : decodeMessages(output)) {
@@ -700,7 +714,7 @@ void testCommandWatchdogAndPendingHealthWake() {
         }
       }
       require(errors == 1 && loop.connectionMustClose() &&
-                  loop.commandInFlight() && !loop.idle(),
+                  loop.commandInFlight() && !idle(loop),
               "watchdog released command ownership or emitted duplicate failures");
     }
   }
@@ -713,7 +727,7 @@ void testCommandWatchdogAndPendingHealthWake() {
       [](std::span<const uint8_t>) {}, [] { return std::string("{}"); },
       {[] { return uint64_t{1'000'000}; }, [] { return 0.0; }});
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  require(!loop.tick() && loop.idle() && !loop.millisecondsUntilNextWakeup(),
+  require(!loop.tick() && idle(loop) && !loop.millisecondsUntilNextWakeup(),
           "fully idle engine retained a polling wake");
 }
 
@@ -756,6 +770,51 @@ void testDuplicateLiveRequestClosesWithoutAmbiguousError() {
   }
 }
 
+// The protocol frees an id when its request ends. A cancel and a new request
+// for that id in one input start the new request while the engine still
+// holds the cancelled one's finished entry.
+void testCancelledIdIsReusableInTheSameInput() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeRuntime loop(
+      {}, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  storage.commandInFlight = [&] { return loop.commandInFlight(); };
+  loop.announceReady();
+  const auto first = protocol::serializeMessage(protocol::Message{request(7, 4)});
+  require(first && loop.receive(*first.value) && loop.tick() && loop.tick() &&
+              !loop.commandInFlight(),
+          "the first request did not start");
+  const auto cancel =
+      protocol::serializeMessage(protocol::Message{protocol::CancelFrame{7}});
+  const auto again = protocol::serializeMessage(protocol::Message{request(7)});
+  require(cancel && again, "cancel or request wire failed");
+  std::vector<uint8_t> input = *cancel.value;
+  input.insert(input.end(), again.value->begin(), again.value->end());
+  require(loop.receive(input),
+          "a cancel and a request for one id closed the connection");
+  runUntilIdle(loop);
+  std::vector<protocol::FinishReason> done;
+  uint32_t errors = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
+      done.push_back(event->reason);
+    errors += std::holds_alternative<protocol::ErrorEvent>(message);
+  }
+  require(errors == 0 &&
+              done == std::vector<protocol::FinishReason>{
+                          protocol::FinishReason::Cancelled,
+                          protocol::FinishReason::Stop},
+          "a cancelled id was not reusable in the same input");
+}
+
 void testControlFailureUsesExecutionBoundary() {
   for (bool metalFailure : {false, true}) {
     test::TestKvStorage storage(32, 4096, 4);
@@ -792,6 +851,112 @@ void testControlFailureUsesExecutionBoundary() {
     require(errors == 1 && !loop.engineHealthy() && loop.connectionMustClose(),
             "control exception did not terminate the unhealthy engine");
   }
+}
+
+// A frame whose handling throws stops the engine through the same boundary
+// as tick(): one EngineUnhealthy event, whatever was thrown, with a Metal
+// failure named and counted.
+void testFrameFailureUsesExecutionBoundary() {
+  enum class Thrown { Standard, Metal, Foreign };
+  for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 8);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor;
+    RuntimeMetrics metrics;
+    engine::NativeLoopConfig config;
+    config.metrics = &metrics;
+    std::vector<uint8_t> output;
+    engine::NativeRuntime loop(
+        config, resources, executor,
+        [&](std::span<const uint8_t> bytes) {
+          output.insert(output.end(), bytes.begin(), bytes.end());
+        },
+        [thrown]() -> std::string {
+          if (thrown == Thrown::Standard)
+            throw std::runtime_error("status test");
+          if (thrown == Thrown::Metal)
+            throw metal::MetalBackendError("status test");
+          throw 42;
+        });
+    loop.announceReady();
+    const auto status = protocol::serializeMessage(
+        protocol::Message{protocol::StatusRequestFrame{77}});
+    require(status && !loop.receive(*status.value) && !loop.engineHealthy() &&
+                loop.connectionMustClose(),
+            "a failed status frame did not stop the engine");
+    uint32_t errors = 0;
+    for (const auto &message : decodeMessages(output)) {
+      if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+        require(error->requestId == 0 &&
+                    error->failureClass == protocol::FailureClass::EngineUnhealthy &&
+                    error->code == (thrown == Thrown::Metal
+                                        ? "metal_execution_failed"
+                                        : "engine_execution_failed"),
+                "a frame exception lost its engine failure classification");
+        ++errors;
+      }
+    }
+    require(errors == 1 && metrics.snapshot().metalFailures ==
+                               (thrown == Thrown::Metal ? 1U : 0U),
+            "a frame exception was reported or counted more than once");
+  }
+}
+
+// The loop checks its protocol limits once, when it is built; the codec and
+// the parser rely on them.
+void testInvalidLimitsAreRejectedAtConstruction() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 8);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  protocol::ProtocolLimits limits;
+  limits.maxMaskWords = 0;
+  bool refused = false;
+  try {
+    engine::NativeRuntime loop(
+        {}, resources, executor, [](std::span<const uint8_t>) {},
+        [] { return std::string("{}"); }, {}, limits);
+  } catch (const std::invalid_argument &error) {
+    refused = std::string(error.what()).find("limit_exceeded") !=
+              std::string::npos;
+  }
+  require(refused, "the loop accepted invalid protocol limits");
+}
+
+// An exception while the engine admits a request is engine-fatal: nothing
+// below the engine rolls back, and the loop reports it once.
+void testAdmissionExceptionStopsTheEngineOnce() {
+  test::TestKvStorage storage(32, 4096, 4);
+  KvPool pool(storage, 32);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  executor.onBegin = [] { throw std::runtime_error("begin failed"); };
+  std::vector<uint8_t> output;
+  engine::NativeRuntime loop(
+      {}, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  const auto wire = protocol::serializeMessage(protocol::Message{request(1)});
+  require(wire && loop.receive(*wire.value), "admission fixture was refused");
+  require(!loop.tick() && !loop.engineHealthy() && loop.connectionMustClose(),
+          "an admission exception did not stop the engine");
+  uint32_t errors = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {
+      require(error->requestId == 0 &&
+                  error->failureClass == protocol::FailureClass::EngineUnhealthy &&
+                  error->code == "engine_execution_failed" &&
+                  error->message == "begin failed",
+              "an admission exception lost its engine failure");
+      ++errors;
+    }
+  }
+  require(errors == 1, "an admission exception was reported more than once");
 }
 
 // Every path that stops the engine keeps its reason for the exit log, not
@@ -1258,7 +1423,8 @@ void testInvalidScoreFailsOneRequestAndKeepsTheBatch() {
 // A constrained request's initial token mask crosses the native protocol.
 // Only the response to the pending mask request, with one row of the
 // configured width, reaches the model. Any other response fails that
-// request alone, and one that arrives after the request ended is ignored.
+// request alone, and one that arrives after the request ended, cancelled or
+// timed out waiting for it, is ignored.
 void testConstrainedMaskExchange() {
   enum class Reply {
     Valid,
@@ -1266,10 +1432,13 @@ void testConstrainedMaskExchange() {
     WrongWordCount,
     EmptyRow,
     Malformed,
-    AfterCancel
+    AfterCancel,
+    AfterTimeout
   };
-  for (Reply reply : {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
-                      Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel}) {
+  for (Reply reply :
+       {Reply::Valid, Reply::WrongMaskId, Reply::WrongWordCount,
+        Reply::EmptyRow, Reply::Malformed, Reply::AfterCancel,
+        Reply::AfterTimeout}) {
     test::TestKvStorage storage(32, 4096, 4);
     KvPool pool(storage, 32);
     engine::Cache resources(pool, CacheNamespace{});
@@ -1278,13 +1447,14 @@ void testConstrainedMaskExchange() {
     engine::NativeLoopConfig config;
     config.engine.maxContext = 1024;
     config.maskWordsPerToken = 2;
+    double now = 100.0;
     engine::NativeRuntime loop(
         config, resources, executor,
         [&](std::span<const uint8_t> bytes) {
           output.insert(output.end(), bytes.begin(), bytes.end());
         },
         [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
-        {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+        {[] { return uint64_t{1'000'000}; }, [&] { return now; }});
     storage.commandInFlight = [&] { return loop.commandInFlight(); };
     loop.announceReady();
     const auto send = [&](protocol::Message message) {
@@ -1296,6 +1466,8 @@ void testConstrainedMaskExchange() {
     constrained.priority = protocol::RequestPriority::Background;
     constrained.cohort = protocol::Cohort::Constrained;
     constrained.constraint = protocol::ConstraintMode::TokenMask;
+    constrained.absoluteDeadlineUnixMicros = 601'000'000;
+    constrained.remainingDeadlineMicros = 600'000'000;
     send(constrained);
     while (loop.tick()) {
     }
@@ -1319,6 +1491,10 @@ void testConstrainedMaskExchange() {
       send(protocol::CancelFrame{7});
       runUntilIdle(loop);
     }
+    if (reply == Reply::AfterTimeout) {
+      now += 5000.0;
+      runUntilIdle(loop);
+    }
     if (reply == Reply::Malformed) {
       // The frame claims one more mask word than it carries.
       auto wire = protocol::serializeMessage(protocol::Message{response});
@@ -1333,6 +1509,7 @@ void testConstrainedMaskExchange() {
 
     std::optional<protocol::FinishReason> done;
     std::vector<std::string> errors;
+    std::string errorMessage;
     uint32_t maskRequests = 0;
     for (const auto &message : decodeMessages(output)) {
       if (const auto *event = std::get_if<protocol::DoneEvent>(&message))
@@ -1342,6 +1519,7 @@ void testConstrainedMaskExchange() {
                     error->failureClass == protocol::FailureClass::RequestError,
                 "mask response failure was not the request's own error");
         errors.push_back(error->code);
+        errorMessage = error->message;
       }
       maskRequests += std::holds_alternative<protocol::MaskRequestEvent>(message);
     }
@@ -1356,13 +1534,18 @@ void testConstrainedMaskExchange() {
       require(done == protocol::FinishReason::Cancelled && errors.empty() &&
                   executor.providedMasks == 0,
               "mask response after cancellation was not ignored");
+    } else if (reply == Reply::AfterTimeout) {
+      require(!done && errors == std::vector<std::string>{"mask_timeout"} &&
+                  executor.providedMasks == 0,
+              "mask response after its timeout was not ignored");
     } else {
-      const std::string expected = reply == Reply::Malformed
-                                       ? "invalid_payload_length"
-                                       : "invalid_mask_response";
-      require(!done && errors == std::vector<std::string>{expected} &&
+      require(!done &&
+                  errors == std::vector<std::string>{"invalid_mask_response"} &&
                   executor.providedMasks == 0,
               "mismatched mask response did not fail only its request");
+      require(reply != Reply::Malformed ||
+                  errorMessage.starts_with("invalid_payload_length: "),
+              "a malformed mask response lost its decoding issue");
     }
   }
 }
@@ -1378,10 +1561,14 @@ int main() {
     testPromptProgress();
     testCapacityFailureHasOneTerminalFrame();
     testFatalFramingClosesConnection();
+    testInvalidLimitsAreRejectedAtConstruction();
     testRequestErrorKeepsFraming();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
+    testCancelledIdIsReusableInTheSameInput();
     testControlFailureUsesExecutionBoundary();
+    testAdmissionExceptionStopsTheEngineOnce();
+    testFrameFailureUsesExecutionBoundary();
     testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();

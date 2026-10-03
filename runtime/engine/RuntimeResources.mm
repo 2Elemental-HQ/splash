@@ -295,6 +295,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     requireStartupHeadroom(hostAvailableMemory, preparationReserveBytes, level);
   };
   backend->setOperationGuard(admitMetalOperation);
+  // A synchronous command wait gives up when the process shuts down, also
+  // after startup.
+  backend->setWaitInterrupt(config.cancelled);
   // One disk quota serves KV pages and states. Without room for a state,
   // disk KV cannot preserve a restorable prefix, so the tier stays off, and
   // no state's write needs the staging buffer the plan would set aside.

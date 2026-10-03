@@ -17,7 +17,8 @@
 // bit for bit, whatever lanes share its batch; a distribution of one token
 // selects the masked argmax; and a lane that ignores end-of-sequence never
 // selects a stop token.
-// Extreme repetition penalties saturate to exact, finite outcomes. The host
+// Extreme repetition penalties saturate to exact, finite outcomes, and rows
+// of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
 #include "metal/MetalBackend.hpp"
@@ -1808,6 +1809,70 @@ void extremeSearches(MetalBackend &backend) {
   }
 }
 
+// A row of non-finite logits, which a non-finite hidden row leaves, has no
+// token to select: greedy and sampled policies select 0xFFFFFFFF for a first
+// token and at every verify row, and acceptance retains it as the next
+// anchor. The model runtime reports that sentinel as the request's own
+// failure, which keeps the rest of the batch serving.
+void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t kSentinel = 0xFFFFFFFFU;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, 1);
+  const AcceptanceBuffers acceptance{
+      allocate(backend, kPositions * sizeof(uint32_t)),
+      batch.buffers.draftCandidates,
+      batch.buffers.draftProbabilities,
+      batch.buffers.vocabularyRows,
+      batch.buffers.uniforms,
+      batch.buffers.outputTokens,
+      allocate(backend, sizeof(uint32_t)),
+      allocate(backend, sizeof(uint32_t))};
+  Random random(0x6e616e);
+  for (uint32_t position = 0; position < kPositions; ++position) {
+    const uint32_t draft = 3 + random.next() % (vocabulary - 3);
+    setDraft(batch, 0, position, {draft}, draft, random);
+    static_cast<uint32_t *>(acceptance.proposedTokens.contents())[position] = draft;
+  }
+  batch.inputTokens()[0] = 7;
+  for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+    batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+  for (const SamplingPolicy &policy : {SamplingPolicy{1, 0.0F, 1.0F, false},
+                                       SamplingPolicy{20, 1.0F, 0.9F, false}}) {
+    const std::string label = policy.samples() ? "sampled" : "greedy";
+    std::fill(batch.logits(), batch.logits() + batch.rows * vocabulary,
+              std::numeric_limits<float>::quiet_NaN());
+    batch.poison();
+    CommandGraph initial;
+    sampling.addInitial(initial, policy, batch.buffers, 0, kStopTokens[0],
+                        kStopTokens[1], {});
+    static_cast<void>(backend.submitCommand(initial.dispatches()));
+    require(batch.outputTokens()[0] == kSentinel,
+            label + ": a first token from a non-finite row is " +
+                std::to_string(batch.outputTokens()[0]));
+    batch.poison();
+    CommandGraph verify;
+    sampling.addVerify(verify, {&policy, 1}, batch.buffers, kStopTokens[0],
+                       kStopTokens[1], {});
+    static_cast<void>(backend.submitCommand(verify.dispatches()));
+    for (uint32_t row = 0; row < kRows; ++row)
+      require(batch.outputTokens()[row] == kSentinel,
+              label + ": verify row " + std::to_string(row) +
+                  " of non-finite logits selected " +
+                  std::to_string(batch.outputTokens()[row]));
+    CommandGraph accept;
+    const std::array<uint32_t, 1> maximumRetained{kRows};
+    sampling.addAcceptance(accept, acceptance, maximumRetained, {&policy, 1},
+                           kStopTokens[0], kStopTokens[1]);
+    static_cast<void>(backend.submitCommand(accept.dispatches()));
+    const uint32_t retained =
+        *static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+    require(retained >= 1 && retained <= kRows &&
+                batch.outputTokens()[retained - 1] == kSentinel,
+            label + ": acceptance did not retain the sentinel as its anchor");
+  }
+}
+
 // The host words: prompt bits only when repetition reads them, counts of
 // every selected token (the generated history and the pending anchor), and
 // no token outside the vocabulary or history without a prompt.
@@ -1945,6 +2010,8 @@ int main(int argc, char **argv) {
               std::to_string(samplingMask);
       speculativeExactness(backend, samplingMask);
     }
+    stage = "non-finite rows";
+    nonFiniteRowsSelectTheSentinel(backend);
     stage = "ties";
     ties(backend);
     stage = "min_p cuts";

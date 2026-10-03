@@ -30,7 +30,6 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
 
 [[noreturn]] void fail(RuntimeBootstrapReport report,
                        RuntimeBootstrapStage stage, std::string message) {
-  report.ready = false;
   report.stage = stage;
   report.message = std::move(message);
   report.warmup.error = report.message;
@@ -65,7 +64,8 @@ std::string_view runtimeBootstrapStageName(RuntimeBootstrapStage stage) {
 
 std::string RuntimeBootstrapReport::describe() const {
   std::ostringstream out;
-  out << (ready ? "runtime bootstrap ready" : "runtime bootstrap failed")
+  out << (stage == RuntimeBootstrapStage::Ready ? "runtime bootstrap ready"
+                                                : "runtime bootstrap failed")
       << " [" << runtimeBootstrapStageName(stage) << "]: " << message;
   if (!memoryAudit.message.empty()) {
     out << '\n' << memoryAudit.describe();
@@ -123,19 +123,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime,
     ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
-  if (!memoryReporter) {
-    fail(std::move(report), RuntimeBootstrapStage::MemoryAudit,
-         "actual memory reporter is required");
-  }
-  if (nativeLoop.ready()) {
-    fail(std::move(report), RuntimeBootstrapStage::AnnounceReady,
-         "native loop announced ready before bootstrap");
-  }
-  if (!nativeLoop.engineHealthy()) {
-    fail(std::move(report), RuntimeBootstrapStage::AnnounceReady,
-         "native loop is unhealthy before warmup");
-  }
-
   uint64_t estimatedPeakBytes = 0;
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
@@ -229,10 +216,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
          report.memoryAudit.describe());
   }
   report.warmup.memoryBudgetValidated = true;
-  if (!report.warmup.ready()) {
-    fail(report, RuntimeBootstrapStage::MemoryAudit,
-         "warmup report is incomplete after memory validation");
-  }
 
   try {
     nativeLoop.announceReady();
@@ -243,11 +226,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     fail(report, RuntimeBootstrapStage::AnnounceReady,
          "binary ReadyEvent announcement failed with an unknown exception");
   }
-  if (!nativeLoop.ready()) {
-    fail(report, RuntimeBootstrapStage::AnnounceReady,
-         "native loop did not enter ready state");
-  }
-  report.ready = true;
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
   report.warmup.error.clear();

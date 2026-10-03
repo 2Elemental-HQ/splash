@@ -72,20 +72,24 @@ class TokenConstraintTest(unittest.TestCase):
     def test_generated_tokens_advance_the_grammar_and_end_with_eos(self):
         a, b, c, eos = self.a, self.b, self.c, self.eos
         constraint = self.constraint()
-        constraint.consume([a])
+        # Committed tokens advance the grammar before its next mask.
+        constraint.commit([a])
         self.assertEqual(self.rows(constraint.masks(())), [[b, c]])
-        constraint.consume([b])
+        constraint.commit([b])
         self.assertEqual(self.rows(constraint.masks(())), [[eos]])
         # LLGuidance's bulk API rejects EOS once the grammar has stopped.
         self.assertFalse(constraint.matcher.deep_copy().consume_tokens([eos]))
-        constraint.consume([eos])
+        constraint.commit([eos])
+        constraint.finish()
         self.assertFalse(constraint.matcher.is_error())
         for tokens in ([self.z], [self.Constraint.VOCABULARY], [-1]):
             with (
                 self.subTest(tokens=tokens),
                 self.assertRaises(NativeError) as caught,
             ):
-                self.constraint().consume(tokens)
+                rejecting = self.constraint()
+                rejecting.commit(tokens)
+                rejecting.finish()
             self.assertEqual(caught.exception.code, "constraint_error")
             # The parser's state dump, generated text included, stays out.
             self.assertNotIn("\n", caught.exception.message)

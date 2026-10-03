@@ -998,6 +998,9 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
+A mask request the server leaves unanswered for 5 s fails that request with
+the retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
+batch's command.
 A lane's arithmetic can depend on the batch it decodes in and on how its
 prompt is chunked. Concurrent requests change both, and chunk boundaries also
 come from the cached boundary a request resumes from and from the junctions
@@ -1194,12 +1197,13 @@ position. The final prefill chunk runs the target head but no sampling policy or
 DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
 reports zero decode time. Cancelled requests carry no logits.
 
-A non-finite score logit is a per-request failure, not an engine fault: the
-engine reports `model_result_invalid` for that request alone, before it
-publishes the failing step's cache state or any output, and the rest of the
-batch finishes normally. Prompt chunks that already succeeded keep the blocks
-they committed, exactly as they do for a cancelled request. GPU faults and
-broken engine invariants stay fatal and still mark the runtime unhealthy.
+A non-finite logit row is a per-request failure, not an engine fault: a score
+logit, or a token the sampling kernels could only select outside the
+vocabulary. The engine reports `model_result_invalid` for that request alone,
+before it publishes the failing step's cache state or any output, and the rest
+of the batch finishes normally. Prompt chunks that already succeeded keep the
+blocks they committed, exactly as they do for a cancelled request. GPU faults
+and broken engine invariants stay fatal and still mark the runtime unhealthy.
 
 ## Validate
 

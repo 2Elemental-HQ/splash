@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -16,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -78,7 +81,10 @@ public:
     return {};
   }
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t>) override {}
+  std::optional<std::string> provideMask(uint64_t,
+                                         std::span<const uint32_t>) override {
+    return std::nullopt;
+  }
   void end(uint64_t) override {}
 
 private:
@@ -131,9 +137,12 @@ struct Harness final {
   engine::Cache resources{pool, CacheNamespace{}};
   Executor executor;
   engine::FdTransport transport;
-  engine::NativeRuntime loop{
-      {}, resources, executor, transport.outputSink(),
-      [] { return std::string("{\"schema_version\":5}"); }};
+  // What the loop answers a status request with.
+  std::function<std::string()> status = [] {
+    return std::string("{\"schema_version\":5}");
+  };
+  engine::NativeRuntime loop{{}, resources, executor, transport.outputSink(),
+                             [this] { return status(); }};
 };
 
 std::vector<uint8_t> wire(const protocol::Message &message) {
@@ -572,6 +581,57 @@ void testInputEndsAfterItsBytes() {
   close(listener);
 }
 
+// The signal that requests a shutdown ends an output write the server has
+// stopped draining, which would otherwise hold the loop forever: run()
+// returns at once with the engine failed.
+void testShutdownInterruptsABlockedOutputWrite() {
+  Harness harness;
+  // The loop builds the status reply right before it writes it.
+  std::promise<void> answering;
+  harness.status = [&] {
+    answering.set_value();
+    return std::string("{\"schema_version\":5}");
+  };
+  // Like the process's own handler, without SA_RESTART: the signal interrupts
+  // the write.
+  struct sigaction action {};
+  action.sa_handler = [](int) {};
+  sigemptyset(&action.sa_mask);
+  struct sigaction previous {};
+  require(sigaction(SIGUSR1, &action, &previous) == 0,
+          "could not install the test signal handler");
+  // Fill the output pipe, so the reply's write blocks.
+  const int output = harness.pipes.output[1];
+  const int flags = fcntl(output, F_GETFL);
+  require(fcntl(output, F_SETFL, flags | O_NONBLOCK) == 0,
+          "could not make the output nonblocking");
+  const std::vector<uint8_t> filler(64 * 1024, 0);
+  while (writeAvailable(output, filler)) {
+  }
+  require(fcntl(output, F_SETFL, flags) == 0, "could not restore the output");
+  std::promise<engine::NativeProcessExit> exited;
+  auto exit = exited.get_future();
+  std::thread loop([&] { exited.set_value(harness.transport.run(harness.loop)); });
+  wakeWithStatusRequest(harness, 12);
+  if (answering.get_future().wait_for(std::chrono::seconds(5)) !=
+      std::future_status::ready)
+    abandon("the loop did not answer the status request");
+  // The loop is past its shutdown check, on its way into the write. A signal
+  // that comes before the write starts interrupts nothing, so it repeats
+  // until run() returns.
+  harness.transport.requestShutdown();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (exit.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      abandon("a shutdown did not end a blocked output write");
+    pthread_kill(loop.native_handle(), SIGUSR1);
+  }
+  loop.join();
+  sigaction(SIGUSR1, &previous, nullptr);
+  require(exit.get() == engine::NativeProcessExit::EngineFailure,
+          "an interrupted output write did not fail the engine");
+}
+
 void testCleanEofAndProtocolFailure() {
   require(run({}) == engine::NativeProcessExit::CleanEof,
           "empty clean input did not return clean EOF");
@@ -593,6 +653,7 @@ int main() {
     testQueueBoundStopsTheWriter();
     testShutdownJoinsTheReader();
     testInputEndsAfterItsBytes();
+    testShutdownInterruptsABlockedOutputWrite();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

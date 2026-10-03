@@ -236,6 +236,8 @@ struct BackendAsyncState {
     std::function<void(id<MTLCommandBuffer>)> activeCompletion;
     CommandWatchdog commandWatchdog;
     bool stopping = false;
+    // MetalBackend::setWaitInterrupt's predicate.
+    std::function<bool()> waitInterrupt;
 
     void sampleDeviceMemory() const noexcept {
         if (!device) return;
@@ -348,6 +350,12 @@ struct BackendAsyncState {
         ensureHealthy();
     }
 
+    // True when the process is shutting down; the waiter decides whether
+    // that gives its command up.
+    [[nodiscard]] bool waitInterrupted() const noexcept {
+        return waitInterrupt && waitInterrupt();
+    }
+
     [[nodiscard]] bool hasActiveSubmission() const noexcept {
         std::lock_guard lock(gateMutex);
         return activeSequence != 0;
@@ -437,26 +445,47 @@ struct CommandTicket::State {
 
     // Waits for the command in kTicketWaitSlice slices. Between them, outside
     // `mutex` (the watchdog may finish this ticket through finishCommand), it
-    // asks the backend whether to stop. False when the backend gave up on a
+    // asks the backend whether to stop, and with honorShutdown also whether
+    // the process is shutting down. False when the backend gave up on a
     // command that never completed: the GPU may still use the retained
     // allocations, which the command's completion handler keeps alive with
     // this state.
-    [[nodiscard]] bool awaitCompletion() noexcept {
+    [[nodiscard]] bool awaitCompletion(bool honorShutdown) noexcept {
         std::unique_lock lock(mutex);
         while (!condition.wait_for(lock, kTicketWaitSlice,
                                    [this] { return completed; })) {
             lock.unlock();
-            const bool stop = backend->commandAbandoned();
+            const bool abandoned = backend->commandAbandoned();
+            const bool interrupted =
+                !abandoned && honorShutdown && backend->waitInterrupted();
             lock.lock();
-            if (stop && !completed) return false;
+            if (completed) break;
+            // A shutdown gives the command up only here, where the lock shows
+            // it unfinished: one that completed meanwhile leaves the backend
+            // healthy.
+            if (interrupted) backend->markUnhealthy(shutdownReason());
+            if (abandoned || interrupted) return false;
         }
         return true;
     }
 
+    // Why the backend is unhealthy once a shutdown gave this command up.
+    [[nodiscard]] std::string shutdownReason() const noexcept {
+        std::string reason = "shutdown requested while waiting for a Metal command";
+        try {
+            reason = "shutdown requested while waiting for Metal command " +
+                     std::to_string(sequence);
+        } catch (const std::bad_alloc &) {
+        }
+        return reason;
+    }
+
     // An abandoned command keeps its allocations until its completion
     // handler lets go of this state; the unhealthy backend admits no more.
+    // A shutdown does not give up this wait: teardown waits for the command,
+    // as long as the watchdog lets it.
     void abandon() noexcept {
-        if (awaitCompletion()) release();
+        if (awaitCompletion(false)) release();
     }
 };
 
@@ -626,7 +655,7 @@ bool CommandTicket::ready() const noexcept {
 
 CommandTiming CommandTicket::wait() {
     if (!state_) throw MetalBackendError("Metal command ticket is empty");
-    if (!state_->awaitCompletion()) {
+    if (!state_->awaitCompletion(true)) {
         // Let go first, so that unwinding does not wait again.
         auto backend = state_->backend;
         state_.reset();
@@ -750,6 +779,10 @@ void MetalBackend::checkOperation() const {
 
 void MetalBackend::setOperationGuard(std::function<void()> guard) {
     impl_->operationGuard = std::move(guard);
+}
+
+void MetalBackend::setWaitInterrupt(std::function<bool()> shuttingDown) {
+    impl_->asyncState->waitInterrupt = std::move(shuttingDown);
 }
 
 MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,

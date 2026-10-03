@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash::engine {
@@ -55,6 +56,50 @@ struct EngineRequest final {
   }
 };
 
+// How a request ends without finishing: decided by the engine, reported by
+// the protocol adapter from this one table.
+enum class LaneOutcome : uint8_t {
+  // Completes with EngineFinishReason::Cancelled; never sent as an error.
+  Cancelled,
+  DeadlineExceeded,
+  ResourceTimeout,
+  // A lone lane that cannot fit even after every cached prefix went:
+  // retrying the same request fails the same way.
+  CapacityExhausted,
+  ModelResultInvalid,
+  InvalidMask,
+  // The server left a token-mask request unanswered (Engine.cpp's limit).
+  MaskTimeout,
+};
+
+struct LaneOutcomeWire final {
+  std::string_view code;
+  bool retryable;
+};
+
+[[nodiscard]] constexpr LaneOutcomeWire
+laneOutcomeWire(LaneOutcome outcome) noexcept {
+  switch (outcome) {
+  case LaneOutcome::Cancelled:
+    return {"cancelled", false};
+  case LaneOutcome::DeadlineExceeded:
+    return {"deadline_exceeded", false};
+  case LaneOutcome::ResourceTimeout:
+    return {"resource_timeout", true};
+  case LaneOutcome::CapacityExhausted:
+    return {"capacity_exhausted", false};
+  case LaneOutcome::ModelResultInvalid:
+    return {"model_result_invalid", false};
+  case LaneOutcome::InvalidMask:
+    return {"invalid_mask_response", false};
+  case LaneOutcome::MaskTimeout:
+    return {"mask_timeout", true};
+  }
+}
+
+inline constexpr std::string_view kDeadlineExceededMessage =
+    "request deadline exceeded";
+
 class EngineEventSink {
 public:
   virtual ~EngineEventSink() = default;
@@ -69,12 +114,8 @@ public:
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
                          std::span<const float> optionLogits) = 0;
-  virtual void failed(uint64_t requestId, std::string code, std::string message,
-                      bool retryable) = 0;
+  virtual void failed(uint64_t requestId, LaneOutcome outcome,
+                      std::string message) = 0;
 };
-
-// The code of a request the engine could not give memory to even alone: not
-// retryable.
-inline constexpr std::string_view kCapacityExhausted = "capacity_exhausted";
 
 } // namespace splash::engine

@@ -71,7 +71,7 @@ class RequestLifetimeTests(unittest.TestCase):
                 if outcome == "callback_error":
 
                     class Constraint:
-                        def consume(self, _tokens):
+                        def commit(self, _tokens):
                             raise api.APIError(400, "constraint callback failed")
 
                     job.constraint = Constraint()
@@ -241,7 +241,7 @@ class RequestLifetimeTests(unittest.TestCase):
         self.addCleanup(release.set)
 
         class Constraint:
-            def consume(self, _tokens):
+            def commit(self, _tokens):
                 entered.set()
                 if not release.wait(2):
                     raise TimeoutError("test callback was not released")

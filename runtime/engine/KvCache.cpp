@@ -147,19 +147,10 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   entry.diskNode = RecencyOrder::allocate(entry.id);
 
   pool_.retainPage(physicalPage, true);
-  bool blockInserted = false;
-  try {
-    auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
-    if (!unique)
-      throw std::logic_error("duplicate KV cache block id");
-    blockInserted = true;
-    index_.emplace(position->second.indexHash, position->first);
-  } catch (...) {
-    if (blockInserted)
-      blocks_.erase(nextBlockId_);
-    pool_.releasePage(physicalPage, true);
-    throw;
-  }
+  auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
+  if (!unique)
+    throw std::logic_error("duplicate KV cache block id");
+  index_.emplace(position->second.indexHash, position->first);
   const uint64_t id = nextBlockId_++;
   ++residentBlocks_;
   blockOnPage_[physicalPage] = id;

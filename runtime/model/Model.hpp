@@ -245,9 +245,11 @@ struct ModelStepResult final {
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
   // Set when the model computed an unusable result for this lane alone, such
-  // as a non-finite score logit. The engine fails that one request before it
-  // publishes cache state or emits output, and the rest of the batch stands.
-  // Broken invariants and GPU faults stay exceptions and remain engine-fatal.
+  // as a non-finite score logit or a selection outside the vocabulary (the
+  // sampling kernels' sentinel for a non-finite logit row). The engine fails
+  // that one request before it publishes cache state or emits output, and the
+  // rest of the batch stands. Broken invariants and GPU faults stay
+  // exceptions and remain engine-fatal.
   std::string failure{};
 
   bool operator==(const ModelStepResult &) const = default;
@@ -489,8 +491,9 @@ public:
   // A denied allocation retries between calls, so it frees only what it
   // needs. keepLane keeps the pooled buffers one lane starts from.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane) noexcept = 0;
-  virtual void provideMask(uint64_t requestId,
-                           std::span<const uint32_t> words) = 0;
+  // Why this request's mask is unusable, or nothing when the model took it.
+  [[nodiscard]] virtual std::optional<std::string>
+  provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
   virtual void end(uint64_t requestId) = 0;
 };
 

@@ -51,6 +51,7 @@ public:
   [[nodiscard]] NativeProcessExit run(NativeRuntime &loop);
   // Async-signal-safe. Asks run() to return CleanEof at its next iteration.
   // It does not wait for in-flight GPU work; the process owner bounds teardown.
+  // An output write the signal interrupts fails instead of resuming.
   void requestShutdown() noexcept;
   [[nodiscard]] bool shutdownRequested() const noexcept;
   // The longest one control pass and one tick of run() have taken. Read on

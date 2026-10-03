@@ -30,8 +30,8 @@ enum class RuntimeBootstrapStage {
 [[nodiscard]] std::string_view runtimeBootstrapStageName(
     RuntimeBootstrapStage stage);
 
+// A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
-    bool ready = false;
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;

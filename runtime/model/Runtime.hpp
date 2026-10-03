@@ -47,8 +47,8 @@ public:
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane) noexcept override;
-  void provideMask(uint64_t requestId,
-                   std::span<const uint32_t> words) override;
+  [[nodiscard]] std::optional<std::string>
+  provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;

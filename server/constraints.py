@@ -32,8 +32,24 @@ class TokenConstraint:
         self.matcher = matcher
         self.executor = executor
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.VOCABULARY)
+        # Generated batches the grammar has not consumed yet. The reader
+        # thread commits them; the mask thread consumes them before the next
+        # mask, so reading the native stream never waits for the grammar.
+        self._lock = threading.Lock()
+        self._committed: list[tuple[int, ...]] = []
+
+    def commit(self, token_ids):
+        if any(not 0 <= token < self.VOCABULARY for token in token_ids):
+            raise NativeError("constraint_error", "generated token is out of range")
+        with self._lock:
+            self._committed.append(tuple(token_ids))
+
+    def finish(self):
+        """Checks the tokens generated after the last mask."""
+        self._consume_committed()
 
     def masks(self, simulation_tokens):
+        self._consume_committed()
         if len(simulation_tokens) >= self.MAX_ROWS:
             raise NativeError("constraint_error", "too many simulation tokens")
         in_range = next(
@@ -65,28 +81,31 @@ class TokenConstraint:
             raise NativeError("constraint_error", "output grammar has no valid token")
         return self.bitmask[:rows].tobytes()
 
-    def consume(self, token_ids):
-        if any(not 0 <= token < self.VOCABULARY for token in token_ids):
-            raise NativeError("constraint_error", "generated token is out of range")
-        # LLGuidance's bulk API rejects EOS after a NoExtension stop.
-        stopped_eos = (
-            len(token_ids) == 1
-            and token_ids[0] in self.EOS_TOKENS
-            and not self.matcher.is_error()
-            and self.matcher.is_stopped()
-            and self.matcher.is_accepting()
-        )
-        valid = (
-            self.matcher.consume_token(token_ids[0])
-            if stopped_eos
-            else self.matcher.consume_tokens(token_ids)
-        )
-        if not valid:
-            # The lines after the first dump the parser state, output included.
-            error = self.matcher.get_error()
-            raise NativeError(
-                "constraint_error", error.splitlines()[0] if error else "invalid token"
+    def _consume_committed(self):
+        with self._lock:
+            batches, self._committed = self._committed, []
+        for token_ids in batches:
+            # LLGuidance's bulk API rejects EOS after a NoExtension stop.
+            stopped_eos = (
+                len(token_ids) == 1
+                and token_ids[0] in self.EOS_TOKENS
+                and not self.matcher.is_error()
+                and self.matcher.is_stopped()
+                and self.matcher.is_accepting()
             )
+            valid = (
+                self.matcher.consume_token(token_ids[0])
+                if stopped_eos
+                else self.matcher.consume_tokens(token_ids)
+            )
+            if not valid:
+                # The lines after the first dump the parser state, output
+                # included.
+                error = self.matcher.get_error()
+                raise NativeError(
+                    "constraint_error",
+                    error.splitlines()[0] if error else "invalid token",
+                )
 
 
 def validate_tokenizer(tokenizer):

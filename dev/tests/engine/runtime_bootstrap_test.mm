@@ -286,7 +286,10 @@ public:
     return std::make_shared<State>();
   }
   uint64_t reclaimIdleState(bool) noexcept override { return 0; }
-  void provideMask(uint64_t, std::span<const uint32_t>) override {}
+  std::optional<std::string> provideMask(uint64_t,
+                                         std::span<const uint32_t>) override {
+    return std::nullopt;
+  }
   void end(uint64_t) override {}
 
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
@@ -390,7 +393,8 @@ void testAllNativeWarmupsPrecedeReady() {
         return actual;
       },
       harness.loop());
-  require(report.ready && report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready &&
+              report.warmup.ready() && report.memoryAudit.valid &&
               harness.loop().ready() && !harness.output().empty(),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5, 6}),
@@ -414,7 +418,8 @@ RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
 
 void requireReadyWithoutReducingConcurrency(
     Harness &harness, const RuntimeBootstrapReport &report) {
-  require(report.ready && report.warmup.ready() && report.memoryAudit.valid &&
+  require(report.stage == RuntimeBootstrapStage::Ready &&
+              report.warmup.ready() && report.memoryAudit.valid &&
               harness.loop().ready(),
           "memory-limited warmup did not become ready");
   protocol::FrameParser parser;
@@ -508,8 +513,7 @@ void testResourceFailureClassificationSurvivesBootstrap() {
                                              "budget details", failure);
         RuntimeBootstrapError error(resourceError);
         const auto &report = error.report();
-        require(!report.ready &&
-                    report.stage == RuntimeBootstrapStage::ResourceAssembly &&
+        require(report.stage == RuntimeBootstrapStage::ResourceAssembly &&
                     report.resourceFailure == failure &&
                     report.message == message && report.warmup.error == message &&
                     report.memoryPlanJson == "{\"budget\":1}" &&

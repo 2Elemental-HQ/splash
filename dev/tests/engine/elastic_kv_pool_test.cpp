@@ -93,16 +93,13 @@ void testRunwayIsAllocatedThroughThePool() {
 }
 
 // Page ids cover every extent the budget could hold, so running out of them
-// is a broken invariant rather than a refusal; the pages taken go back.
+// is a broken invariant rather than a refusal.
 void testIdExhaustionIsALogicError() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 8);
     requireThrows<std::logic_error>(
         [&] { static_cast<void>(pool.acquirePages(9, false)); },
         "running out of page ids was not a logic error");
-    const auto status = pool.snapshot();
-    require(status.pagesActive == 0 && status.pagesFree == 8,
-            "running out of page ids kept the pages taken");
 }
 
 // An extent the storage refuses denies the acquisition, which holds no page
@@ -134,32 +131,6 @@ void testFailedGrowthKeepsItsExtentsForTheRetry() {
     require(reclaimEvery(pool, false) == 3 &&
                 pool.snapshot().pagesAllocated == 0,
             "a reclaim pass did not return the extents the retry left");
-}
-
-// A storage that throws while allocating leaves every page free and the
-// accounting whole; the extent allocated before it stays, reclaimable, and
-// the pool keeps serving.
-void testThrowingStorageKeepsAccounting() {
-    TestKvStorage storage(12, 100, 4);
-    storage.growthAllowed = [](uint32_t extent) {
-        if (extent == 1) throw std::runtime_error("test allocation failure");
-        return true;
-    };
-    KvPool pool(storage, 0);
-    bool threw = false;
-    try {
-        static_cast<void>(pool.acquirePages(5, false));
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    auto status = pool.snapshot();
-    require(threw && status.pagesActive == 0 && status.pagesFree == 4 &&
-                status.pagesAllocated == 4 && status.reclaimableExtents == 1,
-            "throwing storage leaked pages or broke the extent accounting");
-    storage.growthAllowed = nullptr;
-    auto pages = pool.acquirePages(5, false);
-    require(pages.granted() && pool.snapshot().pagesActive == 5,
-            "pool did not serve after a throwing storage");
 }
 
 void testPressureReusesFreePagesAndDeniesGrowth() {
@@ -398,7 +369,6 @@ int main() {
         testRunwayIsAllocatedThroughThePool();
         testIdExhaustionIsALogicError();
         testFailedGrowthKeepsItsExtentsForTheRetry();
-        testThrowingStorageKeepsAccounting();
         testPressureReusesFreePagesAndDeniesGrowth();
         testPassReleasesEveryEmptyExtent();
         testFullestExtentFillsFirstSoColdExtentsDrain();

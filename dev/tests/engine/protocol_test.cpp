@@ -550,17 +550,19 @@ void testHeaderFailures() {
   std::vector<uint8_t> invalidMagic(24, 'r');
   expect(std::move(invalidMagic), IssueCode::BadMagic);
 
+  // A caller that keeps feeding a failed parser is a bug.
   FrameParser sticky;
   auto corrupted = valid;
   corrupted[0] = 0;
   ParseStep first = sticky.consume(corrupted);
   CHECK(test, first.issue);
-  ParseStep second = sticky.consume(valid);
-  CHECK(test, second.issue);
-  if (second.issue) {
-    CHECK(test, second.issue->code == IssueCode::ParserAlreadyFailed);
-    CHECK(test, second.consumedBytes == 0);
+  bool refused = false;
+  try {
+    static_cast<void>(sticky.consume(valid));
+  } catch (const std::logic_error &) {
+    refused = true;
   }
+  CHECK(test, refused);
 }
 
 void testTruncationAtEveryBoundary() {
@@ -1051,20 +1053,11 @@ void testOverflowLimitsAndOuterTruncation() {
   constexpr std::string_view test = "overflow limits and outer truncation";
   ProtocolLimits invalid;
   invalid.maxFramePayloadBytes = std::numeric_limits<uint64_t>::max();
-  FrameParser parser(invalid);
-  CHECK(test, parser.failed());
-  ParseStep step = parser.consume({});
-  CHECK(test, step.issue);
-  if (step.issue) {
-    CHECK(test, step.issue->code == IssueCode::ParserAlreadyFailed);
-  }
-
-  auto invalidEncode = serializeMessage(Message{exampleRequest()}, invalid);
-  CHECK(test, !invalidEncode);
-  if (invalidEncode.issue) {
-    CHECK(test,
-          invalidEncode.issue->failureClass == FailureClass::ProtocolFatal);
-    CHECK(test, invalidEncode.issue->code == IssueCode::LimitExceeded);
+  const std::optional<ProtocolIssue> refused = validateLimits(invalid);
+  CHECK(test, refused);
+  if (refused) {
+    CHECK(test, refused->failureClass == FailureClass::ProtocolFatal);
+    CHECK(test, refused->code == IssueCode::LimitExceeded);
   }
 
   ProtocolLimits tight;
@@ -1142,7 +1135,8 @@ void testFuzzLikeInputsAndMutations() {
         break;
       }
     }
-    static_cast<void>(parser.finish());
+    if (!parser.failed())
+      static_cast<void>(parser.finish());
   }
 
   auto valid = serializeMessage(Message{exampleRequest()});
@@ -1169,7 +1163,8 @@ void testFuzzLikeInputsAndMutations() {
         static_cast<void>(decodeFrame(*step.frame));
       }
     }
-    static_cast<void>(parser.finish());
+    if (!parser.failed())
+      static_cast<void>(parser.finish());
   }
 }
 

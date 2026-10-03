@@ -357,6 +357,15 @@ std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens) {
   return result;
 }
 
+// Gives the request a mask the runtime must take.
+void provideMask(model::Runtime &executor, uint64_t requestId,
+                 std::span<const uint32_t> words) {
+  const std::optional<std::string> rejected =
+      executor.provideMask(requestId, words);
+  require(!rejected, "the runtime rejected a usable token mask: " +
+                         rejected.value_or(""));
+}
+
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
 StateSamples sampleCommittedState(const model::QwenStateStorage &states,
@@ -770,6 +779,123 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   std::cout << "repeated_image_placements=PASS\n";
 }
 
+// Fills every byte of a lane's GDN recurrent state, the FP32 half of the cell
+// its next transition reads, with 0xFF: NaN, which the recurrence carries into
+// every row the lane computes. Non-finite KV would not do: the paged-attention
+// tile of some GPU families gives non-finite keys and values zero weight.
+void poisonRecurrentState(const model::QwenStateStorage &states, uint32_t slot) {
+  const metal::MetalBuffer &recurrent =
+      states.buffers(slot).gdn[states.metadata(slot).activeParity].recurrentBase;
+  std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
+}
+
+// Zeroes the pages: a lane computing from a NaN state writes NaN keys and
+// values there, which the checks that follow must not find.
+void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
+  for (const uint32_t page : ids)
+    for (const std::span<std::byte> bytes : pages.spans(page))
+      std::ranges::fill(bytes, std::byte{0});
+}
+
+// A request whose own state is non-finite selects outside the vocabulary,
+// which the runtime reports as that lane's failure instead of throwing: in a
+// decode beside a healthy lane, which commits and keeps decoding, at the end
+// of a prefill, and in a constrained request's first selection from its final
+// hidden. The failed lanes emit nothing and the backend stays healthy. The
+// state cells they return to the pool are cleared or overwritten before a
+// lane reads them again.
+void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
+                                         const kv::PageStorage &pages,
+                                         const model::QwenStateStorage &states,
+                                         const metal::MetalBackend &backend,
+                                         std::span<const uint32_t> chat,
+                                         std::span<const uint32_t> prompt) {
+  // The chat ends where the assistant starts reasoning, so a greedy lane does
+  // not select a stop token there and both decode lanes stay open after
+  // prefill. The prefill and constrained lanes fail whatever their tokens.
+  const std::vector<uint32_t> prompt40(chat.end() - 40, chat.end());
+  const std::vector<uint32_t> prompt80(prompt.begin(), prompt.begin() + 80);
+  const std::vector<uint32_t> pagesA{36, 37};
+  const std::vector<uint32_t> pagesB{38, 39};
+  const std::vector<uint32_t> pagesC{124, 125, 126};
+  const auto inVocabulary = [](const ModelStepResult &result) {
+    return std::all_of(result.outputTokens.begin(), result.outputTokens.end(),
+                       [](uint32_t token) { return token < kVocabulary; });
+  };
+
+  beginCold(executor, makeRequest(201, prompt40, 16), 0);
+  beginCold(executor, makeRequest(202, prompt40, 16), 1);
+  requireOpen(prefillChunk(executor, 201, 0, 0, 0, prompt40, pagesA),
+              "non-finite decode fixture");
+  requireOpen(prefillChunk(executor, 202, 1, 0, 0, prompt40, pagesB),
+              "non-finite decode fixture");
+  poisonRecurrentState(states, 0);
+  const BatchPlan plan{WorkKind::Decode,
+                       BatchCohort::Greedy,
+                       {{201, 0}, {202, 0}},
+                       DecodeStage::Regular};
+  const std::array items{withRevision({201, 0, 40, 0, 0, pagesA}),
+                         withRevision({202, 1, 40, 0, 0, pagesB})};
+  const std::vector<ModelStepResult> decoded = executor.decode(plan, items);
+  require(decoded.size() == 2 && !decoded[0].failure.empty() &&
+              decoded[0].outputTokens.empty(),
+          "a decode from a non-finite state did not fail its lane alone");
+  require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
+              !decoded[1].finished && inVocabulary(decoded[1]),
+          "a non-finite lane disturbed its healthy neighbour");
+  executor.end(201);
+  const ModelStepResult continued =
+      decodeOne(executor, 202, 1, 40 + decoded[1].outputTokens.size(), pagesB,
+                BatchCohort::Greedy);
+  require(continued.failure.empty() && !continued.outputTokens.empty() &&
+              inVocabulary(continued),
+          "the healthy lane did not keep decoding after its neighbour failed");
+  executor.end(202);
+  clearPages(pages, pagesA);
+
+  beginCold(executor, makeRequest(203, prompt80, 16), 0);
+  prefillChunk(executor, 203, 0, 0, 0, std::span(prompt80).first(64), pagesC);
+  poisonRecurrentState(states, 0);
+  const ModelStepResult prefilled = prefillChunk(
+      executor, 203, 0, 64, 64, std::span(prompt80).subspan(64), pagesC);
+  require(!prefilled.failure.empty() && prefilled.outputTokens.empty(),
+          "a prefill from a non-finite state did not fail its lane");
+  executor.end(203);
+  clearPages(pages, pagesC);
+
+  EngineRequest constrained =
+      makeRequest(204, prompt80, 16, BatchCohort::Constrained);
+  constrained.constraint = ConstraintMode::TokenMask;
+  beginCold(executor, constrained, 0);
+  prefillChunk(executor, 204, 0, 0, 0, std::span(prompt80).first(64), pagesC,
+               BatchCohort::Constrained);
+  poisonRecurrentState(states, 0);
+  prefillChunk(executor, 204, 0, 64, 64, std::span(prompt80).subspan(64),
+               pagesC, BatchCohort::Constrained);
+  require(decodeOne(executor, 204, 0, 80, pagesC, BatchCohort::Constrained,
+                    DecodeStage::RequestInitialMask)
+                  .nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "the non-finite constrained fixture did not request its mask");
+  provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
+  // A failed first selection leaves no anchor to verify, so its decode is
+  // complete at once; one that selected a token would wait for its next mask.
+  const BatchPlan apply{WorkKind::Decode,
+                        BatchCohort::Constrained,
+                        {{204, 0}},
+                        DecodeStage::ApplyInitialMask};
+  const std::array applied{withRevision({204, 0, 80, 0, 0, pagesC})};
+  const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(apply, applied, {});
+  const std::vector<ModelStepResult> selected =
+      ticket->ready() ? ticket->wait() : std::vector<ModelStepResult>{};
+  require(selected.size() == 1 && !selected[0].failure.empty() &&
+              selected[0].outputTokens.empty(),
+          "a constrained selection from a non-finite hidden did not fail its lane");
+  executor.end(204);
+  clearPages(pages, pagesC);
+  require(backend.healthy(), "a non-finite lane made the backend unhealthy");
+  std::cout << "non_finite_rows=PASS\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -1106,6 +1232,8 @@ int main(int argc, char **argv) {
       require(decodeRejected, "score request allowed a decode step");
       executor.end(99);
     }
+    requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
+                                        samplingSeedTokens, prompt128);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
@@ -1252,7 +1380,7 @@ int main(int argc, char **argv) {
     require(microInitialMask.nextDecodeStage == DecodeStage::ApplyInitialMask,
             "constrained short prefill did not preserve mask handshake");
     const std::array<uint32_t, 1> forcedMicroToken{106};
-    executor.provideMask(56, singletonMasks(forcedMicroToken));
+    provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
         decodeOne(executor, 56, 0, prompt8.size(), constrainedPages,
                   BatchCohort::Constrained, DecodeStage::ApplyInitialMask);
@@ -1313,7 +1441,7 @@ int main(int argc, char **argv) {
       require(initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
-      executor.provideMask(replayId, singletonMasks(firstAnchor));
+      provideMask(executor, replayId, singletonMasks(firstAnchor));
       auto pending = beginMaskedDecodeOne(executor, replayId, 1, 129,
                                           replayPages,
                                           DecodeStage::ApplyInitialMask);
@@ -1330,7 +1458,7 @@ int main(int argc, char **argv) {
       }
       if (stored < proposed.size())
         maskTokens[stored] = proposed[stored] == 101 ? 102 : 101;
-      executor.provideMask(replayId, singletonMasks(maskTokens));
+      provideMask(executor, replayId, singletonMasks(maskTokens));
       const auto replayed = finishMaskedDecode(std::move(pending));
       require(replayed.size() == 1 &&
                   replayed[0].acceptedDraftTokens == stored - 1 &&
@@ -1466,7 +1594,7 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> initialWords = singletonMasks(initialTokens);
     require(initialWords.size() == kMaskWords,
             "empty simulation did not produce exactly one mask row");
-    executor.provideMask(40, initialWords);
+    provideMask(executor, 40, initialWords);
 
     PendingMaskedDecode verify = beginMaskedDecodeOne(
         executor, 40, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
@@ -1483,7 +1611,7 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> verifyWords = singletonMasks(verifyTokens);
     require(verifyWords.size() == uint64_t{9} * kMaskWords,
             "DFlash-8 verify did not produce nine mask rows");
-    executor.provideMask(40, verifyWords);
+    provideMask(executor, 40, verifyWords);
     auto constrainedResults = finishMaskedDecode(std::move(verify));
     require(constrainedResults.size() == 1,
             "constrained overlap returned the wrong batch width");
@@ -1517,7 +1645,7 @@ int main(int argc, char **argv) {
             "perfect constrained accounting skipped its initial mask");
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
-    executor.provideMask(44, singletonMasks(perfectInitialTokens));
+    provideMask(executor, 44, singletonMasks(perfectInitialTokens));
     PendingMaskedDecode perfectPending = beginMaskedDecodeOne(
         executor, 44, 0, 129, pageTable, DecodeStage::ApplyInitialMask);
     require(perfectPending.maskRequests.size() == 1 &&
@@ -1536,7 +1664,7 @@ int main(int argc, char **argv) {
                                           125,
                                           126,
                                           127};
-    executor.provideMask(44, singletonMasks(perfectVerify));
+    provideMask(executor, 44, singletonMasks(perfectVerify));
     auto perfectResults = finishMaskedDecode(std::move(perfectPending));
     require(perfectResults.size() == 1,
             "perfect constrained overlap returned the wrong width");
@@ -1564,7 +1692,7 @@ int main(int argc, char **argv) {
             "second exact constrained hit skipped initial mask");
     const uint32_t anchorC = 105;
     std::array<uint32_t, 1> alternateTokens{anchorC};
-    executor.provideMask(41, singletonMasks(alternateTokens));
+    provideMask(executor, 41, singletonMasks(alternateTokens));
     ModelStepResult alternateOutput =
         decodeOne(executor, 41, 0, 129, pageTable, BatchCohort::Constrained,
                   DecodeStage::ApplyInitialMask);
@@ -1623,8 +1751,8 @@ int main(int argc, char **argv) {
         "B2 constrained initial masks are not empty simulations");
     std::array<uint32_t, 1> crossAnchor0{110};
     std::array<uint32_t, 1> crossAnchor1{111};
-    executor.provideMask(42, singletonMasks(crossAnchor0));
-    executor.provideMask(43, singletonMasks(crossAnchor1));
+    provideMask(executor, 42, singletonMasks(crossAnchor0));
+    provideMask(executor, 43, singletonMasks(crossAnchor1));
     crossInitialPlan.decodeStage = DecodeStage::ApplyInitialMask;
     PendingMaskedDecode crossPending =
         beginMaskedDecode(executor, crossInitialPlan, crossItems);
@@ -1640,8 +1768,8 @@ int main(int argc, char **argv) {
       const uint32_t rejected = simulation[1] == 112 ? 113 : 112;
       crossVerify[lane] =
           {anchor, rejected, 114, 115, 116, 117, 118, 119, 120};
-      executor.provideMask(crossPending.maskRequests[lane].requestId,
-                           singletonMasks(crossVerify[lane]));
+      provideMask(executor, crossPending.maskRequests[lane].requestId,
+                  singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
     require(crossResults.size() == 2 &&
@@ -2188,7 +2316,7 @@ int main(int argc, char **argv) {
                 "preempted request retained its GDN/draft buffers");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
-          executor.provideMask(sequence.id, singletonMasks(anchor));
+          provideMask(executor, sequence.id, singletonMasks(anchor));
         }
         slot = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
@@ -2249,7 +2377,7 @@ int main(int argc, char **argv) {
                 "preemption fixture did not request initial mask");
         if (!preempt) {
           const std::array<uint32_t, 1> anchor{100};
-          executor.provideMask(sequence.id, singletonMasks(anchor));
+          provideMask(executor, sequence.id, singletonMasks(anchor));
         }
       }
       if (preempt)
@@ -2266,7 +2394,7 @@ int main(int argc, char **argv) {
           std::array<uint32_t, 9> forced;
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;
-          executor.provideMask(sequence.id, singletonMasks(forced));
+          provideMask(executor, sequence.id, singletonMasks(forced));
           result = finishMaskedDecode(std::move(pending)).front();
           for (size_t row = 0; row < result.outputTokens.size(); ++row)
             require(row < forced.size() && result.outputTokens[row] == forced[row],

@@ -65,21 +65,17 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
             "KV extent " + std::to_string(extent) + " is already allocated");
     }
     const uint64_t bytes = extentBytes();
-    try {
-        return admitAllocation_(bytes, [&] {
-            metal::MetalBuffer allocated = backend_.allocateBuffer(
-                bytes, metal::BufferStorage::Shared,
-                "kv-extent-" + std::to_string(extent * extentPages_));
-            if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
-                throw std::logic_error(
-                    "KV extent address leaves no room for the page index");
-            }
-            extentAddresses_[extent] = allocated.gpuAddress();
-            buffer = std::move(allocated);
-        });
-    } catch (const metal::MetalAllocationError &error) {
-        return error.failure();
-    }
+    return admitAllocation_(bytes, [&] {
+        metal::MetalBuffer allocated = backend_.allocateBuffer(
+            bytes, metal::BufferStorage::Shared,
+            "kv-extent-" + std::to_string(extent * extentPages_));
+        if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
+            throw std::logic_error(
+                "KV extent address leaves no room for the page index");
+        }
+        extentAddresses_[extent] = allocated.gpuAddress();
+        buffer = std::move(allocated);
+    });
 }
 
 void PageStorage::releaseExtent(uint32_t extent) {

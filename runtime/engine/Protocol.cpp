@@ -52,34 +52,6 @@ template <typename T> ProtocolResult<T> failure(ProtocolIssue issue) {
   return {std::nullopt, std::move(issue)};
 }
 
-std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
-  if (limits.maxFramePayloadBytes < kRequestFixedBytes ||
-      limits.maxFramePayloadBytes > kAbsoluteMaxFramePayloadBytes) {
-    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "maxFramePayloadBytes must be in [" +
-                         std::to_string(kRequestFixedBytes) + ", 256 MiB]");
-  }
-  if (limits.maxStatusJsonBytes >
-      limits.maxFramePayloadBytes - kStatusJsonFixedBytes) {
-    return makeIssue(
-        FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-        "status JSON limit does not fit the configured frame limit");
-  }
-  if (limits.maxErrorStringBytes > limits.maxFramePayloadBytes) {
-    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "error string limit exceeds the configured frame limit");
-  }
-  if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
-      !limits.maxTokenBatch || !limits.maxSimulationTokens ||
-      !limits.maxMaskWords || !limits.maxImageSpans ||
-      !limits.maxImagePatches) {
-    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "all configured token, mask, and image limits must be "
-                     "non-zero");
-  }
-  return std::nullopt;
-}
-
 std::optional<PayloadBounds> payloadBounds(FrameType type,
                                            const ProtocolLimits &limits) {
   uint64_t variable = 0;
@@ -1274,6 +1246,34 @@ std::string_view failureClassName(FailureClass failureClass) {
 
 } // namespace
 
+std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
+  if (limits.maxFramePayloadBytes < kRequestFixedBytes ||
+      limits.maxFramePayloadBytes > kAbsoluteMaxFramePayloadBytes) {
+    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
+                     "maxFramePayloadBytes must be in [" +
+                         std::to_string(kRequestFixedBytes) + ", 256 MiB]");
+  }
+  if (limits.maxStatusJsonBytes >
+      limits.maxFramePayloadBytes - kStatusJsonFixedBytes) {
+    return makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
+        "status JSON limit does not fit the configured frame limit");
+  }
+  if (limits.maxErrorStringBytes > limits.maxFramePayloadBytes) {
+    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
+                     "error string limit exceeds the configured frame limit");
+  }
+  if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
+      !limits.maxTokenBatch || !limits.maxSimulationTokens ||
+      !limits.maxMaskWords || !limits.maxImageSpans ||
+      !limits.maxImagePatches) {
+    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
+                     "all configured token, mask, and image limits must be "
+                     "non-zero");
+  }
+  return std::nullopt;
+}
+
 bool connectionMustClose(FailureClass failureClass) {
   return failureClass != FailureClass::RequestError;
 }
@@ -1300,8 +1300,6 @@ std::string_view issueCodeName(IssueCode code) {
     return "invalid_payload_length";
   case IssueCode::TruncatedFrame:
     return "truncated_frame";
-  case IssueCode::ParserAlreadyFailed:
-    return "parser_already_failed";
   case IssueCode::InvalidRequestId:
     return "invalid_request_id";
   case IssueCode::InvalidEnumValue:
@@ -1340,9 +1338,6 @@ std::string ProtocolIssue::describe() const {
 
 ProtocolResult<Frame> encodeMessage(const Message &message,
                                     const ProtocolLimits &limits) {
-  if (auto issue = validateLimits(limits)) {
-    return failure<Frame>(std::move(*issue));
-  }
   try {
     ProtocolResult<Frame> encoded = std::visit(
         [&](const auto &value) -> ProtocolResult<Frame> {
@@ -1409,9 +1404,6 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
 
 ProtocolResult<Message> decodeFrame(const Frame &frame,
                                     const ProtocolLimits &limits) {
-  if (auto issue = validateLimits(limits)) {
-    return failure<Message>(std::move(*issue));
-  }
   if (auto issue =
           validatePayloadLength(frame.type, frame.payload.size(), limits)) {
     return failure<Message>(std::move(*issue));
@@ -1485,11 +1477,7 @@ serializeMessage(const Message &message, const ProtocolLimits &limits) {
   }
 }
 
-FrameParser::FrameParser(ProtocolLimits limits) : limits_(limits) {
-  if (auto issue = validateLimits(limits_)) {
-    terminalIssue_ = std::move(*issue);
-  }
-}
+FrameParser::FrameParser(ProtocolLimits limits) : limits_(limits) {}
 
 std::optional<ProtocolIssue> FrameParser::parseHeader() {
   if (!std::equal(kMagic.begin(), kMagic.end(), header_.begin())) {
@@ -1547,12 +1535,8 @@ void FrameParser::resetCurrentFrame() {
 }
 
 ParseStep FrameParser::consume(std::span<const uint8_t> bytes) {
-  if (terminalIssue_) {
-    return {0, std::nullopt,
-            makeIssue(FailureClass::ProtocolFatal,
-                      IssueCode::ParserAlreadyFailed, 0,
-                      terminalIssue_->describe())};
-  }
+  if (terminalIssue_)
+    throw std::logic_error("native frame parser used after it failed");
 
   size_t consumed = 0;
   while (consumed < bytes.size()) {
@@ -1569,17 +1553,10 @@ ParseStep FrameParser::consume(std::span<const uint8_t> bytes) {
       if (auto issue = parseHeader()) {
         return fail(consumed, std::move(*issue));
       }
-      if (!expectedPayloadBytes_) {
-        Frame frame{currentType_, {}};
-        resetCurrentFrame();
-        return {consumed, std::move(frame), std::nullopt};
-      }
     }
 
     size_t needed = static_cast<size_t>(expectedPayloadBytes_) - payloadBytes_;
     size_t count = std::min(needed, bytes.size() - consumed);
-    if (!count)
-      return {consumed, std::nullopt, std::nullopt};
     try {
       // The validated frame length is known. Reserve it once to avoid
       // geometric growth copies; only received bytes are initialized.
@@ -1612,7 +1589,7 @@ ParseStep FrameParser::consume(std::span<const uint8_t> bytes) {
 
 std::optional<ProtocolIssue> FrameParser::finish() {
   if (terminalIssue_)
-    return terminalIssue_;
+    throw std::logic_error("native frame parser used after it failed");
   if (!headerBytes_ && !readingPayload_)
     return std::nullopt;
 

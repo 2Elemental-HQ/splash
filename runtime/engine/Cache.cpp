@@ -203,19 +203,8 @@ uint64_t Cache::publishCommittedBlocks(uint64_t requestId,
     const bool replacePage = inserted.physicalPage != writerPage;
     if (replacePage)
       pool_.retainPage(inserted.physicalPage, false);
-    try {
-      kv_.retainActive(inserted.id);
-      try {
-        active.cachedBlocks.push_back(inserted.id);
-      } catch (...) {
-        kv_.releaseActive(inserted.id);
-        throw;
-      }
-    } catch (...) {
-      if (replacePage)
-        pool_.releasePage(inserted.physicalPage, false);
-      throw;
-    }
+    kv_.retainActive(inserted.id);
+    active.cachedBlocks.push_back(inserted.id);
     if (replacePage) {
       active.pages[logical] = inserted.physicalPage;
       pagesChanged(active, logical);
@@ -287,13 +276,7 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount) {
   if (const TokenAdmission admission = admitPages(needed - previousSize, acquired);
       !admission.granted())
     return admission;
-  try {
-    active.pages.insert(active.pages.end(), acquired.begin(), acquired.end());
-  } catch (...) {
-    for (uint32_t page : acquired)
-      pool_.releasePage(page, false);
-    throw;
-  }
+  active.pages.insert(active.pages.end(), acquired.begin(), acquired.end());
   pagesChanged(active, previousSize);
   return {};
 }
@@ -653,35 +636,22 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     if (!admission.granted())
       return admission;
   }
-  std::vector<uint32_t> retained;
-  retained.reserve(chain.pages.size());
   kv_.retainActive(chain.blocks.back());
-  try {
-    size_t next = 0;
-    for (size_t index = 0; index < chain.blocks.size(); ++index) {
-      const uint64_t block = chain.blocks[index];
-      if (chain.pages[index] == KvCache::noPage) {
-        // Root first, so every restored block finds its parent resident.
-        chain.pages[index] = fresh[next++];
-        kv_.adoptPage(block, chain.pages[index]);
-        startRestore(block);
-      } else {
-        pool_.retainPage(chain.pages[index], false);
-        retained.push_back(chain.pages[index]);
-      }
-      if (auto restore = restores_.find(block); restore != restores_.end()) {
-        restore->second.waiters.push_back(requestId);
-        ++active.pendingRestores;
-      }
+  size_t next = 0;
+  for (size_t index = 0; index < chain.blocks.size(); ++index) {
+    const uint64_t block = chain.blocks[index];
+    if (chain.pages[index] == KvCache::noPage) {
+      // Root first, so every restored block finds its parent resident.
+      chain.pages[index] = fresh[next++];
+      kv_.adoptPage(block, chain.pages[index]);
+      startRestore(block);
+    } else {
+      pool_.retainPage(chain.pages[index], false);
     }
-  } catch (...) {
-    for (uint32_t page : retained)
-      pool_.releasePage(page, false);
-    for (uint32_t page : fresh)
-      pool_.releasePage(page, false);
-    kv_.releaseActive(chain.blocks.back());
-    active.pendingRestores = 0;
-    throw;
+    if (auto restore = restores_.find(block); restore != restores_.end()) {
+      restore->second.waiters.push_back(requestId);
+      ++active.pendingRestores;
+    }
   }
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
@@ -710,21 +680,17 @@ void Cache::promoteState(const CacheLookup &lookup, StateRestore &transfer) {
   if (!states_.promotable(block, source)) return;
   // Promotion is optional and uses the ordinary snapshot admission/reclaimer.
   // The admitted request can run even when no cache buffer is available.
-  try {
-    auto state = transfer.snapshot();
-    if (!state) {
-      // The restored state is the most recently used one; the oldest RAM
-      // copy makes room for it unless its write has to wait.
-      const auto victim = states_.evictionCandidate();
-      if (victim &&
-          states_.reclaim(victim->id, completionNotifier_, makeRoom_, true).evicted)
-        state = transfer.snapshot();
-    }
-    if (state) states_.promote(block, source, std::move(state));
-    else states_.promotionSkipped();
-  } catch (const std::exception &) {
-    states_.promotionSkipped();
+  auto state = transfer.snapshot();
+  if (!state) {
+    // The restored state is the most recently used one; the oldest RAM copy
+    // makes room for it unless its write has to wait.
+    const auto victim = states_.evictionCandidate();
+    if (victim &&
+        states_.reclaim(victim->id, completionNotifier_, makeRoom_, true).evicted)
+      state = transfer.snapshot();
   }
+  if (state) states_.promote(block, source, std::move(state));
+  else states_.promotionSkipped();
 }
 
 Cache::LeafReclaim Cache::demoteKv(uint64_t block) {

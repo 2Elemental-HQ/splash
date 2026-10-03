@@ -662,7 +662,7 @@ class NativeBackend:
                 if event.sequence_offset == 0:
                     state.first_token_batch_tokens = len(event.tokens)
                 if job.constraint is not None:
-                    job.constraint.consume(event.tokens)
+                    job.constraint.commit(event.tokens)
                 state.streamer.put_tokens(event.tokens)
         except Exception as error:
             with self.lock:
@@ -703,9 +703,17 @@ class NativeBackend:
                 raise self._api_error(state.callback_error)
             if call.callback_errors:
                 raise self._api_error(call.callback_errors[0])
+            done = native.done
+            if (
+                job.constraint is not None
+                and done.reason != wire.FinishReason.CANCELLED
+            ):
+                # The grammar checks what was generated after the last mask. A
+                # cancelled request needs no check, and its last mask may
+                # still be computing.
+                job.constraint.finish()
             state.streamer.end()
             job.reasoning_tokens = state.streamer.count_reasoning_tokens(job.thinking)
-            done = native.done
             stop_sequence = state.streamer.stop_sequence
             result = NativeResult(
                 reason=(
