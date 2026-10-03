@@ -164,14 +164,16 @@ inline void q4_prefill_write_output_sums(device const bfloat *output,
 // in and also write the output's Q4 input sums at buffer 7 (UpSiluSums).
 enum class PrefillQ4Epilogue { Plain, Residual, UpSiluSums };
 
-// The 32 x TileN tile of grid position (row tile, column tile).
+// The 32 x TileN tile of grid position (row tile, column tile). The kernels
+// inline it as their bodies: when prefill_linear_q4_n256_up_silu_sums only
+// calls it, shader validation on macOS 26.5 (an M5 Pro) gets its output wrong.
 template <ushort TileN, ushort Simdgroups, PrefillQ4Epilogue Epilogue>
-inline void q4_prefill(device bfloat *input, device uchar *weights,
-                       device bfloat *scales, device bfloat *biases,
-                       device bfloat *auxiliary, device bfloat *output,
-                       device const float *sums, device float *output_sums,
-                       constant Q4Params &params, uint2 group, uint simd_lane,
-                       uint simd_group, threadgroup float *input_sums) {
+__attribute__((always_inline)) inline void
+q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
+           device bfloat *biases, device bfloat *auxiliary,
+           device bfloat *output, device const float *sums,
+           device float *output_sums, constant Q4Params &params, uint2 group,
+           uint simd_lane, uint simd_group, threadgroup float *input_sums) {
   constexpr ushort TileM = 32;
   constexpr bool UpSiluSums = Epilogue == PrefillQ4Epilogue::UpSiluSums;
   const ulong input_offset = ulong(group.x) * TileM * params.input_size;
