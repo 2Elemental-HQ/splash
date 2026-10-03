@@ -8,15 +8,30 @@
 #include <stdint.h>
 #endif
 
+// The uniforms one lane draws a decode cycle with, in [0, 1): the first
+// token after a prompt draws SPLASH_UNIFORM_INITIAL; the draft's sampled
+// proposal at position p draws SPLASH_UNIFORM_PROPOSALS + p; acceptance tests
+// draft token p against SPLASH_UNIFORM_ACCEPTANCE + p; and a sampled verify
+// row draws its correction, or the bonus token after the whole draft, with
+// SPLASH_UNIFORM_CORRECTION. Lane l's uniforms start at
+// l * SPLASH_SAMPLING_UNIFORMS.
+#define SPLASH_UNIFORM_INITIAL 0u
+#define SPLASH_UNIFORM_PROPOSALS 1u
+#define SPLASH_UNIFORM_ACCEPTANCE                                          \
+  (SPLASH_UNIFORM_PROPOSALS + SPLASH_DRAFT_PROPOSAL_TOKENS)
+#define SPLASH_UNIFORM_CORRECTION                                          \
+  (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_PROPOSAL_TOKENS)
+#define SPLASH_SAMPLING_UNIFORMS (SPLASH_UNIFORM_CORRECTION + 1u)
+
 // One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
 // rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
-// 2 * SPLASH_TARGET_VERIFY_ROWS uniforms each. Selected row s is row s % rows
-// of lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
+// SPLASH_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
+// lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
 // logits_row + s % rows, its mask row lane * (SPLASH_TARGET_VERIFY_ROWS + 1) +
 // mask_row + s % rows, and its draw takes uniform
-// lane * 2 * SPLASH_TARGET_VERIFY_ROWS + uniform; workspaces and output
-// tokens are indexed by s. Rows below drafted_rows follow draft token
-// s % rows (verify input row s % rows + 1).
+// lane * SPLASH_SAMPLING_UNIFORMS + uniform; workspaces and output tokens are
+// indexed by s. Rows below drafted_rows follow draft token s % rows (verify
+// input row s % rows + 1).
 struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;
@@ -109,6 +124,9 @@ struct SamplingPenaltyParams {
 static_assert(sizeof(SamplingPenaltyParams) == 112,
               "Sampling penalty parameters are 112 bytes on both sides");
 
+// The batched selector and acceptance kernels' grids cover exactly the
+// dispatch's lanes: per-lane arrays hold those lanes, and entries past them
+// are zero and unread.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -120,32 +138,12 @@ struct SelectorBatchParams {
 static_assert(sizeof(SelectorBatchParams) == 44,
               "Draft selector parameters are 44 bytes on both sides");
 
-struct VerifyInputBatchParams {
-  uint32_t lanes;
-  uint32_t vocabulary;
-};
-
-static_assert(sizeof(VerifyInputBatchParams) == 8,
-              "Verify input parameters are 8 bytes on both sides");
-
-// The lane view of AcceptBatchParams. No host bytes flow through it: the
-// acceptance kernel builds one per lane from the batched struct.
-struct AcceptParams {
-  uint32_t remaining;
-  uint32_t stop_token_0;
-  uint32_t stop_token_1;
-};
-
-static_assert(sizeof(AcceptParams) == 12,
-              "Acceptance lane parameters are 12 bytes on both sides");
-
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;
   uint32_t stop_token_1;
-  uint32_t lanes;
   uint32_t sampling_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 32,
-              "Batched acceptance parameters are 32 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 28,
+              "Batched acceptance parameters are 28 bytes on both sides");

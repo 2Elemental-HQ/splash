@@ -444,10 +444,6 @@ struct ModelTelemetry final {
   uint64_t stateHeldImageBytes = 0;
   uint64_t imageRowsBytes = 0;
   uint32_t lastDecodeWidth = 0;
-  uint64_t lastDecodeFusedOperations = 0;
-  uint64_t lastDecodeM16Dispatches = 0;
-  uint64_t lastDecodeM24Dispatches = 0;
-  uint64_t lastDecodeM32Dispatches = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
@@ -464,28 +460,16 @@ struct ModelTelemetry final {
   double totalDecodeWallSeconds = 0.0;
 };
 
-// Observable outcome used to check repeated runs of the same configuration.
-// Different configurations may round differently and choose different tokens;
-// paired timings only require comparable work, not identical token IDs.
+// One warmup lane's observable outcome: its step result, the anchor the step
+// left pending and the tokens it committed. The runtime oracle checks the
+// warmups' tokens and their repeatability by it; the decode warmup's anchor
+// is set inside the runtime, so no public request reproduces that lane.
 struct WarmupLaneResult final {
   ModelStepResult step;
   std::optional<uint32_t> pendingToken;
   uint64_t committedTokens = 0;
 
   bool operator==(const WarmupLaneResult &) const = default;
-
-  [[nodiscard]] bool sameWorkAs(const WarmupLaneResult &other) const noexcept {
-    return step.requestId == other.step.requestId &&
-        step.consumedPromptTokens == other.step.consumedPromptTokens &&
-        step.outputTokens.size() == other.step.outputTokens.size() &&
-        step.finished == other.step.finished &&
-        step.nextDecodeStage == other.step.nextDecodeStage &&
-        step.draftedTokens == other.step.draftedTokens &&
-        step.acceptedDraftTokens == other.step.acceptedDraftTokens &&
-        step.outputTokensWithoutKv == other.step.outputTokensWithoutKv &&
-        pendingToken.has_value() == other.pendingToken.has_value() &&
-        committedTokens == other.committedTokens;
-  }
 };
 
 struct WarmupStepResult final {

@@ -112,8 +112,7 @@ bool within(const Reference &ref, uint16_t actual) {
 void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
-  const auto plan = Linear::plan(workload,
-      {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
+  const auto plan = Linear::plan(workload, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
@@ -239,8 +238,7 @@ void splitVisibility(metal::MetalBackend &backend,
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
-                              LinearSimdgroups::Four, splits});
+    return Linear::plan(w, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits});
   };
   LinearScratchSize size;
   const auto grow = [&](const LinearPlan &p) {
@@ -370,12 +368,12 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
   Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
   Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
-  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view, 8, 32, 32,
+  require(PagedAttention::addVerifyGate(graph, packed, attention, output.view,
                                         heads, {1, kvHeads, 256}, lanes).layout == LinearInput::Plain,
           "plain attention gate claimed a table");
   addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, lanes);
   const PreparedInput prepared =
-      PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
+      PagedAttention::addVerifyGate(graph, packed, attention, fused.view,
                                     heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
   require(prepared.layout == layout && prepared.source.sameView(fused.view),
           "fused attention gate did not report the table it wrote");

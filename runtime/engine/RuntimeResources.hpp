@@ -79,10 +79,6 @@ struct RuntimeResourcesConfig {
   // and by the governor afterwards. Empty means the live vm_statistics64
   // estimate; tests substitute a fixed value.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory;
-  // Kernel choices to install over the operator policy. Used by the offline
-  // measurement tool and tests; production leaves it empty. Arenas are sized
-  // for the operator defaults plus these choices.
-  std::optional<ops::OperatorChoices> operatorChoices;
 };
 
 enum class RuntimeResourceFailure {
@@ -168,13 +164,6 @@ public:
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] ActualMemoryReport
   actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
-  // Offline tuning tool only, before any request: swaps between the operator
-  // defaults and the choices this instance was created with. Arenas were
-  // sized for exactly those two configurations, so nothing else may be
-  // installed after creation.
-  void installOperatorChoices(const ops::OperatorChoices &choices) {
-    operators_.install(choices);
-  }
 
 private:
 

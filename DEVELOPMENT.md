@@ -659,7 +659,9 @@ installer screens the parameters, `GgufFile` and the planner check the rest).
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized
 segments, whose kernels are the format's, while float segments read the input
-as it is; the table gathers each row through the inverse (`gguf_embed_rotated_pq20`).
+as it is; the register tile prepares its table from the rotated rows, so the
+input's producer writes plain rows. The token table gathers each row through
+the inverse (`gguf_embed_rotated_pq20`).
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
@@ -692,17 +694,16 @@ takes wherever the tile holds its lanes' rows unpadded. On Apple10 (M5) the stag
 which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
 for MPP `matmul2d`, the neural accelerator's path, on bf16 activations; a step of three request
 lanes runs the 32-row tile over four lanes of storage. Prefill runs the staged kernels on both
-families, chunks of up to 32 rows on the decode tiles. Every projection splits its K across
-threadgroups by one rule (`decodeSplits`: each tile's tiers of threadgroups per core and inputs
-per partition, from measured occupancy, Apple9's staged tile taking the register tile's) that
-does not depend on the batch width. The MoE experts (`runtime/ops/MoE.cpp`) run the same numerics
-per family over the grouped rows: the register form in `linear_gguf_sgmatrix.metal`, the staged
-one in `kernels/shared/moe_gguf.metal`, which Apple9 takes for experts mostly in the formats it
-stages (`MoeShape::expertFormat`). The float router and alpha/beta projections run in
-`kernels/shared/gguf_float.metal`, and the token rows are gathered by one template in
-`kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core count, shape and
-format: `Linear::setChoices` and `ExecutionPlans::install` reject tuned entries for block
-projections and GGUF MoE blocks.
+families: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for chunks of
+up to 32 rows. Every projection splits its K across threadgroups by one rule (`decodeSplits`: each
+tile's tiers of threadgroups per core and inputs per partition, from measured occupancy, Apple9's
+staged tile taking the register tile's) that does not depend on the batch width. The MoE experts
+(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register form
+in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which Apple9
+takes for experts mostly in the formats it stages (`MoeShape::expertFormat`). The float router and
+alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the token rows are gathered
+by one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family,
+core count, shape and format.
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and
@@ -710,9 +711,10 @@ up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>`. The norm, GDN and
 attention-gate variants that also write a register kernel's input table carry `table64` (the
-affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds and SiLU of
-both GGUF families are in `kernels/common/gguf_tile.h`, and the MMA helpers every register
-kernel uses, affine, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+affine Q4 kernel's) or `table16` (the GGUF one's) in their names. The epilogue kinds of both GGUF
+families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, affine, GGUF or
+fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -745,7 +747,9 @@ GGML directly and prints GGML's hashes.
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
 weights DRAM-cold. `make benchmark-gguf-projection GGUF_PROJECTION_ARGS='q4k 5120 8192'` times one
 projection (up to three fused formats and widths, then `K` and an optional epilogue) on both
-decode tiles at one to four lanes and every K split, and marks the device policy's pick;
+decode tiles at one to four lanes and every K split, and marks the device policy's pick, or, with
+a trailing `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row
+prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
@@ -1346,13 +1350,13 @@ unnoticed, but no target runs it because it needs real models: after
 matching installed package to compare every prepared byte.
 
 Compare performance on the same idle Mac with the same model and workload.
-`make tune-kernels MODEL=...` measures the precompiled kernel candidates for the
-installed model on this Mac against the policy defaults in `runtime/ops` and
-prints, per key, the winner with its paired GPU and wall-time gain, spelled as
-the enumerators it would install, or that the default is kept; it changes no
-default and saves no profile. For a GGUF model
-it measures only the attention kernels and the draft, and says so in its
-header, since GGUF projection and MoE plans read no tuned choice
+`make tune-kernels MODEL=...` measures each projection key of the installed
+model on this Mac: the policy default in `runtime/ops` against the tile
+configurations that won an earlier run (`dev/tuning/LinearTuning.hpp`). It
+prints, per key, the winning configuration with its paired GPU and wall-time
+gain, or that the default is kept; it changes no default and saves no profile.
+For a GGUF model it measures only the draft's projections, and says so in its
+header, since the device policy alone plans block projections
 ([GGUF targets](#gguf-targets)). Keep generated reports, profiles, local paths
 and experiment notes out of the source tree and commits.
 

@@ -32,31 +32,34 @@ template <class Function> void rejects(Function function) {
 
 void cpuContracts() {
   DeviceCapabilities device;
-  device.appleGpuFamily = 9;
   device.maxBufferLengthBytes = uint64_t{1} << 40;
-  for (const uint32_t hidden : {2048U, 5120U}) {
-    const LinearMatrix matrix{hidden, hidden};
-    for (const auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
-      for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
-        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
-             phase == LinearPhase::Prefill ? LinearEpilogue::UpWithGate : LinearEpilogue::GateUp}) {
-          const LinearWorkload workload{matrix, rows, phase, epilogue};
-          const auto plans = Linear(device).candidates(workload);
-          const uint64_t bytes = linearTuningFixtureBytes(device, workload);
-          const uint64_t base = uint64_t{plans.front().storageRows()} *
-              (matrix.inputSize + 2 * matrix.outputSize) * 2;
-          require(bytes >= base && bytes % 16384 == 0,
-                  "fixture does not cover input/output/reference or physical alignment");
-          for (const auto &plan : plans)
-            require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
-                2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
-                "fixture misses a candidate workspace");
-          auto denied = device;
-          denied.maxBufferLengthBytes = bytes - 1;
-          rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
-          denied.maxBufferLengthBytes = bytes;
-          require(linearTuningFixtureBytes(denied, workload) == bytes,
-                  "exact admitted capacity rejected");
+  // Apple10 also lists Split128, whose partials and counters the fixture holds.
+  for (const uint32_t family : {9U, 10U}) {
+    device.appleGpuFamily = family;
+    for (const uint32_t hidden : {2048U, 5120U}) {
+      const LinearMatrix matrix{hidden, hidden};
+      for (const auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
+        for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+               phase == LinearPhase::Prefill ? LinearEpilogue::UpWithGate : LinearEpilogue::GateUp}) {
+            const LinearWorkload workload{matrix, rows, phase, epilogue};
+            const auto plans = linearCandidates(device, workload);
+            const uint64_t bytes = linearTuningFixtureBytes(device, workload);
+            const uint64_t base = uint64_t{plans.front().storageRows()} *
+                (matrix.inputSize + 2 * matrix.outputSize) * 2;
+            require(bytes >= base && bytes % 16384 == 0,
+                    "fixture does not cover input/output/reference or physical alignment");
+            for (const auto &plan : plans)
+              require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
+                  2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
+                  "fixture misses a candidate workspace");
+            auto denied = device;
+            denied.maxBufferLengthBytes = bytes - 1;
+            rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
+            denied.maxBufferLengthBytes = bytes;
+            require(linearTuningFixtureBytes(denied, workload) == bytes,
+                    "exact admitted capacity rejected");
+          }
         }
       }
     }
@@ -65,11 +68,11 @@ void cpuContracts() {
        LinearWorkload{{0, 256}, 8}, LinearWorkload{{128, 256}, 8},
        LinearWorkload{{512, 64}, 8}, LinearWorkload{{512, 256}, 7},
        LinearWorkload{{512, 256}, 40},
-       LinearWorkload{{512, 256}, 8, static_cast<LinearPhase>(255)},
-       LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
        LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
-       LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
+       LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill},
+       LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::None,
+                      WeightLayout::Block32}})
     rejects([&] { (void)linearTuningFixtureBytes(device, workload); });
   MeasurementOptions options;
   require(validMeasurementOptions(options), "default measurement options rejected");
@@ -127,7 +130,7 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
     return metal::AllocationResult{};
   };
   auto assertStopped = [&](const LinearTuningResult &result, bool failure) {
-    require(!result.complete && result.choice.configuration == baseline &&
+    require(!result.complete && result.configuration == baseline &&
         bool(result.failure) == failure && result.measurements.empty(),
         "early exit lost baseline or failure");
     require(BackendInstrumentation::submittedCommands(backend) == before, "early exit submitted GPU work");
@@ -188,12 +191,13 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
         ? std::optional{weights} : std::nullopt});
     weightsBefore.push_back(fingerprint(weights));
   }
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   // A gate/up sweep mixing split-K and sequential plans computes the exact
   // gate and up projections once per representative, outside the timing.
   bool mixed = false;
-  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums() ||
-      plan.usesSimdgroup() || plans.front().usesSimdgroup();
+  for (const auto &plan : plans)
+    mixed |= plan.configuration().splits != plans.front().configuration().splits ||
+        plan.usesSimdgroup() || plans.front().usesSimdgroup();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = BackendInstrumentation::submittedCommands(backend);
@@ -222,11 +226,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
   require(backend.memoryStats().allocatedBytes == allocated, "fixture allocation leaked");
   for (size_t i = 0; i < projections.size(); ++i)
     require(fingerprint(projections[i]) == weightsBefore[i], "tuning modified supplied projection");
-  std::vector<WorkloadMeasurements> gpu, wall;
-  gpu.reserve(result.measurements.size());
-  wall.reserve(result.measurements.size());
   std::vector<CandidateMeasurements> gpuCandidates, wallCandidates;
-  constexpr WorkloadId id{0};
   for (size_t i = 0; i < result.measurements.size(); ++i) {
     const auto &measurement = result.measurements[i];
     require(measurement.candidate == CandidateId{uint32_t(i + 1)} &&
@@ -238,16 +238,14 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
       require(measurement.gpuPairs[pair].first == measurementOrder(pair) &&
           measurement.wallPairs[pair].first == measurementOrder(pair),
           "baseline/candidate order did not alternate");
-    gpu.push_back({id, measurement.rawGpuSamples()});
-    wall.push_back({id, measurement.rawWallSamples()});
-    gpuCandidates.push_back({measurement.candidate, {&gpu.back(), 1}});
-    wallCandidates.push_back({measurement.candidate, {&wall.back(), 1}});
+    gpuCandidates.push_back({measurement.candidate, measurement.rawGpuSamples()});
+    wallCandidates.push_back({measurement.candidate, measurement.rawWallSamples()});
   }
-  const auto gpuWinner = selectCandidate(gpuCandidates, {&id, 1}, options.policy);
-  const auto wallWinner = selectCandidate(wallCandidates, {&id, 1}, options.policy);
+  const auto gpuWinner = selectCandidate(gpuCandidates, options.policy);
+  const auto wallWinner = selectCandidate(wallCandidates, options.policy);
   const bool agreed = gpuWinner.verdict == SelectionVerdict::Selected &&
       wallWinner.verdict == SelectionVerdict::Selected && gpuWinner.candidate == wallWinner.candidate;
-  require(result.choice.workload == workload && result.choice.configuration ==
+  require(result.configuration ==
       plans[agreed ? gpuWinner.candidate.value : 0].configuration(),
       "tuning accepted a winner without independent GPU/wall agreement");
 }
@@ -255,7 +253,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
 void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
   const LinearTuningInput input{workload, {{projection, std::nullopt}}};
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   require(plans.size() > 1, "interruption fixture has no alternative");
   const auto admit = [](uint64_t, const auto &allocate) {
     allocate();
@@ -270,7 +268,7 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
     const auto result = tuneLinear(backend, admit, input, options,
         pressure ? stop : MeasurementStop{}, pressure ? MeasurementStop{} : stop);
     require(!result.complete && !result.failure && result.measurements.size() == 1 &&
-        result.choice.configuration == plans.front().configuration() &&
+        result.configuration == plans.front().configuration() &&
         result.measurements[0].status == (pressure ? MeasurementStatus::UnderPressure :
             MeasurementStatus::Cancelled) && result.measurements[0].pairCount == 1 &&
         result.measurements[0].measurement.returnedCalls == 3 &&
@@ -303,7 +301,7 @@ void gpuEveryRepresentative(metal::MetalBackend &backend,
                             const Projection &first, Projection &second) {
   const LinearWorkload workload{{first.outputSize, first.inputSize}, 8};
   const LinearTuningInput input{workload, {{first, {}}, {second, {}}}};
-  const auto plans = Linear(backend.capabilities()).candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   auto *scales = static_cast<uint16_t *>(second.affine().scales.contents());
   const auto saved = scales[0];
   scales[0] = 0x7fc1;
@@ -328,7 +326,7 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   const LinearWorkload workload{{projections.front().outputSize,
       projections.front().inputSize}, rows, phase, epilogue};
   Linear linear(backend.capabilities());
-  const auto plans = linear.candidates(workload);
+  const auto plans = linearCandidates(backend.capabilities(), workload);
   const auto &baseline = plans.front();
   uint64_t gateBytes = 0;
   for (const auto &plan : plans) gateBytes = std::max(gateBytes, plan.gateScratchBytes());
@@ -421,20 +419,18 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   options.maximumWallSeconds = 30;
   // Candidate ID changes order/accounting only: both calls encode exactly the
   // same 16 complete baseline operators. This is a diagnostic, not a synthetic
-  // performance win or a replacement for production-graph confirmation.
-  const auto measurement = measureWorkload({1}, {0}, [&](CandidateId) {
+  // performance win or a replacement for a whole-model A/B.
+  const auto measurement = measureWorkload({1}, [&](CandidateId) {
     return invoke(baseline, 0, 16);
   }, options);
   if (measurement.failure) std::rethrow_exception(measurement.failure);
   require(measurement.pairCount == options.samplePairs &&
       (measurement.status == MeasurementStatus::Completed ||
        measurement.status == MeasurementStatus::Rejected), "baseline self-comparison was interrupted");
-  const WorkloadMeasurements gpu{{0}, measurement.rawGpuSamples()};
-  const WorkloadMeasurements wall{{0}, measurement.rawWallSamples()};
-  const CandidateMeasurements gpuCandidate{{1}, {&gpu, 1}}, wallCandidate{{1}, {&wall, 1}};
-  constexpr WorkloadId required{0};
-  const auto gpuSelection = selectCandidate({&gpuCandidate, 1}, {&required, 1}, options.policy);
-  const auto wallSelection = selectCandidate({&wallCandidate, 1}, {&required, 1}, options.policy);
+  const CandidateMeasurements gpuCandidate{{1}, measurement.rawGpuSamples()},
+      wallCandidate{{1}, measurement.rawWallSamples()};
+  const auto gpuSelection = selectCandidate({&gpuCandidate, 1}, options.policy);
+  const auto wallSelection = selectCandidate({&wallCandidate, 1}, options.policy);
   const bool jointSelection = gpuSelection.verdict == SelectionVerdict::Selected &&
       wallSelection.verdict == SelectionVerdict::Selected;
   std::cout << "Linear self-comparison repetitions=16 representatives=" << projections.size()
@@ -470,17 +466,15 @@ int main(int argc, char **argv) {
                     deterministicQ4Projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
-    // K % 1024 == 0 lists the split-K tiles beside the sequential ones, and on
-    // a GPU with two or more cores the baseline splits K too (Apple9's
-    // simdgroup tile, Apple10's Split128), so every qualification runs the
-    // derived bound, including a one-lane split tile's against a Split128
-    // baseline with as many partial sums.
+    // Four 256-input blocks of K list Split128 at two and four K splits on
+    // Apple10 and later, and Apple9's baseline is its simdgroup tile, so
+    // these sweeps hold outputs to the derived bound as well as bitwise.
     std::array split{deterministicQ4Projection(backend, {512, 1024}, 29),
                      deterministicQ4Projection(backend, {512, 1024}, 131)};
     bool mixedClasses = false;
-    for (const auto &plan : Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
-      mixedClasses |= plan.partialSums() > 1;
-    require(mixedClasses, "split-K candidates are missing for a K % 1024 == 0 workload");
+    for (const auto &plan : linearCandidates(backend.capabilities(), {{512, 1024}, 8}))
+      mixedClasses |= plan.configuration().splits > 1 || plan.usesSimdgroup();
+    require(mixedClasses, "no candidate of a four-block K workload splits K");
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                LinearEpilogue::GateUp})
       gpuSweep(backend, split, 8, LinearPhase::Decode, epilogue);

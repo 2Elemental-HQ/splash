@@ -403,6 +403,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   add("first_recurrent", gdn.recurrentLayers.front(), false);
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
   const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
@@ -415,11 +416,11 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
       const uint32_t dimension = index % layout.headDimension;
       const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
       const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
-      const uint32_t ring = (lengths.draftBase + position) % layout.tokens;
+      const uint32_t ring = (lengths.draftBase + position) % window;
       keySamples.push_back(ops::tuning::bf16ToFloat(
-          keys[(uint64_t{head} * layout.tokens + ring) * layout.headDimension + dimension]));
+          keys[(uint64_t{head} * window + ring) * layout.headDimension + dimension]));
       valueSamples.push_back(ops::tuning::bf16ToFloat(
-          values[(uint64_t{head} * layout.headDimension + dimension) * layout.tokens + ring]));
+          values[(uint64_t{head} * layout.headDimension + dimension) * window + ring]));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
@@ -1610,7 +1611,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 1, 0, prompt128, pageTable);
     require(states.metadata(0).lengths.targetTokens == 128 &&
                 states.metadata(0).lengths.hasCompleteDraftWindow(
-                    states.layout().draft.tokens),
+                    model::ExecutionLimits::draftContextTokens),
             "prefill state length mismatch");
 
     const uint64_t predictedPromptSnapshotBytes =
@@ -1632,7 +1633,7 @@ int main(int argc, char **argv) {
     require(states.metadata(0).lengths.targetTokens ==
                     128 + decoded.outputTokens.size() &&
                 states.metadata(0).lengths.hasCompleteDraftWindow(
-                    states.layout().draft.tokens),
+                    model::ExecutionLimits::draftContextTokens),
             "decode committed length mismatch");
 
     std::cout << "TOKENS";
@@ -2314,11 +2315,8 @@ int main(int argc, char **argv) {
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
                 !b3Decoded[1].outputTokens.empty() &&
                 !b3Decoded[2].outputTokens.empty() &&
-                b3Telemetry.lastDecodeWidth == 3 &&
-                b3Telemetry.lastDecodeM16Dispatches == 0 &&
-                b3Telemetry.lastDecodeM32Dispatches == 0 &&
-                b3Telemetry.lastDecodeM24Dispatches > 0,
-            "B3 projection graph was decomposed instead of using M24");
+                b3Telemetry.lastDecodeWidth == 3,
+            "B3 decode did not run one three-lane graph");
     for (uint64_t id : b3Ids)
       executor.end(id);
 
@@ -2467,11 +2465,8 @@ int main(int argc, char **argv) {
     const model::ModelTelemetry raggedDecodeTelemetry =
         executor.telemetry();
     require(raggedDecoded.size() == raggedIds.size() &&
-                raggedDecodeTelemetry.lastDecodeWidth == 4 &&
-                raggedDecodeTelemetry.lastDecodeM16Dispatches == 0 &&
-                raggedDecodeTelemetry.lastDecodeM24Dispatches == 0 &&
-                raggedDecodeTelemetry.lastDecodeM32Dispatches > 0,
-            "permuted ragged B4 was decomposed instead of using M32");
+                raggedDecodeTelemetry.lastDecodeWidth == 4,
+            "permuted ragged B4 did not run one four-lane graph");
     for (uint64_t id : raggedIds)
       executor.end(id);
 
@@ -2514,9 +2509,8 @@ int main(int argc, char **argv) {
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
     require(raggedReferenceDecoded.size() == raggedPermutation.size() &&
-                executor.telemetry().lastDecodeWidth == 4 &&
-                executor.telemetry().lastDecodeM32Dispatches > 0,
-            "permuted ragged reference was not one M32 graph");
+                executor.telemetry().lastDecodeWidth == 4,
+            "permuted ragged reference was not one four-lane graph");
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];
       const ModelStepResult &reference = raggedReferenceDecoded[order];
@@ -3398,16 +3392,12 @@ int main(int argc, char **argv) {
         require(!lane.step.outputTokens.empty() && lane.committedTokens > 1,
                 "decode warmup omitted its committed deterministic result");
     }
-    const model::ModelTelemetry fusedTelemetry =
+    const model::ModelTelemetry b4Telemetry =
         executor.telemetry();
-    require(batch4.wallSeconds >= fusedTelemetry.lastDecodeWallSeconds,
+    require(batch4.wallSeconds >= b4Telemetry.lastDecodeWallSeconds,
             "decode warmup excluded production work from phase wall time");
-    require(fusedTelemetry.lastDecodeWidth == 4 &&
-                fusedTelemetry.lastDecodeFusedOperations > 0 &&
-                fusedTelemetry.lastDecodeM16Dispatches == 0 &&
-                fusedTelemetry.lastDecodeM24Dispatches == 0 &&
-                fusedTelemetry.lastDecodeM32Dispatches > 0,
-            "B4 decode did not execute the fused M32 production graph");
+    require(b4Telemetry.lastDecodeWidth == 4,
+            "B4 decode did not execute one four-lane production graph");
     const auto repeatedBatch4 = executor.warmupDecodeBatch(4);
     require(repeatedBatch4.lanes == batch4.lanes,
             "repeated baseline B4 decode changed its deterministic result");
@@ -3415,11 +3405,7 @@ int main(int argc, char **argv) {
               << " b1_cycle_wall_seconds=" << batch1.wallSeconds
               << " b2_cycle_wall_seconds=" << batch2.wallSeconds
               << " b3_cycle_wall_seconds=" << batch3.wallSeconds
-              << " b4_cycle_wall_seconds=" << batch4.wallSeconds
-              << " b4_fused_source_ops="
-              << fusedTelemetry.lastDecodeFusedOperations
-              << " b4_m16=" << fusedTelemetry.lastDecodeM16Dispatches
-              << " b4_m32=" << fusedTelemetry.lastDecodeM32Dispatches << '\n';
+              << " b4_cycle_wall_seconds=" << batch4.wallSeconds << '\n';
     model::WarmupStepResult historical =
         executor.warmupCompositeStateRestore();
     require(historical.wallSeconds > 0.0,

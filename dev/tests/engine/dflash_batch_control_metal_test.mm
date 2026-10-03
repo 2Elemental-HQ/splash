@@ -1,6 +1,8 @@
+#include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "model/Model.hpp"
+#include "ops/RowCopy.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -11,13 +13,17 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
 using splash::metal::BufferStorage;
+using splash::metal::CommandGraph;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::ops::RowCopy;
+using splash::ops::RowRegion;
 
 constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
 constexpr uint32_t kProposals =
@@ -56,7 +62,8 @@ void runWidth(MetalBackend &backend, uint32_t width,
       shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
              "accept-target-rows");
   MetalBuffer uniforms =
-      shared(backend, kLanes * 2 * kRows * sizeof(float), "accept-uniforms");
+      shared(backend, kLanes * SPLASH_SAMPLING_UNIFORMS * sizeof(float),
+             "accept-uniforms");
   MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
                               "accept-output");
   MetalBuffer retained =
@@ -96,7 +103,6 @@ void runWidth(MetalBackend &backend, uint32_t width,
             std::begin(params.remaining));
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
-  params.lanes = width;
   ComputeDispatch dispatch;
   dispatch.pipelineName = "decode_accept_dflash";
   dispatch.buffers = {{0, draft},
@@ -126,6 +132,59 @@ void runWidth(MetalBackend &backend, uint32_t width,
   }
 }
 
+// The two row copies of a DFlash cycle, bitwise against a CPU copy: the
+// capture of 13 target hidden rows (width 2048) from source row 5 into the
+// third slot of four of the captured rows from row 2, and the gather of the
+// last 3 of 11 prefill rows into the head's input. Every value outside the
+// destination region keeps its poison, and regions past a row or a buffer
+// are refused.
+void testRowCopy(MetalBackend &backend) {
+  constexpr uint16_t kPoison = 0xA5A5;
+  const auto check = [&](uint32_t sourceRows, RowRegion from,
+                         uint32_t destinationRows, RowRegion to,
+                         uint32_t rows, uint32_t width, const char *what) {
+    MetalBuffer source = shared(backend, uint64_t{sourceRows} * from.stride * 2, "row-copy-source");
+    MetalBuffer destination =
+        shared(backend, uint64_t{destinationRows} * to.stride * 2, "row-copy-destination");
+    auto *input = contents<uint16_t>(source);
+    for (uint64_t i = 0; i < source.sizeBytes() / 2; ++i)
+      input[i] = static_cast<uint16_t>(i * 2654435761u >> 16);
+    std::vector<uint16_t> expected(destination.sizeBytes() / 2, kPoison);
+    std::copy(expected.begin(), expected.end(), contents<uint16_t>(destination));
+    for (uint32_t row = 0; row < rows; ++row)
+      for (uint32_t column = 0; column < width; ++column)
+        expected[uint64_t{to.row + row} * to.stride + to.column + column] =
+            input[uint64_t{from.row + row} * from.stride + from.column + column];
+    CommandGraph graph;
+    RowCopy::add(graph, source, from, destination, to, rows, width);
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    require(std::equal(expected.begin(), expected.end(), contents<uint16_t>(destination)), what);
+  };
+  constexpr uint32_t kWidth = 2048;
+  check(18, {5, kWidth, 0}, 16, {2, 4 * kWidth, 2 * kWidth}, 13, kWidth,
+        "captured rows differ from a CPU copy");
+  check(11, {8, kWidth, 0}, kRows, {0, kWidth, 0}, 3, kWidth,
+        "gathered rows differ from a CPU copy");
+
+  MetalBuffer rows = shared(backend, uint64_t{4} * kWidth * 2, "row-copy-invalid");
+  CommandGraph invalid;
+  const auto rejects = [&](RowRegion from, RowRegion to, uint32_t count, uint32_t width) {
+    try {
+      RowCopy::add(invalid, rows, from, rows, to, count, width);
+    } catch (const std::invalid_argument &) {
+      return;
+    }
+    throw std::runtime_error("invalid row copy was accepted");
+  };
+  rejects({0, kWidth, 0}, {0, kWidth, 0}, 0, kWidth);
+  rejects({0, kWidth, 0}, {0, kWidth, 0}, 1, 0);
+  rejects({0, kWidth, 1}, {0, kWidth, 0}, 1, kWidth);
+  rejects({0, kWidth, 0}, {0, kWidth / 2, 0}, 1, kWidth);
+  rejects({1, kWidth, 0}, {0, kWidth, 0}, 4, kWidth);
+  rejects({0, kWidth, 0}, {3, kWidth, 0}, 2, kWidth);
+  require(invalid.empty(), "an invalid row copy encoded a dispatch");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -147,6 +206,7 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    testRowCopy(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

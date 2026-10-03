@@ -1,4 +1,3 @@
-#include "Checked.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -67,77 +66,6 @@ model::ModelPackage package() {
   return result;
 }
 
-void checkPackage(const model::ModelPackage &package, uint32_t family) {
-  DeviceCapabilities device;
-  device.appleGpuFamily = family;
-  ops::ExecutionPlans baseline(device);
-  const auto before = model::plannedRuntimeMemory(device, package, baseline, kv::Format::Int8);
-  const auto geometry = std::visit([](const auto &weights) {
-    return model::qwenTargetGeometry(weights);
-  }, package.target);
-  const ops::AttentionShape attention{geometry.attentionQueryHeads,
-                                      geometry.attentionKvHeads,
-                                      geometry.attentionHeadDimension};
-  ops::OperatorChoices choices;
-  choices.prefillAttention.push_back(
-      {{attention}, {ops::PrefillSplitMultiplier::Two}});
-  choices.draftAttention.push_back(
-      {{package.draft.layout.attentionShape(), 3}, {80}});
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
-    choices.moe.push_back({{geometry.moeShape(), 24, ops::MoePhase::Decode},
-                           {ops::MoeExpertTile::M32}});
-  ops::ExecutionPlans selected(device);
-  selected.install(choices);
-  const auto after = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
-  const auto prefillBefore = baseline.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const auto prefillAfter = selected.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const uint64_t prefillGrowth =
-      alignUp(prefillAfter.partialsBytes) - alignUp(prefillBefore.partialsBytes) +
-      alignUp(prefillAfter.statisticsBytes) - alignUp(prefillBefore.statisticsBytes);
-  // The selected split count and the fallback baseline share an arena whose
-  // governed bound includes the larger candidate's exact scratch requirement.
-  require(prefillGrowth > 0 &&
-              after.sharedPrefillPlannedAllocatedBytes ==
-                  before.sharedPrefillPlannedAllocatedBytes + prefillGrowth,
-          "runtime prefill allocation lost the selected split workspace bound");
-  const auto selectedPrefill = selected.prefillAttention(
-      2048, attention.queryHeads, geometry.kvLayout, 131072);
-  require(selectedPrefill.configuration.splitMultiplier == ops::PrefillSplitMultiplier::Two &&
-              selectedPrefill.workspace.partialsBytes ==
-                  2 * baseline.prefillAttention(2048, attention.queryHeads,
-                                             geometry.kvLayout, 131072)
-                      .workspace.partialsBytes,
-          "runtime did not install the selected prefill split plan");
-
-  uint64_t decodeGrowth = 0;
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe) {
-    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
-    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
-    for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      decodeGrowth += alignUp(model::kLaneCount * (newMoe.*field.bytes)) -
-                      alignUp(model::kLaneCount * (oldMoe.*field.bytes));
-    require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
-  }
-  require(after.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes + decodeGrowth,
-          "runtime decode allocation does not use all selected width bounds");
-  require(after.laneStatePlannedAllocatedBytes ==
-              before.laneStatePlannedAllocatedBytes,
-          "kernel selection changed the lane state");
-  require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
-                  .configuration().groups == 80,
-          "paired draft did not use the same selection owner");
-  selected.install({});
-  const auto reset = model::plannedRuntimeMemory(device, package, selected, kv::Format::Int8);
-  require(reset.sharedPrefillPlannedAllocatedBytes ==
-              before.sharedPrefillPlannedAllocatedBytes &&
-              reset.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes,
-          "reset left stale selected workspace");
-}
-
 void checkMixedLayouts() {
   auto mixed = package<model::Qwen3_8Weights>();
   auto &target = std::get<model::Qwen3_8Weights>(mixed.target);
@@ -204,8 +132,8 @@ void checkMixedLayouts() {
 
 // One decode arena serves every lane count, and on Apple10 and later a
 // Split128 plan's partials grow with the rows. The arena must hold every
-// lane's plan of every affine target and draft projection, including an
-// installed choice at eight splits, at the measured core counts.
+// lane's plan of every affine target and draft projection at the measured
+// core counts.
 void checkLaneScratch(const model::ModelPackage &package) {
   const auto geometry = model::RuntimeGeometry::from(package, kv::Format::Int8);
   const auto &d = geometry.draft;
@@ -216,18 +144,12 @@ void checkLaneScratch(const model::ModelPackage &package) {
       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
   for (const auto &p : geometry.target.decodeProjections)
     if (p.layout == ops::WeightLayout::Affine64) matrices.push_back({p.outputSize, p.inputSize});
-  const ops::LinearWorkload chosen{{d.hiddenSize, d.targetHiddenSize}, model::kLaneCount * model::kDecodeRows,
-                                   ops::LinearPhase::Decode, ops::LinearEpilogue::None};
   for (uint32_t family : {10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      ops::ExecutionPlans plans(device);
-      ops::OperatorChoices choices;
-      choices.linear.push_back({chosen, {ops::LinearTile::Split128, d.hiddenSize / 128,
-                                         ops::LinearSimdgroups::Eight, 8}});
-      plans.install(choices);
+      const ops::ExecutionPlans plans(device);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
@@ -238,9 +160,6 @@ void checkLaneScratch(const model::ModelPackage &package) {
             require(scratch.partials >= need.partials && scratch.counters >= need.counters,
                     "decode arena scratch below a lane's affine plan");
           }
-      require(plans.linear().plan(chosen).configuration().splits == 8 &&
-                  scratch.partials >= plans.linear().plan(chosen).scratchSize().partials,
-              "decode arena scratch lost the installed split choice");
     }
 }
 
@@ -295,10 +214,6 @@ int main() {
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U, 11U}) {
-      checkPackage(dense, family);
-      checkPackage(sparse, family);
-    }
     checkLaneScratch(dense);
     checkLaneScratch(sparse);
     std::cout << "model execution plans: PASS (two paired geometries)\n";

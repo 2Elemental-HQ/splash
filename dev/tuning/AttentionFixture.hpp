@@ -3,7 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
-#include "ops/ExecutionPlans.hpp"
+#include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -13,16 +13,25 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-// The paged-attention fixture the attention tuner and attention-sweep time:
-// deterministic Page32 history of every lane in the extents of a pool, one
-// chunk of rows per lane with its queries, and the production store and
-// attention graph over them.
+// The paged-attention fixture attention-sweep times: deterministic Page32
+// history of every lane in the extents of a pool, one chunk of rows per lane
+// with its queries, and the production store and attention graph over them.
 namespace splash::ops::tuning {
+
+// The target attention layer a fixture holds: its query and KV heads and its
+// cache format.
+struct AttentionShape final {
+  uint32_t queryHeads = 0;
+  uint32_t kvHeads = 0;
+  uint32_t headDimension = 0;
+  kv::Format format = kv::Format::Int8;
+};
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
 // poolLayers attention layers, in extents of extentPages pages.
@@ -170,7 +179,7 @@ private:
 // A fixture's extents start its one allocation and its tensors are views of
 // the rest, resident for every command like every backend buffer; kernels
 // reach the extents only through the lanes' page tables. Lanes past the
-// plan's repeat lane 0, as padded verify lanes do.
+// plan's lanes bind lane 0's page table, as the runtime's padded lanes do.
 class AttentionFixture final {
 public:
   using Tensor = AttentionFixturePlan::Tensor;
@@ -196,15 +205,9 @@ public:
         pageIds_[lane].push_back((2 * (firstPage + page) + 1) % plan_.poolPages);
       firstPage += plan_.pages[lane];
       tables_[lane] = buffer(AttentionFixturePlan::table(lane));
-      stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride, plan_.pages[lane], {}};
-      attention_[lane] = kv::q8VerifyAttentionParams(
-          plan_.histories[lane], kv::kQ8VerifyMaximumRows, plan_.stride, plan_.pages[lane]);
     }
-    for (uint32_t lane = plan_.lanes; lane < AttentionFixturePlan::kMaximumLanes; ++lane) {
+    for (uint32_t lane = plan_.lanes; lane < AttentionFixturePlan::kMaximumLanes; ++lane)
       tables_[lane] = tables_[0];
-      stores_[lane] = stores_[0];
-      attention_[lane] = attention_[0];
-    }
   }
 
   // Zeroes the allocation, then writes the page tables, every lane's
@@ -273,19 +276,28 @@ public:
   // One store and attention of the fixture's rows, encoded as the runtime
   // encodes them.
   void addGraph(metal::CommandGraph &graph, const PrefillAttentionPlan &attention) const {
+    const kv::ChunkedPrefillParams chunk = PagedAttention::prefillParams(
+        plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
     PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
-                                    buffer(Tensor::ChunkValues), tables_[0], stores_[0],
+                                    buffer(Tensor::ChunkValues), tables_[0], chunk,
                                     plan_.layout());
     PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries), buffer(Tensor::Output),
                                buffer(Tensor::Partials), buffer(Tensor::Statistics), tables_[0],
-                               stores_[0], attention);
+                               chunk, attention);
   }
+  // Each lane's rows are its verify rows, in the verify chunk stride.
   void addGraph(metal::CommandGraph &graph, const VerifyAttentionPlan &attention) const {
+    if (plan_.rows != kv::kVerifyRows || plan_.stride != kv::kVerifyChunkStride)
+      throw std::logic_error(
+          "a verify fixture stages its lanes' verify rows in the verify chunk stride");
+    std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
+    for (uint32_t lane = 0; lane < attention.lanes; ++lane)
+      chunks[lane] = PagedAttention::verifyParams(plan_.histories[lane], plan_.pages[lane]);
     PagedAttention::addVerify(
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
          buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
-        stores_, attention_, attention);
+        std::span(chunks).first(attention.lanes), attention);
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }
@@ -328,8 +340,6 @@ private:
   std::array<metal::MetalBuffer, static_cast<size_t>(Tensor::Count)> buffers_{};
   std::array<std::vector<uint32_t>, AttentionFixturePlan::kMaximumLanes> pageIds_;
   std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables_{};
-  std::array<kv::Q8ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> stores_{};
-  std::array<kv::Q8VerifyAttentionParams, AttentionFixturePlan::kMaximumLanes> attention_{};
 };
 
 } // namespace splash::ops::tuning

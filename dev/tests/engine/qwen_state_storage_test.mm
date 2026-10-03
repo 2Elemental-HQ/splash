@@ -26,7 +26,7 @@ using namespace splash::engine;
 namespace {
 
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
-constexpr model::DraftStateLayout kDraftState{5, 8, 2'048, 128};
+constexpr model::DraftStateLayout kDraftState{5, 8, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
@@ -126,7 +126,7 @@ void testLayoutFormulas() {
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
-                                               {1, 1, 2048, 4}};
+                                               {1, 1, 4}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
   auto budget = std::make_shared<model::DiskBudget>(3 * slotBytes);
   auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
@@ -333,8 +333,8 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 // and in the rounded-up slot of a state that is not aligned.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
-  constexpr model::CompositeStateLayout aligned{target, {1, 1, 2048, 4}};
-  constexpr model::CompositeStateLayout unaligned{target, {1, 1, 2048, 1}};
+  constexpr model::CompositeStateLayout aligned{target, {1, 1, 4}};
+  constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1}};
   static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
                 unaligned.cachedBytes() % kHostPageBytes != 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);

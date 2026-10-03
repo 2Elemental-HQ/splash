@@ -6,34 +6,35 @@
 
 using namespace metal;
 
-// Q8 KV page geometry shared by the attention and store kernels. A page holds
-// SplashQ8PageTokens tokens of every KV head: keys token-major, values
-// dimension-major, and one fp32 scale per (KV head, token) for each tensor.
-constant uint SplashQ8PageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
-constant uint SplashQ8HeadDimension = SPLASH_KV_HEAD_DIMENSION;
+// KV page geometry of both formats, shared by the attention and store
+// kernels. A page holds SplashKvPageTokens tokens of every KV head: keys
+// token-major, values dimension-major. INT8 adds one fp32 scale per (KV head,
+// token) for each tensor.
+constant uint SplashKvPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
+constant uint SplashKvHeadDimension = SPLASH_KV_HEAD_DIMENSION;
 
 // An element's index in a layer's region of one tensor: its page's slab,
 // then its place in the slab (abi/KvExtent.h).
 template <uint KVHeads>
-inline ulong splash_q8_key_index(uint page, uint head, uint token,
+inline ulong splash_kv_key_index(uint page, uint head, uint token,
                                    uint dimension) {
   constexpr ulong ElementsPerPage =
-      ulong(KVHeads) * SplashQ8PageTokens * SplashQ8HeadDimension;
+      ulong(KVHeads) * SplashKvPageTokens * SplashKvHeadDimension;
   return ulong(page) * ElementsPerPage +
          splash_kv_key_element(head, token, dimension);
 }
 
 template <uint KVHeads>
-inline ulong splash_q8_value_index(uint page, uint head, uint token,
+inline ulong splash_kv_value_index(uint page, uint head, uint token,
                                      uint dimension) {
   constexpr ulong ElementsPerPage =
-      ulong(KVHeads) * SplashQ8PageTokens * SplashQ8HeadDimension;
+      ulong(KVHeads) * SplashKvPageTokens * SplashKvHeadDimension;
   return ulong(page) * ElementsPerPage +
          splash_kv_value_element(head, token, dimension);
 }
 
 template <uint KVHeads>
 inline ulong splash_q8_scale_index(uint page, uint head, uint token) {
-  constexpr ulong ScalesPerPage = ulong(KVHeads) * SplashQ8PageTokens;
+  constexpr ulong ScalesPerPage = ulong(KVHeads) * SplashKvPageTokens;
   return ulong(page) * ScalesPerPage + splash_kv_scale_element(head, token);
 }

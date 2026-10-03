@@ -22,6 +22,7 @@
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
 #include "metal/MetalBackend.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
 #import <Foundation/Foundation.h>
@@ -54,6 +55,7 @@ using namespace splash::ops;
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
 constexpr uint32_t kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
@@ -148,12 +150,12 @@ struct Batch final {
 Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   const uint32_t rows = lanes * kRows;
   const auto space = Sampling::workspace(rows);
-  const auto proposals = Sampling::draftWorkspace(lanes * kPositions);
+  const auto proposals = DraftSelector::workspace(lanes * kPositions);
   return {SamplingBuffers{
               allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
               allocate(backend, space.partialMassesBytes),
               allocate(backend, space.vocabularyRowsBytes),
-              allocate(backend, uint64_t{lanes} * 2 * kRows * sizeof(float)),
+              allocate(backend, uint64_t{lanes} * kUniforms * sizeof(float)),
               allocate(backend,
                        uint64_t{lanes} * (kRows + 1) * ((vocabulary + 31) / 32) * 4),
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
@@ -384,7 +386,8 @@ void requireSampledRow(const Batch &batch, uint32_t index,
   requireArrivalsReturned(batch, index, label);
   requireMaximum(record, target, label);
   const uint32_t lane = index / kRows;
-  const float uniform = batch.uniforms()[lane * 2 * kRows + 2 * kRows - 1];
+  const float uniform =
+      batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_CORRECTION];
   const uint32_t token = batch.outputTokens()[index];
   if (row == kPositions) {
     requireDraw(token, target.probabilities, uniform, target.ambiguousMass,
@@ -421,7 +424,8 @@ void requireInitialDraw(const Batch &batch, uint32_t lane,
   requireArrivalsReturned(batch, lane, label);
   requireMaximum(batch.record(lane), target, label);
   requireDraw(batch.outputTokens()[lane], target.probabilities,
-              batch.uniforms()[lane * 2 * kRows], target.ambiguousMass, label);
+              batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_INITIAL],
+              target.ambiguousMass, label);
 }
 
 // The penalty kernel's arithmetic on the host: the logit of a token the
@@ -554,7 +558,7 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
        ++index)
     batch.masks()[index] = 0xB6DB6DB6U ^ index;
-  for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+  for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
     batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
   std::vector<SamplingPolicy> policies;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -701,7 +705,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
     for (uint32_t token = 0; token < vocabulary; ++token)
       counts[token] = words[token] & SPLASH_PENALTY_COUNT_MASK;
     uint32_t *inputs = batch.inputTokens() + lane * kRows;
-    float *uniforms = batch.uniforms() + lane * 2 * kRows;
+    float *uniforms = batch.uniforms() + lane * kUniforms;
     inputs[0] = 5 + lane;
     std::vector<float> base(vocabulary);
     fillRow(base.data(), vocabulary, random);
@@ -738,12 +742,12 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       ++counts[draft];
       const double p = targets.back().probability(draft);
       // Accept a right token surely and refuse the wrong one.
-      uniforms[kRows + row] =
+      uniforms[SPLASH_UNIFORM_ACCEPTANCE + row] =
           row < kWrongAt[lane] ? float(p * 0.5) : float(std::min(1.0, p * 2.0 + 0.01));
       require(!sampled || row >= kWrongAt[lane] || p > 1e-4,
               "a sampled lane drafted a token its target cannot accept");
     }
-    uniforms[2 * kRows - 1] = 0.37F;
+    uniforms[SPLASH_UNIFORM_CORRECTION] = 0.37F;
 
     // Acceptance as accept_greedy_lane and accept_sampled_lane define it.
     const uint32_t accepted = kWrongAt[lane];
@@ -760,7 +764,8 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
     if (accepted < kPositions)
       weights[inputs[accepted + 1]] = 0.0;
     const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
-    const double threshold = double(uniforms[2 * kRows - 1]) * total;
+    const double threshold =
+        double(uniforms[SPLASH_UNIFORM_CORRECTION]) * total;
     double cumulative = 0.0;
     uint32_t token = 0;
     while (cumulative + weights[token] <= threshold)
@@ -846,7 +851,7 @@ void extremes(MetalBackend &backend) {
       for (const float uniform : {0.0F, 0.51F, 0.999F}) {
         std::copy(original.begin(), original.end(), row);
         batch.poison();
-        batch.uniforms()[0] = uniform;
+        batch.uniforms()[SPLASH_UNIFORM_INITIAL] = uniform;
         const SamplingPolicy policy{temperature > 0.0F ? kTopK : 1U,
                                     temperature,
                                     1.0F,
@@ -1037,8 +1042,8 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                candidates[candidates.size() == 3 ? position % 3 : 0], random);
     }
     batch.inputTokens()[lane * kRows] = 7;
-    for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
-      batch.uniforms()[lane * 2 * kRows + uniform] =
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
+      batch.uniforms()[lane * kUniforms + uniform] =
           0.5F * (random.unit() + 1.0F);
   }
   const std::string label = std::string(minP ? "min_p" : "sampled") +
@@ -1070,7 +1075,8 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   for (const SamplingPolicy &policy : initialPolicies) {
     for (const uint32_t offset : {1U, 4U}) {
       batch.poison();
-      batch.uniforms()[0] = 0.5F * (random.unit() + 1.0F);
+      batch.uniforms()[SPLASH_UNIFORM_INITIAL] =
+          0.5F * (random.unit() + 1.0F);
       CommandGraph initial;
       sampling.addInitial(initial, {&policy, 1}, batch.buffers, offset,
                           kStopTokens[0], kStopTokens[1], {});
@@ -1122,7 +1128,7 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
     candidates[entry] = random.next() % vocabulary;
     proposal[entry] = 0.5F * (random.unit() + 1.0F) / kDraftCandidates;
   }
-  for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+  for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
     batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
   const auto stops = shardEdgeStopTokens(vocabulary);
   CommandGraph graph;
@@ -1165,7 +1171,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
   constexpr uint32_t lanes = 2;
   Sampling sampling(vocabulary);
   const std::array<SamplingPolicy, lanes> policies{
-      SamplingPolicy{.topK = 1, .temperature = 0.0F},
+      SamplingPolicy{},
       SamplingPolicy{
           .topK = 0, .temperature = 0.8F, .topP = 0.9F, .minP = 0.05F}};
   const auto stops = shardEdgeStopTokens(vocabulary);
@@ -1186,7 +1192,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
       candidates[entry] = random.next() % vocabulary;
       proposal[entry] = 0.5F * (random.unit() + 1.0F) / kDraftCandidates;
     }
-    for (uint32_t uniform = 0; uniform < lanes * 2 * kRows; ++uniform)
+    for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
     std::fill_n(batch.masks(), lanes * (kRows + 1) * batch.maskWords(),
                 maskWord);
@@ -1337,7 +1343,7 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
     for (const float temperature : {0.0F, 0.8F}) {
       for (const float uniform : {0.0F, 0.5F, 0.999F}) {
         batch.poison();
-        uniforms[0] = uniform;
+        uniforms[SPLASH_UNIFORM_INITIAL] = uniform;
         CommandGraph initial;
         const SamplingPolicy policy{32, temperature, 1.0F, false, excludes};
         sampling.addInitial(initial, {&policy, 1}, batch.buffers, kRows - 1,
@@ -1374,7 +1380,7 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
     static_cast<float *>(acceptance.proposalProbabilities.contents())
         [uint64_t{lane} * kPositions * kDraftCandidates] = 1.0F;
   }
-  std::fill(uniforms, uniforms + kLanes * 2 * kRows, 0.5F);
+  std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
   const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
   for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
     for (uint32_t excludeMask = 0; excludeMask < (1U << lanes); ++excludeMask) {
@@ -1497,7 +1503,7 @@ void ties(MetalBackend &backend) {
       const uint32_t draft = position % 2 ? tied[kept] : tied[kept - 1];
       setDraft(batch, 0, position, {draft}, draft, random);
     }
-    for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
     batch.poison();
     CommandGraph verify;
@@ -1572,7 +1578,7 @@ void minPCuts(MetalBackend &backend) {
       const uint32_t draft = position % 2 ? c.dropped : c.last;
       setDraft(batch, 0, position, {draft}, draft, random);
     }
-    for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
     batch.poison();
     CommandGraph verify;
@@ -1623,8 +1629,8 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
   std::fill(proposal, proposal + lanes * kPositions * kDraftCandidates, 0.0F);
   std::array<std::array<uint32_t, kRows>, lanes> expectedOutput{};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    float *uniforms = batch.uniforms() + lane * 2 * kRows;
-    uniforms[2 * kRows - 1] = 0.5F * (random.unit() + 1.0F);
+    float *uniforms = batch.uniforms() + lane * kUniforms;
+    uniforms[SPLASH_UNIFORM_CORRECTION] = 0.5F * (random.unit() + 1.0F);
     uint32_t *inputs = batch.inputTokens() + lane * kRows;
     inputs[0] = 9;
     for (uint32_t row = 0; row < kRows; ++row) {
@@ -1645,7 +1651,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
         proposed[lane * kPositions + row] = draft;
         candidates[(lane * kPositions + row) * kDraftCandidates] = draft;
         proposal[(lane * kPositions + row) * kDraftCandidates] = 1.0F;
-        uniforms[kRows + row] =
+        uniforms[SPLASH_UNIFORM_ACCEPTANCE + row] =
             right ? float(p * 0.5) : float(std::min(1.0, p * 2.0 + 0.01));
         if (right)
           expectedOutput[lane][row] = draft;
@@ -1659,7 +1665,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
       if (row < kPositions)
         weights[inputs[row + 1]] = 0.0;
       const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
-      const double threshold = uniforms[2 * kRows - 1] * total;
+      const double threshold = uniforms[SPLASH_UNIFORM_CORRECTION] * total;
       const double slack = (1e-5 + target.ambiguousMass) * total;
       double cumulative = 0.0;
       uint32_t token = 0;
@@ -1752,9 +1758,9 @@ void overProposedResidual(MetalBackend &backend) {
     const std::string label = "over-proposed residual, correction uniform " +
                               std::to_string(correction);
     // The first draft token is rejected: 0.9 * 0.9 exceeds its probability.
-    for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.9F;
-    batch.uniforms()[2 * kRows - 1] = correction;
+    batch.uniforms()[SPLASH_UNIFORM_CORRECTION] = correction;
     batch.poison();
     CommandGraph graph;
     sampling.addVerify(graph, {&policy, 1}, batch.buffers, kStopTokens[0],
@@ -1800,7 +1806,7 @@ void extremeSearches(MetalBackend &backend) {
     setDraft(batch, 0, position, {draft}, draft, random);
   }
   batch.inputTokens()[0] = 7;
-  for (uint32_t uniform = 0; uniform < 2 * kRows; ++uniform)
+  for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
     batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
   const std::vector<float> original(batch.logits(),
                                     batch.logits() + batch.rows * vocabulary);

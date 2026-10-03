@@ -1,11 +1,11 @@
 #include "metal/kernels/common/paged_store_row.h"
 
-// Writes every current row directly into its final Q8 page slot. Decode writes
+// Writes every current row directly into its final page slot. Decode writes
 // all speculative rows; acceptance is represented solely by the host-visible
 // committed length. A rejected suffix remains unreachable and is overwritten
 // by the next command starting at the same logical position.
 template <uint KVHeads, typename CacheElement>
-inline void splash_q8_store_chunk_phase(
+inline void splash_store_chunk_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const SplashKvPage *page_table,
     constant SplashChunkedPrefillParams &params,
@@ -13,7 +13,7 @@ inline void splash_q8_store_chunk_phase(
     uint simd_group) {
   uint rows = params.chunk_tokens * KVHeads;
   if (!splash_chunk_contract_valid(params) || group >= 2 * rows ||
-      thread_index >= SplashQ8HeadDimension)
+      thread_index >= SplashKvHeadDimension)
     return;
 
   bool value_tensor = group >= rows;
@@ -36,7 +36,7 @@ prefill_attention_q8_store(device const bfloat *chunk_keys [[buffer(0)]],
                         uint simd_lane [[thread_index_in_simdgroup]],
                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
-  splash_q8_store_chunk_phase<4, int8_t>(
+  splash_store_chunk_phase<4, int8_t>(
       chunk_keys, chunk_values, page_table, params, maxima, group,
       thread_index, simd_lane, simd_group);
 }
@@ -51,7 +51,7 @@ kernel void prefill_attention_q8_store_kv2_g8(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
-  splash_q8_store_chunk_phase<2, int8_t>(
+  splash_store_chunk_phase<2, int8_t>(
       chunk_keys, chunk_values, page_table, params, maxima, group,
       thread_index, simd_lane, simd_group);
 }
@@ -68,7 +68,7 @@ prefill_attention_bf16_store(device const bfloat *chunk_keys [[buffer(0)]],
                         uint thread_index [[thread_index_in_threadgroup]],
                         uint simd_lane [[thread_index_in_simdgroup]],
                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_q8_store_chunk_phase<4, bfloat>(
+  splash_store_chunk_phase<4, bfloat>(
       chunk_keys, chunk_values, page_table, params, nullptr, group,
       thread_index, simd_lane, simd_group);
 }
@@ -82,7 +82,7 @@ kernel void prefill_attention_bf16_store_kv2_g8(
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  splash_q8_store_chunk_phase<2, bfloat>(
+  splash_store_chunk_phase<2, bfloat>(
       chunk_keys, chunk_values, page_table, params, nullptr, group,
       thread_index, simd_lane, simd_group);
 }

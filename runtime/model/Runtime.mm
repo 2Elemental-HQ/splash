@@ -4,11 +4,11 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
-#include "ops/DraftAttention.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
+#include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 
@@ -76,7 +76,7 @@ private:
   bool representativePrefillTiming_;
 };
 
-using kv::Q8ChunkedPrefillParams;
+using kv::ChunkedPrefillParams;
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
   return token == geometry.target.stopTokens[0] ||
@@ -316,8 +316,7 @@ struct Runtime::Impl {
                                       .constrained = true,
                                       .penalties = {1.1F, 0.5F, 0.5F},
                                       .minP = 0.05F};
-    const std::array<ops::SamplingPolicy, 2> policies{
-        sampled, {.topK = 1, .temperature = 0.0F}};
+    const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
@@ -663,7 +662,8 @@ struct Runtime::Impl {
 
   static void stageSamplingCycle(Request &entry) noexcept {
     entry.cycleUniforms.fill(0.0F);
-    for (uint32_t index = 1; index < entry.cycleUniforms.size(); ++index) {
+    for (uint32_t index = SPLASH_UNIFORM_PROPOSALS;
+         index < SPLASH_SAMPLING_UNIFORMS; ++index) {
       entry.cycleUniforms[index] = nextUniform(entry);
     }
   }
@@ -792,14 +792,10 @@ struct Runtime::Impl {
   }
 
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
-    const bool enabled = samplingEnabled(entry);
-    return {enabled ? entry.sampling.topK : 1,
-            enabled ? entry.sampling.temperature : 0.0F,
-            enabled ? entry.sampling.topP : 1.0F,
-            entry.constraint == ConstraintMode::TokenMask,
+    return {entry.sampling.topK, entry.sampling.temperature,
+            entry.sampling.topP, entry.constraint == ConstraintMode::TokenMask,
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
-            samplingPenalties(entry),
-            enabled ? entry.sampling.minP : 0.0F};
+            samplingPenalties(entry), entry.sampling.minP};
   }
 
   ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
@@ -880,7 +876,7 @@ struct Runtime::Impl {
   // cycle.
   void uploadInitialUniform(Request &entry, uint32_t lane) const {
     entry.cycleUniforms.fill(0.0F);
-    entry.cycleUniforms[0] = nextUniform(entry);
+    entry.cycleUniforms[SPLASH_UNIFORM_INITIAL] = nextUniform(entry);
     uploadSamplingUniforms(entry, lane);
   }
 
@@ -897,15 +893,13 @@ struct Runtime::Impl {
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, storage);
     };
-    ops::LinearDispatchStats stats;
     targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
                              d(DecodeTensor::FinalHidden),
                              d(DecodeTensor::Logits), width,
-                             decodeArena->linearScratch(), stats);
+                             decodeArena->linearScratch());
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
-    std::array<ops::SamplingPolicy, kLaneCount> policies;
-    policies.fill({.topK = 1, .temperature = 0.0F});
+    std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
     for (const InitialSelection &lane : lanes) {
       if (!lane.select)
@@ -983,9 +977,9 @@ struct Runtime::Impl {
                                                  std::move(finish));
   }
 
-  Q8ChunkedPrefillParams q8Params(uint64_t logicalPosition,
-                                  uint32_t chunkTokens, uint32_t chunkStride,
-                                  std::span<const uint32_t> pages) const {
+  ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
+                                   uint32_t chunkTokens, uint32_t chunkStride,
+                                   std::span<const uint32_t> pages) const {
     return ops::PagedAttention::prefillParams(
         logicalPosition, chunkTokens, chunkStride,
         static_cast<uint32_t>(pages.size()));
@@ -1000,7 +994,7 @@ struct Runtime::Impl {
     uint64_t queryOffset = 0;
     uint64_t kvOffset = 0;
     uint32_t captureBegin = 0;
-    Q8ChunkedPrefillParams q8;
+    ChunkedPrefillParams chunk;
     MetalBuffer pageTable;
     DispatchDraftCapturePlan captures;
   };
@@ -1047,13 +1041,13 @@ struct Runtime::Impl {
       const uint32_t capturedRows = captureRows(captures);
       const uint32_t attentionStride =
           ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
-      const Q8ChunkedPrefillParams q8 =
-          q8Params(item.logicalPosition, item.tokenCount, attentionStride,
-                   item.pageTable);
+      const ChunkedPrefillParams chunk =
+          chunkParams(item.logicalPosition, item.tokenCount, attentionStride,
+                      item.pageTable);
       MetalBuffer pageTable = synchronizedPageTable(entry, item);
       batch.sequences.push_back({&entry, &item, lane, batch.rows,
                                  attentionStride, queryOffset, kvOffset,
-                                 batch.capturedRows, q8, std::move(pageTable),
+                                 batch.capturedRows, chunk, std::move(pageTable),
                                  std::move(captures)});
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
@@ -1169,7 +1163,7 @@ struct Runtime::Impl {
       destination.attentionStride = sequence.attentionStride;
       destination.queryOffset = sequence.queryOffset;
       destination.kvOffset = sequence.kvOffset;
-      destination.q8 = sequence.q8;
+      destination.chunk = sequence.chunk;
       destination.pageTable = sequence.pageTable;
       const uint32_t gdnLayers = geometry.target.stateLayout.layers;
       const uint64_t stateBegin = uint64_t{lane} * gdnLayers;
@@ -1253,12 +1247,13 @@ struct Runtime::Impl {
       if (entry.replayingGeneration ||
           item.logicalPosition + item.tokenCount != entry.promptTokens)
         continue;
-      ops::DraftAttention::gatherLastRows(
+      const uint32_t hidden = geometry.target.hiddenSize;
+      ops::RowCopy::add(
           graph,
-          prefillU16(finalHidden, sequence.rowBegin + item.tokenCount - 1, 1,
-                     geometry.target.hiddenSize),
-          decodeArena->get(sequence.lane, DecodeTensor::Hidden0), 1,
-          geometry.target.hiddenSize);
+          prefillU16(finalHidden, sequence.rowBegin, item.tokenCount, hidden),
+          {item.tokenCount - 1, hidden, 0},
+          decodeArena->get(sequence.lane, DecodeTensor::Hidden0),
+          {0, hidden, 0}, 1, hidden);
       if (entry.constraint != ConstraintMode::None)
         continue;
       const bool scoring = !entry.scoreTokens.empty();
@@ -1308,10 +1303,6 @@ struct Runtime::Impl {
       // The draft is a text model over logical positions.
       draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
     }
-    *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Arrived),
-                        "decode arrived") = 0;
-    *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Generation),
-                        "decode generation") = 0;
   }
 
   // Batch lanes beyond the active width replay the last active request so
@@ -1341,8 +1332,7 @@ struct Runtime::Impl {
 
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
-                             std::span<const uint64_t> logicalPositions,
-                             ops::LinearDispatchStats &stats) {
+                             std::span<const uint64_t> logicalPositions) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
@@ -1354,10 +1344,8 @@ struct Runtime::Impl {
       return decodeArena->packed(tensor, storage);
     };
     std::array<uint32_t, kLaneCount> cacheLengths{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      cacheLengths[lane] =
-          static_cast<uint32_t>(logicalPositions[std::min(lane, lanes - 1)]);
-    }
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
 
     DFlashDecodeBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
@@ -1383,8 +1371,8 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel.vocabularyProjection(), cacheLengths,
-                         lanes, stats);
+                         targetModel.vocabularyProjection(),
+                         std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -1401,14 +1389,12 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes),
-        kDraftProposalTokens);
+        std::span(anchors).first(lanes), std::span(policies).first(lanes));
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
-                                      std::span<const ModelBatchItem> items,
-                                      ops::LinearDispatchStats &stats) {
+                                      std::span<const ModelBatchItem> items) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1418,12 +1404,8 @@ struct Runtime::Impl {
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, storage);
     };
-    auto paddedItem = [&](uint32_t lane) -> const ModelBatchItem & {
-      return items[std::min(lane, lanes - 1)];
-    };
 
-    std::array<Q8ChunkedPrefillParams, kLaneCount> q8{};
-    std::array<kv::Q8VerifyAttentionParams, kLaneCount> verify{};
+    std::array<ChunkedPrefillParams, kLaneCount> chunks{};
     const uint32_t gdnLayers = geometry.target.stateLayout.layers;
     const uint32_t attentionLayers =
         geometry.target.kvLayout.attentionLayers;
@@ -1437,7 +1419,6 @@ struct Runtime::Impl {
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
-    buffers.recurrent = d(DecodeTensor::Recurrent);
     buffers.gdnHidden = d(DecodeTensor::GdnHidden);
     buffers.gdnOutput = d(DecodeTensor::GdnOutput);
     buffers.denseIntermediate = d(DecodeTensor::Intermediate);
@@ -1450,8 +1431,6 @@ struct Runtime::Impl {
     buffers.attentionOutput = d(DecodeTensor::AttentionOutput);
     buffers.ropeCos = d(DecodeTensor::RopeCos);
     buffers.ropeSin = d(DecodeTensor::RopeSin);
-    buffers.arrived = d(DecodeTensor::Arrived);
-    buffers.generation = d(DecodeTensor::Generation);
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
@@ -1463,15 +1442,11 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      chunks[lane] = ops::PagedAttention::verifyParams(
+          items[lane].logicalPosition,
+          static_cast<uint32_t>(items[lane].pageTable.size()));
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      const ModelBatchItem &item = paddedItem(lane);
-      q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
-                          item.pageTable);
-      verify[lane] = kv::q8VerifyAttentionParams(
-          q8[lane].committed_tokens, q8[lane].chunk_tokens,
-          q8[lane].chunk_stride, q8[lane].page_table_entries);
-      if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
-        throw std::invalid_argument("invalid batched KV verify geometry");
       Request &entry = laneEntry(entries, lane);
       buffers.pageTables[lane] =
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
@@ -1494,8 +1469,8 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(), q8,
-                          verify, lanes, stats);
+    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
+                          std::span(chunks).first(lanes), lanes);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1519,8 +1494,7 @@ struct Runtime::Impl {
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
-                                   std::span<const ModelBatchItem> items,
-                                   ops::LinearDispatchStats &stats) {
+                                   std::span<const ModelBatchItem> items) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
@@ -1531,9 +1505,8 @@ struct Runtime::Impl {
     };
 
     std::array<uint32_t, kLaneCount> startPositions{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
-      startPositions[lane] = static_cast<uint32_t>(
-          items[std::min(lane, lanes - 1)].logicalPosition);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      startPositions[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
     DFlashContextBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
@@ -1544,8 +1517,8 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers), startPositions,
-                                lanes, stats);
+    draftModel.addContextCommit(graph, std::move(buffers),
+                                std::span(startPositions).first(lanes));
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -1590,7 +1563,7 @@ struct Runtime::Impl {
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    sampling.addVerifyInput(
+    targetModel.addVerifyInput(
         graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
         decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes);
@@ -1636,17 +1609,12 @@ struct Runtime::Impl {
 
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      const ops::LinearDispatchStats &stats, CommandTiming timing) {
+      CommandTiming timing) {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
       auto d = [&](DecodeTensor tensor) {
         return decodeArena->get(lane, tensor);
       };
-      const uint32_t generation =
-          *contents<uint32_t>(d(DecodeTensor::Generation), "target generation");
-      if (generation != geometry.target.stateLayout.layers)
-        throw std::runtime_error("target verify resident grids did not finish");
-
       laneResult.retained = *contents<uint32_t>(d(DecodeTensor::RetainedCount),
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
@@ -1712,10 +1680,6 @@ struct Runtime::Impl {
     }
 
     counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
-    counters.lastDecodeFusedOperations = stats.fusedSourceOperations;
-    counters.lastDecodeM16Dispatches = stats.m16Dispatches;
-    counters.lastDecodeM24Dispatches = stats.m24Dispatches;
-    counters.lastDecodeM32Dispatches = stats.m32Dispatches;
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
@@ -1733,11 +1697,10 @@ struct Runtime::Impl {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::span<const ModelBatchItem> items,
-                            const ops::LinearDispatchStats &stats,
                             const CommandGraph &draft,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)),
-          items_(items.begin(), items.end()), stats_(stats),
+          items_(items.begin(), items.end()),
           wake_(std::move(completion)) {
       submit(draft);
     }
@@ -1775,7 +1738,7 @@ struct Runtime::Impl {
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    DecodeTensor::Hidden0, width);
         impl_.encodeTargetVerifyBatchForward(
-            target, {entries.data(), lanes_.size()}, items_, stats_);
+            target, {entries.data(), lanes_.size()}, items_);
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -1820,7 +1783,7 @@ struct Runtime::Impl {
                                       {maximumRetained.data(), lanes_.size()});
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
-              commit, {entries.data(), lanes_.size()}, items_, stats_);
+              commit, {entries.data(), lanes_.size()}, items_);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -1867,7 +1830,7 @@ struct Runtime::Impl {
           targetForwardGpuSeconds_;
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
-      return impl_.finalizeDecode(lanes_, items_, stats_, timing_);
+      return impl_.finalizeDecode(lanes_, items_, timing_);
     }
 
     double wallMilliseconds() const noexcept override {
@@ -1895,7 +1858,6 @@ struct Runtime::Impl {
     Impl &impl_;
     std::vector<DecodeLaneResult> lanes_;
     std::vector<ModelBatchItem> items_;
-    ops::LinearDispatchStats stats_;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
@@ -2288,7 +2250,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   const uint32_t ropeRows = width * kDecodeRows;
-  ops::LinearDispatchStats batchStats;
   CommandGraph commandGraph;
   impl_->addRopeTables(
       commandGraph,
@@ -2301,30 +2262,26 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               DecodeTensor::DraftHidden0, width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width}, batchStats);
+                               {logicalPositions.data(), width});
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, batchStats, commandGraph,
-        std::move(completion));
+        *impl_, std::move(lanes), items, commandGraph, std::move(completion));
   }
   impl_->encodeBatchVerifyInput(commandGraph, width);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               DecodeTensor::Hidden0, width);
-  impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items,
-                                        batchStats);
+  impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
   impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
   impl_->encodeBatchAcceptance(commandGraph, entries,
                                {maximumRetained.data(), width});
   impl_->encodeBatchGdnCommit(commandGraph, entries);
-  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items,
-                                     batchStats);
+  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
   auto finish = [impl, lanes = std::move(lanes),
-                 items = std::move(copiedItems),
-                 batchStats](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, batchStats, timing);
+                 items = std::move(copiedItems)](CommandTiming timing) mutable {
+    return impl->finalizeDecode(lanes, items, timing);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.dispatches(), std::move(completion));
@@ -2564,28 +2521,11 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                                    decoded[lane].outputTokensWithoutKv &&
                            lengths.hasCompleteDraftWindow(kDraftCacheStride);
     }
-    const bool fusedWidth =
-        width == 1 ||
-        (width == 2 && impl_->counters.lastDecodeFusedOperations &&
-         impl_->counters.lastDecodeM16Dispatches) ||
-        (width == 3 && impl_->counters.lastDecodeFusedOperations &&
-         impl_->counters.lastDecodeM24Dispatches) ||
-        (width == 4 && impl_->counters.lastDecodeFusedOperations &&
-         impl_->counters.lastDecodeM32Dispatches);
-    const bool fusedMaximum =
-        width != kLaneCount || (impl_->counters.lastDecodeM32Dispatches > 0 &&
-                                impl_->counters.lastDecodeM16Dispatches == 0);
-    if (!committedEveryLane || !fusedWidth || !fusedMaximum ||
-        impl_->counters.lastDecodeWidth != width) {
+    if (!committedEveryLane || impl_->counters.lastDecodeWidth != width) {
       throw std::runtime_error(
           "decode warmup B" + std::to_string(width) +
           " mismatch [committed=" + std::to_string(committedEveryLane) +
-          ",fused=" + std::to_string(fusedWidth) +
-          ",maximum=" + std::to_string(fusedMaximum) +
-          ",m16=" + std::to_string(impl_->counters.lastDecodeM16Dispatches) +
-          ",m24=" + std::to_string(impl_->counters.lastDecodeM24Dispatches) +
-          ",m32=" + std::to_string(impl_->counters.lastDecodeM32Dispatches) +
-          "]");
+          ",width=" + std::to_string(impl_->counters.lastDecodeWidth) + "]");
     }
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),

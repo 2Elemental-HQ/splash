@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
-#include <utility>
 
 namespace splash::ops {
 namespace {
@@ -21,11 +20,6 @@ uint32_t effectiveTopK(const SamplingPolicy &policy,
                        uint32_t vocabulary) noexcept {
   return policy.topK && policy.topK < vocabulary ? policy.topK : vocabulary;
 }
-constexpr uint32_t kDraftShards = SPLASH_DRAFT_SAMPLING_SHARDS;
-// Each position's group scores its 16 x 16 edge table eight edges per
-// simdgroup task; eight simdgroups balance the seven-group B1 dispatch
-// against the 28 groups of B4 (wider groups speed up B1 and slow down B4).
-constexpr uint32_t kEdgeThreads = 256;
 constexpr uint32_t kPenaltyThreads = 256;
 
 void requireVocabulary(std::span<const uint32_t> tokens, size_t vocabulary) {
@@ -47,17 +41,6 @@ SamplingWorkspace Sampling::workspace(uint32_t rows) {
           uint64_t{rows} * SPLASH_TARGET_VOCABULARY_RANGES *
               sizeof(TargetVocabularyRange),
           uint64_t{rows} * sizeof(uint32_t)};
-}
-
-DraftSelectorWorkspace Sampling::draftWorkspace(uint32_t positions) {
-  if (!positions)
-    throw std::invalid_argument("invalid draft selector workspace position count");
-  const uint64_t candidates = uint64_t{positions} * SPLASH_DRAFT_CANDIDATES;
-  // The partial values are followed by each position's 16 x 16 edge table.
-  return {candidates * kDraftShards * sizeof(uint32_t),
-          candidates * (kDraftShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
-          candidates * sizeof(uint32_t), candidates * sizeof(float),
-          candidates * sizeof(float)};
 }
 
 void Sampling::rebuildPenaltyWords(std::span<uint32_t> words,
@@ -150,7 +133,8 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid initial sampling row");
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
-  addSelection(graph, policies, buffers, {1, rowOffset, 0, 0, 0}, stopToken0,
+  addSelection(graph, policies, buffers,
+               {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0,
                stopToken1);
 }
 
@@ -163,10 +147,10 @@ void Sampling::addVerify(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid sampling batch width");
   addPenalties(graph, policies, buffers, penalties, 0, true);
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
-  // follows draft token r; every row draws with the lane's last uniform.
+  // follows draft token r; every row draws with the lane's correction
+  // uniform.
   addSelection(graph, policies, buffers,
-               {SPLASH_TARGET_VERIFY_ROWS, 0, 1,
-                2 * SPLASH_TARGET_VERIFY_ROWS - 1,
+               {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION,
                 SPLASH_DRAFT_PROPOSAL_TOKENS},
                stopToken0, stopToken1);
 }
@@ -235,42 +219,6 @@ void Sampling::addSelection(metal::CommandGraph &graph,
   }
 }
 
-void Sampling::addDraftSelector(
-    metal::CommandGraph &graph, DraftSelectorBuffers buffers,
-    std::span<const uint32_t> anchors,
-    std::span<const SamplingPolicy> policies, uint32_t proposalTokens) const {
-  if (anchors.empty() || anchors.size() != policies.size() ||
-      anchors.size() > kMaximumLanes ||
-      proposalTokens != SPLASH_DRAFT_PROPOSAL_TOKENS)
-    throw std::invalid_argument("invalid draft selector batch");
-  const uint32_t lanes = static_cast<uint32_t>(anchors.size());
-  SelectorBatchParams params{};
-  params.lanes = lanes;
-  params.vocabulary = vocabulary_;
-  for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
-    const uint32_t source = std::min(lane, lanes - 1);
-    params.anchor[lane] = anchors[source];
-    params.temperature[lane] = policies[source].temperature;
-    if (lane < lanes && policies[lane].samples())
-      params.sampling_mask |= uint32_t{1} << lane;
-  }
-  graph.add("draft_select_top16_sharded",
-            {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_,
-            {uint64_t{lanes} * proposalTokens * kDraftShards, 1, 1});
-  graph.add("draft_select_edges",
-            {buffers.partialIds, buffers.partialValues, buffers.candidates,
-             buffers.unary, buffers.selectorHidden,
-             buffers.predecessorCodebook, buffers.successorCodebook},
-            params, {uint64_t{lanes} * proposalTokens, 1, 1},
-            {kEdgeThreads, 1, 1});
-  graph.add("draft_select_dflash",
-            {buffers.candidates, buffers.unary, buffers.partialValues,
-             buffers.uniforms, buffers.proposedTokens,
-             buffers.proposalProbabilities},
-            params, {lanes, 1, 1}, {1, 1, 1});
-}
-
 void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
@@ -279,11 +227,11 @@ void Sampling::addAcceptance(
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
       maximumRetained.size() > kMaximumLanes)
     throw std::invalid_argument("invalid DFlash acceptance batch");
+  const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
   AcceptBatchParams params{};
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
-  params.lanes = static_cast<uint32_t>(maximumRetained.size());
-  for (uint32_t lane = 0; lane < params.lanes; ++lane) {
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
         maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid DFlash retention limit");
@@ -296,22 +244,7 @@ void Sampling::addAcceptance(
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
              buffers.acceptedCounts},
-            params, {params.lanes, 1, 1}, {1, 1, 1});
-}
-
-void Sampling::addVerifyInput(metal::CommandGraph &graph,
-                              metal::MetalBuffer draftInputTokens,
-                              metal::MetalBuffer proposedTokens,
-                              metal::MetalBuffer verifyInputTokens,
-                              uint32_t lanes) const {
-  if (!lanes || lanes > kMaximumLanes)
-    throw std::invalid_argument("invalid verify input batch");
-  const VerifyInputBatchParams params{lanes, vocabulary_};
-  graph.add("verify_input_tokens",
-            {std::move(draftInputTokens), std::move(proposedTokens),
-             std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
-            {1, 1, 1});
+            params, {lanes, 1, 1}, {1, 1, 1});
 }
 
 } // namespace splash::ops

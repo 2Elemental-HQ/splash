@@ -142,8 +142,8 @@ class ArchitectureTests(unittest.TestCase):
         symbols = (
             "PrefillAttentionWave",
             "prefillAttentionTiles",
-            "kQ8VerifySplits",
-            "kQ8PrefillAttentionTileRows",
+            "kVerifySplits",
+            "kPrefillAttentionTileRows",
             "moeMaximumTiles",
             "kMoePrefillTileRows",
             "kMoeDecodeTileRows",
@@ -160,15 +160,9 @@ class ArchitectureTests(unittest.TestCase):
             "LinearTile",
             "LinearConfig",
             "LinearSimdgroups",
-            "PrefillSplitMultiplier",
-            "PrefillAttentionConfig",
-            "VerifySplitCount",
-            "VerifyAttentionConfig",
-            "AttentionScalePlacement",
             "MoeExpertTile",
             "MoeExpertSimdgroups",
             "MoeConfig",
-            "DraftAttentionConfiguration",
             "selectorShards",
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -345,8 +339,6 @@ class ArchitectureTests(unittest.TestCase):
             assembly.write_text(
                 '#include "model/Runtime.hpp"\n'
                 "ops::ExecutionPlans plans(device);\n"
-                "ops::OperatorChoices choices;\n"
-                "plans.install(choices);\n"
                 "ops::tuning::MeasurementOptions options;\n"
             )
             with mock.patch.object(check_architecture, "ROOT", root):

@@ -168,7 +168,7 @@ struct QwenTargetPrefillSequence final {
   uint32_t attentionStride = 0;
   uint64_t queryOffset = 0;
   uint64_t kvOffset = 0;
-  kv::Q8ChunkedPrefillParams q8;
+  kv::ChunkedPrefillParams chunk;
   metal::MetalBuffer pageTable;
   std::span<const metal::MetalBuffer> convolutionIn;
   std::span<const metal::MetalBuffer> convolutionOut;
@@ -215,7 +215,6 @@ struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
-  metal::MetalBuffer recurrent;
   metal::MetalBuffer gdnHidden;
   metal::MetalBuffer gdnOutput;
   metal::MetalBuffer denseIntermediate;
@@ -228,8 +227,6 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer attentionOutput;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
-  metal::MetalBuffer arrived;
-  metal::MetalBuffer generation;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -290,15 +287,18 @@ public:
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
-      std::span<const kv::Q8ChunkedPrefillParams> q8,
-      std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::LinearDispatchStats &stats) const;
+      std::span<const kv::ChunkedPrefillParams> chunks,
+      uint32_t lanes) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                    uint32_t lanes, ops::LinearScratch scratch,
-                    ops::LinearDispatchStats &stats) const;
+                    uint32_t lanes, ops::LinearScratch scratch) const;
+  // The verify input tokens addEmbedding then gathers: each lane's anchor,
+  // row 0 of its draft input, and the draft's proposals.
+  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
+                      metal::MetalBuffer proposals,
+                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,

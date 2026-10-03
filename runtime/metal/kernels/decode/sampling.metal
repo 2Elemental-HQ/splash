@@ -908,8 +908,7 @@ kernel void decode_sample_vocabulary_draw(
           drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * 2 * SPLASH_TARGET_VERIFY_ROWS +
-                   params.uniform],
+          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
           token, draft_probability) &&
@@ -1226,8 +1225,6 @@ kernel void draft_select_edges(
   constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
   uint batch = row / Positions;
   uint position = row % Positions;
-  if (batch >= params.lanes)
-    return;
   threadgroup uint successors[Candidates];
   threadgroup uint predecessors[Candidates];
   if (simd_group == 0) {
@@ -1305,9 +1302,6 @@ kernel void draft_select_dflash(
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[thread_position_in_grid]]) {
-  if (batch >= params.lanes)
-    return;
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
@@ -1316,7 +1310,7 @@ kernel void draft_select_dflash(
   device const float *tables = partial_values +
                                params.lanes * Positions * Shards * Candidates +
                                batch * Positions * Candidates * Candidates;
-  uniforms += batch * 2 * Rows;
+  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
 
@@ -1347,7 +1341,7 @@ kernel void draft_select_dflash(
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&
-            cumulative > uniforms[position + 1]) {
+            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
           selected = i;
         }
       }
@@ -1371,6 +1365,13 @@ inline float sparse_lookup(device const uint *ids,
   }
   return 0.0f;
 }
+
+// One lane's view of AcceptBatchParams, built by decode_accept_dflash.
+struct AcceptParams {
+  uint remaining;
+  uint stop_token_0;
+  uint stop_token_1;
+};
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
 // cut after the first stop token, and records the retained and accepted
@@ -1409,7 +1410,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                             draft_probs + accepted * kDraftCandidates,
                             kDraftCandidates, token);
     float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[accepted + SPLASH_TARGET_VERIFY_ROWS] * q < p))
+    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -1507,24 +1508,6 @@ kernel void decode_sample_argmax_reduce(
     tokens[s] = token;
 }
 
-kernel void verify_input_tokens(
-    device const uint *draft_input [[buffer(0)]],
-    device const uint *draft_tokens [[buffer(1)]],
-    device uint *verify_input [[buffer(2)]],
-    constant VerifyInputBatchParams &params [[buffer(3)]],
-    uint index [[thread_position_in_grid]]) {
-  uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS;
-  if (index < count) {
-    uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
-    uint row = index % SPLASH_TARGET_VERIFY_ROWS;
-    uint token = row == 0
-                     ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
-                     : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
-                                    row - 1];
-    verify_input[index] = min(token, params.vocabulary - 1u);
-  }
-}
-
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
@@ -1550,8 +1533,6 @@ kernel void decode_accept_dflash(
     device uint *accepted_count [[buffer(7)]],
     constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  if (batch >= params.lanes)
-    return;
   uint remaining = params.remaining[batch];
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1};
@@ -1565,7 +1546,7 @@ kernel void decode_accept_dflash(
         draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
         target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
-        uniforms + batch * 2 * SPLASH_TARGET_VERIFY_ROWS, lane_target,
+        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
   } else {
     accept_greedy_lane(lane_draft, lane_target, retained[batch],

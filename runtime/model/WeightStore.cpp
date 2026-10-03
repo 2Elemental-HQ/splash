@@ -2,6 +2,7 @@
 
 #include "Checked.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufFile.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/PreparedWeights.hpp"
 
@@ -262,7 +263,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     std::memcpy(&d, bytes, sizeof d);
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
-        (d.type != GGUF_TYPE_F32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
+        (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
@@ -270,7 +271,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    if (d.type == GGUF_TYPE_F32) {
+    if (d.type == ggml::kF32) {
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));

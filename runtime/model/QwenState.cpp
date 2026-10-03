@@ -205,10 +205,8 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
       pool_(std::make_shared<QwenBufferPool>()) {
   if (!admitAllocation_)
     throw std::invalid_argument("Qwen state allocation admission is required");
-  if (!layout_.valid() ||
-      layout_.draft.tokens != ExecutionLimits::draftContextTokens) {
+  if (!layout_.valid())
     throw std::invalid_argument("Qwen composite state layout is invalid");
-  }
   if (file) {
     file_ = std::move(file);
     staging_ = std::make_shared<StateStaging>();
@@ -488,13 +486,13 @@ const QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) const {
 
 void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
                                        bool cacheSnapshot) const {
-  if (lengths.draftLength > layout_.draft.tokens ||
+  if (lengths.draftLength > ExecutionLimits::draftContextTokens ||
       lengths.draftEnd() > lengths.targetTokens) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
   if (cacheSnapshot &&
       (!lengths.targetTokens ||
-       !lengths.hasCompleteDraftWindow(layout_.draft.tokens) ||
+       !lengths.hasCompleteDraftWindow(ExecutionLimits::draftContextTokens) ||
        lengths.targetTokens % kv::kPageTokens)) {
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");

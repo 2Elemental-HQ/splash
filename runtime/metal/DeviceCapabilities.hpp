@@ -19,8 +19,9 @@ struct DeviceCapabilities {
     // Highest supported MTLGPUFamilyAppleN.
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
     uint32_t appleGpuFamily = 0;
-    // IORegistry gpu-core-count; zero means unavailable. Kernel policy then
-    // uses its fallback for unknown core counts; keep the missing value here.
+    // IORegistry gpu-core-count; zero means unavailable. ops::plannedGpuCores
+    // substitutes ops::kAssumedGpuCores for kernel policy. Keep the missing
+    // value here (status reports it).
     uint32_t gpuCoreCount = 0;
     uint64_t physicalMemoryBytes = 0;
     uint64_t recommendedMaxWorkingSetBytes = 0;

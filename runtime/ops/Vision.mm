@@ -25,6 +25,14 @@ constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 
+// The one vision tower the kernels are specialized for.
+constexpr VisionLayout kTower{};
+static_assert(kTower.headDimension + 8 == kQkDimension && kTower.hiddenSize % kGemmColumnTile == 0 &&
+                  kTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
+                  kTower.mergedHiddenSize % kMergerColumnTile == 0 &&
+                  kTower.patchDimension % kGemmColumnTile == 0,
+              "vision kernels' tile assumptions");
+
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
 }
@@ -61,14 +69,8 @@ void requireLayout(const VisionLayout &layout) {
   // Packages share the same vision tower; only the language-space projection
   // width varies with the text model.
   VisionLayout tower = layout;
-  tower.outputHiddenSize = VisionLayout{}.outputHiddenSize;
-  if (tower != VisionLayout{} || !layout.outputHiddenSize ||
-      layout.headDimension + 8 != kQkDimension ||
-      layout.hiddenSize % kGemmColumnTile ||
-      layout.paddedIntermediateSize % kGemmColumnTile ||
-      layout.mergedHiddenSize % kMergerColumnTile ||
-      layout.outputHiddenSize % kMergerColumnTile ||
-      layout.patchDimension % kGemmColumnTile) {
+  tower.outputHiddenSize = kTower.outputHiddenSize;
+  if (tower != kTower || !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
     throw std::invalid_argument(
         "vision kernels are specialized for the Qwen3.5 27-block tower");
   }

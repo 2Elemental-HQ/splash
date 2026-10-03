@@ -23,9 +23,6 @@ TUNING_SOURCES := \
 	dev/tuning/Tuning.cpp \
 	dev/tuning/Measurement.cpp \
 	dev/tuning/LinearTuning.cpp \
-	dev/tuning/AttentionTuning.cpp \
-	dev/tuning/DraftAttentionTuning.cpp \
-	dev/tuning/MoeTuning.cpp \
 	dev/tuning/TuningWorkloads.cpp
 # Control-plane tests compile the runtime sources they check: their sanitizer
 # builds cannot use the unsanitized engine library, and none links a framework.
@@ -106,9 +103,6 @@ TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_LINEAR_TUNING := $(ENGINE_TEST_BUILD)/linear-tuning
-TEST_ATTENTION_TUNING := $(ENGINE_TEST_BUILD)/attention-tuning
-TEST_DRAFT_ATTENTION_TUNING := $(ENGINE_TEST_BUILD)/draft-attention-tuning
-TEST_MOE_TUNING := $(ENGINE_TEST_BUILD)/moe-tuning
 TEST_TUNING_WORKLOADS := $(ENGINE_TEST_BUILD)/tuning-workloads
 TUNE_KERNELS := $(ENGINE_TEST_BUILD)/tune-kernels
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
@@ -130,10 +124,10 @@ TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
 TEST_Q8_KERNEL_SOURCES := \
-	runtime/metal/kernels/prefill/attention_q8.metal \
-	runtime/metal/kernels/decode/attention_q8.metal \
-	runtime/metal/kernels/prefill/attention_q8_store.metal \
-	runtime/metal/kernels/decode/attention_q8_store.metal
+	runtime/metal/kernels/prefill/paged_attention.metal \
+	runtime/metal/kernels/decode/paged_attention.metal \
+	runtime/metal/kernels/prefill/paged_attention_store.metal \
+	runtime/metal/kernels/decode/paged_attention_store.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.
@@ -150,8 +144,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_C
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_TUNING_WORKLOADS) \
-	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
-	$(TEST_DRAFT_ATTENTION_TUNING) $(TEST_MOE_TUNING) \
+	$(TEST_LINEAR_PLAN) $(TEST_LINEAR_TUNING) \
 	$(TEST_OPERATOR_TUNING) \
 	$(TEST_OPERATOR_MEASUREMENT) \
 	$(TEST_EXECUTION_PLANS) \
@@ -182,9 +175,6 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_LINEAR_TUNING) \
-	$(TEST_ATTENTION_TUNING) \
-	$(TEST_DRAFT_ATTENTION_TUNING) \
-	$(TEST_MOE_TUNING) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -448,21 +438,6 @@ $(TEST_LINEAR_TUNING): dev/tests/engine/linear_tuning_test.cc $(TUNING_SOURCES) 
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_ATTENTION_TUNING): dev/tests/engine/attention_tuning_test.cc $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
-
-$(TEST_DRAFT_ATTENTION_TUNING): dev/tests/engine/draft_attention_tuning_test.cc $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
-
-$(TEST_MOE_TUNING): dev/tests/engine/moe_tuning_test.mm $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
-
 $(TEST_TUNING_WORKLOADS): dev/tests/engine/tuning_workloads_test.cpp $(TUNING_SOURCES) \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
@@ -485,10 +460,10 @@ $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
+$(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm $(TUNING_SOURCES) \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(TUNING_SOURCES) \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_DFLASH_BATCH_CONTROL_TEST): dev/tests/engine/dflash_batch_control_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
@@ -634,9 +609,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
 	$(TEST_LINEAR_TUNING) --cpu
-	$(TEST_ATTENTION_TUNING)
-	$(TEST_DRAFT_ATTENTION_TUNING)
-	$(TEST_MOE_TUNING) --cpu
 	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
 	/bin/sh dev/tests/tune_kernels_cli.sh $(TUNE_KERNELS)
 	$(TEST_OPERATOR_WORKSPACE)
@@ -672,9 +644,6 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_TUNING) --metal $(LIB)
-	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TUNING) --metal $(LIB)
-	$(METAL_TEST_ENV) $(TEST_MOE_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(TEST_LINEAR_PLAN) --capabilities $(LIB)
@@ -738,8 +707,10 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 	$(TEST_ATTENTION_SWEEP) $(LIB) $(ATTENTION_SWEEP_ARGS)
 
 # One GGUF projection on both decode tiles at every lane count and K split
-# (the split tiers of runtime/ops/LinearGguf.cpp); GGUF_PROJECTION_ARGS passes
-# <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds].
+# (the split tiers of runtime/ops/LinearGguf.cpp), or with prefill=R[,R...]
+# on the 128-row prefill tile at each chunk of R rows; GGUF_PROJECTION_ARGS
+# passes <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
+# [prefill=R[,R...]].
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)

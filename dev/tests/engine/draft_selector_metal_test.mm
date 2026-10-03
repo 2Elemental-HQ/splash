@@ -7,8 +7,8 @@
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing.
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/ExecutionGeometry.h"
-#include "ops/Sampling.hpp"
+#include "metal/abi/Sampling.h"
+#include "ops/DraftSelector.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #import <Foundation/Foundation.h>
@@ -142,8 +142,8 @@ void runCase(MetalBackend &backend, const Case &c) {
   Random random(0x5e1ec7 + uint64_t{c.vocabulary} * 8 + c.lanes * 2 + c.sampling);
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
-  const auto workspace = Sampling::draftWorkspace(positions);
-  Sampling sampling(c.vocabulary);
+  const auto workspace = DraftSelector::workspace(positions);
+  const DraftSelector selector(c.vocabulary);
 
   MetalBuffer logits = allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
@@ -152,20 +152,24 @@ void runCase(MetalBackend &backend, const Case &c) {
   for (uint32_t row = 0; row < rows; ++row)
     fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
+  const MetalBuffer selectorHidden =
+      randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F);
+  const DraftCodebooks codebooks{
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
   DraftSelectorBuffers buffers{
       logits,
       allocate(backend, workspace.partialIdsBytes),
       allocate(backend, workspace.partialValuesBytes),
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
-      randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F),
-      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
-      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
-      allocate(backend, uint64_t{c.lanes} * 2 * kRows * sizeof(float)),
+      selectorHidden,
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes)};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * 2 * kRows; ++index)
+  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
   std::vector<SamplingPolicy> policies(c.lanes);
@@ -175,7 +179,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 
   CommandGraph graph;
-  sampling.addDraftSelector(graph, buffers, anchors, policies, kPositions);
+  selector.add(graph, buffers, codebooks, anchors, policies);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -188,11 +192,11 @@ void runCase(MetalBackend &backend, const Case &c) {
   const auto *probabilities =
       static_cast<const float *>(buffers.proposalProbabilities.contents());
   const auto *hidden =
-      static_cast<const uint16_t *>(buffers.selectorHidden.contents());
+      static_cast<const uint16_t *>(selectorHidden.contents());
   const auto *predecessors =
-      static_cast<const uint16_t *>(buffers.predecessorCodebook.contents());
+      static_cast<const uint16_t *>(codebooks.predecessor.contents());
   const auto *successors =
-      static_cast<const uint16_t *>(buffers.successorCodebook.contents());
+      static_cast<const uint16_t *>(codebooks.successor.contents());
 
   for (uint32_t lane = 0; lane < c.lanes; ++lane) {
     uint32_t predecessor = anchors[lane];
@@ -241,7 +245,8 @@ void runCase(MetalBackend &backend, const Case &c) {
           reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
           sum += reference[rank];
         }
-        const float uniform = uniforms[lane * 2 * kRows + position + 1];
+        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
+                                       SPLASH_UNIFORM_PROPOSALS + position];
         std::array<double, kCandidates> cumulative{};
         uint32_t expectedSelection = kCandidates - 1;
         for (uint32_t rank = 0; rank < kCandidates; ++rank) {
@@ -274,32 +279,25 @@ void runCase(MetalBackend &backend, const Case &c) {
 }
 
 void invalidRequests(MetalBackend &backend) {
-  Sampling sampling(1024);
-  const auto workspace = Sampling::draftWorkspace(kPositions);
-  DraftSelectorBuffers buffers{
+  rejects([] { DraftSelector(0); });
+  const DraftSelector selector(1024);
+  const auto workspace = DraftSelector::workspace(kPositions);
+  const DraftSelectorBuffers buffers{
       allocate(backend, uint64_t{kRows} * 1024 * sizeof(float)),
       allocate(backend, workspace.partialIdsBytes),
       allocate(backend, workspace.partialValuesBytes),
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{kRows} * kRank * 2),
-      allocate(backend, uint64_t{1024} * kRank * 2),
-      allocate(backend, uint64_t{1024} * kRank * 2),
-      allocate(backend, 2 * kRows * sizeof(float)),
+      allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes)};
+  const DraftCodebooks codebooks{allocate(backend, uint64_t{1024} * kRank * 2),
+                                 allocate(backend, uint64_t{1024} * kRank * 2)};
   const std::array<uint32_t, 2> anchors{1, 2};
   const std::array<SamplingPolicy, 1> policies{SamplingPolicy{}};
   CommandGraph graph;
-  rejects([&] {
-    sampling.addDraftSelector(graph, buffers, anchors, policies, kPositions);
-  });
-  // The kernels compile the proposal count in.
-  for (const uint32_t proposals : {0U, kPositions - 1, kPositions + 1})
-    rejects([&] {
-      sampling.addDraftSelector(graph, buffers, std::span(anchors).first(1),
-                                policies, proposals);
-    });
+  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); });
   require(graph.empty(), "invalid draft selector request encoded a graph");
 }
 

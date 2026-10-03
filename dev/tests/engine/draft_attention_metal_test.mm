@@ -7,6 +7,7 @@
 // bounds, the window mask, empty splits and the empty-row softmax guard are
 // all exercised.
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/DraftAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -36,7 +37,7 @@ constexpr uint32_t kWindow = 2048;
 constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
-constexpr uint32_t kSplits = 4;
+constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
@@ -182,30 +183,29 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       static_cast<const uint16_t *>(queries.contents()) +
           uint64_t{lanes} * kRows * kAttention);
 
-  std::vector<uint16_t> baseline;
-  for (const auto configuration : DraftAttention::candidates(shape)) {
-    std::memcpy(queries.contents(), input.data(), input.size() * 2);
-    CommandGraph graph;
-    DraftAttention::addDecode(graph,
-        {queries, keys, values, queryKeys, queryValues}, cacheLengths, kWindow,
-        DraftAttention::plan(shape, lanes, configuration));
-    const auto dispatches = graph.dispatches();
-    require(dispatches.size() == 2 &&
-                dispatches[0].threadgroups.x == kKvHeads &&
-                dispatches[0].threadgroups.y == lanes &&
-                dispatches[0].threadgroups.z == kSplits &&
-                dispatches[1].threadgroups.x == kKvHeads &&
-                dispatches[1].threadgroups.y == lanes &&
-                dispatches[1].threadgroups.z == 1,
-            "draft attention core dispatch changed with configuration");
-    static_cast<void>(backend.submitCommand(dispatches));
-    const auto *output = static_cast<const uint16_t *>(queries.contents());
-    if (baseline.empty())
-      baseline.assign(output, output + input.size());
-    else
-      require(std::equal(baseline.begin(), baseline.end(), output),
-              "draft attention candidate changed core output");
-  }
+  CommandGraph graph;
+  DraftAttention::addDecode(graph,
+      {queries, keys, values, queryKeys, queryValues},
+      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+  const auto dispatches = graph.dispatches();
+  require(dispatches.size() == 2 &&
+              dispatches[0].threadgroups.x == kKvHeads &&
+              dispatches[0].threadgroups.y == lanes &&
+              dispatches[0].threadgroups.z == kSplits &&
+              dispatches[1].threadgroups.x == kKvHeads &&
+              dispatches[1].threadgroups.y == lanes &&
+              dispatches[1].threadgroups.z == 1,
+          "draft attention core dispatch changed");
+  static_cast<void>(backend.submitCommand(dispatches));
+  // A cache length for each of the plan's lanes, no fewer.
+  CommandGraph mismatched;
+  rejects([&] {
+    DraftAttention::addDecode(mismatched,
+        {queries, keys, values, queryKeys, queryValues},
+        std::span(cacheLengths).first(lanes - 1),
+        DraftAttention::plan(shape, lanes));
+  });
+  require(mismatched.empty(), "mismatched cache lengths encoded a graph");
 
   const auto *output = static_cast<const uint16_t *>(queries.contents());
   std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
@@ -246,34 +246,26 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
 
 void planGeometry() {
   for (const auto shape : kShapes) {
-    const auto candidates = DraftAttention::candidates(shape);
-    require(candidates.size() == 4 && candidates.front() == DraftAttentionConfiguration{},
-            "draft candidate list lost the full-grid baseline");
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       const uint64_t rows = uint64_t{lanes} * kRows;
-      for (const auto configuration : candidates) {
-        const auto plan = DraftAttention::plan(shape, lanes, configuration);
-        const auto workspace = plan.workspace();
-        require(plan.lanes() == lanes && plan.shape() == shape &&
-                    plan.configuration() == configuration &&
-                    workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
-                    workspace.qkvBytes == rows * 6144 * 2 &&
-                    workspace.groupedQueriesBytes ==
-                        rows * 4096 * 2 +
-                            uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
-                    workspace.queryKeysBytes == rows * 8 * 128 * 2 &&
-                    workspace.queryValuesBytes == rows * 8 * 128 * 2,
-                "draft plan padded lanes or changed tensor storage");
-      }
+      const auto plan = DraftAttention::plan(shape, lanes);
+      const auto workspace = plan.workspace();
+      require(plan.lanes() == lanes && plan.shape() == shape &&
+                  workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
+                  workspace.qkvBytes == rows * 6144 * 2 &&
+                  workspace.groupedQueriesBytes ==
+                      rows * 4096 * 2 +
+                          uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
+                  workspace.queryKeysBytes == rows * 8 * 128 * 2 &&
+                  workspace.queryValuesBytes == rows * 8 * 128 * 2,
+              "draft plan padded lanes or changed tensor storage");
     }
     rejects([&] { (void)DraftAttention::plan(shape, 0); });
     rejects([&] { (void)DraftAttention::plan(shape, 5); });
-    rejects([&] { (void)DraftAttention::plan(shape, 1, {1}); });
-    rejects([&] { (void)DraftAttention::plan(shape, 1, {61}); });
   }
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
-  rejects([&] { (void)DraftAttention::candidates(unsupported); });
+  rejects([&] { (void)DraftAttention::plan(unsupported, 1); });
   rejects([&] { (void)DraftAttention::plan({}, 1); });
 }
 
@@ -286,8 +278,8 @@ void fillDyadic(const MetalBuffer &buffer, uint32_t multiplier, uint32_t modulus
 
 void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                        uint32_t lanes) {
-  const auto baselinePlan = DraftAttention::plan(shape, lanes);
-  const auto workspace = baselinePlan.workspace();
+  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto workspace = plan.workspace();
   const uint64_t rows = uint64_t{lanes} * kRows;
   auto allocate = [&](uint64_t bytes) {
     return backend.allocateBuffer(bytes, BufferStorage::Shared, "draft phases");
@@ -329,81 +321,105 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   std::vector<uint16_t> originalQkv(
       static_cast<const uint16_t *>(qkv.contents()),
       static_cast<const uint16_t *>(qkv.contents()) + workspace.qkvBytes / 2);
-  const std::array preparedBuffers{qkv, queries, queryKeys, queryValues};
-  std::array<std::vector<uint16_t>, 4> preparedBaseline;
-  for (const auto configuration : DraftAttention::candidates(shape)) {
-    const auto plan = DraftAttention::plan(shape, lanes, configuration);
-    for (const auto stage : {DraftConvolutionStage::Prepare,
-                            DraftConvolutionStage::Residual}) {
-      std::memset(output.contents(), 0xFF, output.sizeBytes());
-      CommandGraph graph;
-      DraftAttention::addConvolution(graph,
-          {input, dynamic, weights, residual, output}, plan, stage);
-      std::array<uint32_t, 3> params{};
-      std::memcpy(params.data(), graph.dispatches()[0].bytes[0].data,
-                  sizeof(params));
-      const uint32_t expectedGroups = configuration.groups
-          ? configuration.groups
-          : (kRows * shape.hiddenSize + 255) / 256;
-      require(graph.dispatches()[0].threadgroups.x == params[0] &&
-                  params[0] == expectedGroups && params[2] == lanes,
-              "convolution dispatch and loop stride permit overlapping writes");
-      static_cast<void>(backend.submitCommand(graph.dispatches()));
-      const auto *actual = static_cast<const uint16_t *>(output.contents());
-      const bool finish = stage == DraftConvolutionStage::Residual;
-      const uint32_t kind = finish ? 1 : 0;
-      for (uint64_t row = 0; row < rows; ++row) {
-        for (uint32_t channel = 0; channel < shape.hiddenSize; ++channel) {
-          const uint64_t index = row * shape.hiddenSize + channel;
-          const uint32_t group = channel / channelsPerGroup;
-          float value = tuning::bf16ToFloat(in[index]) *
-              (tuning::bf16ToFloat(base[(kind * 2) * shape.hiddenSize + channel]) +
+  for (const auto stage : {DraftConvolutionStage::Prepare,
+                          DraftConvolutionStage::Residual}) {
+    std::memset(output.contents(), 0xFF, output.sizeBytes());
+    CommandGraph graph;
+    DraftAttention::addConvolution(graph,
+        {input, dynamic, weights, residual, output}, plan, stage);
+    const bool finish = stage == DraftConvolutionStage::Residual;
+    uint32_t params = 0;
+    std::memcpy(&params, graph.dispatches()[0].bytes[0].data, sizeof(params));
+    require(graph.dispatches()[0].threadgroups.x == (kRows * shape.hiddenSize + 255) / 256 &&
+                params == (finish ? 1U : 0U),
+            "convolution dispatch does not cover each element once");
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    const auto *actual = static_cast<const uint16_t *>(output.contents());
+    const uint32_t kind = finish ? 1 : 0;
+    for (uint64_t row = 0; row < rows; ++row) {
+      for (uint32_t channel = 0; channel < shape.hiddenSize; ++channel) {
+        const uint64_t index = row * shape.hiddenSize + channel;
+        const uint32_t group = channel / channelsPerGroup;
+        float value = tuning::bf16ToFloat(in[index]) *
+            (tuning::bf16ToFloat(base[(kind * 2) * shape.hiddenSize + channel]) +
+             tuning::bf16ToFloat(dyn[row * shape.dynamicSize +
+                            (kind * 2) * convolutionGroups + group]));
+        if (row % kRows != 0)
+          value += tuning::bf16ToFloat(in[index - shape.hiddenSize]) *
+              (tuning::bf16ToFloat(base[(kind * 2 + 1) * shape.hiddenSize + channel]) +
                tuning::bf16ToFloat(dyn[row * shape.dynamicSize +
-                              (kind * 2) * convolutionGroups + group]));
-          if (row % kRows != 0)
-            value += tuning::bf16ToFloat(in[index - shape.hiddenSize]) *
-                (tuning::bf16ToFloat(base[(kind * 2 + 1) * shape.hiddenSize + channel]) +
-                 tuning::bf16ToFloat(dyn[row * shape.dynamicSize +
-                                (kind * 2 + 1) * convolutionGroups + group]));
-          if (finish)
-            value += tuning::bf16ToFloat(res[index]);
-          require(actual[index] == tuning::floatToBf16(value),
-                  "draft convolution differed from exact CPU arithmetic");
-        }
+                              (kind * 2 + 1) * convolutionGroups + group]));
+        if (finish)
+          value += tuning::bf16ToFloat(res[index]);
+        require(actual[index] == tuning::floatToBf16(value),
+                "draft convolution differed from exact CPU arithmetic");
       }
     }
+  }
 
-    std::memcpy(qkv.contents(), originalQkv.data(), qkv.sizeBytes());
-    CommandGraph graph;
-    DraftAttention::addPrepare(graph,
-        {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
-         queryValues}, plan);
-    DraftAttention::addReorder(graph, queries, packed, plan);
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-    for (size_t i = 0; i < preparedBuffers.size(); ++i) {
-      const auto *values =
-          static_cast<const uint16_t *>(preparedBuffers[i].contents());
-      if (configuration == DraftAttentionConfiguration{})
-        preparedBaseline[i].assign(values,
-                                   values + preparedBuffers[i].sizeBytes() / 2);
-      else
-        require(std::equal(preparedBaseline[i].begin(), preparedBaseline[i].end(),
-                           values),
-                "draft prepare candidate changed normalization/RoPE/storage");
-    }
-    const auto *grouped = static_cast<const uint16_t *>(queries.contents());
-    const auto *reordered = static_cast<const uint16_t *>(packed.contents());
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
-      for (uint32_t row = 0; row < kRows; ++row) {
-        for (uint32_t head = 0; head < shape.queryHeads; ++head) {
-          for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-            require(reordered[laneOffset + row * kAttention + head * kHeadDim +
-                               dim] ==
-                        grouped[laneOffset + (head * kRows + row) * kHeadDim +
-                                dim],
-                    "draft reorder differed from CPU layout reference");
+  CommandGraph graph;
+  DraftAttention::addPrepare(graph,
+      {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
+       queryValues}, plan);
+  DraftAttention::addReorder(graph, queries, packed, plan);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  require(std::equal(originalQkv.begin(), originalQkv.end(),
+                     static_cast<const uint16_t *>(qkv.contents())),
+          "draft prepare wrote its QKV input");
+  // Every query and key head RMS-normalized (unit norm weights), rounded to
+  // bf16 and rotated, and every value head copied. A rotated value is within
+  // an ulp of the fp64 rotation of the bf16-rounded norms plus an ulp of the
+  // larger input, which covers fp32 rounding a norm to its other neighbour.
+  constexpr uint32_t kPacked = 6144, kPairs = kHeadDim / 2;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t row = 0; row < kRows; ++row) {
+      const uint64_t laneRow = uint64_t{lane} * kRows + row;
+      const uint16_t *packedRow = originalQkv.data() + laneRow * kPacked;
+      for (uint32_t head = 0; head < shape.queryHeads + kKvHeads; ++head) {
+        const bool query = head < shape.queryHeads;
+        const uint32_t h = query ? head : head - shape.queryHeads;
+        const uint16_t *source = packedRow + (query ? 0 : kAttention) + h * kHeadDim;
+        const auto *prepared = static_cast<const uint16_t *>(
+            (query ? queries : queryKeys).contents()) +
+            ((uint64_t{lane} * (query ? shape.queryHeads : kKvHeads) + h) * kRows + row) * kHeadDim;
+        double squares = 0;
+        for (uint32_t d = 0; d < kHeadDim; ++d)
+          squares += double(tuning::bf16ToFloat(source[d])) * tuning::bf16ToFloat(source[d]);
+        const double inverse = 1 / std::sqrt(squares / kHeadDim + 1e-6);
+        for (uint32_t d = 0; d < kPairs; ++d) {
+          const double first = tuning::bf16ToFloat(
+              tuning::floatToBf16(float(tuning::bf16ToFloat(source[d]) * inverse)));
+          const double second = tuning::bf16ToFloat(
+              tuning::floatToBf16(float(tuning::bf16ToFloat(source[d + kPairs]) * inverse)));
+          const double c = static_cast<const float *>(ropeCos.contents())[laneRow * kPairs + d];
+          const double s = static_cast<const float *>(ropeSin.contents())[laneRow * kPairs + d];
+          const double rotated[2] = {first * c - second * s, second * c + first * s};
+          for (uint32_t half = 0; half < 2; ++half)
+            require(std::fabs(tuning::bf16ToFloat(prepared[d + half * kPairs]) - rotated[half]) <=
+                        tuning::ulpBf16(float(rotated[half])) +
+                            tuning::ulpBf16(float(std::max(std::fabs(first), std::fabs(second)))),
+                    "draft prepare differs from the fp64 norm and rotation");
         }
+        if (!query)
+          for (uint32_t d = 0; d < kHeadDim; ++d)
+            require(static_cast<const uint16_t *>(queryValues.contents())
+                            [((uint64_t{lane} * kKvHeads + h) * kHeadDim + d) * kRows + row] ==
+                        packedRow[kAttention + kKvHeads * kHeadDim + h * kHeadDim + d],
+                    "draft prepare value copy differs");
+      }
+    }
+  const auto *grouped = static_cast<const uint16_t *>(queries.contents());
+  const auto *reordered = static_cast<const uint16_t *>(packed.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
+    for (uint32_t row = 0; row < kRows; ++row) {
+      for (uint32_t head = 0; head < shape.queryHeads; ++head) {
+        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
+          require(reordered[laneOffset + row * kAttention + head * kHeadDim +
+                             dim] ==
+                      grouped[laneOffset + (head * kRows + row) * kHeadDim +
+                              dim],
+                  "draft reorder differed from CPU layout reference");
       }
     }
   }
@@ -412,28 +428,23 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const auto shortBuffer = backend.view(output, 0, output.sizeBytes() - 2);
   rejects([&] {
     DraftAttention::addConvolution(invalid,
-        {input, dynamic, weights, residual, shortBuffer}, baselinePlan,
+        {input, dynamic, weights, residual, shortBuffer}, plan,
         DraftConvolutionStage::Prepare);
   });
   rejects([&] {
     DraftAttention::addPrepare(invalid,
         {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, {}, queryValues},
-        baselinePlan);
+        plan);
   });
   rejects([&] {
-    DraftAttention::addReorder(invalid, queries, {}, baselinePlan);
+    DraftAttention::addReorder(invalid, queries, {}, plan);
   });
   const std::array<MetalBuffer, kLanes> emptyRings{};
   const std::array<uint32_t, kLanes> lengths{};
   rejects([&] {
     DraftAttention::addDecode(invalid,
-        {queries, emptyRings, emptyRings, queryKeys, queryValues}, lengths,
-        kWindow, baselinePlan);
-  });
-  rejects([&] {
-    DraftAttention::addDecode(invalid,
-        {queries, emptyRings, emptyRings, queryKeys, queryValues}, lengths,
-        kWindow - 1, baselinePlan);
+        {queries, emptyRings, emptyRings, queryKeys, queryValues},
+        std::span(lengths).first(lanes), plan);
   });
   require(invalid.empty(), "invalid draft request partially encoded a graph");
 }
@@ -444,7 +455,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // [head][dim][slot]); every other slot keeps its bits. The prefill writes
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read, and
-// the host rejects another ring stride or a buffer below its rows.
+// the host rejects a buffer below its rows.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
@@ -530,8 +541,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   const MetalBuffer keys = ring(), values = ring();
   CommandGraph prefill;
   DraftAttention::addContextPrefill(prefill, kv, keyNorm, ropeCos, ropeSin,
-                                    keys, values, kTokens, kWindow, kStart,
-                                    shape);
+                                    keys, values, kTokens, kStart, shape);
   static_cast<void>(backend.submitCommand(prefill.dispatches()));
   check(keys, values, static_cast<const uint16_t *>(kv.contents()),
         static_cast<const float *>(ropeCos.contents()),
@@ -539,7 +549,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
 
   // Commit: three lanes retaining 8, 3 and (clamped) 8 of their verify rows.
   constexpr uint32_t kCommitLanes = 3;
-  const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 0};
+  const std::array<uint32_t, kCommitLanes> starts{2044, 0, 4101};
   const uint32_t retained[kCommitLanes] = {8, 3, 12};
   const MetalBuffer laneKv =
       randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
@@ -557,7 +567,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
-                                   kWindow, shape, kCommitLanes);
+                                   shape);
   static_cast<void>(backend.submitCommand(commit.dispatches()));
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -574,31 +584,35 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   };
   CommandGraph invalid;
   const auto prefillWith = [&](const MetalBuffer &q, const MetalBuffer &sines,
-                               const MetalBuffer &k, uint32_t stride) {
+                               const MetalBuffer &k) {
     DraftAttention::addContextPrefill(invalid, q, keyNorm, ropeCos, sines, k,
-                                      values, kTokens, stride, kStart, shape);
+                                      values, kTokens, kStart, shape);
   };
-  // A ring of another stride: head h's upper slots would land in head h + 1
-  // and the last head's past the ring.
-  const MetalBuffer halfRing = backend.view(keys, 0, keys.sizeBytes() / 2);
-  rejects([&] { prefillWith(kv, ropeSin, halfRing, kWindow / 2); });
-  rejects([&] { prefillWith(kv, ropeSin, shorter(keys), kWindow); });
-  rejects([&] { prefillWith(shorter(kv), ropeSin, keys, kWindow); });
-  rejects([&] { prefillWith(kv, shorter(ropeSin), keys, kWindow); });
+  rejects([&] { prefillWith(kv, ropeSin, shorter(keys)); });
+  rejects([&] { prefillWith(shorter(kv), ropeSin, keys); });
+  rejects([&] { prefillWith(kv, shorter(ropeSin), keys); });
   // The last lane's values ring.
   const MetalBuffer lastRing = laneValues[kCommitLanes - 1];
   const auto commitWith = [&](const MetalBuffer &q, const MetalBuffer &counts,
-                              const MetalBuffer &last, uint32_t stride) {
+                              const MetalBuffer &last) {
     std::array<MetalBuffer, kLanes> rings = laneValues;
     rings[kCommitLanes - 1] = last;
     DraftAttention::addContextCommit(invalid, q, keyNorm, laneCos, laneSin,
-                                     laneKeys, rings, counts, starts, stride,
-                                     shape, kCommitLanes);
+                                     laneKeys, rings, counts, starts, shape);
   };
-  rejects([&] { commitWith(laneKv, retainedCounts, lastRing, kWindow / 2); });
-  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing), kWindow); });
-  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing, kWindow); });
-  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing, kWindow); });
+  rejects([&] { commitWith(laneKv, retainedCounts, shorter(lastRing)); });
+  rejects([&] { commitWith(shorter(laneKv), retainedCounts, lastRing); });
+  rejects([&] { commitWith(laneKv, shorter(retainedCounts), lastRing); });
+  // The start positions name the lanes: none, or more than a batch, commit
+  // nothing.
+  const std::array<uint32_t, kLanes + 1> overfull{};
+  for (const std::span<const uint32_t> positions :
+       {std::span<const uint32_t>(), std::span<const uint32_t>(overfull)})
+    rejects([&] {
+      DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
+                                       laneSin, laneKeys, laneValues,
+                                       retainedCounts, positions, shape);
+    });
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
 }

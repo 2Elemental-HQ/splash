@@ -231,6 +231,7 @@ ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/DraftAttention.cpp \
+	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -240,6 +241,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/RoPE.cpp \
+	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
