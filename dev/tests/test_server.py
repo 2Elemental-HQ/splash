@@ -544,6 +544,7 @@ def main_args(**overrides):
             "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
+            "announce_served_name": False,
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
@@ -4200,7 +4201,7 @@ class ServerTest(unittest.TestCase):
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
         app = SimpleNamespace(
-            model="test-model",
+            response_model="test-model",
             backend=SimpleNamespace(cancel=mock.Mock()),
             persist_response=mock.Mock(),
         )
