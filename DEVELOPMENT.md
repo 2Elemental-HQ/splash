@@ -66,7 +66,12 @@ at 512 KiB/s (286 seconds for 128 MiB), capped by `--request-timeout` when set.
 Timed-out uploads return 408 and release their input reservation. An upload
 refused before it is read, such as one over the shared budget, is still
 received on these terms, so a client that sends its whole body before reading
-the response gets the refusal.
+the response gets the refusal. An inference request ends when its client
+disconnects, and a client that shuts down its sending side after the request,
+as `nc` does at the end of its input, counts as disconnected and gets no
+response. A response write waits up to 30 seconds for a client that has
+stopped reading, past `--request-timeout` too, and the request counts against
+`--queue-size` until then.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
 Source `install/completions/splash.bash` for Bash or
@@ -866,6 +871,9 @@ budget and the native 64-image limit (one image per page). Model context and
 isolated rendering limits also apply. URL inputs, opening passwords and citations
 are unsupported.
 Responses automatic truncation and unsupported history edits return errors.
+Responses and Messages history replay an assistant turn as one message whose
+text precedes its calls, the order the chat template renders, even where the
+response wrote text after a call.
 
 `POST /tokenize` accepts `{"content":"hello","add_special":false}` and returns
 `{"tokens":[...]}` using the loaded tokenizer. Special-token strings are recognized;
