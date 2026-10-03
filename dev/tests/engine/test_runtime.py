@@ -1,3 +1,4 @@
+import math
 import os
 import select
 import subprocess
@@ -5,6 +6,7 @@ import threading
 import time
 import unittest
 import weakref
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -186,29 +188,44 @@ class FakeFactory:
 def request(
     token,
     *,
+    prompt_tokens=None,
     logical_max_output_tokens=32,
     priority=wire.RequestPriority.NORMAL,
-    deadline=None,
+    deadline=45.0,
     sampling=None,
     seed=0,
     constraint=wire.ConstraintMode.NONE,
     mask_provider=None,
     image_owner=None,
+    return_progress=False,
     score_tokens=(),
     generation_prompt_tokens=0,
 ):
-    return engine_runtime.GenerationRequest(
-        prompt_tokens=(token, token + 1),
-        logical_max_output_tokens=logical_max_output_tokens,
-        deadline=deadline or engine_runtime.Deadline.after(45),
+    """A request whose deadline is `deadline` seconds from now."""
+    frame = native_peer.request_frame(
+        request_id=0,
         priority=priority,
+        absolute_deadline_unix_micros=0,
+        remaining_deadline_micros=0,
+        logical_max_output_tokens=logical_max_output_tokens,
+        prompt_tokens=prompt_tokens or (token, token + 1),
         sampling=sampling or wire.SamplingParameters(),
         seed=seed,
         constraint=constraint,
-        mask_provider=mask_provider,
-        image_owner=image_owner,
+        return_progress=return_progress,
         score_tokens=score_tokens,
         generation_prompt_tokens=generation_prompt_tokens,
+    )
+    return engine_runtime.GenerationRequest(
+        frame, time.monotonic() + deadline, mask_provider, image_owner
+    )
+
+
+def written_frame(process, call):
+    return next(
+        frame
+        for frame in process.stdin.messages(wire.RequestFrame)
+        if frame.request_id == call.request_id
     )
 
 
@@ -221,7 +238,7 @@ def send_success(process, call, *, lane=0, tokens=(10, 11, 12)):
         wire.DoneEvent(
             call.request_id,
             wire.FinishReason.STOP,
-            len(call.request.prompt_tokens),
+            len(written_frame(process, call).prompt_tokens),
             len(tokens),
             100,
             200,
@@ -261,7 +278,7 @@ class RuntimeTests(unittest.TestCase):
             request(
                 100,
                 priority=wire.RequestPriority.FOREGROUND,
-                deadline=engine_runtime.Deadline(1_900_000_000_000_001, 9_000_001),
+                deadline=9.0,
                 seed=55,
             ),
             request(
@@ -272,14 +289,15 @@ class RuntimeTests(unittest.TestCase):
             request(
                 300,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda event: (
-                    (1,) * (event.words_per_mask * event.mask_rows)
-                ),
+                mask_provider=lambda event: array(
+                    "I", (1,) * (event.words_per_mask * event.mask_rows)
+                ).tobytes(),
             ),
             request(400, priority=wire.RequestPriority.BACKGROUND),
         )
         callbacks = []
         event_types = {}
+        starts = {}
         streamed = {}
         callback_lock = threading.Lock()
         callbacks_complete = threading.Event()
@@ -288,6 +306,8 @@ class RuntimeTests(unittest.TestCase):
             def event(call, message):
                 with callback_lock:
                     event_types.setdefault(call.request_id, []).append(type(message))
+                    if isinstance(message, wire.StartEvent):
+                        starts[call.request_id] = message
                     if isinstance(message, wire.TokensEvent):
                         streamed.setdefault(call.request_id, []).extend(message.tokens)
 
@@ -303,8 +323,11 @@ class RuntimeTests(unittest.TestCase):
                 on_complete=completed,
             )
 
+        submitted_wall = time.time_ns() // 1000
+        submitted_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=4) as executor:
             calls = list(executor.map(submit, range(4)))
+        written_wall = time.time_ns() // 1000
 
         frames = process.stdin.wait_for(wire.RequestFrame, count=4)
         self.assertEqual(runtime.pending_count, 4)
@@ -316,30 +339,42 @@ class RuntimeTests(unittest.TestCase):
                 runtime.submit(request(500))
             serialize.assert_not_called()
 
-        expected = {item.prompt_tokens: item for item in requests}
+        expected = {item.frame.prompt_tokens: item for item in requests}
         for frame, raw in process.stdin.records_of(wire.RequestFrame):
             source = expected[frame.prompt_tokens]
-            self.assertEqual(frame.priority, source.priority)
-            self.assertEqual(raw[wire.FRAME_HEADER_BYTES + 8], int(source.priority))
+            self.assertEqual(frame.priority, source.frame.priority)
             self.assertEqual(
-                frame.absolute_deadline_unix_micros,
-                source.deadline.absolute_unix_micros,
+                raw[wire.FRAME_HEADER_BYTES + 8], int(source.frame.priority)
+            )
+            # Stamped once, at submission, from the monotonic deadline.
+            self.assertGreater(frame.remaining_deadline_micros, 0)
+            self.assertLessEqual(
+                frame.remaining_deadline_micros,
+                (source.deadline - submitted_at) * 1_000_000,
+            )
+            self.assertLessEqual(
+                submitted_wall,
+                frame.absolute_deadline_unix_micros - frame.remaining_deadline_micros,
+            )
+            self.assertLessEqual(
+                frame.absolute_deadline_unix_micros - frame.remaining_deadline_micros,
+                written_wall,
             )
             self.assertEqual(
-                frame.remaining_deadline_micros, source.deadline.remaining_micros
-            )
-            self.assertEqual(
-                frame.logical_max_output_tokens, source.logical_max_output_tokens
+                frame.logical_max_output_tokens,
+                source.frame.logical_max_output_tokens,
             )
             self.assertAlmostEqual(
-                frame.sampling.temperature, source.sampling.temperature, places=6
+                frame.sampling.temperature,
+                source.frame.sampling.temperature,
+                places=6,
             )
             self.assertAlmostEqual(
-                frame.sampling.top_p, source.sampling.top_p, places=6
+                frame.sampling.top_p, source.frame.sampling.top_p, places=6
             )
-            self.assertEqual(frame.sampling.top_k, source.sampling.top_k)
-            self.assertEqual(frame.seed, source.seed)
-            self.assertEqual(frame.constraint, source.constraint)
+            self.assertEqual(frame.sampling.top_k, source.frame.sampling.top_k)
+            self.assertEqual(frame.seed, source.frame.seed)
+            self.assertEqual(frame.constraint, source.frame.constraint)
 
         reverse_calls = list(reversed(calls))
         for index, call in enumerate(reverse_calls):
@@ -351,22 +386,17 @@ class RuntimeTests(unittest.TestCase):
             )
 
         for index, call in enumerate(reverse_calls):
-            result = call.result(1.0)
+            call.result(1.0)
             self.assertEqual(
                 streamed[call.request_id], [1000 + index, 2000 + index, 3000 + index]
             )
-            self.assertEqual(result.start.lane, index)
+            self.assertEqual(starts[call.request_id].lane, index)
         self.assertTrue(callbacks_complete.wait(1.0))
         self.assertEqual(callbacks, [call.request_id for call in reverse_calls])
         for call in calls:
             self.assertEqual(
                 event_types[call.request_id],
-                [
-                    wire.StartEvent,
-                    wire.TokensEvent,
-                    wire.TokensEvent,
-                    wire.DoneEvent,
-                ],
+                [wire.StartEvent, wire.TokensEvent, wire.TokensEvent],
             )
         self.assertEqual(runtime.pending_count, 0)
         self.assertTrue(runtime.ready)
@@ -389,7 +419,7 @@ class RuntimeTests(unittest.TestCase):
         send_success(factory.processes[0], call)
         try:
             self.assertTrue(callback_entered.wait(1.0))
-            self.assertEqual(call.result(1.0).done.completion_tokens, 3)
+            self.assertEqual(call.result(1.0).completion_tokens, 3)
             self.assertFalse(callback_complete.is_set())
         finally:
             callback_release.set()
@@ -528,8 +558,8 @@ class RuntimeTests(unittest.TestCase):
         )
 
         result = call.result(1.0)
-        self.assertEqual(result.done.completion_tokens, 3)
-        self.assertEqual(result.done.reason, wire.FinishReason.LENGTH)
+        self.assertEqual(result.completion_tokens, 3)
+        self.assertEqual(result.reason, wire.FinishReason.LENGTH)
 
     def test_stop_done_at_logical_max_is_valid(self):
         factory = FakeFactory()
@@ -540,15 +570,18 @@ class RuntimeTests(unittest.TestCase):
         send_success(process, call, tokens=(20, 21, 22))
 
         result = call.result(1.0)
-        self.assertEqual(result.done.completion_tokens, 3)
-        self.assertEqual(result.done.reason, wire.FinishReason.STOP)
+        self.assertEqual(result.completion_tokens, 3)
+        self.assertEqual(result.reason, wire.FinishReason.STOP)
 
     def test_cancel_is_a_correlated_frame(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
-        call = runtime.submit(request(10))
+        events = []
+        call = runtime.submit(
+            request(10), on_event=lambda _call, event: events.append(event)
+        )
 
         self.assertTrue(call.cancel())
         self.assertFalse(call.cancel())
@@ -560,9 +593,9 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         result = call.result(1.0)
-        self.assertEqual(result.done.reason, wire.FinishReason.CANCELLED)
-        self.assertIsNone(result.start)
-        self.assertEqual(result.done.completion_tokens, 0)
+        self.assertEqual(result.reason, wire.FinishReason.CANCELLED)
+        self.assertEqual(events, [])
+        self.assertEqual(result.completion_tokens, 0)
         self.assertFalse(call.cancel())
 
     def test_generation_prompt_tokens_reach_the_request_frame(self):
@@ -598,8 +631,8 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         result = call.result(1.0)
-        self.assertEqual(result.done.completion_tokens, 0)
-        self.assertEqual(result.done.option_logits, (1.5, -2.25, 0.5))
+        self.assertEqual(result.completion_tokens, 0)
+        self.assertEqual(result.option_logits, (1.5, -2.25, 0.5))
 
     def test_score_done_rejects_invalid_terminal_results(self):
         for reason, logits, decode_micros in (
@@ -680,8 +713,8 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         result = call.result(1.0)
-        self.assertEqual(result.done.reason, wire.FinishReason.CANCELLED)
-        self.assertEqual(result.done.option_logits, ())
+        self.assertEqual(result.reason, wire.FinishReason.CANCELLED)
+        self.assertEqual(result.option_logits, ())
 
     def test_generate_is_the_blocking_convenience_over_direct_submit(self):
         def handler(process, message):
@@ -705,10 +738,13 @@ class RuntimeTests(unittest.TestCase):
         factory = FakeFactory(handler)
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
-        call = runtime.submit(request(15))
+        events = []
+        call = runtime.submit(
+            request(15), on_event=lambda _call, event: events.append(event)
+        )
         result = call.result(1.0)
-        self.assertEqual(result.done.completion_tokens, 2)
-        self.assertEqual(result.start.matched_prompt_tokens, 1)
+        self.assertEqual(result.completion_tokens, 2)
+        self.assertEqual(events[0].matched_prompt_tokens, 1)
 
     def test_mask_response_preserves_both_ids_and_exact_word_count(self):
         provider_thread = []
@@ -717,13 +753,15 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             provider_thread.append(threading.current_thread().name)
             provider_called.set()
-            return tuple(range(1, event.words_per_mask * event.mask_rows + 1))
+            return array(
+                "I", range(1, event.words_per_mask * event.mask_rows + 1)
+            ).tobytes()
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory,
-            mask_workers=1,
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
         )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -740,37 +778,135 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(provider_thread[0].startswith("splash-mask"))
         self.assertEqual(response.request_id, call.request_id)
         self.assertEqual(response.mask_request_id, 987)
-        self.assertEqual(response.mask_words, (1, 2, 3, 4, 5, 6, 7, 8))
+        self.assertEqual(response.mask_words, array("I", range(1, 9)).tobytes())
         send_success(process, call)
-        self.assertEqual(call.result(1.0).done.completion_tokens, 3)
+        self.assertEqual(call.result(1.0).completion_tokens, 3)
 
     def test_bad_mask_size_cancels_and_fails_only_that_call(self):
+        for mask, message in (
+            (array("I", (1,)).tobytes(), "returned 4 bytes; expected 24$"),
+            (None, "returned NoneType; expected 24 bytes$"),
+        ):
+            with self.subTest(message=message):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+                self.addCleanup(runtime.close)
+                process = factory.processes[0]
+                bad = runtime.submit(
+                    request(
+                        30,
+                        constraint=wire.ConstraintMode.TOKEN_MASK,
+                        mask_provider=lambda _event, mask=mask: mask,
+                    )
+                )
+                healthy = runtime.submit(request(40))
+
+                process.send(wire.StartEvent(bad.request_id, 0, 0))
+                process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
+                cancel = process.stdin.wait_for(wire.CancelFrame)[0]
+                self.assertEqual(cancel.request_id, bad.request_id)
+                process.send(
+                    wire.DoneEvent(
+                        bad.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
+                    )
+                )
+                with self.assertRaisesRegex(
+                    engine_runtime.MaskComputationFailed, message
+                ):
+                    bad.result(1.0)
+                send_success(process, healthy)
+                self.assertEqual(healthy.result(1.0).completion_tokens, 3)
+                self.assertTrue(runtime.ready)
+
+    def test_token_mask_mode_and_provider_go_together(self):
+        def provider(_event):
+            return b""
+
+        for constraint, mask_provider in (
+            (wire.ConstraintMode.TOKEN_MASK, None),
+            (wire.ConstraintMode.NONE, provider),
+        ):
+            with self.subTest(constraint=constraint):
+                with self.assertRaisesRegex(ValueError, "exactly one mask provider"):
+                    request(
+                        10,
+                        constraint=constraint,
+                        mask_provider=mask_provider,
+                    )
+
+    def test_mask_request_for_unconstrained_request_is_protocol_fatal(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
-        bad = runtime.submit(
+        call = runtime.submit(request(10))
+        process.send(wire.StartEvent(call.request_id, 0, 0))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        with self.assertRaisesRegex(
+            engine_runtime.ProtocolFatal, "token mask for an unconstrained request"
+        ):
+            call.result(1.0)
+        self.assertFalse(runtime.ready)
+
+    def test_mask_failure_marks_the_call_cancelled_and_writes_one_cancel(self):
+        computed = []
+
+        def provider(event):
+            computed.append(event.mask_request_id)
+            return b""
+
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(
             request(
                 30,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda _event: (1,),
+                mask_provider=provider,
             )
         )
-        healthy = runtime.submit(request(40))
-
-        process.send(wire.StartEvent(bad.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
-        cancel = process.stdin.wait_for(wire.CancelFrame)[0]
-        self.assertEqual(cancel.request_id, bad.request_id)
+        process.send(wire.StartEvent(call.request_id, 0, 0))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.stdin.wait_for(wire.CancelFrame)
+        self.assertTrue(call.cancel_requested)
+        self.assertFalse(call.cancel())
+        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, ()))
         process.send(
             wire.DoneEvent(
-                bad.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
         with self.assertRaises(engine_runtime.MaskComputationFailed):
-            bad.result(1.0)
-        send_success(process, healthy)
-        self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
+            call.result(1.0)
+        self.assertEqual(len(process.stdin.messages(wire.CancelFrame)), 1)
+        self.assertEqual(computed, [88])
+
+    def test_event_callback_error_cancels_once_and_is_the_call_result(self):
+        failures = [ValueError("first"), ValueError("second")]
+
+        def on_event(_call, event):
+            if isinstance(event, wire.TokensEvent):
+                raise failures[event.sequence_offset]
+
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(request(10), on_event=on_event)
+        process.send(wire.StartEvent(call.request_id, 0, 0))
+        process.send(wire.TokensEvent(call.request_id, 0, (20,)))
+        process.stdin.wait_for(wire.CancelFrame)
+        process.send(wire.TokensEvent(call.request_id, 1, (21,)))
+        process.send(
+            wire.DoneEvent(
+                call.request_id, wire.FinishReason.CANCELLED, 2, 2, 0, 0, 10, ()
+            )
+        )
+        self.assertEqual(call.result(1.0).reason, wire.FinishReason.CANCELLED)
+        self.assertIs(call.callback_error, failures[0])
+        self.assertIsNone(call.callback_error.__traceback__)
+        self.assertEqual(len(process.stdin.messages(wire.CancelFrame)), 1)
         self.assertTrue(runtime.ready)
 
     def test_cancelled_call_never_writes_a_late_mask_response(self):
@@ -782,13 +918,13 @@ class RuntimeTests(unittest.TestCase):
             provider_started.set()
             provider_release.wait(1.0)
             provider_finished.set()
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory,
-            mask_workers=1,
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
         )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         process = factory.processes[0]
         call = runtime.submit(
@@ -809,7 +945,7 @@ class RuntimeTests(unittest.TestCase):
                 call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
             )
         )
-        self.assertEqual(call.result(1.0).done.reason, wire.FinishReason.CANCELLED)
+        self.assertEqual(call.result(1.0).reason, wire.FinishReason.CANCELLED)
         provider_release.set()
         self.assertTrue(provider_finished.wait(1.0))
         time.sleep(0.02)
@@ -824,11 +960,14 @@ class RuntimeTests(unittest.TestCase):
             calls_to_provider.append(event.request_id)
             started.set()
             release.wait(5.0)
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
+        self.enterContext(
+            mock.patch.object(engine_runtime.MultiplexedRuntime, "_mask_workers", 1)
+        )
         runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, mask_workers=1, pending_limit=2
+            process_factory=factory, pending_limit=2
         )
         self.addCleanup(runtime.close)
         self.addCleanup(release.set)
@@ -887,7 +1026,7 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             started.set()
             release.wait(5.0)
-            return (1,) * (event.words_per_mask * event.mask_rows)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -957,7 +1096,6 @@ class RuntimeTests(unittest.TestCase):
         status = runtime.status(timeout=1.0)
         self.assertNotEqual(status.correlation_id, first.correlation_id)
         self.assertEqual(status.json, READY_STATUS)
-        self.assertEqual(runtime.last_status, status)
         self.assertTrue(runtime.ready)
 
     @fast_liveness_probe
@@ -1006,6 +1144,18 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(process.stdin.messages(wire.StatusRequestFrame)), probes)
         self.assertTrue(runtime.ready)
 
+    def test_status_with_correlation_zero_is_protocol_fatal(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        call = runtime.submit(request(10))
+        factory.processes[0].send(wire.StatusJsonEvent(0, READY_STATUS))
+        with self.assertRaisesRegex(
+            engine_runtime.ProtocolFatal, "unknown correlation 0"
+        ):
+            call.result(1.0)
+        self.assertFalse(runtime.ready)
+
     def test_request_failures_are_scoped(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
@@ -1029,13 +1179,21 @@ class RuntimeTests(unittest.TestCase):
             request_error.result(1.0)
         self.assertTrue(caught.exception.retryable)
         self.assertEqual(caught.exception.code, b"deadline_exceeded")
-        self.assertEqual(healthy.result(1.0).done.completion_tokens, 3)
+        self.assertEqual(healthy.result(1.0).completion_tokens, 3)
         self.assertTrue(runtime.ready)
 
-    def test_unhealthy_fatal_and_eof_fail_all_then_restart_lazily(self):
+    def test_unhealthy_fatal_and_eof_fail_all_then_restart_on_wait_ready(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
+
+        def relaunch():
+            # A failed engine refuses new work and starts nothing by itself.
+            with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "not ready"):
+                runtime.submit(request(1))
+            launched = len(factory.processes)
+            self.assertTrue(runtime.wait_ready(1))
+            self.assertEqual(len(factory.processes), launched + 1)
 
         first = factory.processes[0]
         first_calls = (runtime.submit(request(80)), runtime.submit(request(90)))
@@ -1054,6 +1212,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.ready)
         self.assertEqual(len(factory.processes), 1)
 
+        relaunch()
         after_unhealthy = runtime.submit(request(100))
         second = factory.processes[1]
         self.assertEqual(runtime.restart_count, 1)
@@ -1070,6 +1229,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(engine_runtime.ProtocolFatal):
             after_unhealthy.result(1.0)
 
+        relaunch()
         after_fatal = runtime.submit(request(110))
         third = factory.processes[2]
         self.assertEqual(runtime.restart_count, 2)
@@ -1077,11 +1237,97 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(engine_runtime.EngineUnhealthy):
             after_fatal.result(1.0)
 
+        relaunch()
         after_eof = runtime.submit(request(120))
         fourth = factory.processes[3]
         self.assertEqual(runtime.restart_count, 3)
         send_success(fourth, after_eof)
-        self.assertEqual(after_eof.result(1.0).done.completion_tokens, 3)
+        self.assertEqual(after_eof.result(1.0).completion_tokens, 3)
+
+    def test_engine_failure_listener_runs_before_calls_end_with_served_seconds(
+        self,
+    ):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        order = []
+        completed = threading.Event()
+        runtime.on_engine_failure = lambda error, served: order.append(
+            ("listener", str(error), served)
+        )
+
+        def complete(_call):
+            order.append(("complete",))
+            completed.set()
+
+        call = runtime.submit(request(10), on_complete=complete)
+        factory.processes[0].close_stdout()
+        with self.assertRaises(engine_runtime.EngineUnhealthy):
+            call.result(1.0)
+        self.assertTrue(completed.wait(1.0))
+        self.assertEqual(len(order), 2)
+        kind, message, served = order[0]
+        self.assertEqual((kind, message), ("listener", "native protocol reached EOF"))
+        self.assertGreaterEqual(served, 0)
+        self.assertEqual(order[1], ("complete",))
+        # close() is not an engine failure.
+        self.assertTrue(runtime.wait_ready(1))
+        runtime.close()
+        self.assertEqual(len(order), 2)
+
+    def test_fatal_error_property_reports_changed_limits(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        self.assertIsNone(runtime.fatal_error)
+        factory.initial_output = native_peer.serialize_event(
+            wire.ReadyEvent(4, 65_536, False)
+        )
+        with mock.patch.object(runtime._crash_trace, "dump"):
+            factory.processes[0].kill()
+            with self.assertRaisesRegex(
+                engine_runtime.EngineUnhealthy, "restart the Splash server"
+            ):
+                runtime.wait_ready(1)
+        self.assertIsInstance(runtime.fatal_error, engine_runtime.EngineUnhealthy)
+        self.assertIn("context window", str(runtime.fatal_error))
+
+    def test_unanswered_status_with_fail_unanswered_fails_only_its_generation(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        failures = []
+        runtime.on_engine_failure = lambda error, _served: failures.append(error)
+
+        with self.assertRaises(TimeoutError):
+            runtime.status(timeout=0.05)
+        self.assertTrue(runtime.ready)
+        self.assertEqual(failures, [])
+
+        with self.assertRaises(TimeoutError):
+            runtime.status(timeout=0.05, fail_unanswered=True)
+        self.assertFalse(runtime.ready)
+        (failure,) = failures
+        self.assertIsInstance(failure, engine_runtime.EngineUnhealthy)
+        self.assertEqual(
+            str(failure), "native loop did not answer status within 0.05 s"
+        )
+        self.assertTrue(runtime.wait_ready(1))
+        self.assertEqual(len(failures), 1)
+
+        # A request whose engine fails before it expires ends with that
+        # failure and never fails the next engine.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(runtime.status, 0.5, fail_unanswered=True)
+            factory.processes[1].stdin.wait_for(wire.StatusRequestFrame)
+            factory.processes[1].kill()
+            with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "EOF"):
+                pending.result(1)
+        self.assertTrue(runtime.wait_ready(1))
+        self.assertEqual(
+            [str(failure) for failure in failures[1:]], ["native protocol reached EOF"]
+        )
+        self.assertTrue(runtime.ready)
 
     def test_invalidation_before_registration_returns_the_admission_slot(self):
         factory = FakeFactory()
@@ -1089,25 +1335,27 @@ class RuntimeTests(unittest.TestCase):
             process_factory=factory, pending_limit=1
         )
         self.addCleanup(runtime.close)
-        ensure_process = runtime._ensure_process
+        serialize = wire.serialize_message
 
-        def ensure_then_fail(timeout=None):
-            generation = ensure_process(timeout=timeout)
+        def serialize_then_fail(message):
+            encoded = serialize(message)
             runtime._fail_generation(
-                generation, engine_runtime.EngineUnhealthy("lost after readiness")
+                runtime._generation,
+                engine_runtime.EngineUnhealthy("lost after admission"),
             )
-            return generation
+            return encoded
 
-        with mock.patch.object(runtime, "_ensure_process", ensure_then_fail):
+        with mock.patch.object(wire, "serialize_message", serialize_then_fail):
             with self.assertRaises(engine_runtime.EngineUnhealthy):
                 runtime.submit(request(125))
         self.assertEqual(runtime.pending_count, 0)
         self.assertEqual(runtime._admission_slots._value, runtime.pending_limit)
 
+        self.assertTrue(runtime.wait_ready(1))
         replacement = runtime.submit(request(126))
         self.assertEqual(runtime.restart_count, 1)
         send_success(factory.processes[1], replacement)
-        self.assertEqual(replacement.result(1.0).done.completion_tokens, 3)
+        self.assertEqual(replacement.result(1.0).completion_tokens, 3)
 
     def test_eof_restarts_and_close_is_terminal(self):
         factory = FakeFactory()
@@ -1116,6 +1364,7 @@ class RuntimeTests(unittest.TestCase):
         factory.processes[0].close_stdout()
         with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "reached EOF"):
             call.result(1.0)
+        self.assertTrue(runtime.wait_ready(1))
         replacement = runtime.submit(request(140))
         self.assertEqual(runtime.restart_count, 1)
         send_success(factory.processes[1], replacement)
@@ -1215,7 +1464,7 @@ class RuntimeTests(unittest.TestCase):
             )
         self.assertIsNotNone(factory.processes[0].poll())
 
-    def test_concurrent_submitters_share_one_failed_startup(self):
+    def test_concurrent_waiters_share_one_failed_startup(self):
         factory = FakeFactory(initial_output=b"")
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
@@ -1225,14 +1474,14 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         barrier = threading.Barrier(4)
 
-        def submit(index):
+        def wait_ready(_index):
             barrier.wait()
             with self.assertRaises(engine_runtime.EngineUnhealthy):
-                runtime.submit(request(200 + index))
+                runtime.wait_ready()
 
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=4) as executor:
-            list(executor.map(submit, range(4)))
+            list(executor.map(wait_ready, range(4)))
         elapsed = time.monotonic() - started
         self.assertEqual(len(factory.processes), 1)
         self.assertLess(elapsed, 0.5)
@@ -1335,34 +1584,34 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_deadline_helper_serializes_absolute_and_remaining_clocks(self):
-        deadline = engine_runtime.Deadline.after(
-            1.25,
-            wall_time_ns=lambda: 1_700_000_000_000_000_000,
-        )
-        self.assertEqual(deadline.absolute_unix_micros, 1_700_000_001_250_000)
-        self.assertEqual(deadline.remaining_micros, 1_250_000)
-
+    def test_wire_deadline_is_stamped_once_at_submission(self):
+        wall = 1_700_000_000_000_000
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         with mock.patch.object(
-            engine_runtime.time, "time_ns", return_value=1_700_000_000_000_000_000
+            engine_runtime.time, "time_ns", return_value=wall * 1000
         ):
             call = runtime.submit(
-                request(
-                    160, priority=wire.RequestPriority.FOREGROUND, deadline=deadline
-                )
+                request(160, priority=wire.RequestPriority.FOREGROUND, deadline=1.25)
             )
-        frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
-        self.assertEqual(frame.request_id, call.request_id)
-        self.assertEqual(frame.priority, wire.RequestPriority.FOREGROUND)
+            unbounded = runtime.submit(request(170, deadline=math.inf))
+        first, second = factory.processes[0].stdin.wait_for(wire.RequestFrame, 2)
+        self.assertEqual(first.request_id, call.request_id)
+        self.assertEqual(first.priority, wire.RequestPriority.FOREGROUND)
+        self.assertGreater(first.remaining_deadline_micros, 0)
+        self.assertLessEqual(first.remaining_deadline_micros, 1_250_000)
         self.assertEqual(
-            frame.absolute_deadline_unix_micros, deadline.absolute_unix_micros
+            first.absolute_deadline_unix_micros - first.remaining_deadline_micros,
+            wall,
         )
-        self.assertEqual(frame.remaining_deadline_micros, deadline.remaining_micros)
+        self.assertEqual(second.request_id, unbounded.request_id)
+        self.assertEqual(
+            second.remaining_deadline_micros, engine_runtime._MAX_U64 - wall
+        )
+        self.assertEqual(second.absolute_deadline_unix_micros, engine_runtime._MAX_U64)
 
-    def test_short_request_leaves_shared_startup_running(self):
+    def test_short_wait_leaves_shared_startup_running(self):
         factory = FakeFactory(initial_output=b"")
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory,
@@ -1372,27 +1621,23 @@ class RuntimeTests(unittest.TestCase):
         )
         self.addCleanup(runtime.close)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            short = executor.submit(
-                runtime.submit, request(1, deadline=engine_runtime.Deadline.after(0.03))
-            )
-            long = executor.submit(
-                runtime.submit, request(2, deadline=engine_runtime.Deadline.after(1))
-            )
+            short = executor.submit(runtime.wait_ready, 0.03)
+            long = executor.submit(runtime.wait_ready, 1.0)
             with self.assertRaises(TimeoutError):
                 short.result(0.5)
             self.assertEqual(len(factory.processes), 1)
             process = factory.processes[0]
             self.assertIsNone(process.poll())
-            self.assertEqual(process.stdin.messages(wire.RequestFrame), [])
             process.send(READY)
-            call = long.result(0.5)
+            self.assertTrue(long.result(0.5))
+        call = runtime.submit(request(2))
         frames = process.stdin.messages(wire.RequestFrame)
         self.assertEqual([frame.prompt_tokens for frame in frames], [(2, 3)])
         send_success(process, call)
         call.result(0.5)
         self.assertEqual(runtime.pending_count, 0)
 
-    def test_startup_expires_even_after_every_caller_has_left(self):
+    def test_startup_expires_even_after_every_waiter_has_left(self):
         factory = FakeFactory(initial_output=b"")
         created = threading.Event()
 
@@ -1406,15 +1651,14 @@ class RuntimeTests(unittest.TestCase):
         )
         self.addCleanup(runtime.close)
         with self.assertRaises(TimeoutError):
-            runtime.submit(request(1, deadline=engine_runtime.Deadline.after(0.01)))
+            runtime.wait_ready(0.01)
         self.assertTrue(created.wait(1.0))
         process = factory.processes[0]
         self.assertIsNone(process.poll())
         self.assertIsNotNone(process.wait(5.0))
         self.assertFalse(runtime.ready)
-        self.assertEqual(process.stdin.messages(wire.RequestFrame), [])
 
-    def test_slow_process_factory_does_not_hold_request_deadline(self):
+    def test_slow_process_factory_does_not_hold_a_waiter(self):
         release = threading.Event()
         factory = FakeFactory()
 
@@ -1428,27 +1672,28 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    runtime.submit,
-                    request(1, deadline=engine_runtime.Deadline.after(0.01)),
-                )
+                future = executor.submit(runtime.wait_ready, 0.01)
                 with self.assertRaises(TimeoutError):
                     future.result(0.5)
         finally:
             release.set()
         self.assertTrue(runtime.wait_ready(0.5))
         self.assertEqual(len(factory.processes), 1)
-        self.assertEqual(factory.processes[0].stdin.messages(wire.RequestFrame), [])
 
-    def test_expired_request_does_not_launch_or_write(self):
+    def test_submit_on_a_not_ready_runtime_fails_fast_and_launches_nothing(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory, eager_start=False
         )
         self.addCleanup(runtime.close)
+        started = time.monotonic()
+        with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "not ready"):
+            runtime.submit(request(1))
+        self.assertLess(time.monotonic() - started, 0.5)
         with self.assertRaises(TimeoutError):
-            runtime.submit(request(1, deadline=engine_runtime.Deadline(1, 1_000_000)))
+            runtime.submit(request(1, deadline=-1.0))
         self.assertEqual(factory.processes, [])
+        self.assertEqual(runtime._admission_slots._value, runtime.pending_limit)
 
     def test_late_process_factory_cannot_publish_ready_after_startup_expiry(self):
         release = threading.Event()
@@ -1483,9 +1728,7 @@ class RuntimeTests(unittest.TestCase):
         with runtime._write_lock:
             for action in (
                 lambda: runtime.status(timeout=0.01),
-                lambda: runtime.submit(
-                    request(1, deadline=engine_runtime.Deadline.after(0.01))
-                ),
+                lambda: runtime.submit(request(1, deadline=0.01)),
             ):
                 started = time.monotonic()
                 with self.assertRaises(TimeoutError):
@@ -1501,10 +1744,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancel_write_timeout_fails_generation(self):
         factory = FakeFactory()
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, io_timeout=0.02
-        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
+        runtime._io_timeout_seconds = 0.02
         call = runtime.submit(request(1))
         with runtime._write_lock:
             self.assertTrue(call.cancel())
@@ -1551,24 +1793,22 @@ class RuntimeTests(unittest.TestCase):
         def factory():
             return processes.pop() if processes else replacement_factory()
 
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, io_timeout=0.15
-        )
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
-        recovered_calls = []
+        runtime._io_timeout_seconds = 0.15
         failure_state = []
 
         def completed(_call):
             failure_state.append((runtime._write_lock.locked(), runtime.ready))
-            recovered_calls.append(runtime.submit(request(2)))
+            # Re-entering submit from a terminal callback is refused at once.
+            try:
+                runtime.submit(request(2))
+            except engine_runtime.EngineUnhealthy as error:
+                failure_state.append(type(error))
 
         active = runtime.submit(request(1), on_complete=completed)
         os.read(read_fd, 65536)  # Drain just the first complete request.
-        large = engine_runtime.GenerationRequest(
-            prompt_tokens=tuple(range(131072)),
-            logical_max_output_tokens=32,
-            deadline=engine_runtime.Deadline.after(1),
-        )
+        large = request(0, prompt_tokens=tuple(range(131072)), deadline=1.0)
         with ThreadPoolExecutor(max_workers=1) as executor:
             writer = executor.submit(runtime.submit, large)
             self.assertTrue(select.select([read_fd], [], [], 0.5)[0])
@@ -1581,10 +1821,12 @@ class RuntimeTests(unittest.TestCase):
                 writer.result(0.5)
         with self.assertRaises(engine_runtime.EngineUnhealthy):
             active.result(0.5)
-        self.assertEqual(failure_state, [(False, False)])
+        self.assertEqual(
+            failure_state, [(False, False), engine_runtime.EngineUnhealthy]
+        )
         self.assertIsNotNone(process.poll())
-        self.assertEqual(len(recovered_calls), 1)
-        recovered = recovered_calls[0]
+        self.assertTrue(runtime.wait_ready(1))
+        recovered = runtime.submit(request(2))
         send_success(replacement_factory.processes[0], recovered)
         recovered.result(0.5)
         self.assertEqual(runtime.pending_count, 0)
@@ -1600,11 +1842,7 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         active = runtime.submit(request(1))
         os.read(read_fd, 65536)  # Drain just the first complete request.
-        large = engine_runtime.GenerationRequest(
-            prompt_tokens=tuple(range(131072)),
-            logical_max_output_tokens=32,
-            deadline=engine_runtime.Deadline.after(0.1),
-        )
+        large = request(0, prompt_tokens=tuple(range(131072)), deadline=0.1)
         received = bytearray()
         with ThreadPoolExecutor(max_workers=1) as executor:
             writer = executor.submit(runtime.submit, large)
@@ -1622,7 +1860,7 @@ class RuntimeTests(unittest.TestCase):
             message for message, _raw in native_peer.ClientFrameReader().feed(received)
         ]
         self.assertEqual([frame.request_id for frame in frames], [call.request_id])
-        self.assertEqual(frames[0].prompt_tokens, large.prompt_tokens)
+        self.assertEqual(frames[0].prompt_tokens, large.frame.prompt_tokens)
         # The engine, not the transport, now fails the expired request alone.
         self.assertTrue(runtime.ready)
         self.assertFalse(active.done)

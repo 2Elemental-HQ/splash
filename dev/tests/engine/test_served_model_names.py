@@ -1,3 +1,4 @@
+import argparse
 import io
 import json
 import tempfile
@@ -14,10 +15,10 @@ from dev.tests.engine.test_json_responses import (
     stream_events,
     tool_request,
 )
-from dev.tests.engine.test_launcher import keep_stop_signals
+from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
-from server import frontend
 from server import protocol as native_wire
+from server import serve_options
 from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
@@ -267,8 +268,8 @@ class ServedModelNamesTests(unittest.TestCase):
             "a/../b",
         ):
             with self.subTest(name=name):
-                with self.assertRaises(ValueError):
-                    frontend.validate_served_model_name(name)
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    serve_options.parse_served_model_name(name)
                 for parse, args in (
                     (api.parse_args, SERVER_ARGS),
                     (launcher.parse_args, ["serve", "--model", "owner/repo"]),
@@ -279,8 +280,7 @@ class ServedModelNamesTests(unittest.TestCase):
                     ):
                         parse([*args, "--served-model-name", name])
         for name in ALIASES:
-            self.assertEqual(frontend.validate_served_model_name(name), name)
-            self.assertEqual(launcher._parse_served_model_name(name), name)
+            self.assertEqual(serve_options.parse_served_model_name(name), name)
 
     def test_announce_requires_a_served_name(self):
         for parse, args in (
@@ -363,7 +363,7 @@ class ServedModelNamesTests(unittest.TestCase):
                 ]
             )
             argv = execute.call_args.args[1]
-            parsed = api.parse_args(argv[3:])
+            parsed = api.parse_args(server_arguments(argv))
             self.assertEqual(parsed.model, "owner/repo")
             self.assertEqual(parsed.served_model_name, ["local", "stable", "-local"])
 
@@ -389,7 +389,7 @@ class ServedModelNamesTests(unittest.TestCase):
                         *flags,
                     ]
                 )
-                parsed = api.parse_args(execute.call_args.args[1][3:])
+                parsed = api.parse_args(server_arguments(execute.call_args.args[1]))
                 self.assertEqual(parsed.served_model_name, ["local"])
                 self.assertIs(parsed.announce_served_name, announced)
 
@@ -402,11 +402,6 @@ class ServedModelNamesTests(unittest.TestCase):
                 with (
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="codex"
-                    ),
-                    mock.patch.object(
-                        launcher,
-                        "_running_status",
-                        return_value={"maximum_context_tokens": 4096},
                     ),
                     mock.patch.object(
                         launcher, "_request_json", return_value=json.loads(payload)

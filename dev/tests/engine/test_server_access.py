@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import os
+import time
 import unittest
 from unittest import mock
 from xml.etree import ElementTree
@@ -95,7 +96,13 @@ class ServerAccessTests(unittest.TestCase):
                     blocked.cancelled.wait(2),
                     "stream disconnect did not cancel generation",
                 )
-                self.assertTrue(harness.server.requests.idle.wait(2))
+                deadline = time.monotonic() + 2
+                while (
+                    harness.server.requests.stats()["active"]
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                self.assertEqual(harness.server.requests.stats()["active"], 0)
                 self.assertEqual(harness.request("POST", path, body, headers)[0], 200)
 
     def test_openai_sdk_recognizes_auth_errors_and_recovers_with_valid_key(self):
@@ -377,6 +384,17 @@ class ServerAccessTests(unittest.TestCase):
             response.read()
             self.assertEqual(response.status, 401)
 
+    def test_routes_and_auth_use_one_normalized_path(self):
+        harness = self.harness(api_key="test-server-key")
+        key = {"Authorization": "Bearer test-server-key"}
+        status, _, payload = harness.request("GET", "/./ready")
+        self.assertEqual((status, json.loads(payload)), (200, {"status": "ready"}))
+        status, _, payload = harness.request("GET", "/v1/models/../models", headers=key)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["object"], "list")
+        self.assertEqual(harness.request("GET", "/v1/../status")[0], 401)
+        self.assertEqual(harness.request("GET", "/v1/../status", headers=key)[0], 200)
+
     def test_public_probes_and_optional_webui(self):
         harness = self.harness(api_key="test-server-key", webui=False)
         for method in ("GET", "HEAD"):
@@ -402,14 +420,8 @@ class ServerAccessTests(unittest.TestCase):
     def test_cli_takes_origins_as_browsers_send_them(self):
         typed = ["tauri://localhost", "http://localhost:3000", "*"]
         flags = [flag for origin in typed for flag in ("--allowed-origin", origin)]
-        # The launcher passes the values on as typed; the server parses them.
-        for (parse, arguments), parsed in zip(
-            PARSERS,
-            (
-                typed,
-                [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN],
-            ),
-        ):
+        parsed = [("tauri", "localhost", None), ("http", "localhost", 3000), ANY_ORIGIN]
+        for parse, arguments in PARSERS:
             self.assertEqual(parse([*arguments, *flags]).allowed_origin, parsed)
             self.assertEqual(parse(arguments).allowed_origin, [])
             for origin, refusal in (

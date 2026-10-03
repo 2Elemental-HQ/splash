@@ -28,11 +28,14 @@ no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
-An engine that fails is restarted at once, and failed restarts back off from
-1 to 16 seconds. Meanwhile generation requests get 503 `engine_recovering`,
-whose message names the last failure. An engine whose loop stops answering
-while requests are pending is failed after 30 seconds and restarted the same
-way.
+An engine that fails is restarted at once. If it fails again within 60 s of
+starting, the next restart waits 5 s; after a third such failure (failed
+restarts count) Splash stops restarting it, and requests get 500
+`engine_failed` naming the crash trace until the server is restarted.
+Meanwhile generation requests get 503 `engine_recovering`, whose message names
+the last failure. An engine whose loop leaves a status request unanswered for
+30 seconds, while requests are pending or during a background status refresh,
+is failed and restarted by the same rules.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
@@ -222,7 +225,8 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort n
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
-semantics (off when omitted); judgment endpoints always disable thinking.
+semantics (off when omitted); judgment endpoints always disable thinking. The
+built-in chat page sends no effort unless the user picks one.
 
 A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
 passed to the template as variables and outrank the effort, so
@@ -770,9 +774,19 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
-generated text for both streaming and complete responses, and `constraints.py`
-compiles token constraints. `make architecture-check` prevents lower layers from
-importing the HTTP entry module.
+generated text as it arrives, one parser serving streamed and complete
+responses alike, and `constraints.py` compiles token constraints. Messages and
+Responses build streamed and complete responses from the same block sequence;
+the one difference is a call cut by the token limit, which a complete Messages
+response leaves out. `make architecture-check` prevents lower layers from
+importing the HTTP entry module, and keeps one import style in `server/` and
+`install/`: a module imports its package's modules relatively. The server
+runs as `python -m server.server`; `install/launcher.py`, `install/models.py`
+and `install/catalog.py`, which run as scripts, import their siblings through
+a PEP 366 header. `serve_options.py` defines the options
+`splash serve` shares with the server once, each with its check, default and
+help, and how the launcher passes it on; it imports only the standard library,
+since the launcher parses them before `.venv` exists.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The
@@ -902,7 +916,8 @@ request sent. Messages requires `max_tokens`; a larger value than the context
 leaves generates up to the context limit, since Claude Code asks for the same
 limit on every turn and does not compact for it. A response the context limit
 ends then has the `stop_reason` `model_context_window_exceeded`, as in
-Anthropic's API, not `max_tokens`.
+Anthropic's API, not `max_tokens`. Messages refuses a final assistant message
+(prefill) with 400; `count_tokens` still counts it.
 
 Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
@@ -936,7 +951,12 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.error` | The engine is restarting; `error` names its failure or the last failed restart |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
+
+`GET /ready` is 200 while the engine's own `ready` is true. While the engine
+loop is busy, `/ready` keeps its last answer until the loop has left status
+requests unanswered for 30 s; a loop that leaves a status refresh unanswered
+that long fails the engine, which then restarts.
 
 `GET /metrics` exposes the same counters in Prometheus text format.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not
@@ -967,8 +987,10 @@ response writing for admitted API requests. Preparation, queue, template,
 tokenization, output grammar preparation and image preparation are measured
 separately; preparation includes its nested stages. Tokenization covers the encoding call, including reuse when
 available. Histogram buckets are cumulative and labeled by upper bound.
-TTFT starts before upload and ends at the first native token
-event. Output intervals are between native token events, which can contain
+HTTP TTFT (`http_ttft`) starts before upload and ends at the first native
+token event; native TTFT (`metrics.ttft_ms`, per-request
+`request_latency.ttft_ms`) starts when the engine receives the request.
+Output intervals are between native token events, which can contain
 multiple speculative tokens; they are not per-token latency. Native queue timing
 is recorded from successful completions. These histograms live with the HTTP
 process and survive a native engine restart.
@@ -980,7 +1002,8 @@ logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
 can contain private conversation data. A frame over 16 MiB, such as a request
 with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
-cannot be replayed.
+cannot be replayed. `python -m server.crash_trace <trace>`, run from the
+checkout root, replays a trace.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -1453,7 +1476,7 @@ Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
 alone does not measure end-to-end agent performance.
 
 For slow tool-bearing requests, the `latency` section of `/status` separates
-preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
+preparation, tokenization, grammar preparation, native queueing and HTTP TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;
 it does not include generation-time masks. The `grammar_cache` counters show
 whether compiled output grammars are reused. Tool definitions still contribute

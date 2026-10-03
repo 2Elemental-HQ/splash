@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import math
 
-if __package__:
-    from .latency import prometheus_latency
-else:
-    from latency import prometheus_latency
+from .latency import prometheus_latency
 
 
 def is_finite_number(value):
@@ -229,7 +226,7 @@ def timings_dict(result):
     emission respectively: those tokens precede the intervals being measured.
     These are elapsed request intervals, not isolated GPU execution times.
     """
-    latency = metrics_dict(result)["request_latency"]
+    latency = result.metrics["request_latency"]
     prompt_ms = latency.get("start_to_first_token_ms", 0.0)
     prompt_rate = result.prefill_tokens * 1000.0 / prompt_ms if prompt_ms else 0.0
     return {

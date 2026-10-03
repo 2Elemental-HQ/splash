@@ -96,8 +96,54 @@ def check_server_dependencies() -> list[str]:
     return errors
 
 
+def check_package_imports() -> list[str]:
+    # The server and the installer each import their own modules one way,
+    # relatively, never by their package's name. The installer's script
+    # entry points name their package in a PEP 366 header, their one use of
+    # __package__.
+    header = ast.dump(
+        ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
+    )
+    entry_points = {"install/launcher.py", "install/models.py", "install/catalog.py"}
+    errors = []
+    for package in ("server", "install"):
+        paths = sorted((ROOT / package).glob("*.py"))
+        own_names = {package, *(path.stem for path in paths)}
+        for path in paths:
+            name = relative(path)
+            tree = ast.parse(path.read_text())
+            allowed = set()
+            if name in entry_points:
+                allowed = {
+                    id(node)
+                    for statement in tree.body
+                    if isinstance(statement, ast.If)
+                    and ast.dump(statement.test) == header
+                    for node in ast.walk(statement)
+                }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and not node.level:
+                    modules = [node.module]
+                elif isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                else:
+                    modules = []
+                for module in modules:
+                    if module.split(".")[0] in own_names:
+                        errors.append(
+                            f"{name}: imports {module} without a relative import"
+                        )
+                if (
+                    isinstance(node, ast.Name)
+                    and node.id == "__package__"
+                    and id(node) not in allowed
+                ):
+                    errors.append(f"{name}: reads __package__")
+    return errors
+
+
 def check() -> list[str]:
-    errors = check_server_dependencies()
+    errors = check_server_dependencies() + check_package_imports()
     obsolete_roots = (
         ROOT / "runtime" / "kernels",
         ROOT / "runtime" / "src" / "metal",

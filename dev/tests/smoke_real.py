@@ -93,7 +93,8 @@ class RealServer:
         )
         command = [
             sys.executable,
-            str(ROOT / "server/server.py"),
+            "-m",
+            "server.server",
             str(package),
             "--host",
             "127.0.0.1",

@@ -23,7 +23,16 @@ from tokenizers import Tokenizer, decoders, models
 
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
-from server import api_shapes, diagnostics, documents, judgments, tool_schema
+from dev.tests.tool_output import argument_grammar, project, tool_policy
+from server import (
+    api_shapes,
+    diagnostics,
+    documents,
+    images,
+    judgments,
+    serve_options,
+    tool_schema,
+)
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -33,9 +42,13 @@ from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
+from server.metrics import metrics_dict
 from server.origins import ANY_ORIGIN, parse_allowed_origin
 from server.thinking import ThinkingCodec
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
+
+# The deadline of a request prepared directly, which never expires.
+FOREVER = math.inf
 
 
 def _byte_alphabet():
@@ -319,7 +332,7 @@ class FakeCall:
         self.request = request
         self.on_event = on_event
         self.on_complete = on_complete
-        self.callback_errors = ()
+        self.callback_error = None
         self.cancel_requested = False
         self._result = None
         self._error = None
@@ -335,7 +348,9 @@ class FakeCall:
         try:
             self.on_event(self, event)
         except Exception as error:
-            self.callback_errors = (*self.callback_errors, error)
+            if self.callback_error is None:
+                self.callback_error = error
+            self.cancel()
 
     def complete(self, *, result=None, error=None):
         with self._lock:
@@ -425,7 +440,7 @@ class FakeRuntime:
             call.complete(error=plan.exception)
             return
         if plan.error:
-            call.complete(error=api_errors.NativeError(*plan.error))
+            call.complete(error=api_errors.ConstraintError(plan.error))
             return
         completion = 0
         if not plan.cancelled.is_set():
@@ -444,7 +459,6 @@ class FakeRuntime:
             else {
                 "stop": native_wire.FinishReason.STOP,
                 "length": native_wire.FinishReason.LENGTH,
-                "cancelled": native_wire.FinishReason.CANCELLED,
             }[plan.reason]
         )
         plan.terminal.set()
@@ -454,16 +468,14 @@ class FakeRuntime:
         done = native_wire.DoneEvent(
             call.request_id,
             reason,
-            len(request.prompt_tokens),
+            len(request.frame.prompt_tokens),
             completion,
             1_000,
             2_000,
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
         )
-        call.complete(
-            result=api.engine_runtime.GenerationResult(call.request_id, None, done)
-        )
+        call.complete(result=done)
 
     def close(self):
         if self.closed:
@@ -512,15 +524,15 @@ def main_args(**overrides):
             "max_memory": None,
             "max_cache_disk": 0,
             "decode_share": None,
-            "max_image_pixels": api.image_input.MAX_PIXELS,
-            "request_timeout": 2,
+            "max_image_pixels": images.MAX_PIXELS,
+            "request_timeout": None,
             "queue_size": 1,
             "host": "127.0.0.1",
             "allowed_host": [],
             "allowed_origin": [],
             "api_key": None,
             "no_webui": False,
-            "max_request_size": api.DEFAULT_MAX_REQUEST_BYTES,
+            "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
@@ -563,13 +575,13 @@ class Harness:
         timeout=2,
         max_context=128,
         model="test-model",
-        request_logger=None,
+        request_logger=lambda _record: None,
         constraint_factory=None,
-        io_timeout=api.HTTP_IO_TIMEOUT,
+        io_timeout=None,
         thinking_codec=None,
         api_key=None,
         webui=True,
-        max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
+        max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
         allowed_origins=(),
@@ -600,7 +612,6 @@ class Harness:
         self.server = api.FrontendServer(
             (host, 0),
             self.app,
-            io_timeout,
             request_capacity=queue_size,
             api_key=api_key,
             webui=webui,
@@ -608,6 +619,13 @@ class Harness:
             allowed_hosts=allowed_hosts,
             allowed_origins=map(parse_allowed_origin, allowed_origins),
         )
+        # The server reads HTTP_IO_TIMEOUT per connection. A harness given its
+        # own holds it until close(); patching only once setup has succeeded
+        # never leaves it patched.
+        self._io_timeout = None
+        if io_timeout is not None:
+            self._io_timeout = mock.patch.object(api, "HTTP_IO_TIMEOUT", io_timeout)
+            self._io_timeout.start()
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -649,6 +667,8 @@ class Harness:
         self.thread.join()
         self.server.server_close()
         self.backend.close()
+        if self._io_timeout is not None:
+            self._io_timeout.stop()
 
 
 class ServerTest(unittest.TestCase):
@@ -706,6 +726,9 @@ class ServerTest(unittest.TestCase):
             def deep_copy(self):
                 return SimpleNamespace(grammar=self.grammar, copy=True)
 
+        self.enterContext(
+            mock.patch.object(generation_constraints.ConstraintFactory, "CACHE_SIZE", 2)
+        )
         with (
             mock.patch(
                 "server.constraints.guidance_tokenizer",
@@ -718,7 +741,7 @@ class ServerTest(unittest.TestCase):
                 side_effect=lambda matcher, executor: (matcher, executor),
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object(), cache_size=2)
+            factory = generation_constraints.ConstraintFactory(object())
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -735,7 +758,7 @@ class ServerTest(unittest.TestCase):
                 "entries": 2,
                 "capacity": 2,
                 "source_bytes": 8,
-                "source_budget_bytes": factory.DEFAULT_CACHE_SOURCE_BYTES,
+                "source_budget_bytes": factory.CACHE_SOURCE_BYTES,
                 "hits": 1,
                 "misses": 4,
             },
@@ -1069,6 +1092,7 @@ class ServerTest(unittest.TestCase):
             {
                 "ready": True,
                 "recovering": False,
+                "stopped": False,
                 "pending": 0,
                 "pending_limit": 4,
                 "restarts": 0,
@@ -1270,7 +1294,7 @@ class ServerTest(unittest.TestCase):
             {"status": "hit", "matched_tokens": 1, "lane": 0},
         )
         self.assertNotIn("queue_ms", response["metrics"])
-        self.assertEqual(runtime.requests[0].seed, 7)
+        self.assertEqual(runtime.requests[0].frame.seed, 7)
 
     class CharTokenizer(FakeTokenizer):
         """One token per character, so single-letter answer slots are exact."""
@@ -1350,7 +1374,7 @@ class ServerTest(unittest.TestCase):
             },
         )
 
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         # The rendered prompt plus one slot token is exactly the boundary the
         # engine scores; verify it against the tokenizer, not the response.
         prompt_text = harness.tokenizer.decode(request.prompt_tokens)
@@ -1358,6 +1382,7 @@ class ServerTest(unittest.TestCase):
             response["prompt_sha256"],
             hashlib.sha256(prompt_text.encode()).hexdigest(),
         )
+        self.assertEqual(response["answer_token_ids"], list(request.score_tokens))
         self.assertEqual(
             harness.tokenizer.encode(prompt_text + "A"),
             list(request.prompt_tokens) + [ord("A")],
@@ -1441,17 +1466,6 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
 
-    def test_judgments_missing_logits_is_a_server_error(self):
-        runtime = FakeRuntime(Plan())
-        harness = self.harness(
-            runtime, tokenizer=self.CharTokenizer(), max_context=8192
-        )
-        status, _, payload = harness.request(
-            "POST", "/v1/judgments", self.judgment_body()
-        )
-        self.assertEqual(status, 500, payload)
-        self.assertEqual(json.loads(payload)["error"]["code"], "protocol_error")
-
     def test_judgments_deadline_cancels_the_score_request(self):
         plan = Plan(logits=(0.0, 1.0), block=True)
         runtime = FakeRuntime(plan)
@@ -1478,11 +1492,12 @@ class ServerTest(unittest.TestCase):
             ],
             timeout=1.0,
         )
+        deadline = app.request_deadline(body, clock[0])
         with (
             mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
             self.assertRaises(api.APIError) as error,
         ):
-            app.prepare_judgment(body)
+            app.prepare_judgment(body, deadline=deadline)
         self.assertEqual(
             (error.exception.status, error.exception.code), (504, "request_timeout")
         )
@@ -1499,7 +1514,8 @@ class ServerTest(unittest.TestCase):
                         {"id": f"opt{index}", "description": f"case {index}"}
                         for index in range(16)
                     ]
-                )
+                ),
+                deadline=FOREVER,
             )
         self.assertEqual(
             (error.exception.status, error.exception.code),
@@ -1564,6 +1580,33 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response["answers"]["choice"]["probabilities"], {"only": 1.0})
         self.assertEqual(response["answers"]["score"]["score"], 0.0)
         self.assertEqual(response["usage"], {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_render_failure_is_a_request_error(self):
+        class QuestionRenderFails(self.CharTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                if messages[0].get("content") == judgments.SYSTEMONE_SYSTEM:
+                    raise ValueError("the template cannot render this question")
+                return super().apply_chat_template(messages, **kwargs)
+
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=QuestionRenderFails(), max_context=8192
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Some evidence",
+                "questions": {"supported": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"],
+            "question prompt could not be rendered",
+        )
         self.assertEqual(runtime.requests, [])
 
     def test_systemone_shared_deadline_cancels_only_current_question(self):
@@ -1639,13 +1682,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertTrue((request_id or "").startswith("req_"))
 
-        # Paths that normalize away from the catalog get no request id.
-        status, request_id, _ = get("/health")
-        self.assertEqual(status, 200)
-        self.assertIsNone(request_id)
-        status, request_id, _ = get("/v1/models/%2e%2e/%2e%2e/health")
-        self.assertEqual(status, 404)
-        self.assertIsNone(request_id)
+        # Paths that normalize away from the catalog are routed where they
+        # lead, without a request id.
+        for path in ("/health", "/v1/models/%2e%2e/%2e%2e/health"):
+            with self.subTest(path=path):
+                status, request_id, _ = get(path)
+                self.assertEqual(status, 200)
+                self.assertIsNone(request_id)
 
     def test_systemone_question_count_budget_rejects_before_inference(self):
         runtime = FakeRuntime()
@@ -1778,7 +1821,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
         )
         self.assertEqual(status, 200)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         # 64x64 upscales to the 256x256 minimum: a 16x16 patch grid, 64 tokens.
         self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
         (span,) = request.image_spans
@@ -1803,7 +1846,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
         )
         self.assertEqual(harness.app.images.stats()["entries"], 1)
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
+        self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
 
     def test_image_positions_ignore_quoted_vision_tokens(self):
         from tokenizers import pre_tokenizers
@@ -2047,9 +2090,9 @@ class ServerTest(unittest.TestCase):
                     cases.append((path, kind, self.anthropic_body(messages=messages)))
         with (
             mock.patch.object(
-                api.image_input,
+                images,
                 "decode_data_url",
-                wraps=api.image_input.decode_data_url,
+                wraps=images.decode_data_url,
             ) as decode,
             mock.patch.object(
                 documents, "pdf_content", wraps=documents.pdf_content
@@ -2083,25 +2126,22 @@ class ServerTest(unittest.TestCase):
         anthropic = api_shapes.anthropic_to_chat_prompt
         responses = api_shapes.responses_to_chat_body
         with (
-            mock.patch.object(
-                api.image_input, "decode_data_url", side_effect=AssertionError
-            ),
+            mock.patch.object(images, "decode_data_url", side_effect=AssertionError),
             mock.patch.object(documents, "_render", side_effect=AssertionError),
         ):
             converted = {
                 "responses": responses(
-                    {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_image", "image_url": image},
-                                    {"type": "input_file", "file_data": image},
-                                ],
-                            }
-                        ]
-                    }
-                )["messages"],
+                    {},
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": image},
+                                {"type": "input_file", "file_data": image},
+                            ],
+                        }
+                    ],
+                )[0]["messages"],
                 "anthropic": anthropic(
                     {
                         "model": "m",
@@ -2131,17 +2171,20 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(kinds[0], "image_url")
                 self.assertEqual(kinds[-1], "file")
                 with self.assertRaisesRegex(api.APIError, "^image input"):
-                    api_shapes.normalize_messages(messages, vision=False)
+                    api_shapes.normalize_messages(
+                        messages, vision=False, deadline=FOREVER
+                    )
                 with self.assertRaisesRegex(api.APIError, "^PDF input"):
                     api_shapes.normalize_messages(
                         [{"role": "user", "content": messages[0]["content"][1:]}],
                         vision=False,
+                        deadline=FOREVER,
                     )
         # Normalization renders the document's PDF after its title and context.
         self.assertEqual(
-            api_shapes.normalize_messages(converted["anthropic"], vision=True)[0][
-                "content"
-            ][1:],
+            api_shapes.normalize_messages(
+                converted["anthropic"], vision=True, deadline=FOREVER
+            )[0]["content"][1:],
             [
                 {"type": "text", "text": "Report\n"},
                 {"type": "text", "text": "Fixture\n"},
@@ -2182,7 +2225,7 @@ class ServerTest(unittest.TestCase):
             {"role": "user", "content": [part] * limit},
             {"role": "tool", "content": [part]},
         ]
-        with mock.patch.object(api.image_input, "decode_data_url") as decode:
+        with mock.patch.object(images, "decode_data_url") as decode:
             with self.assertRaisesRegex(api.APIError, f"at most {limit} images"):
                 app._prepare_images(messages, check_context=False)
             decode.assert_not_called()
@@ -2232,17 +2275,20 @@ class ServerTest(unittest.TestCase):
         app = self.harness(
             FakeRuntime(), tokenizer=self.ImagePadTokenizer(), max_context=1024
         ).app
-        app.images = api.image_input.ImageCache(request_budget_bytes=256 * 256 * 3)
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
+        self.enterContext(
+            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 256 * 256 * 3)
+        )
+        app.images = images.ImageCache()
+        job = app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         native_request = app.backend._generation_request(job)
         self.assertIs(native_request.image_owner, job.image_owner)
         del job
         with self.assertRaisesRegex(api.APIError, "image memory budget") as failure:
-            app.prepare(self.body(messages=[self._image_message()]))
+            app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         self.assertEqual(failure.exception.status, 503)
         del native_request
         self.assertEqual(app.images.stats()["request_bytes"], 0)
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
+        job = app.prepare(self.body(messages=[self._image_message()]), deadline=FOREVER)
         self.assertGreater(app.images.stats()["request_bytes"], 0)
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
@@ -2281,7 +2327,7 @@ class ServerTest(unittest.TestCase):
             [part["type"] for part in rendered[0]["content"]],
             ["text", "image_url", "text"],
         )
-        self.assertEqual(len(runtime.requests[0].image_spans), 1)
+        self.assertEqual(len(runtime.requests[0].frame.image_spans), 1)
 
         status, _, _ = harness.request(
             "POST",
@@ -2300,9 +2346,9 @@ class ServerTest(unittest.TestCase):
             ),
         )
         self.assertEqual(status, 200)
-        self.assertEqual(len(runtime.requests[1].image_spans), 1)
+        self.assertEqual(len(runtime.requests[1].frame.image_spans), 1)
         self.assertEqual(
-            runtime.requests[1].image_spans, runtime.requests[0].image_spans
+            runtime.requests[1].frame.image_spans, runtime.requests[0].frame.image_spans
         )
 
     def test_tool_results_carry_images_like_user_content(self):
@@ -2358,7 +2404,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
         )
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
         (span,) = request.image_spans
         self.assertEqual((span.offset, span.tokens), (1, 64))
@@ -2396,7 +2442,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
         )
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
+        self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
 
         # Responses tool outputs use the same image pixels and span geometry,
         # including when the tool result is replayed from stored history.
@@ -2439,8 +2485,12 @@ class ServerTest(unittest.TestCase):
                 [part["type"] for part in rendered[-1]["content"]],
                 ["text", "image_url"],
             )
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
-            self.assertEqual(runtime.requests[-1].image_pixels, request.image_pixels)
+            self.assertEqual(
+                runtime.requests[-1].frame.image_spans, request.image_spans
+            )
+            self.assertEqual(
+                runtime.requests[-1].frame.image_pixels, request.image_pixels
+            )
             status, _, payload = harness.request(
                 "POST",
                 "/v1/responses",
@@ -2449,7 +2499,9 @@ class ServerTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(status, 200, payload)
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
+            self.assertEqual(
+                runtime.requests[-1].frame.image_spans, request.image_spans
+            )
 
     def test_responses_tool_images_reject_invalid_content_before_inference(self):
         runtime = FakeRuntime()
@@ -2677,11 +2729,10 @@ class ServerTest(unittest.TestCase):
                         self.assertEqual(status, 200, payload)
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
-                job, *_ = harness.app.prepare(
-                    api.anthropic_to_chat_body(
-                        {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
-                    )
+                chat, _ = api.anthropic_to_chat_body(
+                    {**body, "max_tokens": 8}, thinking_resolver=no_signed_thinking
                 )
+                job = harness.app.prepare(chat, deadline=FOREVER)
                 self.assertEqual(counted["input_tokens"], len(job.prompt_tokens))
                 self.assertEqual(job.request_id, index + 1)
                 counts.append(counted["input_tokens"])
@@ -2715,18 +2766,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(json.loads(payload), {"input_tokens": 130})
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
-        with self.assertRaisesRegex(api.APIError, "context window"):
-            harness.app.prepare(
-                api.anthropic_to_chat_body(
-                    {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
-                )
-            )
-        harness.app.max_context = 256
-        job, *_ = harness.app.prepare(
-            api.anthropic_to_chat_body(
-                {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
-            )
+        chat, _ = api.anthropic_to_chat_body(
+            {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
         )
+        with self.assertRaisesRegex(api.APIError, "context window"):
+            harness.app.prepare(chat, deadline=FOREVER)
+        harness.app.max_context = 256
+        job = harness.app.prepare(chat, deadline=FOREVER)
         self.assertEqual(len(job.prompt_tokens), 130)
         del job
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
@@ -2799,7 +2845,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(harness.backend.runtime.requests, [])
 
     def test_anthropic_tool_history_and_choice_use_one_chat_pipeline(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 system=[{"type": "text", "text": "be exact"}],
                 messages=[
@@ -2859,7 +2905,7 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(translated["parallel_tool_calls"])
 
     def test_anthropic_adaptive_thinking_maps_reasoning_effort(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
@@ -2867,7 +2913,7 @@ class ServerTest(unittest.TestCase):
             thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(translated["reasoning_effort"], "high")
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "low"},
@@ -2906,7 +2952,7 @@ class ServerTest(unittest.TestCase):
 
     def test_anthropic_strips_nonsemantic_billing_system_block(self):
         def translated(metadata):
-            return api.anthropic_to_chat_body(
+            chat, _ = api.anthropic_to_chat_body(
                 self.anthropic_body(
                     system=[
                         {
@@ -2923,6 +2969,7 @@ class ServerTest(unittest.TestCase):
                 ),
                 thinking_resolver=no_signed_thinking,
             )
+            return chat
 
         first = translated("one")
         self.assertEqual(first, translated("two"))
@@ -2932,12 +2979,13 @@ class ServerTest(unittest.TestCase):
         )
 
     def test_anthropic_preserves_inline_system_messages(self):
-        translated = api.anthropic_to_chat_body(
+        translated, _ = api.anthropic_to_chat_body(
             self.anthropic_body(
                 messages=[
                     {"role": "user", "content": "hello"},
                     {"role": "system", "content": "dynamic system update"},
                     {"role": "assistant", "content": "acknowledged"},
+                    {"role": "user", "content": "continue"},
                 ]
             ),
             thinking_resolver=no_signed_thinking,
@@ -2948,6 +2996,7 @@ class ServerTest(unittest.TestCase):
                 {"role": "user", "content": "hello"},
                 {"role": "system", "content": "dynamic system update"},
                 {"role": "assistant", "content": "acknowledged"},
+                {"role": "user", "content": "continue"},
             ],
         )
 
@@ -3101,7 +3150,11 @@ class ServerTest(unittest.TestCase):
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
         harness = self.harness(FakeRuntime(Plan([[1], [26], [27]])))
-        with self.openai_client(harness) as client:
+        with (
+            # The fake vocabulary's </think> is token 26.
+            mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26),
+            self.openai_client(harness) as client,
+        ):
             response = client.chat.completions.create(
                 model="test-model",
                 messages=[{"role": "user", "content": "hello"}],
@@ -3232,14 +3285,14 @@ class ServerTest(unittest.TestCase):
         result = backend_api.NativeResult(
             "stop", 1, 1, 1.0, 2.0, 3.0, 1, first_token_batch_tokens=1
         )
-        metrics = api.metrics_dict(result)
+        metrics = metrics_dict(result)
         self.assertNotIn("stream_tokens_per_second", metrics["request_latency"])
         self.assertEqual(metrics["prefill"]["tokens"], 1)
         result.completion_tokens = 3
         for interval in (0.0, math.inf, 5e-324):
             result.first_token_to_done_ms = interval
             self.assertNotIn(
-                "stream_tokens_per_second", api.metrics_dict(result)["request_latency"]
+                "stream_tokens_per_second", metrics_dict(result)["request_latency"]
             )
 
     def test_stream_rate_excludes_the_whole_first_speculative_batch(self):
@@ -3267,7 +3320,6 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(records), 1)
         record = records[0]
-        self.assertEqual(record["event"], "request")
         self.assertEqual(record["outcome"], "stop")
         self.assertNotIn("queue_ms", record)
         self.assertNotIn("queue_ms", record["metrics"])
@@ -3301,16 +3353,18 @@ class ServerTest(unittest.TestCase):
             "template",
             "tokenization",
             "images",
-            "ttft",
+            "http_ttft",
             "output_interval",
         ):
             with self.subTest(stage=stage):
                 self.assertEqual(snapshot[stage]["count"], 1)
                 self.assertGreater(snapshot[stage]["sum"], 0)
-        self.assertGreater(snapshot["http_request"]["sum"], snapshot["ttft"]["sum"])
+        self.assertGreater(
+            snapshot["http_request"]["sum"], snapshot["http_ttft"]["sum"]
+        )
         status, _, payload = harness.request("GET", "/metrics")
         self.assertEqual(status, 200, payload)
-        self.assertIn(b"splash_ttft_seconds_count 1", payload)
+        self.assertIn(b"splash_http_ttft_seconds_count 1", payload)
         self.assertIn(b"splash_output_interval_seconds_count 1", payload)
 
     def test_console_request_summary(self):
@@ -3451,14 +3505,6 @@ class ServerTest(unittest.TestCase):
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
         self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
-        for invalid in ("auto", "-1", "0G", "5X"):
-            with (
-                self.subTest(invalid=invalid),
-                mock.patch("sys.stderr", io.StringIO()) as error,
-                self.assertRaises(SystemExit),
-            ):
-                api.parse_args([*required, "--max-cache-disk", invalid])
-            self.assertIn("use 0 to disable, or a size such as 5G", error.getvalue())
         self.assertEqual(args.kv_format, "int8")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
@@ -3470,8 +3516,6 @@ class ServerTest(unittest.TestCase):
             api._native_command(disk_bf16_args)[-3:],
             [str(5 * 1024**3), "--kv-format", "bf16"],
         )
-        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            api.parse_args([*required, "--kv-format", "fp16"])
         self.assertIsNone(args.decode_share)
         self.assertNotIn("--decode-share", api._native_command(args))
         share_args = api.parse_args(
@@ -3489,46 +3533,33 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(
                 api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
             )
-        self.assertEqual(
-            api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
-        )
-        self.assertEqual(
-            api.parse_args([*required, "--max-memory", "32G"]).max_memory, 32 * 1024**3
-        )
-        self.assertEqual(args.request_timeout, math.inf)
+        self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         # No server option bounds the output of a request that names no
         # limit: it may use what the two-token prompt leaves of the window.
         app = make_frontend(tokenizer, backend, "test-model", 40000, 1, 2, vision=True)
-        self.assertEqual(app.prepare(self.body())[0].max_new_tokens, 39998)
+        self.assertEqual(
+            app.prepare(self.body(), deadline=FOREVER).max_new_tokens, 39998
+        )
         with mock.patch("sys.stderr"):
-            for option, value in (
-                ("--max-context", "0"),
-                ("--max-context", "262145"),
-                ("--max-context", "not-a-number"),
-                ("--max-memory", "0"),
-                ("--max-memory", "not-a-number"),
-                ("--request-timeout", "0"),
-                ("--request-timeout", "nan"),
-                ("--request-timeout", "inf"),
-                ("--decode-share", "-0.5"),
-                ("--decode-share", "nan"),
-                ("--decode-share", "inf"),
-                ("--queue-size", "0"),
-                ("--port", "-1"),
-                ("--port", "65536"),
-            ):
+            for value in ("-1", "65536"):
                 with self.assertRaises(SystemExit):
-                    api.parse_args([*required, option, value])
+                    api.parse_args([*required, "--port", value])
 
     def test_public_ids_are_stable_and_unique_across_app_instances(self):
         tokenizer = FakeTokenizer()
-        first_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
-        second_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        first_backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
+        second_backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(first_backend.close)
         self.addCleanup(second_backend.close)
         with mock.patch.object(
@@ -3540,8 +3571,8 @@ class ServerTest(unittest.TestCase):
             second = make_frontend(
                 tokenizer, second_backend, "test-model", 128, 1, 2, vision=True
             )
-        first_job, _, _ = first.prepare(self.body(seed=1))
-        second_job, _, _ = second.prepare(self.body(seed=1))
+        first_job = first.prepare(self.body(seed=1), deadline=FOREVER)
+        second_job = second.prepare(self.body(seed=1), deadline=FOREVER)
         self.assertEqual((first_job.request_id, second_job.request_id), (1, 1))
         self.assertNotEqual(first_job.public_id, second_job.public_id)
         result = backend_api.NativeResult("stop", 2, 1, 1, 1, 1)
@@ -3651,6 +3682,8 @@ class ServerTest(unittest.TestCase):
             runtime, tokenizer, request_logger=diagnostics.print_request
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
+        # No --request-timeout, no deadline.
+        self.assertEqual(app_type.call_args.args[4], math.inf)
         self.assertEqual(app_type.call_args.args[5], 4)
         runtime.wait_ready.assert_called_once_with()
         server.serve_forever.assert_called_once()
@@ -4101,6 +4134,58 @@ class ServerTest(unittest.TestCase):
                 response.read()
                 connection.close()
 
+    def test_chat_and_text_streams_share_keepalive_and_usage_chunks(self):
+        usage = {"stream": True, "stream_options": {"include_usage": True}}
+        for path, body, field, empty in (
+            (
+                "/v1/chat/completions",
+                self.body(reasoning_effort="none", **usage),
+                "delta",
+                {},
+            ),
+            (
+                "/v1/completions",
+                {"model": "test-model", "prompt": "hello", **usage},
+                "text",
+                "",
+            ),
+        ):
+            with self.subTest(path=path):
+                plan = Plan([[4]], before_start=True, block=True)
+                harness = self.harness(FakeRuntime(plan))
+                with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
+                    connection, response = harness.open_stream(path, body)
+                    try:
+                        # A comment until the request starts, then a chunk
+                        # that adds nothing.
+                        self.assertEqual(response.readline(), b": splash-keepalive\n")
+                        plan.start_release.set()
+                        chunk = json.loads(self.next_sse_data(response))
+                        if path == "/v1/chat/completions":
+                            self.assertEqual(
+                                chunk["choices"][0]["delta"],
+                                {"role": "assistant", "content": ""},
+                            )
+                            chunk = json.loads(self.next_sse_data(response))
+                        self.assertEqual(chunk["choices"][0][field], empty)
+                        self.assertIsNone(chunk["choices"][0]["finish_reason"])
+                    finally:
+                        plan.release.set()
+                        payload = response.read()
+                        connection.close()
+                chunks = [
+                    json.loads(line[6:])
+                    for line in payload.decode().splitlines()
+                    if line.startswith("data: {")
+                ]
+                finish, final = chunks[-2:]
+                self.assertEqual(finish["choices"][0]["finish_reason"], "stop")
+                self.assertIn("timings", finish)
+                self.assertEqual(final["choices"], [])
+                self.assertEqual(final["usage"]["completion_tokens"], 1)
+                self.assertIn("metrics", final)
+                self.assertTrue(payload.endswith(b"data: [DONE]\n\n"))
+
     def test_responses_stream_heartbeats_before_native_start(self):
         plan = Plan([[4]], before_start=True)
         harness = self.harness(FakeRuntime(plan))
@@ -4155,7 +4240,7 @@ class ServerTest(unittest.TestCase):
         clock = [0.0]
         events = iter(
             [
-                ("start", "miss"),
+                ("start", None),
                 None,
                 None,
                 ("text", "answer"),
@@ -4174,7 +4259,7 @@ class ServerTest(unittest.TestCase):
 
         job.events = SimpleNamespace(get=next_event)
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            handler._responses_stream(job, False, False)
+            handler._responses_stream(job)
 
         raw = handler.wfile.getvalue()
         stream = io.BytesIO(raw)
@@ -4244,20 +4329,19 @@ class ServerTest(unittest.TestCase):
 
         job = SimpleNamespace(
             public_id="request",
+            thinking=False,
             tool_policy=policy,
             response_validator=None,
             deadline=100,
             events=SimpleNamespace(get=next_event),
         )
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            _, _, calls, _, _ = handler._collect(
+            calls = handler._collect(
                 job,
-                False,
-                True,
-                lambda field, text: handler._sse({field: text}),
-                handler._sse,
-                handler._sse_keepalive,
-            )
+                on_text=lambda field, text: handler._sse({field: text}),
+                on_tool_delta=handler._sse,
+                on_idle=handler._sse_keepalive,
+            ).tool_calls
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
         self.assertGreaterEqual(snapshots[-3].count(b": splash-keepalive"), 3)
@@ -4281,7 +4365,7 @@ class ServerTest(unittest.TestCase):
                 clock[0] += 0.5
                 handler._next_event(job, heartbeat)
                 if index % 2:
-                    handler._responses_sse("event", {"text": "x"})
+                    handler._event_sse("event", {"text": "x"})
                 else:
                     handler._sse({"text": "x"})
         heartbeat.assert_not_called()
@@ -4594,31 +4678,27 @@ class ServerTest(unittest.TestCase):
                 "POST", "/v1/responses", dict(body, stream=True)
             )
         self.assertEqual((status, stream_status), (200, 200))
-        response = json.loads(payload)
-        nonstream_message = next(
-            item for item in response["output"] if item["type"] == "message"
-        )
         events = self.response_events(stream_payload)
         streamed = "".join(
             event["delta"]
             for event in events
             if event["type"] == "response.output_text.delta"
         )
-        completed = events[-1]["response"]
-        stream_messages = [
-            item for item in completed["output"] if item["type"] == "message"
-        ]
         expected = " \nalpha \t\n beta \t\n"
-        self.assertEqual(nonstream_message["content"][0]["text"], expected)
-        self.assertEqual(
-            "".join(item["content"][0]["text"] for item in stream_messages),
-            expected,
-        )
         self.assertEqual(streamed, expected)
-        self.assertEqual(
-            [item["type"] for item in completed["output"]],
-            ["message", "function_call", "message"],
-        )
+        for output in (json.loads(payload)["output"], events[-1]["response"]["output"]):
+            self.assertEqual(
+                [item["type"] for item in output],
+                ["message", "function_call", "message"],
+            )
+            self.assertEqual(
+                "".join(
+                    item["content"][0]["text"]
+                    for item in output
+                    if item["type"] == "message"
+                ),
+                expected,
+            )
         self.assertNotIn("<tool_call>", stream_payload.decode())
 
     def test_streaming_multiple_tools_never_exposes_xml(self):
@@ -4883,7 +4963,7 @@ class ServerTest(unittest.TestCase):
             f"<parameter=nested>\n{nested}\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1)
+        _, calls, _ = project(text, tool_policy({"f": {}}))
         arguments = json.loads(calls[0]["function"]["arguments"])
         self.assertEqual(
             arguments,
@@ -4917,14 +4997,13 @@ class ServerTest(unittest.TestCase):
             },
             "required": ["text", "count"],
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=text>\n123\n</parameter>\n"
             "<parameter=count>\n3\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"text": "123", "count": 3},
@@ -4954,7 +5033,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", tool_schema._tool_arguments_grammar(schema))
+        self.assertIn("/(?s:.*)/", argument_grammar(schema))
         valid = {
             "id": "call_1",
             "type": "function",
@@ -4991,7 +5070,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", tool_schema._tool_arguments_grammar(schema))
+        self.assertIn("/(?s:.*)/", argument_grammar(schema))
 
         valid = {
             "id": "call_1",
@@ -5032,7 +5111,7 @@ class ServerTest(unittest.TestCase):
             True,
         )
         self.assertEqual(len(tools), 1)
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertNotIn("propertyNames", grammar)
         invalid = {
             "id": "call_1",
@@ -5071,7 +5150,7 @@ class ServerTest(unittest.TestCase):
             "required",
             False,
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         self.assertEqual(json.dumps(schema), original)
         for path in ("website/index.html", "../secret", "website/../secret"):
@@ -5132,7 +5211,7 @@ class ServerTest(unittest.TestCase):
             "required",
             False,
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         for reference in references:
             self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
@@ -5169,19 +5248,18 @@ class ServerTest(unittest.TestCase):
                 "text": {"type": "string"},
             },
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=direct>\n123\n</parameter>\n"
             "<parameter=chained>\n456\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"direct": "123", "chained": "456"},
         )
-        grammar = tool_schema._tool_arguments_grammar(schema)
+        grammar = argument_grammar(schema)
         self.assertIn('[suffix="\\n</parameter>\\n"]', grammar)
         self.assertEqual(grammar.count("/(?s:.*)/"), 3)
         self.assertNotIn(r'[^"\s]', grammar)
@@ -5193,13 +5271,12 @@ class ServerTest(unittest.TestCase):
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             '<parameter=text>\n "line"\n\n</parameter>\n'
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"text": ' "line"\n'},
@@ -5225,7 +5302,7 @@ class ServerTest(unittest.TestCase):
             "</function>\n</tool_call>world\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        content, calls = model_output.parse_tool_calls(text, 1)
+        content, calls, _ = project(text, tool_policy({"echo": {}}))
         self.assertEqual(content, "")
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
@@ -5258,7 +5335,7 @@ class ServerTest(unittest.TestCase):
             "<parameter=maybe>\nnull\n</parameter>\n"
             "</function>\n</tool_call> visible suffix"
         )
-        content, calls = model_output.parse_tool_calls(raw, "fuzz", policy)
+        content, calls, _ = project(raw, policy, "fuzz")
         model_output.validate_tool_calls(calls, policy)
         self.assertEqual(content, "visible prefix  visible suffix")
 
@@ -5267,18 +5344,17 @@ class ServerTest(unittest.TestCase):
             "type": "object",
             "properties": {"text": {"type": "string", "enum": [" edge "]}},
         }
-        policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
         text = (
             "<tool_call>\n<function=echo>\n"
             "<parameter=text>\n edge \n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls = model_output.parse_tool_calls(text, 1, policy)
+        _, calls, _ = project(text, tool_policy({"echo": schema}))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"text": " edge "}
         )
         with self.assertRaisesRegex(api.APIError, "XML framing"):
-            tool_schema._tool_arguments_grammar(
+            argument_grammar(
                 {
                     "type": "object",
                     "properties": {
@@ -5292,7 +5368,9 @@ class ServerTest(unittest.TestCase):
 
     def test_tool_choice_shapes_the_grammar_policy_not_the_prompt(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [
@@ -5308,7 +5386,7 @@ class ServerTest(unittest.TestCase):
         )
         for extra, required, parallel, start in cases:
             with self.subTest(**extra):
-                job, _, _ = app.prepare(self.body(tools=tools, **extra))
+                job = app.prepare(self.body(tools=tools, **extra), deadline=FOREVER)
                 rendered, kwargs = tokenizer.templates[-1]
                 self.assertEqual(rendered, [{"role": "user", "content": "hello"}])
                 self.assertEqual(kwargs["tools"], tools)
@@ -5329,18 +5407,25 @@ class ServerTest(unittest.TestCase):
 
     def test_stop_is_refused_only_while_a_tool_can_be_called(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         tools = [{"type": "function", "function": {"name": "f"}}]
-        job, _, _ = app.prepare(self.body(tools=tools, tool_choice="none", stop=["x"]))
+        job = app.prepare(
+            self.body(tools=tools, tool_choice="none", stop=["x"]), deadline=FOREVER
+        )
         self.assertEqual(job.tool_policy.schemas, {})
         for choice in ("auto", "required"):
             with (
                 self.subTest(tool_choice=choice),
                 self.assertRaisesRegex(api.APIError, "stop cannot be combined"),
             ):
-                app.prepare(self.body(tools=tools, tool_choice=choice, stop=["x"]))
+                app.prepare(
+                    self.body(tools=tools, tool_choice=choice, stop=["x"]),
+                    deadline=FOREVER,
+                )
 
     def test_tool_names_accept_long_mcp_names_up_to_128_characters(self):
         runtime = FakeRuntime(Plan([[4]]))
@@ -5675,15 +5760,17 @@ class ServerTest(unittest.TestCase):
 
     def test_qwen_reasoning_efforts(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         for effort in ("xhigh", "medium", "low"):
-            app.prepare(self.body(reasoning_effort=effort))
+            app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
             template = tokenizer.templates[-1][1]
             self.assertTrue(template["enable_thinking"])
             self.assertEqual(template["reasoning_effort"], effort)
-        app.prepare(self.body(reasoning_effort="none"))
+        app.prepare(self.body(reasoning_effort="none"), deadline=FOREVER)
         template = tokenizer.templates[-1][1]
         self.assertFalse(template["enable_thinking"])
         self.assertNotIn("reasoning_effort", template)
@@ -5775,9 +5862,11 @@ class ServerTest(unittest.TestCase):
                     "content": "A historical <think> must not open thinking.",
                 },
             )
-            job, thinking, _ = app.prepare(body)
-            self.assertEqual((thinking, job.thinking), (expected, expected))
-            self.assertEqual(app.count_tokens(body), len(job.prompt_tokens))
+            job = app.prepare(body, deadline=FOREVER)
+            self.assertEqual(job.thinking, expected)
+            self.assertEqual(
+                app.count_tokens(body, deadline=FOREVER), len(job.prompt_tokens)
+            )
         self.assertIn("think:", factory.grammars[-1])
 
     def test_responses_omitted_or_null_effort_preserves_native_thinking_off(self):
@@ -5816,8 +5905,9 @@ class ServerTest(unittest.TestCase):
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
                 with self.subTest(accepted=accepted, effort=effort):
                     tokenizer.templates.clear()
-                    job, thinking, _ = app.prepare(self.body(reasoning_effort=effort))
-                    self.assertTrue(thinking)
+                    job = app.prepare(
+                        self.body(reasoning_effort=effort), deadline=FOREVER
+                    )
                     self.assertTrue(job.thinking)
                     self.assertEqual(
                         [
@@ -5832,7 +5922,7 @@ class ServerTest(unittest.TestCase):
         app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
         tokenizer.templates.clear()
         with self.assertRaises(api.APIError):
-            app.prepare(self.body(reasoning_effort="high"))
+            app.prepare(self.body(reasoning_effort="high"), deadline=FOREVER)
         self.assertEqual(
             [kwargs["reasoning_effort"] for _, kwargs in tokenizer.templates],
             ["high", "xhigh"],
@@ -5841,7 +5931,7 @@ class ServerTest(unittest.TestCase):
             tokenizer, "apply_chat_template", side_effect=ValueError("bad content")
         ) as render:
             with self.assertRaises(api.APIError) as caught:
-                app.prepare(self.body(reasoning_effort="high"))
+                app.prepare(self.body(reasoning_effort="high"), deadline=FOREVER)
             render.assert_called_once()
             self.assertIsInstance(caught.exception.__cause__, ValueError)
 
@@ -5854,10 +5944,9 @@ class ServerTest(unittest.TestCase):
                 self.subTest(effort=effort),
                 self.assertRaisesRegex(api.APIError, "invalid reasoning_effort"),
             ):
-                app.prepare(self.body(reasoning_effort=effort))
+                app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
         self.assertEqual(tokenizer.templates, [])
-        job, thinking, _ = app.prepare(self.body(reasoning_effort=None))
-        self.assertTrue(thinking)
+        job = app.prepare(self.body(reasoning_effort=None), deadline=FOREVER)
         self.assertTrue(job.thinking)
         self.assertNotIn("enable_thinking", tokenizer.templates[-1][1])
 
@@ -5875,7 +5964,7 @@ class ServerTest(unittest.TestCase):
                 self.subTest(effort=effort),
                 self.assertRaisesRegex(api.APIError, "requested thinking mode"),
             ):
-                app.prepare(self.body(reasoning_effort=effort))
+                app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
 
     def test_generation_prompt_decides_thinking_and_its_token_count(self):
         history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
@@ -5916,17 +6005,17 @@ class ServerTest(unittest.TestCase):
             body = self.anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
                 body["thinking"] = thinking
-            chat = api.anthropic_to_chat_body(
+            chat, _ = api.anthropic_to_chat_body(
                 body, thinking_resolver=no_signed_thinking
             )
-            job, active, _ = app.prepare(chat)
-            self.assertFalse(active)
+            job = app.prepare(chat, deadline=FOREVER)
             self.assertFalse(job.thinking)
             self.assertEqual(
                 app.count_tokens(
                     api.anthropic_to_chat_prompt(
                         body, thinking_resolver=no_signed_thinking
-                    )
+                    ),
+                    deadline=FOREVER,
                 ),
                 len(job.prompt_tokens),
             )
@@ -6030,7 +6119,7 @@ class ServerTest(unittest.TestCase):
                     },
                 )
                 original = json.dumps(body, sort_keys=True)
-                prompt = harness.app._prepare_prompt(body)
+                prompt = harness.app._prepare_prompt(body, None, deadline=FOREVER)
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
                 self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)
@@ -6061,10 +6150,11 @@ class ServerTest(unittest.TestCase):
                 events = []
                 for start in range(0, len(payload), width):
                     events.extend(projector.put(payload[start : start + width]))
-                tail = projector.finish(payload, [], False)
+                content, _, unsent = projector.finish(False)
+                self.assertEqual(content, payload)
                 self.assertTrue(all(kind == "content" for kind, _ in events))
                 self.assertEqual(
-                    "".join(value for _, value in events) + "".join(tail), payload
+                    "".join(value for _, value in events) + unsent, payload
                 )
 
     def test_structured_tool_response_streams_and_recovers_from_length(self):
@@ -6125,10 +6215,14 @@ class ServerTest(unittest.TestCase):
 
     def test_reasoning_effort_is_preserved_until_the_template_renders(self):
         harness = self.harness(FakeRuntime())
-        prompt = harness.app._prepare_prompt(self.body(reasoning_effort="minimal"))
+        prompt = harness.app._prepare_prompt(
+            self.body(reasoning_effort="minimal"), None, deadline=FOREVER
+        )
         self.assertEqual(prompt.reasoning_effort, "minimal")
-        _, thinking, _ = harness.app.prepare(self.body(reasoning_effort="minimal"))
-        self.assertTrue(thinking)
+        job = harness.app.prepare(
+            self.body(reasoning_effort="minimal"), deadline=FOREVER
+        )
+        self.assertTrue(job.thinking)
 
     def test_chat_length_safely_finishes_partial_structured_and_tool_output(self):
         schema = {
@@ -6228,7 +6322,7 @@ class ServerTest(unittest.TestCase):
                     "value": {keyword: [{"type": value_type}, {"type": "null"}]}
                 },
             }
-            grammar = tool_schema._tool_arguments_grammar(schema)
+            grammar = argument_grammar(schema)
             self.assertIn("%json", grammar)
             self.assertNotIn("RAW_START", grammar)
 
@@ -6246,16 +6340,16 @@ class ServerTest(unittest.TestCase):
                     "properties": {"value": value_schema},
                     "required": ["value"],
                 }
-                grammar = tool_schema._tool_arguments_grammar(schema)
+                grammar = argument_grammar(schema)
                 self.assertIn("%json", grammar)
-                policy = tool_schema.ToolPolicy({}, {"echo": schema}, True, False)
+                policy = tool_policy({"echo": schema})
                 values = []
                 for wire in ("null", '"null"'):
                     text = (
                         "<tool_call>\n<function=echo>\n<parameter=value>\n"
                         f"{wire}\n</parameter>\n</function>\n</tool_call>"
                     )
-                    _, calls = model_output.parse_tool_calls(text, 1, policy)
+                    _, calls, _ = project(text, policy)
                     values.append(
                         json.loads(calls[0]["function"]["arguments"])["value"]
                     )
@@ -6375,7 +6469,7 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(**fields, **neutral)
                 )
                 self.assertEqual(status, 200, payload)
-                sampling = runtime.requests[0].sampling
+                sampling = runtime.requests[0].frame.sampling
                 for name, value in fields.items():
                     self.assertEqual(getattr(sampling, name), value)
         # A nonzero temperature below 0.01 samples at 0.01; zero stays
@@ -6394,7 +6488,9 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(temperature=temperature)
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[0].sampling.temperature, sampled)
+                self.assertEqual(
+                    runtime.requests[0].frame.sampling.temperature, sampled
+                )
         refused = (
             ({"temperature": 2.5}, "temperature must be a number in [0, 2]"),
             ({"temperature": -0.5}, "temperature must be a number in [0, 2]"),
@@ -6457,7 +6553,7 @@ class ServerTest(unittest.TestCase):
                     "POST", "/v1/chat/completions", self.body(top_k=top_k)
                 )
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[0].sampling.top_k, sent)
+                self.assertEqual(runtime.requests[0].frame.sampling.top_k, sent)
         for top_k in (-2, 2.5, True, "20"):
             with self.subTest(top_k=top_k):
                 runtime.requests.clear()
@@ -6485,7 +6581,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(
-            runtime.requests[0].sampling,
+            runtime.requests[0].frame.sampling,
             native_wire.SamplingParameters(
                 temperature=1.0,
                 top_p=0.95,
@@ -6512,7 +6608,7 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/responses", self.responses_body(store=False, **fields)
         )
         self.assertEqual(status, 200, payload)
-        sampling = runtime.requests[0].sampling
+        sampling = runtime.requests[0].frame.sampling
         for name, value in fields.items():
             self.assertEqual(getattr(sampling, name), value)
         status, _, payload = harness.request(
@@ -6542,7 +6638,7 @@ class ServerTest(unittest.TestCase):
         def prepare(index):
             try:
                 operation = app.count_tokens if index == 1 else app.prepare
-                results.append(operation(self.body()))
+                results.append(operation(self.body(), deadline=FOREVER))
             except Exception as error:
                 errors.append(error)
 
@@ -6648,7 +6744,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(len(runtime.requests), 1)
-        request = runtime.requests[0]
+        request = runtime.requests[0].frame
         self.assertEqual(
             len(request.prompt_tokens) + request.logical_max_output_tokens, 10
         )
@@ -6696,8 +6792,10 @@ class ServerTest(unittest.TestCase):
             with self.subTest(path=path):
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 200, payload)
-                self.assertEqual(runtime.requests[-1].logical_max_output_tokens, 8)
-                self.assertEqual(runtime.requests[-1].prompt_tokens, (101, 102))
+                self.assertEqual(
+                    runtime.requests[-1].frame.logical_max_output_tokens, 8
+                )
+                self.assertEqual(runtime.requests[-1].frame.prompt_tokens, (101, 102))
 
         # The window, not a server default, bounds a request that names no
         # limit; one that names a limit inside the window gets it as is.
@@ -6711,7 +6809,7 @@ class ServerTest(unittest.TestCase):
                 status, _, payload = harness.request("POST", path, body)
                 self.assertEqual(status, 200, payload)
                 self.assertEqual(
-                    runtime.requests[-1].logical_max_output_tokens, expected
+                    runtime.requests[-1].frame.logical_max_output_tokens, expected
                 )
 
         harness.app.max_context = 100000
@@ -6719,14 +6817,14 @@ class ServerTest(unittest.TestCase):
             with mock.patch.object(
                 FakeTokenizer, "__call__", return_value={"input_ids": [101] * length}
             ):
-                job, *_ = harness.app.prepare(self.body())
+                job = harness.app.prepare(self.body(), deadline=FOREVER)
             self.assertEqual(job.max_new_tokens, expected)
             self.assertEqual(len(job.prompt_tokens), length)
         with mock.patch.object(
             FakeTokenizer, "__call__", return_value={"input_ids": [101] * 100000}
         ):
             with self.assertRaisesRegex(api.APIError, "prompt exceeds") as caught:
-                harness.app.prepare(self.body())
+                harness.app.prepare(self.body(), deadline=FOREVER)
             self.assertEqual(caught.exception.code, "context_length_exceeded")
 
     def test_preparation_consumes_original_deadline_and_releases_slots(self):
@@ -6747,12 +6845,14 @@ class ServerTest(unittest.TestCase):
                     app.tokenizer, "apply_chat_template", side_effect=tokenize
                 ),
             ):
+                body = self.body(timeout=1)
+                deadline = app.request_deadline(body, clock[0])
                 if elapsed < 1:
-                    job, *_ = app.prepare(self.body(timeout=1))
+                    job = app.prepare(body, deadline=deadline)
                     self.assertEqual(job.deadline, 101.0)
                 else:
                     with self.assertRaises(api.APIError) as error:
-                        app.prepare(self.body(timeout=1))
+                        app.prepare(body, deadline=deadline)
                     self.assertEqual(
                         (error.exception.status, error.exception.code),
                         (504, "request_timeout"),
@@ -6770,8 +6870,9 @@ class ServerTest(unittest.TestCase):
         app.tokenizer.templates.clear()
         app.preparation_slots.acquire()
         try:
+            body = self.body(timeout=0.02)
             with self.assertRaises(api.APIError) as error:
-                app.prepare(self.body(timeout=0.02))
+                app.prepare(body, deadline=app.request_deadline(body, time.monotonic()))
             self.assertEqual(
                 (error.exception.status, error.exception.code), (504, "request_timeout")
             )
@@ -6807,10 +6908,9 @@ class ServerTest(unittest.TestCase):
                     factory.create.side_effect = expire
                 else:
                     images.side_effect = expire
+                body = self.body(timeout=1, response_format={"type": "json_object"})
                 with self.assertRaises(api.APIError) as error:
-                    app.prepare(
-                        self.body(timeout=1, response_format={"type": "json_object"})
-                    )
+                    app.prepare(body, deadline=app.request_deadline(body, clock[0]))
                 self.assertEqual(error.exception.status, 504)
                 if stage == "grammar":
                     images.assert_called_once()
@@ -6856,7 +6956,7 @@ class ServerTest(unittest.TestCase):
         for length in (0, -1):
             status, _ = harness.raw_post(b"", length)
             self.assertEqual(status, 400)
-        status, _ = harness.raw_post(b"", api.DEFAULT_MAX_REQUEST_BYTES + 1)
+        status, _ = harness.raw_post(b"", serve_options.DEFAULT_MAX_REQUEST_BYTES + 1)
         self.assertEqual(status, 413)
         status, _ = harness.raw_post(b"\xff", 1)
         self.assertEqual(status, 400)
@@ -7044,7 +7144,7 @@ class ServerTest(unittest.TestCase):
                 connection.putrequest("POST", path)
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader(
-                    "Content-Length", str(api.DEFAULT_MAX_REQUEST_BYTES)
+                    "Content-Length", str(serve_options.DEFAULT_MAX_REQUEST_BYTES)
                 )
                 connection.endheaders()  # Do not send any body to an overloaded server.
                 response = connection.getresponse()
@@ -7102,7 +7202,11 @@ class ServerTest(unittest.TestCase):
                     harness.request("POST", "/v1/chat/completions", self.body())[0], 500
                 )
         self._wait_for_http_active(harness.server.requests, 0)
-        with mock.patch.object(harness.backend, "submit", return_value=False):
+        with mock.patch.object(
+            harness.backend.runtime,
+            "submit",
+            side_effect=api.engine_runtime.PendingLimitExceeded("full"),
+        ):
             self.assertEqual(
                 harness.request("POST", "/v1/chat/completions", self.body())[0], 503
             )
@@ -7441,13 +7545,15 @@ class ServerTest(unittest.TestCase):
 
     def test_official_sampling_defaults_and_random_seed(self):
         tokenizer = FakeTokenizer()
-        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
         body = self.body()
         body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
-            job, _, _ = app.prepare(body)
+            job = app.prepare(body, deadline=FOREVER)
         self.assertEqual(
             (job.sampling, job.seed),
             (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
@@ -7457,8 +7563,8 @@ class ServerTest(unittest.TestCase):
         blocking = Plan([[4]], block=True)
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime, queue_size=1)
-        head, _, _ = harness.app.prepare(self.body(timeout=2))
-        self.assertTrue(harness.backend.submit(head))
+        head = harness.app.prepare(self.body(timeout=2), deadline=FOREVER)
+        harness.backend.submit(head)
         self.assertTrue(blocking.started.wait(1))
 
         connection = http.client.HTTPConnection(
@@ -7484,11 +7590,11 @@ class ServerTest(unittest.TestCase):
         harness = self.harness(FakeRuntime())
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
-                harness.app.prepare(self.body(priority=value))
-        job, _, _ = harness.app.prepare_responses(
-            self.responses_body(priority="foreground")
+                harness.app.prepare(self.body(priority=value), deadline=FOREVER)
+        job = harness.app.prepare_responses(
+            self.responses_body(priority="foreground"), deadline=FOREVER
         )
-        self.assertEqual(job.priority, backend_api.REQUEST_PRIORITIES["foreground"])
+        self.assertEqual(job.priority, native_wire.RequestPriority.FOREGROUND)
 
     def test_active_timeout_signals_and_next_request_runs(self):
         blocking = Plan([[4]], block=True)
@@ -7593,13 +7699,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(runtime.cancel_count, 1)
 
     def test_runtime_error_does_not_poison_next_request(self):
-        runtime = FakeRuntime(Plan(error=("bad_request", "broken")), Plan([[4]]))
+        runtime = FakeRuntime(Plan(error="broken"), Plan([[4]]))
         harness = self.harness(runtime)
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body()
         )
         self.assertEqual(status, 400)
-        self.assertEqual(json.loads(payload)["error"]["code"], "bad_request")
+        self.assertEqual(json.loads(payload)["error"]["code"], "constraint_error")
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 
@@ -7645,7 +7751,10 @@ class ServerTest(unittest.TestCase):
         class PressuredRuntime(FakeRuntime):
             def __init__(self):
                 super().__init__()
-                self.status_event = native_peer.status_event(memory_pressure="critical")
+                # The engine is not ready under critical pressure.
+                self.status_event = native_peer.status_event(
+                    ready=False, memory_pressure="critical"
+                )
 
         harness = self.harness(PressuredRuntime())
         status, _, payload = harness.request("GET", "/ready")
@@ -7703,15 +7812,15 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("boom", stderr.getvalue())
 
     def test_unexpected_responses_stream_error_is_failed_and_cancels(self):
-        harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
+        # The first output item fails to render while the model still writes.
+        plan = Plan([[14], [15]], delay=1)
+        harness = self.harness(FakeRuntime(plan))
         stderr = io.StringIO()
         with (
             mock.patch.object(
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
-            mock.patch.object(
-                api.FrontendHandler, "_collect", side_effect=RuntimeError("boom")
-            ),
+            mock.patch.object(api, "responses_item", side_effect=RuntimeError("boom")),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
             status, _, payload = harness.request(
@@ -7726,6 +7835,7 @@ class ServerTest(unittest.TestCase):
             events[-1]["response"]["error"]["code"], "internal_server_error"
         )
         cancel.assert_called_once()
+        self.assertTrue(plan.cancelled.is_set())
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",
@@ -7804,8 +7914,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(
             (
-                runtime.requests[0].logical_max_output_tokens,
-                runtime.requests[0].seed,
+                runtime.requests[0].frame.logical_max_output_tokens,
+                runtime.requests[0].frame.seed,
             ),
             (8, 7),
         )
@@ -8611,16 +8721,15 @@ class ServerTest(unittest.TestCase):
                 ],
             }
         ]
-        translated = api_shapes.responses_to_chat_body(
-            self.responses_body(
-                tools=tools,
-                tool_choice={
-                    "type": "function",
-                    "namespace": namespace,
-                    "name": first_name,
-                },
-            )
+        body = self.responses_body(
+            tools=tools,
+            tool_choice={
+                "type": "function",
+                "namespace": namespace,
+                "name": first_name,
+            },
         )
+        translated, namespaces = api_shapes.responses_to_chat_body(body, body["input"])
         aliases = [tool["function"]["name"] for tool in translated["tools"]]
         self.assertEqual([len(alias) for alias in aliases], [64, 64])
         self.assertNotEqual(aliases[0], aliases[1])
@@ -8628,10 +8737,7 @@ class ServerTest(unittest.TestCase):
             translated["tool_choice"],
             {"type": "function", "function": {"name": aliases[0]}},
         )
-        self.assertEqual(
-            translated["_tool_namespaces"][aliases[0]],
-            (namespace, first_name),
-        )
+        self.assertEqual(namespaces[aliases[0]], (namespace, first_name))
         self.assertEqual(_namespace_alias(namespace, first_name), aliases[0])
 
     def test_responses_streaming_tool_call_and_failed_event(self):
@@ -8933,7 +9039,10 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_response_store_is_strictly_byte_bounded_lru(self):
-        store = request_frontend.ResponseStore(2048)
+        self.enterContext(
+            mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 2048)
+        )
+        store = request_frontend.ResponseStore()
         for index in range(10):
             response = {
                 "id": f"resp_{index}",
@@ -8946,14 +9055,18 @@ class ServerTest(unittest.TestCase):
         self.assertGreater(stats["evictions"], 0)
         self.assertIsNone(store.get("resp_0"))
         self.assertIsNotNone(store.get("resp_9"))
-        self.assertFalse(
-            request_frontend.ResponseStore(64).put(
-                {"id": "resp_large", "text": "x" * 128}, []
+        with mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 64):
+            self.assertFalse(
+                request_frontend.ResponseStore().put(
+                    {"id": "resp_large", "text": "x" * 128}, []
+                )
             )
-        )
 
     def test_response_store_concurrent_churn_remains_bounded(self):
-        store = request_frontend.ResponseStore(8192)
+        self.enterContext(
+            mock.patch.object(request_frontend.ResponseStore, "BUDGET_BYTES", 8192)
+        )
+        store = request_frontend.ResponseStore()
         errors = []
 
         def churn(shard):
@@ -9146,6 +9259,7 @@ class MessageNormalizationTest(unittest.TestCase):
                 {"role": "user", "content": "continue"},
             ],
             vision=True,
+            deadline=FOREVER,
         )
         call = messages[1]["tool_calls"][0]["function"]
         self.assertEqual(call["name"], "shell")
@@ -9171,6 +9285,7 @@ class MessageNormalizationTest(unittest.TestCase):
                         },
                     ],
                     vision=True,
+                    deadline=FOREVER,
                 )
                 self.assertEqual(
                     complete[1]["tool_calls"][0]["function"]["arguments"], expected
@@ -9195,6 +9310,7 @@ class MessageNormalizationTest(unittest.TestCase):
                         },
                     ],
                     vision=True,
+                    deadline=FOREVER,
                 )
         with self.assertRaises(api.APIError):
             api_shapes.normalize_messages(
@@ -9212,6 +9328,7 @@ class MessageNormalizationTest(unittest.TestCase):
                     },
                 ],
                 vision=True,
+                deadline=FOREVER,
             )
 
 

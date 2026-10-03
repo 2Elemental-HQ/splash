@@ -2,12 +2,8 @@
 
 import hmac
 
-if __package__:
-    from .errors import APIError
-    from .origins import ANY_ORIGIN, DEFAULT_PORTS, parse_authority, parse_origin
-else:
-    from errors import APIError
-    from origins import ANY_ORIGIN, DEFAULT_PORTS, parse_authority, parse_origin
+from .errors import APIError
+from .origins import ANY_ORIGIN, DEFAULT_PORTS, parse_authority, parse_origin
 
 
 def validate_api_key(value):

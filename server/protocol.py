@@ -267,7 +267,8 @@ class CancelFrame:
 class MaskResponseFrame:
     request_id: int
     mask_request_id: int
-    mask_words: tuple[int, ...] | bytes
+    # Little-endian uint32 words, words_per_mask per mask row.
+    mask_words: bytes
 
 
 @dataclass(slots=True, frozen=True)
@@ -731,11 +732,11 @@ def _validated_request(
 
 
 def _mask_payload(values):
-    if isinstance(values, bytes):
-        if len(values) % 4:
-            raise ValueError("mask bytes must contain complete uint32 words")
-        return values
-    return _words(values, "mask words").tobytes()
+    if not isinstance(values, bytes):
+        raise ValueError("mask words must be packed bytes")
+    if len(values) % 4:
+        raise ValueError("mask bytes must contain complete uint32 words")
+    return values
 
 
 def _frame(frame_type: FrameType, payload_bytes: int) -> bytearray:

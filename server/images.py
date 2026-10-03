@@ -26,7 +26,6 @@ MAX_PIXELS = 4_194_304
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
-DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
 
 
 class ImageError(ValueError):
@@ -158,7 +157,7 @@ class PreparedImages(list):
     def append(self, image):
         size = len(image.pixels)
         with self._cache._lock:
-            if size > self._cache.request_budget_bytes - self._cache._request_bytes:
+            if size > self._cache.REQUEST_BUDGET_BYTES - self._cache._request_bytes:
                 raise ImageCapacityError("in-flight image memory budget is full")
             self._cache._request_bytes += size
             self._bytes += size
@@ -172,15 +171,11 @@ class PreparedImages(list):
 class ImageCache:
     """Byte-budgeted LRU of prepared images keyed by the raw image bytes."""
 
-    def __init__(
-        self,
-        budget_bytes: int = DEFAULT_CACHE_BYTES,
-        request_budget_bytes: int = DEFAULT_CACHE_BYTES,
-    ):
-        if budget_bytes < 0 or request_budget_bytes <= 0:
-            raise ValueError("invalid image memory budget")
-        self.budget_bytes = budget_bytes
-        self.request_budget_bytes = request_budget_bytes
+    # Cached prepared images, and the images of requests in flight.
+    BUDGET_BYTES = 256 * 1024 * 1024
+    REQUEST_BUDGET_BYTES = 256 * 1024 * 1024
+
+    def __init__(self):
         # GC may finalize a cancelled batch during a cache insertion on this
         # same thread; returning its byte charge must not deadlock the cache.
         self._lock = threading.RLock()
@@ -199,13 +194,13 @@ class ImageCache:
                 self._entries.move_to_end(key)
                 return cached
         prepared = prepare(payload, max_pixels)
-        if len(prepared.pixels) > self.budget_bytes:
+        if len(prepared.pixels) > self.BUDGET_BYTES:
             return prepared
         with self._lock:
             if key not in self._entries:
                 self._entries[key] = prepared
                 self._bytes += len(prepared.pixels)
-                while self._bytes > self.budget_bytes:
+                while self._bytes > self.BUDGET_BYTES:
                     _, evicted = self._entries.popitem(last=False)
                     self._bytes -= len(evicted.pixels)
         return prepared
@@ -215,7 +210,7 @@ class ImageCache:
             return {
                 "entries": len(self._entries),
                 "bytes": self._bytes,
-                "budget_bytes": self.budget_bytes,
+                "budget_bytes": self.BUDGET_BYTES,
                 "request_bytes": self._request_bytes,
-                "request_budget_bytes": self.request_budget_bytes,
+                "request_budget_bytes": self.REQUEST_BUDGET_BYTES,
             }
