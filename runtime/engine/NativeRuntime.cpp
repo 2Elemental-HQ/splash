@@ -112,6 +112,17 @@ bool NativeRuntime::runControl(const std::function<bool()> &control) {
   return false;
 }
 
+bool NativeRuntime::flushRestorePoints() {
+  if (!engineHealthy_)
+    return false;
+  try {
+    return core_.flushRestorePoints();
+  } catch (...) {
+    executionFailed(std::current_exception());
+  }
+  return false;
+}
+
 void NativeRuntime::releaseIdleWeights() {
   if (!config_.weights || config_.weights->released() || !core_.idle() ||
       clocks_.monotonicMilliseconds() - lastRequestMilliseconds_ <
