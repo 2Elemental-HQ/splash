@@ -85,6 +85,7 @@ public:
 
   [[nodiscard]] uint32_t pageCount() const noexcept;
   [[nodiscard]] uint64_t bytesPerPage() const noexcept;
+  [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
   // Free pages of allocated extents; acquisition hands these out first.
   [[nodiscard]] uint32_t freePageCount() const noexcept;
   [[nodiscard]] uint32_t activeReferences(uint32_t page) const;

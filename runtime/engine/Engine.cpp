@@ -457,12 +457,14 @@ bool Engine::admitQueued(double now) {
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
   // A later request may not share the generation prompt; generated history
   // that a resumed lane replays is its own.
-  const uint32_t tail =
-      active.replayTokens == active.promptTokens
-          ? std::max(active.request.generationPromptTokens, uint32_t{1})
-          : 1;
-  return (active.replayTokens - tail) / KvCache::pageTokens *
-         KvCache::pageTokens;
+  if (active.replayTokens == active.promptTokens)
+    return promptReplayBoundary(active);
+  return (active.replayTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;
+}
+
+uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
+  const uint32_t tail = std::max(active.request.generationPromptTokens, uint32_t{1});
+  return (active.promptTokens - tail) / KvCache::pageTokens * KvCache::pageTokens;
 }
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
@@ -649,6 +651,8 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
         ++counters_.deduplicatedStatePublications;
       active.latestCheckpoint = {};
     }
+    if (resumeBoundary == promptReplayBoundary(active))
+      active.replayPoint = cache_.useState(lookup.state->kvBlock());
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
   if (resuming) {
@@ -802,6 +806,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
   addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
+  // A resumed lane below its prompt's replay point lost that state; it
+  // rebuilds the one its conversation's next turn resumes from on the way.
+  addCandidate(promptReplayBoundary(active), Request::StateBoundary::Purpose::Replay);
   std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
             [](const Request::StateBoundary &left,
                const Request::StateBoundary &right) {
@@ -917,6 +924,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
     materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+      // The conversation's next turn resumes here, whatever this boundary's
+      // purpose: the state is in use before any of the ways below keeps it,
+      // so each of them makes room as work in use.
+      if (objective.tokens == promptReplayBoundary(active))
+        active.replayPoint = cache_.useState(block);
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
@@ -942,8 +954,26 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         if (!state)
           state = model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
-          state = model_.snapshot(active.request.id);
+        // Room comes from what this publication's class may take: cached KV
+        // and states in use only for a block in use. A state in use is never
+        // dropped for a busy write slot; this publication gives way instead.
+        // The command that reached this boundary is consumed and the next one
+        // not yet submitted, so KV that empties an extent releases it now. A
+        // recycled state hands over its buffers; an extent may hold less
+        // than a state, so room is made until the snapshot fits, nothing
+        // more of the class goes, or the extents given cover one snapshot:
+        // a denial after that is not the budget's.
+        if (!state) {
+          const bool growth = !growthPaused();
+          const uint64_t needed = model_.snapshotBytes();
+          uint64_t released = 0;
+          StateRoom room;
+          do {
+            room = cache_.reclaimOneState(checkpoint, block, growth);
+            released += room.extentBytes;
+            if (room)
+              state = model_.snapshot(active.request.id);
+          } while (!state && room.extentBytes && released < needed);
           if (state)
             ++counters_.recycledStatePublications;
         }
@@ -1139,15 +1169,16 @@ auto Engine::allocate(Attempt &&attempt, bool inService,
   Allocation<Admission> result{tryOnce(), {}};
   Admission &admission = result.admission;
   Denial &denial = result.denial;
+  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   while (memoryDenied(admission)) {
     const bool paused =
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     CacheReclaimResult reclaimed;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
-      reclaimed = paused ? reuseCachedStateWhilePaused() : reclaimForState();
+      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo);
     else
-      reclaimed = paused ? reuseCachedPagesWhilePaused(admission)
-                         : reclaimForKv(admission.additionalPages);
+      reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
+                         : reclaimForKv(admission.additionalPages, upTo);
     if (reclaimed.madeProgress) {
       admission = tryOnce();
       continue;
@@ -1184,11 +1215,11 @@ bool Engine::growthPaused() const {
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
 // acknowledge any reclaimed bytes.
-CacheReclaimResult Engine::reclaimForState() {
+CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
   const CacheReclaimResult reclaimed =
-      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents);
+      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1197,10 +1228,10 @@ CacheReclaimResult Engine::reclaimForState() {
 // The reclaim step for KV pages the engine's limit refused. Allocated extents
 // stay for the pages to reuse; idle state memory goes first, then the cache
 // gives up what covers the shortfall in one step.
-CacheReclaimResult Engine::reclaimForKv(uint32_t pages) {
+CacheReclaimResult Engine::reclaimForKv(uint32_t pages, ReclaimClass upTo) {
   if (reclaimIdleState(false))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages);
+  const CacheReclaimResult reclaimed = cache_.reclaimForPages(pages, upTo);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
@@ -1219,13 +1250,13 @@ bool Engine::reclaimIdleState(bool keepLane) noexcept {
 // from, and nothing is allocated. A state goes only when those in RAM cover
 // what the pool lacks; otherwise the cache survives, and the request grows
 // if it is in service and waits if it is not.
-CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
+CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
   const uint32_t lacked = model_.statesToActivate();
-  if (!lacked || cache_.evictableStates() < lacked)
+  if (!lacked || cache_.evictableStates(upTo) < lacked)
     return {};
-  const CacheReclaimResult reused = cache_.reclaimStateForLane();
+  const CacheReclaimResult reused = cache_.reclaimStateForLane(upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;
@@ -1234,23 +1265,23 @@ CacheReclaimResult Engine::reuseCachedStateWhilePaused() {
 // Host pressure pauses growth, and the pressure controller owns the shrink.
 // Extents that stay allocated are outside that accounting: a request short
 // of pages takes idle cached pages before it grows or waits. Cache is only
-// evicted when the pages no request holds can actually cover the shortfall;
-// otherwise it survives for later hits, and the request grows if it is in
-// service and waits if it is not. A reclaim that must wait for the transfer
-// in flight makes the request wait with it, as it does without the pause.
-// Idle model state goes first, but not the pooled buffers the next lane
-// starts from: they would not let this request grow, and the paced pass
-// keeps them for the next one.
-CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission) {
+// evicted when the pages the request's class may take can actually cover
+// the shortfall: never those a request holds, nor, for a start a resident
+// lane holds back, the idle KV that states in use restore through
+// (Cache::reusablePages). Otherwise it survives for later hits, and the
+// request grows if it is in service and waits if it is not. A reclaim that
+// must wait for the transfer in flight makes the request wait with it, as it
+// does without the pause. Idle model state goes first, but not the pooled
+// buffers the next lane starts from: they would not let this request grow,
+// and the paced pass keeps them for the next one.
+CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
+                                                       ReclaimClass upTo) {
   if (reclaimIdleState(true))
     return {true, 0};
-  const KvPoolSnapshot pool = cache_.snapshot().pool;
-  // Cached prefixes can also have active owners; those pages cannot be reused.
-  const uint32_t reusable = pool.pagesAllocated - pool.pagesActive;
-  if (reusable < admission.additionalPages)
+  if (cache_.reusablePages(upTo) < admission.additionalPages)
     return {};
   const CacheReclaimResult reused =
-      cache_.reclaimForPages(admission.additionalPages);
+      cache_.reclaimForPages(admission.additionalPages, upTo);
   if (reused.madeProgress)
     signalResourceProgress();
   return reused;
@@ -1528,6 +1559,8 @@ void Engine::release(Request &active) {
     active.suspended = false;
     signalResourceProgress();
   }
+  // Every end comes here; this request's use of its replay point ends.
+  active.replayPoint.reset();
 }
 
 void Engine::sweepTerminal() {

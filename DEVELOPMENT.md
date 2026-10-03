@@ -523,17 +523,19 @@ when it needs one of its pages. When it is built it allocates the runway, the
 extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
-pressure, an admission the budget denies, or startup cleanup. Kernels reach a
-page through the GPU address in its request's page table, so no command binds
-KV; the residency set makes extents resident for every command. The host reaches
-the same memory (`PageStorage::spans`), which is how the disk tier moves pages.
-A reclaim returns free pages before it evicts anything: an empty extent as it
-is, and the free pages scattered over the others as soon as they cover the
-extent that holds the fewest pages, whose pages the pool copies to them
-(`KvPool::compactExtent`). The blocks and requests on those pages follow them,
-a page a disk transfer reads or writes stays where it is, and a pass that
-evicts everything copies only what is left afterwards. Every extent a pass
-empties is released.
+pressure, an admission the budget denies, the publication of a replay point in
+use, or startup cleanup. Kernels reach a page through the GPU address in its
+request's page table, so no command binds KV; the residency set makes extents
+resident for every command. The host reaches the same memory
+(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
+returns free pages before it evicts anything: an empty extent as it is, and the
+free pages scattered over the others as soon as they cover the extent that holds
+the fewest pages, whose pages the pool copies to them (`KvPool::compactExtent`).
+The blocks and requests on those pages follow them, a page a disk transfer reads
+or writes stays where it is, and a pass that evicts everything copies only what
+is left afterwards. Every extent a pass empties is released, except that a
+warning pass, like startup cleanup, keeps one empty extent as the runway the next
+request starts from.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
@@ -897,6 +899,23 @@ cannot be replayed.
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
 next turn may render it differently, so a follow-up resumes from there.
+
+Until the request ends, suspended or not, that replay point is in use, and so is
+the KV it restores through. Cache victims come in three classes: checkpoints,
+then ordinary states and KV, then what is in use. No work displaces anything of
+a class above its own. Memory for running requests takes what is in use after
+everything else. A start that a resident lane holds back takes nothing in use:
+it waits for that lane. A publication in use takes cached KV and states in the
+same order, then the oldest state in use; of the KV it takes only leaves whose
+page frees at once, and only while an extent can be emptied; the extent is
+released at once, and the snapshot follows. Other publications recycle only
+states, a disk copy in use may displace the oldest copy in use, and ordinary or
+optional work never displaces anything in use. Nothing in use is pinned, so
+running work that needs the memory still takes it once nothing else is left. A
+resumed lane that lost its prompt's replay point rebuilds it on the way.
+`/status` reports under `state` the replay points unfinished requests hold
+(`in_use`, zero when idle) and those evicted all the same (`in_use_evictions`).
+
 Requests sharing a cold prefix can wait for a resident request's planned recovery
 point, then enter through the ordinary cache restore path. Waiting requests hold
 no active state cell or KV pages and return to ordinary admission when no useful
@@ -959,6 +978,9 @@ must leave the other its share. When the tier takes no more, admission waits
 for a transfer instead of evicting additional victims.
 
 A state with no available RAM cache slot can be written directly from its lane.
+When every state in RAM is in use and no cached KV is left to take, a replay
+point takes the slot of the oldest by writing that one out, and goes
+unpublished while the staging buffer is busy.
 Rolling checkpoints replace the least recently used copies like any state, so
 a suspended request keeps its progress when the quota is full; they retire when
 replaced or no longer needed. With the disk tier enabled, a checkpoint less than one full
@@ -972,10 +994,12 @@ states remain usable even when there is no room to promote them into RAM cache.
 
 Two unlinked temporary files share one quota for live slots. A full quota
 replaces the oldest redundant copy first, then the oldest sole copy, across
-both KV and states. A quota smaller than the working set can cause repeated
-reads and writes; it is not a write-rate limit. Each file retains its allocated
-high-water mark until shutdown, so filesystem space can exceed the live-slot
-quota. Closing the server releases both files.
+both KV and states. Sole copies of states in use, and the KV they restore
+through, make room only for a copy that is itself in use, and last; an ordinary
+state that finds no other room is dropped. A quota smaller than the working set
+can cause repeated reads and writes; it is not a write-rate limit. Each file
+retains its allocated high-water mark until shutdown, so filesystem space can
+exceed the live-slot quota. Closing the server releases both files.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range:
 whole 1 MiB chunks of 16 KiB-aligned memory that start at an aligned offset of
@@ -1138,6 +1162,12 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
+
+Each phase's record keeps what its requests reused of the cache (`reuse`).
+Every request after a phase's first resends the conversation, so a phase other
+than the cancellation phase (`cancel`) that completed two or more requests and
+reused no cached prompt token fails. Replay points of unfinished requests
+evicted during a phase only print a warning.
 
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:

@@ -138,6 +138,7 @@ public:
                                                 0.0);
     return test::immediateTicket(std::move(result), completion);
   }
+  uint64_t snapshotBytes() const noexcept override { return 64; }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return std::make_shared<State>();
   }

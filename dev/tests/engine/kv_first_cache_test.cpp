@@ -116,7 +116,8 @@ TokenAdmission admitLikeEngine(engine::Cache &cache,
                                const std::function<TokenAdmission()> &attempt) {
   TokenAdmission admission = attempt();
   while (admission.failure == TokenAdmissionFailure::Denied) {
-    const CacheReclaimResult step = cache.reclaimForPages(admission.additionalPages);
+    const CacheReclaimResult step =
+        cache.reclaimForPages(admission.additionalPages, ReclaimClass::InUse);
     if (!step.madeProgress) {
       if (step.pending)
         admission.failure = TokenAdmissionFailure::Pending;
@@ -144,7 +145,10 @@ struct CacheFixture {
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  explicit CacheFixture(engine::KvTier *tier = nullptr) : cache(pool, cacheNamespace(), tier) {
+  // With running, the request that cached the chain stays unfinished, so
+  // none of its KV is a victim, as for a request publishing its states.
+  explicit CacheFixture(engine::KvTier *tier = nullptr, bool running = false)
+      : cache(pool, cacheNamespace(), tier) {
     storage.budgetPages = 4;
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
@@ -157,7 +161,8 @@ struct CacheFixture {
     static_cast<void>(cache.publishCommittedBlocks(1, prompt, 128));
     for (uint32_t boundary = 32; boundary <= 128; boundary += 32)
       blocks.push_back(cache.blockAt(1, boundary));
-    cache.endRequest(1);
+    if (!running)
+      cache.endRequest(1);
   }
 
   void publish(uint32_t block, uint64_t bytes = 100) {
@@ -170,11 +175,37 @@ struct CacheFixture {
   }
 };
 
+// Four one-page prefixes, each cached by a request of its own, on four pages,
+// all allocated, and a budget of no more. With continued, each prompt runs
+// one token past its page, so a lookup can match the page.
+struct Prefixes {
+  test::TestKvStorage storage{5, 100, 1};
+  KvPool pool{storage, 4};
+  engine::Cache cache;
+  std::array<std::vector<uint32_t>, 4> prompts;
+  std::array<uint64_t, 4> blocks{};
+
+  explicit Prefixes(test::TestKvTier *tier = nullptr, bool continued = true)
+      : cache(pool, cacheNamespace(), tier) {
+    storage.budgetPages = 4;
+    for (uint32_t i = 0; i < prompts.size(); ++i) {
+      prompts[i].assign(KvCache::pageTokens, 1000 + i);
+      cache.beginRequest(i + 1);
+      require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
+      blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
+      cache.endRequest(i + 1);
+      if (continued)
+        prompts[i].push_back(9999);
+    }
+  }
+  engine::CacheLookup lookup(uint32_t index) { return cache.lookup(prompts[index]); }
+};
+
 // Demotes the oldest leaves one at a time, each copy landing before the next
 // starts.
 void demoteLeaves(engine::Cache &cache, test::TestKvTier &tier, uint32_t leaves) {
   for (uint32_t i = 0; i < leaves; ++i) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
             "KV demotion did not start");
     tier.complete();
     require(cache.pollTransfers(), "KV demotion did not finish");
@@ -195,7 +226,7 @@ void testSchedulingProbeDoesNotChangeCachePolicy() {
               fixture.cache.snapshot().stateCache.pinned == 0 &&
               fixture.cache.snapshot().lookup.lookups == 0,
           "scheduling probe pinned a lease or counted a cache hit");
-  require(fixture.cache.reclaimOneState() && cachedTokens(prefix) == 0 &&
+  require(fixture.cache.reclaimOneState(false, 0, true) && cachedTokens(prefix) == 0 &&
               cachedTokens(fixture.prompt) == 128,
           "scheduling probe refreshed the oldest state's eviction order");
 }
@@ -267,7 +298,7 @@ void testProbeRechecksStateChanges() {
   fixture.publish(3);
   fixture.publish(0);
   const CacheProbe probe = fixture.cache.probe(fixture.prompt);
-  require(probe.cachedTokens() == 128 && fixture.cache.reclaimOneState(),
+  require(probe.cachedTokens() == 128 && fixture.cache.reclaimOneState(false, 0, true),
           "state eviction fixture did not remove the deepest state");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
   require(lookup.kvBoundary == 128 && lookup.resumeBoundary() == 32,
@@ -286,9 +317,10 @@ void testProbeFallsBackWhenKvChanges() {
   CacheFixture fixture;
   fixture.publish(0);
   const CacheProbe probe = fixture.cache.probe(fixture.prompt);
-  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
-              fixture.cache.snapshot().kvCache.blocks == 3,
-          "KV eviction fixture did not evict the cached tail");
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+          fixture.cache.snapshot().kvCache.blocks == 3,
+      "KV eviction fixture did not evict the cached tail");
   auto lookup = fixture.cache.lookup(fixture.prompt, {}, &probe);
   require(lookup.kvBoundary == 96 && lookup.resumeBoundary() == 32,
           "admission probe reused an evicted KV block");
@@ -518,7 +550,7 @@ void testCheckpointDoesNotOutrankTheResumePoint() {
   fixture.cache.publishCompositeState(fixture.blocks.at(2),
                                       std::make_shared<TestState>(100), true);
   const CacheReclaimResult step =
-      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, true);
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse, true);
   const auto kept = fixture.cache.snapshot().stateCache;
   require(step.madeProgress && kept.entries == 1 && kept.checkpointEntries == 0,
           "a disposable checkpoint outranked the resume point");
@@ -589,7 +621,8 @@ void testUnifiedRecencyAndReleasedByteAccounting() {
   {
     CacheFixture fixture;
     fixture.publish(0, 150);
-    const CacheReclaimResult reclaimed = fixture.cache.reclaimOne();
+    const CacheReclaimResult reclaimed =
+        fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
     require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 100 &&
                 fixture.cache.snapshot().kvCache.blocks == 3 &&
                 fixture.cache.snapshot().stateCache.entries == 1,
@@ -601,7 +634,8 @@ void testUnifiedRecencyAndReleasedByteAccounting() {
     // footprint. With the only leaf state-backed, the state is selected.
     CacheFixture fixture;
     fixture.publish(3, 150);
-    const CacheReclaimResult reclaimed = fixture.cache.reclaimOne();
+    const CacheReclaimResult reclaimed =
+        fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
     require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 150 &&
                 fixture.cache.snapshot().stateCache.entries == 0 &&
                 fixture.cache.snapshot().stateCache.bytes == 0 &&
@@ -637,7 +671,7 @@ void testFinishedRequestLeavesTailKvBeforeItsState() {
 
   for (uint32_t remaining : {3U, 2U}) {
     const CacheReclaimResult reclaimed =
-        cache.reclaimOne(CacheReclaimMode::KeepExtents);
+        cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
     require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 0 &&
                 cache.snapshot().kvCache.blocks == remaining &&
                 cache.snapshot().stateCache.entries == 1,
@@ -646,13 +680,13 @@ void testFinishedRequestLeavesTailKvBeforeItsState() {
   require(cache.lookup(prompt).resumeBoundary() == 64,
           "state did not survive the eviction of the decode tail");
   const CacheReclaimResult state =
-      cache.reclaimOne(CacheReclaimMode::KeepExtents);
+      cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(state.madeProgress && state.reclaimedBytes == 100 &&
               cache.snapshot().stateCache.entries == 0 &&
               cache.snapshot().kvCache.blocks == 2,
           "state was not evicted once its block became the oldest leaf");
   const CacheReclaimResult leaf =
-      cache.reclaimOne(CacheReclaimMode::KeepExtents);
+      cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(leaf.madeProgress && cache.snapshot().kvCache.blocks == 1,
           "state block was not evictable after its state left");
 }
@@ -737,11 +771,11 @@ void testRestoredCheckpointsKeepTheirEvictionPriority() {
     fixture.cache.endRequest(2);
   }
 
-  require(fixture.cache.reclaimOneState() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
               !fixture.cache.checkpointState(fixture.blocks[2]) &&
               fixture.cache.checkpointState(fixture.blocks[1]),
           "restore did not refresh recency within checkpoint LRU");
-  require(fixture.cache.reclaimOneState() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
               !fixture.cache.checkpointState(fixture.blocks[1]) &&
               fixture.lookup(33).resumeBoundary() == 32 &&
               fixture.cache.snapshot().stateCache.entries == 2,
@@ -758,12 +792,14 @@ void testCheckpointReclaimPrecedesOlderKv() {
   fixture.publish(0, 150);
   fixture.cache.publishCompositeState(fixture.blocks[2],
                                       std::make_shared<TestState>(200), true);
-  const auto reclaimed = fixture.cache.reclaimOne();
+  const auto reclaimed =
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 200 &&
               fixture.cache.snapshot().kvCache.blocks == 4 &&
               fixture.lookup(33).resumeBoundary() == 32,
           "checkpoint reclaim displaced older ordinary state or KV");
-  require(fixture.cache.reclaimOne().reclaimedBytes == 100 &&
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                      .reclaimedBytes == 100 &&
               fixture.cache.snapshot().kvCache.blocks == 3,
           "ordinary state and KV lost their shared LRU order");
 }
@@ -773,11 +809,11 @@ void testOptionalReclaimLeavesOrdinaryStateIntact() {
   fixture.publish(0, 150);
   fixture.cache.publishCompositeState(fixture.blocks[2],
                                       std::make_shared<TestState>(200), true);
-  require(fixture.cache.reclaimOneState(true) &&
+  require(fixture.cache.reclaimOneState(true, 0, true) &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 0 &&
               fixture.lookup(33).resumeBoundary() == 32,
           "optional publication failed to recycle a disposable checkpoint");
-  require(!fixture.cache.reclaimOneState(true) &&
+  require(!fixture.cache.reclaimOneState(true, 0, true) &&
               fixture.cache.snapshot().stateCache.entries == 1,
           "optional publication displaced ordinary cached state");
 }
@@ -793,7 +829,7 @@ void testCheckpointPinsAndBoundaryUpgrade() {
   const auto checkpoint = fixture.cache.checkpointState(fixture.blocks[1]);
   auto first = fixture.lookup(65);
   auto second = fixture.lookup(97);
-  require(fixture.cache.reclaimOneState() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
               fixture.lookup(33).resumeBoundary() == 0 &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 2 &&
               fixture.cache.snapshot().stateCache.checkpointBytes == 500,
@@ -804,11 +840,11 @@ void testCheckpointPinsAndBoundaryUpgrade() {
           "pinned ordinary boundary could not upgrade its checkpoint");
   first.state.reset();
   second.state.reset();
-  require(fixture.cache.reclaimOneState() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
               fixture.lookup(97).resumeBoundary() == 64 &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 0,
           "pinned boundary upgrade corrupted the eviction queues");
-  require(fixture.cache.reclaimOneState() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
               fixture.cache.lookup(fixture.prompt).resumeBoundary() == 64,
           "upgraded checkpoint did not join ordinary LRU");
 
@@ -849,7 +885,7 @@ void testCheckpointPressurePreservesHotPrefix() {
   const TokenAdmission denied = cache.ensureTokens(3, 64);
   require(denied.failure == TokenAdmissionFailure::Denied,
           "necessary KV growth was not denied by the shared budget");
-  const auto reclaimed = cache.reclaimOne(CacheReclaimMode::KeepExtents);
+  const auto reclaimed = cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 200 &&
               cache.ensureTokens(3, 64).granted() &&
               cache.lookup(hot).resumeBoundary() == 32 &&
@@ -876,14 +912,17 @@ void testTieredStateLifecycle() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne().reclaimedBytes == 100, "demotion did not free the state's RAM at once");
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .reclaimedBytes == 100,
+          "demotion did not free the state's RAM at once");
   auto snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.bytes == 0 && snapshot.diskBytes == 100 && snapshot.entries == 1 &&
               snapshot.offloads == 1 && control->slots == 1,
           "demoted entry did not become its disk copy");
   require(!fixture.cache.pollTransfers(), "unfinished write was consumed early");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
-  require(fixture.cache.reclaimOne().reclaimedBytes == 100,
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .reclaimedBytes == 100,
           "pending write prevented disposable checkpoint reclamation");
   control->ready = true;
   require(fixture.cache.pollTransfers() && !fixture.cache.pollTransfers(),
@@ -895,9 +934,13 @@ void testTieredStateLifecycle() {
     auto lookup = fixture.lookup(129);
     require(lookup.resumeBoundary() == 128 && !lookup.state->state()->residentBytes(),
             "disk state did not retain matching KV identity");
-    require(!fixture.cache.reclaimOne().madeProgress, "pinned restore lost its KV");
+    require(!fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                 .madeProgress,
+            "pinned restore lost its KV");
   }
-  require(fixture.cache.reclaimOne().madeProgress, "disk state permanently protected KV");
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress,
+      "disk state permanently protected KV");
   require(fixture.cache.snapshot().stateCache.entries == 0 && control->slots == 0,
           "KV eviction leaked disk state");
 }
@@ -907,7 +950,9 @@ void testTieredWriteReuseAndFailure() {
     CacheFixture fixture;
     auto control = std::make_shared<TransferControl>();
     publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne().reclaimedBytes == 100, "demotion did not free RAM");
+    require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                    .reclaimedBytes == 100,
+            "demotion did not free RAM");
     {
       // A hit inside the write window is a disk hit queued behind the write.
       auto lookup = fixture.lookup(129);
@@ -932,18 +977,21 @@ void testDiskQuotaReplacesByRecency() {
   control->capacity = 1;
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne().madeProgress && fixture.cache.pollTransfers() &&
-              control->slots == 1,
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .madeProgress &&
+              fixture.cache.pollTransfers() && control->slots == 1,
           "first write failed");
   // The second state needs the slot: the older copy, the only one of its
   // state, gives way.
-  require(fixture.cache.reclaimOne().madeProgress && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .madeProgress &&
+              fixture.cache.pollTransfers(),
           "replacement failed");
   require(fixture.cache.snapshot().stateCache.entries == 1 && control->slots == 1 &&
               fixture.lookup(129).resumeBoundary() == 128 && !fixture.lookup(33).state,
           "the older disk copy was not replaced");
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers() &&
+  require(fixture.cache.reclaimOneState(true, 0, true) && fixture.cache.pollTransfers() &&
               fixture.cache.snapshot().stateCache.offloads == 3 && control->slots == 1 &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
               fixture.lookup(129).resumeBoundary() == 64,
@@ -973,7 +1021,7 @@ void testRollingCheckpointsUseTheTier() {
           "retirement left the disk copy behind");
   fixture.cache.publishCompositeState(fixture.blocks[2],
                                       std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOneState(true, 0, true) && fixture.cache.pollTransfers(),
           "RAM checkpoint was not reclaimed");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.offloads == 2 && stats.bytes == 0 && stats.checkpointEntries == 1 &&
@@ -982,15 +1030,16 @@ void testRollingCheckpointsUseTheTier() {
   control->capacity = 1;
   fixture.cache.publishCompositeState(fixture.blocks[3],
                                       std::make_shared<TieredState>(control), true);
-  require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers() &&
+  require(fixture.cache.reclaimOneState(true, 0, true) && fixture.cache.pollTransfers() &&
               control->slots == 1 && fixture.cache.snapshot().stateCache.offloads == 3 &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
               fixture.cache.checkpointState(fixture.blocks[3]) &&
               !fixture.cache.checkpointState(fixture.blocks[2]),
           "a full quota kept the older checkpoint");
-  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
-              tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
-          "the checkpoint's leaf was dropped instead of demoted");
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+          tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
+      "the checkpoint's leaf was dropped instead of demoted");
 }
 
 void testDiskPromotionAndInvalidation() {
@@ -999,7 +1048,10 @@ void testDiskPromotionAndInvalidation() {
   control->ready = true;
   const auto block = fixture.blocks[3];
   publishReusable(fixture, block, std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne().madeProgress && fixture.cache.pollTransfers(), "offload failed");
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .madeProgress &&
+              fixture.cache.pollTransfers(),
+          "offload failed");
   auto first = fixture.lookup(129);
   auto peer = fixture.lookup(129);
   auto invalid = first.state->state();
@@ -1023,7 +1075,9 @@ void testInvalidationDuringOffload() {
   auto control = std::make_shared<TransferControl>();
   auto source = std::make_shared<TieredState>(control);
   publishReusable(fixture, fixture.blocks[3], source);
-  require(fixture.cache.reclaimOne().madeProgress, "write not started");
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress,
+      "write not started");
   fixture.cache.discardState(fixture.blocks[3], source.get());
   require(fixture.cache.snapshot().stateCache.entries == 1,
           "a stale handle to the RAM copy discarded the disk copy");
@@ -1041,12 +1095,13 @@ void testDemotionFreesTheBufferAtOnce() {
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "required publication could not recycle a buffer");
+  require(fixture.cache.reclaimOneState(false, 0, true).made,
+          "required publication could not recycle a buffer");
   auto snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.entries == 2 && snapshot.bytes == 100 && snapshot.diskBytes == 100,
           "demotion took a second state or kept the victim's RAM");
   // One write in flight: a second victim inside the window is dropped.
-  require(fixture.cache.reclaimOneState(), "second recycle failed");
+  require(fixture.cache.reclaimOneState(false, 0, true).made, "second recycle failed");
   snapshot = fixture.cache.snapshot().stateCache;
   require(snapshot.entries == 1 && snapshot.bytes == 0 && snapshot.offloads == 1,
           "second victim was written while a write was in flight");
@@ -1074,7 +1129,10 @@ void testPromotionIdentityAndDenial() {
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne().madeProgress && fixture.cache.pollTransfers(), "promotion fixture write failed");
+    require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                    .madeProgress &&
+                fixture.cache.pollTransfers(),
+            "promotion fixture write failed");
     auto first = fixture.lookup(129);
     auto peer = fixture.lookup(129);
     PromotionTicket ticket;
@@ -1103,7 +1161,9 @@ void testRepublicationKeepsTheDiskCopy() {
   control->ready = true;
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne().madeProgress && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
+                  .madeProgress &&
+              fixture.cache.pollTransfers(),
           "state was not demoted");
   require(!fixture.cache.reuseCompositeState(fixture.blocks[0]),
           "a disk-only copy stood in for a RAM publication");
@@ -1116,7 +1176,7 @@ void testRepublicationKeepsTheDiskCopy() {
   // The other state is used; the republished one is the oldest RAM copy and
   // leaves RAM without a second write.
   recordUse(fixture, 129);
-  require(fixture.cache.reclaimOneState() && !fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOneState(false, 0, true) && !fixture.cache.pollTransfers(),
           "re-eviction of a state with a disk copy wrote it again");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.bytes == 100 && stats.diskBytes == 100 && stats.offloads == 1 &&
@@ -1130,7 +1190,7 @@ void testRepublicationKeepsTheDiskCopy() {
 void testLostStatesAreCounted() {
   CacheFixture fixture;
   fixture.publish(3);
-  require(fixture.cache.reclaimOneState(), "state was not dropped");
+  require(fixture.cache.reclaimOneState(false, 0, true).made, "state was not dropped");
   {
     auto lookup = fixture.lookup(129);
     require(lookup.kvBoundary == 128 && !lookup.state && lookup.lostState,
@@ -1140,13 +1200,14 @@ void testLostStatesAreCounted() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(), "state was not demoted");
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
+          "state was not demoted");
   {
     auto hit = fixture.lookup(129);
     require(hit.state && !hit.lostState, "a disk hit was counted as a lost state");
   }
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
-  require(fixture.cache.reclaimOneState(true), "checkpoint was not dropped");
+  require(fixture.cache.reclaimOneState(true, 0, true).made, "checkpoint was not dropped");
   {
     auto shallow = fixture.lookup(65);
     require(!shallow.state && !shallow.lostState, "a dropped checkpoint counted as a lost state");
@@ -1161,7 +1222,8 @@ void testRestoredStateKeepsItsDiskCopy() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(), "state was not demoted");
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
+          "state was not demoted");
   {
     auto lookup = fixture.lookup(129);
     PromotionTicket ticket;
@@ -1171,7 +1233,7 @@ void testRestoredStateKeepsItsDiskCopy() {
   auto stats = fixture.cache.snapshot().stateCache;
   require(stats.promotions == 1 && stats.bytes == 100 && stats.diskBytes == 100 && control->slots == 1,
           "promotion dropped the disk copy");
-  require(fixture.cache.reclaimOneState() && !fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOneState(false, 0, true) && !fixture.cache.pollTransfers(),
           "re-eviction after a restore wrote the state again");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.bytes == 0 && stats.diskBytes == 100 && stats.offloads == 1 &&
@@ -1187,7 +1249,7 @@ void testDiskCheckpointRamAccounting() {
     fixture.cache.publishCompositeState(fixture.blocks[3],
                                         std::make_shared<TieredState>(control), true);
     const auto point = fixture.cache.checkpointState(fixture.blocks[3]);
-    require(fixture.cache.reclaimOneState(true) && fixture.cache.pollTransfers(),
+    require(fixture.cache.reclaimOneState(true, 0, true) && fixture.cache.pollTransfers(),
             "checkpoint demotion failed");
     if (republish) {
       fixture.cache.publishCompositeState(fixture.blocks[3],
@@ -1272,9 +1334,10 @@ void testDiskPublicationLifecycle() {
           "completion changed tier occupancy");
   require(fixture.cache.publishStateToDisk(fixture.blocks[1], write) && control->slots == 2,
           "the next publication did not follow the finished write");
-  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress &&
-              tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
-          "the stated leaf was dropped instead of demoted");
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+          tier.demotions == 1 && fixture.cache.snapshot().kvCache.blocks == 4,
+      "the stated leaf was dropped instead of demoted");
 }
 
 // A failed write leaves nothing of a state published to disk; the block
@@ -1306,7 +1369,7 @@ void testFailedWriteUnderALookup() {
     auto control = std::make_shared<TransferControl>();
     const auto block = fixture.blocks[3];
     publishReusable(fixture, block, std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOneState(), "state was not demoted");
+    require(fixture.cache.reclaimOneState(false, 0, true).made, "state was not demoted");
     auto reader = fixture.lookup(129);
     require(reader.state && !reader.state->state()->residentBytes(),
             "the state in flight was not served from disk");
@@ -1346,7 +1409,7 @@ void testFailedWriteIsCountedAfterItsEntryLeft() {
     const auto block = fixture.blocks[3];
     if (replaced) {
       publishReusable(fixture, block, std::make_shared<TieredState>(control));
-      require(fixture.cache.reclaimOneState(), "state was not demoted");
+      require(fixture.cache.reclaimOneState(false, 0, true).made, "state was not demoted");
       {
         auto reader = fixture.lookup(129);
         fixture.cache.discardState(block, reader.state->state().get());
@@ -1376,7 +1439,7 @@ void testDiskPublicationMakesRoom() {
   control->ready = true;
   control->capacity = 1;
   publishReusable(fixture, fixture.blocks[1], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers() &&
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers() &&
               control->slots == 1,
           "the older state did not fill the quota");
   const StateWriter write = [&](std::function<void()>) { return writeState(control); };
@@ -1407,8 +1470,10 @@ void testDiskReplacementSpansStatesAndKv() {
   control->ready = true;
   control->capacity = 1;
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(), "state was not demoted");
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1, "leaf was not written");
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
+          "state was not demoted");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 1,
+          "leaf was not written");
   tier.complete();
   require(fixture.cache.pollTransfers(), "leaf did not land");
   // Both come back: the block and its state hold RAM and disk copies.
@@ -1432,9 +1497,11 @@ void testDiskReplacementSpansStatesAndKv() {
   // for nothing first; then the write gives up the redundant KV copy and,
   // when that is not enough, the state copy that is the only one.
   fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState() && fixture.cache.snapshot().stateCache.offloads == 1,
+  require(fixture.cache.reclaimOneState(false, 0, true) &&
+              fixture.cache.snapshot().stateCache.offloads == 1,
           "the restored state was written again");
-  require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(), "new state was not written");
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
+          "new state was not written");
   stats = fixture.cache.snapshot();
   require(stats.stateCache.offloads == 2 && stats.stateCache.entries == 1 && control->slots == 1 &&
               stats.kvTier.diskBlocks == 0 && stats.kvCache.blocks == 4 &&
@@ -1466,25 +1533,6 @@ void testQuotaWithoutTheKvTier() {
 // RAM contents match a cache without the tier step for step, and every hit
 // without the tier is a hit with it. The disk only adds.
 void testTierOnlyAddsToTierOff() {
-  struct Prefixes {
-    test::TestKvStorage storage{4, 100, 1};
-    KvPool pool{storage, 4};
-    engine::Cache cache{pool, cacheNamespace()};
-    std::array<std::vector<uint32_t>, 4> prompts;
-    std::array<uint64_t, 4> blocks{};
-
-    Prefixes() {
-      for (uint32_t i = 0; i < prompts.size(); ++i) {
-        prompts[i].assign(KvCache::pageTokens, 1000 + i);
-        cache.beginRequest(i + 1);
-        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
-        blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
-        cache.endRequest(i + 1);
-        prompts[i].push_back(9999);
-      }
-    }
-    engine::CacheLookup lookup(uint32_t index) { return cache.lookup(prompts[index]); }
-  };
   for (uint32_t seed = 1; seed <= 64; ++seed) {
     Prefixes off, on;
     auto control = std::make_shared<TransferControl>();
@@ -1516,8 +1564,8 @@ void testTierOnlyAddsToTierOff() {
         break;
       }
       default: // memory pressure recycles one buffer on each side
-        static_cast<void>(off.cache.reclaimOneState());
-        static_cast<void>(on.cache.reclaimOneState());
+        static_cast<void>(off.cache.reclaimOneState(false, 0, true));
+        static_cast<void>(on.cache.reclaimOneState(false, 0, true));
         static_cast<void>(on.cache.pollTransfers());
       }
       require(on.cache.snapshot().stateCache.bytes == off.cache.snapshot().stateCache.bytes,
@@ -1534,7 +1582,8 @@ void testDemotionCostsNoSecondState() {
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control)); // A, A
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control)); // B
-  require(fixture.cache.reclaimOneState(), "no buffer was recycled for C");            // C needs a buffer
+  require(fixture.cache.reclaimOneState(false, 0, true).made,
+          "no buffer was recycled for C"); // C needs a buffer
   {
     auto b = fixture.lookup(129);
     require(b.state && b.state->kvBlock() == fixture.blocks[3] && b.state->state()->residentBytes() == 100,
@@ -1557,12 +1606,12 @@ void testCancelledRestoreStopsQueuedReads() {
       if (peerBlocks == 2) {
         fixture.cache.publishCompositeState(fixture.blocks[1],
                                             std::make_shared<TieredState>(control));
-        require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(),
+        require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
                 "shared prefix state demotion failed");
       }
       fixture.cache.publishCompositeState(fixture.blocks[3],
                                           std::make_shared<TieredState>(control));
-      require(fixture.cache.reclaimOneState() && fixture.cache.pollTransfers(),
+      require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
               "state demotion failed");
       demoteLeaves(fixture.cache, tier, 4);
       auto lookup = fixture.lookup(129);
@@ -1623,10 +1672,10 @@ void testKvDemotionAndRestoreLifecycle() {
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
   // The state goes first and frees its RAM at once; the leaf under it is
   // then worth keeping.
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && tier.demotions == 0 &&
-              fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              tier.demotions == 0 && fixture.cache.pollTransfers(),
           "state was not demoted ahead of its leaf");
-  const auto step = fixture.cache.reclaimOne(reuse);
+  const auto step = fixture.cache.reclaimOne(reuse, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 0 && tier.demotions == 1 &&
               tier.slots == 1 && fixture.pool.freePageCount() == 0,
           "leaf under a disk state was dropped or freed before its copy landed");
@@ -1634,7 +1683,8 @@ void testKvDemotionAndRestoreLifecycle() {
   require(stats.kvTier.pendingPages == 1 && stats.kvCache.blocks == 4 &&
               stats.kvTier.diskBlocks == 1,
           "pending demotion was not accounted");
-  require(!fixture.cache.pollTransfers() && !fixture.cache.reclaimOne(reuse).madeProgress,
+  require(!fixture.cache.pollTransfers() &&
+              !fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
           "the chain was reclaimed past its demoting leaf");
   tier.complete();
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1,
@@ -1679,8 +1729,8 @@ void testKvDemotionAndRestoreLifecycle() {
   }
   // Both tiers hold the block now: its next reclaim costs no write, and the
   // state on disk stays.
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1 &&
-              fixture.pool.freePageCount() == 1 &&
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 1 && fixture.pool.freePageCount() == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 3 &&
               fixture.cache.snapshot().stateCache.diskBytes == 100,
           "a block with a disk copy was written again or lost its state");
@@ -1692,16 +1742,18 @@ void testTailsDropAndParentsFollowToDisk() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvTier tier;
   CacheFixture fixture(&tier);
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 0 &&
-              fixture.pool.freePageCount() == 1,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 0 && fixture.pool.freePageCount() == 1,
           "a tail was written");
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              fixture.cache.pollTransfers(),
           "state was not demoted first");
   for (uint32_t written = 1; written <= 3; ++written) {
-    require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == written,
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == written,
             "a block the disk chain depends on was dropped");
     tier.complete();
     require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1 + written,
@@ -1726,8 +1778,9 @@ void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
     CacheFixture fixture(&tier);
     auto control = std::make_shared<TransferControl>();
     fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 &&
-                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+                fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == 1,
             "the leaf under a state being written was not written");
     tier.complete();
     control->success = false;
@@ -1750,13 +1803,15 @@ void testDiskCopiesNoStateNeedsGoWithTheLeaf() {
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
-                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+                fixture.cache.pollTransfers() &&
+                fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == 1,
             "leaf was not written");
     tier.complete();
     require(fixture.cache.pollTransfers() && tier.slots == 1, "leaf did not land");
-    require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1 &&
-                tier.slots == 0 && fixture.pool.freePageCount() == 2 &&
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == 1 && tier.slots == 0 && fixture.pool.freePageCount() == 2 &&
                 fixture.cache.snapshot().stateCache.entries == 0,
             "a leaf was written after making room took the state it was written for");
   }
@@ -1775,15 +1830,16 @@ void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              fixture.cache.pollTransfers(),
           "state was not demoted first");
   // One demotion is all the tier takes at a time, and it stays in flight.
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1 &&
-              tier.inFlight() == 1,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 1 && tier.inFlight() == 1,
           "the first leaf was not written");
   // Its parent is no leaf while the page being written is still resident, so
   // the pass has nothing to give and says so: wait for the transfer.
-  const CacheReclaimResult busy = fixture.cache.reclaimOne(reuse);
+  const CacheReclaimResult busy = fixture.cache.reclaimOne(reuse, ReclaimClass::InUse);
   require(!busy.madeProgress && busy.pending && tier.demotions == 1 &&
               fixture.cache.snapshot().kvCache.blocks == 4,
           "a leaf was dropped or the wait was not reported while the tier was busy");
@@ -1793,7 +1849,7 @@ void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
   fixture.cache.endRequest(2);
   tier.complete();
   require(fixture.cache.pollTransfers() && tier.inFlight() == 0, "the demotion did not land");
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 2,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 2,
           "the leaf was not written once the tier had room");
   tier.complete();
   require(fixture.cache.pollTransfers(), "second leaf did not land");
@@ -1807,12 +1863,13 @@ void testUnusableTierDropsTheLeafInstead() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              fixture.cache.pollTransfers(),
           "state was not demoted first");
   // Nothing is in flight and nothing ever makes room: waiting would be
   // waiting for nothing, so the leaf and its disk copy go instead.
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 0 &&
-              fixture.cache.snapshot().kvCache.blocks == 3 &&
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 0 && fixture.cache.snapshot().kvCache.blocks == 3 &&
               fixture.cache.snapshot().kvTier.demotionsRefused == 1,
           "an unusable tier parked the leaf instead of dropping it");
   fixture.cache.beginRequest(2);
@@ -1827,20 +1884,22 @@ void testUnusableTierDropsTheLeafInstead() {
   test::TestKvTier second;
   CacheFixture deep(&second);
   deep.cache.publishCompositeState(deep.blocks[3], std::make_shared<TieredState>(control));
-  require(deep.cache.reclaimOne(reuse).reclaimedBytes == 100 && deep.cache.pollTransfers(),
+  require(deep.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              deep.cache.pollTransfers(),
           "deep state was not demoted");
-  require(deep.cache.reclaimOne(reuse).madeProgress && second.demotions == 1, "leaf was not written");
+  require(deep.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && second.demotions == 1,
+          "leaf was not written");
   second.complete();
   require(deep.cache.pollTransfers(), "leaf did not land");
   second.writableFile = false;
   {
     auto held = deep.lookup(129);
-    require(held.state && !deep.cache.reclaimOne(reuse).madeProgress &&
+    require(held.state && !deep.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
                 deep.cache.snapshot().kvCache.blocks == 3 &&
                 deep.cache.snapshot().kvTier.diskBlocks == 1,
             "a leaf was dropped under a disk subtree a lookup holds");
   }
-  require(deep.cache.reclaimOne(reuse).madeProgress &&
+  require(deep.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
               deep.cache.snapshot().kvCache.blocks == 2 &&
               deep.cache.snapshot().kvTier.diskBlocks == 0 &&
               deep.cache.snapshot().stateCache.entries == 0,
@@ -1860,8 +1919,10 @@ void testParentOfDiskChildrenSurvivesRefusal() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
-              fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 1,
           "leaf was not written");
   tier.complete();
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "leaf did not land");
@@ -1891,17 +1952,19 @@ void testSecondStateWaitsForTheWrite() {
   auto control = std::make_shared<TransferControl>();
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100, "first state was not written");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100,
+          "first state was not written");
   auto stats = fixture.cache.snapshot().stateCache;
   require(stats.entries == 2 && stats.bytes == 100 && stats.diskBytes == 100 && stats.offloads == 1,
           "first write did not free its RAM");
-  require(!fixture.cache.reclaimOne(reuse).madeProgress,
+  require(!fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
           "a state was dropped or a leaf under one was taken while a write was in flight");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.entries == 2 && stats.bytes == 100 && stats.evictions == 0,
           "the waiting state did not stay");
   control->ready = true;
-  require(fixture.cache.pollTransfers() && fixture.cache.reclaimOne(reuse).reclaimedBytes == 100,
+  require(fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100,
           "the waiting state was not written after the first landed");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.entries == 2 && stats.bytes == 0 && stats.diskBytes == 200 && stats.offloads == 2 &&
@@ -1917,28 +1980,29 @@ void testWaitingCheckpointHoldsBackNothingElse() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOneState(), "first state was not written");
+  require(fixture.cache.reclaimOneState(false, 0, true).made, "first state was not written");
   fixture.publish(2);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control),
                                       true);
   // The idle tail is the oldest and needs no transfer; the ordinary state
   // cannot be written and goes next, then the leaf it stood on.
-  require(fixture.cache.reclaimOne(reuse).madeProgress &&
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
               fixture.cache.snapshot().kvCache.blocks == 3,
           "the waiting checkpoint held back an idle KV tail");
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 &&
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
               fixture.cache.snapshot().stateCache.entries == 2,
           "the waiting checkpoint held back an ordinary state");
-  require(fixture.cache.reclaimOne(reuse).madeProgress &&
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
               fixture.cache.snapshot().kvCache.blocks == 2,
           "the waiting checkpoint held back the leaf a state left");
-  const CacheReclaimResult waiting = fixture.cache.reclaimOne(reuse);
+  const CacheReclaimResult waiting = fixture.cache.reclaimOne(reuse, ReclaimClass::InUse);
   auto stats = fixture.cache.snapshot().stateCache;
   require(!waiting.madeProgress && waiting.pending && stats.bytes == 100 &&
               stats.checkpointEntries == 1 && stats.checkpointEvictions == 0,
           "the checkpoint did not wait for the write in flight");
   control->ready = true;
-  require(fixture.cache.pollTransfers() && fixture.cache.reclaimOne(reuse).reclaimedBytes == 100,
+  require(fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100,
           "the checkpoint was not written after the first landed");
   stats = fixture.cache.snapshot().stateCache;
   require(stats.offloads == 2 && stats.bytes == 0 && stats.checkpointEntries == 1 &&
@@ -1949,38 +2013,22 @@ void testWaitingCheckpointHoldsBackNothingElse() {
 // A refusal ends the scan: the tier is full for every leaf alike, so one
 // attempt costs one refusal, not one per cached block.
 void testFullTierStopsTheScan() {
-  struct Prefixes {
-    test::TestKvStorage storage{5, 100, 1};
-    KvPool pool{storage, 4};
-    test::TestKvTier tier;
-    engine::Cache cache{pool, cacheNamespace(), &tier};
-    std::array<std::vector<uint32_t>, 4> prompts;
-    std::array<uint64_t, 4> blocks{};
-
-    Prefixes() {
-      storage.budgetPages = 4;
-      for (uint32_t i = 0; i < prompts.size(); ++i) {
-        prompts[i].assign(KvCache::pageTokens, 1000 + i);
-        cache.beginRequest(i + 1);
-        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
-        blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
-        cache.endRequest(i + 1);
-      }
-    }
-  } p;
+  test::TestKvTier tier;
+  Prefixes p(&tier, false);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 4;
   for (uint64_t block : p.blocks) {
     p.cache.publishCompositeState(block, std::make_shared<TieredState>(control));
-    require(p.cache.reclaimOneState() && p.cache.pollTransfers(), "state was not demoted");
+    require(p.cache.reclaimOneState(false, 0, true) && p.cache.pollTransfers(),
+            "state was not demoted");
   }
   // One transfer at a time: the first leaf takes it and the request waits for
   // that page rather than evicting more.
-  p.tier.transferLimit = 1;
+  tier.transferLimit = 1;
   p.cache.beginRequest(9);
   require(admitTokens(p.cache, 9, 32).failure == TokenAdmissionFailure::Pending &&
-              p.tier.demotions == 1 && p.cache.snapshot().kvCache.blocks == 4,
+              tier.demotions == 1 && p.cache.snapshot().kvCache.blocks == 4,
           "the first leaf was not written, or a leaf was dropped");
   // A larger shortfall meets a tier that the transfer in flight fills. Every
   // leaf would answer the same, so the scan asks once and waits.
@@ -1988,7 +2036,7 @@ void testFullTierStopsTheScan() {
               p.cache.snapshot().kvTier.demotionsRefused == 1 &&
               p.cache.snapshot().kvCache.blocks == 4,
           "a full tier was asked once per leaf, or a leaf was dropped");
-  p.tier.complete();
+  tier.complete();
   require(p.cache.pollTransfers() && admitTokens(p.cache, 9, 32).granted(),
           "the page did not return");
   p.cache.endRequest(9);
@@ -2004,8 +2052,9 @@ void testRestoresInFlightMakeAShortfallPending() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
-              fixture.cache.reclaimOne(reuse).madeProgress,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
           "leaf was not written");
   tier.complete();
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "leaf did not land");
@@ -2031,26 +2080,9 @@ void testRestoresInFlightMakeAShortfallPending() {
 // disk-only leaf; a block whose copy was replaced stays in RAM.
 void testDiskReplacementOrder() {
   constexpr auto reuse = CacheReclaimMode::KeepExtents;
-  struct Prefixes {
-    test::TestKvStorage storage{4, 100, 1};
-    KvPool pool{storage, 4};
-    test::TestKvTier tier;
-    engine::Cache cache{pool, cacheNamespace(), &tier};
-    std::array<std::vector<uint32_t>, 4> prompts;
-    std::array<uint64_t, 4> blocks{};
-
-    Prefixes() {
-      tier.capacity = 1;
-      for (uint32_t i = 0; i < prompts.size(); ++i) {
-        prompts[i].assign(KvCache::pageTokens, 1000 + i);
-        cache.beginRequest(i + 1);
-        require(admitTokens(cache, i + 1, KvCache::pageTokens).granted(), "prefix KV failed");
-        blocks[i] = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
-        cache.endRequest(i + 1);
-        prompts[i].push_back(9999);
-      }
-    }
-  } p;
+  test::TestKvTier tier;
+  tier.capacity = 1;
+  Prefixes p(&tier);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 4;
@@ -2058,36 +2090,38 @@ void testDiskReplacementOrder() {
     p.cache.publishCompositeState(block, std::make_shared<TieredState>(control));
   // The oldest state goes to disk, then the leaf under it.
   const auto demoteNext = [&] {
-    require(p.cache.reclaimOne(reuse).reclaimedBytes == 100 && p.cache.pollTransfers(),
+    require(p.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+                p.cache.pollTransfers(),
             "state was not demoted first");
-    require(p.cache.reclaimOne(reuse).madeProgress, "leaf under a disk state was not reclaimed");
+    require(p.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
+            "leaf under a disk state was not reclaimed");
   };
   // A goes to disk and comes back: RAM and disk both hold it.
   demoteNext();
-  require(p.tier.demotions == 1, "A was not written");
-  p.tier.complete();
+  require(tier.demotions == 1, "A was not written");
+  tier.complete();
   require(p.cache.pollTransfers() && p.pool.freePageCount() == 1, "A did not free its page");
   {
     auto lookup = p.cache.lookup(p.prompts[0]);
     p.cache.beginRequest(9);
     require(admitRestore(p.cache, 9, lookup).granted(),
             "A did not restore");
-    p.tier.complete();
+    tier.complete();
     require(p.cache.pollTransfers(), "A's restore did not finish");
     lookup = {};
     p.cache.endRequest(9);
   }
   // B needs the one slot: A's redundant copy goes, A stays resident.
   demoteNext();
-  require(p.tier.demotions == 2 && p.tier.slots == 1 &&
+  require(tier.demotions == 2 && tier.slots == 1 &&
               p.cache.snapshot().kvCache.blocks == 4 && p.cache.snapshot().kvTier.diskBlocks == 1,
           "B did not replace A's redundant copy");
-  p.tier.complete();
+  tier.complete();
   require(p.cache.pollTransfers() && p.pool.freePageCount() == 1, "B did not free its page");
   // C needs the slot: no redundant copy is left, so the oldest disk-only
   // leaf, B, leaves with its state.
   demoteNext();
-  require(p.tier.demotions == 3 && p.tier.slots == 1 &&
+  require(tier.demotions == 3 && tier.slots == 1 &&
               p.cache.lookup(p.prompts[1]).kvBoundary == 0 && control->slots == 2,
           "C did not replace the oldest disk-only leaf");
 }
@@ -2127,8 +2161,10 @@ void testTransferFailures() {
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
-                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+                fixture.cache.pollTransfers() &&
+                fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == 1,
             "no demotion");
     tier.complete(false);
     require(fixture.cache.pollTransfers(), "failed write was not consumed");
@@ -2144,8 +2180,10 @@ void testTransferFailures() {
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-    require(fixture.cache.reclaimOne(reuse).reclaimedBytes == 100 && fixture.cache.pollTransfers() &&
-                fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+    require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+                fixture.cache.pollTransfers() &&
+                fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                tier.demotions == 1,
             "no demotion");
     tier.complete();
     require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "no disk block");
@@ -2194,7 +2232,8 @@ void testFailedRestoreDropsTheBlocksBelow() {
         cache.publishCommittedBlocks(request, request == 1 ? prompt : sibling, 128);
     cache.endRequest(request);
     cache.publishCompositeState(last, std::make_shared<TieredState>(control));
-    require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+            "state was not demoted");
   }
   // Both fourth blocks go to disk, then the third block they share.
   demoteLeaves(cache, tier, 3);
@@ -2261,10 +2300,11 @@ void testBusyTierPreservesDiskVictim() {
       auto block = cache.publishCommittedBlocks(i + 1, prompts[i], KvCache::pageTokens);
       cache.endRequest(i + 1);
       cache.publishCompositeState(block, std::make_shared<TieredState>(control));
-      require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+      require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+              "state was not demoted");
       prompts[i].push_back(9999);
     }
-    require(cache.reclaimOne(reuse).madeProgress, "first demotion failed");
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "first demotion failed");
     tier.complete();
     require(cache.pollTransfers(), "first demotion did not finish");
     if (restored) {
@@ -2276,14 +2316,14 @@ void testBusyTierPreservesDiskVictim() {
       lookup = {};
       cache.endRequest(9);
     }
-    require(cache.reclaimOne(reuse).madeProgress && tier.slots == 2,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.slots == 2,
             "second demotion did not fill quota");
-    require(!cache.reclaimOne(reuse).madeProgress, "busy tier did not wait");
+    require(!cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "busy tier did not wait");
     require(tier.slots == 2 && cache.snapshot().kvTier.diskBlocks == 2 &&
                 cache.lookup(prompts[0]).kvBoundary == KvCache::pageTokens,
             "busy tier discarded a disk prefix without starting a write");
     tier.complete();
-    require(cache.pollTransfers() && cache.reclaimOne(reuse).madeProgress &&
+    require(cache.pollTransfers() && cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
                 tier.demotions == 3,
             "disk replacement did not resume once the tier had room");
     tier.complete();
@@ -2313,7 +2353,7 @@ void testReclaimForPagesCoversTheShortfall() {
     }
     require(pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8,
             "fixture geometry changed");
-    const CacheReclaimResult reclaimed = cache.reclaimForPages(3);
+    const CacheReclaimResult reclaimed = cache.reclaimForPages(3, ReclaimClass::InUse);
     if (withState) {
       require(reclaimed.madeProgress && reclaimed.reclaimedBytes > 0 &&
                   pool.freePageCount() == 0 && cache.snapshot().kvCache.blocks == 8 &&
@@ -2346,7 +2386,7 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
   const uint64_t leaf = cache.publishCommittedBlocks(1, chain, 64);
   cache.endRequest(1);
   cache.publishCompositeState(leaf, std::make_shared<TieredState>(control));
-  require(cache.reclaimOne(reuse).madeProgress && cache.pollTransfers(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && cache.pollTransfers(),
           "the chain's state was not demoted");
   demoteLeaves(cache, tier, 1);
   // The chain is its resident root and its leaf on disk. A newer chain
@@ -2362,8 +2402,8 @@ void testLookupKeepsADiskChainsResidentBoundaryWarm() {
   {
     const auto lookup = cache.lookup(chain);
     require(lookup.resumeBoundary() == 64, "the disk chain did not match");
-    require(cache.reclaimOne(reuse).madeProgress && pool.freePageCount() == 3 &&
-                tier.demotions == 1,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                pool.freePageCount() == 3 && tier.demotions == 1,
             "the reclaim took the chain's resident boundary");
   }
   require(cache.lookup(newer).kvBoundary == 0 &&
@@ -2382,7 +2422,8 @@ void testRestoreKeepsTheBlockItExtends() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).madeProgress && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              fixture.cache.pollTransfers(),
           "state was not demoted");
   demoteLeaves(fixture.cache, tier, 2);
   require(fixture.pool.freePageCount() == 2, "the last two blocks did not go to disk");
@@ -2399,7 +2440,8 @@ void testRestoreKeepsTheBlockItExtends() {
   }
   // The last block gives up its page again; the one before it keeps a disk
   // copy and has only a disk child.
-  require(fixture.cache.reclaimOne(reuse).madeProgress && fixture.pool.freePageCount() == 1,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              fixture.pool.freePageCount() == 1,
           "the restored leaf did not drop its page");
   fixture.cache.beginRequest(3);
   require(admitTokens(fixture.cache, 3, 32).granted() && fixture.pool.freePageCount() == 0,
@@ -2441,9 +2483,10 @@ void testDemotionKeepsThePageUnderANewState() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
-  require(fixture.cache.reclaimOne(reuse).madeProgress && fixture.cache.pollTransfers(),
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              fixture.cache.pollTransfers(),
           "state was not demoted");
-  require(fixture.cache.reclaimOne(reuse).madeProgress && tier.demotions == 1,
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 1,
           "the leaf's demotion did not start");
   fixture.publish(3);
   require(fixture.cache.snapshot().stateCache.bytes == 100, "the new state is not in RAM");
@@ -2477,7 +2520,7 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   const uint64_t third = cache.blockAt(1, 96);
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
-  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(), "state was not demoted");
   demoteLeaves(cache, tier, 3);
   // The restore reads the second block; the last two wait for their turn.
   tier.transferLimit = 1;
@@ -2500,7 +2543,8 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   require(tier.restores == 2 && tier.inFlight() == 0 && cache.snapshot().kvCache.blocks == 3,
           "the cancelled restore dropped the page under a state in RAM");
   control->capacity = control->slots;
-  require(cache.reclaimOne(reuse).reclaimedBytes == 100 && cache.pollTransfers(),
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).reclaimedBytes == 100 &&
+              cache.pollTransfers(),
           "the state in RAM was not written");
   lookup = cache.lookup(std::span<const uint32_t>(prompt).first(97));
   require(lookup.kvBoundary == 96 && lookup.state && lookup.state->kvBlock() == third &&
@@ -2525,7 +2569,8 @@ void testLargeSharedDiskRestore() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   cache.publishCompositeState(boundary, std::make_shared<TieredState>(control));
-  require(cache.reclaimOneState() && cache.pollTransfers(), "large state demotion failed");
+  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+          "large state demotion failed");
   demoteLeaves(cache, tier, pages);
   require(pool.freePageCount() == pages && tier.demotions == pages,
           "large prefix was not fully on disk");
@@ -2596,7 +2641,7 @@ struct ExtentFixture {
   // Evicts the first prompt's three leaves, the oldest in the cache.
   void evictFirstPrompt() {
     for (uint32_t leaf = 0; leaf < 3; ++leaf) {
-      require(cache.reclaimOne(CacheReclaimMode::KeepExtents).madeProgress,
+      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
               "the first prompt's leaf was not evicted");
     }
     require(cache.snapshot().kvCache.blocks == 6,
@@ -2622,11 +2667,11 @@ void testCompactionReturnsFreePagesBeforeEvicting() {
   // 2 keeps the third prompt's last page, extent 3 is empty.
   fixture.evictFirstPrompt();
 
-  CacheReclaimResult step = cache.reclaimOne(release);
+  CacheReclaimResult step = cache.reclaimOne(release, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 400 &&
               fixture.storage.copies.empty(),
           "the empty extent was not released as it is");
-  step = cache.reclaimOne(release);
+  step = cache.reclaimOne(release, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 400 &&
               fixture.storage.copies.size() == 1 &&
               fixture.storage.copies[0].from == 3 && fixture.storage.copies[0].to == 9 &&
@@ -2649,7 +2694,7 @@ void testCompactionReturnsFreePagesBeforeEvicting() {
   lookup = {};
 
   // The free pages left cover no extent: the next step evicts.
-  step = cache.reclaimOne(release);
+  step = cache.reclaimOne(release, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 100 &&
               cache.snapshot().stateCache.entries == 1 &&
               fixture.storage.copies.size() == 1,
@@ -2664,7 +2709,7 @@ void testCompactionLeavesTheRunway() {
   engine::Cache &cache = fixture.cache;
   fixture.evictFirstPrompt();
   const CacheReclaimResult step =
-      cache.reclaimOne(CacheReclaimMode::ReleaseExtents, false, true);
+      cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse, false, true);
   const KvPoolSnapshot pool = cache.snapshot().pool;
   require(step.madeProgress && step.reclaimedBytes == 0 &&
               fixture.storage.copies.size() == 1 && pool.pagesAllocated == 12 &&
@@ -2701,19 +2746,21 @@ void testCompactionFollowsOnlyTheMovedBlocks() {
   // Extent 0 keeps the first prompt's first block and the second prompt's
   // first block; extent 2 keeps the third prompt's last block alone.
   demoteLeaves(cache, tier, 2);
-  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
-              cache.reclaimOne(release).madeProgress && storage.copies.size() == 1 &&
-              storage.copies[0].from == 8 && storage.copies[0].to == 1,
+  require(cache.reclaimOne(release, ReclaimClass::InUse).reclaimedBytes == 400 &&
+              cache.reclaimOne(release, ReclaimClass::InUse).madeProgress &&
+              storage.copies.size() == 1 && storage.copies[0].from == 8 &&
+              storage.copies[0].to == 1,
           "the third prompt's leaf did not move into extent 0");
   // The first prompt's first block goes to disk and the second prompt's
   // state and two upper blocks go, so extents 0 and 1 hold two pages each.
   demoteLeaves(cache, tier, 1);
   for (uint32_t victim = 0; victim < 3; ++victim)
-    require(cache.reclaimOne(reuse).madeProgress, "the second prompt was not evicted");
-  require(cache.reclaimOne(release).madeProgress && storage.copies.size() == 3 &&
-              storage.copies[1].from == 1 && storage.copies[1].to == 4 &&
-              storage.copies[2].from == 3 && storage.copies[2].to == 5 &&
-              cache.snapshot().pool.extentCompactions == 2,
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
+            "the second prompt was not evicted");
+  require(cache.reclaimOne(release, ReclaimClass::InUse).madeProgress &&
+              storage.copies.size() == 3 && storage.copies[1].from == 1 &&
+              storage.copies[1].to == 4 && storage.copies[2].from == 3 &&
+              storage.copies[2].to == 5 && cache.snapshot().pool.extentCompactions == 2,
           "extent 0 was not emptied into extent 1");
 
   auto lookup = cache.lookup(fixture.prompts[2]);
@@ -2746,11 +2793,11 @@ void testCompactionFollowsOnlyTheMovedBlocks() {
 
   // The oldest leaves go: the second prompt's first block, the third
   // prompt's state, then its leaf, which frees the page it moved to last.
-  require(cache.reclaimOne(reuse).madeProgress && pool.pageFree(5) &&
-              cache.reclaimOne(reuse).madeProgress,
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && pool.pageFree(5) &&
+              cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
           "the second prompt's moved block did not free its page");
   const uint32_t freePages = pool.freePageCount();
-  require(cache.reclaimOne(reuse).madeProgress && pool.pageFree(4) &&
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && pool.pageFree(4) &&
               pool.freePageCount() == freePages + 1,
           "the twice-moved leaf did not free the page it moved to last");
 }
@@ -2808,7 +2855,7 @@ void testCompactionLeavesAPageBeingRestored() {
   uint64_t last = cache.publishCommittedBlocks(1, onDisk, 32);
   cache.endRequest(1);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
-  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(), "state was not demoted");
   demoteLeaves(cache, tier, 1);
   // Three plain blocks on pages 0 to 2.
   const std::vector<uint32_t> plain = prompt(2000, 3);
@@ -2835,12 +2882,14 @@ void testCompactionLeavesAPageBeingRestored() {
   cache.endRequest(4);
   // The plain leaves go: extent 0 keeps only the page being read into.
   for (uint32_t leaf = 0; leaf < 3; ++leaf)
-    require(cache.reclaimOne(reuse).madeProgress, "plain leaf was not evicted");
-  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
-              cache.reclaimOne(release).reclaimedBytes == 400 && storage.copies.empty(),
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
+            "plain leaf was not evicted");
+  require(cache.reclaimOne(release, ReclaimClass::InUse).reclaimedBytes == 400 &&
+              cache.reclaimOne(release, ReclaimClass::InUse).reclaimedBytes == 400 &&
+              storage.copies.empty(),
           "the empty extents were not released first");
 
-  const CacheReclaimResult step = cache.reclaimOne(release);
+  const CacheReclaimResult step = cache.reclaimOne(release, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 400 && storage.copies.size() == 3 &&
               storage.copies[0].from == 4 && storage.copies[0].to == 0 &&
               storage.copies[1].from == 5 && storage.copies[1].to == 1 &&
@@ -2895,16 +2944,18 @@ void testCompactionLeavesAPageBeingDemoted() {
   const uint64_t last = cache.publishCommittedBlocks(2, chained, 128);
   cache.endRequest(2);
   cache.publishCompositeState(last, std::make_shared<TieredState>(control));
-  require(cache.reclaimOneState() && cache.pollTransfers(), "state was not demoted");
+  require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(), "state was not demoted");
   // The plain block goes, then the chain's leaf starts to be written.
-  require(cache.reclaimOne(reuse).madeProgress && cache.reclaimOne(reuse).madeProgress &&
-              tier.demotions == 1 && cache.snapshot().kvCache.blocks == 4,
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 1 &&
+              cache.snapshot().kvCache.blocks == 4,
           "the chain's leaf did not start its demotion");
-  require(cache.reclaimOne(release).reclaimedBytes == 400 &&
-              cache.reclaimOne(release).reclaimedBytes == 400 && storage.copies.empty(),
+  require(cache.reclaimOne(release, ReclaimClass::InUse).reclaimedBytes == 400 &&
+              cache.reclaimOne(release, ReclaimClass::InUse).reclaimedBytes == 400 &&
+              storage.copies.empty(),
           "the empty extents were not released first");
 
-  const CacheReclaimResult step = cache.reclaimOne(release);
+  const CacheReclaimResult step = cache.reclaimOne(release, ReclaimClass::InUse);
   require(step.madeProgress && step.reclaimedBytes == 400 && storage.copies.size() == 3 &&
               storage.copies[0].from == 1 && storage.copies[0].to == 5 &&
               storage.copies[1].from == 2 && storage.copies[1].to == 6 &&
@@ -2927,8 +2978,680 @@ void testCompactionLeavesAPageBeingDemoted() {
   cache.endRequest(3);
 }
 
+// Caches a request's chain of whole pages: its prompt, one token past the
+// last page, and its blocks, root first. With running the request stays
+// unfinished, so its chain stays active, as a running request's does.
+std::pair<std::vector<uint32_t>, std::vector<uint64_t>>
+cacheChain(engine::Cache &cache, uint64_t id, uint32_t pages, bool running = false) {
+  std::vector<uint32_t> prompt(pages * KvCache::pageTokens + 1);
+  for (uint32_t row = 0; row < prompt.size(); ++row)
+    prompt[row] = static_cast<uint32_t>(1000 * id + row);
+  cache.beginRequest(id);
+  require(admitTokens(cache, id, pages * KvCache::pageTokens).granted(),
+          "fixture pages were not acquired");
+  static_cast<void>(cache.publishCommittedBlocks(id, prompt, pages * KvCache::pageTokens));
+  std::vector<uint64_t> blocks;
+  for (uint32_t page = 1; page <= pages; ++page)
+    blocks.push_back(cache.blockAt(id, page * KvCache::pageTokens));
+  if (!running)
+    cache.endRequest(id);
+  return {std::move(prompt), std::move(blocks)};
+}
+
+// A state an unfinished request uses goes after every other state and KV
+// leaf, newer or not, and still goes once nothing else is left.
+void testStateInUseGoesLast() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  StateUse use = fixture.cache.useState(fixture.blocks[0]);
+  fixture.publish(1);
+  // The lookup makes the chain's leaf and the other state newer.
+  require(fixture.lookup(129).resumeBoundary() == 64 &&
+              fixture.cache.snapshot().stateCache.inUse == 1,
+          "the state was not marked in use");
+  while (fixture.cache.snapshot().kvCache.blocks > 1) {
+    require(
+        fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+            fixture.cache.stateResident(fixture.blocks[0]),
+        "the state in use left before the other state and KV");
+  }
+  require(fixture.cache.snapshot().stateCache.entries == 1, "the other state survived");
+  const CacheReclaimResult last =
+      fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+  const auto snapshot = fixture.cache.snapshot().stateCache;
+  require(last.madeProgress && snapshot.entries == 0 && snapshot.inUse == 1 &&
+              snapshot.inUseEvictions == 1,
+          "the last state in use could not be reclaimed");
+  use.reset();
+  require(fixture.cache.snapshot().stateCache.inUse == 0, "the mark outlived its handle");
+}
+
+// The KV a state in use restores through goes with that state, after
+// ordinary states and KV: a newer ordinary state goes before the older leaf
+// of a state in use that only the disk holds.
+void testKvAStateInUseNeedsGoesLast() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{7, 100, 1};
+  storage.budgetPages = 6;
+  KvPool pool{storage, 6};
+  test::TestKvTier tier;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
+  StateUse use = cache.useState(used[1]);
+  cache.publishCompositeState(used[1], std::make_shared<TieredState>(control));
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && cache.pollTransfers() &&
+              !cache.stateResident(used[1]),
+          "the state in use was not written");
+  const std::vector<uint64_t> ordinary = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(ordinary[1], std::make_shared<TestState>(100));
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              !cache.stateResident(ordinary[1]) && tier.demotions == 0,
+          "the KV a state in use needs went before an ordinary state");
+}
+
+// Marks count per block: requests sharing it each hold one, a mark taken
+// before the publication applies to it, and so does one on a block whose
+// state left and was published again. Only a publication that is itself in
+// use displaces a state in use, after every other state; ordinary and
+// optional publications never do. The chain's request runs, so no KV
+// competes with the states.
+void testStateUsesAreCountedPerBlock() {
+  CacheFixture fixture(nullptr, true);
+  const auto resident = [&](uint32_t block) {
+    return fixture.cache.stateResident(fixture.blocks[block]);
+  };
+  StateUse early = fixture.cache.useState(fixture.blocks[0]);
+  fixture.publish(0);
+  StateUse shared = fixture.cache.useState(fixture.blocks[0]);
+  early.reset();
+  require(fixture.cache.snapshot().stateCache.inUse == 1 &&
+              !fixture.cache.reclaimOneState(true, fixture.blocks[1], true) &&
+              !fixture.cache.reclaimOneState(false, fixture.blocks[1], true) && resident(0),
+          "a shared mark was lost, or an ordinary publication took a state in use");
+  fixture.publish(1);
+  StateUse publishing = fixture.cache.useState(fixture.blocks[2]);
+  require(fixture.cache.reclaimOneState(false, fixture.blocks[2], true) && resident(0) &&
+              !resident(1),
+          "recycling took the state in use before an ordinary one");
+  require(!fixture.cache.reclaimOneState(true, fixture.blocks[2], true) && resident(0),
+          "an optional publication at a used block took a state in use");
+  require(fixture.cache.reclaimOneState(false, fixture.blocks[2], true) && !resident(0) &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 1,
+          "a publication in use could not recycle the last state in use");
+  fixture.publish(0);
+  require(!fixture.cache.reclaimOneState(false, fixture.blocks[1], true) && resident(0),
+          "a state published again at a used block was not in use");
+  shared.reset();
+  require(fixture.cache.snapshot().stateCache.inUse == 1 &&
+              fixture.cache.reclaimOneState(false, fixture.blocks[1], true) && !resident(0),
+          "a released block stayed in use");
+}
+
+// The KV above a state is in use only while that state is: once a state
+// marked after its publication has left, and its mark is released, its chain
+// goes by recency again, before a newer ordinary state.
+void testKvInUseFollowsItsState() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{7, 100, 1};
+  storage.budgetPages = 6;
+  KvPool pool{storage, 6};
+  engine::Cache cache(pool, cacheNamespace());
+  const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
+  cache.publishCompositeState(used[1], std::make_shared<TestState>(100));
+  StateUse use = cache.useState(used[1]);
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              cache.snapshot().stateCache.entries == 0 &&
+              cache.snapshot().stateCache.inUseEvictions == 1,
+          "the state in use did not go once nothing else was left");
+  use.reset();
+  const std::vector<uint64_t> ordinary = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(ordinary[1], std::make_shared<TestState>(100));
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress,
+            "the cache could not be reclaimed");
+  require(cache.stateResident(ordinary[1]) && cache.snapshot().kvCache.blocks == 2,
+          "the KV of a state that left stayed in use");
+}
+
+// The resume-point floor keeps the newest ordinary publication: a newer
+// finished point is kept over an older one in use, and states in use still
+// go after the rest. A state in use is never the resume point, even when it
+// is newer than every ordinary one: its class protects it, and a speculative
+// shrink takes it before the ordinary point.
+void testKeepResumePointKeepsTheNewestOrdinaryPublication() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  CacheFixture fixture;
+  fixture.publish(0);
+  StateUse running = fixture.cache.useState(fixture.blocks[1]);
+  fixture.publish(1);
+  fixture.publish(2);
+  // Lookups refresh what they find, so the order is read without them.
+  const auto held = [&](uint32_t block) {
+    return fixture.cache.stateResident(fixture.blocks[block]);
+  };
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse, true).madeProgress &&
+              fixture.cache.snapshot().kvCache.blocks == 3,
+          "the older KV leaf did not go first");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse, true).madeProgress && !held(0) &&
+              held(1) && held(2),
+          "the older ordinary state did not go before the state in use");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse, true).madeProgress && !held(1) &&
+              held(2) && fixture.cache.snapshot().stateCache.inUseEvictions == 1,
+          "the state in use outranked the newer resume point");
+  require(!fixture.cache.reclaimOne(reuse, ReclaimClass::InUse, true).madeProgress && held(2),
+          "the speculative shrink took the resume point");
+  // A state in use newer than every ordinary one goes; the ordinary point
+  // stays.
+  CacheFixture newer;
+  newer.publish(0);
+  StateUse newest = newer.cache.useState(newer.blocks[2]);
+  newer.publish(2);
+  static_cast<void>(newer.cache.reclaimCache(std::numeric_limits<uint64_t>::max(), true, false));
+  const auto states = newer.cache.snapshot().stateCache;
+  require(states.entries == 1 && states.inUseEvictions == 1 &&
+              newer.cache.stateResident(newer.blocks[0]) &&
+              !newer.cache.stateResident(newer.blocks[2]),
+          "the speculative shrink kept a state in use over the newest ordinary publication");
+}
+
+// A state in use is reusable: a checkpoint there becomes ordinary, and one
+// published there is ordinary.
+void testStatesInUseAreOrdinary() {
+  CacheFixture fixture;
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TestState>(100), true);
+  const StateCheckpoint checkpoint = fixture.cache.checkpointState(fixture.blocks[1]);
+  StateUse use = fixture.cache.useState(fixture.blocks[1]);
+  require(fixture.cache.retireCheckpointState(checkpoint) &&
+              fixture.cache.snapshot().stateCache.entries == 1 &&
+              fixture.cache.snapshot().stateCache.checkpointEntries == 0,
+          "rolling retirement erased a state in use");
+  StateUse later = fixture.cache.useState(fixture.blocks[2]);
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TestState>(100), true);
+  require(!fixture.cache.checkpointState(fixture.blocks[2]) &&
+              fixture.cache.snapshot().stateCache.checkpointEntries == 0,
+          "a checkpoint published at a used block stayed disposable");
+}
+
+// States in use and the KV they need wait for transfers in flight, and a
+// request short of pages waits with them: what those return may be enough.
+// Once they have landed, the state in use goes with its leaf.
+void testInUseWaitsForTransfersInFlight() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, 0, true).made, "the first state was not written");
+  // Only the transfer holds this state back: nothing needs to write it.
+  StateUse use = fixture.cache.useState(fixture.blocks[1]);
+  fixture.publish(1);
+  CacheReclaimResult result;
+  while ((result = fixture.cache.reclaimOne(reuse, ReclaimClass::InUse)).madeProgress) {
+  }
+  require(result.pending && fixture.cache.stateResident(fixture.blocks[1]),
+          "a state in use went while a transfer was in flight");
+  // Two pages are free; the third has to come from the leaf in use.
+  fixture.cache.beginRequest(2);
+  require(admitTokens(fixture.cache, 2, 96).failure == TokenAdmissionFailure::Pending &&
+              fixture.cache.stateResident(fixture.blocks[1]),
+          "a request short of pages took the KV in use while a transfer was in flight");
+  control->ready = true;
+  require(fixture.cache.pollTransfers() && admitTokens(fixture.cache, 2, 96).granted() &&
+              !fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 1,
+          "the state in use was not taken once the transfer landed");
+  fixture.cache.endRequest(2);
+}
+
+// A lane that takes a cached state's buffers is running work: a state in use
+// goes after every other state, newer or not, and once no transfer in flight
+// can return what is needed first.
+void testLaneTakesStatesInUseLast() {
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  StateUse use = fixture.cache.useState(fixture.blocks[0]);
+  fixture.publish(0);
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
+  require(fixture.cache.evictableStates(ReclaimClass::InUse) == 2 &&
+              fixture.cache.reclaimStateForLane(ReclaimClass::InUse).madeProgress &&
+              fixture.cache.stateResident(fixture.blocks[0]) &&
+              !fixture.cache.stateResident(fixture.blocks[1]),
+          "a lane took the state in use before a newer ordinary state");
+  // The ordinary state's write is in flight.
+  const CacheReclaimResult waiting = fixture.cache.reclaimStateForLane(ReclaimClass::InUse);
+  require(!waiting.madeProgress && waiting.pending &&
+              fixture.cache.stateResident(fixture.blocks[0]),
+          "a lane took a state in use while a transfer was in flight");
+  control->ready = true;
+  require(fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimStateForLane(ReclaimClass::InUse).madeProgress &&
+              fixture.cache.evictableStates(ReclaimClass::InUse) == 0 &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 1,
+          "a lane could not take the last state in use");
+}
+
+// Work that a resident lane holds back reclaims up to the ordinary class:
+// the ordinary state and the stateless KV go, and then it stops short of the
+// state in use and the KV that state restores through, with nothing pending.
+// Of the four idle pages, only the stateless leaves' two are reusable to it.
+// Running work takes that state once it is all that is left, and its KV is
+// then ordinary.
+void testOrdinaryClassStopsShortOfStatesInUse() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  CacheFixture fixture;
+  fixture.publish(0);
+  StateUse use = fixture.cache.useState(fixture.blocks[1]);
+  fixture.publish(1);
+  require(fixture.cache.reusablePages(ReclaimClass::Ordinary) == 2 &&
+              fixture.cache.reusablePages(ReclaimClass::InUse) == 4,
+          "work held back counted the KV in use as reusable");
+  uint32_t steps = 0;
+  CacheReclaimResult step;
+  while ((step = fixture.cache.reclaimOne(reuse, ReclaimClass::Ordinary)).madeProgress)
+    ++steps;
+  require(steps == 3 && !step.pending && fixture.cache.snapshot().stateCache.entries == 1 &&
+              fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.snapshot().kvCache.blocks == 2,
+          "work held back took what is in use, or left an ordinary victim");
+  require(!fixture.cache.reclaimStateForLane(ReclaimClass::Ordinary).madeProgress &&
+              fixture.cache.evictableStates(ReclaimClass::Ordinary) == 0 &&
+              fixture.cache.evictableStates(ReclaimClass::InUse) == 1,
+          "a lane held back could take the state in use");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              !fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 1 &&
+              fixture.cache.reusablePages(ReclaimClass::Ordinary) == 4,
+          "running work did not take the state in use");
+}
+
+// A publication in use never drops a state in use for a busy write slot:
+// while the write in flight holds it nothing is recycled, and that
+// publication goes without. Once the slot is free, a publication in use
+// takes the state by writing it. The chain's request runs, so no KV is
+// left to make room with either.
+void testRecycleNeverDropsAStateInUseForTheWriteSlot() {
+  CacheFixture fixture(nullptr, true);
+  auto control = std::make_shared<TransferControl>();
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, 0, true).made, "the first state was not written");
+  StateUse held = fixture.cache.useState(fixture.blocks[1]);
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
+  StateUse publishing = fixture.cache.useState(fixture.blocks[2]);
+  require(!fixture.cache.reclaimOneState(false, fixture.blocks[2], true) &&
+              fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 0,
+          "a state in use was dropped for a busy write slot");
+  control->ready = true;
+  require(fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOneState(false, fixture.blocks[2], true) &&
+              fixture.lookup(65).resumeBoundary() == 64 &&
+              fixture.cache.snapshot().stateCache.offloads == 2,
+          "the state in use was not written for the publication in use");
+}
+
+// Disk replacement follows the class of the copy it makes room for: the
+// write of a state in use gives up ordinary copies first and the oldest copy
+// in use last, while an ordinary state's write never replaces a copy in use;
+// that state is dropped, as when the quota holds nothing to give. The
+// chain's request runs, so only states compete.
+void testDiskReplacementTakesStatesInUseLast() {
+  CacheFixture fixture(nullptr, true);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  // Probes find the copies without refreshing them.
+  const auto cached = [&](uint32_t tokens) {
+    return fixture.cache.probe(std::span<const uint32_t>(fixture.prompt).first(tokens))
+        .cachedTokens();
+  };
+  const auto inUseEvictions = [&] {
+    return fixture.cache.snapshot().stateCache.inUseEvictions;
+  };
+  StateUse oldest = fixture.cache.useState(fixture.blocks[0]);
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, fixture.blocks[0], true) &&
+              fixture.cache.pollTransfers(),
+          "the oldest state in use was not written");
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers() &&
+              control->slots == 2,
+          "the ordinary state was not written");
+  // The quota is full: a write in use gives up the ordinary copy.
+  StateUse older = fixture.cache.useState(fixture.blocks[2]);
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, fixture.blocks[2], true) &&
+              fixture.cache.pollTransfers() && cached(65) == 32 && cached(97) == 96 &&
+              inUseEvictions() == 0,
+          "a write in use replaced a copy in use before an ordinary one");
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, 0, true) && cached(129) == 96 &&
+              inUseEvictions() == 0,
+          "an ordinary write replaced the only copy of a state in use");
+  StateUse newer = fixture.cache.useState(fixture.blocks[3]);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+  require(
+      fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+          fixture.cache.pollTransfers() && cached(33) == 0 && cached(97) == 96 &&
+          cached(129) == 128 && inUseEvictions() == 1,
+      "the write of a state in use did not replace the oldest copy in use");
+}
+
+// A request short of pages takes the KV leaf a state in use needs after a
+// newer leaf nothing in use needs.
+void testPageShortageTakesLeavesInUseLast() {
+  test::TestKvStorage storage{7, 100, 1};
+  storage.budgetPages = 6;
+  KvPool pool{storage, 6};
+  engine::Cache cache(pool, cacheNamespace());
+  const auto [usedPrompt, used] = cacheChain(cache, 1, 2);
+  // The older chain's leaf holds the state in use.
+  StateUse use = cache.useState(used[1]);
+  cache.publishCompositeState(used[1], std::make_shared<TestState>(100));
+  static_cast<void>(cacheChain(cache, 2, 2));
+  cache.beginRequest(3);
+  require(admitTokens(cache, 3, 96).granted() && cache.lookup(usedPrompt).resumeBoundary() == 64,
+          "a request short of pages took the leaf a state in use needs before a newer one");
+  cache.endRequest(3);
+}
+
+// The parent a disk-only state in use restores through goes with the states
+// in use: its write may displace their copies, so a quota holding only them
+// never keeps it in RAM.
+void testKvAStateInUseNeedsNeverPinsMemory() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvTier tier;
+  tier.capacity = 1;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  StateUse use = fixture.cache.useState(fixture.blocks[3]);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              fixture.cache.pollTransfers(),
+          "the state in use was not written");
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 1,
+          "the leaf of the state in use was not written");
+  tier.complete();
+  require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1,
+          "the leaf did not land");
+  // Block 2 is a leaf the state in use needs; the quota holds only that
+  // state's KV copy.
+  require(fixture.cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              fixture.cache.snapshot().kvCache.blocks == 2 &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 1,
+          "the parent a state in use needs stayed in RAM");
+}
+
+// An ordinary leaf's write never displaces the copies a state in use needs,
+// even when they are older. While a lookup holds the ordinary copy below the
+// leaf, the leaf stays; then the ordinary copies give way, and the leaf,
+// which nothing needs any more, goes without one.
+void testOrdinaryDemotionKeepsCopiesInUse() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{7, 100, 1};
+  storage.budgetPages = 6;
+  KvPool pool{storage, 6};
+  test::TestKvTier tier;
+  tier.capacity = 3;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const auto settle = [&](const char *message) {
+    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, message);
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  };
+  // The older chain goes to disk whole: its state in use, then its KV.
+  const auto [usedPrompt, used] = cacheChain(cache, 1, 2);
+  StateUse use = cache.useState(used[1]);
+  cache.publishCompositeState(used[1], std::make_shared<TieredState>(control));
+  for (uint32_t step = 0; step < 3; ++step)
+    settle("the chain in use did not go to disk");
+  // The newer chain's tail and its ordinary state follow; the quota is full.
+  const auto [ordinaryPrompt, ordinary] = cacheChain(cache, 2, 3);
+  cache.publishCompositeState(ordinary[2], std::make_shared<TieredState>(control));
+  for (uint32_t step = 0; step < 2; ++step)
+    settle("the ordinary tail did not go to disk");
+  require(tier.slots == 3 && cache.snapshot().kvCache.blocks == 2,
+          "fixture did not fill the quota");
+  // The parent of that tail cannot be written without displacing a copy.
+  // While a lookup holds the ordinary state, only copies in use could go.
+  {
+    const CacheLookup held = cache.lookup(ordinaryPrompt);
+    require(held.state && !cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+                cache.snapshot().stateCache.inUseEvictions == 0,
+            "an ordinary leaf's write displaced a copy in use");
+  }
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress &&
+              cache.snapshot().kvCache.blocks == 1 && tier.slots == 2 &&
+              cache.snapshot().stateCache.entries == 1 &&
+              cache.snapshot().stateCache.inUseEvictions == 0,
+          "an ordinary leaf's write displaced the copies a state in use needs");
+  require(cache.probe(usedPrompt).cachedTokens() == 64,
+          "the state in use lost the KV it restores through");
+}
+
+// Promotion is optional: without a free slot it never takes a state in use
+// for one, and the restored state stays on disk.
+void testPromotionSkipsForAStateInUse() {
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+  require(fixture.cache.reclaimOneState(false, 0, true) && fixture.cache.pollTransfers(),
+          "state was not demoted");
+  StateUse use = fixture.cache.useState(fixture.blocks[1]);
+  fixture.publish(1);
+  auto lookup = fixture.lookup(129);
+  PromotionTicket ticket;
+  ticket.available = false;
+  fixture.cache.promoteState(lookup, ticket);
+  const auto stats = fixture.cache.snapshot().stateCache;
+  require(ticket.copies == 1 && stats.promotionsSkipped == 1 && stats.inUseEvictions == 0 &&
+              fixture.cache.stateResident(fixture.blocks[1]),
+          "promotion took a state in use for its slot");
+}
+
+// A copy that failed is not the protection giving way.
+void testInUseEvictionsCountChoices() {
+  CacheFixture fixture;
+  StateUse use = fixture.cache.useState(fixture.blocks[1]);
+  fixture.publish(1);
+  const auto state = fixture.lookup(65).state->state();
+  fixture.cache.discardState(fixture.blocks[1], state.get());
+  require(!fixture.lookup(65).state &&
+              fixture.cache.snapshot().stateCache.inUseEvictions == 0,
+          "a failed copy counted as an eviction of a state in use");
+}
+
+// A publication in use makes room as running work does: another
+// conversation's KV older than every ordinary state goes first, then that
+// state, then newer KV. Optional and ordinary publications take no KV, and
+// the running chain the publication belongs to is never a victim.
+void testPublicationInUseTakesOrdinaryKv() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  const auto older = cacheChain(cache, 1, 2).first;
+  const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
+  const auto newer = cacheChain(cache, 3, 2);
+  const uint64_t point = cacheChain(cache, 4, 2, true).second[1];
+  StateUse use = cache.useState(point);
+  const auto blocks = [&] { return cache.snapshot().kvCache.blocks; };
+  require(!cache.reclaimOneState(true, point, true) && blocks() == 8,
+          "an optional publication took KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point, true) && cache.stateResident(stated[1]),
+            "the older KV did not go before the newer ordinary state");
+  require(blocks() == 6 && cache.lookup(older).kvBoundary == 0 &&
+              pool.snapshot().pagesAllocated == 6,
+          "the older KV did not go with its extents");
+  require(cache.reclaimOneState(false, point, true) && !cache.stateResident(stated[1]) &&
+              blocks() == 6,
+          "the ordinary state did not go before newer KV");
+  require(!cache.reclaimOneState(false, newer.second[0], true) && blocks() == 6,
+          "an ordinary publication took KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point, true).made, "the KV of the old state did not go");
+  require(blocks() == 4 && cache.lookup(newer.first).kvBoundary == 64,
+          "newer KV went before older KV");
+  for (uint32_t leaf = 0; leaf < 2; ++leaf)
+    require(cache.reclaimOneState(false, point, true).made, "the newest KV did not go");
+  require(!cache.reclaimOneState(false, point, true) && blocks() == 2 &&
+              cache.snapshot().stateCache.inUseEvictions == 0,
+          "a publication took its own running chain");
+  cache.endRequest(4);
+}
+
+// While the engine may not grow, an extent's bytes give a snapshot nothing:
+// a publication in use leaves KV and extents where they are and recycles
+// states like any other publication, the oldest in use after the ordinary
+// ones. With growth each step says what it gave, buffers or an extent.
+void testPublicationInUseWithoutGrowthTakesStatesAlone() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  const auto older = cacheChain(cache, 1, 2).first;
+  const std::vector<uint64_t> stated = cacheChain(cache, 2, 2).second;
+  cache.publishCompositeState(stated[1], std::make_shared<TestState>(100));
+  const uint64_t other = cacheChain(cache, 3, 2, true).second[1];
+  StateUse held = cache.useState(other);
+  cache.publishCompositeState(other, std::make_shared<TestState>(100));
+  const uint64_t point = cacheChain(cache, 4, 2, true).second[1];
+  StateUse use = cache.useState(point);
+  const auto blocks = [&] { return cache.snapshot().kvCache.blocks; };
+  const auto allocated = [&] { return pool.snapshot().pagesAllocated; };
+  require(blocks() == 8 && allocated() == 8, "fixture geometry changed");
+
+  StateRoom room = cache.reclaimOneState(false, point, false);
+  require(room && room.extentBytes == 0 && !cache.stateResident(stated[1]) && blocks() == 8 &&
+              allocated() == 8 && cache.lookup(older).kvBoundary == 64,
+          "without growth the publication took KV ahead of the ordinary state");
+  room = cache.reclaimOneState(false, point, false);
+  require(room && room.extentBytes == 0 && !cache.stateResident(other) && blocks() == 8 &&
+              allocated() == 8 && cache.snapshot().stateCache.inUseEvictions == 1,
+          "without growth the publication took KV ahead of the state in use");
+  require(!cache.reclaimOneState(false, point, false) && blocks() == 8 && allocated() == 8,
+          "without growth the publication took KV once no state was left");
+  room = cache.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 100 && blocks() == 7 && allocated() == 7,
+          "with growth the oldest KV did not go with its extent");
+  cache.endRequest(3);
+  cache.endRequest(4);
+}
+
+// A publication in use takes ordinary KV only: the KV another state in use
+// restores through stays, and running work takes it, last.
+void testPublicationInUseLeavesKvInUse() {
+  constexpr auto reuse = CacheReclaimMode::KeepExtents;
+  test::TestKvStorage storage{4, 100, 1};
+  KvPool pool{storage, 4};
+  test::TestKvTier tier;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint64_t> used = cacheChain(cache, 1, 2).second;
+  StateUse held = cache.useState(used[1]);
+  cache.publishCompositeState(used[1], std::make_shared<TieredState>(control));
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && cache.pollTransfers() &&
+              !cache.stateResident(used[1]),
+          "the state in use was not written");
+  const uint64_t point = cacheChain(cache, 2, 2, true).second[1];
+  StateUse use = cache.useState(point);
+  require(!cache.reclaimOneState(false, point, true) && cache.snapshot().kvCache.blocks == 4 &&
+              tier.demotions == 0,
+          "a publication in use took the KV a state in use restores through");
+  require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == 1,
+          "running work did not take the KV in use last");
+  cache.endRequest(2);
+}
+
+// A snapshot cannot wait for a demotion: a publication in use passes over
+// every leaf whose page returns only once a copy is written, here each older
+// leaf, which holds a state only the disk holds. It starts no demotion, so it
+// displaces no disk copy, and recycles the oldest state in use instead.
+void testInUsePublicationStartsNoDemotion() {
+  test::TestKvStorage storage{6, 100, 1};
+  KvPool pool{storage, 6};
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  engine::Cache cache(pool, cacheNamespace(), &tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  for (uint64_t id : {1, 2}) {
+    cache.publishCompositeState(cacheChain(cache, id, 2).second[1],
+                                std::make_shared<TieredState>(control));
+    require(cache.reclaimOneState(false, 0, true) && cache.pollTransfers(),
+            "the older state was not written");
+  }
+  const uint64_t other = cacheChain(cache, 3, 1, true).second[0];
+  StateUse held = cache.useState(other);
+  cache.publishCompositeState(other, std::make_shared<TestState>(100));
+  const uint64_t point = cacheChain(cache, 4, 1, true).second[0];
+  StateUse use = cache.useState(point);
+  const CacheSnapshot before = cache.snapshot();
+  const StateRoom room = cache.reclaimOneState(false, point, true);
+  const CacheSnapshot after = cache.snapshot();
+  require(room && room.extentBytes == 0 && tier.demotions == 0 &&
+              !cache.stateResident(other) && after.stateCache.inUseEvictions == 1 &&
+              after.stateCache.diskBytes == before.stateCache.diskBytes &&
+              after.kvTier.diskBlocks == before.kvTier.diskBlocks &&
+              after.kvCache.blocks == before.kvCache.blocks,
+          "a publication in use started a demotion or displaced a disk copy");
+  cache.endRequest(3);
+  cache.endRequest(4);
+}
+
+// KV gives a publication in use memory only through an extent it empties.
+// Where the pages requests hold leave no extent to empty, three held in each
+// of two extents, no KV goes: the stateless chain on the other two pages
+// stays, nothing is copied, and the oldest state in use is recycled.
+void testInUsePublicationTakesNoKvWhenNoExtentCanEmpty() {
+  test::TestKvStorage storage{8, 100, 4};
+  KvPool pool{storage, 8};
+  engine::Cache cache(pool, cacheNamespace());
+  const uint64_t other = cacheChain(cache, 1, 3, true).second[2];
+  StateUse held = cache.useState(other);
+  cache.publishCompositeState(other, std::make_shared<TestState>(100));
+  static_cast<void>(cacheChain(cache, 2, 2));
+  const uint64_t point = cacheChain(cache, 3, 3, true).second[2];
+  StateUse use = cache.useState(point);
+  require(std::ranges::equal(cache.pageTable(1).pages, std::vector<uint32_t>{0, 1, 2}) &&
+              std::ranges::equal(cache.pageTable(3).pages, std::vector<uint32_t>{5, 6, 7}),
+          "fixture geometry changed");
+  const StateRoom room = cache.reclaimOneState(false, point, true);
+  require(room && room.extentBytes == 0 && !cache.stateResident(other) &&
+              cache.snapshot().stateCache.inUseEvictions == 1 &&
+              cache.snapshot().kvCache.blocks == 8 && storage.copies.empty(),
+          "a publication in use took KV although no extent could be emptied");
+  cache.endRequest(1);
+  cache.endRequest(3);
+}
+
 int main() {
   try {
+    testStateInUseGoesLast();
+    testKvAStateInUseNeedsGoesLast();
+    testStateUsesAreCountedPerBlock();
+    testKvInUseFollowsItsState();
+    testKeepResumePointKeepsTheNewestOrdinaryPublication();
+    testStatesInUseAreOrdinary();
+    testInUseWaitsForTransfersInFlight();
+    testLaneTakesStatesInUseLast();
+    testOrdinaryClassStopsShortOfStatesInUse();
+    testRecycleNeverDropsAStateInUseForTheWriteSlot();
+    testDiskReplacementTakesStatesInUseLast();
+    testPageShortageTakesLeavesInUseLast();
+    testKvAStateInUseNeedsNeverPinsMemory();
+    testOrdinaryDemotionKeepsCopiesInUse();
+    testPromotionSkipsForAStateInUse();
+    testInUseEvictionsCountChoices();
+    testPublicationInUseTakesOrdinaryKv();
+    testPublicationInUseWithoutGrowthTakesStatesAlone();
+    testPublicationInUseLeavesKvInUse();
+    testInUsePublicationStartsNoDemotion();
+    testInUsePublicationTakesNoKvWhenNoExtentCanEmpty();
     testLargeSharedDiskRestore();
     testReclaimForPagesCoversTheShortfall();
     testLookupKeepsADiskChainsResidentBoundaryWarm();

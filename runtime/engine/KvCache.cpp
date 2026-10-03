@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace splash::engine {
@@ -250,7 +251,8 @@ bool KvCache::hasDiskChildren(uint64_t blockId) const {
   return entry.children > entry.residentChildren;
 }
 
-void KvCache::countState(uint64_t blockId, bool added) noexcept {
+template <typename Count>
+void KvCache::countAbove(uint64_t blockId, const Count &count) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end())
     std::terminate();
@@ -258,16 +260,54 @@ void KvCache::countState(uint64_t blockId, bool added) noexcept {
     const auto parent = blocks_.find(above);
     if (parent == blocks_.end())
       std::terminate();
-    added ? ++parent->second.statesBelow : --parent->second.statesBelow;
+    count(parent->second);
     above = parent->second.parent;
   }
 }
 
+void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
+  countAbove(blockId, [&](Block &entry) {
+    added ? ++entry.statesBelow : --entry.statesBelow;
+    if (inUse)
+      added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+  });
+}
+
+void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
+  countAbove(blockId, [&](Block &entry) {
+    added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+  });
+}
+
 bool KvCache::stateBelow(uint64_t blockId) const { return block(blockId).statesBelow > 0; }
+
+bool KvCache::stateInUseBelow(uint64_t blockId) const {
+  return block(blockId).statesInUseBelow > 0;
+}
 
 void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
+
+uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
+  std::unordered_set<uint64_t> visited;
+  uint32_t pages = 0;
+  for (uint64_t blockId : blocks) {
+    while (blockId && visited.insert(blockId).second) {
+      const Block &entry = block(blockId);
+      if (entry.page != noPage) {
+        // The request holding this page holds every page above it too.
+        if (pool_.activeReferences(entry.page))
+          break;
+        if (!entry.transferring)
+          ++pages;
+      }
+      // A disk-only block holds no page; the walk goes on above it.
+      blockId = entry.parent;
+    }
+  }
+  return pages;
+}
 
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
@@ -397,8 +437,11 @@ KvCache::evictionCandidate(uint64_t after) const {
 }
 
 std::optional<CacheEvictionCandidate>
-KvCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskLeaves_.oldest();
+KvCache::diskCandidate(bool duplicate, uint64_t after) const {
+  const RecencyOrder &order = duplicate ? duplicates_ : diskLeaves_;
+  if (!after)
+    return order.oldest();
+  return order.next({after, block(after).lastUsed});
 }
 
 std::vector<uint64_t> KvCache::subtree(uint64_t blockId) const {

@@ -105,9 +105,11 @@ public:
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;
 
   // Runs only between commands: throws std::logic_error while a command is
-  // in flight. Reclaim order follows ownership and preserves reusable
-  // prefixes for as long as possible: idle model state, empty KV extents,
-  // disposable checkpoints, then ordinary state/KV in LRU order.
+  // in flight. Returns idle model state first, then reclaims the cache:
+  // Cache::evictAll() under critical pressure, else Cache::reclaimCache,
+  // whose contract (Cache.hpp) gives the order; then returns the buffers
+  // evicted states parked. A warning pass keeps one lane's pooled buffers
+  // and one empty extent (keepServingFootprint).
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is
@@ -160,6 +162,10 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // The block of the prompt's replay boundary, where the conversation's
+    // next turn resumes: its state is in use from the moment the request
+    // reaches, reuses or restores it until the request ends, suspended or not.
+    StateUse replayPoint;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -204,6 +210,9 @@ private:
   // only its prompt, before the prompt's generation prompt.
   [[nodiscard]] static uint32_t
   replayStateBoundary(const Request &request) noexcept;
+  // replayStateBoundary while the lane replays only its prompt.
+  [[nodiscard]] static uint32_t
+  promptReplayBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
@@ -226,13 +235,14 @@ private:
                                  double nowMilliseconds);
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
-  // memory of the other kind is released first.
-  [[nodiscard]] CacheReclaimResult reclaimForState();
-  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages);
+  // memory of the other kind is released first. Each takes cache up to the
+  // class allocate() derives from inService.
+  [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
+  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
   [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
-  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused();
+  [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
-      const TokenAdmission &admission);
+      const TokenAdmission &admission, ReclaimClass upTo);
   [[nodiscard]] bool growthPaused() const;
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
@@ -256,12 +266,14 @@ private:
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;
   // Runs one allocation of a lane's state or of KV pages, reclaiming between
-  // attempts while that makes progress. A refusal from the host reuses what
-  // the engine holds; when that gives nothing, a request in service retries
-  // as one (EngineConfig::serving), which only the engine's limit and
-  // critical pressure refuse. A refusal from the engine's limit reclaims
-  // cache; when that gives nothing, fallback may let go of what the request
-  // itself pins, and the reclaim goes on.
+  // attempts while that makes progress. A request in service is running
+  // work and reclaims up to what is in use; one that a resident lane holds
+  // back takes nothing in use and waits for that lane. A refusal from the
+  // host reuses what the engine holds; when that gives nothing, a request in
+  // service retries as one (EngineConfig::serving), which only the engine's
+  // limit and critical pressure refuse. A refusal from the engine's limit
+  // reclaims cache; when that gives nothing, fallback may let go of what the
+  // request itself pins, and the reclaim goes on.
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService,
                               const std::function<bool()> &fallback = {})

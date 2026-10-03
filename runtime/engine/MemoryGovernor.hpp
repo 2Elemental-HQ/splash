@@ -96,8 +96,9 @@ struct MemoryReclaimDirective {
   bool reclaim = false;
   bool evictAllUnpinnedPrefixes = false;
   uint64_t targetBytes = 0;
-  // Keep the newest state publication, the point a follow-up request resumes
-  // from. Only a shrink that nothing is waiting for can afford to.
+  // Keep the newest ordinary state publication (else the newest checkpoint),
+  // the point a follow-up request resumes from. Only a shrink that nothing is
+  // waiting for can afford to.
   bool keepResumePoint = false;
   // Keep what a request starts from without growing: one lane's pooled state
   // buffers and one empty KV extent, so the next request starts without

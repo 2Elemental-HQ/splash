@@ -73,6 +73,7 @@ public:
     return std::make_unique<test::HeldTicket>(std::move(results), ticketReady,
                                               0.0);
   }
+  uint64_t snapshotBytes() const noexcept override { return 64; }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
     return {};
   }

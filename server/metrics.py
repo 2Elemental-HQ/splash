@@ -108,6 +108,8 @@ def prometheus_metrics(status):
         ),
         "splash_state_entries": ("state", "entries"),
         "splash_state_pinned": ("state", "pinned"),
+        "splash_state_in_use": ("state", "in_use"),
+        "splash_state_in_use_evictions_total": ("state", "in_use_evictions"),
         "splash_state_bytes": ("state", "bytes"),
         "splash_state_active_cells": ("state", "active_cells"),
         "splash_state_hits_total": ("state", "hits"),
