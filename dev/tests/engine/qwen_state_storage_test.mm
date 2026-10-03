@@ -1,3 +1,4 @@
+#include "Checked.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
@@ -328,17 +329,17 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 }
 
 // A state need not fill its slot: the write zeros the slot past it and the
-// read leaves the rest, in a slot one alignment unit larger than an aligned
-// state and in the rounded-up slot of a state that is not aligned.
+// read leaves the rest, in a slot one host page larger than an aligned state
+// and in the rounded-up slot of a state that is not aligned.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
   constexpr model::CompositeStateLayout aligned{target, {1, 1, 2048, 4}};
   constexpr model::CompositeStateLayout unaligned{target, {1, 1, 2048, 1}};
-  constexpr uint64_t unit = model::SlotFile::kAlignmentBytes;
-  static_assert(aligned.cachedBytes() % unit == 0 && unaligned.cachedBytes() % unit != 0);
+  static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
+                unaligned.cachedBytes() % kHostPageBytes != 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
   for (const auto &[layout, slotBytes] :
-       {std::pair{aligned, aligned.cachedBytes() + unit},
+       {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
     model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout,
                                     std::make_shared<model::SlotFile>(

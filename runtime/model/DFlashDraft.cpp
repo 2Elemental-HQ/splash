@@ -1,4 +1,5 @@
 #include "DFlashDraft.hpp"
+#include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
 
 #include <stdexcept>
@@ -299,11 +300,11 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
   DFlashDraftWeights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
-  const uint64_t convolutionBytes = checkedWeightMultiply(
-      checkedWeightMultiply(4, layout.hiddenSize,
-                            "draft convolution elements"),
+  const uint64_t convolutionBytes = checkedMultiply<WeightStoreError>(
+      checkedMultiply<WeightStoreError>(4, layout.hiddenSize,
+                                        "draft convolution elements"),
       kBFloat16Bytes, "draft convolution bytes");
-  const uint64_t headNormBytes = checkedWeightMultiply(
+  const uint64_t headNormBytes = checkedMultiply<WeightStoreError>(
       layout.attentionHeadDimension, kBFloat16Bytes,
       "draft head norm bytes");
 
@@ -348,9 +349,10 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
     result.selectorProjection = readAffineProjection(
         file, layout.selectorRank, layout.hiddenSize, "selector");
-    const uint64_t codebookBytes = checkedWeightMultiply(
-        checkedWeightMultiply(layout.vocabularySize, layout.selectorRank,
-                              "draft codebook elements"),
+    const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
+        checkedMultiply<WeightStoreError>(layout.vocabularySize,
+                                          layout.selectorRank,
+                                          "draft codebook elements"),
         kBFloat16Bytes, "draft codebook bytes");
     result.predecessorCodebook =
         file.section(codebookBytes, "predecessor-codebook");
@@ -360,7 +362,6 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     result.files.push_back(file.record());
   }
 
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;

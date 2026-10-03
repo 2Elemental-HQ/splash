@@ -85,9 +85,9 @@ bool SlotFile::Operation::wait() {
 }
 
 namespace {
-// One transfer of the worker: a whole number of alignment units.
+// One transfer of the worker: a whole number of host pages.
 constexpr size_t kChunkBytes = 1 << 20;
-static_assert(kChunkBytes % SlotFile::kAlignmentBytes == 0);
+static_assert(kChunkBytes % kHostPageBytes == 0);
 
 off_t slotOffset(uint64_t index, uint64_t slotBytes) {
   return static_cast<off_t>(index * slotBytes);
@@ -118,7 +118,7 @@ uint64_t totalBytes(const std::vector<Span> &spans) {
 template <typename Span>
 bool direct(Span span) noexcept {
   return span.size() >= kChunkBytes &&
-         reinterpret_cast<std::uintptr_t>(span.data()) % SlotFile::kAlignmentBytes == 0;
+         reinterpret_cast<std::uintptr_t>(span.data()) % kHostPageBytes == 0;
 }
 
 // Walks the spans of an operation in order, one piece at a time.
@@ -138,13 +138,13 @@ public:
   }
   // The length of the next chunk through the buffer: `limit`, or the bytes
   // before a later span the file can move straight when they are fewer and
-  // a whole number of alignment units, so that span starts at an aligned
-  // offset of the slot.
+  // a whole number of host pages, so that span starts at an aligned offset
+  // of the slot.
   [[nodiscard]] size_t gatherBytes(size_t limit) const noexcept {
     if (span_ == spans_.size()) return limit;
     size_t before = spans_[span_].size() - offset_;
     for (size_t index = span_ + 1; index < spans_.size() && before < limit; ++index) {
-      if (direct(spans_[index]) && before % SlotFile::kAlignmentBytes == 0) return before;
+      if (direct(spans_[index]) && before % kHostPageBytes == 0) return before;
       before += spans_[index].size();
     }
     return limit;
@@ -203,7 +203,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
     throw std::invalid_argument("invalid slot file capacity");
   if (capacityBytes < slotBytes)
     throw std::invalid_argument("slot file quota holds no slot");
-  if (slotBytes % kAlignmentBytes)
+  if (slotBytes % kHostPageBytes)
     throw std::invalid_argument("slot size is not aligned for uncached IO");
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
@@ -229,7 +229,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
   if (::fcntl(backing_->descriptor, F_NOCACHE, 1) < 0)
     throw std::system_error(errno, std::generic_category(), "uncached slot file");
   void *buffer = nullptr;
-  if (::posix_memalign(&buffer, kAlignmentBytes, kChunkBytes) != 0)
+  if (::posix_memalign(&buffer, kHostPageBytes, kChunkBytes) != 0)
     throw std::bad_alloc();
   buffer_.reset(static_cast<std::byte *>(buffer));
   worker_ = std::thread([this] { run(); });

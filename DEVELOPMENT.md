@@ -449,7 +449,9 @@ target, `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) and `AffinePreparation`
 for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`)
 and `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation`
 for an MLX or GGUF vision tower. They open their files through `PreparedFiles`,
-the `PreparedWeights` cache with the load's guards. `AffinePreparation` reorders
+the `PreparedWeights` cache with the load's guards; the target and draft loaders
+keep their planned images in `PreparedImages` (`PreparedFiles.hpp`), whose
+sizes `preparedModelWeightBytes` sums. `AffinePreparation` reorders
 an MLX target's codes, scales and biases into 256-row tiles without
 requantization, quantizes the draft's BF16 projections into the same tiles
 ([Drafts](#drafts)) and computes GDN decay as `float(-exp(double(A_log)))`,
@@ -494,28 +496,31 @@ Each entry records in `source` its component (such as `target/layer-0.bin`),
 the digest of the source data it was written from and the source path.
 Publishing an entry removes the complete entries it supersedes: the same
 component from the same source data under another key, which an earlier
-preparation identity wrote, and entries of earlier Splash versions prepared from
-the same source path. Entries of other sources or revisions, which
+preparation identity wrote. Entries of other sources or revisions, which
 installations may share, stay. Removal happens under the converter lock, so no
 entry being written is touched, and a running process keeps the files it has
 mapped until it unmaps them. Two builds of different preparation identities
 sharing one cache supersede each other's entries at every start; give a
 development build its own `SPLASH_WEIGHT_CACHE`.
 
-One writer per cache serializes conversion; complete cache hits bypass this
-lock. Each output's disk space is preallocated before writing. Interruption,
-disk-full errors and memory-pressure rejection cannot publish partial files;
-concurrent external disk activity can still exhaust the volume. Retrying removes
-abandoned writes under the converter lock and reuses previously completed
+One writer per cache serializes conversion; complete cache hits never wait for
+this lock. Each output's disk space is preallocated before writing.
+Interruption, disk-full errors and memory-pressure rejection cannot publish
+partial files; concurrent external disk activity can still exhaust the volume.
+Every converter-lock acquisition removes abandoned writes, and so does a warm
+start that finds the lock free; a warm start that cannot lock or clean the cache
+(read-only, or without `flock`) leaves them and still loads. Replacing an
+invalid entry also drops its digest proof. Retrying reuses previously completed
 files, which are read-only. Cold preparation reports each artifact's progress.
 
 Cold source hashing and output validation stream bounded buffers. Unchanged
-files reuse a digest proof tied to device, inode, size, birth time, mtime and
-ctime; a write or replacement invalidates it. This is not a full disk scrub on
-every startup. Preparation uses uncached destination I/O. Every adapter sizes
-its conversion steps to one staging bound, input and output together, of
-32 MiB (`kWeightPreparationStagingBytes`), whatever the tensor, layer or expert
-count, inside a 64 MiB admission reserve that also covers source metadata.
+files reuse a digest proof tied to inode, size, birth time, mtime and ctime, so
+a remounted volume keeps its proofs; a write or replacement invalidates it.
+This is not a full disk scrub on every startup. Preparation uses uncached
+destination I/O. Every adapter sizes its conversion steps to one staging bound,
+input and output together, of 32 MiB (`kWeightPreparationStagingBytes`),
+whatever the tensor, layer or expert count, inside a 64 MiB admission reserve
+that also covers source metadata.
 Complete rows and multiple row tiles are processed together where possible,
 avoiding per-row I/O and small GPU waits. Startup runs two checks
 (`RuntimeResources.mm`), both stopped by cancellation. `admitWeightPreparation`,

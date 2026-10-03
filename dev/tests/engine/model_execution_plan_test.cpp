@@ -1,3 +1,4 @@
+#include "Checked.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -93,8 +94,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   const auto prefillAfter = selected.prefillAttentionWorkspace(
       2048, attention.queryHeads, geometry.kvLayout);
   const uint64_t prefillGrowth =
-      model::alignArena(prefillAfter.partialsBytes) - model::alignArena(prefillBefore.partialsBytes) +
-      model::alignArena(prefillAfter.statisticsBytes) - model::alignArena(prefillBefore.statisticsBytes);
+      alignUp(prefillAfter.partialsBytes) - alignUp(prefillBefore.partialsBytes) +
+      alignUp(prefillAfter.statisticsBytes) - alignUp(prefillBefore.statisticsBytes);
   // The selected split count and the fallback baseline share an arena whose
   // governed bound includes the larger candidate's exact scratch requirement.
   require(prefillGrowth > 0 &&
@@ -115,8 +116,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
     const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
     const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
     for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      decodeGrowth += model::alignArena(model::kLaneCount * (newMoe.*field.bytes)) -
-                      model::alignArena(model::kLaneCount * (oldMoe.*field.bytes));
+      decodeGrowth += alignUp(model::kLaneCount * (newMoe.*field.bytes)) -
+                      alignUp(model::kLaneCount * (oldMoe.*field.bytes));
     require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
   }
   require(after.sharedDecodePlannedAllocatedBytes ==

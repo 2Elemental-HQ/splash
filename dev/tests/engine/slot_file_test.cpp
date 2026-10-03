@@ -1,3 +1,4 @@
+#include "Checked.hpp"
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
@@ -15,14 +16,14 @@
 #include <utility>
 #include <vector>
 
+using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
 
-// A slot is its payload rounded up to the alignment of uncached IO.
-static_assert(SlotFile::slotBytesFor(1) == SlotFile::kAlignmentBytes &&
-              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes) == SlotFile::kAlignmentBytes &&
-              SlotFile::slotBytesFor(SlotFile::kAlignmentBytes + 1) ==
-                  2 * SlotFile::kAlignmentBytes);
+// A slot is its payload rounded up to whole host pages, as uncached IO wants.
+static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
+              SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
+              SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
 static void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
@@ -40,7 +41,7 @@ static void testFailedWriteStopsWriting() {
   if (!child) {
     int result = 0;
     try {
-      constexpr size_t size = SlotFile::kAlignmentBytes;
+      constexpr size_t size = kHostPageBytes;
       // The engine starts with the default disposition, which kills the
       // process on a write past the limit, so the file has to change it.
       signal(SIGXFSZ, SIG_DFL);
@@ -89,7 +90,7 @@ static void testFailedWriteStopsWriting() {
 // and a read may take less than was written, scattered differently.
 static void testScatteredSpans() {
   // Three of the worker's 1 MiB chunks, the last one partial.
-  constexpr size_t size = (2 << 20) + 3 * SlotFile::kAlignmentBytes;
+  constexpr size_t size = (2 << 20) + 3 * kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget);
   auto slot = file.acquire();
@@ -134,14 +135,14 @@ static void testScatteredSpans() {
 using Shape = std::vector<std::pair<size_t, bool>>;
 static std::vector<std::span<std::byte>> placeSpans(std::vector<std::byte> &storage,
                                                     const Shape &shape) {
-  constexpr size_t unit = SlotFile::kAlignmentBytes;
-  const auto room = [](size_t bytes) { return (bytes + 1 + unit - 1) / unit * unit; };
-  size_t total = unit;
+  const auto room = [](size_t bytes) { return splash::alignUp(bytes + 1); };
+  size_t total = kHostPageBytes;
   for (const auto &[bytes, aligned] : shape) total += room(bytes);
   storage.assign(total, std::byte{0});
   void *base = storage.data();
   size_t space = storage.size();
-  auto *cursor = static_cast<std::byte *>(std::align(unit, total - unit, base, space));
+  auto *cursor = static_cast<std::byte *>(
+      std::align(kHostPageBytes, total - kHostPageBytes, base, space));
   std::vector<std::span<std::byte>> spans;
   for (const auto &[bytes, aligned] : shape) {
     spans.emplace_back(cursor + (aligned ? 0 : 1), bytes);
@@ -166,9 +167,9 @@ static void testAlignedRunsMoveDirectly() {
       {{5 * chunk / 2, true}},
       // The last run starts at an unaligned offset of the slot.
       {{3 * chunk / 2, true}, {100, false}, {chunk, true}},
-      // The buffer takes only the alignment units before a run, so the run
-      // starts at an aligned offset of the slot.
-      {{3 * SlotFile::kAlignmentBytes, false}, {5 * chunk / 4, true}},
+      // The buffer takes only the host pages before a run, so the run starts
+      // at an aligned offset of the slot.
+      {{3 * kHostPageBytes, false}, {5 * chunk / 4, true}},
   };
   uint32_t state = 1;
   for (const Shape &shape : shapes) {
@@ -233,7 +234,7 @@ static void testCancelledDirectWrite() {
 // A freed slot gives its blocks back: two files filling one quota in turn
 // occupy what the quota holds on disk, not twice it.
 static void testFreedSlotsReturnTheirBlocks() {
-  constexpr size_t size = SlotFile::kAlignmentBytes;
+  constexpr size_t size = kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
   SlotFile first(size, budget), second(size, budget);
   std::vector<std::byte> source(size, std::byte{7}), output(size);
@@ -261,7 +262,7 @@ static void testFreedSlotsReturnTheirBlocks() {
 // hole and reads back. The first slot goes on the worker, which drops the
 // write's hold on it last.
 static void testPunchedSlotIsReusable() {
-  constexpr size_t size = 2 * SlotFile::kAlignmentBytes;
+  constexpr size_t size = 2 * kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget);
   std::vector<std::byte> first(size, std::byte{1}), second(size / 2, std::byte{2});
@@ -284,7 +285,7 @@ int main() {
     testCancelledDirectWrite();
     testFreedSlotsReturnTheirBlocks();
     testPunchedSlotIsReusable();
-    constexpr size_t size = 4 * SlotFile::kAlignmentBytes;
+    constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);
     require(file.slotBytes() == size && budget->usedBytes() == 0,

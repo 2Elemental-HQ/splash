@@ -1,9 +1,11 @@
 #pragma once
 
+#include "model/AffinePreparation.hpp"
 #include "model/PreparedFiles.hpp"
 
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace splash::model {
 
@@ -32,6 +34,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t preparedDraftBytes(const DFlashDraftLayout &layout);
+// Every planned file of a layout, its sections at their offsets: the layers,
+// then model.bin.
+[[nodiscard]] std::vector<affine::Image> draftCheckpointImages(const DFlashDraftLayout &layout);
 
 } // namespace splash::model
