@@ -855,31 +855,12 @@ int main(int argc, char **argv) {
         decodeWarmupWall{};
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
-    std::array<std::vector<double>, model::ExecutionLimits::maximumBatchWidth>
-        decodeSamples;
     std::vector<std::string> performanceFailures;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-      decodeSamples[width - 1].reserve(samples);
-    }
-    for (uint32_t sample = 0; sample < samples; ++sample) {
-      for (uint32_t offset = 0; offset < decodeWarmupWall.size(); ++offset) {
-        const uint32_t width =
-            1 + (sample + offset) % decodeWarmupWall.size();
-        if (progress)
-          progress->begin("warmup", "decode", sample, 0, width);
-        static_cast<void>(executor->warmupDecodeBatch(width));
-        const double gpuMilliseconds =
-            executor->telemetry().lastDecodeGpuSeconds * 1000.0;
-        decodeSamples[width - 1].push_back(gpuMilliseconds);
-        if (progress) {
-          progress->complete("decode_warmup", "B" + std::to_string(width),
-                             sample, 0, width, 0.0, gpuMilliseconds, 0.0);
-        }
-      }
     }
 
     Events events;
@@ -1247,18 +1228,6 @@ int main(int argc, char **argv) {
       if (index)
         std::cout << ',';
       std::cout << decodeWarmupGpu[index];
-    }
-    std::cout << "],\"decode_gpu_samples_ms\":[";
-    for (size_t width = 0; width < decodeSamples.size(); ++width) {
-      if (width)
-        std::cout << ',';
-      std::cout << '[';
-      for (size_t sample = 0; sample < decodeSamples[width].size(); ++sample) {
-        if (sample)
-          std::cout << ',';
-        std::cout << decodeSamples[width][sample];
-      }
-      std::cout << ']';
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
               << decodeThroughputPrompt.size()
