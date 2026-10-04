@@ -281,9 +281,7 @@ SERVE_OPTIONS = (
         dict(
             action="store_true",
             default=False,
-            help="keep the SSD cache for the next server of the same model, writing "
-            "each conversation's newest restore point behind it (needs "
-            "--max-cache-disk)",
+            help="keep the SSD cache across restarts (needs --max-cache-disk)",
         ),
     ),
     ServeOption(
