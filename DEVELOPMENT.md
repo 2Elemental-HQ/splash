@@ -37,6 +37,12 @@ the last failure. An engine whose loop leaves a status request unanswered for
 30 seconds, while requests are pending or during a background status refresh,
 is failed and restarted by the same rules.
 
+Timeouts and keep-alives count only time the Mac is awake: a request in flight
+when the Mac sleeps continues when it wakes. While requests run, Splash keeps
+the Mac from sleeping automatically, as `caffeinate -i` does; the display may
+still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
+`serve --allow-idle-sleep` lets it sleep automatically.
+
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
@@ -144,6 +150,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
+| `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 | `--no-webui` | Off | Disable the chat page. |
 
 The startup summary and `maximum_context_tokens` in `/status` show the effective
@@ -780,7 +787,8 @@ queue's bound, the latency window, the prefill checkpoint interval and the
 resource wait) and its clocks and live host-memory estimate through
 `runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
 production parameter; `make architecture-check` keeps production from writing
-that configuration.
+that configuration, and from measuring time on a clock that counts sleep: the
+runtime measures it on `AwakeClock` (`runtime/AwakeClock.hpp`).
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The

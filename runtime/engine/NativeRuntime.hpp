@@ -24,6 +24,10 @@ struct NativeLoopConfig {
   // back, an image per tick, before the engine runs the next request. Null
   // where they stay, as in tests of other behavior.
   model::WeightMemory *weights = nullptr;
+  // Told true when the engine takes a request while it holds none, and false
+  // when its last request ends; the process keeps the Mac from idle sleep in
+  // between (main.mm). It must not throw. Empty where nothing needs to know.
+  std::function<void(bool)> holdingRequests;
 };
 
 // Translates native protocol messages and events at the Engine boundary.
@@ -125,6 +129,8 @@ private:
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
   bool send(const protocol::EngineEvent &event);
+  // After a request's terminal event: the engine no longer holds it.
+  void ended(uint64_t requestId, double now);
 
   void started(uint64_t requestId, uint32_t matchedTokens,
                uint32_t lane) override;
@@ -142,7 +148,7 @@ private:
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 
-  // The system clock in microseconds and the steady clock in milliseconds,
+  // The system clock in microseconds and the awake clock in milliseconds,
   // or the test seam's (TestConfig).
   struct Clocks {
     std::function<uint64_t()> unixMicros;
