@@ -881,11 +881,6 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (median(decodeSamples[2]) >
-        median(decodeSamples[0]) + median(decodeSamples[1])) {
-      performanceFailures.push_back(
-          "direct B3 decode is slower than separate B1 plus B2 commands");
-    }
 
     Events events;
     engine::EngineConfig engineConfig;
@@ -937,6 +932,26 @@ int main(int argc, char **argv) {
           *std::min_element(b2.begin(), b2.end())) {
         performanceFailures.push_back(
             "B3 aggregate decode throughput fell below B2");
+      }
+      // Nor may a B3 step take longer than a B1 step and a B2 step, which
+      // would decode the three lanes sooner apart. Every width is timed over
+      // its own run of steps here. A warmup command is not comparable across
+      // widths: it follows one setup prefill per lane, so where sustained
+      // load lowers the GPU clock (an M3 Max in Low Power Mode) a wider one
+      // runs at a lower clock.
+      const auto stepGpuMilliseconds = [&](uint32_t width) {
+        std::vector<double> values;
+        for (const DecodeThroughputMeasurement &measurement : decodeThroughput) {
+          if (measurement.width == width)
+            values.push_back(measurement.decodeGpuMilliseconds /
+                             static_cast<double>(measurement.decodeBatches));
+        }
+        return median(std::move(values));
+      };
+      if (stepGpuMilliseconds(3) >
+          stepGpuMilliseconds(1) + stepGpuMilliseconds(2)) {
+        performanceFailures.push_back(
+            "a B3 decode step takes longer than a B1 step and a B2 step");
       }
     }
 

@@ -123,6 +123,38 @@ class HttpRegressionTests(unittest.TestCase):
                 parse("community/not-installed")
             self.assertIn("missing installed model", error.getvalue())
 
+    def test_another_checkouts_assembly_is_held_by_its_installation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            # This checkout installed nothing; another one built the assembly.
+            checkout = root / "checkout/install/models"
+            models = root / "other/install/models"
+            assembly = models / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            link = models / "owner/model"
+            link.parent.mkdir()
+            link.symlink_to(assembly, target_is_directory=True)
+            for package in (assembly, link):
+                with self.subTest(package=str(package.relative_to(models))):
+                    with mock.patch.object(smoke.model_artifacts, "MODELS", checkout):
+                        arguments = smoke.parse_args(
+                            [
+                                "--package",
+                                str(package),
+                                "--model",
+                                "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
+                            ]
+                        )
+                        smoke.hold_package(arguments)
+                    try:
+                        self.assertEqual(arguments.package, assembly)
+                        self.assertTrue(smoke.assembly.is_held(assembly))
+                    finally:
+                        arguments.held_record.close()
+            self.assertTrue((models / ".install.lock").exists())
+            self.assertFalse(checkout.exists())
+
     def row(self, version, sample=0, latency=10, round=None):
         return {
             "version": version,
