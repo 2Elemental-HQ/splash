@@ -115,6 +115,8 @@ test-http-real: preflight $(TARGET) verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \
 		--model "$(MODEL)" --package "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)
 
+# Finds the selected clients and runs test_clients.py's tests of the installed
+# OpenCode, Codex and Pi among them, which need no model.
 agent-preflight: model-selection install-development
 	$(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) --preflight-only
 

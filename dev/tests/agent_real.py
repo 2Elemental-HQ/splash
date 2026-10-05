@@ -42,6 +42,13 @@ TEST_COMMAND = " ".join(("python3", *TEST_ARGUMENTS))
 # A successful command running the unittest module: the prompt names python3,
 # but an agent may run the tests with its own interpreter or its full path.
 RAN_TESTS = re.compile(r"\bpython[\d.]*\s+-m\s+unittest\b")
+# The test_clients.py classes that test a client as installed, with no model,
+# each taking its executable from SPLASH_<NAME>_BINARY.
+INSTALLED_CLIENT_TESTS = {
+    "opencode": "InstalledOpenCodeTests",
+    "codex": "InstalledCodexTests",
+    "pi": "InstalledPiTests",
+}
 
 
 class AgentFailure(RuntimeError):
@@ -90,6 +97,21 @@ def validate_server_configuration(initial, model, context, identity):
         raise AgentFailure(
             "running server native build differs from the verified build"
         )
+
+
+def run_installed_client_tests(versions):
+    """Runs test_clients.py's tests of the clients versions located that it
+    has tests for, each client at the path located."""
+    environment, tests = dict(os.environ), []
+    for name, test in INSTALLED_CLIENT_TESTS.items():
+        if name in versions:
+            environment[f"SPLASH_{name.upper()}_BINARY"] = versions[name]["path"]
+            tests.append(f"dev.tests.engine.test_clients.{test}")
+    if not tests:
+        return
+    command = [sys.executable, "-m", "unittest", *tests]
+    if subprocess.run(command, cwd=ROOT, env=environment).returncode:
+        raise AgentFailure("the installed clients failed test_clients.py's tests")
 
 
 def atomic_json(path, value):
@@ -1099,6 +1121,7 @@ def main(argv=None):
             versions[name]["major_version"] = major
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.preflight_only:
+        run_installed_client_tests(versions)
         atomic_json(
             args.output,
             {"schema_version": 2, "result": "preflight_only", "clients": versions},

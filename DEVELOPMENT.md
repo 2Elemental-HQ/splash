@@ -1384,6 +1384,10 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+`test-agent-real` and `test-release-real` first run the tests
+`dev/tests/engine/test_clients.py` has of the installed OpenCode, Codex and Pi
+among the selected clients, which need no model.
+
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
 root, `splash-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
