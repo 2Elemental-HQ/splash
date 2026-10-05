@@ -19,6 +19,9 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     metal::MetalBuffer output, uint32_t width,
                                     uint32_t rows, LinearScratch scratch,
                                     LinearInput layout) {
+  const uint64_t bytes = uint64_t{rows} * width * 2;
+  requireBytes(input, bytes, "norm input");
+  requireBytes(output, bytes, "norm output");
   if (layout != LinearInput::Plain) {
     requireTableScratch(scratch, layout, width, rows);
     graph.add(normKernel(std::string("norm_rms") + tableSuffix(layout) + "_decode", weight, width),

@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -178,11 +179,15 @@ private:
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
-  // Selects the rows that rows names of every lane.
-  void addSelection(metal::CommandGraph &graph,
-                    std::span<const SamplingPolicy> policies,
-                    const SamplingBuffers &buffers, const TargetRows &rows,
-                    uint32_t stopToken0, uint32_t stopToken1) const;
+  // The parameters that select the rows `rows` names of every lane; throws
+  // unless the buffers hold what the selection's kernels reach, before
+  // addInitial or addVerify encodes anything.
+  [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
+                                               const SamplingBuffers &buffers, const TargetRows &rows,
+                                               uint32_t stopToken0, uint32_t stopToken1) const;
+  // Selects the rows `selection` names of its `lanes` lanes.
+  void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection, uint32_t lanes,
+                    const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
