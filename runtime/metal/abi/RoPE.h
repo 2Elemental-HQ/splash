@@ -7,6 +7,12 @@
 #include <stdint.h>
 #endif
 
+// Rotary pairs in a row of the RoPE tables (ops::RoPE), which the attention
+// kernels read: the target rotates 64 of its 256 head dimensions (Qwen3.5's
+// partial rotary factor 1/4), the draft all 128 of its own.
+#define SPLASH_TARGET_ROPE_PAIRS 32u
+#define SPLASH_DRAFT_ROPE_PAIRS 64u
+
 struct RopeTableParams {
   uint32_t target_rows;
   uint32_t draft_rows;

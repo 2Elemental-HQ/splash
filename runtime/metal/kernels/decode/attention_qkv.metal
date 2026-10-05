@@ -11,7 +11,7 @@ inline void full_qkv_decode_phase(
     device bfloat *keys, device bfloat *values, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint2 group, uint thread_index, uint lane,
     uint simd_group) {
-  constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
+  constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;

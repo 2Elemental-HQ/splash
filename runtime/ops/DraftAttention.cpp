@@ -1,6 +1,7 @@
 #include "ops/DraftAttention.hpp"
 
 #include "metal/abi/DraftAttention.h"
+#include "metal/abi/RoPE.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
@@ -50,7 +51,7 @@ void requireContextInputs(const metal::MetalBuffer &contextKv,
                           DraftAttentionShape shape) {
   requireBytes(contextKv, rows * (shape.qkvSize - shape.attentionSize) * 2, "draft context K/V");
   requireBytes(keyNorm, uint64_t{shape.headDimension} * 2, "draft key norm");
-  const uint64_t ropeBytes = rows * shape.headDimension / 2 * 4;
+  const uint64_t ropeBytes = rows * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(ropeSin, ropeBytes, "draft RoPE sine");
 }
@@ -62,6 +63,8 @@ void requireLanes(uint32_t lanes) {
 
 enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
 
+// The compiled shapes' heads are 128 wide, which the RoPE tables rotate whole.
+static_assert(2 * SPLASH_DRAFT_ROPE_PAIRS == 128);
 [[nodiscard]] KernelLayout kernelShape(DraftAttentionShape shape) {
   if (shape == DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128})
     return KernelLayout::Hidden5120;
@@ -137,7 +140,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   requireBytes(buffers.queryValues, workspace.queryValuesBytes, "draft query values");
   requireBytes(buffers.queryNorm, uint64_t{shape.headDimension} * 2, "draft query norm");
   requireBytes(buffers.keyNorm, uint64_t{shape.headDimension} * 2, "draft key norm");
-  const uint64_t ropeBytes = uint64_t{lanes} * kRows * shape.headDimension / 2 * 4;
+  const uint64_t ropeBytes = uint64_t{lanes} * kRows * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(buffers.ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(buffers.ropeSin, ropeBytes, "draft RoPE sine");
   graph.add("draft_attention_qkv",

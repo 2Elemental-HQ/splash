@@ -15,6 +15,12 @@ namespace {
 
 static_assert(offsetof(MoeExpertParams, expert_stride_bytes_0) == 16);
 
+// Affine Q8 projections store their rows in tiles of 256 (StorageN order):
+// the router fills one tile with its expert slots, and the shared expert's
+// scalar gate pads its one row to a tile.
+constexpr uint32_t kQ8TileRows = 256;
+static_assert(kQ8TileRows == SPLASH_MOE_EXPERT_SLOTS);
+
 bool matches(const Q8Projection &projection, uint32_t output,
              uint32_t input) noexcept {
   const uint64_t elements = uint64_t{output} * input;
@@ -80,8 +86,8 @@ void validate(const MoeWeights &weights, MoeShape shape) {
     return;
   }
   const AffineMoeWeights &affine = weights.affine();
-  if (!shape.valid() || !matches(affine.router, 256, hidden) ||
-      !matches(affine.sharedScalarGate, 256, hidden) ||
+  if (!shape.valid() || !matches(affine.router, SPLASH_MOE_EXPERT_SLOTS, hidden) ||
+      !matches(affine.sharedScalarGate, kQ8TileRows, hidden) ||
       !matches(affine.expertGate, shape.experts, intermediate, hidden) ||
       !matches(affine.expertUp, shape.experts, intermediate, hidden) ||
       !matches(affine.expertDown, shape.experts, hidden, intermediate) ||
@@ -101,10 +107,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint64_t groupedRows = uint64_t{tiles} * tileRows;
   const uint32_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint32_t outputWidth = splitExperts ? widest : shape.hiddenSize;
-  // The router's rows x 256 fp32 scores live in the grouped input until the
-  // gather overwrites them. Register plans also hold the down pass's Table16
-  // tiles there.
-  const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(float);
+  // The router's fp32 scores, a row of expert slots per row, live in the
+  // grouped input until the gather overwrites them. Register plans also hold
+  // the down pass's Table16 tiles there.
+  const uint64_t scoreBytes = uint64_t{rows} * SPLASH_MOE_EXPERT_SLOTS * sizeof(float);
   const bool table16 = ggufTile == MoeGgufTile::Register;
   const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
@@ -280,14 +286,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                                    shape.expertsPerToken};
   const bool block = weights.layout() == WeightLayout::Block32;
   if (block) {
-    // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
+    // fp32 scores of the F32 router in rows of expert slots, as the select
+    // kernel reads.
     addGgufFloat(graph, buffers.input, weights.blocks().router, scratch.groupedInput, rows,
-                 256, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
+                 SPLASH_MOE_EXPERT_SLOTS, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
     graph.add("moe_route_select_f32",
               {scratch.groupedInput, buffers.input,
                weights.blocks().sharedScalarGate.plane0, scratch.selectedExperts,
                scratch.routingWeights},
-              routeParams, {rows, 1, 1});
+              routeParams, {rows, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
   } else {
     const AffineMoeWeights &affine = weights.affine();
     const MoeRouteTile route = moeRouteTile(rows, plan.configuration().routeWideRows);
@@ -296,21 +303,21 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, affine.router.planes.weights, affine.router.planes.scales,
                affine.router.planes.biases, scratch.groupedInput},
               routeParams,
-              {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
+              {(rows + route.rows - 1) / route.rows, SPLASH_MOE_EXPERT_SLOTS / route.experts, 1});
     graph.add("moe_route_select_q8",
               {scratch.groupedInput, buffers.input,
                affine.sharedScalarGate.planes.weights,
                affine.sharedScalarGate.planes.scales,
                affine.sharedScalarGate.planes.biases, scratch.selectedExperts,
                scratch.routingWeights},
-              routeParams, {rows, 1, 1});
+              routeParams, {rows, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
   }
   graph.add("moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             MoeGroupParams{rows, shape.expertsPerToken, tileRows,
                            shape.experts},
-            {1, 1, 1});
+            {1, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",

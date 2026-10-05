@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/MoE.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
 
@@ -27,7 +28,7 @@ struct MoeShape final {
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
-           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
+           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 256 == 0;
   }

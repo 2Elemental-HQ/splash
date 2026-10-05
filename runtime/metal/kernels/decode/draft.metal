@@ -45,6 +45,7 @@ inline void draft_qkv_prepare_phase(
     uint thread_index, uint lane, uint simd_group) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, QHeads = 32, KVHeads = 8,
                  HeadDim = 128;
+  static_assert(2 * SPLASH_DRAFT_ROPE_PAIRS == HeadDim, "the draft rotates its whole head");
   constexpr uint QWidth = QHeads * HeadDim, KWidth = KVHeads * HeadDim;
   constexpr uint PackedWidth = QWidth + 2 * KWidth;
   constexpr uint QueryTasks = Rows * QHeads;
@@ -87,8 +88,8 @@ inline void draft_qkv_prepare_phase(
     if (thread_index < HeadDim / 2) {
       float first = float(head[thread_index]);
       float second = float(head[thread_index + HeadDim / 2]);
-      float cosine = rope_cos[row * (HeadDim / 2) + thread_index];
-      float sine = rope_sin[row * (HeadDim / 2) + thread_index];
+      float cosine = rope_cos[row * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
+      float sine = rope_sin[row * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
       destination[thread_index] = bfloat(first * cosine - second * sine);
       destination[thread_index + HeadDim / 2] =
           bfloat(second * cosine + first * sine);
@@ -118,7 +119,7 @@ kernel void draft_context_kv_commit(
   constexpr uint KVHeads = 8;
   // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * 128;
-  constexpr uint RopeLaneStride = Rows * 64;
+  constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
   device bfloat *keys =
@@ -500,7 +501,7 @@ kernel void draft_attention_qkv(
   constexpr ulong Attention = 4096;
   constexpr ulong KVHeads = 8;
   constexpr ulong HeadDim = 128;
-  constexpr ulong RopeStride = Rows * 64;
+  constexpr ulong RopeStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
   uint batch = group.y;
   threadgroup float reductions[8];
   threadgroup bfloat head[128];
