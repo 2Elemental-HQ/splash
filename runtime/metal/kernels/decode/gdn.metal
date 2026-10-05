@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 // Decode threadgroups are 256 threads: one simdgroup per verify row in the
@@ -328,14 +329,8 @@ inline void gdn_commit_prefix_batch_phase(
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   uint batch = group.z;
   uint layer = group.y;
-  device const uchar *current = batch == 0   ? current_0
-                                : batch == 1 ? current_1
-                                : batch == 2 ? current_2
-                                             : current_3;
-  device uchar *next = batch == 0   ? next_0
-                       : batch == 1 ? next_1
-                       : batch == 2 ? next_2
-                                    : next_3;
+  device const uchar *current = SPLASH_LANE_BINDING(batch, current_0, current_1, current_2, current_3);
+  device uchar *next = SPLASH_LANE_BINDING(batch, next_0, next_1, next_2, next_3);
   const ulong rows = (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * Rows;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
@@ -406,12 +401,8 @@ inline void gdn_decode_batch_phase(
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
-  device const uchar *current = batch == 0
-      ? current0
-      : (batch == 1 ? current1 : (batch == 2 ? current2 : current3));
-  device uchar *next = batch == 0
-      ? next0
-      : (batch == 1 ? next1 : (batch == 2 ? next2 : next3));
+  device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);
+  device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3);
   packed += ulong(batch) * Rows * PackedWidth;
   mixed += ulong(batch) * Rows * ConvDim;
   decay += ulong(batch) * Rows * ValueHeads;
