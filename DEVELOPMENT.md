@@ -100,6 +100,7 @@ access.
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+| `--no-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-request-size`) are a whole
@@ -1209,6 +1210,8 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
+- `runtime/ane/`: the Neural Engine client, on the private AppleNeuralEngine
+  framework.
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
@@ -1504,6 +1507,65 @@ four simdgroups at 24 rows. `make benchmark-prefill` times the prefill tiles the
 chooses among (N128 and N256 on eight simdgroups, N128 on four), with their residual and gated
 epilogues, on the 27B's and 35B's projection shapes at 17 to 2,048 rows: the measurements behind
 the Apple9 prefill rule in `runtime/ops/Linear.cpp`.
+
+### Neural Engine prefill
+
+Prefill chunks of 512 rows or more of a dense target split each layer's FFN by
+intermediate channel (`runtime/ops/AneFfn.cpp`). The GPU runs the leading
+channels on its prefill kernels, its down projection reading a view of the
+leading inputs of down's rows (`Projection::planeInputs`). The Neural Engine
+runs the rest as one W8A8 program, Hadamard-rotated int8 activations and
+per-row int8 weights (`runtime/ane/Program.mm`): a chunk takes the smallest of
+its functions that holds it, one every 128 rows from 512 to 2048, all reading
+and writing one set of surfaces sized for 2048 rows. The ANE service holds
+memory for a loaded program's intermediate values, which its functions share:
+13 programs of one function each held it 13 times (3.25 GB at the M6's share,
+against 0.67 GB for the one program). The GPU requantizes the
+ANE's weights from the Q4 or GGUF planes one layer ahead into double-buffered
+IOSurfaces and adds the ANE's partial down projection to its own. Shared
+events order each evaluation between the GPU's packing and that join inside
+the one prefill command (`metal::EventStep`); each signal ends a Metal command
+buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
+GPU.
+
+Startup picks the share on the loaded model before it builds the memory
+governor (`AneFfn::calibrate`): it times five FFN layers spread over the
+model's depth at shares 0.4 and 0.8, fits
+`T(s) = max(G(s), A(s), uG·G(s) + uA·A(s))`, and takes the share where the
+GPU's part G and the ANE's A meet (the least within 1% of the least max(G, A)),
+the fastest of a prefill of seconds on the M5 Max (0.24), the M5 Pro (0.41) and
+the M6 (0.76). Past it the GPU waits on the ANE, which the model takes to run as
+fast as alone, while on the M6 the two slow each other's memory accesses beyond
+the GPU's L2, the ANE by up to a third. It splits if
+T predicts a 5% gain there, then checks those layers split at that share
+against the GPU alone (within 5% RMS; int8 leaves about 1%). The split's
+buffers are a memory category of their own (`Neural
+Engine split`), which comes out of the KV cache: the split runs only while the
+plan with it still holds `--max-context`, or without one all the context the
+GPU alone would. Its program also holds buffers in the ANE's service, outside
+Metal, which only the host's free memory shows: on Qwen3.8-27B about 0.7 GB at
+the M6's share and 0.2 GB at the M5 Pro's, against 0.5 and 0.26 GB of the
+split's own. So the split also runs only while the host still holds, above the
+governor's 1 GiB margin, what the engine allocates to serve that context (the
+arenas, one lane's state and the context's KV pages): a start asks the host
+before it creates the split, for its planned bytes, and again once it has
+created it. The GPU runs the FFN alone if no share gains 5%, the check fails,
+either rule refuses, or the ANE or one of its functions is unavailable, as
+under Metal's validation layer, whose wrapped shared events the ANE cannot
+share; only cancellation ends the start. Startup logs which (`Neural Engine
+FFN split at share ...`). The first start compiles the ANE program, about
+10-15 s on an M5 and half a minute on an M6; the ANE service keeps it under a
+hash of its source, which stays in `$TMPDIR/splash-ane-programs`, so later
+starts load it until macOS clears that directory. Each share compiles a
+program of its own, and the M6's ANE service keeps few, so a start keeps the
+share the last one chose (`choice-*` in that directory) while it stays within
+1% of the best. The ANE computes in fp16, whose range (±65504) bounds the FFN values a
+split layer can produce. The split's logits differ from the GPU's alone (KL
+about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
+the GPU, and `backend-benchmark --ane-ffn-share` runs a given share.
+`make test-engine-metal` runs `ane-ffn`: its kernels against CPU references
+for affine Q4 and every GGUF format under shader validation, then, without it,
+the split's memory and its output against the GPU alone.
 
 ### Residency and KV extents
 
@@ -1932,12 +1994,14 @@ the other. Per model, `release-check`:
   and requires the conversation's next turn to restore its prompt from disk
   (`test-http-real` with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`);
 - compares this build with `BASELINE`, which must have another build
-  identity, in ABBA order (`test-performance-real`): output tokens and
-  acceptance must be identical (`EXPECT_OUTPUT_CHANGE=1` allows changed
-  outputs with acceptance within 0.02), and so must the bytes of the weight
-  images both load (`dev/benchmarks/weights.py`); decode and prefill GPU time
-  may regress by at most the larger of 2% and twice the run's own ABBA spread,
-  and a spread above 5% fails as inconclusive.
+  identity, in ABBA order (`test-performance-real`), every round after the
+  first to report a [Neural Engine share](#neural-engine-prefill) running that
+  share when its build takes one: output tokens and acceptance must be
+  identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
+  within 0.02), and so must the bytes of the weight images both load
+  (`dev/benchmarks/weights.py`); decode and prefill GPU time may regress by at
+  most the larger of 2% and twice the run's own ABBA spread, and a spread
+  above 5% fails as inconclusive.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json` must be identical on

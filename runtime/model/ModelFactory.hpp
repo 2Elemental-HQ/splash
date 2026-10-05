@@ -6,6 +6,7 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -70,6 +71,8 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
+  // The prefill FFN's Neural Engine split (createAneFfn), if any.
+  ops::AneFfn *aneFfn = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -96,6 +99,16 @@ loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor);
 
+// The Neural Engine split of the model's prefill FFN (ops::AneFfn), which
+// takes a dense target's FFN in the formats it supports. The others need
+// one: its calibration on this device on a prefill arena of its own, the
+// split at `share` ready to run, and the Metal memory of that split.
+[[nodiscard]] bool supportsAneFfn(const LoadedModel &model);
+[[nodiscard]] ops::AneFfn::Calibration calibrateAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
+                                                       const ops::ExecutionPlans &operators, kv::Format format);
+[[nodiscard]] std::unique_ptr<ops::AneFfn> createAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
+                                                        const ops::ExecutionPlans &operators, double share);
+[[nodiscard]] uint64_t aneFfnBytes(const LoadedModel &model, double share);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,

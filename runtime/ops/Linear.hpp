@@ -120,6 +120,20 @@ struct LinearScratch final {
   // (ProjectionShape::rotated), sized by decode/prefillScratchSize(shape).rotated.
   metal::MetalBuffer rotated{};
 };
+// One layer's SwiGLU projections, affine Q4 or quantized GGUF tensors:
+// down(silu(gate x) * up x).
+struct SwiGluProjections final {
+  const Projection *gate = nullptr;
+  const Projection *up = nullptr;
+  const Projection *down = nullptr;
+};
+// A prefill chunk's buffers of its dense FFN: the normalized rows and their
+// Q4 sums, gate's output, the intermediate rows and their Q4 sums, and the
+// linear scratch.
+struct PrefillFfnBuffers final {
+  metal::MetalBuffer normalized, sums, gateScratch, intermediate, downSums;
+  LinearScratch scratch;
+};
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
   [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
@@ -292,6 +306,10 @@ public:
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
                           uint32_t rows, LinearScratch scratch) const;
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows,
+  // whose Q4 sums the norm wrote.
+  void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
+                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it

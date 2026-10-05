@@ -255,6 +255,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     NativeRuntime::ByteSink output,
     NativeRuntime::StatusProvider statusProvider) {
   std::unique_ptr<RuntimeResources> resources;
+  config.resources.maximumContextTokens = config.nativeLoop.engine.maxContext;
   try {
     resources = RuntimeResources::create(config.resources);
   } catch (const RuntimeResourcesError &error) {

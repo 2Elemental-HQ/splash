@@ -198,6 +198,44 @@ void testDiskTierStateStagingIsBudgeted() {
           "a plan without the disk tier reported state staging");
 }
 
+// The prefill FFN's Neural Engine split is fixed runtime memory of its own
+// category, which the KV cache gives up, so the context it leaves is the
+// plan's to state; the status and description report it.
+void testNeuralEngineSplitIsBudgeted() {
+  const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
+  ModelMemoryProfile split = model();
+  // Qwen3.8-27B's split at the M6's share (DEVELOPMENT.md, Neural Engine prefill).
+  const uint64_t surfaces = 508 * kMiB;
+  split.footprint.aneFfnBytes = surfaces;
+  const EngineMemoryPlan with = test::requireMemoryPlan(device(), split);
+  const auto &budget = with.breakdown();
+  require(budget.aneFfnBytes == surfaces &&
+              budget.fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + surfaces &&
+              with.maximumContextTokens() < without.maximumContextTokens(),
+          "the split was not planned as fixed runtime memory out of the KV cache");
+  require(with.toStatusJson().find("\"ane_ffn_bytes\":" + std::to_string(surfaces) +
+                                   ",\"state_staging_bytes\"") != std::string::npos &&
+              budget.describe().find("Neural Engine split: " + std::to_string(surfaces)) !=
+                  std::string::npos &&
+              without.toStatusJson().find("\"ane_ffn_bytes\":0,") != std::string::npos,
+          "the split is missing from the memory plan status");
+}
+
+// Serving one request takes the arenas, one lane's state and its KV pages,
+// never less than the runway warmup takes.
+void testServingBytes() {
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
+  const auto &budget = plan.breakdown();
+  const uint64_t base = budget.sharedPrefillBytes + budget.sharedDecodeBytes + budget.laneStateBytes;
+  const uint64_t runway = budget.minimumDynamicBytes - budget.laneStateBytes;
+  require(budget.servingBytes(0) == base + runway && budget.servingBytes(1) == base + runway,
+          "a short request was planned below the warmup runway");
+  const uint32_t tokens = 4096 * budget.kvPageTokens + 1;
+  require(4097 * budget.kvPageBytes > runway &&
+              budget.servingBytes(tokens) == base + 4097 * budget.kvPageBytes,
+          "a request's KV pages were not counted whole");
+}
+
 // The pipeline and runtime reserves are the model constants rather than part
 // of a model's plan, and a model's plan without one of its arenas is refused.
 void testReservesAreTheModelConstants() {
@@ -362,6 +400,8 @@ int main() {
     testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
+    testNeuralEngineSplitIsBudgeted();
+    testServingBytes();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
     testContextTokensWithin();

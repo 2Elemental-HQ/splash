@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -71,6 +72,9 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  // The base allocation's MTLResource.allocatedSize, as memoryStats() counts
+  // it; views of one allocation all report it.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   [[nodiscard]] BufferStorage storage() const noexcept;
   // Returns nullptr for private buffers and released memory
   // (MetalBackend::releaseMemory). The pointer covers this view only.
@@ -85,6 +89,32 @@ public:
 private:
   struct Impl;
   explicit MetalBuffer(std::shared_ptr<Impl> impl);
+
+  std::shared_ptr<Impl> impl_;
+
+  friend class MetalBackend;
+};
+
+// A shared event another agent, such as the Neural Engine, waits on or
+// signals. Copies name the same event. nativeHandle() is its
+// id<MTLSharedEvent> for Objective-C++ callers.
+class SharedEvent final {
+public:
+  SharedEvent();
+  ~SharedEvent();
+  SharedEvent(const SharedEvent &);
+  SharedEvent &operator=(const SharedEvent &);
+  SharedEvent(SharedEvent &&) noexcept;
+  SharedEvent &operator=(SharedEvent &&) noexcept;
+
+  [[nodiscard]] explicit operator bool() const noexcept;
+  [[nodiscard]] void *nativeHandle() const noexcept;
+  // Raises the event to at least `value` from the CPU.
+  void signal(uint64_t value) const noexcept;
+
+private:
+  struct Impl;
+  explicit SharedEvent(std::shared_ptr<Impl> impl);
 
   std::shared_ptr<Impl> impl_;
 
@@ -109,15 +139,31 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// A dispatch-free step that orders a command against another agent: signal
+// raises the event to value once all earlier work has completed; otherwise
+// later work waits until the event reaches value. The work before a signal is
+// committed as its own Metal command buffer, so the signal is never held back
+// behind the dispatches that follow it.
+struct EventStep {
+  SharedEvent event;
+  uint64_t value = 0;
+  bool signal = false;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // Set for an event step, which has no pipeline or bindings.
+  std::optional<EventStep> event{};
 };
 
 struct CommandTiming {
+  // From the GPU start of a command's first Metal command buffer to the end
+  // of its last: a command split at event signals (EventStep) also counts the
+  // time its later buffers wait for the other agent.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
 };
@@ -254,9 +300,17 @@ public:
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label);
+  // A Shared buffer over whole pages of memory another agent also reads or
+  // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
+  // keeps `owner` until it lets the buffer go; the memory is the owner's, so
+  // releaseMemory refuses it.
+  [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
+                                             std::shared_ptr<void> owner,
+                                             std::string_view label);
 
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+  [[nodiscard]] SharedEvent newSharedEvent();
 
   // Frees the memory of a buffer from allocateBuffer while no command is in
   // flight: it leaves the residency set and the accounting. Its views stay

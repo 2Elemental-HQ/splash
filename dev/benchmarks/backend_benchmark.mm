@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <iterator>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <condition_variable>
 #include <cstdint>
@@ -17,6 +19,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -696,6 +699,29 @@ uint32_t parseSamples(std::string_view value) {
   return static_cast<uint32_t>(parsed);
 }
 
+// --ane-ffn-share: the Neural Engine share a previous round reported, in
+// [0, 1).
+// A context limit, as serve's --max-context: a positive token count.
+uint32_t parseMaxContext(std::string_view value) {
+  uint64_t parsed = 0;
+  for (char character : value) {
+    if (character < '0' || character > '9' || parsed > std::numeric_limits<uint32_t>::max() / 10)
+      throw std::invalid_argument("--max-context takes a positive token count");
+    parsed = parsed * 10 + static_cast<uint64_t>(character - '0');
+  }
+  if (!parsed || parsed > std::numeric_limits<uint32_t>::max())
+    throw std::invalid_argument("--max-context takes a positive token count");
+  return static_cast<uint32_t>(parsed);
+}
+
+double parseAneFfnShare(const char *value) {
+  char *end = nullptr;
+  const double share = std::strtod(value, &end);
+  if (end == value || *end || !(share >= 0.0 && share < 1.0))
+    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
+  return share;
+}
+
 double median(std::vector<double> values) {
   if (values.empty())
     throw std::invalid_argument("cannot take the median of no samples");
@@ -761,14 +787,21 @@ int main(int argc, char **argv) {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
-                   "[--scenario NAME[,NAME...]]\n"
+                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE] "
+                   "[--max-context TOKENS]\n"
                    "  NAME: decode, partial, context or exact "
-                   "(default: decode,partial,context)\n";
+                   "(default: decode,partial,context)\n"
+                   "  SHARE: the prefill FFN's Neural Engine share to run "
+                   "instead of calibrating one (0: GPU alone)\n"
+                   "  TOKENS: the context the engine serves, as serve's "
+                   "--max-context (default: what memory holds)\n";
       return 2;
     }
     uint32_t samples = 1;
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
+    std::optional<double> aneFfnShare;
+    uint32_t maxContext = 0;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
@@ -779,6 +812,10 @@ int main(int argc, char **argv) {
         progressPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--scenario") {
         selected = parseScenarios(argv[index + 1]);
+      } else if (option == "--ane-ffn-share") {
+        aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--max-context") {
+        maxContext = parseMaxContext(argv[index + 1]);
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -794,6 +831,8 @@ int main(int argc, char **argv) {
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
+    config.aneFfnShare = aneFfnShare;
+    bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
     // Complete production warmup and memory audit before measuring. Retry
@@ -830,6 +869,8 @@ int main(int argc, char **argv) {
     // its Engine stays empty. The later benchmark Engine is the sole request
     // driver and is destroyed before the bootstrap owner/model/shared cache.
     auto *resources = &bootstrap->resources();
+    // The Neural Engine share startup calibrated, or the one given.
+    const double ranAneFfnShare = resources->aneFfnShare();
     auto *executor = &bootstrap->modelRuntime();
     const auto &cacheIdentity = resources->cacheIdentity();
     const std::string identity =
@@ -867,7 +908,7 @@ int main(int argc, char **argv) {
 
     Events events;
     engine::EngineConfig engineConfig;
-    engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
+    engineConfig.maxContext = maxContext ? maxContext : resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
@@ -1207,8 +1248,12 @@ int main(int argc, char **argv) {
       measurements.push_back(std::move(lazyReuse));
     }
 
+    // Shortest form that reads back as the same share.
+    std::array<char, 32> share{};
+    const auto written = std::to_chars(share.data(), share.data() + share.size(), ranAneFfnShare);
     std::cout << "{\"schema_version\":2,\"build_id\":\"" << SPLASH_BUILD_ID
               << "\",\"identity\":" << identity
+              << ",\"ane_ffn_share\":" << std::string_view(share.data(), written.ptr - share.data())
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
               << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows

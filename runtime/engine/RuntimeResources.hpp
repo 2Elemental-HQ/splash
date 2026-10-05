@@ -104,6 +104,16 @@ struct RuntimeResourcesConfig {
   // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       queryHostAvailableMemory;
+  // The share of the prefill FFN's Neural Engine split to run instead of
+  // calibrating one: 0 runs the GPU alone (--no-ane), and a benchmark round
+  // runs the share of the first so that rounds repeat one another; the
+  // memory plan must still fit it.
+  std::optional<double> aneFfnShare;
+  // The context the engine is asked to hold (--max-context), zero for all the
+  // memory plan holds. The split's memory comes out of the KV cache, so it
+  // runs only while the plan still holds this context, or with zero all the
+  // context it holds without the split.
+  uint32_t maximumContextTokens = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -156,13 +166,14 @@ private:
 };
 
 // Owns every process-wide native resource exactly once. Members go in
-// reverse declaration order: Cache -> KV pool -> KV disk tier -> state
-// storage -> KV page storage -> governor -> loaded model -> Metal backend
-// -> a persistent tier's directory, whose lock goes last. The KV disk tier
-// must go before the KV page storage: its IO worker reads and writes pages
-// in place in the extents, and its destructor waits for every transfer in
-// flight. A persistent tier's files are sealed first, however the process
-// ends, so that the copies the cache lets go of stay for the next process.
+// reverse declaration order: Neural Engine split -> Cache -> KV pool -> KV
+// disk tier -> state storage -> KV page storage -> governor -> loaded model
+// -> Metal backend -> a persistent tier's directory, whose lock goes last.
+// The KV disk tier must go before the KV page storage: its IO worker reads
+// and writes pages in place in the extents, and its destructor waits for
+// every transfer in flight. A persistent tier's files are sealed first,
+// however the process ends, so that the copies the cache lets go of stay for
+// the next process.
 class RuntimeResources final {
 public:
   // A persistent tier takes back what the last process left before create()
@@ -202,6 +213,8 @@ public:
   [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
     return hostAvailableAtStart_;
   }
+  // The share the prefill FFN's Neural Engine split runs at; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   [[nodiscard]] model::WeightImages &weightImages() noexcept { return *model_.images; }
@@ -221,6 +234,7 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
+                   std::unique_ptr<ops::AneFfn> aneFfn,
                    std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
@@ -239,6 +253,7 @@ private:
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
+  std::unique_ptr<ops::AneFfn> aneFfn_;
   std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;

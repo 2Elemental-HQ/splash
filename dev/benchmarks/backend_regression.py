@@ -11,7 +11,9 @@ otherwise idle:
   every partial request's output tokens are identical in all four rounds. With
   --expect-output-change (or EXPECT_OUTPUT_CHANGE=1) each build must still
   repeat itself, and the candidate's acceptance rate per width may be at most
-  0.02 below the baseline's.
+  0.02 below the baseline's. Startup calibrates the share of the prefill FFN's
+  Neural Engine split from timings, so the first share a round reports is the
+  one every later round runs (--ane-ffn-share) when its build takes it.
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold) and the TTFT of its
   partial hit (partial_4k_hit).
@@ -52,13 +54,28 @@ class RegressionError(RuntimeError):
     pass
 
 
-def supports_scenario_list(benchmark: Path) -> bool:
-    """Whether a backend-benchmark takes a comma-separated --scenario; its
-    usage, printed without arguments, says so. Older builds take one."""
-    usage = subprocess.run(
+def usage(benchmark: Path) -> str:
+    """A backend-benchmark's usage, which it prints without arguments. It
+    names the options a build takes: older builds take one --scenario, and
+    builds before the Neural Engine split no --ane-ffn-share."""
+    return subprocess.run(
         [str(benchmark)], capture_output=True, text=True, timeout=60
     ).stderr
-    return "NAME[,NAME...]" in usage
+
+
+def pin_ane_ffn_share(args, document: dict) -> None:
+    """Keeps the first Neural Engine share a round reports for every later
+    round, and fails a round that ran another."""
+    share = document.get("ane_ffn_share")
+    if share is None:
+        return
+    if args.ane_ffn_share is None:
+        args.ane_ffn_share = share
+    elif share != args.ane_ffn_share:
+        raise RegressionError(
+            f"ran the Neural Engine split at share {share}, "
+            f"not the first round's {args.ane_ffn_share}"
+        )
 
 
 def invocations(combined: bool) -> list[str]:
@@ -101,6 +118,8 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             "--progress",
             str(stem.with_suffix(".progress.jsonl")),
         ]
+        if args.ane_ffn_share is not None and args.takes_ane_ffn_share[version]:
+            command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
         print(f"round {round_index + 1} {version}: {scenario}", file=sys.stderr)
         with stem.with_suffix(".log").open("w") as log:
             finished = subprocess.run(
@@ -108,7 +127,9 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             )
         stem.with_suffix(".json").write_text(finished.stdout)
         try:
-            documents.append(parse_document(finished.stdout, finished.returncode))
+            document = parse_document(finished.stdout, finished.returncode)
+            pin_ane_ffn_share(args, document)
+            documents.append(document)
         except RegressionError as error:
             log = stem.with_suffix(".log")
             tail = "".join(log.read_text(errors="replace").splitlines(True)[-3:])
@@ -353,9 +374,12 @@ def main(argv=None) -> int:
     environments = {"baseline": dict(os.environ), "candidate": dict(os.environ)}
     if not weights.loads_in_memory(trees["baseline"] / "build"):
         environments["baseline"].update(weights.baseline_environment(args.output_dir))
-    args.combined = all(
-        supports_scenario_list(tree / BENCHMARK) for tree in trees.values()
-    )
+    usages = {name: usage(tree / BENCHMARK) for name, tree in trees.items()}
+    args.combined = all("NAME[,NAME...]" in text for text in usages.values())
+    args.takes_ane_ffn_share = {
+        name: "--ane-ffn-share" in text for name, text in usages.items()
+    }
+    args.ane_ffn_share = None
     document = {
         "schema_version": 1,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
@@ -381,6 +405,7 @@ def main(argv=None) -> int:
             for index, version in enumerate(ROUNDS)
         ]
         document["rounds"] = rounds
+        document["ane_ffn_share"] = args.ane_ffn_share
         document["comparison"] = summarize(rounds, args.expect_output_change)
         document["weights"] = weights.compare_builds(
             trees["baseline"] / "build",

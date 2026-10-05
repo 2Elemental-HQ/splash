@@ -1408,7 +1408,9 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
-    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
+    std::optional<double> givenAneFfnShare;
+    if (argc < 3)
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1417,6 +1419,12 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--ane-ffn-share" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        givenAneFfnShare = std::strtod(value, &end);
+        if (end == value || *end || !(*givenAneFfnShare >= 0.0 && *givenAneFfnShare < 1.0))
+          fail("--ane-ffn-share takes a share in [0, 1)");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -1443,13 +1451,28 @@ int main(int argc, char **argv) {
     model::LoadedModel model =
         model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
+    // A dense target's prefill FFN splits with the Neural Engine at the share
+    // startup calibrates, as the server runs it, unless one is given; where
+    // the Neural Engine is unavailable the GPU runs it alone, as there.
+    double aneFfnShare = givenAneFfnShare.value_or(0.0);
+    if (!givenAneFfnShare && model::supportsAneFfn(model)) {
+      try {
+        const ops::AneFfn::Calibration calibration =
+            model::calibrateAneFfn(backend, model, operators, format);
+        aneFfnShare = calibration.share;
+        std::cout << "ane_ffn_split_error=" << calibration.error << '\n';
+      } catch (const std::exception &error) {
+        std::cout << "ane_ffn_split unavailable: " << error.what() << '\n';
+      }
+    }
+    const uint64_t aneFfnBytes = aneFfnShare > 0.0 ? model::aneFfnBytes(model, aneFfnShare) : 0;
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format);
     ModelMemoryFootprint footprint{
         model.targetActualAllocatedBytes(),
         model.draft.actualAllocatedBytes,
         model.vision.actualAllocatedBytes,
-        executorPlan, 0};
+        executorPlan, 0, aneFfnBytes};
     ModelMemoryProfile profile{
         model.name(), model.maximumContextTokens(),
         model.targetKvLayout(format), footprint};
@@ -1471,6 +1494,27 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             queryHostAvailableMemory, 0);
+    // As at startup, the split runs only while the host holds it beside what
+    // the runtime allocates to serve the oracle's pages, before it exists and
+    // once it does. It is allocated beside the weights, outside the
+    // governor's admissions, and its own category of the plan bounds it, as
+    // the memory audit requires.
+    std::unique_ptr<ops::AneFfn> aneFfn;
+    if (aneFfnShare > 0.0) {
+      const uint64_t serving = budget.servingBytes(pageCount * kv::kPageTokens);
+      if (governor.hostHolds(aneFfnBytes + serving)) {
+        aneFfn = model::createAneFfn(backend, model, operators, aneFfnShare);
+        require(aneFfn->allocatedBytes() <= aneFfnBytes,
+                "the Neural Engine split allocated more than its plan");
+        if (!governor.hostHolds(serving))
+          aneFfn.reset();
+      }
+      if (!aneFfn) {
+        std::cout << "ane_ffn_split unavailable: it leaves the host too little free memory\n";
+        aneFfnShare = 0.0;
+      }
+    }
+    std::cout << "ane_ffn_share=" << aneFfnShare << '\n';
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {
@@ -1513,7 +1557,7 @@ int main(int argc, char **argv) {
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout(), nullptr);
-    model::RuntimeContext context{backend, model, pages, states, operators};
+    model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,

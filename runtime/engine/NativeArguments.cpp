@@ -119,6 +119,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--ane") {
+      if (value != "on" && value != "off")
+        throw UsageError("--ane requires on or off");
+      result.neuralEngine = value == "on";
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }

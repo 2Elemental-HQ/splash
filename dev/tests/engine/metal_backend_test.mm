@@ -18,12 +18,14 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -34,9 +36,12 @@ using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
+using splash::metal::CommandTicket;
 using splash::metal::ComputeDispatch;
+using splash::metal::EventStep;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
+using splash::metal::SharedEvent;
 using splash::test::rejects;
 using splash::test::sharedBuffer;
 using splash::metal::MetalBuffer;
@@ -1128,6 +1133,85 @@ void releasedMemory(const std::string &metallibPath) {
     std::cout << "PASS released memory\n";
 }
 
+// Memory another agent shares, such as the Neural Engine's surfaces, wrapped
+// without a copy: kernels and the CPU see the same bytes, the accounting
+// counts them, and only their owner frees them.
+void wrappedMemory(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    void *memory = nullptr;
+    require(posix_memalign(&memory, page, page) == 0, "could not allocate a page");
+    std::shared_ptr<void> owner(memory, std::free);
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    MetalBuffer buffer = backend.wrapSharedMemory(memory, page, owner, "wrapped page");
+    require(buffer.contents() == memory && buffer.allocatedBytes() == page &&
+                backend.memoryStats().allocatedBytes == before + page,
+            "a wrapped page is not the memory it wraps or is not counted");
+    *static_cast<uint32_t *>(memory) = 5;
+    const uint32_t count = 1, increment = 7;
+    (void)backend.submit({"test_add_u32", {{0, backend.view(buffer, 0, sizeof(uint32_t))}},
+                          {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+                          {1, 1, 1}, {1, 1, 1}});
+    require(*static_cast<uint32_t *>(memory) == 12, "a kernel did not write the wrapped page");
+    for (const auto &[operation, expected] :
+         std::initializer_list<std::pair<std::function<void()>, std::string_view>>{
+             {[&] { backend.releaseMemory(buffer); }, "owner's to release"},
+             {[&] { (void)backend.wrapSharedMemory(static_cast<uint8_t *>(memory) + 64, page, owner, ""); },
+              "whole pages"}}) {
+        bool refused = false;
+        try {
+            operation();
+        } catch (const MetalBackendError &error) {
+            refused = std::string_view(error.what()).find(expected) != std::string_view::npos;
+        }
+        require(refused, "wrapped memory was released or misaligned memory was wrapped");
+    }
+    std::cout << "PASS wrapped memory\n";
+}
+
+// Event steps order a command against another agent, the CPU here: the work
+// before a signal completes before the event rises, and the work after a wait
+// runs only once the agent raises the event to its value.
+void eventSteps(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const SharedEvent event = backend.newSharedEvent();
+    id<MTLSharedEvent> native = (__bridge id<MTLSharedEvent>)event.nativeHandle();
+    const uint32_t count = 1, one = 1, ten = 10;
+    const auto add = [&](const uint32_t &increment) {
+        return ComputeDispatch{"test_add_u32", {{0, buffer}},
+                               {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+                               {1, 1, 1}, {1, 1, 1}};
+    };
+    ComputeDispatch signal, wait;
+    signal.event = EventStep{event, 1, true};
+    wait.event = EventStep{event, 2, false};
+    const std::vector<ComputeDispatch> dispatches{add(one), signal, wait, add(ten)};
+    CommandTicket ticket = backend.submitCommandAsync(dispatches);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (native.signaledValue < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(native.signaledValue == 1 && *value == 1,
+            "the event rose before the work ahead of its signal, or never");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(*value == 1, "the work after a wait ran before the event reached it");
+    event.signal(2);
+    (void)ticket.wait();
+    require(*value == 11, "the work after a wait did not run once the event reached it");
+    ComputeDispatch empty;
+    empty.event = EventStep{};
+    bool refused = false;
+    try {
+        (void)backend.submitCommandAsync(std::vector<ComputeDispatch>{add(one), empty}).wait();
+    } catch (const MetalBackendError &) {
+        refused = true;
+    }
+    require(refused, "an event step without an event was submitted");
+    std::cout << "PASS event steps\n";
+}
+
 void run(const std::string &metallibPath) {
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
@@ -1412,6 +1496,8 @@ int main(int argc, const char *argv[]) {
             buffersStayResident(argv[1]);
             infiniteKeepAliveHoldsResidency(argv[1]);
             releasedMemory(argv[1]);
+            wrappedMemory(argv[1]);
+            eventSteps(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);

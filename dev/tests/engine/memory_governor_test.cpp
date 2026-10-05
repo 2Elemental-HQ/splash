@@ -598,6 +598,29 @@ void testRequestInServiceGrowsThroughHostPressure() {
           "the mark of a request in service outlived it");
 }
 
+// Startup asks whether the host holds memory it can do without by the rule a
+// reservation outside service meets: the warning margin stays free above the
+// host's reserve and what is reserved. An unmeasured host holds nothing.
+void testHostHoldsWhatAReservationWould() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + 3 * kGiB;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, [&available] { return available; }, 0);
+  require(governor.hostHolds(2 * kGiB) && !governor.hostHolds(2 * kGiB + 1),
+          "the host held other than its room past the warning margin");
+  bool heldBeside = false;
+  require(admit(governor, kGiB, [&] {
+            heldBeside = governor.hostHolds(kGiB) && !governor.hostHolds(kGiB + 1);
+          }) && heldBeside,
+          "the host held memory a reservation had taken");
+  require(!admit(governor, 2 * kGiB + 1), "a reservation the host does not hold was admitted");
+  available.reset();
+  require(!governor.hostHolds(1), "an unmeasured host held memory");
+}
+
 } // namespace
 
 int main() {
@@ -614,6 +637,7 @@ int main() {
     testPolicyContinuesHeldBackTarget();
     testExhaustedReclaimWaivesTheHold();
     testRequestInServiceGrowsThroughHostPressure();
+    testHostHoldsWhatAReservationWould();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

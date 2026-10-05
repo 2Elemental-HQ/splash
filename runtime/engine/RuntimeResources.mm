@@ -124,6 +124,98 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
   }
 }
 
+std::string fixed(double value, int digits) {
+  std::ostringstream text;
+  text << std::fixed << std::setprecision(digits) << value;
+  return text.str();
+}
+
+// The prefill FFN's Neural Engine split the engine runs, if any, which
+// replaces `memoryPlan` with the plan that sets its memory aside. It runs at
+// the share the config gives, or else at the one calibration finds fastest,
+// while its program loads and runs and the engine still holds the context the
+// config asks for, or all the context `memoryPlan` holds when it asks none:
+// in that plan, and in the host's free memory beside what the engine
+// allocates to serve it, above the governor's margin. Otherwise the GPU runs
+// the FFN alone on `memoryPlan` as it is. A failure of the split's, host
+// memory pressure its own memory caused included, leaves the GPU alone; only
+// cancellation ends the start, which meets the host's limits again without
+// the split.
+std::unique_ptr<ops::AneFfn>
+startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+            const ops::ExecutionPlans &operators, const RuntimeResourcesConfig &config,
+            const MemoryGovernor &governor,
+            const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,
+            EngineMemoryPlan &memoryPlan) {
+  if (config.aneFfnShare && *config.aneFfnShare == 0.0) {
+    logLine("The GPU runs the prefill FFN alone, as given.");
+    return {};
+  }
+  if (!model::supportsAneFfn(loaded))
+    return {};
+  const auto started = AwakeClock::now();
+  const auto seconds = [&] {
+    return fixed(std::chrono::duration<double>(AwakeClock::now() - started).count(), 1);
+  };
+  const std::string layer =
+      " ms per " + std::to_string(ops::AneFfn::kMaximumRows) + "-row FFN layer";
+  const auto unavailable = [](std::string_view reason) {
+    logLine("Neural Engine FFN split unavailable (", reason, "); the GPU runs the FFN alone.");
+  };
+  try {
+    ops::AneFfn::Calibration calibration;
+    if (config.aneFfnShare)
+      calibration.share = *config.aneFfnShare;
+    else
+      calibration = model::calibrateAneFfn(backend, loaded, operators, config.kvFormat);
+    if (calibration.share == 0.0) {
+      logLine("The GPU runs the prefill FFN alone, ", fixed(calibration.gpuMilliseconds, 1), layer,
+                 ": no Neural Engine split beats it by enough (calibrated in ", seconds(), " s).");
+      return {};
+    }
+    const uint64_t bytes = model::aneFfnBytes(loaded, calibration.share);
+    std::optional<EngineMemoryPlan> plan = planMemory(bytes).plan;
+    const uint32_t context = config.maximumContextTokens ? config.maximumContextTokens
+                                                         : memoryPlan.maximumContextTokens();
+    if (!plan || plan->maximumContextTokens() < context) {
+      unavailable("its memory leaves " + std::to_string(plan ? plan->maximumContextTokens() : 0) +
+                  " tokens of context, not " + std::to_string(context));
+      return {};
+    }
+    // Its program's buffers live in the Neural Engine's service, beyond its
+    // own, which only the host's free memory shows: the host is asked before
+    // the split exists, for its planned bytes, and again once it does.
+    const uint64_t serving = plan->breakdown().servingBytes(context);
+    const auto leftToServe = [&] {
+      return "it leaves the host too little free memory to serve " + std::to_string(context) + " tokens";
+    };
+    if (!governor.hostHolds(bytes + serving)) {
+      unavailable(leftToServe());
+      return {};
+    }
+    auto split = model::createAneFfn(backend, loaded, operators, calibration.share);
+    if (!governor.hostHolds(serving)) {
+      unavailable(leftToServe());
+      return {};
+    }
+    memoryPlan = std::move(*plan);
+    if (config.aneFfnShare)
+      logLine("Neural Engine FFN split at the given share ", fixed(calibration.share, 3), ".");
+    else
+      logLine("Neural Engine FFN split at share ", fixed(calibration.share, 2), ": a predicted ",
+                 fixed(calibration.splitMilliseconds, 1), layer, " against ",
+                 fixed(calibration.gpuMilliseconds, 1), " on the GPU alone, output ",
+                 fixed(100.0 * calibration.error, 1), "% RMS from the GPU's (set up in ", seconds(),
+                 " s).");
+    return split;
+  } catch (const std::exception &error) {
+    if (config.cancelled && config.cancelled())
+      throw;
+    unavailable(error.what());
+    return {};
+  }
+}
+
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
   if (value.size() != 64) {
     throw std::invalid_argument(
@@ -225,7 +317,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::optional<uint64_t> hostAvailableAtStart)
+    std::unique_ptr<ops::AneFfn> aneFfn, std::optional<uint64_t> hostAvailableAtStart)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -234,7 +326,8 @@ RuntimeResources::RuntimeResources(
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), hostAvailableAtStart_(hostAvailableAtStart) {}
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -387,20 +480,23 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         RuntimeResourceStage::MemoryPlanning,
         std::string("model allocated-size plan is invalid: ") + error.what());
   }
-
-  ModelMemoryFootprint footprint{
-      loaded.targetActualAllocatedBytes(),
-      loaded.draft.actualAllocatedBytes,
-      loaded.vision.actualAllocatedBytes,
-      modelMemoryPlan,
-      stateStagingBytes,
+  // The engine's memory plan, with `aneFfnBytes` set aside for the prefill
+  // FFN's Neural Engine split.
+  const auto planMemory = [&](uint64_t aneFfnBytes) {
+    ModelMemoryFootprint footprint{
+        loaded.targetActualAllocatedBytes(),
+        loaded.draft.actualAllocatedBytes,
+        loaded.vision.actualAllocatedBytes,
+        modelMemoryPlan,
+        stateStagingBytes,
+        aneFfnBytes,
+    };
+    ModelMemoryProfile modelProfile{
+        loaded.name(), loaded.maximumContextTokens(),
+        loaded.targetKvLayout(config.kvFormat), footprint};
+    return evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
   };
-
-  ModelMemoryProfile modelProfile{
-      loaded.name(), loaded.maximumContextTokens(),
-      loaded.targetKvLayout(config.kvFormat), footprint};
-  EngineMemoryPlanResult planResult =
-      evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+  EngineMemoryPlanResult planResult = planMemory(0);
   if (!planResult.plan) {
     throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
                                 planResult.status.message,
@@ -421,18 +517,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   }
 
   try {
-    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
     // allocator reserves, so memory outside the backend's buffers is charged
-    // only beyond them, and elastic state and KV never grow into them.
+    // only beyond them, and elastic state and KV never grow into them. The
+    // split only moves bytes from KV to fixed runtime memory, so the governor
+    // is the same with it or without.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, budget.hardBudgetBytes, hostReserveBytes, config.hostAvailableMemory,
-        budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes);
+        *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes, config.hostAvailableMemory,
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    std::unique_ptr<ops::AneFfn> aneFfn =
+        startAneFfn(*backend, loaded, operators, config, *memoryGovernor, planMemory, memoryPlan);
+    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,
     // never the id range, limits the pool.
@@ -502,7 +602,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        hostAvailableAtStart));
+        std::move(aneFfn), hostAvailableAtStart));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -615,6 +715,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *kvPages_,
       *stateStorage_,
       operators_,
+      aneFfn_.get(),
   };
 }
 
@@ -632,6 +733,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
+  report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

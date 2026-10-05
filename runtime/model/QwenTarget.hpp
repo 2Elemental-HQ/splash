@@ -20,6 +20,10 @@
 #include <variant>
 #include <vector>
 
+namespace splash::ops {
+class AneFfn;
+} // namespace splash::ops
+
 namespace splash::model {
 
 struct Qwen3_8Layout;
@@ -193,6 +197,11 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   ops::MoeScratch moe;
+
+  // The dense FFN's buffers among these.
+  [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
+    return {normalized, projectionSums, denseGateScratch, denseIntermediate, downProjectionSums, linearScratch};
+  }
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -263,11 +272,13 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows.
+  // Returns the hidden buffer that holds the last layer's output rows. The
+  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
+  // Neural Engine on `aneFfn`, when given.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers) const;
+      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,

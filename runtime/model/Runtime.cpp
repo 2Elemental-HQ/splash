@@ -5,6 +5,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
@@ -134,6 +135,55 @@ StateAdmission admitIdleLane(const QwenStateStorage &states,
       return activate(lane);
   }
   return {{}, StateFailure::ConcurrencyLimit};
+}
+
+// A prefill arena's tensors as the target's prefill reads them.
+QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
+  QwenTargetPrefillBuffers buffers;
+  // Prefill plans read plain bf16 rows, so there is no input table or sums.
+  buffers.linearScratch = {.partials = arena.get(PrefillTensor::LinearPartials),
+                           .counters = arena.get(PrefillTensor::LinearCounters),
+                           .rotated = arena.get(PrefillTensor::LinearRotated)};
+  buffers.hidden = {arena.get(PrefillTensor::Hidden0), arena.get(PrefillTensor::Hidden1)};
+  buffers.normalized = arena.get(PrefillTensor::Normalized);
+  buffers.captured = arena.get(PrefillTensor::Captured);
+  buffers.gdnPacked = arena.get(PrefillTensor::GdnPacked);
+  buffers.gdnQueries = arena.get(PrefillTensor::GdnQueries);
+  buffers.gdnKeys = arena.get(PrefillTensor::GdnKeys);
+  buffers.gdnValues = arena.get(PrefillTensor::GdnValues);
+  buffers.gdnDecay = arena.get(PrefillTensor::GdnDecay);
+  buffers.gdnBeta = arena.get(PrefillTensor::GdnBeta);
+  buffers.recurrent = arena.get(PrefillTensor::Recurrent);
+  buffers.gdnHidden = arena.get(PrefillTensor::GdnHidden);
+  buffers.gdnOutput = arena.get(PrefillTensor::GdnOutput);
+  buffers.denseGateScratch = arena.get(PrefillTensor::GateIntermediate);
+  buffers.denseIntermediate = arena.get(PrefillTensor::Intermediate);
+  buffers.fullPacked = arena.get(PrefillTensor::FullPacked);
+  buffers.fullQueries = arena.get(PrefillTensor::FullQueries);
+  buffers.fullAttention = arena.get(PrefillTensor::FullAttention);
+  buffers.attentionPartials = arena.get(PrefillTensor::AttentionPartials);
+  buffers.attentionStatistics = arena.get(PrefillTensor::AttentionStatistics);
+  buffers.attentionHidden = arena.get(PrefillTensor::AttentionHidden);
+  buffers.attentionOutput = arena.get(PrefillTensor::AttentionOutput);
+  buffers.projectionSums = arena.get(PrefillTensor::ProjectionSums);
+  buffers.downProjectionSums = arena.get(PrefillTensor::DownProjectionSums);
+  buffers.ropeCos = arena.get(PrefillTensor::RopeCos);
+  buffers.ropeSin = arena.get(PrefillTensor::RopeSin);
+  buffers.chunkKeys = arena.get(PrefillTensor::ChunkKeys);
+  buffers.chunkValues = arena.get(PrefillTensor::ChunkValues);
+  buffers.moe = arena.moeScratch();
+  return buffers;
+}
+
+// The FFN layers of a dense target, which the Neural Engine split can take;
+// none for another target.
+std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
+  std::vector<ops::SwiGluProjections> layers;
+  if (const auto *dense = std::get_if<Qwen3_8Weights>(&model.target))
+    for (const Qwen3_8LayerWeights &layer : dense->layers)
+      layers.push_back({&layer.gateProjection, &layer.upProjection,
+                        &layer.downProjection});
+  return layers;
 }
 
 } // namespace
@@ -279,6 +329,7 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
+  ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -293,7 +344,8 @@ struct Runtime::Impl {
                                             value.backend, operators);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators) {
+        draftModel(value.model.draft, value.backend, operators),
+        aneFfn(value.aneFfn) {
     if (states.layout() != model.stateLayout() ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1197,43 +1249,11 @@ struct Runtime::Impl {
             capture.absoluteEnd - capture.absoluteBegin};
       }
     }
-    QwenTargetPrefillBuffers buffers;
-    // Prefill plans read plain bf16 rows, so there is no input table or sums.
-    buffers.linearScratch = {.partials = p(PrefillTensor::LinearPartials),
-                             .counters = p(PrefillTensor::LinearCounters),
-                             .rotated = p(PrefillTensor::LinearRotated)};
-    buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
-    buffers.normalized = p(PrefillTensor::Normalized);
-    buffers.captured = p(PrefillTensor::Captured);
-    buffers.gdnPacked = p(PrefillTensor::GdnPacked);
-    buffers.gdnQueries = p(PrefillTensor::GdnQueries);
-    buffers.gdnKeys = p(PrefillTensor::GdnKeys);
-    buffers.gdnValues = p(PrefillTensor::GdnValues);
-    buffers.gdnDecay = p(PrefillTensor::GdnDecay);
-    buffers.gdnBeta = p(PrefillTensor::GdnBeta);
-    buffers.recurrent = p(PrefillTensor::Recurrent);
-    buffers.gdnHidden = p(PrefillTensor::GdnHidden);
-    buffers.gdnOutput = p(PrefillTensor::GdnOutput);
-    buffers.denseGateScratch = p(PrefillTensor::GateIntermediate);
-    buffers.denseIntermediate = p(PrefillTensor::Intermediate);
-    buffers.fullPacked = p(PrefillTensor::FullPacked);
-    buffers.fullQueries = p(PrefillTensor::FullQueries);
-    buffers.fullAttention = p(PrefillTensor::FullAttention);
-    buffers.attentionPartials = p(PrefillTensor::AttentionPartials);
-    buffers.attentionStatistics = p(PrefillTensor::AttentionStatistics);
-    buffers.attentionHidden = p(PrefillTensor::AttentionHidden);
-    buffers.attentionOutput = p(PrefillTensor::AttentionOutput);
-    buffers.projectionSums = p(PrefillTensor::ProjectionSums);
-    buffers.downProjectionSums = p(PrefillTensor::DownProjectionSums);
-    buffers.ropeCos = p(PrefillTensor::RopeCos);
-    buffers.ropeSin = p(PrefillTensor::RopeSin);
-    buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
-    buffers.chunkValues = p(PrefillTensor::ChunkValues);
-    buffers.moe = prefillArena->moeScratch();
+    QwenTargetPrefillBuffers buffers = prefillBuffers(*prefillArena);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvPages.layers());
+        kvPages.layers(), aneFfn);
     addRaggedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0
@@ -2062,6 +2082,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph;
+  if (impl_->aneFfn)
+    impl_->aneFfn->begin();
   const auto captures = impl_->encodeRaggedPrefillGraph(graph, items, entries);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
@@ -2071,11 +2093,15 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
+  if (impl_->aneFfn)
+    impl_->aneFfn->submit();
   CommandTicket command = impl_->backend.submitCommandAsync(
       graph.dispatches(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, captures,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    if (impl->aneFfn)
+      impl->aneFfn->finish();
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
@@ -2643,6 +2669,26 @@ ModelTelemetry Runtime::telemetry() const noexcept {
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
   }
   return result;
+}
+
+bool supportsAneFfn(const LoadedModel &model) {
+  return ops::AneFfn::supports(aneFfnLayers(model));
+}
+
+ops::AneFfn::Calibration calibrateAneFfn(MetalBackend &backend, const LoadedModel &model,
+                                         const ops::ExecutionPlans &operators, kv::Format format) {
+  const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
+  const QwenTargetPrefillBuffers buffers = prefillBuffers(arena);
+  return ops::AneFfn::calibrate(backend, operators.linear(), aneFfnLayers(model), buffers.ffn(), buffers.hidden);
+}
+
+uint64_t aneFfnBytes(const LoadedModel &model, double share) {
+  return ops::AneFfn::plannedBytes(aneFfnLayers(model), share);
+}
+
+std::unique_ptr<ops::AneFfn> createAneFfn(MetalBackend &backend, const LoadedModel &model,
+                                          const ops::ExecutionPlans &operators, double share) {
+  return std::make_unique<ops::AneFfn>(backend, operators.linear(), aneFfnLayers(model), share);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,

@@ -40,6 +40,9 @@ struct ModelMemoryFootprint final {
   // when the tier's state file opened (a quota that holds one state); zero
   // otherwise.
   uint64_t stateStagingBytes = 0;
+  // The prefill FFN's Neural Engine split (ops::AneFfn::plannedBytes); zero
+  // without one.
+  uint64_t aneFfnBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -115,6 +118,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint64_t aneFfnBytes = 0;
   uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
@@ -141,6 +145,10 @@ struct EngineMemoryBreakdown {
   uint64_t minimumRequiredBytes = 0;
   uint64_t deficitBytes = 0;
 
+  // What the engine allocates as it starts and serves one request of
+  // `contextTokens`: the shared arenas, one lane's state and the request's KV
+  // pages, at least the runway warmup takes.
+  [[nodiscard]] uint64_t servingBytes(uint32_t contextTokens) const noexcept;
   [[nodiscard]] std::string toStatusJson() const;
   [[nodiscard]] std::string describe() const;
 };

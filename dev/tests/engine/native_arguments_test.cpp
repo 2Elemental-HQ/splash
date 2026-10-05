@@ -144,6 +144,7 @@ void testServerCommandLines(const char *path) {
       {"image_patches_default",
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
+      {"no_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
   };
   // Every field but the model inspected from the directory.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
@@ -154,7 +155,8 @@ void testServerCommandLines(const char *path) {
            read.kvFormat == meant.kvFormat && read.decodeShare == meant.decodeShare &&
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
-           read.preventIdleSleep == meant.preventIdleSleep;
+           read.preventIdleSleep == meant.preventIdleSleep &&
+           read.neuralEngine == meant.neuralEngine;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -194,6 +196,7 @@ void testRefusals() {
             "--idle-release requires off or a positive number of seconds");
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
+  refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
   refuses({"auto", "auto", "--cache-dir", "/srv/cache"},
           "--cache-dir requires a MAX_CACHE_DISK_BYTES quota");
   refuses({"auto", "auto", "5368709120", "--cache-dir", ""},

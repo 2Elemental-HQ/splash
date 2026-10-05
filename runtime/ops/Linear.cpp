@@ -587,6 +587,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   }
   requireAffineProjection(p, w.matrix);
   if (gate) requireAffineProjection(*gate, w.matrix);
+  if (p.planeInputSize() != p.inputSize && (w.phase != LinearPhase::Prefill || selected.usesQ4Register()))
+    throw std::invalid_argument("a view of leading inputs runs only the prefill tiles");
   const AffineWeights &weights = p.affine();
   if (selected.usesQ4Register()) {
     if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
@@ -607,7 +609,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
-      graph.add(std::string(name), bindings, Q4Params{n, k},
+      graph.add(std::string(name), bindings, Q4PrefillParams{n, k, p.planeInputSize()},
           {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
@@ -674,6 +676,14 @@ void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer i
                                 uint32_t rows, LinearScratch scratch) const {
   add(graph, {.input = input, .output = output, .sums = sums, .residual = residual, .scratch = scratch}, p,
       prefillPlan(p, rows, LinearEpilogue::Residual));
+}
+void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
+                              const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
+                              uint32_t rows) const {
+  addPrefill(graph, b.normalized, *ffn.gate, b.gateScratch, b.sums, rows, b.scratch);
+  addPrefillUpWithGate(graph, b.normalized, *ffn.up, b.gateScratch, b.intermediate, b.sums, b.downSums, rows,
+                       b.scratch);
+  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, b.downSums, rows, b.scratch);
 }
 void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                                   metal::MetalBuffer gateScratch, metal::MetalBuffer output,

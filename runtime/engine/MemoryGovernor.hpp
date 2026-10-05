@@ -192,6 +192,11 @@ public:
   // The control pass's evaluation: snapshot(), with the host's hysteresis
   // moved to its sample, as a reservation's moves it.
   MemoryGovernorSnapshot evaluate() noexcept;
+  // Whether the host has room now for `bytes` more beside what is reserved,
+  // as a reservation no request in service needs must: above the host's
+  // reserve and the warning margin. Startup asks it before it takes memory
+  // it can do without.
+  [[nodiscard]] bool hostHolds(uint64_t bytes) const noexcept;
 
 private:
   // Held while an admitted allocation runs; released when it ends.
