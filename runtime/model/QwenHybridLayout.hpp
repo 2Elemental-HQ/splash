@@ -12,7 +12,8 @@ namespace splash::model {
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
-// The magic of a Qwen target's packed embedding file, whatever its family.
+// The magic of a Qwen target's affine embedding image, packaged or written
+// from MLX, whatever its family.
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
 // Sizes of the mixer sections in a packed layer file.

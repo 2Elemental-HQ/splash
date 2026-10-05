@@ -1,12 +1,13 @@
 #pragma once
 
-// The affine images of a checkpoint in the existing packed ABI, as
-// model/AffineTarget.cpp plans an MLX target's and model/DraftCheckpoint.cpp a
-// DFlash2 draft's, and their writer. An MLX projection's codes, scales and
-// biases are reordered into 256-row tiles without requantization, a BF16
-// projection is quantized into the same tiles as MLX's affine quantization
-// rounds it, the GDN decay becomes float(-exp(double(A_log))), and every
-// other tensor is copied as stored.
+// The affine images of a checkpoint, laid out as a Splash package's files,
+// which the target and draft loaders read (QwenTargetLoader.hpp,
+// DFlashDraft.cpp): model/AffineTarget.cpp plans an MLX target's and
+// model/DraftCheckpoint.cpp a DFlash2 draft's, and writeAffineImage writes
+// them. An MLX projection's codes, scales and biases are reordered into
+// 256-row tiles without requantization, a BF16 projection is quantized into
+// the same tiles as MLX's affine quantization rounds it, the GDN decay becomes
+// float(-exp(double(A_log))), and every other tensor is copied as stored.
 
 #include "model/WeightSource.hpp"
 

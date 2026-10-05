@@ -1,7 +1,8 @@
 #pragma once
 
-// Source adapter for a Qwen GGUF: its images are written into memory and
-// read like packaged weights.
+// Source adapter for a Qwen GGUF: its images (model/GgufImageLayout.hpp) are
+// written into memory, and QwenTargetLoader reads them as block-quantized
+// weights (BlockTargetFormat).
 
 #include <filesystem>
 #include <memory>
