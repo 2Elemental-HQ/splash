@@ -205,6 +205,9 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
+    # The id of the call the token limit cut, whose arguments are
+    # unfinished; None when it cut none.
+    cut_call: str | None
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -458,9 +461,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-        payload.clear()
-        body = json_codec.loads(text)
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except (ValueError, RecursionError):
+            # Text that is not JSON, or JSON nested deeper than the parser
+            # reads.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
         if not isinstance(body, dict):
             raise RequestValidationError(
                 [field_error([], "request body must be an object")]
@@ -634,12 +644,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 route.errors,
                 log=self._submitted is None or error.status >= 500,
             )
-        except (ValueError, RecursionError):
-            self._cancel_submitted()
-            error = RequestValidationError(
-                [field_error([], "invalid JSON request body")]
-            )
-            self._safe_error(error, route.errors, log=self._submitted is None)
         except Exception as error:
             self._cancel_submitted()
             log_unexpected(error)
@@ -908,7 +912,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         publish(events)
         return Collected(
-            "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+            "".join(reasoning),
+            content_text,
+            tool_calls,
+            result,
+            splitter.reasoning,
+            None if projector is None else projector.call_id,
         )
 
     def _complete(self, job):
@@ -947,6 +956,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         result = collected.result
         blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        if collected.cut_call is not None:
+            # A complete message leaves out the call the token limit cut.
+            blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
             if collected.reasoning and job.thinking_display == "omitted"
