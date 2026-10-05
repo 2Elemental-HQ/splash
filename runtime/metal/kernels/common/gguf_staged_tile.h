@@ -49,16 +49,14 @@ template <class Acc, class Fn> inline void gguf_elements(thread Acc &acc, Fn fn)
 // must be reached by every thread of the threadgroup.
 template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
 inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
-                              uint plane_input_size, uint output_origin, threadgroup half *stage, threadgroup half2 *tl,
-                              uint thread_index, uint step_begin, uint step_end, bool matmuls, thread Acc &acc) {
+                              uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
+                              uint step_begin, uint step_end, bool matmuls, thread Acc &acc) {
   // Prefetch: the steps whose weights are loaded ahead of the one being staged.
   constexpr ushort Prefetch = 1, GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
-  // A tile's groups lie in order: the first input_size / 32 of a view of the leading plane_input_size inputs of
-  // wider rows are those it reads.
-  const uint groups = plane_input_size / 32, units = groups / F::MetaGroups;
+  const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
@@ -109,8 +107,8 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
 template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
 inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end, thread Acc &acc) {
-  gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, input_size, output_origin, stage, tl, simd_lane,
-                                           step_begin, step_end, true, acc);
+  gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
+                                           step_end, true, acc);
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
 }
 

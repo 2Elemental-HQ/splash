@@ -1451,7 +1451,8 @@ producer writes plain rows. The token table gathers each row through the inverse
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>` and
-`gguf_prefill_<format>_<e>`, the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
+`gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
+leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>`. The norm, GDN and
 attention-gate variants that also write a register kernel's input table carry `table64` (the
@@ -1513,9 +1514,12 @@ the Apple9 prefill rule in `runtime/ops/Linear.cpp`.
 Prefill chunks of 512 rows or more of a dense target split each layer's FFN by
 intermediate channel (`runtime/ops/AneFfn.cpp`). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
-leading inputs of down's rows (`Projection::planeInputs`). The Neural Engine
-runs the rest as one W8A8 program, Hadamard-rotated int8 activations and
-per-row int8 weights (`runtime/ane/Program.mm`): a chunk takes the smallest of
+leading inputs of down's rows (`Projection::planeInputs`) through instances
+of the residual kernels of their own (`<kernel>_leading_inputs`), which run
+the residual kernel's tile on the weight planes advanced past the inputs the
+view leaves unread. The Neural Engine runs the rest as one W8A8 program,
+Hadamard-rotated int8 activations and per-row int8 weights
+(`runtime/ane/Program.mm`): a chunk takes the smallest of
 its functions that holds it, one every 128 rows from 512 to 2048, all reading
 and writing one set of surfaces sized for 2048 rows. The ANE service holds
 memory for a loaded program's intermediate values, which its functions share:

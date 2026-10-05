@@ -594,7 +594,8 @@ void prefill(MetalBackend &backend, const Linear &linear) {
 
 // ---------------------------------------------------------------- leading inputs
 // A view of the leading inputs of a projection's rows (Projection::planeInputs), as the ANE FFN split runs down's GPU
-// share, equals bit for bit a projection of those inputs repacked on their own, in every format and epilogue.
+// share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
+// those inputs repacked on their own, in every format, over two plane tiles of rows.
 void leadingInputs(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t N = 512, K = 1024, kLeading = 512, kChunk = 168;
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
@@ -616,21 +617,20 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
                     BlockWeights{{QuantizedSegment::planes(f, N, kLeading, whole.segment.plane0, whole.segment.plane1,
                                                            whole.segment.meta)}});
     view.planeInputs = K;
-    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
-      const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, e, WeightLayout::Block32};
-      const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
-      const uint32_t storage = plan.storageRows();
-      const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
-                                                  storage);
-      const std::vector<uint16_t> aux = storageRows(activations(Inputs::Dense, storage, N), N, storage, storage);
-      const std::string label = std::string(fmtName(fi)) + " " + epilogueName(e) + " leading inputs";
-      const Outcome expected = run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label);
-      const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
-      if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
-    }
+    const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual,
+                           WeightLayout::Block32};
+    const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+    const uint32_t storage = plan.storageRows();
+    const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
+                                                storage);
+    const std::vector<uint16_t> aux = storageRows(residuals(storage, N), N, storage, storage);
+    const std::string label = std::string(fmtName(fi)) + " leading inputs";
+    const Outcome expected = run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label);
+    const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
+    if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
   }
-  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate, a view of 512 of "
-          "1024 inputs equal to them repacked");
+  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats' residual prefill over a view of 512 of 1024 "
+          "inputs equal to them repacked");
 }
 
 // ---------------------------------------------------------------- split visibility

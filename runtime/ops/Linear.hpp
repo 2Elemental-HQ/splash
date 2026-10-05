@@ -20,6 +20,12 @@ namespace splash::ops {
 [[nodiscard]] inline std::string kernelInstance(std::string_view name, FloatOutput destination) {
   return std::string(name) + (destination == FloatOutput::Float32 ? "_f32" : "");
 }
+// The instance of prefill residual kernel `name` that reads a view of the
+// leading inputs of wider weight rows (Projection::planeInputs):
+// "<name>_leading_inputs".
+[[nodiscard]] inline std::string leadingInputsInstance(std::string_view name) {
+  return std::string(name) + "_leading_inputs";
+}
 // The tile of a float projection (kernels/shared/gguf_float.metal): fp32
 // simdgroup MMA on the weights as stored, or the neural accelerator's bf16
 // matmul on each weight's three bf16 parts, which sum to it exactly. Both
@@ -38,12 +44,15 @@ struct LinearMatrix final {
 };
 
 // Throws unless `projection` is an affine projection of `matrix` whose planes
-// hold all of its Q4 weights, scales and biases.
+// hold all of its Q4 weights, scales and biases, in rows of its
+// planeInputSize() inputs.
 void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
 // Throws unless the planes of the quantized `segment` hold every tile of its
 // outputSize x inputSize weights (metal/abi/QuantFormat.h), naming them
-// "<what> plane0", "<what> plane1" and "<what> meta".
-void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what);
+// "<what> plane0", "<what> plane1" and "<what> meta": in rows of
+// `planeInputs` inputs, of which it is a view of the leading ones
+// (Projection::planeInputs), or of its inputSize when that is 0.
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };

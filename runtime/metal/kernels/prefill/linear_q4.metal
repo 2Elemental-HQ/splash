@@ -34,11 +34,10 @@ constant constexpr ushort PrefillSumBatch = 256;
 // Both paths use the same accumulation order.
 template <ushort TileM, ushort TileN, ushort Simdgroups, bool AddResidual,
           bool MultiplySiluGate>
-__attribute__((always_inline)) inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
+inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
                                 device bfloat *scales, device bfloat *biases,
                                 device bfloat *output, device bfloat *auxiliary,
                                 uint output_size, uint input_size,
-                                uint plane_input_size,
                                 device const float *precomputed_sums,
                                 uint output_origin, uint simd_lane,
                                 uint simd_group,
@@ -52,15 +51,12 @@ __attribute__((always_inline)) inline void q4_mpp_prefill_tile(device bfloat *in
       matmul2d_descriptor(TileM, TileN, 64, false, true, false);
   matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   auto a0 = a.slice<64, TileM>(0, 0);
-  // A tile's groups lie in order: the first quant_groups of a view of the
-  // leading inputs of wider rows (plane_groups) are those it reads.
   uint quant_groups = input_size / 64;
-  uint plane_groups = plane_input_size / 64;
   uint tile = output_origin / kQ4StorageColumns;
   uint tile_column = output_origin % kQ4StorageColumns;
   device uchar *tile_weights =
       weights +
-      (ulong(tile) * plane_groups * kQ4StorageColumns + tile_column) * 64 / 2;
+      (ulong(tile) * quant_groups * kQ4StorageColumns + tile_column) * 64 / 2;
   tensor<device uint4b_format, dextents<int, 2>, tensor_inline> first_b(
       tile_weights, dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
   auto b0 = first_b.slice<64, TileN>(0, 0);
@@ -103,7 +99,7 @@ __attribute__((always_inline)) inline void q4_mpp_prefill_tile(device bfloat *in
       auto index = accumulated.get_multidimensional_index(i);
       uint row = index[1];
       ulong parameter =
-          (ulong(tile) * plane_groups + quant_group) * kQ4StorageColumns +
+          (ulong(tile) * quant_groups + quant_group) * kQ4StorageColumns +
           tile_column + index[0];
       float sum = StagedSums
           ? input_sums[(quant_group % PrefillSumBatch) * TileM + row]
@@ -176,9 +172,8 @@ __attribute__((always_inline)) inline void
 q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
            device bfloat *biases, device bfloat *auxiliary,
            device bfloat *output, device const float *sums,
-           device float *output_sums, constant Q4PrefillParams &params,
-           uint2 group, uint simd_lane, uint simd_group,
-           threadgroup float *input_sums) {
+           device float *output_sums, constant Q4Params &params, uint2 group,
+           uint simd_lane, uint simd_group, threadgroup float *input_sums) {
   constexpr ushort TileM = 32;
   constexpr bool UpSiluSums = Epilogue == PrefillQ4Epilogue::UpSiluSums;
   const ulong input_offset = ulong(group.x) * TileM * params.input_size;
@@ -189,9 +184,8 @@ q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
   q4_mpp_prefill_tile<TileM, TileN, Simdgroups,
                       Epilogue == PrefillQ4Epilogue::Residual, UpSiluSums>(
       input + input_offset, weights, scales, biases, output + output_offset,
-      auxiliary + output_offset, params.output_size, params.input_size,
-      params.plane_input_size, sums, group.y * TileN, simd_lane, simd_group,
-      input_sums);
+      auxiliary + output_offset, params.output_size, params.input_size, sums,
+      group.y * TileN, simd_lane, simd_group, input_sums);
   if constexpr (UpSiluSums)
     q4_prefill_write_output_sums<TileM, TileN, Simdgroups>(
         output + output_offset, output_sums, params.output_size,
@@ -203,18 +197,18 @@ q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
 // auxiliary rows and passes its output in their place.
 #define PREFILL_Q4_BUFFERS_Plain                                               \
   device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
-      constant Q4PrefillParams &params [[buffer(6)]]
+      constant Q4Params &params [[buffer(6)]]
 #define PREFILL_Q4_ARGUMENTS_Plain output, output, sums, nullptr
 #define PREFILL_Q4_BUFFERS_Residual                                            \
   device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],  \
       device const float *sums [[buffer(6)]],                                  \
-      constant Q4PrefillParams &params [[buffer(7)]]
+      constant Q4Params &params [[buffer(7)]]
 #define PREFILL_Q4_ARGUMENTS_Residual residual, output, sums, nullptr
 #define PREFILL_Q4_BUFFERS_UpSiluSums                                          \
   device bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],      \
       device const float *sums [[buffer(6)]],                                  \
       device float *output_sums [[buffer(7)]],                                 \
-      constant Q4PrefillParams &params [[buffer(8)]]
+      constant Q4Params &params [[buffer(8)]]
 #define PREFILL_Q4_ARGUMENTS_UpSiluSums gate, output, sums, output_sums
 // Eight simdgroups stage the row sums in threadgroup memory; four read them
 // from device memory.
@@ -242,6 +236,45 @@ PREFILL_Q4(prefill_linear_q4_n256_up_silu_sums, 256, 8, UpSiluSums)
 PREFILL_Q4(prefill_linear_q4_n128_sg4, 128, 4, Plain)
 PREFILL_Q4(prefill_linear_q4_n128_residual_sg4, 128, 4, Residual)
 PREFILL_Q4(prefill_linear_q4_n128_up_silu_sums_sg4, 128, 4, UpSiluSums)
+
+// The parameters (a scale, a bias and 64 weights per column and group) that
+// a view of the leading input_size inputs of rows of plane_input_size leaves
+// unread in the 256-column tiles before the one holding `column`.
+inline ulong q4_unread_parameters(constant Q4PrefillLeadingParams &params,
+                                  uint column) {
+  return ulong(column / kQ4StorageColumns) *
+         (params.plane_input_size / 64 - params.matrix.input_size / 64) *
+         kQ4StorageColumns;
+}
+
+// The residual kernels over a view of the leading inputs of wider weight rows,
+// for the Neural Engine FFN split's down projection. Each runs the tile of its
+// residual kernel on the planes advanced past the parameters the view leaves
+// unread before its column tile, which the tile then addresses as rows of
+// input_size inputs.
+#define PREFILL_Q4_LEADING(Name, TileN, Simdgroups)                            \
+  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+                   device uchar *weights [[buffer(1)]],                        \
+                   device bfloat *scales [[buffer(2)]],                        \
+                   device bfloat *biases [[buffer(3)]],                        \
+                   device bfloat *residual [[buffer(4)]],                      \
+                   device bfloat *output [[buffer(5)]],                        \
+                   device const float *sums [[buffer(6)]],                     \
+                   constant Q4PrefillLeadingParams &params [[buffer(7)]],      \
+                   uint2 group [[threadgroup_position_in_grid]],               \
+                   uint simd_lane [[thread_index_in_simdgroup]],               \
+                   uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
+    PREFILL_Q4_INPUT_SUMS_##Simdgroups;                                        \
+    const ulong unread = q4_unread_parameters(params, group.y * TileN);        \
+    q4_prefill<TileN, Simdgroups, PrefillQ4Epilogue::Residual>(                \
+        input, weights + unread * 64 / 2, scales + unread, biases + unread,    \
+        residual, output, sums, nullptr, params.matrix, group, simd_lane,      \
+        simd_group, input_sums);                                               \
+  }
+PREFILL_Q4_LEADING(prefill_linear_q4_n128_residual_leading_inputs, 128, 8)
+PREFILL_Q4_LEADING(prefill_linear_q4_n256_residual_leading_inputs, 256, 8)
+PREFILL_Q4_LEADING(prefill_linear_q4_n128_residual_sg4_leading_inputs, 128, 4)
+#undef PREFILL_Q4_LEADING
 #undef PREFILL_Q4
 #undef PREFILL_Q4_INPUT_SUMS_4
 #undef PREFILL_Q4_INPUT_SUMS_8

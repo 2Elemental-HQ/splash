@@ -13,9 +13,9 @@
 // affine router as one tile of expert slots (SPLASH_MOE_EXPERT_SLOTS).
 #define SPLASH_AFFINE_TILE_ROWS 256u
 
-// A Q4 projection's matrix, for the decode tiles whose grid covers it (a
-// K-split tile reads its split count from the grid). Separate from
-// ops::LinearMatrix so host-only fields cannot change the ABI.
+// A Q4 projection's matrix, for prefill and the decode tiles whose grid
+// covers it (a K-split tile reads its split count from the grid). Separate
+// from ops::LinearMatrix so host-only fields cannot change the ABI.
 struct Q4Params {
   uint32_t output_size;
   uint32_t input_size;
@@ -24,16 +24,17 @@ struct Q4Params {
 static_assert(sizeof(Q4Params) == 8,
               "Q4 projection parameters are 8 bytes on both sides");
 
-// A Q4 projection's matrix for prefill. plane_input_size: the inputs each
-// weight row holds, of which the projection reads the first input_size.
-struct Q4PrefillParams {
-  uint32_t output_size;
-  uint32_t input_size;
+// The prefill residual kernels over a view of the leading inputs of wider
+// weight rows (prefill_linear_q4_*_leading_inputs): each row of the weight,
+// scale and bias planes holds plane_input_size inputs, of which the
+// projection reads the first matrix.input_size.
+struct Q4PrefillLeadingParams {
+  Q4Params matrix;
   uint32_t plane_input_size;
 };
 
-static_assert(sizeof(Q4PrefillParams) == 12,
-              "Q4 prefill projection parameters are 12 bytes on both sides");
+static_assert(sizeof(Q4PrefillLeadingParams) == 12,
+              "Q4 leading-input prefill parameters are 12 bytes on both sides");
 
 // The persistent decode tiles' matrix and their grid's `groups`
 // threadgroups, which stride over the column tiles. The stride is a
