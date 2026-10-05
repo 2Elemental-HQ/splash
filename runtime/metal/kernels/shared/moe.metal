@@ -12,8 +12,9 @@
 // Routing first writes SPLASH_MOE_EXPERT_SLOTS fp32 scores per row, then
 // sorts them. Q8 affine terms accumulate per K slice, and slices sum in fixed
 // order so both score tile shapes produce identical results. The 8-row tile
-// favors short chunks; the 32-row tile amortizes weight loads over longer
-// chunks. Measurements cover Apple10; Apple9 validation remains outstanding.
+// favors short chunks and the 32-row tile, which amortizes weight loads,
+// longer ones; their crossover (ops::moeRouteTile) is measured on Apple10
+// only.
 constant constexpr uint kMoeRouteSlices = 8;
 static_assert(kQ4StorageColumns == SPLASH_MOE_EXPERT_SLOTS,
               "the affine router is one Q8 storage tile of expert slots");
@@ -547,10 +548,9 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
 // The grouped rows as Table16 tiles (kernels/common/gguf_sgmatrix.h), the
 // input of the Apple9 GGUF register expert tile. Threadgroup (tile, part)
 // writes the four 64-input spans [4 part, 4 part + 4) of an 8-row tile, one
-// simdgroup per row: 8 us per 35B decode layer at one lane on the 40-core M3
-// Max and 14 us at four, against 15 and 44 us for a threadgroup per span pair
-// (most of a decode dispatch's tiles are past the tile count) and 19 and 23 us
-// for one per tile. The gather reads each grouped row's route like
+// simdgroup per row: on the 40-core M3 Max, 8 us per 35B decode layer at one
+// lane and 14 us at four, under two thirds of the time of a threadgroup per
+// span pair or per tile. The gather reads each grouped row's route like
 // moe_gather_rows (padding rows are zero); the prepare reads grouped rows (the
 // down pass's intermediate). Grid (tiles, width / 256), 256 threads.
 template <class Source>

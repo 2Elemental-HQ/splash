@@ -53,8 +53,9 @@ struct GgufPrefillParams {
 };
 static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
 
-// Decode tiles of both families (the register tile on Apple9, the staged
-// tile elsewhere and for prefill chunks of up to 32 rows): one tensor per
+// Decode tiles: the register tile, which Apple9 runs but for the projections
+// it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
+// runs every other decode and prefill chunks of up to 32 rows. One tensor per
 // dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K

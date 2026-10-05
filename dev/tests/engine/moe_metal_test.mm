@@ -594,7 +594,7 @@ void planBounds() {
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; families 10 and
-  // later keep the shipped tile.
+  // later run eight.
   using splash::ops::gpuFamilyClass;
   require(splash::ops::moeDecodeSimdgroups(gpuFamilyClass(9)) == MoeExpertSimdgroups::Four &&
               splash::ops::moeDecodeSimdgroups(gpuFamilyClass(10)) == MoeExpertSimdgroups::Eight &&

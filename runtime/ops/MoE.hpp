@@ -180,19 +180,15 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // Simdgroups per affine 8-row expert tile, a device policy the execution
-// plans set. Eight is the shipped N128 tile for both projections.
-// Four halves the threadgroup to 128 threads and runs gate/up at N128 and
-// down at N256, for Apple9 decode plans: family 9 has no per-core matrix
-// unit, and a decode expert grid leaves it latency-bound at low occupancy.
-// Measured on a 40-core Apple9 GPU at the 35B shape (H=2048, E=256,
-// top_k=8, I=512), ms per layer at rows 8/16/24/32: gate/up
-// 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
-// 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
-// variants had mixed results across shapes, so family 10 keeps eight.
-// Smaller Apple9 core counts still need performance validation; this family
-// gate does not establish their optimum. Either choice writes bit-identical
-// outputs and needs the same workspace; only the down pass's column grid
-// changes.
+// plans set. Eight runs the N128 tile for both projections. Four halves the
+// threadgroup to 128 threads and runs gate/up at N128 and down at N256, for
+// Apple9 decode plans: Apple9 has no per-core matrix unit, and a decode expert
+// grid leaves it latency-bound at low occupancy. At the 35B shape (H=2048,
+// E=256, top_k=8, I=512) and 8-32 rows, four is 1.06x-1.23x faster for
+// gate/up and 1.15x-1.25x for down on a 40-core M3 Max, the only Apple9 GPU
+// measured; on Apple10 its results are mixed across shapes, so Apple10 keeps
+// eight. Either choice writes bit-identical outputs and needs the same
+// workspace; only the down pass's column grid changes.
 enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
 
 [[nodiscard]] constexpr MoeExpertSimdgroups

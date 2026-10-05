@@ -330,9 +330,9 @@ struct DecodeGroupPolicy final {
   uint32_t manyWaveTilesPerCore;
 };
 // Resident-wave and full-grid thresholds measured on 16/20-core Apple10 GPUs.
-// Gate/up uses the conservative limit shared by both devices. Its many-wave
-// threshold follows N256; the four-simdgroup threshold scales from N128. Those
-// two extrapolations remain unmeasured.
+// Gate/up takes the lower of the two devices' limits. Two thresholds are
+// derived rather than measured: gate/up's many-wave threshold is N256's, and
+// the four-simdgroup thresholds are N128's doubled.
 constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
     kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
@@ -372,14 +372,13 @@ uint32_t decodeGroups(uint32_t tiles, uint32_t cores,
 // A multi-row N256 decode tile halves the input re-reads of N128 but also
 // halves the grid; it pays only while the N256 grid keeps two tiles per core.
 constexpr uint32_t kWideDecodeTilesPerCore = 2;
-// Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
-// tile. Paired-A/B tuning (tune-kernels) and the per-shape microprofile
-// (benchmark-prefill) on a 32-core Apple9 GPU (M4 Max) measured the
-// four-simdgroup N128 tile ahead of N256 on every prefill shape and probed
-// row count: +6..10% GPU wherever the margin cleared the tuning threshold,
-// never behind. Apple9 GPUs at or below that measured core count therefore
-// share the Apple10 prefill rule. Larger Apple9 GPUs (40-core class) keep the
-// wide-tile rule below; it was sized for them and remains unremeasured there.
+// Apple9 GPUs of up to 32 cores prefill with the Apple10 rule, the
+// four-simdgroup N128 tile, which on a 32-core M4 Max is never slower than
+// N256 on any prefill shape or row count and 6-10% faster wherever the
+// difference is measurable (tune-kernels, benchmark-prefill).
+// Larger Apple9 GPUs (40-core class) run N256 for UpWithGate and wherever its
+// grid reaches eight threadgroups per core, which amortizes the larger tile;
+// N128's four-simdgroup tile is not measured against it on them.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 
@@ -453,9 +452,10 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
                                                               : LinearTile::N128, 0};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  // Keep the existing broad-column plain projection path for wider batches:
-  // independent row tiles repeat its weight stream. Reuse the existing
-  // two-N256-tiles-per-core boundary rather than model-specific dimensions.
+  // Wide plain projections of three or four lanes take the broad-column tiles
+  // below on every family, since independent row tiles would repeat the weight
+  // stream. Wide is the two-N256-tiles-per-core boundary
+  // (kWideDecodeTilesPerCore), not a model dimension.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
       tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
   if (family_ == GpuFamilyClass::Apple9 && !widePlain) {

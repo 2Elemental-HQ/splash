@@ -71,8 +71,7 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 // Over the 27B and 35B dense shapes, all formats, one to four lanes, on the
 // 16- and 20-core M5 Pro and 10-, 30- and 40-core GPUs emulated by width:
 // 3.6% over the fastest split of each shape in total and 36% at worst on a
-// 15-us shape (the register tiers in threads per core: 6.6%; the previous 32
-// per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
+// 15-us shape (the register tiers in threads per core: 6.6%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
 // The staged tile's tiers on a family. Apple9 cores take as many of its
@@ -249,7 +248,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
   // the same half stage and matmul rows, so its outputs equal the prefill
-  // tile's up to the K split's fp32 reassociation (gguf-projection full),
+  // tile's up to the K split's fp32 reassociation (gguf-projection checks it),
   // and each simdgroup streams its own 32 columns instead of four 8-row
   // simdgroups sharing a stage. Unsplit, on a 17408 x 5120 Q4_K projection
   // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
@@ -332,9 +331,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 // The staged decode tiles, for decode and prefill chunks of up to 32 rows:
 // every row of the plan's storage in each threadgroup's tile, grid (64-column
 // tiles, K splits). Decode runs one dispatch per projection (addDecodeTensor,
-// fusedSegments); its two gate/up passes were within -4..+2% of the fused
-// gate/up kernel they replaced on the 27B gate/up at 10-40 cores. Prefill
-// chunks run one dispatch per segment.
+// fusedSegments), gate/up as two passes, which a fused gate/up kernel does not
+// beat (-4..+2% on the 27B gate/up at 10-40 cores). Prefill chunks run one
+// dispatch per segment.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {

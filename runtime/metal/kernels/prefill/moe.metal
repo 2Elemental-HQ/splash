@@ -10,8 +10,7 @@
 // every pass reads and writes the rows of that matmul, which the gather fills,
 // and the combine reads only live rows. All row variants share one kernel:
 // register allocation follows the 32-row path, while smaller paths save
-// instructions. This path has been measured on Apple10; Apple9 performance
-// remains unmeasured.
+// instructions. Its performance is measured on Apple10 only.
 constant constexpr uint PrefillMoeTileRows = 32;
 
 template <ushort Rows, bool MultiplySiluGate>

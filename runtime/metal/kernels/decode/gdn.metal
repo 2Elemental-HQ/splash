@@ -14,11 +14,10 @@
 // The phases therefore hand each other their operands in threadgroup memory
 // instead of device memory, issue their device loads before their stores
 // (the scan loads the next rows' state before storing the current rows'),
-// and the gate runs one simdgroup per row without barriers. Over the 27B's 48
-// layers with DRAM-cold states this took one to four lanes from 2.23 / 3.00 /
-// 4.36 / 4.86 ms to 1.81 / 2.50 / 3.52 / 4.30 ms on a 40-core M3 Max and from
-// 1.93 / 4.02 / 5.43 / 7.03 ms to 1.62 / 2.90 / 4.31 / 5.55 ms on a 16-core
-// M5 Pro, bitwise unchanged.
+// and the gate runs one simdgroup per row without barriers: over the 27B's 48
+// layers with DRAM-cold states that takes 11-28% less time at one to four
+// lanes than the same phases through device memory (40-core M3 Max, 16-core
+// M5 Pro), with the same bits.
 constant uint kDecodeSimdgroups = 8;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
