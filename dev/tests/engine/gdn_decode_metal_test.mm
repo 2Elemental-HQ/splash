@@ -6,7 +6,9 @@
 // exercised) and every retained count of the commit. The recurrent state is
 // checked at fp32 accuracy from the kernel's own k/v and gates, after those
 // were checked against the reference; the hidden rows from the recurrent rows
-// read from that state with the reference q and rounded to bf16.
+// read from that state with the reference q and rounded to bf16. The decode
+// gate's hidden rows are also checked bit for bit against the prefill gate's
+// from the same recurrent rows.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
@@ -20,6 +22,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -689,6 +692,103 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
           what + " output is not the grouped output in tiled head order");
 }
 
+// The decode gate (gdn_decode_gate, decode/gdn.metal) reproduces the prefill
+// gate (gdn_gate_phase, common/gdn_primitives.h) bit for bit from the same
+// recurrent rows. Both recurrences produce those rows exactly here: a_scale 0
+// makes every decay one, convolution weights only on the query channels'
+// current input make the keys and values zero, and at token t every key
+// head's query input is one on columns 17 t and 127, which the RMS norm and
+// its scale turn into 1/16 on both. Every recurrent row is then a state
+// column over 16, which is exact for a state of bf16 values that is zero in
+// column 127. The prefill's rows, both decays and the decode's unchanged
+// state confirm that before the hidden rows of every lane are compared.
+void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float32, GdnHeadOrder order) {
+  const std::string what = std::string("gate parity vh") + std::to_string(shape.valueHeads) +
+                           (float32 ? " f32 norm" : "") + (order == GdnHeadOrder::Tiled ? " tiled" : "");
+  constexpr uint32_t kSharedColumn = kHeadDim - 1;
+  const auto queryColumn = [](uint32_t token) { return 17 * token; };
+  const uint32_t keyWidth = shape.keyHeads * kHeadDim;
+  const uint32_t valueWidth = shape.valueHeads * kHeadDim;
+  const uint64_t stateFloats = uint64_t{valueWidth} * kHeadDim, stateBytes = stateFloats * 4;
+  constexpr uint16_t kOne = 0x3F80;
+  Fixture fixture(backend, shape, kMaxLanes, float32);
+  Random random(0x6a7e + shape.valueHeads + float32);
+
+  auto *convWeights = static_cast<uint16_t *>(fixture.convWeights.contents());
+  std::fill_n(convWeights, uint64_t{shape.convolutionDimension} * 4, uint16_t{0});
+  for (uint32_t channel = 0; channel < keyWidth; ++channel)
+    convWeights[channel * 4 + 3] = kOne;
+  std::fill_n(static_cast<float *>(fixture.decayWeights.contents()), shape.valueHeads, 0.0F);
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    for (uint32_t token = 0; token < kRows; ++token) {
+      uint16_t *row = static_cast<uint16_t *>(fixture.packed.contents()) + lane * fixture.packedStride +
+                      uint64_t{token} * shape.packedWidth;
+      std::fill_n(row, keyWidth, uint16_t{0});
+      for (uint32_t head = 0; head < shape.keyHeads; ++head)
+        row[head * kHeadDim + queryColumn(token)] = row[head * kHeadDim + kSharedColumn] = kOne;
+    }
+    auto *state =
+        reinterpret_cast<float *>(static_cast<uint8_t *>(fixture.current[lane].contents()) + fixture.cell.convBytes);
+    for (uint64_t index = 0; index < stateFloats; ++index)
+      state[index] = index % kHeadDim == kSharedColumn ? 0.0F : roundBfloat(random.unit());
+  }
+
+  CommandGraph decode;
+  require(GDN::addDecode(decode, fixture.decodeBuffers(0), shape, kMaxLanes, 0, fixture.cell.strides(), order,
+                         LinearInput::Plain)
+                  .layout == LinearInput::Plain,
+          what + ": plain GDN claimed a table");
+  (void)backend.submitCommand(decode.dispatches());
+
+  const auto buffer = [&](uint64_t bytes) { return sharedBuffer(backend, bytes); };
+  const uint64_t valueRows = uint64_t{kRows} * valueWidth * 2;
+  GdnPrefillBuffers prefill{{},
+                            fixture.convWeights,
+                            {},
+                            buffer(uint64_t{3} * shape.convolutionDimension * 2),
+                            buffer(uint64_t{kRows} * keyWidth * 2),
+                            buffer(uint64_t{kRows} * keyWidth * 2),
+                            buffer(valueRows),
+                            fixture.decayWeights,
+                            fixture.timeBias,
+                            buffer(uint64_t{kRows} * shape.valueHeads * 4),
+                            buffer(uint64_t{kRows} * shape.valueHeads * 2),
+                            {},
+                            buffer(stateBytes),
+                            buffer(valueRows),
+                            fixture.mixerNorm,
+                            buffer(valueRows)};
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    const std::string where = what + " lane " + std::to_string(lane);
+    prefill.packed = backend.view(fixture.packed, uint64_t{lane} * fixture.packedStride * 2,
+                                  fixture.packedStride * 2);
+    prefill.convolutionIn = backend.view(fixture.current[lane], 0, uint64_t{3} * shape.convolutionDimension * 2);
+    prefill.recurrentIn = backend.view(fixture.current[lane], fixture.cell.convBytes, stateBytes);
+    CommandGraph graph;
+    GDN::addPrefill(graph, prefill, shape, kRows, order);
+    (void)backend.submitCommand(graph.dispatches());
+
+    const float *state = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), 0);
+    const auto *rows = static_cast<const uint16_t *>(prefill.recurrentRows.contents());
+    for (uint32_t token = 0; token < kRows; ++token)
+      for (uint32_t head = 0; head < shape.valueHeads; ++head)
+        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
+          require(rows[(uint64_t{token} * shape.valueHeads + head) * kHeadDim + dim] ==
+                      floatToBf16(state[(uint64_t{head} * kHeadDim + dim) * kHeadDim + queryColumn(token)] / 16),
+                  where + ": prefill recurrent rows are not the state's columns over 16");
+    const auto *prefillDecay = static_cast<const float *>(prefill.decay.contents());
+    for (uint32_t token = 0; token < kRows; ++token)
+      for (uint32_t head = 0; head < shape.valueHeads; ++head)
+        require(fixture.decayRow(0, lane, token)[head] == 1.0F &&
+                    prefillDecay[token * shape.valueHeads + head] == 1.0F,
+                where + ": a decay is not one");
+    require(!std::memcmp(fixture.cell.recurrent(fixture.cellBytes(fixture.next[lane]), 0), state, stateBytes),
+            where + ": the decode changed the state");
+    require(!std::memcmp(fixture.hiddenRow(lane, 0, 0), prefill.hidden.contents(), valueRows),
+            where + ": decode and prefill gates wrote different hidden rows");
+  }
+}
+
 void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes[1];
   Fixture fixture(backend, shape, 1);
@@ -759,6 +859,10 @@ int main(int argc, char **argv) {
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
           runDecode(backend, shape, lanes, float32);
+    for (bool float32 : {false, true})
+      for (const GdnShape &shape : kShapes)
+        for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
+          gateMatchesPrefill(backend, shape, float32, order);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {
