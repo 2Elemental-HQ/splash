@@ -80,8 +80,8 @@ constexpr SplitTier kStagedTiers[] = {{6, 512}};
 // 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
 // 0.012 ms projection), where the fitted tier above is 13-27% slower on
 // 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
-std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
-  if (appleGpuFamily == 9) return kRegisterTiers;
+std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
+  if (family == GpuFamilyClass::Apple9) return kRegisterTiers;
   return kStagedTiers;
 }
 
@@ -89,8 +89,8 @@ std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
 LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
   return {.tile = LinearTile::GgufRegister, .splits = decodeSplits(n, k, cores, kRegisterTiers)};
 }
-LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily) {
-  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(appleGpuFamily))};
+LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family) {
+  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(family))};
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -257,18 +257,18 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,
-                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(appleGpuFamily_))}
+                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  if (family_ == GpuFamilyClass::Apple9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
+  return stagedDecode(n, k, gpuCores_, family_);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
-  if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   return size;
 }
 
@@ -456,8 +456,9 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return appleGpuFamily_ != 9 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
-                                                                                     : FloatTile::Simdgroup;
+  return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
+             ? FloatTile::NeuralAccelerator
+             : FloatTile::Simdgroup;
 }
 
 // Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural

@@ -221,9 +221,18 @@ inline constexpr uint32_t kAssumedGpuCores = 32;
 [[nodiscard]] constexpr uint32_t plannedGpuCores(const DeviceCapabilities &device) noexcept {
   return device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores;
 }
+// The GPU family classes kernel policy tells apart: Apple9 (family 9: M3,
+// M4), whose matrix operations share the FP32 pipe, and Apple10 (family 10
+// and later: M5, M6), whose cores each hold a neural accelerator. Startup
+// refuses families below 9.
+enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
+[[nodiscard]] constexpr GpuFamilyClass gpuFamilyClass(uint32_t appleGpuFamily) noexcept {
+  return appleGpuFamily >= 10 ? GpuFamilyClass::Apple10 : GpuFamilyClass::Apple9;
+}
 
 // Owns projection pipeline selection and dispatch for both weight layouts.
-// Device policy uses GPU family, core count and workload tile counts.
+// Device policy uses the GPU family class, core count and workload tile
+// counts.
 class Linear final {
 public:
   explicit Linear(const DeviceCapabilities &device) noexcept;
@@ -302,7 +311,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
-  uint32_t appleGpuFamily_ = 0;
+  GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
 };
 

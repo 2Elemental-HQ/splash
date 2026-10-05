@@ -25,8 +25,7 @@ void include(Workspace &bound, const Workspace &required,
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      appleGpuFamily_(device.appleGpuFamily) {}
+      family_(gpuFamilyClass(device.appleGpuFamily)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
@@ -51,9 +50,9 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   MoeConfig config;
   config.routeWideRows = moeRouteWideRows_;
   config.expertTile = prefill ? MoeExpertTile::M32 : MoeExpertTile::M8;
-  if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups_;
+  if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups(family_);
   if (shape.weightLayout == WeightLayout::Block32) {
-    const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
+    const MoeGgufTile tile = moeGgufTile(family_, shape);
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     config.ggufTile = tile;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);

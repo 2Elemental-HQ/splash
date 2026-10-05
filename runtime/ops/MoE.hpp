@@ -193,12 +193,10 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // changes.
 enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
 
-// Families below 9 are rejected at startup; 10 and later keep the shipped
-// tile, as does an unknown family.
 [[nodiscard]] constexpr MoeExpertSimdgroups
-moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily == 9 ? MoeExpertSimdgroups::Four
-                             : MoeExpertSimdgroups::Eight;
+moeDecodeSimdgroups(GpuFamilyClass family) noexcept {
+  return family == GpuFamilyClass::Apple9 ? MoeExpertSimdgroups::Four
+                                          : MoeExpertSimdgroups::Eight;
 }
 
 // The expert tile of GGUF plans, which run three grouped passes (gate, up
@@ -218,9 +216,9 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
-  return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
-                                                                         : MoeGgufTile::Staged;
+[[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, MoeShape shape) noexcept {
+  return family == GpuFamilyClass::Apple9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+                                                                                      : MoeGgufTile::Staged;
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the

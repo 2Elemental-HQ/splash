@@ -434,7 +434,7 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 } // namespace
 
 Linear::Linear(const DeviceCapabilities &device) noexcept
-    : appleGpuFamily_(device.appleGpuFamily),
+    : family_(gpuFamilyClass(device.appleGpuFamily)),
       gpuCores_(plannedGpuCores(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
@@ -442,15 +442,15 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
       .storageRows();
 }
 
-// GPU family selects variants; core count and workload tile counts determine
-// parallelism.
+// The GPU family class selects variants; core count and workload tile counts
+// determine parallelism.
 LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   validate(w);
   if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w, projections);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
-    if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
+    if (family_ == GpuFamilyClass::Apple10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
     const bool wide = double(rowTiles) * tiles256 >=
@@ -464,7 +464,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   // two-N256-tiles-per-core boundary rather than model-specific dimensions.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
       tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
-  if (appleGpuFamily_ == 9 && !widePlain) {
+  if (family_ == GpuFamilyClass::Apple9 && !widePlain) {
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
     const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
     uint32_t splits = 1;
@@ -475,7 +475,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
       splits *= 2;
     return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits};
   }
-  if (appleGpuFamily_ >= 10) {
+  if (family_ == GpuFamilyClass::Apple10) {
     if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
       return {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
     if (lanes == 1)
@@ -485,8 +485,8 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   // lanes, which keep their one-tile grids: the round-robin policy above was
   // measured on Apple10.
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
-    return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
-                                 : tiles;
+    return family_ == GpuFamilyClass::Apple10 ? decodeGroups(tiles, gpuCores_, policy)
+                                              : tiles;
   };
   if (w.epilogue == LinearEpilogue::GateUp)
     return {LinearTile::N256, groups(tiles256, kGateUpGroups)};

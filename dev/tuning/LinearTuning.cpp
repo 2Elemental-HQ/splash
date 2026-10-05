@@ -189,7 +189,7 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
   if (w.epilogue != LinearEpilogue::GateUp) append({LinearTile::N128, columns / 128});
   if (w.epilogue != LinearEpilogue::Residual) append({LinearTile::N256, columns / 256});
   // Split128 partitions K in whole 256-input blocks.
-  if (device.appleGpuFamily >= 10)
+  if (gpuFamilyClass(device.appleGpuFamily) == GpuFamilyClass::Apple10)
     for (uint32_t splits = 2;
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / 256; splits *= 2)
       append({LinearTile::Split128, 0, LinearSimdgroups::Eight, splits});
