@@ -166,11 +166,11 @@ ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
 
 namespace {
 GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
-    metal::MetalBuffer section = file.section(sizeof(GgufTensorDescriptor), std::string(label) + "-desc");
+    metal::MetalBuffer section = file.section(GgufTensorDescriptor::kBytes, std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
-    GgufTensorDescriptor d;
-    std::memcpy(&d, bytes, sizeof d);
+    const GgufTensorDescriptor d = GgufTensorDescriptor::decode(
+        std::span<const uint8_t, GgufTensorDescriptor::kBytes>(bytes, GgufTensorDescriptor::kBytes));
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
         (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))

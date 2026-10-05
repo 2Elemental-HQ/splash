@@ -6,7 +6,6 @@
 #include "model/WeightLayout.hpp"
 
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -219,20 +218,18 @@ private:
                   const GgufPlaneBytes &bytes, const std::string &name) {
     if (rows > std::numeric_limits<uint32_t>::max() || columns > std::numeric_limits<uint32_t>::max())
       throw GgufError("tensor is too large for its descriptor: " + name);
-    GgufTensorDescriptor d{};
-    d.type = type;
-    d.outputSize = static_cast<uint32_t>(rows);
-    d.inputSize = static_cast<uint32_t>(columns);
-    d.p0 = format.plane0_bytes;
-    d.p1 = format.plane1_bytes;
-    d.metaBytes = format.meta_bytes;
-    d.metaGroups = format.meta_groups;
-    d.plane0Bytes = bytes.plane0;
-    d.plane1Bytes = bytes.plane1;
-    d.metaTotalBytes = bytes.meta;
-    std::vector<uint8_t> encoded(sizeof d);
-    std::memcpy(encoded.data(), &d, sizeof d);
-    image_.fills.push_back({section(encoded.size()), std::move(encoded)});
+    const auto encoded = GgufTensorDescriptor{.type = type,
+                                              .outputSize = static_cast<uint32_t>(rows),
+                                              .inputSize = static_cast<uint32_t>(columns),
+                                              .p0 = format.plane0_bytes,
+                                              .p1 = format.plane1_bytes,
+                                              .metaBytes = format.meta_bytes,
+                                              .metaGroups = format.meta_groups,
+                                              .plane0Bytes = bytes.plane0,
+                                              .plane1Bytes = bytes.plane1,
+                                              .metaTotalBytes = bytes.meta}
+                             .encode();
+    image_.fills.push_back({section(encoded.size()), {encoded.begin(), encoded.end()}});
   }
 
   const GgufFile &file_;

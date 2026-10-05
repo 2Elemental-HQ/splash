@@ -428,20 +428,14 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                        "unaligned packed file size was accepted");
 }
 
-// One tensor of a GGUF image: its 64-byte descriptor, then its sections.
-std::filesystem::path writeGgufTensor(const std::filesystem::path &path, uint32_t type,
-                                      uint32_t rows, uint32_t columns,
-                                      std::array<uint32_t, 4> planeLayout,
-                                      std::array<uint64_t, 3> planes) {
-    std::vector<uint64_t> sections{64};
-    for (uint64_t bytes : planes)
+// One tensor of a GGUF image: its descriptor, then its sections.
+std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
+                                      const splash::model::GgufTensorDescriptor &tensor) {
+    std::vector<uint64_t> sections{splash::model::GgufTensorDescriptor::kBytes};
+    for (uint64_t bytes : {tensor.plane0Bytes, tensor.plane1Bytes, tensor.metaTotalBytes})
         if (bytes) sections.push_back(bytes);
     writeWeightFile(path, kGgufImageMagic, 0, 0, sections);
-    std::array<uint8_t, 64> descriptor{};
-    const std::array<uint32_t, 7> words{type, rows, columns, planeLayout[0], planeLayout[1],
-                                        planeLayout[2], planeLayout[3]};
-    std::memcpy(descriptor.data(), words.data(), sizeof(words));
-    std::memcpy(descriptor.data() + 32, planes.data(), sizeof(planes));
+    const auto descriptor = tensor.encode();
     int file = open(path.c_str(), O_WRONLY | O_CLOEXEC);
     require(file >= 0 && pwrite(file, descriptor.data(), descriptor.size(),
                                 kWeightFileAlignment) == static_cast<ssize_t>(descriptor.size()),
@@ -457,11 +451,22 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     // Q8_0 planes and native rows as the planner lays them out.
     const QuantFormat &q80 = kQuantFormats[GGUF_FMT_Q80];
     const splash::model::GgufPlaneBytes planes = splash::model::ggufPlaneBytes(q80, rows, columns);
-    const auto projection = writeGgufTensor(root / "projection.bin", q80.ggml_type, rows, columns,
-                                            {q80.plane0_bytes, q80.plane1_bytes, q80.meta_bytes, q80.meta_groups},
-                                            {planes.plane0, planes.plane1, planes.meta});
-    const auto embedding = writeGgufTensor(root / "embedding.bin", q80.ggml_type, rows, columns, {0, 0, 0, 0},
-                                           {rows * splash::model::ggufRowBytes(q80, columns), 0, 0});
+    const auto projection = writeGgufTensor(root / "projection.bin",
+                                            {.type = q80.ggml_type,
+                                             .outputSize = rows,
+                                             .inputSize = columns,
+                                             .p0 = q80.plane0_bytes,
+                                             .p1 = q80.plane1_bytes,
+                                             .metaBytes = q80.meta_bytes,
+                                             .metaGroups = q80.meta_groups,
+                                             .plane0Bytes = planes.plane0,
+                                             .plane1Bytes = planes.plane1,
+                                             .metaTotalBytes = planes.meta});
+    const auto embedding = writeGgufTensor(root / "embedding.bin",
+                                           {.type = q80.ggml_type,
+                                            .outputSize = rows,
+                                            .inputSize = columns,
+                                            .plane0Bytes = rows * splash::model::ggufRowBytes(q80, columns)});
     splash::model::WeightImages images(backend);
     const auto loaded = [&](const std::filesystem::path &path) {
         return images.load(

@@ -1,5 +1,4 @@
 #include "ModelDescriptor.hpp"
-#include "QwenVision.hpp"
 #include "WeightStore.hpp"
 
 #import <Foundation/Foundation.h>
