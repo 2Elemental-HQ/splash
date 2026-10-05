@@ -26,6 +26,7 @@ from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
 from server import (
     api_shapes,
+    connections,
     diagnostics,
     documents,
     images,
@@ -7210,7 +7211,7 @@ class ServerTest(unittest.TestCase):
         while time.monotonic() < deadline:
             with server.connections.lock:
                 held = list(server.connections.holders)
-            if not any(api._has_input(connection) for connection in held):
+            if not any(connections._has_input(connection) for connection in held):
                 return
             time.sleep(0.005)
         self.fail("a connection's input stayed unread")
@@ -7324,7 +7325,7 @@ class ServerTest(unittest.TestCase):
         for upload in uploads:
             upload.close()
 
-    @mock.patch.object(api, "_has_input", return_value=False)
+    @mock.patch.object(connections, "_has_input", return_value=False)
     def test_connection_slots_close_the_longest_waiting_connection(self, _):
         slots = api.ConnectionSlots(2)
         first, second, third, fourth = (mock.Mock() for _ in range(4))
@@ -7334,7 +7335,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(slots.admit(third))
         # Still awaiting its request, it is answered before it is closed.
         second.send.assert_called_once_with(
-            api.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
+            connections.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
         )
         second.shutdown.assert_called_once_with(socket.SHUT_RDWR)
         # A connection that lost its slot is not served.
@@ -7377,7 +7378,9 @@ class ServerTest(unittest.TestCase):
         # The idle connection gives way, although it waited less long.
         self.assertTrue(slots.admit(new))
         self.assertFalse(slots.serving(idle))
-        self.assertEqual(idle_client.recv(65536), api.CONNECTION_OVERLOADED_RESPONSE)
+        self.assertEqual(
+            idle_client.recv(65536), connections.CONNECTION_OVERLOADED_RESPONSE
+        )
         self.assertEqual(idle_client.recv(1), b"")
         # When every slot has a request, the new connection is refused.
         new_client.sendall(b"GET /health HTTP/1.1\r\n\r\n")
