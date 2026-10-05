@@ -115,7 +115,6 @@ struct SafetensorsCheckpoint::Impl {
   std::vector<std::unique_ptr<WeightSource>> files;
   TensorIndex tensors;
   NSDictionary *quantization = nil;
-  NSDictionary *textConfig = nil;
 
   void readConfiguration(const std::filesystem::path &path) {
     if (std::filesystem::file_size(path) > 1024 * 1024)
@@ -127,9 +126,6 @@ struct SafetensorsCheckpoint::Impl {
     if (quantizationConfig && ![quantizationConfig isKindOfClass:[NSDictionary class]])
       throw WeightStoreError("invalid source quantization configuration");
     quantization = quantizationConfig;
-    textConfig = config[@"text_config"] ?: config;
-    if (![textConfig isKindOfClass:[NSDictionary class]])
-      throw WeightStoreError("source has no text model configuration");
   }
 };
 
@@ -167,51 +163,6 @@ void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uin
         number(entry[@"group_size"] ?: impl_->quantization[@"group_size"]) != 64 ||
         (mode && ![mode isEqual:@"affine"]))
       throw WeightStoreError("unsupported affine quantization for " + std::string(projection));
-  }
-}
-namespace {
-id configValue(NSDictionary *config, std::string_view key) {
-  id value = config;
-  while (!key.empty()) {
-    const auto dot = key.find('.');
-    const auto part = key.substr(0, dot);
-    if (![value isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *name = [[NSString alloc] initWithBytes:part.data() length:part.size() encoding:NSUTF8StringEncoding];
-    value = value[name];
-    if (dot == key.npos) break;
-    key.remove_prefix(dot + 1);
-  }
-  return value;
-}
-}
-void SafetensorsCheckpoint::requireConfigNumber(std::string_view key, double expected) const {
-  @autoreleasepool {
-    id value = configValue(impl_->textConfig, key);
-    if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] != expected)
-      throw WeightStoreError("source model configuration does not match: " + std::string(key));
-  }
-}
-void SafetensorsCheckpoint::requireConfigString(std::string_view key, std::string_view expected,
-                                               std::string_view legacyKey) const {
-  @autoreleasepool {
-    id value = configValue(impl_->textConfig, key);
-    if (!value && !legacyKey.empty()) {
-      key = legacyKey;
-      value = configValue(impl_->textConfig, key);
-    }
-    if (![value isKindOfClass:[NSString class]] || std::string_view([value UTF8String]) != expected)
-      throw WeightStoreError("source model configuration does not match: " + std::string(key));
-  }
-}
-void SafetensorsCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const {
-  @autoreleasepool {
-    id types = impl_->textConfig[@"layer_types"];
-    if (![types isKindOfClass:[NSArray class]] || [types count] != layers)
-      throw WeightStoreError("source layer schedule does not match");
-    for (uint32_t layer = 0; layer < layers; ++layer) {
-      NSString *expected = (layer + 1) % fullAttentionPeriod ? @"linear_attention" : @"full_attention";
-      if (![types[layer] isEqual:expected]) throw WeightStoreError("source layer schedule does not match");
-    }
   }
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
