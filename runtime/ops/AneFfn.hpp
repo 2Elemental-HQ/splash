@@ -188,7 +188,8 @@ private:
   [[nodiscard]] bool wait(bool release);
 
   metal::MetalBackend &backend_;
-  const Linear &linear_;
+  // A copy: the plans' owner may move or end before the split does.
+  const Linear linear_;
   double share_ = 0.0;
   Shape shape_;
   std::vector<Layer> layers_;
