@@ -15,7 +15,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
+#include <utility>
+#include <variant>
 
 // The private AppleNeuralEngine interface this file uses.
 @protocol SplashAneModel
@@ -52,20 +55,94 @@ namespace {
 
 constexpr unsigned kQos = QOS_CLASS_DEFAULT;
 
-Class requireClass(const char *name) {
-  static const bool loaded =
-      dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW);
-  Class result = loaded ? NSClassFromString(@(name)) : nil;
-  if (!result) throw std::runtime_error(std::string("AppleNeuralEngine does not provide ") + name);
-  return result;
-}
-
 [[noreturn]] void fail(const char *what, NSError *error) {
   throw std::runtime_error(std::string("ANE ") + what + " failed" +
                            (error ? std::string(": ") + error.description.UTF8String : std::string()));
 }
 
-id<SplashAneClient> client() { return [(Class<SplashAneClient>)requireClass("_ANEClient") sharedConnection]; }
+// Runs `body`, which messages the private interface, and throws an
+// Objective-C exception it raises as a std::runtime_error naming `step`:
+// std::exception handlers do not catch an NSException.
+template <class F> decltype(auto) guarded(const char *step, F &&body) {
+  @try {
+    return std::forward<F>(body)();
+  } @catch (NSException *exception) {
+    throw std::runtime_error(
+        [NSString stringWithFormat:@"ANE %s raised %@: %@", step, exception.name, exception.reason].UTF8String);
+  }
+}
+
+// The private interface's classes and the service's client.
+struct Api final {
+  __strong id<SplashAneClient> client = nil;
+  Class<SplashAneModel> model = nil;
+  Class<SplashAneSurface> surface = nil;
+  Class<SplashAneEvents> events = nil, signalEvent = nil, waitEvent = nil;
+  Class<SplashAneRequest> request = nil;
+};
+
+// Loads the framework and finds each class this file uses and the shared
+// client, checking that each responds to every selector this file sends it.
+// Throws at the first failure.
+Api resolve() {
+  if (!dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW)) {
+    const char *reason = dlerror();
+    throw std::runtime_error(std::string("AppleNeuralEngine does not load: ") + (reason ? reason : "no reason"));
+  }
+  const auto lacks = [](const std::string &what) { return std::runtime_error("AppleNeuralEngine lacks " + what); };
+  // +[class selector] for a class method, -[class selector] for an instance
+  // method.
+  const auto method = [](char kind, const char *name, SEL selector) {
+    return std::string(1, kind) + "[" + name + " " + sel_getName(selector) + "]";
+  };
+  const auto require = [&](const char *name, std::initializer_list<SEL> classMethods,
+                           std::initializer_list<SEL> instanceMethods) {
+    Class found = NSClassFromString(@(name));
+    if (!found) throw lacks(name);
+    for (const SEL selector : classMethods)
+      if (![found respondsToSelector:selector]) throw lacks(method('+', name, selector));
+    for (const SEL selector : instanceMethods)
+      if (![found instancesRespondToSelector:selector]) throw lacks(method('-', name, selector));
+    return found;
+  };
+  Api api;
+  api.model = require("_ANEModel", {@selector(modelAtURL:key:)}, {@selector(modelAttributes)});
+  api.surface = require("_ANEIOSurfaceObject", {@selector(objectWithIOSurface:)}, {});
+  api.events = require("_ANESharedEvents", {@selector(sharedEventsWithSignalEvents:waitEvents:)}, {});
+  api.signalEvent =
+      require("_ANESharedSignalEvent", {@selector(signalEventWithValue:symbolIndex:eventType:sharedEvent:)}, {});
+  api.waitEvent = require("_ANESharedWaitEvent", {@selector(waitEventWithValue:sharedEvent:eventType:)}, {});
+  api.request = require("_ANERequest",
+                        {@selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:
+                                   procedureIndex:sharedEvents:transactionHandle:)},
+                        {@selector(setCompletionHandler:)});
+  // The client's instance methods, on the client the service shares.
+  id client = [(Class<SplashAneClient>)require("_ANEClient", {@selector(sharedConnection)}, {}) sharedConnection];
+  if (!client) throw lacks("a shared connection");
+  for (const SEL selector : {@selector(compileModel:options:qos:error:), @selector(compiledModelExistsFor:),
+                             @selector(purgeCompiledModel:), @selector(loadModel:options:qos:error:),
+                             @selector(unloadModel:options:qos:error:),
+                             @selector(evaluateWithModel:options:request:qos:error:)})
+    if (![client respondsToSelector:selector]) throw lacks(method('-', "_ANEClient", selector));
+  api.client = client;
+  return api;
+}
+
+// The private interface, resolved on first use. A resolution that fails is
+// not retried: each use throws its message.
+const Api &api() {
+  static const std::variant<Api, std::string> resolved = []() -> std::variant<Api, std::string> {
+    @autoreleasepool {
+      try {
+        return guarded("interface lookup", resolve);
+      } catch (const std::exception &error) {
+        return std::string(error.what());
+      }
+    }
+  }();
+  if (const std::string *failure = std::get_if<std::string>(&resolved)) throw std::runtime_error(*failure);
+  return std::get<Api>(resolved);
+}
 
 uint32_t elementBytes(Surface::Element element) noexcept { return element == Surface::Element::Int8 ? 1 : 2; }
 
@@ -86,6 +163,16 @@ std::string hex(uint64_t value) {
 }
 std::span<const uint8_t> bytesOf(std::string_view text) {
   return {reinterpret_cast<const uint8_t *>(text.data()), text.size()};
+}
+
+// Whether `file` holds `bytes` and nothing else.
+bool holds(const std::filesystem::path &file, std::span<const uint8_t> bytes) {
+  std::ifstream in(file, std::ios::binary | std::ios::ate);
+  if (!in || static_cast<uint64_t>(in.tellg()) != bytes.size()) return false;
+  std::vector<uint8_t> contents(bytes.size());
+  in.seekg(0);
+  return in.read(reinterpret_cast<char *>(contents.data()), static_cast<std::streamsize>(contents.size())) &&
+         std::ranges::equal(contents, bytes);
 }
 
 // Writes `file` whole: another process may read it at the same time.
@@ -171,80 +258,108 @@ struct Procedure final {
 };
 
 struct Program::Impl {
+  explicit Impl(const Api &api) : api(api) {}
+
+  const Api &api;
   __strong id model = nil;
   // By procedure.
   std::vector<Procedure> procedures;
   bool loaded = false;
 
   ~Impl() {
-    if (loaded) [client() unloadModel:model options:@{} qos:kQos error:nil];
+    if (!loaded) return;
+    // A destructor does not throw: an unload that fails is ignored.
+    try {
+      guarded("unload", [&] { [api.client unloadModel:model options:@{} qos:kQos error:nil]; });
+    } catch (...) {
+    }
   }
 };
 
-Program::Program(std::string_view mil, std::span<const uint8_t> weights) : impl_(std::make_unique<Impl>()) {
+Program::Program(std::string_view mil, std::span<const uint8_t> weights) : impl_(std::make_unique<Impl>(api())) {
+  const Api &api = impl_->api;
   @autoreleasepool {
-    // The source's hash names its directory and the service's key; a file of
-    // the source's size there already holds it.
+    // The source's hash names its directory and the service's key; a file
+    // there that does not hold the source's bytes is written again.
     const std::string key = hex(fnv1a(weights, fnv1a(bytesOf(mil))));
     const std::filesystem::path directory = cacheDirectory() / key;
     std::filesystem::create_directories(directory);
-    for (const auto &[name, bytes] : {std::pair{"model.mil", bytesOf(mil)}, std::pair{"weights.bin", weights}}) {
-      std::error_code missing;
-      if (std::filesystem::file_size(directory / name, missing) != bytes.size()) writeWhole(directory / name, bytes);
-    }
+    for (const auto &[name, bytes] : {std::pair{"model.mil", bytesOf(mil)}, std::pair{"weights.bin", weights}})
+      if (!holds(directory / name, bytes)) writeWhole(directory / name, bytes);
 
-    impl_->model = [(Class<SplashAneModel>)requireClass("_ANEModel")
-        modelAtURL:[NSURL fileURLWithPath:@(directory.c_str()) isDirectory:YES]
-               key:@(key.c_str())];
+    impl_->model = guarded("model creation", [&] {
+      return [api.model modelAtURL:[NSURL fileURLWithPath:@(directory.c_str()) isDirectory:YES] key:@(key.c_str())];
+    });
     if (!impl_->model) fail("model creation", nil);
     const auto compile = [&] {
-      NSError *error = nil;
-      if (![client() compileModel:impl_->model
-                          options:@{@"kANEFModelType" : @"kANEFModelMIL", @"kANEFNetPlistFilenameKey" : @"model.mil"}
-                              qos:kQos
-                            error:&error])
-        fail("compilation", error);
+      guarded("compilation", [&] {
+        NSDictionary *options = @{@"kANEFModelType" : @"kANEFModelMIL", @"kANEFNetPlistFilenameKey" : @"model.mil"};
+        NSError *error = nil;
+        if (![api.client compileModel:impl_->model options:options qos:kQos error:&error]) fail("compilation", error);
+      });
     };
-    const bool compiled = [client() compiledModelExistsFor:impl_->model];
+    const bool compiled =
+        guarded("compiled model lookup", [&] { return [api.client compiledModelExistsFor:impl_->model]; });
     if (!compiled) compile();
-    NSError *error = nil;
-    if (![client() loadModel:impl_->model options:@{} qos:kQos error:&error]) {
+    guarded("load", [&] {
+      NSError *error = nil;
+      if ([api.client loadModel:impl_->model options:@{} qos:kQos error:&error]) return;
       // A compilation the service kept from another compiler, say, compiles
       // again once.
       if (!compiled) fail("load", error);
-      [client() purgeCompiledModel:impl_->model];
+      guarded("purge", [&] { [api.client purgeCompiledModel:impl_->model]; });
       compile();
       error = nil;
-      if (![client() loadModel:impl_->model options:@{} qos:kQos error:&error]) fail("load", error);
-    }
+      if (![api.client loadModel:impl_->model options:@{} qos:kQos error:&error]) fail("load", error);
+    });
     impl_->loaded = true;
-    NSDictionary *description = [impl_->model modelAttributes][@"ANEFModelDescription"];
-    NSArray *symbols = description[@"kANEFModelInputSymbolsArrayKey"];
-    NSDictionary *functions = description[@"kANEFModelProcedureNameToIDMapKey"];
-    NSArray *procedures = description[@"ANEFModelProcedures"];
-    if (![symbols isKindOfClass:NSArray.class] || ![functions isKindOfClass:NSDictionary.class] ||
-        ![procedures isKindOfClass:NSArray.class] || procedures.count != functions.count)
-      throw std::runtime_error("ANE program does not describe its procedures");
-    impl_->procedures.resize(procedures.count);
-    for (NSString *function in functions) {
-      const NSUInteger index = [functions[function] unsignedIntegerValue];
-      if (index >= procedures.count) throw std::runtime_error("ANE program names an unknown procedure");
-      impl_->procedures[index].function = function.UTF8String;
-    }
-    for (NSDictionary *entry in procedures) {
-      const NSUInteger index = [entry[@"ANEFModelProcedureID"] unsignedIntegerValue];
-      NSArray *outputs = entry[@"ANEFModelOutputSymbolIndexArray"];
-      if (index >= procedures.count || outputs.count != 1)
-        throw std::runtime_error("ANE program has a procedure of other than one output");
-      Procedure &procedure = impl_->procedures[index];
-      procedure.outputSymbol = [outputs[0] unsignedIntValue];
-      for (NSNumber *symbol in entry[@"ANEFModelInputSymbolIndexArray"]) {
-        if (symbol.unsignedIntegerValue >= symbols.count)
-          throw std::runtime_error("ANE program names an unknown input");
-        procedure.inputSymbols.push_back(symbol.unsignedIntValue);
-        procedure.inputs.emplace_back([symbols[symbol.unsignedIntegerValue] UTF8String]);
+    // Each value of the attributes is checked for its kind before it is
+    // messaged.
+    guarded("model attributes", [&] {
+      const auto undescribed = [] { return std::runtime_error("ANE program does not describe its procedures"); };
+      NSDictionary *attributes = [impl_->model modelAttributes];
+      if (![attributes isKindOfClass:NSDictionary.class]) throw undescribed();
+      NSDictionary *description = attributes[@"ANEFModelDescription"];
+      if (![description isKindOfClass:NSDictionary.class]) throw undescribed();
+      NSArray *symbols = description[@"kANEFModelInputSymbolsArrayKey"];
+      NSDictionary *functions = description[@"kANEFModelProcedureNameToIDMapKey"];
+      NSArray *procedures = description[@"ANEFModelProcedures"];
+      if (![symbols isKindOfClass:NSArray.class] || ![functions isKindOfClass:NSDictionary.class] ||
+          ![procedures isKindOfClass:NSArray.class] || procedures.count != functions.count)
+        throw undescribed();
+      impl_->procedures.resize(procedures.count);
+      for (NSString *function in functions) {
+        NSNumber *index = functions[function];
+        if (![function isKindOfClass:NSString.class] || ![index isKindOfClass:NSNumber.class]) throw undescribed();
+        if (index.unsignedIntegerValue >= procedures.count)
+          throw std::runtime_error("ANE program names an unknown procedure");
+        impl_->procedures[index.unsignedIntegerValue].function = function.UTF8String;
       }
-    }
+      for (NSDictionary *entry in procedures) {
+        if (![entry isKindOfClass:NSDictionary.class]) throw undescribed();
+        NSNumber *index = entry[@"ANEFModelProcedureID"];
+        NSArray *outputs = entry[@"ANEFModelOutputSymbolIndexArray"];
+        NSArray *inputs = entry[@"ANEFModelInputSymbolIndexArray"];
+        if (![index isKindOfClass:NSNumber.class] || ![outputs isKindOfClass:NSArray.class] ||
+            ![inputs isKindOfClass:NSArray.class])
+          throw undescribed();
+        if (index.unsignedIntegerValue >= procedures.count || outputs.count != 1)
+          throw std::runtime_error("ANE program has a procedure of other than one output");
+        NSNumber *output = outputs[0];
+        if (![output isKindOfClass:NSNumber.class]) throw undescribed();
+        Procedure &procedure = impl_->procedures[index.unsignedIntegerValue];
+        procedure.outputSymbol = output.unsignedIntValue;
+        for (NSNumber *symbol in inputs) {
+          if (![symbol isKindOfClass:NSNumber.class]) throw undescribed();
+          if (symbol.unsignedIntegerValue >= symbols.count)
+            throw std::runtime_error("ANE program names an unknown input");
+          NSString *input = symbols[symbol.unsignedIntegerValue];
+          if (![input isKindOfClass:NSString.class]) throw undescribed();
+          procedure.inputSymbols.push_back(symbol.unsignedIntValue);
+          procedure.inputs.emplace_back(input.UTF8String);
+        }
+      }
+    });
   }
 }
 
@@ -266,12 +381,19 @@ void Program::enqueue(uint32_t procedure, std::span<const Surface> inputs, const
                       std::function<void(bool)> done) {
   const Procedure &called = impl_->procedures.at(procedure);
   if (inputs.size() != called.inputs.size()) throw std::invalid_argument("ANE program input count mismatch");
+  const Api &api = impl_->api;
   @autoreleasepool {
-    Class<SplashAneSurface> surfaces = (Class<SplashAneSurface>)requireClass("_ANEIOSurfaceObject");
+    const auto object = [&](const Surface &surface) {
+      return guarded("surface object creation", [&] {
+        id result = [api.surface objectWithIOSurface:(IOSurfaceRef)surface.surface.get()];
+        if (!result) fail("surface object creation", nil);
+        return result;
+      });
+    };
     NSMutableArray *objects = [NSMutableArray arrayWithCapacity:inputs.size()];
     NSMutableArray *indices = [NSMutableArray arrayWithCapacity:inputs.size()];
     for (size_t index = 0; index < inputs.size(); ++index) {
-      [objects addObject:[surfaces objectWithIOSurface:(IOSurfaceRef)inputs[index].surface.get()]];
+      [objects addObject:object(inputs[index])];
       [indices addObject:@(called.inputSymbols[index])];
     }
     id native = (__bridge id)event.nativeHandle();
@@ -279,37 +401,41 @@ void Program::enqueue(uint32_t procedure, std::span<const Surface> inputs, const
     // validation layer wraps lacks: it would raise an Objective-C exception.
     if (![native respondsToSelector:NSSelectorFromString(@"eventPort")])
       throw std::runtime_error("the Neural Engine cannot share a Metal event the validation layer wraps");
-    id events = [(Class<SplashAneEvents>)requireClass("_ANESharedEvents")
-        sharedEventsWithSignalEvents:@[ [(Class<SplashAneEvents>)requireClass("_ANESharedSignalEvent")
-                                         signalEventWithValue:signal
-                                                  symbolIndex:0
-                                                    eventType:0
-                                                  sharedEvent:native] ]
-                          waitEvents:@[ [(Class<SplashAneEvents>)requireClass("_ANESharedWaitEvent")
-                                         waitEventWithValue:wait
-                                                sharedEvent:native
-                                                  eventType:0] ]];
-    id request = [(Class<SplashAneRequest>)requireClass("_ANERequest")
-        requestWithInputs:objects
-             inputIndices:indices
-                  outputs:@[ [surfaces objectWithIOSurface:(IOSurfaceRef)output.surface.get()] ]
-            outputIndices:@[ @(called.outputSymbol) ]
-            weightsBuffer:nil
-                perfStats:nil
-           procedureIndex:@(procedure)
-             sharedEvents:events
-        transactionHandle:nil];
-    if (!request) fail("request creation", nil);
+    id events = guarded("event creation", [&] {
+      id signalEvent = [api.signalEvent signalEventWithValue:signal symbolIndex:0 eventType:0 sharedEvent:native];
+      id waitEvent = [api.waitEvent waitEventWithValue:wait sharedEvent:native eventType:0];
+      if (!signalEvent || !waitEvent) fail("event creation", nil);
+      id result = [api.events sharedEventsWithSignalEvents:@[ signalEvent ] waitEvents:@[ waitEvent ]];
+      if (!result) fail("event creation", nil);
+      return result;
+    });
+    id outputObject = object(output);
+    id request = guarded("request creation", [&] {
+      id result = [api.request requestWithInputs:objects
+                                    inputIndices:indices
+                                         outputs:@[ outputObject ]
+                                   outputIndices:@[ @(called.outputSymbol) ]
+                                   weightsBuffer:nil
+                                       perfStats:nil
+                                  procedureIndex:@(procedure)
+                                    sharedEvents:events
+                               transactionHandle:nil];
+      if (!result) fail("request creation", nil);
+      return result;
+    });
     // An evaluation with shared events runs asynchronously and requires a
-    // completion handler.
-    metal::SharedEvent retained = event;
-    [request setCompletionHandler:^(BOOL success, NSError *) {
-      if (!success) retained.signal(signal);
-      done(success);
-    }];
-    NSError *error = nil;
-    if (![client() evaluateWithModel:impl_->model options:@{} request:request qos:kQos error:&error])
-      fail("evaluation", error);
+    // completion handler, which only reports the evaluation's result. It is
+    // built outside the lambda below so that it holds a copy of `done`: a
+    // block in a lambda holds the lambda's reference instead.
+    void (^completion)(BOOL, NSError *) = ^(BOOL success, NSError *) {
+      if (done) done(success);
+    };
+    guarded("completion handler", [&] { [request setCompletionHandler:completion]; });
+    guarded("evaluation", [&] {
+      NSError *error = nil;
+      if (![api.client evaluateWithModel:impl_->model options:@{} request:request qos:kQos error:&error])
+        fail("evaluation", error);
+    });
   }
 }
 

@@ -50,7 +50,9 @@ inline constexpr uint64_t kConstantOffset = 64;
 // model's intermediate values beside the surfaces, which its procedures share:
 // one program of several functions holds what its largest function needs,
 // where a program per function would hold their sum. Evaluations run
-// asynchronously, ordered against Metal work by a shared event.
+// asynchronously, ordered against Metal work by a shared event. A program
+// throws a std::runtime_error for a class or selector the client lacks, an
+// object it does not return and an Objective-C exception it raises.
 class Program final {
 public:
   // `weights` is the blob file the program's constants name. The service
@@ -69,8 +71,8 @@ public:
 
   // Queues one evaluation of `procedure` that starts once `event` reaches
   // `wait` and raises it to `signal` when done. done(false) reports a failed
-  // evaluation, after the event is raised anyway so that Metal work waiting
-  // on it continues. Throws if the evaluation cannot be queued.
+  // evaluation, for which the program does not raise the event. Throws if the
+  // evaluation cannot be queued.
   void enqueue(uint32_t procedure, std::span<const Surface> inputs, const Surface &output,
                const metal::SharedEvent &event, uint64_t wait, uint64_t signal, std::function<void(bool)> done);
 
