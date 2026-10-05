@@ -55,7 +55,7 @@ template <class Layout> Layout tinyLayout() {
 // loader, in the order it plans them, through check.
 template <class Loader, class Layout, class Open>
 void prepare(metal::MetalBackend &backend, const std::filesystem::path &root, const Layout &layout, Open open) {
-  model::WeightImages images(backend);
+  model::WeightImages images(backend, "fixture");
   Loader loader(images, root, layout);
   open(loader, [](model::WeightFile weights) {
     static_cast<void>(weights.section(weights.record().declaredBytes - model::kWeightFileAlignment, {}));
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
         });
         writeEveryByte(root, model::draftCheckpointImages(layout));
         // The draft reads the images as it reads a package's files.
-        model::WeightImages images(backend);
+        model::WeightImages images(backend, "fixture");
         model::DraftCheckpointLoader files(images, root, layout);
         const model::DFlashDraftWeights draft = model::loadDFlashDraftWeights(backend, std::ref(files), layout);
         const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
       writeEveryByte(root, model::affineTargetImages(layout));
       // The target loader reads the images as affine Q4 projections of
       // the layout's sizes with bf16 norms, the head into fp32 logits.
-      model::WeightImages images(backend);
+      model::WeightImages images(backend, "fixture");
       model::AffineTargetLoader files(images, root, layout);
       const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
       const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {

@@ -455,7 +455,6 @@ struct ModelTelemetry final {
   uint64_t embeddingCacheBytes = 0;
   uint64_t stateHeldImageBytes = 0;
   uint64_t imageRowsBytes = 0;
-  uint32_t lastDecodeWidth = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;

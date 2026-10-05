@@ -75,7 +75,7 @@ std::vector<std::vector<uint8_t>> bytesOf(const model::WeightImages &images) {
 // Every byte of each image the loader writes.
 std::vector<std::vector<uint8_t>> preparedImages(MetalBackend &backend, const std::filesystem::path &path,
                                                  const model::QwenTargetDimensions &geometry) {
-  model::WeightImages images(backend);
+  model::WeightImages images(backend, "fixture");
   loadImages(backend, images, path, geometry);
   return bytesOf(images);
 }
@@ -92,7 +92,7 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
 // the images are released and restored.
 void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
                        const model::QwenTargetDimensions &geometry, const std::string &name, const Goldens &hashes) {
-  model::WeightImages images(backend);
+  model::WeightImages images(backend, "fixture");
   loadImages(backend, images, path, geometry);
   const auto loaded = bytesOf(images);
   for (const auto &image : images.contents())
@@ -332,7 +332,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"output.weight", kQ6_K},
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
-  model::WeightImages images(backend);
+  model::WeightImages images(backend, "fixture");
   model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");

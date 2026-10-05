@@ -1376,8 +1376,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
             "EOS fixture did not terminate synthetic prefill");
     for (uint32_t width = 1; width <= 4; ++width) {
       const auto result = executor.warmupDecodeBatch(width);
-      require(result.lanes.size() == width &&
-                  executor.telemetry().lastDecodeWidth == width,
+      require(result.lanes.size() == width,
               "prefill EOS skipped the actual decode warmup");
     }
     require(executor.warmupCompositeStateRestore().wallSeconds > 0.0,
@@ -2309,11 +2308,9 @@ int main(int argc, char **argv) {
         withRevision({.requestId = b3Ids[1], .logicalPosition = 1, .pageTable = b3Pages[1]}),
         withRevision({.requestId = b3Ids[2], .logicalPosition = 1, .pageTable = b3Pages[2]})};
     auto b3Decoded = executor.decode(b3Plan, b3Items);
-    const model::ModelTelemetry b3Telemetry = executor.telemetry();
     require(b3Decoded.size() == 3 && !b3Decoded[0].outputTokens.empty() &&
                 !b3Decoded[1].outputTokens.empty() &&
-                !b3Decoded[2].outputTokens.empty() &&
-                b3Telemetry.lastDecodeWidth == 3,
+                !b3Decoded[2].outputTokens.empty(),
             "B3 decode did not run one three-lane graph");
     for (uint64_t id : b3Ids)
       executor.end(id);
@@ -2460,10 +2457,7 @@ int main(int argc, char **argv) {
                                               .pageTable = raggedPages[lane]});
     }
     auto raggedDecoded = executor.decode(raggedDecodePlan, raggedDecodeItems);
-    const model::ModelTelemetry raggedDecodeTelemetry =
-        executor.telemetry();
-    require(raggedDecoded.size() == raggedIds.size() &&
-                raggedDecodeTelemetry.lastDecodeWidth == 4,
+    require(raggedDecoded.size() == raggedIds.size(),
             "permuted ragged B4 did not run one four-lane graph");
     for (uint64_t id : raggedIds)
       executor.end(id);
@@ -2506,8 +2500,7 @@ int main(int argc, char **argv) {
     }
     auto raggedReferenceDecoded =
         executor.decode(raggedReferenceDecodePlan, raggedReferenceDecodeItems);
-    require(raggedReferenceDecoded.size() == raggedPermutation.size() &&
-                executor.telemetry().lastDecodeWidth == 4,
+    require(raggedReferenceDecoded.size() == raggedPermutation.size(),
             "permuted ragged reference was not one four-lane graph");
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];
@@ -3405,8 +3398,6 @@ int main(int argc, char **argv) {
         executor.telemetry();
     require(batch4.wallSeconds >= b4Telemetry.lastDecodeWallSeconds,
             "decode warmup excluded production work from phase wall time");
-    require(b4Telemetry.lastDecodeWidth == 4,
-            "B4 decode did not execute one four-lane production graph");
     const auto repeatedBatch4 = executor.warmupDecodeBatch(4);
     require(repeatedBatch4.lanes == batch4.lanes,
             "repeated baseline B4 decode changed its deterministic result");

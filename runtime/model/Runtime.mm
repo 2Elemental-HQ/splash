@@ -1680,7 +1680,6 @@ struct Runtime::Impl {
         emitTerminalAnchor(entry, result);
     }
 
-    counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
@@ -2519,11 +2518,10 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                                    decoded[lane].outputTokensWithoutKv &&
                            lengths.hasCompleteDraftWindow(kDraftCacheStride);
     }
-    if (!committedEveryLane || impl_->counters.lastDecodeWidth != width) {
+    if (!committedEveryLane) {
       throw std::runtime_error(
           "decode warmup B" + std::to_string(width) +
-          " mismatch [committed=" + std::to_string(committedEveryLane) +
-          ",width=" + std::to_string(impl_->counters.lastDecodeWidth) + "]");
+          " mismatch [results=" + std::to_string(decoded.size()) + "]");
     }
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),

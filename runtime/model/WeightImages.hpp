@@ -50,7 +50,7 @@ struct ImagePlan final {
 // contentIdentity, what the sources hold (ModelDescriptor::sourceIdentity).
 class WeightImages final : public WeightMemory {
 public:
-  explicit WeightImages(metal::MetalBackend &backend, std::string contentIdentity = {}) noexcept
+  WeightImages(metal::MetalBackend &backend, std::string contentIdentity) noexcept
       : backend_(&backend), contentIdentity_(std::move(contentIdentity)) {}
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;

@@ -347,7 +347,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         return std::memcmp(output.contents(), expected.data(), sizeof(expected)) == 0;
     };
     {
-        splash::model::WeightImages images(backend);
+        splash::model::WeightImages images(backend, "fixture");
         WeightFile file = images.load(
             splash::model::packedImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
         retained = file.section(sizeof(expected), "payload");
@@ -393,7 +393,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
 
     const auto load = [&](const std::filesystem::path &path, std::string_view magic, uint32_t layer,
                           uint32_t type) {
-        splash::model::WeightImages images(backend);
+        splash::model::WeightImages images(backend, "fixture");
         return images.load(splash::model::packedImage(path, "test/" + path.filename().string(), magic, layer, type));
     };
     auto headerPath = root / "header.bin";
@@ -467,7 +467,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
                                             .outputSize = rows,
                                             .inputSize = columns,
                                             .plane0Bytes = rows * splash::model::ggufRowBytes(q80, columns)});
-    splash::model::WeightImages images(backend);
+    splash::model::WeightImages images(backend, "fixture");
     const auto loaded = [&](const std::filesystem::path &path) {
         return images.load(
             splash::model::packedImage(path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0));

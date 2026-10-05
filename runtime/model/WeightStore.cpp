@@ -267,9 +267,7 @@ std::string weightManifestFingerprint(
     for (const WeightFileRecord &record : sorted) {
         canonical << record.relativePath << '\t' << record.declaredBytes
                   << '\t' << record.magic << '\t' << record.layer << '\t'
-                  << record.type;
-        if (!record.contentIdentity.empty()) canonical << '\t' << record.contentIdentity;
-        canonical << '\n';
+                  << record.type << '\t' << record.contentIdentity << '\n';
     }
     return weightDigest(canonical.str());
 }
