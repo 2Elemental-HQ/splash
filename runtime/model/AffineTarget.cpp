@@ -66,7 +66,7 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
   // fine-tunes such as Ornith 1.5 still write.
   source.requireConfigString("rope_parameters.rope_type", "default", "rope_parameters.type");
   source.requireLayerTypes(layout.layers, layout.fullAttentionPeriod);
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
+  if (layout.ffnKind == QwenFfnKind::SparseMoe) {
     source.requireConfigString("model_type", "qwen3_5_moe_text");
     source.requireConfigNumber("num_experts", layout.experts);
     source.requireConfigNumber("num_experts_per_tok", layout.expertsPerToken);
@@ -120,7 +120,7 @@ Image layerImage(const Layout &layout, uint32_t layer) {
       projection(result, {{name + projectionName, n}}, n, k, 4, experts);
     }
   };
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
+  if (layout.ffnKind == QwenFfnKind::SparseMoe) {
     // The router and the shared-expert scalar gate are 8-bit, their rows padded to
     // whole 256-row tiles as the reader expects.
     projection(result, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);

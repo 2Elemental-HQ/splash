@@ -16,53 +16,6 @@
 namespace splash::model {
 namespace {
 
-template <class Layout>
-QwenTargetGeometry commonGeometry(const Layout &layout) {
-  static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
-                QwenTargetGeometry::maximumCaptureLayers);
-  QwenTargetGeometry result;
-  result.layers = layout.layers;
-  result.hiddenSize = layout.hiddenSize;
-  result.vocabularySize = layout.vocabularySize;
-  result.packedGdnWidth = layout.packedGdnWidth;
-  result.packedFullWidth = layout.packedFullWidth;
-  result.convolutionDimension = layout.convolutionDimension;
-  result.attentionWidth = layout.attentionWidth;
-  result.attentionQueryHeads = layout.attentionQueryHeads;
-  result.attentionKvHeads = layout.attentionKvHeads;
-  result.attentionHeadDimension = layout.attentionHeadDimension;
-  result.rotaryPairs = layout.rotaryPairs;
-  result.rotaryTheta = layout.rotaryTheta;
-  result.gdnKeyHeads = layout.gdnKeyHeads;
-  result.gdnValueHeads = layout.gdnValueHeads;
-  result.gdnHeadDimension = layout.gdnHeadDimension;
-  result.maskToken = layout.maskToken;
-  result.stopTokens = layout.stopTokens;
-  result.ffnKind = Layout::ffnKind;
-  result.kvLayout = layout.kvLayout();
-  result.stateLayout = layout.gdnStateLayout();
-  result.captureLayerCount =
-      static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(),
-            layout.hiddenCaptureLayers.end(),
-            result.captureLayerValues.begin());
-  return result;
-}
-
-QwenTargetGeometry geometryFor(const Qwen3_8Layout &layout) {
-  QwenTargetGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  return result;
-}
-
-QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
-  QwenTargetGeometry result = commonGeometry(layout);
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  result.expertIntermediateSize = layout.expertIntermediateSize;
-  return result;
-}
-
 template <class Weights>
 void requireWeights(const Weights &weights,
                     const QwenTargetGeometry &geometry) {
@@ -136,7 +89,15 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
 
 template <class Layout, class Layer>
 QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights) {
-  auto geometry = geometryFor(weights.layout);
+  const Layout &layout = weights.layout;
+  static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
+                QwenTargetGeometry::maximumCaptureLayers);
+  QwenTargetGeometry geometry(layout);
+  geometry.captureLayerCount = static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
+  std::copy(layout.hiddenCaptureLayers.begin(), layout.hiddenCaptureLayers.end(),
+            geometry.captureLayerValues.begin());
+  geometry.kvLayout = layout.kvLayout();
+  geometry.stateLayout = layout.gdnStateLayout();
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
       includeProjection(geometry, mixer.inputProjection);

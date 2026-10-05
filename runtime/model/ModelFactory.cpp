@@ -75,7 +75,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
+          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -121,7 +121,7 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
     bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, ggufTargetGeometry(layout))); },
+        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
         descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);

@@ -23,7 +23,7 @@ class GgufTargetLoader final {
 public:
   // Plans every image from the GGUF's metadata once.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry);
+                   const QwenTargetDimensions &geometry);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -48,33 +48,5 @@ private:
   std::shared_ptr<Planned> planned_;
   std::optional<GgufRotation> rotation_;
 };
-
-// The GGUF geometry of a Qwen layout with its family's dense or sparse MoE
-// FFN.
-template <class Layout>
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Layout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.gdnKeyHeads = layout.gdnKeyHeads;
-  geometry.gdnValueHeads = layout.gdnValueHeads;
-  geometry.gdnHeadDimension = layout.gdnHeadDimension;
-  geometry.convolutionDimension = layout.convolutionDimension;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
-    geometry.experts = layout.experts;
-    geometry.expertsPerToken = layout.expertsPerToken;
-    geometry.expertIntermediateSize = layout.expertIntermediateSize;
-  } else {
-    geometry.intermediateSize = layout.intermediateSize;
-  }
-  return geometry;
-}
 
 } // namespace splash::model

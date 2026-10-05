@@ -145,11 +145,11 @@ std::set<LinearWorkload> expectedLinear(
       add(matrix, phase, LinearEpilogue::None);
     add({target.hiddenSize, target.attentionWidth}, phase, LinearEpilogue::Residual);
     if (target.ffnKind == QwenFfnKind::Dense)
-      add({target.hiddenSize, target.denseIntermediateSize}, phase,
+      add({target.hiddenSize, target.intermediateSize}, phase,
            LinearEpilogue::Residual);
   }
   if (target.ffnKind == QwenFfnKind::Dense) {
-    const LinearMatrix up{target.denseIntermediateSize, target.hiddenSize};
+    const LinearMatrix up{target.intermediateSize, target.hiddenSize};
     add(up, LinearPhase::Prefill, LinearEpilogue::None);
     add(up, LinearPhase::Prefill, LinearEpilogue::UpWithGate);
     add(up, LinearPhase::Decode, LinearEpilogue::GateUp);

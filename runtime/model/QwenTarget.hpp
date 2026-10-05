@@ -68,39 +68,23 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 };
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
-// targets. It describes semantics only; operators remain responsible for
-// choosing device-specific Metal pipelines and compute tiles.
-struct QwenTargetGeometry final {
+// targets: the target's dimensions, the layers the draft reads and what its
+// loaded weights add. It describes semantics only; operators remain
+// responsible for choosing device-specific Metal pipelines and compute tiles.
+struct QwenTargetGeometry final : QwenTargetDimensions {
   static constexpr uint32_t maximumCaptureLayers = 8;
 
-  uint32_t layers = 0;
-  uint32_t hiddenSize = 0;
-  uint32_t vocabularySize = 0;
-  uint32_t packedGdnWidth = 0;
-  uint32_t packedFullWidth = 0;
-  uint32_t convolutionDimension = 0;
-  uint32_t gdnKeyHeads = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t attentionWidth = 0;
-  uint32_t attentionQueryHeads = 0;
-  uint32_t attentionKvHeads = 0;
-  uint32_t attentionHeadDimension = 0;
-  uint32_t rotaryPairs = 0;
-  float rotaryTheta = 0.0F;
-  uint32_t denseIntermediateSize = 0;
-  uint32_t experts = 0;
-  uint32_t expertsPerToken = 0;
-  uint32_t expertIntermediateSize = 0;
-  QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  QwenTargetGeometry() = default;
+  explicit QwenTargetGeometry(const QwenTargetDimensions &dimensions) : QwenTargetDimensions(dimensions) {}
+
   // The weight layout every sparse MoE block of the target shares, and in a
   // GGUF the format of most of its routed expert weights.
   ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
-  uint32_t maskToken = 0;
-  std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
+  // The target's KV layout in the format the runtime stores KV in, and its
+  // GDN state layout.
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
   // Distinct operator requirements, collected from the loaded weights.
@@ -118,7 +102,7 @@ struct QwenTargetGeometry final {
     return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat};
   }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
-    return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
+    return ffnKind == QwenFfnKind::Dense ? intermediateSize
                                          : expertIntermediateSize;
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
@@ -151,7 +135,7 @@ struct QwenTargetGeometry final {
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
-           ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize && sized(gateUpProjections)) ||
+           ((ffnKind == QwenFfnKind::Dense && intermediateSize && sized(gateUpProjections)) ||
             (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid()));
   }
 };

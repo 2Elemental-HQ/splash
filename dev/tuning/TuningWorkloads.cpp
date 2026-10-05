@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
+#include <type_traits>
 
 namespace splash::model {
 namespace {
@@ -92,7 +93,7 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
         bothPhases(mixer.inputProjection);
         bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
-      if constexpr (decltype(target.layout)::ffnKind == QwenFfnKind::Dense) {
+      if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layer)>, Qwen3_8LayerWeights>) {
         projection(layer.gateProjection, LinearPhase::Prefill,
                      LinearEpilogue::None);
         projection(layer.upProjection, LinearPhase::Prefill,
