@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         // Each image is written into memory of its own, so one is held at a
         // time.
         const auto check = [&](const auto &load, uint64_t decayOffset = 0, uint32_t decayHeads = 0) {
-          model::WeightImages images(backend);
+          model::WeightImages images(backend, descriptor.sourceIdentity);
           model::AffineTargetLoader loader(images, argv[2], layout);
           compare(load(loader), package / "target", decayOffset, decayHeads);
         };

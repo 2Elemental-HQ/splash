@@ -22,14 +22,9 @@ template <class Weights>
 model::ModelPackage package() {
   model::ModelPackage result;
   Weights target;
-  model::DFlashDraftLayout draft;
-  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>) {
-    draft.layers = 6;
-    draft.hiddenSize = 2048;
-    draft.dynamicSize = 512;
-    draft.intermediateSize = 6144;
-    draft.targetHiddenSize = target.layout.capturedHiddenSize();
-  }
+  const model::DFlashDraftLayout draft = std::is_same_v<Weights, model::Qwen3_6MoeWeights>
+                                             ? model::kQwen3_6MoeDraftLayout
+                                             : model::kQwen3_8DraftLayout;
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::AffineWeights{});
   };

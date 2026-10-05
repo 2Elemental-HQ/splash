@@ -50,19 +50,27 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
+// The dynamic convolutions of every DFlash2 draft layer, as the draft
+// kernels run them (decode/draft.metal): two taps, a row and the one before
+// it, each with one dynamic weight per group of 16 channels.
+inline constexpr uint32_t kDraftConvolutionGroup = 16;
+inline constexpr uint32_t kDraftConvolutionTaps = 2;
+
+// The dimensions of a DFlash2 draft. Each target's draft is defined beside
+// the target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct DFlashDraftLayout final {
-  uint32_t layers = 5;
-  uint32_t hiddenSize = 5120;
-  uint32_t vocabularySize = 248320;
-  uint32_t dynamicSize = 1280;
-  uint32_t qkvSize = 6144;
-  uint32_t attentionSize = 4096;
-  uint32_t intermediateSize = 17408;
-  uint32_t attentionHeadDimension = 128;
-  float rotaryTheta = 10'000'000.0F;
-  uint32_t targetHiddenSize = 25600;
-  uint32_t selectorRank = 256;
-  uint32_t kvHeads = 8;
+  uint32_t layers = 0;
+  uint32_t hiddenSize = 0;
+  uint32_t vocabularySize = 0;
+  uint32_t dynamicSize = 0;
+  uint32_t qkvSize = 0;
+  uint32_t attentionSize = 0;
+  uint32_t intermediateSize = 0;
+  uint32_t attentionHeadDimension = 0;
+  float rotaryTheta = 0.0F;
+  uint32_t targetHiddenSize = 0;
+  uint32_t selectorRank = 0;
+  uint32_t kvHeads = 0;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension};

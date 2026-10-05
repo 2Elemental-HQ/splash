@@ -78,7 +78,7 @@ struct BlockTargetFormat final {
 // (instantiated for both formats).
 template <class Format>
 [[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                                             const QwenMixerGeometry &geometry,
+                                             const QwenTargetDimensions &target,
                                              bool fullAttention);
 
 // Loads the packed files of a target directory: one per hybrid layer,
@@ -119,7 +119,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-    layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
+    layer.mixer = readQwenMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
     readFfn(file, layer, format);
     file.finish();
@@ -154,17 +154,10 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
 // agree with each other and every projection fits the Q4 storage tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
-  uint32_t ffnWidth = 0;
-  bool ffnZero = false;
-  bool routingInconsistent = false;
-  if constexpr (Layout::ffnKind == QwenFfnKind::Dense) {
-    ffnWidth = layout.intermediateSize;
-    ffnZero = zero(ffnWidth);
-  } else {
-    ffnWidth = layout.expertIntermediateSize;
-    ffnZero = zero(layout.experts, layout.expertsPerToken, ffnWidth);
-    routingInconsistent = layout.expertsPerToken > layout.experts;
-  }
+  const bool dense = layout.ffnKind == QwenFfnKind::Dense;
+  const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
+  const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
+  const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
   if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
       zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,

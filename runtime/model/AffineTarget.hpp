@@ -16,10 +16,10 @@ namespace affine {
 struct PlannedCheckpoint;
 }
 
-// Native MLX affine source -> the existing packed target ABI; neither this
-// adapter nor the block-quantized one changes inference kernels. The
-// checkpoint is planned once; each image is written into memory when it is
-// opened.
+// Writes a native MLX affine checkpoint's target into images laid out as a
+// Splash package's target files, which QwenTargetLoader reads as affine
+// weights (AffineTargetFormat). The checkpoint is planned once; each image is
+// written into memory when it is opened.
 class AffineTargetLoader final {
 public:
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_8Layout &layout);

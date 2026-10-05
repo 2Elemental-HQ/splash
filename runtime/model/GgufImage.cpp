@@ -6,7 +6,6 @@
 #include "model/WeightLayout.hpp"
 
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -43,7 +42,7 @@ bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::
 // every such tensor at once; a tensor of the wrong shape throws.
 class Builder {
 public:
-  Builder(const GgufFile &file, const TargetGeometry &geometry, std::vector<std::string> &problems,
+  Builder(const GgufFile &file, const QwenTargetDimensions &geometry, std::vector<std::string> &problems,
           std::string name, uint32_t layer, uint32_t type)
       : file_(file), geometry_(geometry), problems_(problems) {
     image_.name = std::move(name);
@@ -219,24 +218,22 @@ private:
                   const GgufPlaneBytes &bytes, const std::string &name) {
     if (rows > std::numeric_limits<uint32_t>::max() || columns > std::numeric_limits<uint32_t>::max())
       throw GgufError("tensor is too large for its descriptor: " + name);
-    GgufTensorDescriptor d{};
-    d.type = type;
-    d.outputSize = static_cast<uint32_t>(rows);
-    d.inputSize = static_cast<uint32_t>(columns);
-    d.p0 = format.plane0_bytes;
-    d.p1 = format.plane1_bytes;
-    d.metaBytes = format.meta_bytes;
-    d.metaGroups = format.meta_groups;
-    d.plane0Bytes = bytes.plane0;
-    d.plane1Bytes = bytes.plane1;
-    d.metaTotalBytes = bytes.meta;
-    std::vector<uint8_t> encoded(sizeof d);
-    std::memcpy(encoded.data(), &d, sizeof d);
-    image_.fills.push_back({section(encoded.size()), std::move(encoded)});
+    const auto encoded = GgufTensorDescriptor{.type = type,
+                                              .outputSize = static_cast<uint32_t>(rows),
+                                              .inputSize = static_cast<uint32_t>(columns),
+                                              .p0 = format.plane0_bytes,
+                                              .p1 = format.plane1_bytes,
+                                              .metaBytes = format.meta_bytes,
+                                              .metaGroups = format.meta_groups,
+                                              .plane0Bytes = bytes.plane0,
+                                              .plane1Bytes = bytes.plane1,
+                                              .metaTotalBytes = bytes.meta}
+                             .encode();
+    image_.fills.push_back({section(encoded.size()), {encoded.begin(), encoded.end()}});
   }
 
   const GgufFile &file_;
-  const TargetGeometry &geometry_;
+  const QwenTargetDimensions &geometry_;
   std::vector<std::string> &problems_;
   Image image_;
   uint64_t cursor_ = 0;
@@ -247,8 +244,8 @@ std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."
 // The target geometry the metadata declares, with the rotary embedding and
 // norms the kernels compute: the RoPE base and rotated dimensions, the RMS
 // epsilon and no RoPE scaling. One error names every mismatch.
-void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
-  const std::string arch = geometry.architecture();
+void requireMetadata(const GgufFile &file, const QwenTargetDimensions &geometry) {
+  const std::string arch = architecture(geometry.ffnKind);
   if (file.architecture() != arch)
     throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
   std::string mismatched;
@@ -286,7 +283,7 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   expect("ssm.time_step_rank", geometry.gdnValueHeads);
   expect("ssm.state_size", geometry.gdnHeadDimension);
   expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
-  if (geometry.sparseMoe()) {
+  if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
     expect("expert_feed_forward_length", geometry.expertIntermediateSize);
@@ -297,7 +294,7 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
-Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std::string> &problems,
+Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
                  uint32_t index) {
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
@@ -325,7 +322,7 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }
   b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
-  if (g.sparseMoe()) {
+  if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
     b.quantized(p + "ffn_gate_exps.weight", routed * width, g.hiddenSize);
@@ -348,9 +345,9 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
 // H (D x) (ops::InputRotation) while float segments (F32 or BF16 alpha/beta)
 // read x as it is, and the token table, which the rotated gather decodes from
 // PQ2_0 rows, with the GDN value heads of the rotated inputs grouped.
-void requireRotation(const GgufFile &file, const TargetGeometry &g, const std::vector<Image> &images) {
+void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const std::vector<Image> &images) {
   const GgufRotation &rotation = *file.rotation();
-  if (g.sparseMoe()) throw GgufError("rotated weights are supported for dense targets only");
+  if (g.ffnKind == QwenFfnKind::SparseMoe) throw GgufError("rotated weights are supported for dense targets only");
   if (!rotation.valueHeadsGrouped)
     throw GgufError("rotated GDN inputs must keep their value heads grouped (prism.hadamard.gdn_v_grouped)");
   std::set<std::string, std::less<>> repacked;
@@ -366,7 +363,7 @@ void requireRotation(const GgufFile &file, const TargetGeometry &g, const std::v
 
 } // namespace
 
-std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry) {
+std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry) {
   requireMetadata(file, geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;

@@ -59,7 +59,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // Loads every image of the GGUF at path into images: the layers', the head's
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
-                const model::gguf::TargetGeometry &geometry) {
+                const model::QwenTargetDimensions &geometry) {
   model::GgufTargetLoader loader(backend, images, path, geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
@@ -74,14 +74,14 @@ std::vector<std::vector<uint8_t>> bytesOf(const model::WeightImages &images) {
 
 // Every byte of each image the loader writes.
 std::vector<std::vector<uint8_t>> preparedImages(MetalBackend &backend, const std::filesystem::path &path,
-                                                 const model::gguf::TargetGeometry &geometry) {
-  model::WeightImages images(backend);
+                                                 const model::QwenTargetDimensions &geometry) {
+  model::WeightImages images(backend, "fixture");
   loadImages(backend, images, path, geometry);
   return bytesOf(images);
 }
 
 std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
-                                        const model::gguf::TargetGeometry &geometry) {
+                                        const model::QwenTargetDimensions &geometry) {
   model::WeightSource source(path);
   const model::GgufFile gguf(source);
   return model::gguf::planImages(gguf, geometry);
@@ -91,8 +91,8 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
 // `name`, and every golden of `name` written; then the same bytes again once
 // the images are released and restored.
 void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
-                       const model::gguf::TargetGeometry &geometry, const std::string &name, const Goldens &hashes) {
-  model::WeightImages images(backend);
+                       const model::QwenTargetDimensions &geometry, const std::string &name, const Goldens &hashes) {
+  model::WeightImages images(backend, "fixture");
   loadImages(backend, images, path, geometry);
   const auto loaded = bytesOf(images);
   for (const auto &image : images.contents())
@@ -112,7 +112,7 @@ void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
 // grouped head order, the bf16-exact rule and the golden images.
 void checkDense(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
   SmallTarget target = smallTarget(false);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "dense.gguf";
   writeGguf(path, target.tensors, g);
   const std::vector<model::gguf::Image> images = planned(path, g);
@@ -165,7 +165,7 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
   for (bool moe : {false, true})
     for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
       SmallTarget target = smallTarget(moe);
-      const model::gguf::TargetGeometry &g = target.geometry;
+      const model::QwenTargetDimensions &g = target.geometry;
       const Fmt f = Fmt(format);
       const uint32_t stride = rowBytes(f, g.hiddenSize);
       uint32_t seed = 1200 + 2 * format;
@@ -183,7 +183,8 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
       }
       rows.resize(QUANT_TILE_ROWS * stride);
       const Packed expected = repack(f, rows, QUANT_TILE_ROWS, g.hiddenSize, nullptr);
-      const auto path = directory / (std::string(g.architecture()) + "-" + fmtName(format) + ".gguf");
+      const auto path =
+          directory / (std::string(model::gguf::architecture(g.ffnKind)) + "-" + fmtName(format) + ".gguf");
       writeGguf(path, target.tensors, g);
       const auto images = planned(path, g);
       const auto prepared = preparedImages(backend, path, g);
@@ -196,7 +197,7 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
                 (!kQuantFormats[format].plane1_bytes || matches(pair->plane1, expected.w1)) &&
                 matches(pair->meta, expected.meta),
             std::string("prepared ") + fmtName(format) + " alpha/beta and zero rows match the CPU reference (" +
-                g.architecture() + ")");
+                model::gguf::architecture(g.ffnKind) + ")");
     }
 }
 
@@ -204,7 +205,7 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
 // offsets past 4 GiB.
 void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, const Goldens &hashes) {
   SmallTarget target = smallTarget(true);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "moe.gguf";
   writeGguf(path, target.tensors, g);
   checkGoldenImages(backend, path, g, "moe", hashes);
@@ -249,7 +250,7 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
 // values they equal.
 void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(true);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "moe-bf16.gguf";
   std::map<std::string, std::vector<uint8_t>> floats; // the F32 values of the BF16 tensors
   uint32_t seed = 960;
@@ -313,27 +314,26 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   layout.hiddenCaptureLayers.fill(layout.layers - 1);
   const uint32_t hidden = layout.hiddenSize, valueRows = layout.gdnValueHeads * layout.gdnHeadDimension;
   const uint32_t kvRows = layout.attentionKvHeads * layout.attentionHeadDimension;
-  const model::gguf::TargetGeometry geometry = model::ggufTargetGeometry(layout);
   const auto target = directory / "target";
   std::filesystem::create_directory(target);
   writeGguf(target / "target.gguf",
-            targetTensors(geometry, {{"attn_q.weight", kQ8_0},
-                                     {"attn_k.weight", kQ4_K},
-                                     {"attn_v.weight", kQ6_K},
-                                     {"attn_output.weight", kQ8_0},
-                                     {"attn_qkv.weight", kQ8_0},
-                                     {"attn_gate.weight", kQ4_K},
-                                     {"ssm_beta.weight", kIQ4_XS},
-                                     {"ssm_alpha.weight", kIQ4_XS},
-                                     {"ssm_out.weight", kQ8_0},
-                                     {"ffn_gate.weight", kQ4_K},
-                                     {"ffn_up.weight", kQ4_K},
-                                     {"ffn_down.weight", kQ6_K},
-                                     {"output.weight", kQ6_K},
-                                     {"token_embd.weight", kIQ4_XS}}),
-            geometry);
-  model::WeightImages images(backend);
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), geometry);
+            targetTensors(layout, {{"attn_q.weight", kQ8_0},
+                                   {"attn_k.weight", kQ4_K},
+                                   {"attn_v.weight", kQ6_K},
+                                   {"attn_output.weight", kQ8_0},
+                                   {"attn_qkv.weight", kQ8_0},
+                                   {"attn_gate.weight", kQ4_K},
+                                   {"ssm_beta.weight", kIQ4_XS},
+                                   {"ssm_alpha.weight", kIQ4_XS},
+                                   {"ssm_out.weight", kQ8_0},
+                                   {"ffn_gate.weight", kQ4_K},
+                                   {"ffn_up.weight", kQ4_K},
+                                   {"ffn_down.weight", kQ6_K},
+                                   {"output.weight", kQ6_K},
+                                   {"token_embd.weight", kIQ4_XS}}),
+            layout);
+  model::WeightImages images(backend, "fixture");
+  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");

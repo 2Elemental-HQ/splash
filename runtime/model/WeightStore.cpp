@@ -45,10 +45,11 @@ namespace {
 // The header weightFileHeader writes, which the first section follows.
 constexpr uint64_t kHeaderBytes = std::tuple_size_v<decltype(weightFileHeader({}, 0, 0))>;
 
-uint64_t alignPacked(uint64_t value) {
+// Where the section after `offset` starts: the next section boundary.
+uint64_t sectionStart(uint64_t offset) {
     static_cast<void>(
-        checkedAdd<WeightStoreError>(value, kWeightFileAlignment - 1, "packed file alignment"));
-    return alignWeightOffset(value);
+        checkedAdd<WeightStoreError>(offset, kWeightFileAlignment - 1, "weight image section offset"));
+    return alignWeightOffset(offset);
 }
 
 } // namespace
@@ -66,10 +67,10 @@ void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view e
                        const std::string &what) {
     const auto expected = weightFileHeader(expectedMagic, expectedLayer, expectedType);
     if (bytes < expected.size() || bytes % kWeightFileAlignment) {
-        throw WeightStoreError("packed file size is not 16 KiB-aligned: " + what);
+        throw WeightStoreError("weight image size is not 16 KiB-aligned: " + what);
     }
     if (std::memcmp(header, expected.data(), expected.size()) != 0) {
-        throw WeightStoreError("packed file header mismatch: " + what);
+        throw WeightStoreError("weight image header mismatch: " + what);
     }
 }
 } // namespace
@@ -95,12 +96,12 @@ WeightFile::~WeightFile() = default;
 
 metal::MetalBuffer WeightFile::section(uint64_t bytes,
                                        std::string_view label) {
-    if (!bytes) throw WeightStoreError("packed section must not be empty");
-    uint64_t start = alignPacked(impl_->offset);
-    uint64_t end = checkedAdd<WeightStoreError>(start, bytes, "packed section end");
+    if (!bytes) throw WeightStoreError("weight image section must not be empty");
+    uint64_t start = sectionStart(impl_->offset);
+    uint64_t end = checkedAdd<WeightStoreError>(start, bytes, "weight image section end");
     if (start % kWeightFileAlignment || end > impl_->base.sizeBytes()) {
-        throw WeightStoreError(
-            "packed file is truncated at section " + std::string(label));
+        throw WeightStoreError("weight image " + impl_->record.relativePath +
+                               " is truncated at section " + std::string(label));
     }
     impl_->offset = end;
     return impl_->backend->view(impl_->base, start, bytes);
@@ -109,7 +110,7 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
 std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t> parts,
                                                   std::string_view label) {
     uint64_t bytes = 0;
-    for (uint64_t part : parts) bytes = checkedAdd<WeightStoreError>(bytes, part, "packed section size");
+    for (uint64_t part : parts) bytes = checkedAdd<WeightStoreError>(bytes, part, "weight image section size");
     const metal::MetalBuffer whole = section(bytes, label);
     std::vector<metal::MetalBuffer> views;
     uint64_t offset = 0;
@@ -121,10 +122,10 @@ std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t
 }
 
 void WeightFile::finish() {
-    uint64_t consumed = alignPacked(impl_->offset);
+    uint64_t consumed = sectionStart(impl_->offset);
     if (consumed != impl_->base.sizeBytes()) {
         throw WeightStoreError(
-            "packed file has unconsumed or missing bytes: " +
+            "weight image has unconsumed or missing bytes: " +
             impl_->record.relativePath);
     }
 }
@@ -166,11 +167,11 @@ ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
 
 namespace {
 GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
-    metal::MetalBuffer section = file.section(sizeof(GgufTensorDescriptor), std::string(label) + "-desc");
+    metal::MetalBuffer section = file.section(GgufTensorDescriptor::kBytes, std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
-    GgufTensorDescriptor d;
-    std::memcpy(&d, bytes, sizeof d);
+    const GgufTensorDescriptor d = GgufTensorDescriptor::decode(
+        std::span<const uint8_t, GgufTensorDescriptor::kBytes>(bytes, GgufTensorDescriptor::kBytes));
     // Float tensors are rows as stored; quantized ones fill whole tiles.
     if (!d.outputSize || !d.inputSize ||
         (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
@@ -266,9 +267,7 @@ std::string weightManifestFingerprint(
     for (const WeightFileRecord &record : sorted) {
         canonical << record.relativePath << '\t' << record.declaredBytes
                   << '\t' << record.magic << '\t' << record.layer << '\t'
-                  << record.type;
-        if (!record.contentIdentity.empty()) canonical << '\t' << record.contentIdentity;
-        canonical << '\n';
+                  << record.type << '\t' << record.contentIdentity << '\n';
     }
     return weightDigest(canonical.str());
 }

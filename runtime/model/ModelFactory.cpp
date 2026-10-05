@@ -3,6 +3,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/VisionLoader.hpp"
 
 #include <functional>
 #include <limits>
@@ -40,6 +41,25 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
+// The vision role's upstream source, planned; null for a packed vision file
+// or a model without vision.
+std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
+    return nullptr;
+  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
+}
+
+// The vision role: written by `loader` when there is one, else the packed
+// file; empty weights for a model without vision.
+QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                    const VisionLoader *loader) {
+  if (loader) return loadQwenVisionWeights(backend, images, *loader);
+  if (descriptor.visionSource == VisionSource::Packed)
+    return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
+  return {};
+}
+
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
   uint64_t total = 0;
   for (const Image &image : images) total += image.bytes;
@@ -75,7 +95,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
+          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -100,28 +120,13 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   return result;
 }
 
-std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
-    return nullptr;
-  return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
-}
-
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                                    const VisionLoader *loader) {
-  if (loader) return loadQwenVisionWeights(backend, images, *loader);
-  if (descriptor.visionSource == VisionSource::Packed)
-    return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
-  return {};
-}
-
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
     bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, ggufTargetGeometry(layout))); },
+        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
         descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);

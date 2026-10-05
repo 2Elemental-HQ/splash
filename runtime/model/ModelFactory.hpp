@@ -6,7 +6,6 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
-#include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -78,16 +77,6 @@ void requireCompatibleModelPackage(const ModelPackage &package);
 
 // The bytes of every image the model's weights load into.
 [[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
-
-// The vision role's upstream source, planned; null for a packed vision file
-// or a model without vision.
-[[nodiscard]] std::unique_ptr<VisionLoader>
-planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor);
-// The vision role: written by `loader` when there is one, else the packed
-// file; empty weights for a model without vision.
-[[nodiscard]] QwenVisionWeights
-loadVisionWeights(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &root,
-                  const ModelDescriptor &descriptor, const VisionLoader *loader);
 
 // Production loading is selected by the validated package descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.

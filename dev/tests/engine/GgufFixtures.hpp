@@ -129,7 +129,7 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
 }
 
 // Every tensor of the geometry, zero, in the order llama.cpp writes them.
-inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, const TensorTypes &types) {
+inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types) {
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
     const uint32_t type = typeOf(types, name);
@@ -163,7 +163,7 @@ inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, c
       add(p + "ssm_out.weight", {valueRows, hidden});
     }
     add(p + "post_attention_norm.weight", {hidden});
-    if (g.sparseMoe()) {
+    if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
       const uint64_t experts = g.experts, width = g.expertIntermediateSize;
       add(p + "ffn_gate_inp.weight", {hidden, experts});
       add(p + "ffn_gate_exps.weight", {hidden, width, experts});
@@ -200,7 +200,7 @@ inline Tensor &tensorNamed(std::vector<Tensor> &tensors, const std::string &name
 
 // A small target: its geometry and its tensors.
 struct SmallTarget {
-  model::gguf::TargetGeometry geometry;
+  model::QwenTargetDimensions geometry;
   std::vector<Tensor> tensors;
   [[nodiscard]] test_gguf::Bytes &data(const std::string &name) { return tensorNamed(tensors, name).data; }
 };
@@ -227,7 +227,7 @@ inline void randomize(std::vector<Tensor> &tensors, uint32_t seed) {
 // first in its file.
 inline SmallTarget smallTarget(bool moe) {
   SmallTarget target;
-  model::gguf::TargetGeometry &g = target.geometry;
+  model::QwenTargetDimensions &g = target.geometry;
   g.hiddenSize = 512;
   g.vocabularySize = 256;
   g.gdnKeyHeads = 4;
@@ -242,6 +242,7 @@ inline SmallTarget smallTarget(bool moe) {
     g.layers = 1;
     g.gdnValueHeads = 8;
     g.convolutionDimension = 1024; // q and k of 4 heads, v of 8
+    g.ffnKind = model::QwenFfnKind::SparseMoe;
     g.experts = 4;
     g.expertsPerToken = 2;
     g.expertIntermediateSize = 256;
@@ -286,8 +287,8 @@ inline SmallTarget smallTarget(bool moe) {
 }
 
 // The architecture metadata a GGUF of the geometry declares.
-inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g) {
-  const std::string arch = g.architecture();
+inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g) {
+  const std::string arch = model::gguf::architecture(g.ffnKind);
   std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
   const auto key = [&](const char *name, uint32_t value) {
     keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
@@ -307,7 +308,7 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
   key("ssm.time_step_rank", g.gdnValueHeads);
   key("ssm.state_size", g.gdnHeadDimension);
   key("ssm.inner_size", g.gdnValueHeads * g.gdnHeadDimension);
-  if (g.sparseMoe()) {
+  if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
     key("expert_count", g.experts);
     key("expert_used_count", g.expertsPerToken);
     key("expert_feed_forward_length", g.expertIntermediateSize);
@@ -320,7 +321,7 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
 
 // Writes a GGUF of the tensors declaring the geometry.
 inline void writeGguf(const std::filesystem::path &path, const std::vector<Tensor> &tensors,
-                      const model::gguf::TargetGeometry &geometry) {
+                      const model::QwenTargetDimensions &geometry) {
   splash::test::writeFile(path, test_gguf::file(metadata(geometry), tensors));
 }
 

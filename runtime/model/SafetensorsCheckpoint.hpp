@@ -8,9 +8,10 @@
 
 namespace splash::model {
 
-// Checkpoint configuration and safetensors index. Opening parses only
-// metadata; the images read tensor data in bounded slices, without loading
-// the MLX runtime or allocating tensors.
+// A checkpoint's quantization configuration and safetensors index. Opening
+// parses only metadata; the images read tensor data in bounded slices,
+// without loading the MLX runtime or allocating tensors. The rest of its
+// config.json is the model's, which inspectModelPackage checks.
 class SafetensorsCheckpoint final {
 public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory);
@@ -18,11 +19,6 @@ public:
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
-  void requireConfigNumber(std::string_view key, double expected) const;
-  // `legacyKey`, when given, names the field in configurations that predate `key`.
-  void requireConfigString(std::string_view key, std::string_view expected,
-                           std::string_view legacyKey = {}) const;
-  void requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const;
   void checkUnchanged() const;
 private:
   struct Impl;

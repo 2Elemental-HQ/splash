@@ -12,39 +12,14 @@
 #include <vector>
 
 #include "model/GgufFile.hpp"
+#include "model/QwenHybridLayout.hpp"
 
 namespace splash::model::gguf {
 
-struct TargetGeometry {
-  uint32_t layers = 0;
-  uint32_t hiddenSize = 0;
-  uint32_t vocabularySize = 0;
-  uint32_t intermediateSize = 0; // dense FFN
-  uint32_t gdnKeyHeads = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t convolutionDimension = 0;
-  uint32_t attentionWidth = 0;
-  uint32_t attentionKvHeads = 0;
-  uint32_t attentionHeadDimension = 0;
-  // The rotated dimension pairs of each attention head and their RoPE base.
-  uint32_t rotaryPairs = 0;
-  float rotaryTheta = 0.0F;
-  uint32_t fullAttentionPeriod = 0;
-  // A sparse MoE FFN (qwen35moe) when experts is set; the shared expert has
-  // the routed experts' intermediate width.
-  uint32_t experts = 0;
-  uint32_t expertsPerToken = 0;
-  uint32_t expertIntermediateSize = 0;
-  [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
-    return (layer + 1) % fullAttentionPeriod == 0;
-  }
-  [[nodiscard]] bool sparseMoe() const noexcept { return experts != 0; }
-  // The general.architecture of a GGUF of this target.
-  [[nodiscard]] const char *architecture() const noexcept {
-    return sparseMoe() ? "qwen35moe" : "qwen35";
-  }
-};
+// The general.architecture of a GGUF of a target with this FFN.
+[[nodiscard]] constexpr const char *architecture(QwenFfnKind ffn) noexcept {
+  return ffn == QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
+}
 
 // The order of a tensor's rows in the image. Rows below `from` keep their
 // order; from there on, blocks of headRows rows are value heads, which
@@ -106,6 +81,6 @@ struct Image {
 // architecture, the geometry the metadata declares, its rotary embedding and
 // norms included, and each tensor's shape; throws GgufError naming every
 // missing tensor and every tensor of a type this build cannot load.
-[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry);
+[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry);
 
 } // namespace splash::model::gguf
