@@ -26,6 +26,7 @@ from . import images as image_input
 from . import json_codec, judgments, serve_options
 from . import runtime as engine_runtime
 from .api_shapes import (
+    anthropic_block,
     anthropic_response,
     anthropic_stop,
     anthropic_to_chat_body,
@@ -1007,19 +1008,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("ping", {})
 
         def open_block(index, block):
-            if block.kind == "reasoning":
-                content_block = {"type": "thinking", "thinking": "", "signature": ""}
-            elif block.kind == "text":
-                content_block = {"type": "text", "text": ""}
-            else:
-                content_block = {
-                    "type": "tool_use",
-                    "id": block.call_id,
-                    "name": block.name,
-                    "input": {},
-                }
             send(
-                "content_block_start", {"index": index, "content_block": content_block}
+                "content_block_start",
+                {"index": index, "content_block": anthropic_block(job, block)},
             )
             if block.kind == "reasoning" and omitted:
                 send(
