@@ -2,7 +2,8 @@
 // Decode weights with FP32 group coefficients, then round once to the half tile,
 // matching llama.cpp Metal dequantize.h / mul_mm.metal (MIT notice in THIRD_PARTY_NOTICES). Keep activations BF16.
 // Weight planes and meta in the MDGG0001 layout (metal/abi/QuantFormat.h), decoded by kernels/common/quant_formats.h.
-// Activations bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output.
+// Activations bf16 [rows][K]; weights staged as fp16 in threadgroup memory; fp32 accumulation; bf16 output (fp32 from
+// the _a_f32 instances, the logits).
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
@@ -31,8 +32,7 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
 // a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather than
 // to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Full tiles run this
-// loop too: a separate branch-free copy for them, selected per threadgroup, measured up to 4% slower on an M5 Max and
-// no faster on an M3 Max.
+// loop too; a branch-free copy for them is no faster (M3 Max, M5 Max).
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
@@ -62,9 +62,8 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 // MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows (these kernels and the fused ones): a 3-lane step
 // runs the 32-row tile over the storage of four lanes (LinearPlan::storageRows) and the padding lane's rows are
 // computed and discarded. Rows are independent, so every active row is the bits of any other tile height
-// (gguf-projection full); on a 16-core M5 Pro the 32-row tile at three lanes costs what it costs at four, 3-15% less
-// than a 16-row plus an 8-row matmul per stage (0.207 vs 0.218 ms, Q4_K 12288 x 5120, DRAM-cold; 20-core: 0.173 vs
-// 0.203).
+// (gguf-projection checks it); the 32-row tile at three lanes costs what it costs at four, 3-15% less than a 16-row
+// plus an 8-row matmul per stage (DRAM-cold, 16- and 20-core M5 Pro).
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do. The destination's type Out is bf16, or fp32 for the plain epilogue's
 // logits (a_f32, ops::Projection::destination).

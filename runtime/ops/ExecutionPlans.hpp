@@ -47,8 +47,7 @@ private:
 
   Linear linear_;
   uint32_t moeRouteWideRows_;
-  MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
-  uint32_t appleGpuFamily_ = 0;
+  GpuFamilyClass family_;
 };
 
 } // namespace splash::ops

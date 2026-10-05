@@ -15,7 +15,7 @@ inline void full_qkv_storage_phase(
     threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
     uint simd_group) {
   static_assert(QHeads % KHeads == 0);
-  constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
+  constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
   uint query_tasks = params.tokens * QHeads;
@@ -55,13 +55,13 @@ inline void full_qkv_storage_phase(
     chunk_values[value_offset] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < 32) {
+  if (thread_index < RotaryPairs) {
     float first = float(normalized[thread_index]);
-    float second = float(normalized[thread_index + 32]);
+    float second = float(normalized[thread_index + RotaryPairs]);
     float cosine = rope_cos[ulong(row) * RotaryPairs + thread_index];
     float sine = rope_sin[ulong(row) * RotaryPairs + thread_index];
     destination[thread_index] = bfloat(first * cosine - second * sine);
-    destination[thread_index + 32] = bfloat(second * cosine + first * sine);
+    destination[thread_index + RotaryPairs] = bfloat(second * cosine + first * sine);
   } else if (thread_index >= 2 * RotaryPairs) {
     destination[thread_index] = normalized[thread_index];
   }

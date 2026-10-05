@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/Linear.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <array>
@@ -68,13 +69,6 @@ void validate(LinearWorkload w) {
   }
 }
 
-// A buffer a plan does not use needs no bytes and may be absent.
-void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
-  if (bytes && (!buffer || buffer.sizeBytes() < bytes))
-    throw std::invalid_argument(std::string("projection ") + what + " buffer holds " +
-                                std::to_string(buffer.sizeBytes()) + " bytes, needs " + std::to_string(bytes));
-}
-
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
@@ -110,10 +104,10 @@ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexc
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64 ||
-      scratch.input.sizeBytes() < tableBytes(width, rows) ||
-      scratch.sums.sizeBytes() < tableSumsBytes(layout, width, rows))
-    throw std::invalid_argument("linear table scratch is below requirement");
+  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+    throw std::invalid_argument("invalid linear table geometry");
+  requireBytes(scratch.input, tableBytes(width, rows), "linear table");
+  requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
 }
 
 const char *tableSuffix(LinearInput layout) noexcept {
@@ -124,10 +118,10 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
       p.inputSize != matrix.inputSize)
     throw std::invalid_argument("affine projection does not match plan");
-  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "weight");
+  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "projection weight");
   const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
-  requireBytes(p.affine().scales, bytes, "scale");
-  requireBytes(p.affine().biases, bytes, "bias");
+  requireBytes(p.affine().scales, bytes, "projection scale");
+  requireBytes(p.affine().biases, bytes, "projection bias");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
@@ -336,9 +330,9 @@ struct DecodeGroupPolicy final {
   uint32_t manyWaveTilesPerCore;
 };
 // Resident-wave and full-grid thresholds measured on 16/20-core Apple10 GPUs.
-// Gate/up uses the conservative limit shared by both devices. Its many-wave
-// threshold follows N256; the four-simdgroup threshold scales from N128. Those
-// two extrapolations remain unmeasured.
+// Gate/up takes the lower of the two devices' limits. Two thresholds are
+// derived rather than measured: gate/up's many-wave threshold is N256's, and
+// the four-simdgroup thresholds are N128's doubled.
 constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
     kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
@@ -378,14 +372,13 @@ uint32_t decodeGroups(uint32_t tiles, uint32_t cores,
 // A multi-row N256 decode tile halves the input re-reads of N128 but also
 // halves the grid; it pays only while the N256 grid keeps two tiles per core.
 constexpr uint32_t kWideDecodeTilesPerCore = 2;
-// Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
-// tile. Paired-A/B tuning (tune-kernels) and the per-shape microprofile
-// (benchmark-prefill) on a 32-core Apple9 GPU (M4 Max) measured the
-// four-simdgroup N128 tile ahead of N256 on every prefill shape and probed
-// row count: +6..10% GPU wherever the margin cleared the tuning threshold,
-// never behind. Apple9 GPUs at or below that measured core count therefore
-// share the Apple10 prefill rule. Larger Apple9 GPUs (40-core class) keep the
-// wide-tile rule below; it was sized for them and remains unremeasured there.
+// Apple9 GPUs of up to 32 cores prefill with the Apple10 rule, the
+// four-simdgroup N128 tile, which on a 32-core M4 Max is never slower than
+// N256 on any prefill shape or row count and 6-10% faster wherever the
+// difference is measurable (tune-kernels, benchmark-prefill).
+// Larger Apple9 GPUs (40-core class) run N256 for UpWithGate and wherever its
+// grid reaches eight threadgroups per core, which amortizes the larger tile;
+// N128's four-simdgroup tile is not measured against it on them.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 
@@ -434,7 +427,7 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 } // namespace
 
 Linear::Linear(const DeviceCapabilities &device) noexcept
-    : appleGpuFamily_(device.appleGpuFamily),
+    : family_(gpuFamilyClass(device.appleGpuFamily)),
       gpuCores_(plannedGpuCores(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
@@ -442,15 +435,15 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
       .storageRows();
 }
 
-// GPU family selects variants; core count and workload tile counts determine
-// parallelism.
+// The GPU family class selects variants; core count and workload tile counts
+// determine parallelism.
 LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   validate(w);
   if (w.weightLayout == WeightLayout::Block32) return ggufBaseline(w, projections);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
-    if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
+    if (family_ == GpuFamilyClass::Apple10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
     const bool wide = double(rowTiles) * tiles256 >=
@@ -459,12 +452,13 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
                                                               : LinearTile::N128, 0};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  // Keep the existing broad-column plain projection path for wider batches:
-  // independent row tiles repeat its weight stream. Reuse the existing
-  // two-N256-tiles-per-core boundary rather than model-specific dimensions.
+  // Wide plain projections of three or four lanes take the broad-column tiles
+  // below on every family, since independent row tiles would repeat the weight
+  // stream. Wide is the two-N256-tiles-per-core boundary
+  // (kWideDecodeTilesPerCore), not a model dimension.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
       tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
-  if (appleGpuFamily_ == 9 && !widePlain) {
+  if (family_ == GpuFamilyClass::Apple9 && !widePlain) {
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
     const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
     uint32_t splits = 1;
@@ -475,7 +469,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
       splits *= 2;
     return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits};
   }
-  if (appleGpuFamily_ >= 10) {
+  if (family_ == GpuFamilyClass::Apple10) {
     if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
       return {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
     if (lanes == 1)
@@ -485,8 +479,8 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   // lanes, which keep their one-tile grids: the round-robin policy above was
   // measured on Apple10.
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
-    return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
-                                 : tiles;
+    return family_ == GpuFamilyClass::Apple10 ? decodeGroups(tiles, gpuCores_, policy)
+                                              : tiles;
   };
   if (w.epilogue == LinearEpilogue::GateUp)
     return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
@@ -560,19 +554,19 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   const uint64_t rows = selected.storageRows();
-  requireBytes(b.input, rows * k * 2, "input");
-  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
-  if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "residual");
-  requireBytes(b.sums, selected.sumsBytes(), "sums");
-  requireBytes(b.gateScratch, selected.gateScratchBytes(), "gate scratch");
-  requireBytes(b.downSums, selected.downSumsBytes(), "down sums");
+  requireBytes(b.input, rows * k * 2, "projection input");
+  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "projection output");
+  if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "projection residual");
+  requireBytes(b.sums, selected.sumsBytes(), "projection sums");
+  requireBytes(b.gateScratch, selected.gateScratchBytes(), "projection gate scratch");
+  requireBytes(b.downSums, selected.downSumsBytes(), "projection down sums");
   const LinearScratchSize scratch = selected.scratchSize();
-  requireBytes(b.scratch.input, scratch.input, "scratch table");
-  requireBytes(b.scratch.sums, scratch.sums, "scratch sums");
-  requireBytes(b.scratch.partials, scratch.partials, "partials");
-  requireBytes(b.scratch.counters, scratch.counters, "counters");
+  requireBytes(b.scratch.input, scratch.input, "projection scratch table");
+  requireBytes(b.scratch.sums, scratch.sums, "projection scratch sums");
+  requireBytes(b.scratch.partials, scratch.partials, "projection partials");
+  requireBytes(b.scratch.counters, scratch.counters, "projection counters");
   if (p.layout() == WeightLayout::Block32) {
-    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
+    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
     addGguf(graph, b, p, selected, gate);
     // A rotated projection's plan prepares its table, if any, from the
     // rotated rows, which no other plan reads.
@@ -657,8 +651,8 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
   validate({{consumer.outputSize, consumer.inputSize}, rows, LinearPhase::Prefill});
   const uint32_t tiles = (rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
   const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
-  requireBytes(input, storageRows * consumer.inputSize * 2, "input");
-  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
+  requireBytes(input, storageRows * consumer.inputSize * 2, "projection input");
+  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "projection sums");
   graph.add("prefill_linear_q4_sums32", {input, sums}, consumer.inputSize, {tiles, 1, 1});
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,

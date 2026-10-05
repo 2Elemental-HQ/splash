@@ -175,7 +175,8 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
   };
-  const MoeGgufTile device = splash::ops::moeGgufTile(backend.capabilities().appleGpuFamily, ggufShape);
+  const MoeGgufTile device =
+      splash::ops::moeGgufTile(splash::ops::gpuFamilyClass(backend.capabilities().appleGpuFamily), ggufShape);
   const MoeGgufTile other = device == MoeGgufTile::Register ? MoeGgufTile::Staged : MoeGgufTile::Register;
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,

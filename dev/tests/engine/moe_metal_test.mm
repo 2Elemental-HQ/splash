@@ -593,12 +593,12 @@ void planBounds() {
             "affine 32-row decode tile");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
-  // Only family 9 runs the four-simdgroup decode tiles; an unknown family
-  // and families 10 and later keep the shipped tile.
-  require(splash::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
-              splash::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
+  // Only family 9 runs the four-simdgroup decode tiles; families 10 and
+  // later run eight.
+  using splash::ops::gpuFamilyClass;
+  require(splash::ops::moeDecodeSimdgroups(gpuFamilyClass(9)) == MoeExpertSimdgroups::Four &&
+              splash::ops::moeDecodeSimdgroups(gpuFamilyClass(10)) == MoeExpertSimdgroups::Eight &&
+              splash::ops::moeDecodeSimdgroups(gpuFamilyClass(11)) == MoeExpertSimdgroups::Eight,
           "decode expert simdgroups are not gated on GPU family 9");
 }
 

@@ -1282,7 +1282,8 @@ void ggufProjectionMatrix(metal::MetalBackend &backend) {
 
 // A producer writes the table its consumer's plan reads into scratch that
 // holds it: a table layout without that scratch is refused before anything
-// is encoded, and Plain runs the plain kernel.
+// is encoded, and Plain runs the plain kernel. Every other buffer holds what
+// its kernel reaches.
 void producerTableContract(metal::MetalBackend &backend) {
   constexpr uint32_t kLanes = 1, kRows = 8, kHidden = 5120;
   const NormWeights norm{allocate(backend, kHidden * 2)};
@@ -1290,38 +1291,59 @@ void producerTableContract(metal::MetalBackend &backend) {
     return graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == kernel;
   };
   {
+    const metal::MetalBuffer rows = allocate(backend, kRows * kHidden * 2);
     metal::CommandGraph graph;
-    rejects([&] { (void)Normalization::addRms(graph, {}, norm, {}, kHidden, kRows, {}, LinearInput::Table64); });
-    require(graph.empty() && Normalization::addRms(graph, {}, norm, {}, kHidden, kRows).layout == LinearInput::Plain &&
+    rejects([&] { (void)Normalization::addRms(graph, rows, norm, rows, kHidden, kRows, {}, LinearInput::Table64); });
+    require(graph.empty() &&
+                Normalization::addRms(graph, rows, norm, rows, kHidden, kRows).layout == LinearInput::Plain &&
                 plainKernel(graph, "norm_rms"),
             "the norm's table contract");
   }
   {
     const GdnShape shape{16, 32, 128, 8192, 12544};
-    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{};
+    const uint64_t carried = 3 * uint64_t{shape.convolutionDimension} * 2,
+                   recurrent = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension * 4;
+    const GdnStateStrides strides{carried, recurrent, carried};
+    const metal::MetalBuffer state = allocate(backend, carried + recurrent);
+    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{state, state, state, state};
     GdnDecodeBuffers buffers;
+    buffers.packed = allocate(backend, kRows * shape.packedWidth * 2);
+    buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
     buffers.currentStates = states;
     buffers.nextStates = states;
+    buffers.mixed = allocate(backend, kRows * shape.convolutionDimension * 2);
+    buffers.decayWeights = allocate(backend, shape.valueHeads * 4);
+    buffers.timeBias = allocate(backend, shape.valueHeads * 2);
+    buffers.decay = allocate(backend, kRows * shape.valueHeads * 4);
+    buffers.beta = allocate(backend, kRows * shape.valueHeads * 2);
     buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
+    buffers.hidden = allocate(backend, kRows * shape.valueHeads * shape.headDimension * 2);
     metal::CommandGraph graph;
     rejects([&] {
-      (void)GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}, GdnHeadOrder::Grouped, LinearInput::Table16);
+      (void)GDN::addDecode(graph, buffers, shape, kLanes, 0, strides, GdnHeadOrder::Grouped, LinearInput::Table16);
     });
     require(graph.empty() &&
-                GDN::addDecode(graph, buffers, shape, kLanes, 0, {1, 1, 1}, GdnHeadOrder::Grouped, LinearInput::Plain)
+                GDN::addDecode(graph, buffers, shape, kLanes, 0, strides, GdnHeadOrder::Grouped, LinearInput::Plain)
                         .layout == LinearInput::Plain &&
                 plainKernel(graph, "verify_gdn_fused_vh32"),
             "the GDN decode's table contract");
   }
   {
+    // The 27B's attention: 24 query heads over 4 KV heads of 256, and the
+    // verify staging of one lane's 8 rows in 32 per KV head.
     const kv::Layout layout{1, 4, 256};
+    const metal::MetalBuffer packed = allocate(backend, kRows * (24 * 2 + 4 * 2) * 256 * 2);
+    const metal::MetalBuffer attention = allocate(backend, 4 * 32 * 6 * 256 * 2);
+    const metal::MetalBuffer hidden = allocate(backend, kRows * 24 * 256 * 2);
     metal::CommandGraph graph;
     rejects([&] {
-      (void)PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Table64);
+      (void)PagedAttention::addVerifyGate(graph, packed, attention, hidden, 24, layout, kLanes, {},
+                                          LinearInput::Table64);
     });
     require(graph.empty() &&
-                PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Plain).layout ==
-                    LinearInput::Plain &&
+                PagedAttention::addVerifyGate(graph, packed, attention, hidden, 24, layout, kLanes, {},
+                                              LinearInput::Plain)
+                        .layout == LinearInput::Plain &&
                 plainKernel(graph, "verify_attention_gate"),
             "the attention gate's table contract");
   }
@@ -1339,13 +1361,14 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   const LinearScratch scratch{.input = allocate(backend, tableBytes(17408, 32)),
                               .sums = allocate(backend, tableSumsBytes(LinearInput::Table16, 17408, 32))};
   const NormWeights norm{allocate(backend, 17408 * 2)};
+  const metal::MetalBuffer rows = allocate(backend, uint64_t{32} * 17408 * 2);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const LinearPlan plan = m3.decodePlan(rotated, lanes);
     require(plan.configuration().tile == LinearTile::GgufRegister && plan.input() == LinearInput::Plain &&
                 m3.decodePlan(plain, lanes).input() == LinearInput::Table16,
             "a rotated register plan's producer writes a table it discards");
     metal::CommandGraph graph;
-    (void)Normalization::addRms(graph, {}, norm, {}, 17408, lanes * 8, scratch, plan.input());
+    (void)Normalization::addRms(graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
     require(graph.dispatches().back().pipelineName.find("_table") == std::string::npos,
             "a rotated register plan's input norm wrote a table");
   }

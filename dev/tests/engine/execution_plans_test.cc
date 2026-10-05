@@ -127,7 +127,7 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
-                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
+                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(gpuFamilyClass(family)),
                 "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
@@ -140,10 +140,10 @@ void baselinePlans() {
 // plans run the split 32-row passes on every family and keep the shipped
 // simdgroups they do not run.
 void moeDeviceTiles() {
-  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+  for (uint32_t family : {9U, 10U, 11U}) {
     const auto expected = family == 9 ? MoeExpertSimdgroups::Four
                                       : MoeExpertSimdgroups::Eight;
-    require(moeDecodeSimdgroups(family) == expected,
+    require(moeDecodeSimdgroups(gpuFamilyClass(family)) == expected,
             "decode expert simdgroups are not gated on GPU family 9");
     const ExecutionPlans plans(device(family));
     for (auto shape : moeShapes) {
@@ -170,10 +170,10 @@ void moeDeviceTiles() {
 void ggufMoePlans() {
   MoeShape shape = routedShape;
   shape.weightLayout = WeightLayout::Block32;
-  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+  for (uint32_t family : {9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
-    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+    require(moeGgufTile(gpuFamilyClass(family), shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
@@ -193,7 +193,8 @@ void ggufMoePlans() {
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+    require(moeGgufTile(gpuFamilyClass(family), staged) == MoeGgufTile::Staged &&
+                moeGgufTile(gpuFamilyClass(family), q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);

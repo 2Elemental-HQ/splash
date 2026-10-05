@@ -4,6 +4,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <span>
@@ -70,8 +71,7 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 // Over the 27B and 35B dense shapes, all formats, one to four lanes, on the
 // 16- and 20-core M5 Pro and 10-, 30- and 40-core GPUs emulated by width:
 // 3.6% over the fastest split of each shape in total and 36% at worst on a
-// 15-us shape (the register tiers in threads per core: 6.6%; the previous 32
-// per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
+// 15-us shape (the register tiers in threads per core: 6.6%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
 // The staged tile's tiers on a family. Apple9 cores take as many of its
@@ -80,8 +80,8 @@ constexpr SplitTier kStagedTiers[] = {{6, 512}};
 // 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
 // 0.012 ms projection), where the fitted tier above is 13-27% slower on
 // 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
-std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
-  if (appleGpuFamily == 9) return kRegisterTiers;
+std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
+  if (family == GpuFamilyClass::Apple9) return kRegisterTiers;
   return kStagedTiers;
 }
 
@@ -89,8 +89,8 @@ std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
 LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
   return {.tile = LinearTile::GgufRegister, .splits = decodeSplits(n, k, cores, kRegisterTiers)};
 }
-LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, uint32_t appleGpuFamily) {
-  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(appleGpuFamily))};
+LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family) {
+  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(family))};
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
@@ -248,7 +248,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
   // the same half stage and matmul rows, so its outputs equal the prefill
-  // tile's up to the K split's fp32 reassociation (gguf-projection full),
+  // tile's up to the K split's fp32 reassociation (gguf-projection checks it),
   // and each simdgroup streams its own 32 columns instead of four 8-row
   // simdgroups sharing a stage. Unsplit, on a 17408 x 5120 Q4_K projection
   // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
@@ -257,18 +257,18 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,
-                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(appleGpuFamily_))}
+                       .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  if (family_ == GpuFamilyClass::Apple9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
+  return stagedDecode(n, k, gpuCores_, family_);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
-  if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   return size;
 }
 
@@ -301,8 +301,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     // rotated once. Rows past the workload's are padding the tiles discard.
     if (gate && !gate->rotation.signs.sameView(p.rotation.signs))
       throw std::invalid_argument("a rotated gate/up pair takes one rotation");
-    if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
-      throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
+    if (k % GGUF_ROTATION_BLOCK)
+      throw std::invalid_argument("a rotated projection takes whole rotation blocks");
+    requireBytes(p.rotation.signs, k, "rotation sign");
     graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
               {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
@@ -330,9 +331,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 // The staged decode tiles, for decode and prefill chunks of up to 32 rows:
 // every row of the plan's storage in each threadgroup's tile, grid (64-column
 // tiles, K splits). Decode runs one dispatch per projection (addDecodeTensor,
-// fusedSegments); its two gate/up passes were within -4..+2% of the fused
-// gate/up kernel they replaced on the 27B gate/up at 10-40 cores. Prefill
-// chunks run one dispatch per segment.
+// fusedSegments), gate/up as two passes, which a fused gate/up kernel does not
+// beat (-4..+2% on the 27B gate/up at 10-40 cores). Prefill chunks run one
+// dispatch per segment.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -456,8 +457,9 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return appleGpuFamily_ != 9 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
-                                                                                     : FloatTile::Simdgroup;
+  return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
+             ? FloatTile::NeuralAccelerator
+             : FloatTile::Simdgroup;
 }
 
 // Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
@@ -467,13 +469,13 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile) {
   const uint32_t n = weights.outputSize, k = weights.inputSize;
-  const uint64_t element = elementBytes(type);
   const bool accelerator = tile == FloatTile::NeuralAccelerator;
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
-      input.sizeBytes() < uint64_t{rows} * k * 2 ||
-      output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
+      (accelerator && (rows < 16 || k % 32)))
     throw std::invalid_argument("invalid float projection");
+  requireBytes(weights.plane0, uint64_t{n} * k * sizeof(float), "float projection weight");
+  requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
+  requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, elementBytes(type)), "float projection output");
   const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
                              (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
