@@ -1,6 +1,7 @@
 #include "ops/Sampling.hpp"
 
 #include "metal/abi/Sampling.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -96,9 +97,9 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
     if (!penalties.active())
       continue;
     // The kernel indexes the whole table by this row.
-    if (lane >= table.rows.size() ||
-        (uint64_t{table.rows[lane]} + 1) * rowBytes > table.words.sizeBytes())
+    if (lane >= table.rows.size())
       throw std::invalid_argument("penalized lane has no penalty table row");
+    requireBytes(table.words, (uint64_t{table.rows[lane]} + 1) * rowBytes, "penalty table");
     const uint32_t entry = params.entries++;
     params.logits_lane[entry] = lane;
     params.table_row[entry] = table.rows[lane];

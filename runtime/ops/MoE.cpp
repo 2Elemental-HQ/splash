@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "ops/BufferExtent.hpp"
 
 #include <cstddef>
 #include <stdexcept>
@@ -268,15 +269,13 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   validate(weights, shape);
   const uint32_t tiles = plan.maximumTiles();
   const MoeWorkspace &required = plan.workspace();
-  const uint64_t rowBytes = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
-  if (buffers.input.sizeBytes() < rowBytes ||
-      buffers.residual.sizeBytes() < rowBytes ||
-      buffers.output.sizeBytes() < rowBytes)
-    throw std::invalid_argument("MoE row buffers are smaller than execution shape");
+  const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
+  requireBytes(buffers.input, hiddenRows, "MoE input");
+  requireBytes(buffers.residual, hiddenRows, "MoE residual");
+  requireBytes(buffers.output, hiddenRows, "MoE output");
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
-    if ((scratch.*field.buffer).sizeBytes() < required.*field.bytes)
-      throw std::invalid_argument("MoE grouped scratch is smaller than its bound");
+    requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
   const bool block = weights.layout() == WeightLayout::Block32;

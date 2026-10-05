@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/Linear.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <array>
@@ -68,13 +69,6 @@ void validate(LinearWorkload w) {
   }
 }
 
-// A buffer a plan does not use needs no bytes and may be absent.
-void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes, const char *what) {
-  if (bytes && (!buffer || buffer.sizeBytes() < bytes))
-    throw std::invalid_argument(std::string("projection ") + what + " buffer holds " +
-                                std::to_string(buffer.sizeBytes()) + " bytes, needs " + std::to_string(bytes));
-}
-
 LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
@@ -110,10 +104,10 @@ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexc
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64 ||
-      scratch.input.sizeBytes() < tableBytes(width, rows) ||
-      scratch.sums.sizeBytes() < tableSumsBytes(layout, width, rows))
-    throw std::invalid_argument("linear table scratch is below requirement");
+  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+    throw std::invalid_argument("invalid linear table geometry");
+  requireBytes(scratch.input, tableBytes(width, rows), "linear table");
+  requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
 }
 
 const char *tableSuffix(LinearInput layout) noexcept {
@@ -124,10 +118,10 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
       p.inputSize != matrix.inputSize)
     throw std::invalid_argument("affine projection does not match plan");
-  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "weight");
+  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "projection weight");
   const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
-  requireBytes(p.affine().scales, bytes, "scale");
-  requireBytes(p.affine().biases, bytes, "bias");
+  requireBytes(p.affine().scales, bytes, "projection scale");
+  requireBytes(p.affine().biases, bytes, "projection bias");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
@@ -560,19 +554,19 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   const uint64_t rows = selected.storageRows();
-  requireBytes(b.input, rows * k * 2, "input");
-  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
-  if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "residual");
-  requireBytes(b.sums, selected.sumsBytes(), "sums");
-  requireBytes(b.gateScratch, selected.gateScratchBytes(), "gate scratch");
-  requireBytes(b.downSums, selected.downSumsBytes(), "down sums");
+  requireBytes(b.input, rows * k * 2, "projection input");
+  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "projection output");
+  if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "projection residual");
+  requireBytes(b.sums, selected.sumsBytes(), "projection sums");
+  requireBytes(b.gateScratch, selected.gateScratchBytes(), "projection gate scratch");
+  requireBytes(b.downSums, selected.downSumsBytes(), "projection down sums");
   const LinearScratchSize scratch = selected.scratchSize();
-  requireBytes(b.scratch.input, scratch.input, "scratch table");
-  requireBytes(b.scratch.sums, scratch.sums, "scratch sums");
-  requireBytes(b.scratch.partials, scratch.partials, "partials");
-  requireBytes(b.scratch.counters, scratch.counters, "counters");
+  requireBytes(b.scratch.input, scratch.input, "projection scratch table");
+  requireBytes(b.scratch.sums, scratch.sums, "projection scratch sums");
+  requireBytes(b.scratch.partials, scratch.partials, "projection partials");
+  requireBytes(b.scratch.counters, scratch.counters, "projection counters");
   if (p.layout() == WeightLayout::Block32) {
-    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
+    if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
     addGguf(graph, b, p, selected, gate);
     // A rotated projection's plan prepares its table, if any, from the
     // rotated rows, which no other plan reads.
@@ -657,8 +651,8 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
   validate({{consumer.outputSize, consumer.inputSize}, rows, LinearPhase::Prefill});
   const uint32_t tiles = (rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
   const uint64_t storageRows = uint64_t{tiles} * kAffinePrefillTileRows;
-  requireBytes(input, storageRows * consumer.inputSize * 2, "input");
-  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "sums");
+  requireBytes(input, storageRows * consumer.inputSize * 2, "projection input");
+  requireBytes(sums, storageRows * (consumer.inputSize / kQuantGroup) * 4, "projection sums");
   graph.add("prefill_linear_q4_sums32", {input, sums}, consumer.inputSize, {tiles, 1, 1});
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,

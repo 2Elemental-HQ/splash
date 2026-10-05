@@ -145,18 +145,19 @@ struct MoeScratch final {
 struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
+  const char *name;
 };
 inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
-    {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
-    {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
-    {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
-    {&MoeScratch::tileCount, &MoeWorkspace::tileCountBytes},
-    {&MoeScratch::groupedRoutes, &MoeWorkspace::groupedRoutesBytes},
-    {&MoeScratch::routeRows, &MoeWorkspace::routeRowsBytes},
-    {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes},
-    {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes},
-    {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes},
-    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes},
+    {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes, "MoE selected experts"},
+    {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes, "MoE routing weights"},
+    {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes, "MoE tile descriptors"},
+    {&MoeScratch::tileCount, &MoeWorkspace::tileCountBytes, "MoE tile count"},
+    {&MoeScratch::groupedRoutes, &MoeWorkspace::groupedRoutesBytes, "MoE grouped routes"},
+    {&MoeScratch::routeRows, &MoeWorkspace::routeRowsBytes, "MoE route rows"},
+    {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes, "MoE grouped input"},
+    {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes, "MoE expert intermediate"},
+    {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes, "MoE expert output"},
+    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes, "MoE grouped sums"},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),

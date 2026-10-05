@@ -4,6 +4,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <span>
@@ -301,8 +302,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     // rotated once. Rows past the workload's are padding the tiles discard.
     if (gate && !gate->rotation.signs.sameView(p.rotation.signs))
       throw std::invalid_argument("a rotated gate/up pair takes one rotation");
-    if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
-      throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
+    if (k % GGUF_ROTATION_BLOCK)
+      throw std::invalid_argument("a rotated projection takes whole rotation blocks");
+    requireBytes(p.rotation.signs, k, "rotation sign");
     graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
               {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
@@ -468,13 +470,13 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile) {
   const uint32_t n = weights.outputSize, k = weights.inputSize;
-  const uint64_t element = elementBytes(type);
   const bool accelerator = tile == FloatTile::NeuralAccelerator;
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
-      input.sizeBytes() < uint64_t{rows} * k * 2 ||
-      output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
+      (accelerator && (rows < 16 || k % 32)))
     throw std::invalid_argument("invalid float projection");
+  requireBytes(weights.plane0, uint64_t{n} * k * sizeof(float), "float projection weight");
+  requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
+  requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, elementBytes(type)), "float projection output");
   const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
                              (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}

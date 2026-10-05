@@ -3,6 +3,7 @@
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BufferExtent.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -21,18 +22,17 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   if (!rows || !table.outputSize || !table.inputSize)
     throw std::invalid_argument("invalid Q4 embedding shape");
   // Both gathers read `rows` token ids and write `rows` bf16 rows of the table's width.
-  if (tokens.sizeBytes() < uint64_t{rows} * sizeof(uint32_t) ||
-      output.sizeBytes() < uint64_t{rows} * table.inputSize * sizeof(uint16_t))
-    throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
+  requireBytes(tokens, uint64_t{rows} * sizeof(uint32_t), "embedding token");
+  requireBytes(output, uint64_t{rows} * table.inputSize * sizeof(uint16_t), "embedding output");
   if (table.layout() == WeightLayout::Block32) {
     const NativeRows &native = table.blocks();
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
     if (table.rotation) {
       // One threadgroup per rotation block of a row, which gathers the block
       // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).
-      if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK ||
-          table.rotation.signs.sizeBytes() < table.inputSize)
-        throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks and their signs");
+      if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK)
+        throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks");
+      requireBytes(table.rotation.signs, table.inputSize, "embedding rotation sign");
       graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
                 params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
       return;

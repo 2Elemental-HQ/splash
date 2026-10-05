@@ -1,5 +1,7 @@
 #include "ops/PagedAttention.hpp"
 
+#include "ops/BufferExtent.hpp"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -288,11 +290,8 @@ void PagedAttention::addPrefill(
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
-  if (partials.sizeBytes() < plan.workspace.partialsBytes ||
-      statistics.sizeBytes() < plan.workspace.statisticsBytes) {
-    throw std::invalid_argument(
-        "prefill attention scratch is smaller than its bound");
-  }
+  requireBytes(partials, plan.workspace.partialsBytes, "prefill attention partials");
+  requireBytes(statistics, plan.workspace.statisticsBytes, "prefill attention statistics");
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
@@ -312,11 +311,8 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
   }
-  if (buffers.partials.sizeBytes() < plan.workspace.partialsBytes ||
-      buffers.statistics.sizeBytes() < plan.workspace.statisticsBytes) {
-    throw std::invalid_argument(
-        "verify attention scratch is smaller than its bound");
-  }
+  requireBytes(buffers.partials, plan.workspace.partialsBytes, "verify attention partials");
+  requireBytes(buffers.statistics, plan.workspace.statisticsBytes, "verify attention statistics");
   // verifyParams validated each chunk, and the plan scaled each lane's
   // split count from the same committed history; every lane's partials use
   // the plan-wide slot stride.

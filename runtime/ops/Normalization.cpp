@@ -1,6 +1,7 @@
 #include "Normalization.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/BufferExtent.hpp"
 
 #include <utility>
 #include <stdexcept>
@@ -8,8 +9,7 @@
 namespace splash::ops {
 
 std::string normKernel(std::string_view name, const NormWeights &weights, uint32_t width) {
-  if (!weights.buffer || weights.buffer.sizeBytes() < weights.bytes(width))
-    throw std::invalid_argument("norm weights are below the width");
+  requireBytes(weights.buffer, weights.bytes(width), "norm weight");
   return std::string(name) + (weights.float32 ? "_f32" : "");
 }
 

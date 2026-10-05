@@ -2,6 +2,7 @@
 
 #include "Checked.hpp"
 #include "metal/abi/Vision.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <array>
@@ -143,14 +144,9 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
   const auto tokens = static_cast<uint32_t>(grid.patches());
-  if (!pixels || pixels.sizeBytes() < grid.pixelBytes()) {
-    throw std::invalid_argument("image pixels do not cover the grid");
-  }
-  const uint64_t embeddingBytes = uint64_t{embeddingRows(grid)} *
-                                  layout.outputHiddenSize * kBf16Bytes;
-  if (!embeddings || embeddings.sizeBytes() < embeddingBytes) {
-    throw std::invalid_argument("embedding buffer is too small for the grid");
-  }
+  requireBytes(pixels, grid.pixelBytes(), "image pixel");
+  requireBytes(embeddings, uint64_t{embeddingRows(grid)} * layout.outputHiddenSize * kBf16Bytes,
+               "image embedding");
 
   const uint32_t padded = roundUp(tokens, kKeyTile);
   const uint32_t merged = grid.mergedTokens();
