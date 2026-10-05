@@ -756,7 +756,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._json(200, {"prompt": self.app.apply_template(body, deadline=deadline)})
 
     def _post_judgments(self, body, deadline):
-        job, row = self.app.prepare_judgment(body, deadline=deadline)
+        job, row = self.app.prepare_judgment(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
         self._submit(job)
         result = self._await_done(job)
         self._json(
@@ -767,7 +769,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _post_systemone(self, body, deadline):
         answers = {}
         input_tokens = 0
-        for qid, spec, job in self.app.prepare_systemone(body, deadline=deadline):
+        entries = self.app.prepare_systemone(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
+        for qid, spec, job in entries:
             if job is None:
                 answers[qid] = judgments.deterministic_answer(spec)
                 continue
