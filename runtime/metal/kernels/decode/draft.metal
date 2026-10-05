@@ -44,11 +44,12 @@ inline void draft_qkv_prepare_phase(
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, QHeads = 32, KVHeads = 8,
-                 HeadDim = 128;
-  static_assert(2 * SPLASH_DRAFT_ROPE_PAIRS == HeadDim, "the draft rotates its whole head");
-  constexpr uint QWidth = QHeads * HeadDim, KWidth = KVHeads * HeadDim;
-  constexpr uint PackedWidth = QWidth + 2 * KWidth;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
+                 QHeads = SPLASH_DRAFT_QUERY_HEADS,
+                 KVHeads = SPLASH_DRAFT_KV_HEADS,
+                 HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr uint QWidth = SPLASH_DRAFT_ATTENTION_WIDTH, KWidth = KVHeads * HeadDim;
+  constexpr uint PackedWidth = SPLASH_DRAFT_QKV_WIDTH;
   constexpr uint QueryTasks = Rows * QHeads;
   constexpr uint Tasks = QueryTasks + Rows * KVHeads;
 
@@ -117,16 +118,16 @@ kernel void draft_context_kv_commit(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint KVHeads = 8;
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
   // A context row's keys and values (draft_context_kv_phase).
-  constexpr uint RowWidth = 2 * KVHeads * 128;
+  constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
   device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
   threadgroup float reductions[8];
-  threadgroup bfloat normalized[128];
+  threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(
       context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
@@ -150,7 +151,8 @@ inline void draft_attention_split_phase(
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr ushort M = 32, N = 128, D = 128, TileK = 64;
+  constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
+                   D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
   uint common_start =
@@ -395,7 +397,8 @@ inline void draft_attention_split_phase(
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
                                          uint thread_index) {
-  constexpr uint M = 32, D = 128, Stride = M * D + 2 * M,
+  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION,
+                 Stride = M * D + 2 * M,
                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
   constexpr uint Chunk = D / 8;
   uint row = thread_index / 8;
@@ -426,7 +429,8 @@ inline void draft_attention_reduce_phase(device const float *partials,
 inline void draft_attention_reorder_phase(device const bfloat *grouped,
                                           device bfloat *row_major, uint group,
                                           uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, QHeads = 32, HeadDim = 128;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, QHeads = SPLASH_DRAFT_QUERY_HEADS,
+                 HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   const uint element = group * 256 + thread_index;
   if (element >= Rows * QHeads * HeadDim)
     return;
@@ -486,14 +490,14 @@ kernel void draft_attention_qkv(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Packed = 6144;
-  constexpr ulong Attention = 4096;
-  constexpr ulong KVHeads = 8;
-  constexpr ulong HeadDim = 128;
+  constexpr ulong Packed = SPLASH_DRAFT_QKV_WIDTH;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr ulong RopeStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
   uint batch = group.y;
   threadgroup float reductions[8];
-  threadgroup bfloat head[128];
+  threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_qkv_prepare_phase(
       proposal_qkv + batch * Rows * Packed,
       queries + batch * Rows * Attention, q_norm, k_norm,
@@ -522,10 +526,11 @@ kernel void draft_attention_bf16_split(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint AttentionM = 32, AttentionN = 128, KVHeads = 8;
+  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, AttentionN = 128,
+                 KVHeads = SPLASH_DRAFT_KV_HEADS;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Attention = 4096;
-  constexpr ulong HeadDim = 128;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
@@ -555,10 +560,10 @@ kernel void draft_attention_bf16_reduce(
     constant DraftAttentionBatchParams &params [[buffer(1)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-  constexpr uint AttentionM = 32, KVHeads = 8;
+  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Attention = 4096;
-  constexpr ulong HeadDim = 128;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   device const float *partials =
@@ -578,7 +583,7 @@ kernel void draft_attention_reorder(
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Attention = 4096;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
   uint batch = group.y;
   draft_attention_reorder_phase(grouped + batch * Rows * Attention,
                                 row_major + batch * Rows * Attention, group.x,

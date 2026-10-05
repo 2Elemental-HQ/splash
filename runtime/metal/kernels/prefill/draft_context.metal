@@ -14,7 +14,7 @@ prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
                          uint lane [[thread_index_in_simdgroup]],
                          uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float reductions[8];
-  threadgroup bfloat normalized[128];
+  threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(context_kv, k_norm, rope_cos, rope_sin, keys, values,
                          params.start_position, params.tokens, task,
                          thread_index, lane, simd_group, reductions,

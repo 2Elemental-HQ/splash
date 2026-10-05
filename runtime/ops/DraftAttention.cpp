@@ -17,12 +17,11 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
-// Each split leaves a 32-row x (128 + max + sum) fp32 partial behind the
-// grouped queries.
+// Each split leaves a partial of its attention rows x (head dimensions + max
+// + sum) fp32 values behind the grouped queries.
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
-constexpr uint32_t kAttentionRows = 32;
-constexpr uint64_t kPartialBytes =
-    uint64_t{kAttentionRows} * (128 + 2) * sizeof(float);
+constexpr uint64_t kPartialBytes = uint64_t{SPLASH_DRAFT_ATTENTION_ROWS} *
+                                   (SPLASH_DRAFT_HEAD_DIMENSION + 2) * sizeof(float);
 
 // Dispatch width of one surrounding phase per lane: one 256-thread group per
 // 256 elements and at least one group per whole-group task.
@@ -63,12 +62,21 @@ void requireLanes(uint32_t lanes) {
 
 enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
 
-// The compiled shapes' heads are 128 wide, which the RoPE tables rotate whole.
-static_assert(2 * SPLASH_DRAFT_ROPE_PAIRS == 128);
+// The compiled attention (metal/abi/DraftAttention.h) behind each draft
+// hidden size.
 [[nodiscard]] KernelLayout kernelShape(DraftAttentionShape shape) {
-  if (shape == DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128})
+  const auto compiled = [](uint32_t hidden, uint32_t dynamic) {
+    return DraftAttentionShape{hidden,
+                               dynamic,
+                               SPLASH_DRAFT_QKV_WIDTH,
+                               SPLASH_DRAFT_ATTENTION_WIDTH,
+                               SPLASH_DRAFT_QUERY_HEADS,
+                               SPLASH_DRAFT_KV_HEADS,
+                               SPLASH_DRAFT_HEAD_DIMENSION};
+  };
+  if (shape == compiled(5120, 1280))
     return KernelLayout::Hidden5120;
-  if (shape == DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128})
+  if (shape == compiled(2048, 512))
     return KernelLayout::Hidden2048;
   throw std::invalid_argument("unsupported compiled draft attention shape");
 }
