@@ -26,6 +26,7 @@ from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
 from server import (
     api_shapes,
+    connections,
     diagnostics,
     documents,
     images,
@@ -1543,6 +1544,25 @@ class ServerTest(unittest.TestCase):
         )
         # The prepare pass and one boundary check; all 17 ran before the fix.
         self.assertEqual(tokenizer.prompt_encodes, 2)
+
+    def test_client_disconnect_stops_the_slot_boundary_pass(self):
+        tokenizer = self.BoundaryCountingTokenizer()
+        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        body = self.judgment_body(
+            options=[
+                {"id": f"opt{index}", "description": f"case {index}"}
+                for index in range(16)
+            ]
+        )
+        # Connected through admission and the first boundary check.
+        disconnected = iter((False, False, True))
+        with self.assertRaises(ConnectionResetError):
+            app.prepare_judgment(
+                body, deadline=FOREVER, disconnected=lambda: next(disconnected)
+            )
+        # The prepare pass and one boundary check, and the slot returned.
+        self.assertEqual(tokenizer.prompt_encodes, 2)
+        self.assertEqual(app.preparation_active, 0)
 
     def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
         tokenizer = self.BoundaryCountingTokenizer()
@@ -7210,7 +7230,7 @@ class ServerTest(unittest.TestCase):
         while time.monotonic() < deadline:
             with server.connections.lock:
                 held = list(server.connections.holders)
-            if not any(api._has_input(connection) for connection in held):
+            if not any(connections._has_input(connection) for connection in held):
                 return
             time.sleep(0.005)
         self.fail("a connection's input stayed unread")
@@ -7324,7 +7344,7 @@ class ServerTest(unittest.TestCase):
         for upload in uploads:
             upload.close()
 
-    @mock.patch.object(api, "_has_input", return_value=False)
+    @mock.patch.object(connections, "_has_input", return_value=False)
     def test_connection_slots_close_the_longest_waiting_connection(self, _):
         slots = api.ConnectionSlots(2)
         first, second, third, fourth = (mock.Mock() for _ in range(4))
@@ -7334,7 +7354,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(slots.admit(third))
         # Still awaiting its request, it is answered before it is closed.
         second.send.assert_called_once_with(
-            api.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
+            connections.CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT
         )
         second.shutdown.assert_called_once_with(socket.SHUT_RDWR)
         # A connection that lost its slot is not served.
@@ -7377,7 +7397,9 @@ class ServerTest(unittest.TestCase):
         # The idle connection gives way, although it waited less long.
         self.assertTrue(slots.admit(new))
         self.assertFalse(slots.serving(idle))
-        self.assertEqual(idle_client.recv(65536), api.CONNECTION_OVERLOADED_RESPONSE)
+        self.assertEqual(
+            idle_client.recv(65536), connections.CONNECTION_OVERLOADED_RESPONSE
+        )
         self.assertEqual(idle_client.recv(1), b"")
         # When every slot has a request, the new connection is refused.
         new_client.sendall(b"GET /health HTTP/1.1\r\n\r\n")
@@ -7765,11 +7787,50 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
+        # Where the server last had the error, and not its message.
         self.assertRegex(
             stderr.getvalue(),
-            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",
+            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
+            r"server/server\.py:\d+\n$",
         )
         self.assertNotIn("boom", stderr.getvalue())
+
+    def test_value_errors_past_the_body_are_internal_errors(self):
+        # Only a body the server cannot read is invalid JSON. A ValueError or
+        # RecursionError raised while a request is prepared or answered is
+        # the server's own: logged, answered with 500, and the job it
+        # submitted is cancelled.
+        systemone = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"supported": {"type": "noul"}},
+        }
+        for error in (ValueError("late"), RecursionError()):
+            for path, body, target, name in (
+                ("/v1/chat/completions", self.body(), "app", "prepare"),
+                ("/v1/systemone", systemone, "app", "prepare_systemone"),
+                ("/v1/chat/completions", self.body(), "handler", "_complete"),
+            ):
+                with self.subTest(error=type(error).__name__, path=path, name=name):
+                    harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
+                    owner = harness.app if target == "app" else api.FrontendHandler
+                    with (
+                        mock.patch.object(owner, name, side_effect=error),
+                        mock.patch.object(
+                            harness.backend, "cancel", wraps=harness.backend.cancel
+                        ) as cancel,
+                        mock.patch.object(api, "log_unexpected") as logged,
+                    ):
+                        status, _, payload = harness.request("POST", path, body)
+                    self.assertEqual(status, 500, payload)
+                    self.assertEqual(
+                        json.loads(payload)["error"]["code"], "internal_server_error"
+                    )
+                    logged.assert_called_once_with(error)
+                    if target == "handler":
+                        cancel.assert_called_once()
+                    else:
+                        cancel.assert_not_called()
 
     def test_unexpected_responses_stream_error_is_failed_and_cancels(self):
         # The first output item fails to render while the model still writes.
@@ -7798,7 +7859,8 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(plan.cancelled.is_set())
         self.assertRegex(
             stderr.getvalue(),
-            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",
+            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
+            r"server/server\.py:\d+\n$",
         )
 
     def test_streamer_end_error_does_not_kill_backend(self):

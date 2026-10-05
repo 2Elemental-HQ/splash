@@ -1205,38 +1205,28 @@ def anthropic_usage(prompt_tokens, output_tokens, cache):
     }
 
 
+def anthropic_block(job, block, signature=""):
+    """The Messages content block of `block` as a complete response shows it
+    or, while it is in progress, as a stream starts it, before its text or
+    input. Reasoning whose display is omitted shows only `signature`. A call
+    no longer in progress has complete arguments: the projector writes each
+    call it closes as JSON, and a complete response leaves out a call the
+    token limit cut."""
+    if block.kind == "reasoning":
+        thinking = "" if job.thinking_display == "omitted" else block.text
+        return {"type": "thinking", "thinking": thinking, "signature": signature}
+    if block.kind == "text":
+        return {"type": "text", "text": block.text}
+    return {
+        "type": "tool_use",
+        "id": block.call_id,
+        "name": block.name,
+        "input": {} if block.status == "in_progress" else json_codec.loads(block.text),
+    }
+
+
 def anthropic_response(model, job, blocks, result, tool_calls, thinking_signature):
-    content = []
-    for block in blocks:
-        if block.kind == "reasoning":
-            content.append(
-                {
-                    "type": "thinking",
-                    "thinking": (
-                        "" if job.thinking_display == "omitted" else block.text
-                    ),
-                    "signature": thinking_signature,
-                }
-            )
-        elif block.kind == "text":
-            content.append({"type": "text", "text": block.text})
-        else:
-            try:
-                arguments = json_codec.loads(block.text)
-            except ValueError:
-                # Only a call the token limit cut has unfinished arguments,
-                # and a complete message leaves it out.
-                if result.reason != "length":
-                    raise
-                continue
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": block.call_id,
-                    "name": block.name,
-                    "input": arguments,
-                }
-            )
+    content = [anthropic_block(job, block, thinking_signature) for block in blocks]
     if all(item["type"] == "thinking" for item in content):
         content.append({"type": "text", "text": ""})
     return {

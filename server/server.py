@@ -8,13 +8,11 @@ import queue
 import re
 import secrets
 import select
-import shlex
 import signal
 import socket
 import sys
 import threading
 import time
-import weakref
 from dataclasses import dataclass
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +26,7 @@ from . import images as image_input
 from . import json_codec, judgments, serve_options
 from . import runtime as engine_runtime
 from .api_shapes import (
+    anthropic_block,
     anthropic_response,
     anthropic_stop,
     anthropic_to_chat_body,
@@ -45,11 +44,31 @@ from .api_shapes import (
 )
 from .backend import NativeBackend, NativeResult, remaining_request_time
 from .chat_templates import ChatTemplateError, ChatTemplates
+from .connections import (
+    ConnectionSlots,
+    HttpAdmission,
+    LingeringCloser,
+    RequestBodyReservation,
+    refuse_connection,
+)
 from .constraints import ConstraintFactory, validate_tokenizer
 from .diagnostics import log_unexpected, print_request, print_status
-from .errors import APIError, ContextLengthError
+from .errors import (
+    ANTHROPIC_ERRORS,
+    OPENAI_ERRORS,
+    SYSTEMONE_ERRORS,
+    APIError,
+    ErrorDialect,
+    RequestValidationError,
+    field_error,
+)
 from .frontend import Frontend
-from .http_security import OriginRefused, authenticate, validate_headers
+from .http_security import (
+    OriginRefused,
+    RefusedOriginLog,
+    authenticate,
+    validate_headers,
+)
 from .latency import RequestLatency
 from .metrics import prometheus_metrics, timings_dict, usage_dict
 from .origins import ANY_ORIGIN
@@ -61,7 +80,9 @@ from .output import (
 )
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
-# Match the former generation ingress envelope (32 slots × 16 MiB).
+# Request bodies held at once, from upload through preparation and, for what
+# a generation retains of them, until it ends, take at most max(this, twice
+# --max-request-size) bytes, so two of the largest requests always fit.
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
@@ -77,19 +98,6 @@ CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 # The chat page's brand mark, in its text colors, which the page shows too.
 # Browsers, and other clients, ask for a site's icon at /favicon.ico.
 FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
-# The answer to a connection that gets no slot, or gives up its slot before
-# its request is read. With no request path, no API dialect is known: a
-# generic server error with its stable diagnostic code.
-_CONNECTION_OVERLOADED_PAYLOAD = (
-    b'{"error":{"type":"server_error","code":"frontend_overloaded",'
-    b'"message":"HTTP connection capacity is exhausted"}}'
-)
-CONNECTION_OVERLOADED_RESPONSE = (
-    b"HTTP/1.1 503 Service Unavailable\r\n"
-    b"Content-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\n"
-    b"Content-Length: %d\r\n\r\n%s"
-    % (len(_CONNECTION_OVERLOADED_PAYLOAD), _CONNECTION_OVERLOADED_PAYLOAD)
-)
 
 
 def _content_length(value):
@@ -129,6 +137,67 @@ def _normalize_path(raw_path):
     return normalized
 
 
+def _return_progress(body):
+    """A generation request's return_progress, which only a stream takes."""
+    value = body.get("return_progress", False)
+    if not isinstance(value, bool) or (value and body.get("stream") is not True):
+        raise APIError(
+            400, "return_progress requires stream: true and must be a boolean"
+        )
+    return value
+
+
+def _stream_options(body):
+    """A Chat or text completion request's stream and its stream_options."""
+    stream = body.get("stream", False)
+    if stream is None:
+        stream = False
+    options = body.get("stream_options")
+    if options is None:
+        options = {}
+    if (
+        not isinstance(stream, bool)
+        or not isinstance(options, dict)
+        or not isinstance(options.get("include_usage", False), bool)
+    ):
+        raise APIError(400, "invalid streaming options")
+    return stream, {"include_usage": options.get("include_usage", False)}
+
+
+@dataclass(frozen=True, slots=True)
+class PostRoute:
+    """A POST endpoint, as FrontendHandler serves it."""
+
+    # The handler's method that serves a request, given its body and
+    # deadline: it answers the request, or prepares the generation the
+    # request asks for and returns its job and the method that answers with
+    # the job's output.
+    method: str
+    # How the endpoint's API answers errors.
+    errors: ErrorDialect
+    # Whether it answers from the prompt alone: it needs no engine, so the
+    # engine's state refuses none of its requests, which hold slots of the
+    # token-count gate instead of the request gate.
+    prompt_only: bool = False
+
+
+POST_ROUTES = {
+    "/v1/chat/completions": PostRoute("_post_chat_completions", OPENAI_ERRORS),
+    "/v1/completions": PostRoute("_post_completions", OPENAI_ERRORS),
+    "/v1/responses": PostRoute("_post_responses", OPENAI_ERRORS),
+    "/v1/messages": PostRoute("_post_messages", ANTHROPIC_ERRORS),
+    "/v1/messages/count_tokens": PostRoute(
+        "_post_count_tokens", ANTHROPIC_ERRORS, prompt_only=True
+    ),
+    "/tokenize": PostRoute("_post_tokenize", OPENAI_ERRORS, prompt_only=True),
+    "/apply-template": PostRoute(
+        "_post_apply_template", OPENAI_ERRORS, prompt_only=True
+    ),
+    "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
+    "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+}
+
+
 @dataclass(slots=True)
 class Collected:
     """A generation as FrontendHandler._collect gathered it."""
@@ -139,6 +208,9 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
+    # The id of the call the token limit cut, whose arguments are
+    # unfinished; None when it cut none.
+    cut_call: str | None
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -236,7 +308,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if isinstance(error, OriginRefused):
                 self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(error, self.route.startswith("/v1/messages"), log=False)
+            self._safe_error(error, self._path_errors(), log=False)
             return False
         return True
 
@@ -249,7 +321,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.request_version = self.protocol_version
         self._safe_error(
             APIError(code, message or self.responses[code][0]),
-            self.route.startswith("/v1/messages"),
+            self._path_errors(),
             log=False,
         )
 
@@ -262,6 +334,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """The request's path as routing, authentication and error dialects
         all read it; empty before a request line parses."""
         return _normalize_path(getattr(self, "path", ""))
+
+    def _path_errors(self):
+        """How errors are answered that no route answers: as Anthropic's API
+        answers them on its paths, else as OpenAI's."""
+        return (
+            ANTHROPIC_ERRORS if self.route.startswith("/v1/messages") else OPENAI_ERRORS
+        )
 
     def end_headers(self):
         # A browser hands a page the response from another origin only when
@@ -277,9 +356,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         super().end_headers()
 
-    def _send(self, status, data, content_type):
+    def _send(self, status, data, content_type, *, retry_after=False):
         self.send_response(status)
-        if status == 503:
+        if retry_after:
             self.send_header("Retry-After", "1")
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
@@ -298,52 +377,33 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, *, retry_after=False):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
             log_unexpected(error)
-            self._error(
+            self._safe_error(
                 APIError(500, "internal server error", "internal_server_error"),
-                self.route.startswith("/v1/messages"),
+                self._path_errors(),
+                log=False,
             )
             return
-        self._send(status, data, "application/json")
+        self._send(status, data, "application/json", retry_after=retry_after)
 
-    def _error(self, error, anthropic=False):
-        error_type = error.protocol_type(anthropic)
-        message = error.message
-        if anthropic and isinstance(error, ContextLengthError):
-            message = (
-                f"prompt is too long: {error.input_tokens} tokens > "
-                f"{error.maximum_input_tokens} maximum input tokens"
-            )
-            if error.image_tokens_only:
-                message += " (image tokens alone; text not yet counted)"
-        self._json(
-            error.status,
-            {"type": "error", "error": {"type": error_type, "message": message}}
-            if anthropic
-            else {
-                "error": {
-                    "message": error.message,
-                    "type": error_type,
-                    "code": error.code,
-                }
-            },
-        )
-
-    def _log_api_error(self, error):
+    def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
-        print_status(f"Error · {error.code} · {self.command} {path[:256]}", error=True)
+        print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
 
-    def _safe_error(self, error, anthropic=False, *, log=True):
+    def _safe_error(self, error, errors=OPENAI_ERRORS, *, log=True):
+        """Answer with `error` as the API whose `errors` dialect it is answers
+        it, unless the response has begun."""
         if self._response_started:
             return
+        status, code, payload = errors.answer(error)
         if log:
-            self._log_api_error(error)
+            self._log_api_error(code)
         try:
-            self._error(error, anthropic)
+            self._json(status, payload, retry_after=error.retryable)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -352,6 +412,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return HTTP_IO_TIMEOUT + length / HTTP_UPLOAD_BYTES_PER_SECOND
 
     def _read_json_body(self, deadline):
+        """The request's body, a JSON object, read by `deadline`."""
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -403,9 +464,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-        payload.clear()
-        return json_codec.loads(text)
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except (ValueError, RecursionError):
+            # Text that is not JSON, or JSON nested deeper than the parser
+            # reads.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
+        if not isinstance(body, dict):
+            raise RequestValidationError(
+                [field_error([], "request body must be an object")]
+            )
+        return body
 
     def do_HEAD(self):
         self.do_GET()
@@ -449,6 +522,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(
                 200 if ready else 503,
                 {"status": "ready" if ready else "unavailable"},
+                retry_after=not ready,
             )
             return
         if path == "/status":
@@ -528,252 +602,190 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         started_at = time.monotonic()
-        job = None
-        body = None
-        self._body_reservation = None
-        submitted = False
-        path = self.route
-        count_tokens = path == "/v1/messages/count_tokens"
-        prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
-        anthropic = path == "/v1/messages" or count_tokens
-        systemone = path == "/v1/systemone"
-        completions = path == "/v1/completions"
-        if path not in (
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/responses",
-            "/v1/messages",
-            "/v1/messages/count_tokens",
-            "/tokenize",
-            "/apply-template",
-            "/v1/judgments",
-            "/v1/systemone",
-        ):
+        route = POST_ROUTES.get(self.route)
+        if route is None:
             self._safe_error(APIError(404, "not found", "not_found"))
             return
-        refusal = None if prompt_only else self.app.backend.refusal()
+        refusal = None if route.prompt_only else self.app.backend.refusal()
         if refusal is not None:
-            if systemone and refusal.status == 503:
-                refusal = APIError(529, refusal.message, refusal.code)
-            self._safe_error(refusal, anthropic, log=False)
+            self._safe_error(refusal, route.errors, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
         # the native pending limit, and control endpoints need no such slot.
-        admission = self.server.token_counts if prompt_only else self.server.requests
+        admission = (
+            self.server.token_counts if route.prompt_only else self.server.requests
+        )
         if not admission.acquire():
             self._safe_error(
                 APIError(
-                    529 if systemone else 503,
+                    503,
                     "frontend request capacity is exhausted",
                     "frontend_overloaded",
                 ),
-                anthropic,
+                route.errors,
             )
             return
+        self._body_reservation = None
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         try:
-            with self.app.latencies.measure("upload"):
-                body = self._read_json_body(started_at + self.app.request_timeout)
-            if not isinstance(body, dict):
-                if systemone:
-                    raise judgments.SystemOneError(
-                        [judgments.detail([], "request body must be an object")]
-                    )
-                raise APIError(400, "request body must be an object")
-            try:
-                deadline = self.app.request_deadline(body, started_at)
-            except APIError as error:
-                if systemone:
-                    raise judgments.SystemOneError(
-                        [judgments.detail(["timeout"], error.message)]
-                    ) from error
-                raise
-            if path == "/tokenize":
-                self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
-                return
-            if path == "/apply-template":
-                self._json(
-                    200, {"prompt": self.app.apply_template(body, deadline=deadline)}
-                )
-                return
-            if count_tokens:
-                tokens = self.app.count_tokens(
-                    anthropic_to_chat_prompt(
-                        body, thinking_resolver=self.app.thinking_codec.decode
-                    ),
-                    deadline=deadline,
-                )
-                self._json(200, {"input_tokens": tokens})
-                return
-            if path == "/v1/judgments":
-                job, row = self.app.prepare_judgment(body, deadline=deadline)
-                remaining_request_time(deadline)
-                if self._client_disconnected():
-                    raise ConnectionResetError("client disconnected before submission")
-                self.app.backend.submit(job)
-                submitted = True
-                self._judgment_complete(job, row)
-                return
-            if systemone:
-                self._systemone(body, deadline)
-                return
-            responses = path == "/v1/responses"
-            stream = body.get("stream", False)
-            if stream is None and not anthropic:
-                stream = False
-            return_progress = body.get("return_progress", False)
-            if not isinstance(return_progress, bool) or (
-                return_progress and stream is not True
-            ):
-                raise APIError(
-                    400, "return_progress requires stream: true and must be a boolean"
-                )
-            if anthropic:
-                chat, thinking_display = anthropic_to_chat_body(
-                    body, thinking_resolver=self.app.thinking_codec.decode
-                )
-                job = self.app.prepare(
-                    chat,
-                    deadline=deadline,
-                    output_field="max_tokens",
-                    clamp_output_budget=True,
-                    thinking_display=thinking_display,
-                )
-                stream_options = None
-            elif responses:
-                job = self.app.prepare_responses(
-                    body,
-                    deadline=deadline,
-                    reserve_input=self._body_reservation.grow,
-                )
-                stream_options = None
-            else:
-                stream_options = body.get("stream_options")
-                if stream_options is None:
-                    stream_options = {}
-                if (
-                    not isinstance(stream, bool)
-                    or not isinstance(stream_options, dict)
-                    or not isinstance(stream_options.get("include_usage", False), bool)
-                ):
-                    raise APIError(400, "invalid streaming options")
-                stream_options = {
-                    "include_usage": stream_options.get("include_usage", False)
-                }
-                if completions:
-                    job = self.app.prepare_completion(body, deadline=deadline)
-                else:
-                    job = self.app.prepare(body, deadline=deadline)
-            body = None
-            self._body_reservation.retain_for(job)
-            self._body_reservation = None
-            job.return_progress = return_progress
-            job.latency = RequestLatency(self.app.latencies, started_at)
-            remaining_request_time(deadline)
-            if self._client_disconnected():
-                raise ConnectionResetError("client disconnected before submission")
-            self.app.backend.submit(job)
-            submitted = True
-            if anthropic and stream:
-                self._anthropic_stream(job)
-            elif anthropic:
-                self._anthropic_complete(job)
-            elif responses and stream:
-                self._responses_stream(job)
-            elif responses:
-                self._responses_complete(job)
-            elif stream:
-                self._openai_stream(job, stream_options, chat=not completions)
-            elif completions:
-                self._text_completion(job)
-            else:
-                self._complete(job)
-        except judgments.SystemOneError as error:
-            if submitted:
-                self.app.backend.cancel(job)
-            self._systemone_error(error)
+            generation = self._serve(route, started_at)
+            if generation is not None:
+                self._generate(*generation, started_at)
         except (BrokenPipeError, ConnectionResetError):
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
         except TimeoutError:
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
             error = APIError(408, "HTTP I/O timed out", "request_timeout")
-            self._safe_error(error, anthropic, log=not submitted)
+            self._safe_error(error, route.errors, log=self._submitted is None)
         except APIError as error:
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone and error.status == 503:
-                error = APIError(529, error.message, error.code)
+            self._cancel_submitted()
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
-            self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
-        except (ValueError, RecursionError):
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone:
-                self._systemone_error(
-                    judgments.SystemOneError(
-                        [judgments.detail([], "invalid JSON request body")]
-                    )
-                )
-            else:
-                error = APIError(400, "invalid JSON request body")
-                self._safe_error(error, anthropic, log=not submitted)
+            self._safe_error(
+                error,
+                route.errors,
+                log=self._submitted is None or error.status >= 500,
+            )
         except Exception as error:
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
             log_unexpected(error)
             error = APIError(500, "internal server error", "internal_server_error")
-            self._safe_error(error, anthropic, log=False)
+            self._safe_error(error, route.errors, log=False)
         finally:
-            body = None
             if self._body_reservation is not None:
                 self._body_reservation.release()
                 self._body_reservation = None
+            # The handler, in a reference cycle with its header timer,
+            # outlives the request; the job must not, as freeing it returns
+            # the input it retains.
+            self._submitted = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
-    def _await_done(self, job):
-        """The result of a score job, which emits only start and done."""
-        while (event := self._next_event(job))[0] != "done":
-            pass
-        return event[1]
+    def _serve(self, route, started_at):
+        """Read the request and serve it: answer it, or prepare the
+        generation it asks for and return its job and the method that answers
+        with the job's output."""
+        with self.app.latencies.measure("upload"):
+            body = self._read_json_body(started_at + self.app.request_timeout)
+        serve = getattr(self, route.method)
+        return serve(body, self.app.request_deadline(body, started_at))
 
-    def _judgment_complete(self, job, row):
+    def _generate(self, job, respond, started_at):
+        """Submit a prepared generation and answer with its output. The
+        request's input bytes stay reserved only for what the job retains."""
+        self._body_reservation.retain_for(job)
+        self._body_reservation = None
+        job.latency = RequestLatency(self.app.latencies, started_at)
+        self._submit(job)
+        respond(job)
+
+    def _submit(self, job):
+        """Submit `job` unless its deadline has passed or its client has
+        left; from then on a failure cancels it."""
+        remaining_request_time(job.deadline)
+        if self._client_disconnected():
+            raise ConnectionResetError("client disconnected before submission")
+        self.app.backend.submit(job)
+        self._submitted = job
+
+    def _cancel_submitted(self):
+        if self._submitted is not None:
+            self.app.backend.cancel(self._submitted)
+
+    def _post_chat_completions(self, body, deadline):
+        return_progress = _return_progress(body)
+        stream, stream_options = _stream_options(body)
+        job = self.app.prepare(body, deadline=deadline)
+        job.return_progress = return_progress
+        if stream:
+            return job, partial(
+                self._openai_stream, stream_options=stream_options, chat=True
+            )
+        return job, self._complete
+
+    def _post_completions(self, body, deadline):
+        return_progress = _return_progress(body)
+        stream, stream_options = _stream_options(body)
+        job = self.app.prepare_completion(body, deadline=deadline)
+        job.return_progress = return_progress
+        if stream:
+            return job, partial(
+                self._openai_stream, stream_options=stream_options, chat=False
+            )
+        return job, self._text_completion
+
+    def _post_responses(self, body, deadline):
+        return_progress = _return_progress(body)
+        job = self.app.prepare_responses(
+            body, deadline=deadline, reserve_input=self._body_reservation.grow
+        )
+        job.return_progress = return_progress
+        if body.get("stream"):
+            return job, self._responses_stream
+        return job, self._responses_complete
+
+    def _post_messages(self, body, deadline):
+        return_progress = _return_progress(body)
+        chat, thinking_display = anthropic_to_chat_body(
+            body, thinking_resolver=self.app.thinking_codec.decode
+        )
+        job = self.app.prepare(
+            chat,
+            deadline=deadline,
+            output_field="max_tokens",
+            clamp_output_budget=True,
+            thinking_display=thinking_display,
+        )
+        job.return_progress = return_progress
+        if body.get("stream"):
+            return job, self._anthropic_stream
+        return job, self._anthropic_complete
+
+    def _post_count_tokens(self, body, deadline):
+        prompt = anthropic_to_chat_prompt(
+            body, thinking_resolver=self.app.thinking_codec.decode
+        )
+        tokens = self.app.count_tokens(prompt, deadline=deadline)
+        self._json(200, {"input_tokens": tokens})
+
+    def _post_tokenize(self, body, deadline):
+        self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
+
+    def _post_apply_template(self, body, deadline):
+        self._json(200, {"prompt": self.app.apply_template(body, deadline=deadline)})
+
+    def _post_judgments(self, body, deadline):
+        job, row = self.app.prepare_judgment(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
+        self._submit(job)
         result = self._await_done(job)
         self._json(
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
         )
 
-    def _systemone(self, body, deadline):
-        active_job = None
-        try:
-            entries = self.app.prepare_systemone(body, deadline=deadline)
-            remaining_request_time(deadline)
-            if self._client_disconnected():
-                raise ConnectionResetError("client disconnected before submission")
-            answers = {}
-            input_tokens = 0
-            for qid, spec, job in entries:
-                if job is None:
-                    answers[qid] = judgments.deterministic_answer(spec)
-                    continue
-                # One admitted job per HTTP request preserves the existing
-                # queue bound and lets later questions reuse the state prefix.
-                active_job = job
-                self.app.backend.submit(job)
-                result = self._await_done(job)
-                input_tokens += result.prompt_tokens
-                answers[qid] = judgments.systemone_answer(
-                    spec, judgments.softmax(list(result.option_logits))
-                )
-                active_job = None
-        except BaseException:
-            if active_job is not None:
-                self.app.backend.cancel(active_job)
-            raise
+    def _post_systemone(self, body, deadline):
+        answers = {}
+        input_tokens = 0
+        entries = self.app.prepare_systemone(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
+        for qid, spec, job in entries:
+            if job is None:
+                answers[qid] = judgments.deterministic_answer(spec)
+                continue
+            # One admitted job per HTTP request preserves the existing
+            # queue bound and lets later questions reuse the state prefix.
+            self._submit(job)
+            result = self._await_done(job)
+            input_tokens += result.prompt_tokens
+            answers[qid] = judgments.systemone_answer(
+                spec, judgments.softmax(list(result.option_logits))
+            )
         self._json(
             200,
             {
@@ -783,16 +795,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _systemone_error(self, error):
-        if self._response_started:
-            return
-        self._log_api_error(
-            APIError(422, error.details[0]["msg"], "unprocessable_entity")
-        )
-        try:
-            self._json(422, {"detail": error.details})
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+    def _await_done(self, job):
+        """The result of a score job, which emits only start and done."""
+        while (event := self._next_event(job))[0] != "done":
             pass
+        return event[1]
 
     def _next_event(self, job, on_idle=None):
         while True:
@@ -914,7 +921,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         publish(events)
         return Collected(
-            "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+            "".join(reasoning),
+            content_text,
+            tool_calls,
+            result,
+            splitter.reasoning,
+            None if projector is None else projector.call_id,
         )
 
     def _complete(self, job):
@@ -953,6 +965,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         result = collected.result
         blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        if collected.cut_call is not None:
+            # A complete message leaves out the call the token limit cut.
+            blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
             if collected.reasoning and job.thinking_display == "omitted"
@@ -1001,19 +1016,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("ping", {})
 
         def open_block(index, block):
-            if block.kind == "reasoning":
-                content_block = {"type": "thinking", "thinking": "", "signature": ""}
-            elif block.kind == "text":
-                content_block = {"type": "text", "text": ""}
-            else:
-                content_block = {
-                    "type": "tool_use",
-                    "id": block.call_id,
-                    "name": block.name,
-                    "input": {},
-                }
             send(
-                "content_block_start", {"index": index, "content_block": content_block}
+                "content_block_start",
+                {"index": index, "content_block": anthropic_block(job, block)},
             )
             if block.kind == "reasoning" and omitted:
                 send(
@@ -1079,15 +1084,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             send("message_stop", {})
 
         def send_error(error):
-            send(
-                "error",
-                {
-                    "error": {
-                        "type": error.protocol_type(True),
-                        "message": error.message,
-                    }
-                },
-            )
+            self._event_sse("error", ANTHROPIC_ERRORS.payload(error))
 
         self._guarded_stream(job, run, send_error)
 
@@ -1154,15 +1151,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._write_sse(b": splash-keepalive\n\n")
 
     def _sse_error(self, error):
-        self._sse(
-            {
-                "error": {
-                    "message": error.message,
-                    "type": error.protocol_type(),
-                    "code": error.code,
-                }
-            }
-        )
+        self._sse(OPENAI_ERRORS.payload(error))
         self._sse("[DONE]")
 
     def _guarded_stream(self, job, run, send_error):
@@ -1175,7 +1164,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if not self._response_started:
                 raise
             if error.status >= 500:
-                self._log_api_error(error)
+                self._log_api_error(error.code)
             try:
                 send_error(error)
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -1432,320 +1421,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._guarded_stream(job, run, self._sse_error)
 
 
-class HttpAdmission:
-    """Nonwaiting capacity gate, in request counts or input bytes."""
-
-    def __init__(self, capacity):
-        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
-            raise ValueError("HTTP admission capacity must be a positive integer")
-        self.capacity = capacity
-        self.active = 0
-        # Input finalizers can run during a stats snapshot on this thread.
-        self.lock = threading.RLock()
-
-    def acquire(self, amount=1):
-        with self.lock:
-            if self.active + amount > self.capacity:
-                return False
-            self.active += amount
-            return True
-
-    def release(self, amount=1):
-        with self.lock:
-            if amount > self.active:
-                raise RuntimeError("HTTP admission slot released without acquisition")
-            self.active -= amount
-
-    def stats(self):
-        with self.lock:
-            return {"active": self.active, "capacity": self.capacity}
-
-
-def _refuse_connection(connection):
-    """Send CONNECTION_OVERLOADED_RESPONSE without waiting: the server has
-    read no request from the connection and written it no response, so the
-    response fits in its send buffer."""
-    try:
-        connection.send(CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT)
-    except OSError:
-        pass
-
-
-def _has_input(connection):
-    """Whether `connection` holds input its thread has yet to read, such as
-    a request that arrived before its thread ran."""
-    # A poll object holds no descriptor.
-    poller = select.poll()
-    poller.register(connection, select.POLLIN)
-    return bool(poller.poll(0))
-
-
-class LingeringCloser:
-    """Closes connections answered without reading their requests.
-
-    Closing a connection with request bytes unread resets it, and the reset
-    can destroy the answer before the client reads it. Each connection given
-    here is half-closed instead; one thread reads and drops what its client
-    still sends, and closes it once the client has closed or `linger`
-    seconds after its answer. At most `capacity` wait at once; any beyond
-    them are closed at once.
-    """
-
-    # How soon the thread first reads a connection that arrives while it
-    # waits on others.
-    TICK = 0.05
-
-    def __init__(self, capacity, linger):
-        self.capacity = capacity
-        self.linger = linger
-        self.changed = threading.Condition()
-        self.arrivals = []
-        self.held = 0
-        self.stopped = False
-        self.thread = threading.Thread(
-            target=self._run, name="lingering close", daemon=True
-        )
-        self.thread.start()
-
-    def close(self, connection):
-        try:
-            connection.shutdown(socket.SHUT_WR)
-            connection.setblocking(False)
-        except OSError:
-            connection.close()
-            return
-        with self.changed:
-            if self.stopped or self.held >= self.capacity:
-                connection.close()
-                return
-            self.held += 1
-            self.arrivals.append((connection, time.monotonic() + self.linger))
-            self.changed.notify()
-
-    def stop(self):
-        """Close every waiting connection and end the thread."""
-        with self.changed:
-            self.stopped = True
-            self.changed.notify()
-        self.thread.join()
-
-    def _run(self):
-        # A poll object holds no descriptor.
-        poller = select.poll()
-        waiting = {}
-        while True:
-            with self.changed:
-                while not (waiting or self.arrivals or self.stopped):
-                    self.changed.wait()
-                arrivals, self.arrivals = self.arrivals, []
-                stopped = self.stopped
-            for connection, deadline in arrivals:
-                poller.register(connection, select.POLLIN)
-                waiting[connection.fileno()] = connection, deadline
-            if not stopped:
-                for descriptor, _ in poller.poll(self.TICK * 1000):
-                    connection, _ = waiting[descriptor]
-                    try:
-                        if connection.recv(65536):
-                            continue
-                    except BlockingIOError:
-                        continue
-                    except OSError:
-                        pass
-                    waiting[descriptor] = connection, 0.0
-            now = time.monotonic()
-            done = [
-                descriptor
-                for descriptor, (_, deadline) in waiting.items()
-                if stopped or deadline <= now
-            ]
-            for descriptor in done:
-                poller.unregister(descriptor)
-                waiting.pop(descriptor)[0].close()
-            with self.changed:
-                self.held -= len(done)
-            if stopped:
-                return
-
-
-class ConnectionSlots:
-    """The connections the server gives a thread, at most `capacity`.
-
-    One that waits for its request with nothing yet to read, or drains an
-    upload refused unread, gives its slot to a new connection when no slot
-    is free, the longest waiting first, so stalled connections, however
-    many and from however many addresses, cannot keep others out. One whose
-    request has arrived keeps its slot, although its thread may not have
-    run yet: when every slot has a request, arrived or in progress, the new
-    connection is refused. One that gives way still awaiting its request
-    gets the 503 of a connection refused at the accept, as its request may
-    be on its way. One draining a refused upload already has its response.
-    """
-
-    # What a connection with a slot is doing.
-    AWAITING_REQUEST = "awaiting request"
-    SERVING = "serving"
-    DRAINING = "draining"
-
-    def __init__(self, capacity):
-        self.capacity = capacity
-        # Each connection with a slot, mapped to what it is doing; those that
-        # wait on their client in the order they began to.
-        self.holders = {}
-        self.lock = threading.Lock()
-        self.idle = threading.Event()
-        self.idle.set()
-
-    def admit(self, connection):
-        """Give `connection` a slot, awaiting its request; False when every
-        slot has a request, arrived or in progress."""
-        with self.lock:
-            if len(self.holders) >= self.capacity:
-                waiting = next(
-                    (
-                        held
-                        for held, state in self.holders.items()
-                        if state == self.DRAINING
-                        or (state == self.AWAITING_REQUEST and not _has_input(held))
-                    ),
-                    None,
-                )
-                if waiting is None:
-                    return False
-                if self.holders[waiting] == self.AWAITING_REQUEST:
-                    _refuse_connection(waiting)
-                self._close(waiting)
-            self.holders[connection] = self.AWAITING_REQUEST
-            self.idle.clear()
-            return True
-
-    def expire(self, connection):
-        """Close `connection`, and free its slot, if it still awaits its
-        request."""
-        with self.lock:
-            if self.holders.get(connection) == self.AWAITING_REQUEST:
-                self._close(connection)
-
-    def _close(self, connection):
-        # Under the lock, which a connection's release takes before the
-        # connection is closed, so the descriptor is still its own. Its
-        # thread sees the end of input; it has lost its slot, so a request
-        # whose headers the shutdown cut short is not served.
-        del self.holders[connection]
-        try:
-            connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-
-    def serving(self, connection):
-        """Mark the request on `connection` in progress; False once the
-        connection has lost its slot."""
-        with self.lock:
-            if connection not in self.holders:
-                return False
-            self.holders[connection] = self.SERVING
-            return True
-
-    def draining(self, connection):
-        """`connection`, answered, drains an upload refused unread: it waits
-        on its client again, last in line."""
-        with self.lock:
-            if self.holders.pop(connection, None) is not None:
-                self.holders[connection] = self.DRAINING
-
-    def release(self, connection):
-        """Give back the slot of `connection`, if it still has one, before
-        the connection is closed."""
-        with self.lock:
-            self.holders.pop(connection, None)
-            if not self.holders:
-                self.idle.set()
-
-    def stats(self):
-        with self.lock:
-            return {"active": len(self.holders), "capacity": self.capacity}
-
-
-class RequestBodyReservation:
-    """Account input bytes until preparation and any retained input are released."""
-
-    def __init__(self, admission, size):
-        if not admission.acquire(size):
-            raise APIError(
-                503,
-                "request body capacity is exhausted; retry shortly",
-                "frontend_overloaded",
-            )
-        self.admission = admission
-        self.size = size
-
-    def release(self):
-        self.admission.release(self.size)
-        self.size = 0
-
-    def grow(self, size):
-        if not self.admission.acquire(size):
-            raise APIError(
-                503,
-                "retained input capacity is exhausted; retry shortly",
-                "frontend_overloaded",
-            )
-        self.size += size
-
-    def retain_for(self, job):
-        # Generation retains schemas and, for Responses, conversation history.
-        # Text/image prompts have otherwise become tokens and prepared pixels.
-        policy = job.tool_policy
-        retained = (
-            job.response_history_items,
-            job.response_format,
-            policy.schemas if policy else None,
-            policy.namespaces if policy else None,
-            job.stop_sequences,
-        )
-        retained = [value for value in retained if value]
-        size = json_codec.encoded_size(retained) if retained else 0
-        if size > self.size:
-            self.grow(size - self.size)
-        else:
-            self.admission.release(self.size - size)
-        self.size = size
-        if size:
-            weakref.finalize(job, self.release)
-
-
-class RefusedOriginLog:
-    """Prints each origin the server refuses, once. Its browser hides the 403
-    from the page, which sees a network error, so the operator learns here
-    which --allowed-origin would admit it. Any client can send any origin, so
-    past LIMIT origins no more are printed, and the flag value is quoted for a
-    shell."""
-
-    LIMIT = 32
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        # The origins printed, and the first one past LIMIT.
-        self.origins = set()
-
-    def report(self, origin):
-        # Printing under the lock keeps the closing line last.
-        with self.lock:
-            if origin in self.origins or len(self.origins) > self.LIMIT:
-                return
-            self.origins.add(origin)
-            if len(self.origins) > self.LIMIT:
-                print_status("Refused · further Origins are not logged", error=True)
-                return
-            # Visible ASCII, as parse_origin admits, but of any length.
-            shown = origin[:256]
-            print_status(
-                f"Refused · Origin {shown} · restart with --allowed-origin "
-                f"{shlex.quote(shown)} to accept it",
-                error=True,
-            )
-
-
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1766,7 +1441,7 @@ class FrontendServer(ThreadingHTTPServer):
         address,
         app,
         bind_and_activate=True,
-        request_capacity=32,
+        request_capacity=serve_options.DEFAULT_QUEUE_SIZE,
         allowed_hosts=(),
         api_key=None,
         webui=True,
@@ -1829,7 +1504,7 @@ class FrontendServer(ThreadingHTTPServer):
         if not self.connections.admit(request):
             # Do not create a thread or block the accept loop to reject an
             # excess socket.
-            _refuse_connection(request)
+            refuse_connection(request)
             self.refused.close(request)
             return
         super().process_request(request, client_address)
