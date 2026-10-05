@@ -1364,7 +1364,9 @@ and runs native CPU tests without a GPU; `make check-native-metal` requires a
 supported Metal device and runs the kernel tests under shader validation, and the Linear pipeline
 resource check without it. They
 include loading small synthetic MLX, GGUF and vision sources and the GGUF
-kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
+kernels on synthetic tensors. `make check-native-build` builds every native
+test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
+`check-native-build` and the sanitizers.
 
 The real-model targets take `MODEL` exactly as `splash serve --model` does,
 and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
@@ -1415,7 +1417,7 @@ allocates as it runs, must fit in what macOS has available above its reserve,
 so it stops, naming what it needs, while other programs hold that memory. With
 only desktop applications open, a 24 GB Mac runs it for those variants.
 
-`make test-engine-cpu` builds the affine source oracle and `weight-digests` so
+`make check-native-build` builds the affine source oracle and `weight-digests` so
 they cannot break unnoticed. No target runs the oracle, as it needs real
 models: after `make all build/engine-tests/affine-source-oracle`, pass it
 `build/splash.metallib`, an installed MLX model's `target` directory and the

@@ -36,6 +36,8 @@ jobs:
           python-version: "3.13"
       - name: Build production and run CPU runtime checks
         run: make check-source check-native-cpu PYTHON_CANDIDATES=python3
+      - name: Build every native test and tool
+        run: make check-native-build
       - name: Run native sanitizers
         run: make test-sanitizers
 

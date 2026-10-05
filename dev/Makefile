@@ -39,7 +39,8 @@ HTTP_SMOKE_ARGS ?=
 -include dev/native.mk
 
 .PHONY: agent-preflight architecture-check check check-source \
-	check-native-engine check-native-cpu check-native-metal check-python-engine \
+	check-native-engine check-native-cpu check-native-metal check-native-build \
+	check-python-engine \
 	install-development _install-development release-check test \
 	test-agent-real test-http-real test-performance-real test-release-real \
 	test-models test-python test-real verify-models \
@@ -61,12 +62,20 @@ _install-development:
 	"$(PYTHON)" -m pip install -r dev/requirements.txt; \
 	echo "$$hash" > "$(DEV_STAMP)"
 
-# Build production and run native tests that do not require model weights.
-check-native-engine: check-native-cpu check-native-metal
+# Build production and every native test and tool, and run the native tests
+# that do not require model weights.
+check-native-engine: check-native-cpu check-native-metal check-native-build
 
 check-native-cpu: platform-check $(TARGET) test-engine-cpu
 
 check-native-metal: platform-check $(TARGET) test-engine-metal
+
+# Build every native test, benchmark and tool, the outputs TEST_CONFIG_TARGETS
+# and PRODUCTION_FLAG_TOOLS name, and run none: hosted CI has no GPU the Metal
+# tests support and no model for the real-model tests and profiles, and builds
+# them so that none breaks unnoticed.
+check-native-build: platform-check $(TARGET) $(TEST_CONFIG_TARGETS) \
+	$(PRODUCTION_FLAG_TOOLS)
 
 # Discovering dev/tests/engine keeps this gate complete as new current runtime
 # Python tests are added.
