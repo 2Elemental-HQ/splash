@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1226,6 +1227,54 @@ class AgentRunnerTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 timeout=20,
+            )
+
+    def test_preflight_runs_the_installed_client_tests_of_the_clients_found(self):
+        tests = [
+            "dev.tests.engine.test_clients.InstalledCodexTests",
+            "dev.tests.engine.test_clients.InstalledPiTests",
+        ]
+        for status in (0, 1):
+            calls = []
+
+            def run(argv, **options):
+                calls.append((argv, options))
+                tests_run = argv[1:3] == ["-m", "unittest"]
+                return subprocess.CompletedProcess(
+                    argv, status if tests_run else 0, "version", ""
+                )
+
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(
+                    agent.clients, "find_executable", side_effect=lambda n: f"/test/{n}"
+                ),
+                mock.patch.object(agent.subprocess, "run", side_effect=run),
+                mock.patch.dict(os.environ, clear=True),
+            ):
+                report = Path(directory) / "report.json"
+                arguments = [
+                    "--clients",
+                    "claude,codex,pi",
+                    "--model",
+                    "incoai/Qwen3.8-27B-Splash",
+                    "--preflight-only",
+                    "--output",
+                    str(report),
+                ]
+                if status:
+                    with self.assertRaisesRegex(agent.AgentFailure, "installed"):
+                        agent.main(arguments)
+                    self.assertFalse(report.exists())
+                else:
+                    self.assertEqual(agent.main(arguments), 0)
+            argv, options = calls[-1]
+            self.assertEqual(argv, [sys.executable, "-m", "unittest", *tests])
+            self.assertEqual(options["cwd"], agent.ROOT)
+            self.assertEqual(
+                options["env"],
+                {"SPLASH_CODEX_BINARY": "/test/codex", "SPLASH_PI_BINARY": "/test/pi"},
             )
 
     def test_preflight_requires_opencode_major_version(self):

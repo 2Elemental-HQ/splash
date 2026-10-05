@@ -1364,7 +1364,9 @@ and runs native CPU tests without a GPU; `make check-native-metal` requires a
 supported Metal device and runs the kernel tests under shader validation, and the Linear pipeline
 resource check without it. They
 include loading small synthetic MLX, GGUF and vision sources and the GGUF
-kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
+kernels on synthetic tensors. `make check-native-build` builds every native
+test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
+`check-native-build` and the sanitizers.
 
 The real-model targets take `MODEL` exactly as `splash serve --model` does,
 and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
@@ -1381,6 +1383,10 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
+
+`test-agent-real` and `test-release-real` first run the tests
+`dev/tests/engine/test_clients.py` has of the installed OpenCode, Codex and Pi
+among the selected clients, which need no model.
 
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
 root, `splash-test-<id>`, which moves into the run's folder under
@@ -1415,7 +1421,7 @@ allocates as it runs, must fit in what macOS has available above its reserve,
 so it stops, naming what it needs, while other programs hold that memory. With
 only desktop applications open, a 24 GB Mac runs it for those variants.
 
-`make test-engine-cpu` builds the affine source oracle and `weight-digests` so
+`make check-native-build` builds the affine source oracle and `weight-digests` so
 they cannot break unnoticed. No target runs the oracle, as it needs real
 models: after `make all build/engine-tests/affine-source-oracle`, pass it
 `build/splash.metallib`, an installed MLX model's `target` directory and the

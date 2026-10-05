@@ -175,6 +175,203 @@ class SmokeRealTests(unittest.TestCase):
                             server.close()
 
     @staticmethod
+    def server_arguments():
+        return SimpleNamespace(
+            package=Path("/models/package"),
+            binary=Path("/build/splash"),
+            model="test-model",
+            max_context=None,
+            max_memory=None,
+            max_cache_disk="4G",
+            max_image_pixels=None,
+            kv_format="int8",
+        )
+
+    @contextlib.contextmanager
+    def server(self, **options):
+        """A RealServer of server_arguments with these options, its process
+        a mock."""
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(self.server_arguments(), **options)
+            try:
+                yield server
+            finally:
+                server.close()
+
+    def test_a_persistent_cache_server_names_its_directory(self):
+        for cache_dir in (None, Path("/tmp/cache")):
+            with self.subTest(cache_dir=cache_dir), self.server(cache_dir=cache_dir):
+                command = smoke_real.subprocess.Popen.call_args.args[0]
+                self.assertEqual(command[command.index("--max-cache-disk") + 1], "4G")
+                if cache_dir is None:
+                    self.assertNotIn("--persistent-cache", command)
+                else:
+                    index = command.index("--persistent-cache")
+                    self.assertEqual(
+                        command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
+                    )
+
+    def test_persistent_cache_scenario_needs_a_disk_quota(self):
+        model = ["--model", "incoai/Qwen3.8-27B-Splash"]
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            smoke_real.parse_args([*model, "--persistent-cache"])
+        arguments = smoke_real.parse_args(
+            [*model, "--persistent-cache", "--max-cache-disk", "4G"]
+        )
+        self.assertTrue(arguments.persistent_cache)
+        self.assertFalse(smoke_real.parse_args(model).persistent_cache)
+
+    def test_stop_requires_a_clean_exit(self):
+        timeout = smoke_real.subprocess.TimeoutExpired("server", 60)
+        for wait, error in (
+            ({"return_value": 0}, None),
+            ({"return_value": 1}, "status 1"),
+            ({"side_effect": timeout}, "within 60 s"),
+        ):
+            with self.subTest(error=error), self.server() as server:
+                server.process.wait.configure_mock(**wait)
+                if error is None:
+                    server.stop()
+                else:
+                    with self.assertRaisesRegex(smoke_real.SmokeFailure, error):
+                        server.stop()
+                server.process.send_signal.assert_called_once_with(
+                    smoke_real.signal.SIGINT
+                )
+
+    @staticmethod
+    def closed_cache(root):
+        """A cache under root as a clean close leaves it; its directory."""
+        directory = root / "0123abcd"
+        directory.mkdir(mode=0o700)
+        for name in (*smoke_real.CACHE_FILES, "lock"):
+            (directory / name).touch()
+        return directory
+
+    def test_a_closed_cache_holds_its_files_and_a_free_lock_alone(self):
+        with TemporaryDirectory() as temporary:
+            self.closed_cache(Path(temporary))
+            smoke_real.require_closed_cache(Path(temporary))
+        for name, change in {
+            "serving": lambda directory: (directory / "serving").touch(),
+            "probation": lambda directory: (directory / "probation").touch(),
+            "missing file": lambda directory: (directory / "state.slots").unlink(),
+            "open to others": lambda directory: directory.chmod(0o755),
+            "another namespace": lambda directory: (directory.parent / "fe").mkdir(),
+            "no namespace": lambda directory: directory.rename(
+                directory.with_name("N")
+            ),
+        }.items():
+            with self.subTest(name=name), TemporaryDirectory() as temporary:
+                change(self.closed_cache(Path(temporary)))
+                with self.assertRaises(smoke_real.SmokeFailure):
+                    smoke_real.require_closed_cache(Path(temporary))
+        with TemporaryDirectory() as temporary:
+            with (self.closed_cache(Path(temporary)) / "lock").open("rb") as held:
+                smoke_real.fcntl.flock(held, smoke_real.fcntl.LOCK_EX)
+                with self.assertRaisesRegex(smoke_real.SmokeFailure, "lock"):
+                    smoke_real.require_closed_cache(Path(temporary))
+
+    def run_persistent_cache(self, changes=()):
+        """Runs the scenario against scripted servers, each change (read,
+        section, key, value) setting a key of one status read. Returns the
+        bodies both turns sent, the directory each start was given and the
+        closed-cache check."""
+        statuses = [
+            {"disk": {"persistent": True, "taken_back": {"states": 0}}},
+            {"disk": {"write_behind": {"waiting": 1, "durable": 0}}},
+            {
+                "disk": {
+                    "taken_back": {"states": 1, "kv_blocks": 186, "left_behind": 0}
+                },
+                "state": {"disk_hits": 0},
+                "cache": {"kv_disk_hit_tokens": 0, "reused_tokens": 64},
+            },
+            {
+                "state": {"disk_hits": 1},
+                "cache": {"kv_disk_hit_tokens": 5952, "reused_tokens": 6016},
+            },
+        ]
+        for read, section, key, value in changes:
+            statuses[read][section][key] = value
+        answers = [
+            {
+                "choices": [{"message": {"content": "Done"}}],
+                "usage": {"prompt_tokens": 5980},
+            },
+            {"choices": [{"message": {"content": "Again"}}]},
+        ]
+        turns, starts = [], []
+        server = mock.Mock(port=8000)
+
+        def request(port, method, path, body, *, timeout):
+            turns.append(json.loads(json.dumps(body)))
+            return 200, answers[len(turns) - 1]
+
+        @contextlib.contextmanager
+        def serving(arguments, cache_dir):
+            starts.append(cache_dir)
+            yield server
+
+        with (
+            mock.patch.object(smoke_real, "serving", serving),
+            mock.patch.object(smoke_real, "runtime_status", side_effect=statuses),
+            mock.patch.object(smoke_real, "request", request),
+            mock.patch.object(smoke_real, "require_closed_cache") as closed,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            smoke_real.run_persistent_cache(SimpleNamespace(model="test-model"))
+        self.assertEqual(server.stop.call_count, 2)
+        return turns, starts, closed
+
+    def test_persistent_cache_scenario_restores_the_prompt_after_a_restart(self):
+        turns, starts, closed = self.run_persistent_cache()
+        self.assertEqual(starts, [starts[0]] * 2)
+        self.assertEqual(closed.call_args_list, [mock.call(starts[0])] * 2)
+        first, second = (turn["messages"] for turn in turns)
+        self.assertEqual(second[:1], first)
+        self.assertEqual(
+            second[1:],
+            [
+                {"role": "assistant", "content": "Done"},
+                {"role": "user", "content": "Reply with one more short word."},
+            ],
+        )
+
+    def test_persistent_cache_scenario_requires_what_a_restart_takes_back(self):
+        for name, change in {
+            "a tier that is not persistent": (0, "disk", "persistent", False),
+            "a fresh cache that took back": (0, "disk", "taken_back", {"states": 1}),
+            "no restore point to write": (
+                1,
+                "disk",
+                "write_behind",
+                {"waiting": 0, "durable": 0},
+            ),
+            "nothing taken back": (
+                2,
+                "disk",
+                "taken_back",
+                {"states": 0, "kv_blocks": 0, "left_behind": 0},
+            ),
+            "records left behind": (
+                2,
+                "disk",
+                "taken_back",
+                {"states": 1, "kv_blocks": 186, "left_behind": 1},
+            ),
+            "no state from disk": (3, "state", "disk_hits", 0),
+            "too little from disk": (3, "cache", "kv_disk_hit_tokens", 4000),
+            "too little reused": (3, "cache", "reused_tokens", 4064),
+        }.items():
+            with self.subTest(name=name), self.assertRaises(smoke_real.SmokeFailure):
+                self.run_persistent_cache([change])
+
+    @staticmethod
     def timeout_status(**changes):
         status = {
             "instance": "test-instance",

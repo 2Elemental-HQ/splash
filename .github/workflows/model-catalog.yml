@@ -34,10 +34,6 @@ jobs:
           python-version: "3.13"
 
       - name: Refresh the catalog
-        env:
-          # Only required while the collection is private. Drop once the
-          # collection is public under incoai/.
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python dev/tools/update_model_catalog.py
 
       - name: Open a pull request if the catalog changed

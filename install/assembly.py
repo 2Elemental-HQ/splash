@@ -149,8 +149,6 @@ def verify(assembly: Path, *, full=False):
     record = models.read_json(assembly / "model.json")
     if not _well_formed(record):
         raise models.ModelError("invalid resolved model record")
-    if _packed_draft(record["files"]):
-        raise models.ModelError("its draft is not a DFlash2 checkpoint")
     for name, entry in record["files"].items():
         path = assembly / name
         stat = path.stat()
@@ -208,13 +206,6 @@ def _well_formed(record):
             for name, entry in files.items()
         )
     )
-
-
-def _packed_draft(files):
-    """Whether the assembly links a packed draft, draft/model.bin and
-    draft/layer-N.bin, as assemblies did before drafts were prepared from
-    their DFlash2 checkpoints; the runtime loads only a checkpoint now."""
-    return any(name.startswith("draft/") and name.endswith(".bin") for name in files)
 
 
 def pins(record):

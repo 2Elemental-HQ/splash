@@ -7,11 +7,16 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import contextlib
+import fcntl
 import http.client
 import io
 import json
 import os
+import re
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -82,9 +87,16 @@ def stream_request(port: int, path: str, body: dict) -> tuple[int, str, bytes]:
 
 
 class RealServer:
-    def __init__(self, arguments, environment: dict | None = None):
+    def __init__(
+        self,
+        arguments,
+        environment: dict | None = None,
+        *,
+        cache_dir: Path | None = None,
+    ):
         """A server of arguments.package, its process started with these
-        variables added to this process's environment."""
+        variables added to this process's environment, and with a persistent
+        cache in cache_dir when one is given."""
         package = arguments.package.resolve()
         binary = arguments.binary.resolve()
         self.port = available_port()
@@ -113,6 +125,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if cache_dir is not None:
+            command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
@@ -143,6 +157,18 @@ class RealServer:
                 pass
             time.sleep(0.25)
         raise SmokeFailure(f"server did not become ready\n{self.tail()}")
+
+    def stop(self, timeout: float = 60) -> None:
+        """Stops the server with SIGINT, as Ctrl+C stops splash serve, and
+        requires a clean exit within timeout."""
+        self.process.send_signal(signal.SIGINT)
+        try:
+            code = self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            raise SmokeFailure(
+                f"server did not stop within {timeout:.0f} s\n{self.tail()}"
+            ) from None
+        require(code == 0, f"server stopped with status {code}\n{self.tail()}")
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -1467,6 +1493,126 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
     print(f"judgments timeout recovery: PASS (504 after {elapsed:.2f}s)", flush=True)
 
 
+# What a persistent cache keeps under its --cache-dir, one directory per
+# namespace (runtime/engine/CacheDirectory.cpp): the tier's files, the lock,
+# and while a process serves or a start is on probation, a mark of that.
+CACHE_NAMESPACE = re.compile(r"[0-9a-f]{1,64}")
+CACHE_FILES = {"kv.slots", "kv.records", "state.slots", "state.records"}
+
+
+@contextlib.contextmanager
+def serving(arguments, **options):
+    """A ready RealServer of arguments with these options, whose log's tail
+    is printed when anything fails while it serves; closed afterwards."""
+    server = RealServer(arguments, **options)
+    try:
+        validate_status(
+            server.wait_ready(arguments.startup_timeout), arguments.kv_format
+        )
+        yield server
+    except Exception:
+        print(server.tail(), file=sys.stderr)
+        raise
+    finally:
+        server.close()
+
+
+def require_closed_cache(root: Path) -> None:
+    """The one cache under root is as a clean close leaves it: a 0700
+    namespace directory of the tier's files and a lock nobody holds, without
+    a mark of serving or probation."""
+    entries = sorted(root.iterdir())
+    require(
+        len(entries) == 1
+        and CACHE_NAMESPACE.fullmatch(entries[0].name) is not None
+        and entries[0].is_dir(),
+        f"the cache directory holds {[entry.name for entry in entries]}",
+    )
+    directory = entries[0]
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    require(mode == 0o700, f"the cache namespace has mode {mode:o}")
+    names = {path.name for path in directory.iterdir()}
+    require(names == CACHE_FILES | {"lock"}, f"the closed cache holds {sorted(names)}")
+    with (directory / "lock").open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SmokeFailure("a stopped server still holds the cache lock") from None
+
+
+def run_persistent_cache(arguments) -> None:
+    """A conversation's prefix across a clean restart, in a fresh cache
+    directory: the first server answers a prompt deep enough for its restore
+    point to be written, and stops; the second takes the point back, and the
+    conversation's next turn restores the prompt from disk. Each stop must
+    close the cache cleanly."""
+    nonce = uuid.uuid4().hex
+    conversation = chat_body(
+        arguments.model,
+        f"{filler(nonce, 'persistent', 100)} Reply with one short word.",
+    )
+    with tempfile.TemporaryDirectory(prefix="splash-persistent-cache-") as directory:
+        root = Path(directory)
+        with serving(arguments, cache_dir=root) as server:
+            disk = runtime_status(server.port)["disk"]
+            require(
+                disk["persistent"] and disk["taken_back"]["states"] == 0,
+                f"a fresh persistent cache started with {disk!r}",
+            )
+            code, answer = request(
+                server.port, "POST", "/v1/chat/completions", conversation, timeout=300
+            )
+            require(code == 200, f"the first turn failed with HTTP {code}: {answer!r}")
+            prompt_tokens = answer["usage"]["prompt_tokens"]
+            points = runtime_status(server.port)["disk"]["write_behind"]
+            require(
+                points["waiting"] + points["durable"] >= 1,
+                f"the first turn left no restore point to write: {points!r}",
+            )
+            server.stop()
+        require_closed_cache(root)
+        conversation["messages"] += [
+            {
+                "role": "assistant",
+                "content": answer["choices"][0]["message"]["content"],
+            },
+            {"role": "user", "content": "Reply with one more short word."},
+        ]
+        with serving(arguments, cache_dir=root) as server:
+            before = runtime_status(server.port)
+            taken = before["disk"]["taken_back"]
+            require(
+                taken["states"] >= 1
+                and taken["kv_blocks"] >= 1
+                and taken["left_behind"] == 0,
+                f"the restart took back {taken!r}",
+            )
+            code, reply = request(
+                server.port, "POST", "/v1/chat/completions", conversation, timeout=300
+            )
+            require(code == 200, f"the next turn failed with HTTP {code}: {reply!r}")
+            after = runtime_status(server.port)
+            states = after["state"]["disk_hits"] - before["state"]["disk_hits"]
+            restored = (
+                after["cache"]["kv_disk_hit_tokens"]
+                - before["cache"]["kv_disk_hit_tokens"]
+            )
+            reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
+            require(states >= 1, "the next turn restored no state from disk")
+            # The tail past the restore point's block boundary is recomputed.
+            require(
+                min(restored, reused) * 10 >= prompt_tokens * 9,
+                f"the next turn restored {restored} and reused {reused} of the "
+                f"first turn's {prompt_tokens} prompt tokens",
+            )
+            server.stop()
+        require_closed_cache(root)
+    print(
+        f"persistent cache restart: PASS ({restored}/{prompt_tokens} from disk)",
+        flush=True,
+    )
+
+
 def add_server_arguments(parser):
     parser.add_argument("--binary", type=Path, default=ROOT / "build/splash")
     parser.add_argument(
@@ -1514,26 +1660,30 @@ def hold_package(arguments):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_server_arguments(parser)
-    return resolve_server_arguments(parser.parse_args(argv))
+    parser.add_argument(
+        "--persistent-cache",
+        action="store_true",
+        help="instead of the smoke, check a conversation's prefix across a clean "
+        "restart of a server with --persistent-cache in a fresh cache directory "
+        "(needs --max-cache-disk)",
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.persistent_cache and arguments.max_cache_disk is None:
+        parser.error("--persistent-cache needs --max-cache-disk")
+    return resolve_server_arguments(arguments)
 
 
 def main(argv=None) -> int:
     arguments = parse_args(argv)
     hold_package(arguments)
-    server = RealServer(arguments)
-    try:
-        validate_status(
-            server.wait_ready(arguments.startup_timeout), arguments.kv_format
-        )
+    if arguments.persistent_cache:
+        run_persistent_cache(arguments)
+        return 0
+    with serving(arguments) as server:
         run(server.port, arguments.model)
         validate_status(request(server.port, "GET", "/status")[1], arguments.kv_format)
-        print("http smoke: PASS", flush=True)
-        return 0
-    except Exception:
-        print(server.tail(), file=sys.stderr)
-        raise
-    finally:
-        server.close()
+    print("http smoke: PASS", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
