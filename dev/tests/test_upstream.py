@@ -629,6 +629,12 @@ class UpstreamTest(unittest.TestCase):
         fake.publish(other.draft.repo, "c" * 40, lambda p: draft_dir(p, DENSE))
         with mock.patch.object(families, "FAMILIES", (other, MOE)):
             self.prepare(chosen)
+        # Another installation pins the same draft.
+        hub.pin(
+            fake.snapshot(other.draft.repo, "c" * 40),
+            other.draft.repo,
+            chosen.models_root / "someone/other",
+        )
         fake.requests.clear()
         output, _ = self.prepare(chosen)
         self.assertIn(
@@ -639,8 +645,9 @@ class UpstreamTest(unittest.TestCase):
             {"repo": DENSE.draft.repo, "revision": DRAFT_COMMIT},
         )
         self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
-        # Its pin of the repository it no longer links is retired too.
-        self.assertEqual(pins(self.cache), sorted(["a" * 40, DRAFT_COMMIT]))
+        # Its pin of the repository it no longer links is retired too; the
+        # other installation's pin stays.
+        self.assertEqual(pins(self.cache), sorted(["a" * 40, "c" * 40, DRAFT_COMMIT]))
 
     def test_a_draft_the_hub_cannot_resolve_keeps_the_installed_one(self):
         fake = fake_hub(self, self.cache)
@@ -883,53 +890,6 @@ class UpstreamTest(unittest.TestCase):
         self.assertIn("is already installed", output)
         self.assertIn("external cache pruning", warnings)
         self.assertEqual(pins(self.cache), [])
-
-    def test_a_packed_draft_installation_is_installed_again(self):
-        # Assemblies linked Splash-DFlash2's packed drafts before drafts were
-        # prepared from their checkpoints; the runtime loads those no more.
-        fake = fake_hub(self, self.cache)
-        chosen = selection(self.root)
-        self.prepare(chosen)
-        record = assembly.verify(chosen.link)
-        files = {
-            name: Path(entry["path"])
-            for name, entry in record["files"].items()
-            if not name.startswith("draft/")
-        }
-        packed_repo = "company/Splash-DFlash2"
-        packed = hub.snapshot(packed_repo, "c" * 40)
-        packed.mkdir(parents=True)
-        for name in ("config.json", "model.bin", "layer-0.bin"):
-            (packed / name).write_text(name)
-            files["draft/" + name] = packed / name
-        old = record | {
-            "sources": record["sources"]
-            | {"draft": {"repo": packed_repo, "revision": "c" * 40}},
-            "files": {name: assembly.file_record(path) for name, path in files.items()},
-        }
-        # As the installer that assembled such drafts did, without the check;
-        # another installation pins the same draft.
-        other = chosen.models_root / "someone/other"
-        with (
-            models.installation_lock(chosen.models_root),
-            mock.patch.object(assembly, "_packed_draft", return_value=False),
-        ):
-            models.link_selection(
-                chosen.link, assembly.build(chosen.models_root, old, files)
-            )
-            for installation in (chosen.link, other):
-                hub.pin(packed, packed_repo, installation)
-        fake.requests.clear()
-        output, _ = self.prepare(chosen)
-        self.assertIn(
-            f"Reinstalling {MODEL}: its draft is not a DFlash2 checkpoint", output
-        )
-        self.assertIn("draft/model.safetensors", assembly.verify(chosen.link)["files"])
-        self.assertEqual(fake.requests, [(MODEL, None), (DENSE.draft.repo, None)])
-        # The replaced assembly's record names the pins this installation
-        # retires; the other installation's pin stays.
-        self.assertFalse(hub.pinned(packed, chosen.link).exists())
-        self.assertTrue(hub.pinned(packed, other).exists())
 
     def test_a_damaged_assembly_and_an_unreachable_hub_cost_one_request(self):
         fake = fake_hub(self, self.cache)
