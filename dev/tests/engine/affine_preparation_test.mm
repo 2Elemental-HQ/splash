@@ -112,7 +112,9 @@ model::DFlashDraftLayout tinyDraftLayout() {
   layout.attentionSize = 128;
   layout.intermediateSize = 256;
   layout.attentionHeadDimension = 64;
+  layout.rotaryTheta = 10'000'000.0F;
   layout.targetHiddenSize = 256;
+  layout.selectorRank = 256;
   layout.kvHeads = 1;
   return layout;
 }

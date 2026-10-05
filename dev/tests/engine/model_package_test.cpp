@@ -547,8 +547,10 @@ void testSyntheticPackage(MetalBackend &backend,
     draft.attentionSize = 64;
     draft.intermediateSize = 256;
     draft.attentionHeadDimension = 64;
+    draft.rotaryTheta = 10'000'000.0F;
     draft.targetHiddenSize = target.capturedHiddenSize();
     draft.selectorRank = 256;
+    draft.kvHeads = 8;
 
     VisionLayout vision;
     vision.depth = 2;

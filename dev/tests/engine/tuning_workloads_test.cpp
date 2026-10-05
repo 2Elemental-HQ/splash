@@ -229,13 +229,7 @@ void blockTarget() {
     layer.ffn = BlockMoeWeights{};
   }
   package.target = std::move(target);
-  DFlashDraftLayout draft;
-  draft.layers = 6;
-  draft.hiddenSize = 2048;
-  draft.dynamicSize = 512;
-  draft.intermediateSize = 6144;
-  draft.targetHiddenSize = 16384;
-  package.draft = draftWeights(draft);
+  package.draft = draftWeights(kQwen3_6MoeDraftLayout);
   const auto inventory = collectTuningWorkloads(package, tuning::kPrefillProbeRows,
                                                 tuning::kDecodeProbeWidths);
   for (const auto &input : linearKeys(inventory))
@@ -249,24 +243,18 @@ void blockTarget() {
 void run() {
   ModelPackage dense;
   dense.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
-  dense.draft = draftWeights(DFlashDraftLayout{});
+  dense.draft = draftWeights(kQwen3_8DraftLayout);
   checkPair(dense);
 
   ModelPackage sparse;
   sparse.target = targetWeights<Qwen3_6MoeWeights>(Qwen3_6MoeLayout{});
-  DFlashDraftLayout smallerDraft;
-  smallerDraft.layers = 6;
-  smallerDraft.hiddenSize = 2048;
-  smallerDraft.dynamicSize = 512;
-  smallerDraft.intermediateSize = 6144;
-  smallerDraft.targetHiddenSize = 16384;
-  sparse.draft = draftWeights(smallerDraft);
+  sparse.draft = draftWeights(kQwen3_6MoeDraftLayout);
   checkPair(sparse);
 
   Qwen3_8Layout alternateDense;
   alternateDense.hiddenSize = 4096;
   alternateDense.intermediateSize = 14336;
-  DFlashDraftLayout alternateDraft;
+  DFlashDraftLayout alternateDraft = kQwen3_8DraftLayout;
   alternateDraft.hiddenSize = 4096;
   alternateDraft.dynamicSize = 1024;
   alternateDraft.intermediateSize = 12288;
@@ -287,6 +275,7 @@ void run() {
   alternateSparse.experts = 32;
   alternateSparse.expertsPerToken = 4;
   alternateSparse.expertIntermediateSize = 1024;
+  DFlashDraftLayout smallerDraft = kQwen3_6MoeDraftLayout;
   smallerDraft.hiddenSize = 1024;
   smallerDraft.dynamicSize = 256;
   smallerDraft.intermediateSize = 4096;
@@ -311,7 +300,7 @@ void metadataViews(const char *metallib) {
                                                "tuning-inventory-view-test");
   ModelPackage package;
   package.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
-  package.draft = draftWeights(DFlashDraftLayout{});
+  package.draft = draftWeights(kQwen3_8DraftLayout);
   auto &target = std::get<Qwen3_8Weights>(package.target);
   const LinearWorkload key{{target.layout.intermediateSize, target.layout.hiddenSize},
                            8, LinearPhase::Decode, LinearEpilogue::GateUp};

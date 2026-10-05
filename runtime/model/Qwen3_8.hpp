@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DFlashDraft.hpp"
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
@@ -39,6 +40,20 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
                          /* hiddenCaptureLayers */ {5, 19, 33, 47, 61}} {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
+
+// The DFlash2 draft of Qwen3.8-27B.
+inline constexpr DFlashDraftLayout kQwen3_8DraftLayout{.layers = 5,
+                                                       .hiddenSize = 5120,
+                                                       .vocabularySize = 248320,
+                                                       .dynamicSize = 1280,
+                                                       .qkvSize = 6144,
+                                                       .attentionSize = 4096,
+                                                       .intermediateSize = 17408,
+                                                       .attentionHeadDimension = 128,
+                                                       .rotaryTheta = 10'000'000.0F,
+                                                       .targetHiddenSize = 25600,
+                                                       .selectorRank = 256,
+                                                       .kvHeads = 8};
 
 struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;

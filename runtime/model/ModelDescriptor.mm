@@ -160,26 +160,16 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic) {
                kVisionMagic, "vision_magic");
 }
 
-DFlashDraftLayout qwen36DraftLayout() {
-  DFlashDraftLayout layout;
-  layout.layers = 6;
-  layout.hiddenSize = 2048;
-  layout.dynamicSize = 512;
-  layout.intermediateSize = 6144;
-  layout.targetHiddenSize = 16384;
-  return layout;
-}
-
 ModelDescriptor qwen38Descriptor(std::string name) {
   return makeModelDescriptor(std::move(name), Qwen3_8Layout{},
-                             DFlashDraftLayout{}, ops::VisionLayout{});
+                             kQwen3_8DraftLayout, ops::VisionLayout{});
 }
 
 ModelDescriptor qwen36Descriptor(std::string name) {
   constexpr Qwen3_6MoeLayout target;
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.hiddenSize;
-  return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
+  return makeModelDescriptor(std::move(name), target, kQwen3_6MoeDraftLayout,
                              vision);
 }
 

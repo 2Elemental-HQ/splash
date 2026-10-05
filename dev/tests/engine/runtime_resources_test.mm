@@ -55,7 +55,7 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath,
   config.metallibPath = metallibPath;
   config.modelRoot = root.path;
   config.model = model::makeModelDescriptor(
-      "budget-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "budget-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
       ops::VisionLayout{});
   config.buildId = "budget-test";
   return config;
@@ -97,7 +97,7 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config,
 // of them names another.
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
-      "namespace-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "namespace-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
       ops::VisionLayout{});
   const auto identity = [&](char models, std::string_view build, kv::Format format) {
     kv::Layout layout = model.targetKvLayout;
@@ -288,7 +288,7 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
 void testLoadedVisionIsRequiredOnlyWithVision() {
   model::ModelPackage package;
   package.descriptor = model::makeModelDescriptor(
-      "loaded-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "loaded-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
       ops::VisionLayout{});
   model::Qwen3_8Weights target;
   target.actualAllocatedBytes = 1;
