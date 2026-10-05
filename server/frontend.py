@@ -28,7 +28,12 @@ from .chat_templates import (
     template_options,
 )
 from .diagnostics import print_status
-from .errors import APIError, ContextLengthError
+from .errors import (
+    APIError,
+    ContextLengthError,
+    RequestValidationError,
+    field_error,
+)
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
@@ -472,7 +477,9 @@ class Frontend:
         if timeout is None:
             timeout = self.request_timeout
         elif not is_finite_number(timeout) or timeout <= 0:
-            raise APIError(400, "timeout must be positive")
+            raise RequestValidationError(
+                [field_error(["timeout"], "timeout must be positive")]
+            )
         return started_at + min(timeout, self.request_timeout)
 
     def prepare(
@@ -619,7 +626,7 @@ class Frontend:
             )
         except judgments.ScoringUnsupported as error:
             raise APIError(500, str(error), "scoring_unsupported") from error
-        except (APIError, judgments.SystemOneError):
+        except APIError:
             raise
         except Exception as error:
             raise APIError(400, f"{what} prompt could not be rendered") from error
@@ -662,21 +669,19 @@ class Frontend:
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
-            details.append(judgments.detail(["model"], "field required", "missing"))
+            details.append(field_error(["model"], "field required", "missing"))
         elif not self.accepts_model(model):
             details.append(
-                judgments.detail(
-                    ["model"], f"model {model} is not served by this endpoint"
-                )
+                field_error(["model"], f"model {model} is not served by this endpoint")
             )
         state, specs, question_details = judgments.validate_systemone(body)
         details.extend(question_details)
         try:
             priority = self._priority(body)
         except APIError as error:
-            details.append(judgments.detail(["priority"], error.message))
+            details.append(field_error(["priority"], error.message))
         if details:
-            raise judgments.SystemOneError(details)
+            raise RequestValidationError(details)
         jobs = []
         total_tokens = 0
         with self._preparation(deadline):
@@ -686,9 +691,9 @@ class Frontend:
                     continue
                 slots = judgments.slot_labels(self.tokenizer)
                 if len(spec.labels) > len(slots):
-                    raise judgments.SystemOneError(
+                    raise RequestValidationError(
                         [
-                            judgments.detail(
+                            field_error(
                                 ["questions", qid, "criteria"],
                                 f"the served tokenizer supports "
                                 f"{len(slots)} answer slots; "
@@ -703,9 +708,9 @@ class Frontend:
                     if prompt_tokens > self.max_context:
                         raise ContextLengthError(prompt_tokens, self.max_context)
                     if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
-                        raise judgments.SystemOneError(
+                        raise RequestValidationError(
                             [
-                                judgments.detail(
+                                field_error(
                                     ["questions", qid],
                                     "total prepared question tokens exceed "
                                     f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
