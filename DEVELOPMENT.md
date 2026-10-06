@@ -1660,9 +1660,10 @@ unloads the program, so that the ANE's service gives its buffers back while
 the engine is idle, and keeps the split's own, which the residency keep-alive
 unwires (`AneFfn::release`); the next request loads the program again after the
 weights (`AneFfn::restore`), in about 0.1 s, and logs `Neural Engine FFN
-program reloaded in N s`. A program that does not load again within 10 s
-stops the split like a failure while serving, and the request runs on the GPU
-alone. The split's logits differ from the GPU's alone (KL
+program reloaded in N s`. A program that does not unload or load again within
+10 s stops the split like a failure while serving, and the request runs on the
+GPU alone. A split that stopped unloads its program at the next idle release
+once the ANE has reported every evaluation, and keeps it unloaded. The split's logits differ from the GPU's alone (KL
 about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share over chunks
 of `--ane-ffn-minimum-rows` rows or more (512 by default), which

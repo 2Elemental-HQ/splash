@@ -51,7 +51,6 @@ public:
   Handoff &operator=(const Handoff &) = delete;
 
   [[nodiscard]] const metal::SharedEvent &event() const noexcept;
-  [[nodiscard]] AwakeClock::duration bound() const noexcept;
 
   // A value of the event no step has taken, for a step of the command being
   // encoded; once retired, one the event has reached.
@@ -76,6 +75,9 @@ public:
   void retire(std::string reason);
 
   [[nodiscard]] bool retired() const;
+  // Whether the agent has reported every job it started, so that none of
+  // them still runs.
+  [[nodiscard]] bool idle() const;
   // Why the handoff retired, the first failure's; empty until it does.
   [[nodiscard]] std::string reason() const;
 

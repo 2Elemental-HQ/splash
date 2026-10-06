@@ -809,7 +809,8 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
 // A Neural Engine slower than the GPU alone, every evaluation starting kLag after its event reaches its wait: each
 // command's results are usable, the breaker given the GPU alone's layer as timed here stops the split after
 // ane_ffn::Breaker::kWindow commands and not before, for losing to the GPU alone, with the Neural Engine's time over
-// them counted, telling its owner once, and the GPU alone then computes, bit for bit, what it computes on its own.
+// them counted, telling its owner once, and the GPU alone then computes, bit for bit, what it computes on its own;
+// idle, the stopped split unloads its program for good.
 void loses(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
   constexpr auto kLag = std::chrono::milliseconds(200);
   constexpr uint32_t kRows = AneFfn::kMaximumRows, kWindow = ane_ffn::Breaker::kWindow;
@@ -847,6 +848,10 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail("a slow Neural Engine: the GPU's forward after the split stopped differs from the GPU's alone");
   if (split->served().commands != kWindow || lost != 1)
     fail("a slow Neural Engine: the stopped split counted a command, or told its owner again");
+  // Its evaluations all reported, the stopped split unloads its program while idle, once, and keeps it unloaded.
+  if (!split->release()) fail("a slow Neural Engine: the stopped split did not unload its program while idle");
+  split->restore();
+  if (split->release()) fail("a slow Neural Engine: the stopped split loaded its program again");
 }
 
 // The split of the affine Q4 and the GGUF model over normalized rows of normal values, and the numerics of rows the
@@ -912,7 +917,10 @@ void faults(MetalBackend &backend) {
   const Forward after = forward(backend, linear, model, split.get(), rows, AneFfn::kMaximumRows);
   if (!after.usable || after.bits != alone.bits)
     fail("a failed reload: the GPU's forward after the split stopped differs from the GPU's alone");
-  if (split->release()) fail("a failed reload: the stopped split unloaded its program");
+  // Idle, the stopped split unloads what a load that ran late may have left loaded, once, and keeps it unloaded.
+  if (!split->release()) fail("a failed reload: the stopped split did not unload its program while idle");
+  split->restore();
+  if (split->release()) fail("a failed reload: the stopped split loaded its program again");
   section("faults: a program that does not load again stops the split, and the GPU alone then computes what it "
           "computes on its own");
 
@@ -991,8 +999,8 @@ void programs(AneSum &sum, const std::filesystem::path &cache) {
   section("program: an invalid MIL, a function it lacks and a binding of one input short throw; it evaluates");
 
   const std::vector<_Float16> loaded = sum.values();
-  program.unload();
-  program.unload();
+  program.unload(kLimits);
+  program.unload(kLimits);
   message = thrown<std::runtime_error>([&] { sum.enqueue(program, binding, [](bool) {}); });
   if (message.find("not loaded") == std::string::npos) fail("an evaluation of an unloaded program: " + message);
   program.load(kLimits);
@@ -1006,7 +1014,7 @@ void programs(AneSum &sum, const std::filesystem::path &cache) {
   // A program whose compilation the service no longer holds.
   const test::TemporaryDirectory own("splash-ane-program");
   Program lost(sum.mil("sum_lost"), {}, kLimits, own.path());
-  lost.unload();
+  lost.unload(kLimits);
   purge(test::programDirectory(own.path()));
   message = thrown<std::runtime_error>([&] { lost.load(kLimits); });
   if (message.find("not compiled") == std::string::npos) fail("load() of a program not compiled: " + message);

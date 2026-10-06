@@ -131,14 +131,15 @@ public:
   // the split's own (allocatedBytes()), which the backend's residency
   // keep-alive unwires: the surfaces and scratch every command writes again,
   // and the row scales and signs computed once. True once it unloaded the
-  // program; false, doing nothing, once the split stopped, as evaluations it
-  // gave up on may still use the program. A program that does not unload
-  // stops the split. Throws std::logic_error while a command it encoded is
-  // not committed or not finished.
+  // program; false, doing nothing, when it is unloaded, or the split stopped
+  // while evaluations it gave up on may still use it. A stopped split
+  // unloads it once they have all reported, and keeps it unloaded. A
+  // program that does not unload stops the split. Throws std::logic_error
+  // while a command it encoded is not committed or not finished.
   [[nodiscard]] bool release();
-  // Loads the program release() unloaded again; nothing otherwise. Never
-  // throws: a program that does not load stops the split, and the GPU runs
-  // every later chunk alone.
+  // Loads the program release() unloaded again, unless the split stopped;
+  // nothing otherwise. Never throws: a program that does not load stops the
+  // split, and the GPU runs every later chunk alone.
   void restore() noexcept;
 
 private:

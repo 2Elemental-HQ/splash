@@ -134,9 +134,9 @@ public:
                std::function<void(bool)> done);
 
   // Releases the loaded program, whose compilation the service keeps; nothing
-  // if it is not loaded. Waits under the limits the program was last given,
-  // by the constructor or load(). No evaluation may be in flight.
-  void unload();
+  // if it is not loaded. Waits under `limits`, which the destructor's unload
+  // keeps, as it keeps load()'s. No evaluation may be in flight.
+  void unload(Limits limits);
   // Loads the program from the compilation the service kept, under `limits`;
   // nothing if it is loaded. Never compiles: throws "not compiled" if the
   // service no longer holds the compilation, and throws, leaving the program

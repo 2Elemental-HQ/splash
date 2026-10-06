@@ -55,11 +55,12 @@ constexpr auto kHandoffBound = std::chrono::seconds(2);
 // 0.8 (27 s on an M5 Max, about 30 s on an M6), so that a busy Mac still
 // finishes and only a service that stopped answering runs out of it.
 constexpr auto kProgramLimit = std::chrono::seconds(120);
-// How long the service may take to load the program again after the idle
-// release (restore()), while the request that ends the idle waits: the
-// service loads a program it has compiled in 50-150 ms on an M5 Max, so a
-// busy Mac still finishes, and one that stopped answering stops the split
-// instead of holding the request longer.
+// How long the service may take to unload the program for the idle release
+// (release()) and to load it again (restore()), while the engine's loop and
+// then the request that ends the idle wait: the service unloads a program in
+// 3-4 ms and loads one it has compiled in 50-150 ms on an M5 Max, so a busy
+// Mac still finishes, and one that stopped answering stops the split instead
+// of holding the engine longer.
 constexpr auto kReloadLimit = std::chrono::seconds(10);
 
 // The GPU's channels of `intermediate` with the ANE taking `aneUnits`.
@@ -622,9 +623,9 @@ std::optional<AwakeClock::duration> AneFfn::completed() {
 bool AneFfn::release() {
   if (unfinished_ || !jobs_.empty())
     throw std::logic_error("ANE FFN split released while a command it encoded is unfinished");
-  if (handoff_.retired()) return false;
+  if (released_ || (handoff_.retired() && !handoff_.idle())) return false;
   try {
-    program_->unload();
+    program_->unload({kReloadLimit, {}});
   } catch (const std::exception &error) {
     handoff_.retire(std::string("its program did not unload: ") + error.what());
     stopped();
@@ -636,7 +637,9 @@ bool AneFfn::release() {
 }
 
 void AneFfn::restore() noexcept {
-  if (!std::exchange(released_, false)) return;
+  // A stopped split keeps its program unloaded.
+  if (!released_ || handoff_.retired()) return;
+  released_ = false;
   const auto start = AwakeClock::now();
   std::string failure = "an unknown exception";
   try {

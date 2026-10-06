@@ -129,7 +129,6 @@ Handoff::~Handoff() {
 
 const metal::SharedEvent &Handoff::event() const noexcept { return state_->event; }
 
-AwakeClock::duration Handoff::bound() const noexcept { return state_->bound; }
 
 uint64_t Handoff::next() {
   std::lock_guard lock(state_->mutex);
@@ -209,6 +208,11 @@ void Handoff::retire(std::string reason) {
 bool Handoff::retired() const {
   std::lock_guard lock(state_->mutex);
   return state_->retired;
+}
+
+bool Handoff::idle() const {
+  std::lock_guard lock(state_->mutex);
+  return state_->outstanding.empty();
 }
 
 std::string Handoff::reason() const {

@@ -647,7 +647,7 @@ Program::Program(std::string_view mil, std::span<const uint8_t> weights, Limits 
 
 Program::~Program() {
   try {
-    unload();
+    unload(limits_);
   } catch (...) {
   }
 }
@@ -788,7 +788,8 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
   }
 }
 
-void Program::unload() {
+void Program::unload(Limits limits) {
+  limits_ = std::move(limits);
   runOnQueue(impl_->api, limits_, [impl = impl_] {
     if (impl->loaded) impl->unload();
   });
