@@ -107,7 +107,7 @@ loadModel(metal::MetalBackend &backend,
 [[nodiscard]] ops::AneFfn::Calibration calibrateAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
                                                        const ops::ExecutionPlans &operators, kv::Format format);
 [[nodiscard]] std::unique_ptr<ops::AneFfn> createAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
-                                                        const ops::ExecutionPlans &operators, double share);
+                                                        double share);
 [[nodiscard]] uint64_t aneFfnBytes(const LoadedModel &model, double share);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,

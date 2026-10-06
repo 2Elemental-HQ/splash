@@ -21,7 +21,7 @@ namespace splash::ops {
   return std::string(name) + (destination == FloatOutput::Float32 ? "_f32" : "");
 }
 // The instance of prefill residual kernel `name` that reads a view of the
-// leading inputs of wider weight rows (Projection::planeInputs):
+// leading inputs of wider weight rows (Projection::leadingInputs):
 // "<name>_leading_inputs".
 [[nodiscard]] inline std::string leadingInputsInstance(std::string_view name) {
   return std::string(name) + "_leading_inputs";
@@ -51,7 +51,7 @@ void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
 // outputSize x inputSize weights (metal/abi/QuantFormat.h), naming them
 // "<what> plane0", "<what> plane1" and "<what> meta": in rows of
 // `planeInputs` inputs, of which it is a view of the leading ones
-// (Projection::planeInputs), or of its inputSize when that is 0.
+// (Projection::leadingInputs), or of its inputSize when that is 0.
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };

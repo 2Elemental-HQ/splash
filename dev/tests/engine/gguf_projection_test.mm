@@ -593,7 +593,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
 }
 
 // ---------------------------------------------------------------- leading inputs
-// A view of the leading inputs of a projection's rows (Projection::planeInputs), as the ANE FFN split runs down's GPU
+// A view of the leading inputs of a projection's rows (Projection::leadingInputs), as the ANE FFN split runs down's GPU
 // share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
 // those inputs repacked on their own, in every format, over two plane tiles of rows.
 void leadingInputs(MetalBackend &backend, const Linear &linear) {
@@ -613,10 +613,7 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
                                                kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1)
                                                                              : MetalBuffer{},
                                                upload(backend, planes.meta))}});
-    Projection view(N, kLeading,
-                    BlockWeights{{QuantizedSegment::planes(f, N, kLeading, whole.segment.plane0, whole.segment.plane1,
-                                                           whole.segment.meta)}});
-    view.planeInputs = K;
+    const Projection view = Projection(N, K, BlockWeights{{whole.segment}}).leadingInputs(kLeading);
     const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual,
                            WeightLayout::Block32};
     const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);

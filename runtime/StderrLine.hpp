@@ -55,4 +55,10 @@ template <typename... Parts> void logLine(const Parts &...parts) noexcept {
   }
 }
 
+// A notice of a fault the runtime goes on serving past, in the form of the
+// server's warnings (server/server.py): "Warning · " and the parts.
+template <typename... Parts> void logWarning(const Parts &...parts) noexcept {
+  logLine("Warning · ", parts...);
+}
+
 } // namespace splash

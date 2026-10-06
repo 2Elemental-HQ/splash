@@ -1,5 +1,6 @@
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
+#include "ane/ProgramInstrumentation.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
@@ -1409,8 +1410,12 @@ int main(int argc, char **argv) {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
     std::optional<double> givenAneFfnShare;
+    // The evaluation of the split's program that fails, counted from 1 as
+    // ane::ProgramInstrumentation counts them; 0 for none.
+    uint64_t aneFfnFault = 0;
     if (argc < 3)
-      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE]");
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
+           "[--ane-ffn-fault EVALUATION]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1425,6 +1430,11 @@ int main(int argc, char **argv) {
         givenAneFfnShare = std::strtod(value, &end);
         if (end == value || *end || !(*givenAneFfnShare >= 0.0 && *givenAneFfnShare < 1.0))
           fail("--ane-ffn-share takes a share in [0, 1)");
+      } else if (option == "--ane-ffn-fault" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        aneFfnFault = std::strtoull(value, &end, 10);
+        if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -1503,7 +1513,8 @@ int main(int argc, char **argv) {
     if (aneFfnShare > 0.0) {
       const uint64_t serving = budget.servingBytes(pageCount * kv::kPageTokens);
       if (governor.hostHolds(aneFfnBytes + serving)) {
-        aneFfn = model::createAneFfn(backend, model, operators, aneFfnShare);
+        if (aneFfnFault) ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
+        aneFfn = model::createAneFfn(backend, model, aneFfnShare);
         require(aneFfn->allocatedBytes() <= aneFfnBytes,
                 "the Neural Engine split allocated more than its plan");
         if (!governor.hostHolds(serving))
@@ -2464,11 +2475,13 @@ int main(int argc, char **argv) {
     }
     const uint64_t beforeRaggedPrefill =
         BackendInstrumentation::submittedCommands(backend);
+    const uint64_t rerunsBeforeRaggedPrefill = executor.telemetry().aneFfnReruns;
     auto raggedPrefill =
         executor.prefill(raggedPrefillPlan, raggedPrefillItems);
+    // The GPU runs a chunk again alone where the Neural Engine split stops.
     require(raggedPrefill.size() == raggedIds.size() &&
                 BackendInstrumentation::submittedCommands(backend) ==
-                    beforeRaggedPrefill + 1,
+                    beforeRaggedPrefill + 1 + executor.telemetry().aneFfnReruns - rerunsBeforeRaggedPrefill,
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
@@ -3439,6 +3452,12 @@ int main(int argc, char **argv) {
               << historicalTelemetry.lastPrefillWallSeconds
               << " cache_restore_b1_cycle_wall_seconds="
               << historicalTelemetry.lastDecodeWallSeconds << '\n';
+    // An armed fault stops the split once, in the chunk whose evaluation
+    // fails, which the GPU runs again alone, as every chunk after it.
+    std::cout << "ane_ffn_reruns=" << historicalTelemetry.aneFfnReruns
+              << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
+    require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
+            "an armed fault did not stop the split once");
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

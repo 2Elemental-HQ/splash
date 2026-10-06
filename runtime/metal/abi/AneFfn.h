@@ -20,6 +20,14 @@
 // rotating at most ANE_FFN_ROTATE_BLOCKS input blocks of the row.
 #define ANE_FFN_ROTATE_THREADS 256u
 #define ANE_FFN_ROTATE_BLOCKS 8u
+// ane_ffn_weights and ane_ffn_row_scale: one simdgroup per weight row,
+// ANE_FFN_WEIGHT_ROWS rows per threadgroup.
+#define ANE_FFN_WEIGHT_ROWS 8u
+#define ANE_FFN_WEIGHT_THREADS (ANE_FFN_WEIGHT_ROWS * 32u)
+// ane_ffn_pack and ane_ffn_join: tiles of ANE_FFN_TILE rows by ANE_FFN_TILE
+// channels, ANE_FFN_TILE x ANE_FFN_TILE_ROWS threads each.
+#define ANE_FFN_TILE 32u
+#define ANE_FFN_TILE_ROWS 8u
 // int8 values span +-ANE_FFN_INT8_PEAK. The ANE dequantizes them by
 // 1 / ANE_FFN_INT8_UNIT, so that fp16 cannot overflow, which every scale
 // carries back.

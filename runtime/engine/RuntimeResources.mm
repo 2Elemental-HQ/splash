@@ -193,7 +193,7 @@ startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
       unavailable(leftToServe());
       return {};
     }
-    auto split = model::createAneFfn(backend, loaded, operators, calibration.share);
+    auto split = model::createAneFfn(backend, loaded, calibration.share);
     if (!governor.hostHolds(serving)) {
       unavailable(leftToServe());
       return {};

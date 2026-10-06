@@ -289,6 +289,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Runtime.cpp \
 	runtime/model/RuntimeArenas.cpp
 ENGINE_MM_SOURCES := \
+	runtime/ane/Handoff.mm \
 	runtime/ane/Program.mm \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \

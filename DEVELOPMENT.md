@@ -1211,7 +1211,7 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
 - `runtime/ane/`: the Neural Engine client, on the private AppleNeuralEngine
-  framework.
+  framework, and the handoff of a Metal command's work to it.
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
@@ -1514,7 +1514,7 @@ the Apple9 prefill rule in `runtime/ops/Linear.cpp`.
 Prefill chunks of 512 rows or more of a dense target split each layer's FFN by
 intermediate channel (`runtime/ops/AneFfn.cpp`). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
-leading inputs of down's rows (`Projection::planeInputs`) through instances
+leading inputs of down's rows (`Projection::leadingInputs`) through instances
 of the residual kernels of their own (`<kernel>_leading_inputs`), which run
 the residual kernel's tile on the weight planes advanced past the inputs the
 view leaves unread. The Neural Engine runs the rest as one W8A8 program,
@@ -1569,17 +1569,25 @@ stopped answering runs out of its time too. Each share compiles a
 program of its own, and the M6's ANE service keeps few, so a start keeps the
 share the last one chose (`choice-*` in that directory) while it stays within
 1% of the best. The ANE computes in fp16, whose range (±65504) bounds the FFN values a
-split layer can produce. The split's logits differ from the GPU's alone (KL
+split layer can produce. While serving, any failure of the ANE's work stops
+the split for the life of the process (`runtime/ane/Handoff.mm`): an
+evaluation that fails, cannot start or has not completed 2 s after the GPU
+raised its event (Metal fails a command buffer whose wait stays unmet for
+5 s). The CPU then raises the event to the GPU's last wait, the chunk runs
+again on the GPU alone, which computes what it would have, as does every
+chunk after it, and the engine logs `Warning · Neural Engine FFN split
+stopped (...)`. The split's logits differ from the GPU's alone (KL
 about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share.
 `make test-engine-metal` runs `ane-ffn`: its kernels against CPU references
 for affine Q4 and every GGUF format under shader validation, then, without it,
-the split's memory and its output against the GPU alone, and the private
+the split's memory and its output against the GPU alone, each fault of an
+evaluation the client's instrumented build injects
+(`runtime/ane/ProgramInstrumentation.hpp`) at each layer, and the private
 client's failures, limits, unload and load, and cache files on a small
-program. `ane-program-faults` links the client's instrumented build
-(`runtime/ane/ProgramInstrumentation.hpp`), whose injected faults later tests
-of the split can use, and checks that an Objective-C exception and a changed
-method signature fail as `std::runtime_error`.
+program. `handoff` runs the event handoff against an agent the CPU plays in
+each way it can fail, and `ane-program-faults` checks that an Objective-C
+exception and a changed method signature fail as `std::runtime_error`.
 
 ### Residency and KV extents
 

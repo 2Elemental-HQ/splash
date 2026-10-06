@@ -123,7 +123,7 @@ void requireSegments(const Projection &p, LinearMatrix matrix) {
   for (const QuantizedSegment &s : p.blocks().segments) {
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
-    if (!s.isFloat()) requireSegmentPlanes(s, "projection", p.planeInputs);
+    if (!s.isFloat()) requireSegmentPlanes(s, "projection", p.planeInputs());
   }
 }
 
@@ -387,9 +387,9 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
     const metal::DispatchSize groups{plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1};
-    if (p.planeInputs)
+    if (p.planeInputs())
       graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
-                GgufPrefillLeadingParams{params, p.planeInputs}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+                GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
     else
       graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
   }

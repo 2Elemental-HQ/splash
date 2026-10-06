@@ -160,8 +160,8 @@ void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, 
 
 } // namespace
 
-// The state a prefill command's layers share: its inputs and the next GDN,
-// attention and dense FFN layer of the step.
+// The state a prefill command's layers share: its inputs and the next GDN
+// and attention layer of the step.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -174,7 +174,6 @@ struct QwenTarget::PrefillStep {
   ops::AneFfn *aneFfn = nullptr;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
-  uint32_t ffnLayer = 0;
 };
 
 struct QwenTarget::VerifyStep {
@@ -213,7 +212,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
     step.attention.push_back(operators_.prefillAttention(
         sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
-  if (ops::AneFfn::splits(rows)) step.aneFfn = aneFfn;
+  if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -221,7 +220,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
       const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
       const metal::MetalBuffer residual = std::visit(
           [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-      addPrefillFfn(step, layer, residual, output);
+      addPrefillFfn(step, index, layer, residual, output);
       if (const auto slot = geometry_.captureSlot(index))
         for (const QwenTargetPrefillSequence &sequence : sequences)
           for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
@@ -325,9 +324,8 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
   return b.attentionOutput;
 }
 
-void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
-                               metal::MetalBuffer output) const {
-  const uint32_t index = step.ffnLayer++;
+void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
+                               metal::MetalBuffer residual, metal::MetalBuffer output) const {
   addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
   const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
   if (step.aneFfn)
@@ -338,7 +336,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
                                          ffn, residual, output, step.rows);
 }
 
-void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer,
+void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,

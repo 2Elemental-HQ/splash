@@ -1582,15 +1582,17 @@ void blockExtents(metal::MetalBackend &backend) {
   }
 }
 
-// A view of the leading 512 inputs of rows of 1024 (Projection::planeInputs)
+// A view of the leading 512 inputs of rows of 1024 (Projection::leadingInputs)
 // over 512 outputs, two tiles of 256 rows: each prefill residual tile
 // encodes its leading-input instance with the view's parameters, and each
 // plane is read up to the last group the view reads of the second tile, after
 // every group of the first. A plane at that extent encodes, one element
 // shorter or holding only a matrix of the view's own inputs is refused. Every
-// other plan, a rotated view, float segments, a gate/up plan's gate and rows
-// that do not hold the view's inputs in whole quant groups are refused before
-// anything is encoded.
+// other plan, a rotated view and a gate/up plan's gate are refused before
+// anything is encoded. The views' factories refuse inputs beyond the
+// projection's or of part of a quant group or meta unit, rows of part of a
+// tile, and float or rotated weights or a view; a view of leading rows holds
+// its planes' first tiles.
 void leadingInputViews(metal::MetalBackend &backend) {
   const Linear linear = gpu(10, 16);
   constexpr uint32_t n = 512, k = 512, wide = 1024, rows = 168;
@@ -1632,11 +1634,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
   const AffineWeights wideAffine{allocate(backend, uint64_t{n} * wide / 2),
                                  allocate(backend, uint64_t{n} * (wide / 64) * 2),
                                  allocate(backend, uint64_t{n} * (wide / 64) * 2)};
-  const auto affineView = [&](const AffineWeights &planes) {
-    Projection view(n, k, planes);
-    view.planeInputs = wide;
-    return view;
-  };
+  const auto affineView = [&](const AffineWeights &planes) { return Projection(n, wide, planes).leadingInputs(k); };
   const Projection affine = affineView(wideAffine);
   for (const LinearConfig config : {LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
                                     LinearConfig{LinearTile::N128}, LinearConfig{LinearTile::N256}})
@@ -1665,11 +1663,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
   const QuantFormat &q5k = kQuantFormats[GGUF_FMT_Q5K];
   const QuantizedSegment wideSegment = segmentPlanes(backend, GGUF_FMT_Q5K, n, wide);
   const auto ggufView = [&](const QuantizedSegment &planes) {
-    Projection view(n, k,
-                    BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q5K, n, k, planes.plane0, planes.plane1,
-                                                           planes.meta)}});
-    view.planeInputs = wide;
-    return view;
+    return Projection(n, wide, BlockWeights{{planes}}).leadingInputs(k);
   };
   const Projection gguf = ggufView(wideSegment);
   const LinearPlan ggufPlan =
@@ -1696,9 +1690,8 @@ void leadingInputViews(metal::MetalBackend &backend) {
     require(graph.empty(), "a view of leading inputs over planes of its own inputs encoded a dispatch");
   }
 
-  Projection rotated = gguf, floats(n, k, BlockWeights{{QuantizedSegment::floats(n, k, allocate(backend, n * k * 4))}});
+  Projection rotated = gguf;
   rotated.rotation.signs = allocate(backend, k);
-  floats.planeInputs = wide;
   const Projection plain(n, k, wideAffine);
   const LinearPlan gateUp = linear.decodePlan(plain, 1, LinearEpilogue::GateUp, &affine);
   const auto refuses = [&](const Projection &view, const LinearPlan &plan, std::string_view refusal,
@@ -1720,13 +1713,40 @@ void leadingInputViews(metal::MetalBackend &backend) {
                        {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16),
           kOtherPlan);
   refuses(rotated, ggufPlan, kOtherPlan);
-  refuses(floats, ggufPlan, kOtherPlan);
   refuses(plain, gateUp, kOtherPlan, &affine);
-  for (const uint32_t planeInputs : {k - 64, wide + 32}) {
-    Projection view = affine;
-    view.planeInputs = planeInputs;
-    refuses(view, affinePlan, "a view of leading inputs takes rows of whole quant groups that hold its inputs");
-  }
+
+  // The views' factories: inputs beyond the projection's or of part of a quant group or meta unit, and a projection
+  // of float or rotated weights or of a view, are refused.
+  const Projection wideProjection(n, wide, wideAffine), wideGguf(n, wide, BlockWeights{{wideSegment}});
+  constexpr std::string_view kInputs = "a view of leading inputs takes whole quant groups and meta units";
+  constexpr std::string_view kSource = "views of a projection's planes take affine Q4 weights or one unrotated";
+  rejects([&] { (void)wideProjection.leadingInputs(wide + 64); }, kInputs, "a view of more inputs than rows hold");
+  rejects([&] { (void)wideProjection.leadingInputs(k + 32); }, kInputs, "a view of part of a quant group");
+  rejects([&] { (void)wideGguf.leadingInputs(k + 64); }, kInputs, "a view of part of a Q5_K meta unit");
+  const Projection floats(n, wide, BlockWeights{{QuantizedSegment::floats(n, wide, allocate(backend, n * wide * 4))}});
+  Projection rotatedSource = wideGguf;
+  rotatedSource.rotation.signs = allocate(backend, wide);
+  rejects([&] { (void)floats.leadingInputs(k); }, kSource, "a view of float weights");
+  rejects([&] { (void)rotatedSource.leadingInputs(k); }, kSource, "a view of rotated weights");
+  rejects([&] { (void)affine.leadingInputs(k / 2); }, kSource, "a view of a view");
+  rejects([&] { (void)floats.leadingRows(backend, 256); }, kSource, "a view of the rows of float weights");
+
+  // A view of leading rows, whole 256-row tiles, takes each plane's first tiles.
+  const Projection affineRows = wideProjection.leadingRows(backend, 256), ggufRows = wideGguf.leadingRows(backend, 256);
+  require(affineRows.outputSize == 256 && affineRows.inputSize == wide && !affineRows.planeInputs() &&
+              affineRows.affine().weights.sizeBytes() == uint64_t{256} * wide / 2 &&
+              affineRows.affine().scales.sizeBytes() == uint64_t{256} * (wide / 64) * 2 &&
+              affineRows.affine().biases.sizeBytes() == uint64_t{256} * (wide / 64) * 2,
+          "a view of 256 affine rows does not hold their tile");
+  const QuantizedSegment &segment = ggufRows.blocks().segments.front();
+  require(ggufRows.outputSize == 256 && segment.outputSize == 256 && segment.inputSize == wide &&
+              segment.plane0.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane0_bytes &&
+              segment.plane1.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane1_bytes &&
+              segment.meta.sizeBytes() == uint64_t{256} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes,
+          "a view of 256 Q5_K rows does not hold their tile");
+  for (const uint32_t count : {0u, 128u, n + 256})
+    rejects([&] { (void)wideProjection.leadingRows(backend, count); }, "whole plane tiles",
+            "a view of " + std::to_string(count) + " leading rows");
 }
 
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {

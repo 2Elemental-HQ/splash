@@ -42,7 +42,9 @@ inline void ane_ffn_rotate_block(thread float (&value)[K][4], uint lane, device 
     for (uint e = 0; e < 4; ++e) value[k][e] *= sign[k * ANE_FFN_ROTATION_UNIT + lane * 4 + e] * norm;
 }
 
-// The four Q4 values of `row` at inputs [input, input + 4).
+// The four Q4 values of `row` at inputs [input, input + 4), whose tiles the
+// affine layout and the GGUF planes share.
+static_assert(SPLASH_AFFINE_TILE_ROWS == QUANT_TILE_ROWS, "affine Q4 tiles index as quant_tile_index does");
 inline void ane_ffn_q4_values(thread float (&value)[4], device const uchar *weights,
                               device const bfloat *scales, device const bfloat *biases,
                               uint groups, uint row, uint input) {
@@ -93,18 +95,19 @@ kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
   if (simd_group == 0 && lane == 0) token_scale[row] = half(scale * ANE_FFN_INT8_UNIT);
 }
 
-// 32 x 32 tiles of rows x channels, 32 x 8 threads.
+// ANE_FFN_TILE x ANE_FFN_TILE tiles of rows x channels, ANE_FFN_TILE x
+// ANE_FFN_TILE_ROWS threads.
 kernel void ane_ffn_pack(device const half *rotated [[buffer(0)]],
                          device char *packed [[buffer(1)]],
                          constant AneFfnPackParams &params [[buffer(2)]],
                          uint2 tile [[threadgroup_position_in_grid]],
                          uint2 position [[thread_position_in_threadgroup]]) {
-  threadgroup half staged[32][33];
-  const uint row = tile.x * 32, channel = tile.y * 32;
-  for (uint j = position.y; j < 32; j += 8)
+  threadgroup half staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     staged[j][position.x] = rotated[(row + j) * params.hidden + params.channel + channel + position.x];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint j = position.y; j < 32; j += 8)
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     packed[(channel + j) * params.stride + row + position.x] =
         char(clamp(rint(float(staged[position.x][j])), -ANE_FFN_INT8_PEAK, ANE_FFN_INT8_PEAK));
 }
@@ -166,14 +169,14 @@ struct AneFfnGguf {
   }
 };
 
-// One simdgroup per weight row, eight rows x one rotation block of K * 128
-// inputs per threadgroup: the int8 rows under their shared scale, which the
-// first block also copies into the ANE's scale surface.
+// One simdgroup per weight row, ANE_FFN_WEIGHT_ROWS rows x one rotation block
+// of K * 128 inputs per threadgroup: the int8 rows under their shared scale,
+// which the first block also copies into the ANE's scale surface.
 template <uint K, class Source>
 inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *c, device const half *row_scale,
                                 device char *output, device half *scale, device const float *sign,
                                 constant AneFfnWeightParams &params, uint2 tile, uint simd_group, uint lane) {
-  const uint row = tile.x * 8 + simd_group, block = tile.y * K * ANE_FFN_ROTATION_UNIT;
+  const uint row = tile.x * ANE_FFN_WEIGHT_ROWS + simd_group, block = tile.y * K * ANE_FFN_ROTATION_UNIT;
   float value[K][4];
   for (uint k = 0; k < K; ++k)
     Source::values(value[k], a, b, c, params.groups, params.row + row, params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
@@ -193,7 +196,7 @@ template <uint K, class Source>
 inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c, device half *row_scale,
                                device const float *sign, constant AneFfnWeightParams &params, uint tile,
                                uint simd_group, uint lane) {
-  const uint row = tile * 8 + simd_group;
+  const uint row = tile * ANE_FFN_WEIGHT_ROWS + simd_group;
   float peak = 0.0f;
   for (uint block = 0; block < params.width; block += K * ANE_FFN_ROTATION_UNIT) {
     float value[K][4];
@@ -264,18 +267,19 @@ template [[host_name("ane_ffn_row_scale_gguf_inputs")]] kernel AneFfnRowScaleKer
 template [[host_name("ane_ffn_row_scale_gguf_intermediate")]] kernel AneFfnRowScaleKernel
     ane_ffn_row_scale_gguf<kIntermediateUnits>;
 
-// 32 x 32 tiles of rows x channels, 32 x 8 threads.
+// ANE_FFN_TILE x ANE_FFN_TILE tiles of rows x channels, ANE_FFN_TILE x
+// ANE_FFN_TILE_ROWS threads.
 kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
                          device const half *partial [[buffer(1)]],
                          constant AneFfnJoinParams &params [[buffer(2)]],
                          uint2 tile [[threadgroup_position_in_grid]],
                          uint2 position [[thread_position_in_threadgroup]]) {
-  threadgroup float staged[32][33];
-  const uint row = tile.x * 32, channel = tile.y * 32;
-  for (uint j = position.y; j < 32; j += 8)
+  threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     staged[j][position.x] = float(partial[(channel + j) * params.stride + row + position.x]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint j = position.y; j < 32; j += 8) {
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
     if (row + j >= params.rows) continue;
     const uint index = (row + j) * params.hidden + channel + position.x;
     output[index] = bfloat(float(output[index]) + staged[position.x][j]);

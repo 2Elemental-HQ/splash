@@ -95,26 +95,77 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 }
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
-// (Projection::planeInputs) that `plan` has no kernel instance for: only the
+// (Projection::leadingInputs) that `plan` has no kernel instance for: only the
 // prefill residual tiles of affine Q4 weights (N128, N256) and of quantized
-// GGUF segments (GgufPrefill), unrotated, read one (leadingInputsInstance),
-// over rows of whole quant groups that hold its inputs.
+// GGUF segments (GgufPrefill), unrotated, read one (leadingInputsInstance).
 void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
-  if (!p.planeInputs) return;
+  if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
-  const bool quantized = p.layout() == WeightLayout::Affine64 ||
-      std::none_of(p.blocks().segments.begin(), p.blocks().segments.end(),
-                   [](const QuantizedSegment &s) { return s.isFloat(); });
   if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
-      (tile != LinearTile::N128 && tile != LinearTile::N256 && tile != LinearTile::GgufPrefill) || p.rotation ||
-      !quantized)
+      (tile != LinearTile::N128 && tile != LinearTile::N256 && tile != LinearTile::GgufPrefill) || p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
-  if (p.planeInputs < p.inputSize || p.planeInputs % kQuantGroup)
-    throw std::invalid_argument("a view of leading inputs takes rows of whole quant groups that hold its inputs");
+}
+
+// Throws unless views of `p`'s planes can stand for it: its own planes of
+// affine Q4 weights or of one unrotated quantized GGUF tensor.
+void requirePlaneViews(const Projection &p) {
+  if (!p.planeInputs() && (p.layout() == WeightLayout::Affine64 ||
+                           (p.blocks().segments.size() == 1 && !p.blocks().segments.front().isFloat() && !p.rotation)))
+    return;
+  throw std::invalid_argument(
+      "views of a projection's planes take affine Q4 weights or one unrotated quantized GGUF tensor, not a view");
 }
 
 } // namespace
+
+// Every plane of either layout holds its rows in tiles of QUANT_TILE_ROWS
+// rows, each tile's units in order, so the leading rows' tiles lead it.
+static_assert(SPLASH_AFFINE_TILE_ROWS == QUANT_TILE_ROWS, "affine Q4 and GGUF planes share their tiles");
+
+Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t rows) const {
+  requirePlaneViews(*this);
+  if (!rows || rows % QUANT_TILE_ROWS || rows > outputSize)
+    throw std::invalid_argument("a view of leading rows takes whole plane tiles of the projection's rows");
+  // The leading rows of a plane of `rowBytes` bytes per row.
+  const auto view = [&](const metal::MetalBuffer &plane, uint64_t rowBytes) {
+    return rowBytes ? backend.view(plane, 0, rows * rowBytes) : metal::MetalBuffer{};
+  };
+  if (layout() == WeightLayout::Affine64) {
+    const uint64_t groups = inputSize / kQuantGroup;
+    const AffineWeights &planes = affine();
+    return Projection(rows, inputSize,
+                      AffineWeights{view(planes.weights, groups * kQuantGroup / 2), view(planes.scales, groups * 2),
+                                    view(planes.biases, groups * 2)});
+  }
+  const QuantizedSegment &segment = blocks().segments.front();
+  const QuantFormat &format = segment.format();
+  const uint64_t groups = inputSize / 32;
+  return Projection(rows, inputSize,
+                    BlockWeights{{QuantizedSegment::planes(segment.formatId, rows, inputSize,
+                                                           view(segment.plane0, groups * format.plane0_bytes),
+                                                           view(segment.plane1, groups * format.plane1_bytes),
+                                                           view(segment.meta,
+                                                                groups / format.meta_groups * format.meta_bytes))}});
+}
+
+Projection Projection::leadingInputs(uint32_t inputs) const {
+  requirePlaneViews(*this);
+  const bool affineWeights = layout() == WeightLayout::Affine64;
+  const uint32_t unit = affineWeights ? kQuantGroup : 32 * blocks().segments.front().format().meta_groups;
+  if (!inputs || inputs > inputSize || inputs % unit)
+    throw std::invalid_argument("a view of leading inputs takes whole quant groups and meta units of the projection's");
+  const auto view = [&] {
+    if (affineWeights) return Projection(outputSize, inputs, affine());
+    const QuantizedSegment &segment = blocks().segments.front();
+    return Projection(outputSize, inputs,
+                      BlockWeights{{QuantizedSegment::planes(segment.formatId, outputSize, inputs, segment.plane0,
+                                                             segment.plane1, segment.meta)}});
+  };
+  Projection result = view();
+  result.planeInputs_ = inputSize;
+  return result;
+}
 
 // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
@@ -638,8 +689,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
       const metal::DispatchSize groups{selected.storageRows() / kAffinePrefillTileRows,
                                        n / selected.tileColumns(), 1};
       const metal::DispatchSize threads{selected.threadsPerThreadgroup(), 1, 1};
-      if (p.planeInputs)
-        graph.add(leadingInputsInstance(name), bindings, Q4PrefillLeadingParams{{n, k}, p.planeInputs}, groups,
+      if (p.planeInputs())
+        graph.add(leadingInputsInstance(name), bindings, Q4PrefillLeadingParams{{n, k}, p.planeInputs()}, groups,
                   threads);
       else
         graph.add(std::string(name), bindings, Q4Params{n, k}, groups, threads);

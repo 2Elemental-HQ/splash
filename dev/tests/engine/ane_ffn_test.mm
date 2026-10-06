@@ -7,7 +7,11 @@
 // - join: ane_ffn_join adds the ANE's channel-major partial rows to the chunk's output rows and to no others;
 // - the split: which layers, shares and chunks it takes; for three layers of affine Q4 and of mixed GGUF formats,
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two programs and of the
-//   most rows compute what the GPU computes alone within int8's error.
+//   most rows compute what the GPU computes alone within int8's error; layers it is given out of order are refused,
+//   and it keeps what it needs of the layers it was built from;
+// - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
+//   sizes stops the split without failing the Metal command, and the GPU alone then computes what it computes on its
+//   own; an evaluation that signals the shared event below its value leaves the value as it is;
 // - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
 //   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
 //   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
@@ -15,14 +19,16 @@
 // The kernels round where the CPU may not (fast-math rsqrt and division, fused multiply-adds), so an int8 value may
 // differ by one and a scale by its last bit. The split runs on the Neural Engine, which every Apple Silicon Mac has.
 // Metal's validation layer wraps the shared event that orders the split's GPU and ANE work in one the ANE cannot
-// share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split` and `program` the
-// others.
+// share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split`, `faults` and
+// `program` the others. The binary links the instrumented Program, whose faults only `faults` arms.
 #include "AffineQ4Fixture.hpp"
 #include "AneProgramFixture.hpp"
+#include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestFiles.hpp"
+#include "ane/ProgramInstrumentation.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/AneFfn.h"
@@ -36,17 +42,21 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // What the program checks send the private AppleNeuralEngine client beside
@@ -160,7 +170,7 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
   for (uint32_t segment = 0; segment < kHidden / kSegment; ++segment) {
     packed.push_back(filled(backend, uint64_t{kSegment} * kStride, kUntouched));
     graph.add("ane_ffn_pack", {rotated, packed.back()}, AneFfnPackParams{kHidden, segment * kSegment, kStride},
-              {kRows / 32, kSegment / 32, 1}, {32, 8, 1});
+              {kRows / ANE_FFN_TILE, kSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   }
   run(backend, graph);
 
@@ -251,10 +261,10 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
   CommandGraph graph;
   graph.add("ane_ffn_row_scale" + source.suffix + variant, {a, b, c, rowScales, signs},
             AneFfnWeightParams{source.groups, row, scaled, kWeightInputs - scaled, 0, 0, source.format},
-            {rows / 8, 1, 1});
+            {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   graph.add("ane_ffn_weights" + source.suffix + variant, {a, b, c, rowScales, output, scales, signs},
             AneFfnWeightParams{source.groups, row, input, width, stride, scaleStride, source.format},
-            {rows / 8, width / block, 1});
+            {rows / ANE_FFN_WEIGHT_ROWS, width / block, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   run(backend, graph);
 
   const std::string label = source.name + variant;
@@ -298,17 +308,17 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
 
 // ---------------------------------------------------------------- join
 void join(MetalBackend &backend) {
-  constexpr uint32_t kRows = 70, kTiles = (kRows + 31) / 32, kStride = 128;
+  constexpr uint32_t kRows = 70, kTiles = (kRows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, kStride = 128;
   std::normal_distribution<float> normal;
-  std::vector<uint16_t> output(uint64_t{kTiles} * 32 * kHidden), partial(uint64_t{kHidden} * kStride);
+  std::vector<uint16_t> output(uint64_t{kTiles} * ANE_FFN_TILE * kHidden), partial(uint64_t{kHidden} * kStride);
   for (uint16_t &value : output) value = floatToBf16(normal(rng) * 64.0f);
   for (uint16_t &value : partial) value = std::bit_cast<uint16_t>(_Float16(normal(rng)));
   const MetalBuffer joined = upload(backend, output);
   CommandGraph graph;
   graph.add("ane_ffn_join", {joined, upload(backend, partial)}, AneFfnJoinParams{kHidden, kStride, kRows},
-            {kTiles, kHidden / 32, 1}, {32, 8, 1});
+            {kTiles, kHidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   run(backend, graph);
-  for (uint32_t row = 0; row < kTiles * 32; ++row)
+  for (uint32_t row = 0; row < kTiles * ANE_FFN_TILE; ++row)
     for (uint32_t channel = 0; channel < kHidden; ++channel) {
       const uint64_t index = uint64_t{row} * kHidden + channel;
       const uint16_t expected =
@@ -374,10 +384,8 @@ Model ggufModel(MetalBackend &backend) {
   return withLayers(std::move(model));
 }
 
-// Which layers, shares and chunks the split takes.
+// Which layers and shares the split takes.
 void takes(MetalBackend &backend, const Model &affine, const Model &gguf) {
-  static_assert(!AneFfn::splits(AneFfn::kMinimumRows - 1) && AneFfn::splits(AneFfn::kMinimumRows) &&
-                AneFfn::splits(AneFfn::kMaximumRows) && !AneFfn::splits(AneFfn::kMaximumRows + 1));
   if (!AneFfn::supports(affine.layers) || !AneFfn::supports(gguf.layers)) fail("the split does not take the models");
   if (AneFfn::supports({})) fail("the split takes no layers");
   // A hidden size the programs' segments do not take, and layers of two shapes.
@@ -387,67 +395,181 @@ void takes(MetalBackend &backend, const Model &affine, const Model &gguf) {
   if (AneFfn::supports(narrow)) fail("the split takes a hidden size of 4096");
   if (AneFfn::supports(mixed)) fail("the split takes layers of two shapes");
   // Shares that leave the GPU or the ANE no channels.
-  for (const double share : {0.0, 0.02, 0.98, 1.0}) {
-    try {
-      static_cast<void>(AneFfn::plannedBytes(affine.layers, share));
-      fail("share " + std::to_string(share) + " leaves the GPU or the ANE no channels, yet plans");
-    } catch (const std::invalid_argument &) {
-    }
-  }
+  for (const double share : {0.0, 1.0})
+    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(affine.layers, share)); }, "must lie in (0, 1)",
+                  "share " + std::to_string(share) + " was planned");
+  for (const double share : {0.02, 0.98})
+    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(affine.layers, share)); }, "no channels",
+                  "share " + std::to_string(share) + " leaves the GPU or the ANE no channels, yet plans");
   section("takes: models of one splittable shape, and shares that leave each part channels");
 }
 
-// The output of every layer's FFN of `rows` normalized rows from a zero residual, on the GPU alone or split.
-std::vector<float> forward(MetalBackend &backend, const Linear &linear, const Model &model, AneFfn *split,
-                           const PrefillFfnBuffers &ffn, const std::array<MetalBuffer, 2> &hidden, uint32_t rows) {
+// The chunk's buffers of `rows` rows at most: the normalized rows and the FFN's scratch, and the hidden rows the
+// layers' residuals and outputs alternate between.
+struct Chunk {
+  PrefillFfnBuffers ffn;
+  std::array<MetalBuffer, 2> hidden;
+};
+Chunk chunk(MetalBackend &backend, uint32_t rows) {
+  const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
+  const auto sumRows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * (width / 64) * 4); };
+  // Chunks of at least kMinimumRows rows take no split scratch (Linear::prefillScratchSize).
+  return {{bf16Rows(kHidden), sumRows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
+           sumRows(kIntermediate), {}},
+          {bf16Rows(kHidden), bf16Rows(kHidden)}};
+}
+// Normal values scaled by row(r) into the leading rows of the chunk's normalized rows.
+template <class Scale>
+void fillRows(const Chunk &chunk, uint32_t rows, Scale row) {
+  std::normal_distribution<float> normal;
+  auto *values = static_cast<uint16_t *>(chunk.ffn.normalized.contents());
+  for (uint64_t i = 0; i < uint64_t{rows} * kHidden; ++i) values[i] = floatToBf16(normal(rng) * row(i / kHidden));
+}
+
+// A forward of every layer's FFN of a chunk's `rows` normalized rows from a zero residual, split where `split` takes
+// the chunk and on the GPU alone otherwise, as the target's prefill encodes it: its bf16 output, whether the split's
+// results were usable, and the command's milliseconds.
+struct Forward {
+  std::vector<uint16_t> bits;
+  bool usable = true;
+  double milliseconds = 0.0;
+  [[nodiscard]] float operator[](uint64_t index) const { return bf16ToFloat(bits[index]); }
+};
+Forward forward(MetalBackend &backend, const Linear &linear, const Model &model, AneFfn *split, const Chunk &chunk,
+                uint32_t rows) {
+  const auto &[ffn, hidden] = chunk;
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
   if (model.layers.front().gate->layout() == WeightLayout::Affine64)
     linear.addPrefillSums(graph, ffn.normalized, ffn.sums, *model.layers.front().gate, rows);
-  if (split) split->begin();
+  const bool splits = split && split->splits(rows);
+  if (split) static_cast<void>(split->begin());
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
     const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
-    if (split)
+    if (splits)
       split->add(graph, layer, ffn, residual, output, rows);
     else
       linear.addPrefillSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
   }
-  if (split) split->submit();
-  run(backend, graph);
-  if (split) split->finish();
+  Forward result;
+  const auto start = AwakeClock::now();
+  if (split)
+    static_cast<void>(split->commit(graph, {}).wait());
+  else
+    run(backend, graph);
+  result.milliseconds = millisecondsSince(start);
+  result.usable = !split || split->finish();
   const uint16_t *bits = contents<uint16_t>(hidden[kLayers & 1]);
-  std::vector<float> result(uint64_t{rows} * kHidden);
-  for (size_t i = 0; i < result.size(); ++i) result[i] = bf16ToFloat(bits[i]);
+  result.bits.assign(bits, bits + uint64_t{rows} * kHidden);
   return result;
 }
 
-void split(MetalBackend &backend, const Linear &linear, const Model &model, const PrefillFfnBuffers &ffn,
-           const std::array<MetalBuffer, 2> &hidden) {
-  AneFfn split(backend, linear, model.layers, kShare);
-  if (split.share() != kShare) fail(model.name + ": runs share " + std::to_string(split.share()));
+// The RMS of the split's output's difference from the GPU's alone, relative to the GPU's, over the elements `counts`
+// takes, and whether the split's are finite.
+template <class Counts>
+std::pair<double, bool> difference(const Forward &expected, const Forward &got, Counts counts) {
+  double difference = 0.0, magnitude = 0.0;
+  bool finite = true;
+  for (uint64_t i = 0; i < got.bits.size(); ++i) {
+    if (!counts(i / kHidden, i % kHidden)) continue;
+    finite &= std::isfinite(got[i]);
+    const double delta = double(got[i]) - expected[i];
+    difference += delta * delta;
+    magnitude += double(expected[i]) * expected[i];
+  }
+  return {std::sqrt(difference / magnitude), finite};
+}
+std::pair<double, bool> difference(const Forward &expected, const Forward &got) {
+  return difference(expected, got, [](uint64_t, uint64_t) { return true; });
+}
+
+// The split's layers, built from copies of the model's projections that are gone before it runs: it keeps what it
+// needs of them.
+std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model) {
+  const std::vector<Projection> copies = model.projections;
+  std::vector<SwiGluProjections> layers;
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2]});
+  return std::make_unique<AneFfn>(backend, layers, kShare);
+}
+
+void split(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model);
+  if (split->share() != kShare) fail(model.name + ": runs share " + std::to_string(split->share()));
+  if (split->splits(AneFfn::kMinimumRows - 1) || !split->splits(AneFfn::kMinimumRows) ||
+      !split->splits(AneFfn::kMaximumRows) || split->splits(AneFfn::kMaximumRows + 1))
+    fail(model.name + ": the split takes other chunks than those of 512 to 2048 rows");
   // The plan takes whole pages of each of its three buffers, of which Metal may report less.
-  const uint64_t planned = AneFfn::plannedBytes(model.layers, kShare), allocated = split.allocatedBytes();
+  const uint64_t planned = AneFfn::plannedBytes(model.layers, kShare), allocated = split->allocatedBytes();
   if (allocated > planned || planned - allocated >= 3 * kHostPageBytes)
     fail(model.name + ": allocated " + std::to_string(allocated) + " bytes, planned " + std::to_string(planned));
+  fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   // The most rows first: later commands run on what earlier ones left in the split's surfaces.
   for (const uint32_t rows : {AneFfn::kMaximumRows, AneFfn::kMinimumRows, 700u}) {
-    const std::vector<float> expected = forward(backend, linear, model, nullptr, ffn, hidden, rows);
-    const std::vector<float> got = forward(backend, linear, model, &split, ffn, hidden, rows);
-    double difference = 0.0, magnitude = 0.0;
-    bool finite = true;
-    for (size_t i = 0; i < got.size(); ++i) {
-      finite &= std::isfinite(got[i]);
-      const double delta = double(got[i]) - expected[i];
-      difference += delta * delta;
-      magnitude += double(expected[i]) * expected[i];
-    }
-    const double error = std::sqrt(difference / magnitude);
-    std::cout << "  " << model.name << ", " << rows << " rows: " << 100.0 * error << "% RMS from the GPU alone\n";
-    if (!finite || !(error <= kMaximumError))
+    const Forward expected = forward(backend, linear, model, nullptr, chunk, rows);
+    const Forward got = forward(backend, linear, model, split.get(), chunk, rows);
+    const auto [error, finite] = difference(expected, got);
+    std::cout << "  " << model.name << ", " << rows << " rows: " << 100.0 * error << "% RMS from the GPU alone, "
+              << got.milliseconds << " ms\n";
+    if (!got.usable || !finite || !(error <= kMaximumError))
       fail(model.name + ", " + std::to_string(rows) + " rows: " + std::to_string(100.0 * error) +
-           "% RMS from the GPU alone");
+           "% RMS from the GPU alone" + (got.usable ? "" : ", unusable: " + split->reason()));
   }
-  section("split: " + model.name + " layers at share 0.5, its planned memory, chunks of 2048, 512 and 700 rows");
+  section("split: " + model.name + " layers at share 0.5 from layers gone before it runs, its planned memory, "
+          "chunks of 2048, 512 and 700 rows");
+}
+
+// Layers added out of order and buffers short of a chunk's rows are refused before anything is encoded.
+void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
+  AneFfn split(backend, model.layers, kShare);
+  constexpr uint32_t kRows = AneFfn::kMinimumRows;
+  const auto &[ffn, hidden] = chunk;
+  CommandGraph graph;
+  if (!split.begin()) fail("a new split does not begin a command");
+  test::rejects([&] { split.add(graph, 1, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 0",
+                "the split added layer 1 first");
+  split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
+  test::rejects([&] { split.add(graph, 0, ffn, hidden[1], hidden[0], kRows); }, "not its next layer 1",
+                "the split added layer 0 twice");
+  test::rejects([&] { split.add(graph, 2, ffn, hidden[1], hidden[0], kRows); }, "not its next layer 1",
+                "the split skipped layer 1");
+  const size_t encoded = graph.dispatches().size();
+  const MetalBuffer shorter = backend.view(hidden[0], 0, uint64_t{kRows} * kHidden * 2 - 2);
+  test::rejects([&] { split.add(graph, 1, ffn, hidden[1], shorter, kRows); }, "ANE FFN output buffer holds",
+                "an output one element short was accepted");
+  PrefillFfnBuffers narrow = ffn;
+  narrow.normalized = backend.view(ffn.normalized, 0, uint64_t{kRows} * kHidden * 2 - 2);
+  test::rejects([&] { split.add(graph, 1, narrow, hidden[1], hidden[0], kRows); }, "ANE FFN input buffer holds",
+                "an input one element short was accepted");
+  if (graph.dispatches().size() != encoded) fail("a refused layer encoded a dispatch");
+  if (!split.begin()) fail("a split begins a command again");
+  split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
+  section("refusals: layers out of order and buffers short of the chunk's rows");
+}
+
+// The number of evaluations a split queues as it is built: one of each of its functions.
+constexpr uint64_t kBuildEvaluations = (AneFfn::kMaximumRows - AneFfn::kMinimumRows) / AneFfn::kProgramStep + 1;
+
+// A fault armed for the next split's program at the evaluation of `layer` in its first forward of `rows` rows: the
+// forward's results are unusable and the split stops, without failing its command, within the handoff's bound of
+// the evaluation's start, and the GPU alone then computes, bit for bit, what it computes on its own.
+void stops(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk,
+           ane::ProgramInstrumentation::Faults faults, const std::string &what, uint32_t rows,
+           std::string_view reason) {
+  ane::ProgramInstrumentation::arm(faults);
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kShare);
+  const Forward faulted = forward(backend, linear, model, split.get(), chunk, rows);
+  const std::string label = what + ", " + std::to_string(rows) + " rows";
+  if (faulted.usable) fail(label + ": the results were usable");
+  if (!split->retired() || split->splits(rows)) fail(label + ": the split did not stop");
+  if (split->reason().find(reason) == std::string::npos) fail(label + ": stopped for " + split->reason());
+  if (!backend.healthy()) fail(label + ": the backend is unhealthy: " + backend.unhealthyReason());
+  if (!(faulted.milliseconds < 4000.0))
+    fail(label + ": the command took " + std::to_string(faulted.milliseconds) + " ms");
+  const Forward alone = forward(backend, linear, model, nullptr, chunk, rows);
+  const Forward after = forward(backend, linear, model, split.get(), chunk, rows);
+  if (!after.usable || after.bits != alone.bits)
+    fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
 // The split of the affine Q4 and the GGUF model over normalized rows of normal values.
@@ -455,18 +577,67 @@ void split(MetalBackend &backend) {
   const Linear linear(backend.capabilities());
   const Model affine = affineModel(backend), gguf = ggufModel(backend);
   takes(backend, affine, gguf);
-  constexpr uint32_t kRows = AneFfn::kMaximumRows;
-  std::normal_distribution<float> normal;
-  std::vector<uint16_t> normalized(uint64_t{kRows} * kHidden);
-  for (uint16_t &value : normalized) value = floatToBf16(normal(rng));
-  const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{kRows} * width * 2); };
-  const auto sumRows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{kRows} * (width / 64) * 4); };
-  // Chunks of at least kMinimumRows rows take no split scratch (Linear::prefillScratchSize).
-  const PrefillFfnBuffers ffn{upload(backend, normalized), sumRows(kHidden), bf16Rows(kIntermediate),
-                              bf16Rows(kIntermediate), sumRows(kIntermediate), {}};
-  const std::array<MetalBuffer, 2> hidden{bf16Rows(kHidden), bf16Rows(kHidden)};
-  split(backend, linear, affine, ffn, hidden);
-  split(backend, linear, gguf, ffn, hidden);
+  const Chunk rows = chunk(backend, AneFfn::kMaximumRows);
+  split(backend, linear, affine, rows);
+  split(backend, linear, gguf, rows);
+  refusals(backend, affine, rows);
+}
+
+// ---------------------------------------------------------------- faults
+// Each fault of an evaluation at layer 0, 1 and 2 of chunks of 512, 700 and 2048 rows stops the split (stops()); an
+// evaluation that signals the event below its value leaves it there.
+void faults(MetalBackend &backend) {
+  using Faults = ane::ProgramInstrumentation::Faults;
+  const Linear linear(backend.capabilities());
+  const Model model = affineModel(backend);
+  const Chunk rows = chunk(backend, AneFfn::kMaximumRows);
+  fillRows(rows, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  struct Fault {
+    const char *name;
+    Faults (*arm)(uint64_t evaluation);
+    const char *reason;
+  };
+  const Fault kinds[] = {
+      {"a throwing enqueue", [](uint64_t at) { return Faults{.throwingEnqueue = at}; }, "could not start"},
+      {"a failed evaluation", [](uint64_t at) { return Faults{.failingEvaluation = at}; }, "an evaluation failed"},
+      {"a stalled evaluation", [](uint64_t at) { return Faults{.stalledEvaluation = at}; }, "did not complete"},
+      {"a late evaluation",
+       [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(3000)}; },
+       "did not complete"},
+  };
+  for (const Fault &kind : kinds) {
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows})
+        stops(backend, linear, model, rows, kind.arm(kBuildEvaluations + layer + 1),
+              std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
+    section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
+  }
+
+  // The CPU raises the event past an evaluation's signal before it runs.
+  test::AneSum sum(backend);
+  const test::TemporaryDirectory cache("splash-ane-faults");
+  ane::Program program(sum.mil("below"), {}, {std::chrono::seconds(120), {}}, cache.path());
+  const metal::SharedEvent event = backend.newSharedEvent();
+  event.signal(100);
+  struct Report final {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::optional<bool> result;
+  };
+  const auto report = std::make_shared<Report>();
+  sum.fill(rng);
+  program.enqueue(sum.bind(program, "below"), event, 50, 60, [report](bool success) {
+    std::lock_guard lock(report->mutex);
+    report->result = success;
+    report->changed.notify_all();
+  });
+  std::unique_lock lock(report->mutex);
+  report->changed.wait_until(lock, AwakeClock::now() + std::chrono::seconds(10),
+                             [&] { return report->result.has_value(); });
+  const uint64_t value = [(__bridge id<MTLSharedEvent>)event.nativeHandle() signaledValue];
+  if (report->result != true || !sum.summed()) fail("an evaluation waiting on a value passed did not run");
+  if (value != 100) fail("an evaluation's signal of 60 moved the event from 100 to " + std::to_string(value));
+  section("faults: an evaluation's signal below the event's value leaves it there");
 }
 
 // ---------------------------------------------------------------- the program
@@ -599,8 +770,8 @@ void program(MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   const std::string_view mode = argc == 3 ? argv[2] : "";
-  if (mode != "kernels" && mode != "split" && mode != "program") {
-    std::cerr << "usage: ane-ffn METALLIB kernels|split|program\n";
+  if (mode != "kernels" && mode != "split" && mode != "faults" && mode != "program") {
+    std::cerr << "usage: ane-ffn METALLIB kernels|split|faults|program\n";
     return 2;
   }
   try {
@@ -614,6 +785,8 @@ int main(int argc, char **argv) {
       join(backend);
     } else if (mode == "split") {
       split(backend);
+    } else if (mode == "faults") {
+      faults(backend);
     } else {
       program(backend);
     }
