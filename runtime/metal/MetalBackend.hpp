@@ -2,10 +2,10 @@
 
 #include "metal/DeviceCapabilities.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -97,7 +97,8 @@ private:
 
 // A shared event another agent, such as the Neural Engine, waits on or
 // signals. Copies name the same event. nativeHandle() is its
-// id<MTLSharedEvent> for Objective-C++ callers.
+// id<MTLSharedEvent> for Objective-C++ callers. Its value never decreases:
+// Metal ignores a signal below it, from the CPU as from the GPU.
 class SharedEvent final {
 public:
   SharedEvent();
@@ -109,8 +110,13 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] void *nativeHandle() const noexcept;
-  // Raises the event to at least `value` from the CPU.
+  // Raises the event to `value` from the CPU.
   void signal(uint64_t value) const noexcept;
+  // Calls `callback` once, when the event reaches `value`, promptly if it
+  // already has. Callbacks run on a serial dispatch queue of the backend
+  // that created the event, one at a time and never within notify(); they
+  // must not throw.
+  void notify(uint64_t value, std::function<void()> callback) const;
 
 private:
   struct Impl;
@@ -139,25 +145,34 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
-// A dispatch-free step that orders a command against another agent: signal
-// raises the event to value once all earlier work has completed; otherwise
-// later work waits until the event reaches value. The work before a signal is
-// committed as its own Metal command buffer, so the signal is never held back
-// behind the dispatches that follow it.
-struct EventStep {
-  SharedEvent event;
-  uint64_t value = 0;
-  bool signal = false;
-};
-
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
-  // Set for an event step, which has no pipeline or bindings.
-  std::optional<EventStep> event{};
+};
+
+// Orders a command against another agent, such as the Neural Engine, after
+// the first `before` of its dispatches. A Signal raises the event to `value`
+// once all earlier work has completed; a Wait holds all later work until the
+// event reaches `value`. A command is split into Metal command buffers at its
+// signals, so a signal is never held back behind the dispatches that follow
+// it, and a signal is delivered even when the work before it fails.
+struct EventStep {
+  enum class Kind : uint8_t { Signal, Wait };
+
+  size_t before = 0;
+  SharedEvent event;
+  uint64_t value = 0;
+  Kind kind = Kind::Signal;
+};
+
+// What one submission encodes: its dispatches in order, and the event steps
+// between them in the order of their `before`.
+struct Command {
+  std::span<const ComputeDispatch> dispatches;
+  std::span<const EventStep> events;
 };
 
 struct CommandTiming {
@@ -310,6 +325,8 @@ public:
 
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+  // An event at value 0, whose notify() callbacks run on this backend's
+  // event queue.
   [[nodiscard]] SharedEvent newSharedEvent();
 
   // Frees the memory of a buffer from allocateBuffer while no command is in
@@ -325,11 +342,16 @@ public:
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
-  // Encodes an ordered dispatch list into one command buffer and commits it
-  // without waiting. The completion callback only notifies host control
-  // flow; command results and errors are consumed from the returned ticket.
-  // A second command is rejected until wait() consumes the first ticket,
-  // preserving the one-in-flight runtime invariant.
+  // Encodes a command into Metal command buffers, one more than it has event
+  // signals (EventStep), and commits them without waiting. The completion
+  // callback only notifies host control flow; command results and errors are
+  // consumed from the returned ticket, which reports the error of the first
+  // of its buffers that failed. A second command is rejected until wait()
+  // consumes the first ticket, preserving the one-in-flight runtime
+  // invariant.
+  [[nodiscard]] CommandTicket
+  submitCommandAsync(const Command &command, CommandCompletion completion = {});
+  // A command of these dispatches without event steps: one command buffer.
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});

@@ -145,6 +145,28 @@ constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // signal and one more.
 constexpr NSUInteger kMaximumCommandBuffers = 512;
 
+// Refuses the event steps of a command of `dispatches` dispatches that its
+// submission cannot encode.
+void checkEvents(std::span<const EventStep> events, size_t dispatches) {
+    size_t before = 0;
+    NSUInteger signals = 0;
+    for (const EventStep &step : events) {
+        if (!step.event || !step.value)
+            throw MetalBackendError(
+                "event step needs an event and a nonzero value");
+        if (step.before < before)
+            throw MetalBackendError("event steps are out of dispatch order");
+        if (step.before > dispatches)
+            throw MetalBackendError(
+                "event step follows more dispatches than its command has");
+        before = step.before;
+        if (step.kind == EventStep::Kind::Signal) ++signals;
+    }
+    if (signals >= kMaximumCommandBuffers)
+        throw MetalBackendError("Metal command signals more events than its "
+                                "queue holds command buffers");
+}
+
 double awakeSeconds() noexcept {
     return std::chrono::duration<double>(AwakeClock::now().time_since_epoch()).count();
 }
@@ -236,7 +258,7 @@ struct MetalAllocation {
 };
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
-// released: only allocateBuffer and view create one.
+// released: only allocateBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
@@ -245,6 +267,9 @@ struct MetalBuffer::Impl {
 
 struct SharedEvent::Impl {
     __strong id<MTLSharedEvent> event = nil;
+    // The listener of the backend that created the event, which runs its
+    // notify() callbacks; the backend and each of its events hold it.
+    __strong MTLSharedEventListener *listener = nil;
 };
 
 struct BackendAsyncState {
@@ -306,7 +331,8 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
-    void commitSubmission(uint64_t sequence, const std::vector<id<MTLCommandBuffer>> &leading,
+    void commitSubmission(uint64_t sequence,
+                          const std::vector<id<MTLCommandBuffer>> &leading,
                           id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
@@ -418,9 +444,12 @@ struct CommandTicket::State {
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
         std::string error;
-        id<MTLCommandBuffer> failed = command.status != MTLCommandBufferStatusCompleted ? command : nil;
+        // The first buffer that failed names the error: the buffers after a
+        // failed one still run, as its signal is delivered (EventStep).
+        id<MTLCommandBuffer> failed =
+            command.status != MTLCommandBufferStatusCompleted ? command : nil;
         for (id<MTLCommandBuffer> earlier : leadingCommands) {
-            if (earlier.status != MTLCommandBufferStatusCompleted) {
+            if (earlier.status == MTLCommandBufferStatusError) {
                 failed = earlier;
                 break;
             }
@@ -558,6 +587,9 @@ struct MetalBackend::Impl {
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
+    // Runs the notify() callbacks of the backend's shared events, on a
+    // serial dispatch queue.
+    __strong MTLSharedEventListener *eventListener = nil;
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
     __strong id<MTLLibrary> library = nil;
@@ -644,24 +676,12 @@ struct MetalBackend::Impl {
         if (dispatches.empty()) {
             throw MetalBackendError("Metal command must contain a dispatch");
         }
-        const auto signals = std::count_if(dispatches.begin(), dispatches.end(),
-            [](const ComputeDispatch &dispatch) { return dispatch.event && dispatch.event->signal; });
-        if (static_cast<NSUInteger>(signals) >= kMaximumCommandBuffers) {
-            throw MetalBackendError("Metal command signals more events than its queue holds command buffers");
-        }
         PreparedCommand command;
         command.dispatches.reserve(dispatches.size());
         size_t bindings = 0;
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
-            if (dispatch.event) {
-                if (!dispatch.event->event || !dispatch.event->value) {
-                    throw MetalBackendError("event step requires an event and a value");
-                }
-                command.dispatches.push_back(item);
-                continue;
-            }
             item.groups = metalSize(dispatch.threadgroups, "threadgroups");
             item.threads = metalSize(
                 dispatch.threadsPerThreadgroup, "threadsPerThreadgroup");
@@ -722,7 +742,6 @@ struct MetalBackend::Impl {
         }
 
         for (PreparedDispatch &item : command.dispatches) {
-            if (item.source->event) continue;
             item.pipeline = pipeline(item.source->pipelineName);
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
@@ -751,9 +770,10 @@ struct MetalBackend::Impl {
         return command;
     }
 
-    // Encodes and commits prepared dispatches; the ticket retains
-    // `retained` until it is consumed.
+    // Encodes and commits prepared dispatches and the event steps between
+    // them; the ticket retains `retained` until it is consumed.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
         auto ticketState = std::make_shared<CommandTicket::State>();
@@ -781,35 +801,51 @@ struct MetalBackend::Impl {
                 failBeforeCommit("unable to create Metal command buffer");
             }
             ticketState->wallStart = wallStart;
-            // An event signal ends a command buffer; the rest continue in the
-            // next.
+            // The buffers before `command`, each ended by an event signal.
             std::vector<id<MTLCommandBuffer>> leading;
             id<MTLComputeCommandEncoder> encoder = nil;
-            // Indexed by argument table entry. The ticket and the dispatches
-            // keep the buffers alive.
-            __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
-            NSUInteger offsets[kBufferArgumentEntries];
-            for (const PreparedDispatch &item : dispatches) {
-                const ComputeDispatch &dispatch = *item.source;
-                if (dispatch.event) {
+            // Encodes the event steps that follow the first `encoded`
+            // dispatches.
+            auto step = events.begin();
+            const auto encodeSteps = [&](size_t encoded) {
+                for (; step != events.end() && step->before == encoded; ++step) {
                     if (encoder) {
                         [encoder endEncoding];
                         encoder = nil;
                     }
                     id<MTLSharedEvent> event =
-                        (__bridge id<MTLSharedEvent>)dispatch.event->event.nativeHandle();
-                    if (!dispatch.event->signal) {
-                        [command encodeWaitForEvent:event value:dispatch.event->value];
+                        (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
+                    if (step->kind == EventStep::Kind::Wait) {
+                        [command encodeWaitForEvent:event value:step->value];
                         continue;
                     }
-                    [command encodeSignalEvent:event value:dispatch.event->value];
+                    [command encodeSignalEvent:event value:step->value];
+                    // A buffer that fails may end without its signal; the
+                    // work after it, waiting on an agent that waits on the
+                    // signal, would then stall until a timeout ends it. The
+                    // CPU delivers the signal instead, so the command ends
+                    // with the failure at once.
+                    const SharedEvent signaled = step->event;
+                    const uint64_t value = step->value;
+                    [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+                        if (ended.status == MTLCommandBufferStatusError)
+                            signaled.signal(value);
+                    }];
                     leading.push_back(command);
                     command = [queue commandBuffer];
                     if (!command) {
                         failBeforeCommit("unable to create Metal command buffer");
                     }
-                    continue;
                 }
+            };
+            // Indexed by argument table entry. The ticket and the dispatches
+            // keep the buffers alive.
+            __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
+            NSUInteger offsets[kBufferArgumentEntries];
+            for (size_t index = 0; index < dispatches.size(); ++index) {
+                encodeSteps(index);
+                const PreparedDispatch &item = dispatches[index];
+                const ComputeDispatch &dispatch = *item.source;
                 if (!encoder) {
                     encoder = [command computeCommandEncoder];
                     if (!encoder) {
@@ -840,6 +876,7 @@ struct MetalBackend::Impl {
                 [encoder dispatchThreadgroups:item.groups
                          threadsPerThreadgroup:item.threads];
             }
+            encodeSteps(dispatches.size());
             if (encoder) [encoder endEncoding];
             ticketState->leadingCommands = leading;
 
@@ -868,15 +905,11 @@ struct MetalBackend::Impl {
     // timing, so callers observe the usual asynchronous contract.
     CommandTicket submitProfiled(std::span<const ComputeDispatch> dispatches,
                                  CommandCompletion completion) {
-        if (std::any_of(dispatches.begin(), dispatches.end(),
-                [](const ComputeDispatch &dispatch) { return dispatch.event.has_value(); })) {
-            throw MetalBackendError("dispatch profiling cannot replay event steps");
-        }
         const PreparedCommand command = prepare(dispatches);
         CommandTiming total;
         for (const PreparedDispatch &item : command.dispatches) {
             const CommandTiming timing =
-                commit({&item, 1}, command.retainedAllocations, {}).wait();
+                commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
             dispatchProfile.push_back(
                 {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
@@ -908,9 +941,16 @@ void *SharedEvent::nativeHandle() const noexcept {
     return impl_ ? (__bridge void *)impl_->event : nullptr;
 }
 
+// Metal ignores a value below the event's, so the write alone raises it.
 void SharedEvent::signal(uint64_t value) const noexcept {
-    if (impl_ && impl_->event && impl_->event.signaledValue < value)
-        impl_->event.signaledValue = value;
+    if (*this) impl_->event.signaledValue = value;
+}
+
+void SharedEvent::notify(uint64_t value, std::function<void()> callback) const {
+    if (!*this) throw MetalBackendError("an empty shared event cannot notify");
+    [impl_->event notifyListener:impl_->listener
+                         atValue:value
+                           block:^(id<MTLSharedEvent>, uint64_t) { callback(); }];
 }
 
 MetalBuffer::MetalBuffer() = default;
@@ -1028,14 +1068,22 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
             throw MetalBackendError(*impl_->capabilities.validationMessage());
         }
         impl_->asyncState->device = impl_->device;
-        // A command splits into one Metal command buffer per event signal
-        // (EventStep), all created before any commits: the default limit of
-        // 64 outstanding would block a 64-layer prefill with an ANE step each.
+        // A command takes one Metal command buffer per event signal
+        // (EventStep) and one more, all created before the first is
+        // committed, and creating one waits while the queue's limit of them
+        // is outstanding: at the default of 64, a 64-layer prefill with a
+        // Neural Engine step each would wait forever.
         impl_->queue = [impl_->device
             newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
+        impl_->eventListener = [[MTLSharedEventListener alloc]
+            initWithDispatchQueue:dispatch_queue_create(
+                "splash.metal.events",
+                dispatch_queue_attr_make_with_autorelease_frequency(
+                    DISPATCH_QUEUE_SERIAL,
+                    DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM))];
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
         NSError *error = nil;
@@ -1217,6 +1265,7 @@ SharedEvent MetalBackend::newSharedEvent() {
     if (!result->event) {
         throw MetalBackendError("unable to create Metal shared event");
     }
+    result->listener = impl_->eventListener;
     return SharedEvent(std::move(result));
 }
 
@@ -1227,14 +1276,24 @@ CommandTiming MetalBackend::submit(const ComputeDispatch &dispatch) {
 CommandTicket MetalBackend::submitCommandAsync(
     std::span<const ComputeDispatch> dispatches,
     CommandCompletion completion) {
+    return submitCommandAsync(Command{dispatches, {}}, std::move(completion));
+}
+
+CommandTicket MetalBackend::submitCommandAsync(const Command &command,
+                                               CommandCompletion completion) {
     checkOperation();
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
-    if (impl_->dispatchProfiling)
-        return impl_->submitProfiled(dispatches, std::move(completion));
+    if (impl_->dispatchProfiling) {
+        if (!command.events.empty())
+            throw MetalBackendError(
+                "dispatch profiling does not replay event steps");
+        return impl_->submitProfiled(command.dispatches, std::move(completion));
+    }
 #endif
-    Impl::PreparedCommand command = impl_->prepare(dispatches);
-    return impl_->commit(command.dispatches,
-                         std::move(command.retainedAllocations),
+    checkEvents(command.events, command.dispatches.size());
+    Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
+    return impl_->commit(prepared.dispatches, command.events,
+                         std::move(prepared.retainedAllocations),
                          std::move(completion));
 }
 

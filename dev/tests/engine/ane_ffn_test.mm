@@ -110,7 +110,7 @@ const T *contents(const MetalBuffer &buffer) {
   return static_cast<const T *>(buffer.contents());
 }
 void run(MetalBackend &backend, const CommandGraph &graph) {
-  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
 }
 
 float toHalf(float value) { return float(_Float16(value)); }

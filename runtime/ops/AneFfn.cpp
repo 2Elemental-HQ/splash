@@ -794,7 +794,7 @@ double AneFfn::splitError(metal::MetalBackend &backend, const Linear &linear,
   for (uint32_t layer = 0; layer < layers.size(); ++layer)
     split.add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kMaximumRows);
   split.submit();
-  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
   split.finish();
   const std::vector<float> got = output();
 

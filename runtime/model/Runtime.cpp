@@ -2096,7 +2096,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (impl_->aneFfn)
     impl_->aneFfn->submit();
   CommandTicket command = impl_->backend.submitCommandAsync(
-      graph.dispatches(), std::move(completion));
+      graph.command(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, captures,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
