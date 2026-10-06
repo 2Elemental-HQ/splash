@@ -45,7 +45,9 @@ using metal::MetalBuffer;
 
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
-  using Completion = std::function<std::vector<ModelStepResult>(CommandTiming)>;
+  // Runs once the command has completed, and may add work of its own to its
+  // timing, as a rerun of the command does.
+  using Completion = std::function<std::vector<ModelStepResult>(CommandTiming &)>;
 
   DeferredMetalTicket(CommandTicket ticket, Completion completion,
                       bool representativePrefillTiming = true)
@@ -59,9 +61,15 @@ public:
       throw std::logic_error("Metal ticket was already consumed");
     }
     CommandTiming timing = ticket_.wait();
-    wallMilliseconds_ = timing.wallSeconds * 1000.0;
+    const double commandSeconds = timing.wallSeconds;
     Completion completion = std::move(completion_);
-    return completion(timing);
+    std::vector<ModelStepResult> results = completion(timing);
+    wallMilliseconds_ = timing.wallSeconds * 1000.0;
+    // Work the completion added takes wall time, but is no sample of the
+    // command's rows.
+    if (timing.wallSeconds != commandSeconds)
+      representativePrefillTiming_ = false;
+    return results;
   }
 
   double wallMilliseconds() const noexcept override {
@@ -2092,7 +2100,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
                     : impl_->backend.submitCommandAsync(graph.command(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, captures, draws,
-                 items = std::move(copiedItems)](CommandTiming timing) mutable {
+                 items = std::move(copiedItems)](CommandTiming &timing) mutable {
     // A chunk whose Neural Engine work failed holds no usable outputs, and
     // the split has stopped: the GPU runs the chunk again alone, which
     // computes what it would have the first time. Nothing of the chunk is
@@ -2104,7 +2112,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // are copied, not encoded again; and the requests' draws restored, a
     // sampled first token draws the same uniform. The first ticket was
     // released before this completion runs (DeferredMetalTicket::wait), so
-    // the backend takes the rerun's command.
+    // the backend takes the rerun's command, whose time counts in the
+    // chunk's.
     if (impl->aneFfn && !impl->aneFfn->finish()) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
