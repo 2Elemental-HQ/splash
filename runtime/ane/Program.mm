@@ -773,6 +773,9 @@ void Program::load(Limits limits) {
   limits_ = std::move(limits);
   runOnQueue(impl_->api, limits_, [impl = impl_] {
     if (impl->loaded) return;
+#ifdef SPLASH_ANE_INSTRUMENTATION
+    if (impl->faults.failingLoad) throw std::runtime_error("ANE load failed: an injected fault");
+#endif
     if (!impl->compiled()) throw std::runtime_error("ANE program is not compiled");
     impl->load(false);
     try {

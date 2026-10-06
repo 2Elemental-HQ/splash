@@ -216,6 +216,14 @@ startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
   }
 }
 
+// The split's part of what the engine gives back while idle, if it runs one.
+std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
+  if (!split)
+    return std::nullopt;
+  return ReleasableMemory::Split{[split] { return split->release(); },
+                                 [split] { split->restore(); }};
+}
+
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
   if (value.size() != 64) {
     throw std::invalid_argument(
@@ -327,6 +335,7 @@ RuntimeResources::RuntimeResources(
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
       hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>

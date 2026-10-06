@@ -27,9 +27,9 @@ namespace splash::engine {
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
-  // The model's weights: released once the engine has held no request for
-  // the idle release, and written back, an image per tick, before the engine
-  // runs the next request.
+  // What the engine gives back while idle (ReleasableMemory): released once
+  // the engine has held no request for the idle release, and taken back, a
+  // part per tick, before the engine runs the next request.
   model::WeightMemory *weights = nullptr;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
@@ -64,8 +64,8 @@ public:
   bool receive(std::span<const uint8_t> bytes);
   bool finishInput();
 
-  // Executes at most one explicit GPU BatchPlan, or writes back one image of
-  // released weights.
+  // Executes at most one explicit GPU BatchPlan, or takes back one part of
+  // the released weights (model::WeightMemory::restore).
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);

@@ -27,6 +27,9 @@ public:
     // guarded() raises an NSException at the step of this name, as "load" or
     // "evaluation" (Program.mm names its steps).
     std::string raiseAt;
+    // load() throws std::runtime_error from the service's queue, as it does
+    // when the service no longer holds the compilation.
+    bool failingLoad = false;
     // The enqueue() call that throws.
     uint64_t throwingEnqueue = 0;
     // The evaluation that reports failure without running, the one that

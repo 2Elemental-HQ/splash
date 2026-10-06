@@ -1376,7 +1376,10 @@ takes about as long as the load at startup and logs `Weights restored in N s`. A
 restore is not admitted again: the memory plan counted the images at startup,
 and nothing else allocates while the engine holds no request. A restore that
 fails (an allocation the driver refuses, a read error, a source written in
-place) stops the engine, which the server starts again.
+place) stops the engine, which the server starts again. With the
+[Neural Engine split](#neural-engine-prefill), the release unloads its program
+after the images, and the restore loads it again in one tick more, after the
+last image (`ReleasableMemory`).
 
 `loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
 (`QwenTargetFiles`: a package's files, or the images
@@ -1578,14 +1581,22 @@ command buffer whose wait stays unmet for 5 s), or a value the join reads that
 is not finite. The CPU then raises the event to the GPU's last wait, the
 chunk runs again on the GPU alone, which computes what it would have, as does
 every chunk after it, and the engine logs `Warning · Neural Engine FFN split
-stopped (...)`. The split's logits differ from the GPU's alone (KL
+stopped (...)`. The idle release (`--idle-release`) unloads the program, so
+that the ANE's service gives its buffers back while the engine is idle, and
+keeps the split's own, which the residency keep-alive unwires
+(`AneFfn::release`); the next request loads the program again after the
+weights (`AneFfn::restore`), in about 0.1 s, and logs `Neural Engine FFN
+program reloaded in N s`. A program that does not load again within 10 s
+stops the split like a failure while serving, and the request runs on the GPU
+alone. The split's logits differ from the GPU's alone (KL
 about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share.
 `make test-engine-metal` runs `ane-ffn`: its kernels against CPU references
 for affine Q4 and every GGUF format under shader validation, then, without it,
-the split's memory and its output against the GPU alone, each fault of an
-evaluation the client's instrumented build injects
-(`runtime/ane/ProgramInstrumentation.hpp`) at each layer, and the private
+the split's memory and its output against the GPU alone, the same output once
+its program is unloaded and loaded again, each fault of an evaluation the
+client's instrumented build injects (`runtime/ane/ProgramInstrumentation.hpp`)
+at each layer and a program that does not load again, and the private
 client's failures, limits, unload and load, and cache files on a small
 program. `handoff` runs the event handoff against an agent the CPU plays in
 each way it can fail, and `ane-program-faults` checks that an Objective-C

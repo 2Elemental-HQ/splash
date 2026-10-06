@@ -100,6 +100,21 @@ public:
   // and logs why, once.
   [[nodiscard]] bool finish();
 
+  // The engine's idle release (engine::ReleasableMemory). Between commands:
+  // unloads the program, whose memory the ANE service gives back, and keeps
+  // the split's own (allocatedBytes()), which the backend's residency
+  // keep-alive unwires: the surfaces and scratch every command writes again,
+  // and the row scales and signs computed once. True once it unloaded the
+  // program; false, doing nothing, once the split stopped, as evaluations it
+  // gave up on may still use the program. A program that does not unload
+  // stops the split. Throws std::logic_error while a command it encoded is
+  // not committed or not finished.
+  [[nodiscard]] bool release();
+  // Loads the program release() unloaded again; nothing otherwise. Never
+  // throws: a program that does not load stops the split, and the GPU runs
+  // every later chunk alone.
+  void restore() noexcept;
+
 private:
   // The split's channels: hidden and intermediate, the layers', the GPU's and
   // the ANE's, and the segments of down's inputs the ANE takes.
@@ -224,6 +239,8 @@ private:
   uint32_t nextLayer_ = 0;
   // Whether a command committed jobs that finish() has not yet judged.
   bool unfinished_ = false;
+  // From a release() that unloaded the program until restore().
+  bool released_ = false;
   bool warned_ = false;
   uint64_t allocatedBytes_ = 0;
   // Destroyed first: it waits for the evaluations the ANE has not reported.

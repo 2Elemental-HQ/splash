@@ -10,10 +10,13 @@
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two programs and of the
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
 //   fp16 barely holds, and rows of a hidden channel of about 1e5; layers it is given out of order are refused, and it
-//   keeps what it needs of the layers it was built from; an infinity in the ANE's output stops it;
+//   keeps what it needs of the layers it was built from; an infinity in the ANE's output stops it; its program
+//   unloaded for the idle release and loaded again computes what it computed before, and a command encoded or in
+//   flight refuses the release;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
-//   sizes stops the split without failing the Metal command, and the GPU alone then computes what it computes on its
-//   own; an evaluation that signals the shared event below its value leaves the value as it is;
+//   sizes, and a program that does not load again after the idle release, stop the split without failing the Metal
+//   command or throwing, and the GPU alone then computes what it computes on its own; an evaluation that signals the
+//   shared event below its value leaves the value as it is;
 // - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
 //   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
 //   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
@@ -710,6 +713,43 @@ void massiveChannel(MetalBackend &backend, const Linear &linear, const Chunk &ch
   section("massive channel: a hidden channel of about 1e5 from the ANE's channels finite and within the bound");
 }
 
+// The idle release: the program unloaded (release()) and loaded again (restore()) computes what it computed before,
+// bit for bit; a release while a command is encoded, or committed and not finished, is refused.
+void idle(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model);
+  fillRows(chunk, kRows, [](uint64_t) { return 1.0f; });
+  const Forward before = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!split->release()) fail("idle: the program was not unloaded");
+  const auto start = AwakeClock::now();
+  split->restore();
+  const double reload = millisecondsSince(start);
+  const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
+  std::cout << "  loaded again in " << reload << " ms\n";
+  if (!before.usable || !after.usable || split->retired())
+    fail("idle: unusable: " + split->reason());
+  else if (after.bits != before.bits)
+    fail("idle: the program loaded again computes other values");
+
+  const auto &[ffn, hidden] = chunk;
+  CommandGraph graph;
+  if (!split->begin()) fail("idle: the split does not begin a command once loaded again");
+  split->add(graph, 0, ffn, hidden[0], hidden[1], kRows);
+  test::rejects([&] { static_cast<void>(split->release()); }, "unfinished", "a command encoded allowed a release");
+  for (uint32_t layer = 1; layer < kLayers; ++layer)
+    split->add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kRows);
+  metal::CommandTicket command = split->commit(graph, {});
+  test::rejects([&] { static_cast<void>(split->release()); }, "unfinished", "a command in flight allowed a release");
+  static_cast<void>(command.wait());
+  test::rejects([&] { static_cast<void>(split->release()); }, "unfinished", "a command not finished allowed a release");
+  if (!split->finish()) fail("idle: unusable: " + split->reason());
+  if (!split->release()) fail("idle: the program was not unloaded once its command finished");
+  split->restore();
+  if (split->retired()) fail("idle: stopped: " + split->reason());
+  section("idle: the program unloaded and loaded again computes the same values; a command encoded, in flight or "
+          "not finished refuses a release");
+}
+
 // The number of evaluations a split queues as it is built: one of each of its functions.
 constexpr uint64_t kBuildEvaluations = (AneFfn::kMaximumRows - AneFfn::kMinimumRows) / AneFfn::kProgramStep + 1;
 
@@ -747,6 +787,7 @@ void split(MetalBackend &backend) {
   refusals(backend, affine, rows);
   quietRows(backend, linear, affine, rows);
   massiveChannel(backend, linear, rows);
+  idle(backend, linear, affine, rows);
   fillRows(rows, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   stops(backend, linear, affine, rows, {.poisonedEvaluation = kBuildEvaluations + 2}, "an infinity in layer 1's output",
         AneFfn::kMaximumRows, "not finite");
@@ -783,6 +824,22 @@ void faults(MetalBackend &backend) {
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
     section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
   }
+
+  // A program that does not load again after the idle release.
+  ane::ProgramInstrumentation::arm({.failingLoad = true});
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kShare);
+  if (!split->release()) fail("a failed reload: the program was not unloaded");
+  split->restore();
+  if (!split->retired() || split->splits(AneFfn::kMaximumRows)) fail("a failed reload: the split did not stop");
+  if (split->reason().find("did not load again: ANE load failed") == std::string::npos)
+    fail("a failed reload: stopped for " + split->reason());
+  const Forward alone = forward(backend, linear, model, nullptr, rows, AneFfn::kMaximumRows);
+  const Forward after = forward(backend, linear, model, split.get(), rows, AneFfn::kMaximumRows);
+  if (!after.usable || after.bits != alone.bits)
+    fail("a failed reload: the GPU's forward after the split stopped differs from the GPU's alone");
+  if (split->release()) fail("a failed reload: the stopped split unloaded its program");
+  section("faults: a program that does not load again stops the split, and the GPU alone then computes what it "
+          "computes on its own");
 
   // The CPU raises the event past an evaluation's signal before it runs.
   test::AneSum sum(backend);

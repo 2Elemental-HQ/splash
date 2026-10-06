@@ -9,6 +9,7 @@
 #include "engine/Cache.hpp"
 #include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
+#include "engine/ReleasableMemory.hpp"
 #include "metal/CommandWatchdog.hpp"
 
 #include <algorithm>
@@ -1313,14 +1314,17 @@ bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
 // the last request however long it ran, never while one is there. A request
 // waits while they are written back, an image per tick, so the loop answers
 // frames between them, and the images all come back even when it is
-// cancelled. A restore that fails stops the engine.
-void testIdleWeightsAreReleasedAndRestored() {
+// cancelled. A restore that fails stops the engine. What the engine gives
+// back while idle without a Neural Engine split, ReleasableMemory over the
+// images alone, is the images: the test runs through it when `releasable`.
+void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
   Weights weights;
+  ReleasableMemory memory(weights, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
-  config.weights = &weights;
+  config.weights = releasable ? static_cast<model::WeightMemory *>(&memory) : &weights;
   LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
   engine::NativeRuntime &loop = fixture.loop;
   fixture.executor.beginObserver = [&] {
@@ -1392,6 +1396,94 @@ void testIdleWeightsAreReleasedAndRestored() {
                       }) &&
               !loop.engineHealthy() && loop.connectionMustClose(),
           "a failed restore did not stop the engine");
+}
+
+// With the Neural Engine split, the idle release gives back the images, then
+// the split's program. A request waits while the images are written back, an
+// image per tick, and the program is loaded in one tick more, before the
+// request begins. A program that does not load again stops the split, never
+// the engine (ops::AneFfn::restore): the request runs, and a stopped split
+// unloads nothing, so that the images alone come back for the next.
+void testIdleReleaseRestoresTheSplitLast() {
+  constexpr double kIdleReleaseSeconds = 2.0;
+  constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
+  Weights weights;
+  // The split's program: whether it is loaded, the times it was loaded
+  // again, and whether the split stopped, as one whose program does not
+  // load again (`failLoad`) does.
+  bool loaded = true, stopped = false, failLoad = false;
+  uint32_t loads = 0;
+  ReleasableMemory memory(
+      weights, ReleasableMemory::Split{
+                   [&] {
+                     require(weights.released(),
+                             "the split's program was unloaded before the images were released");
+                     if (stopped)
+                       return false;
+                     loaded = false;
+                     return true;
+                   },
+                   [&] {
+                     require(!weights.released() && !loaded,
+                             "the split's program was loaded before every image was written back");
+                     ++loads;
+                     if (failLoad)
+                       stopped = true;
+                     else
+                       loaded = true;
+                   }});
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &memory;
+  LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
+  engine::NativeRuntime &loop = fixture.loop;
+  fixture.executor.beginObserver = [&] {
+    require(!weights.released() && (loaded || stopped),
+            "the model began a request before the split's program was back");
+  };
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(backend, 40ULL << 30, 2ULL << 30,
+                          [] { return std::optional<uint64_t>{64ULL << 30}; }, 0);
+  MemoryControl control(governor, backend, loop);
+  const auto idlePass = [&] {
+    fixture.monotonic += idleRelease;
+    static_cast<void>(control.run(MemoryPressure::Normal));
+    return memory.released();
+  };
+  // Sends request `id`, which ends the idle, and ticks once per image, the
+  // request waiting: true while it still waits after the last image.
+  const auto imagesBack = [&](uint64_t id) {
+    require(loop.receive(protocol::peer::serialize(request(id))), "a request was refused");
+    for (uint32_t image = 0; image < Weights::kImages; ++image)
+      require(loop.tick() && loop.snapshot().completed == id - 1,
+              "a request ran before every image was written back");
+    return loop.weightsSnapshot().restores == id - 1;
+  };
+  loop.announceReady();
+
+  require(idlePass() && !loaded, "the idle release kept the split's program");
+  require(imagesBack(1) && !loaded && !memory.released(),
+          "the restore ended with the last image, before the split's program");
+  require(loop.tick() && loaded && loads == 1 && loop.weightsSnapshot().restores == 1,
+          "the tick after the last image did not load the split's program");
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 1, "the request did not run once the program was back");
+
+  failLoad = true;
+  require(idlePass() && !loaded, "the idle release kept the split's program");
+  require(imagesBack(2) && loop.tick() && stopped && loads == 2 &&
+              loop.weightsSnapshot().restores == 2 && loop.engineHealthy(),
+          "a program that did not load again failed the restore");
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 2, "the request did not run after the split stopped");
+
+  require(idlePass(), "the idle release kept the images once the split stopped");
+  require(!imagesBack(3) && loads == 2 && loop.weightsSnapshot().restores == 3,
+          "a stopped split's program was loaded again");
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 3 && loop.engineHealthy(),
+          "a request after the split stopped did not run");
 }
 
 // With --idle-release off the control pass never releases the weights,
@@ -1507,7 +1599,9 @@ int main() {
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
-    testIdleWeightsAreReleasedAndRestored();
+    testIdleWeightsAreReleasedAndRestored(false);
+    testIdleWeightsAreReleasedAndRestored(true);
+    testIdleReleaseRestoresTheSplitLast();
     testIdleReleaseOffKeepsTheWeights();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();

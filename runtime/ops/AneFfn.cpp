@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -54,6 +55,12 @@ constexpr auto kHandoffBound = std::chrono::seconds(2);
 // 0.8 (27 s on an M5 Max, about 30 s on an M6), so that a busy Mac still
 // finishes and only a service that stopped answering runs out of it.
 constexpr auto kProgramLimit = std::chrono::seconds(120);
+// How long the service may take to load the program again after the idle
+// release (restore()), while the request that ends the idle waits: the
+// service loads a program it has compiled in 50-150 ms on an M5 Max, so a
+// busy Mac still finishes, and one that stopped answering stops the split
+// instead of holding the request longer.
+constexpr auto kReloadLimit = std::chrono::seconds(10);
 
 uint32_t gpuChannels(uint32_t intermediate, double share) {
   if (!(share > 0.0 && share < 1.0)) throw std::invalid_argument("ANE FFN share must lie in (0, 1)");
@@ -686,6 +693,39 @@ bool AneFfn::completed() {
     usable = false;
   }
   return usable;
+}
+
+bool AneFfn::release() {
+  if (unfinished_ || !jobs_.empty())
+    throw std::logic_error("ANE FFN split released while a command it encoded is unfinished");
+  if (handoff_.retired()) return false;
+  try {
+    program_->unload();
+  } catch (const std::exception &error) {
+    handoff_.retire(std::string("its program did not unload: ") + error.what());
+    stopped();
+    return false;
+  }
+  released_ = true;
+  logLine("Neural Engine FFN program unloaded while idle");
+  return true;
+}
+
+void AneFfn::restore() noexcept {
+  if (!std::exchange(released_, false)) return;
+  const auto start = AwakeClock::now();
+  std::string failure = "an unknown exception";
+  try {
+    program_->load({kReloadLimit, {}});
+    logLine("Neural Engine FFN program reloaded in ", std::fixed, std::setprecision(2),
+            millisecondsSince(start) / 1000.0, " s");
+    return;
+  } catch (const std::exception &error) {
+    failure = error.what();
+  } catch (...) {
+  }
+  handoff_.retire("its program did not load again: " + failure);
+  stopped();
 }
 
 void AneFfn::stopped() {
