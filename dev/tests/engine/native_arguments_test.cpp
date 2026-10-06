@@ -144,7 +144,7 @@ void testServerCommandLines(const char *path) {
       {"image_patches_default",
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
-      {"no_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
   };
   // Every field but the model inspected from the directory.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {

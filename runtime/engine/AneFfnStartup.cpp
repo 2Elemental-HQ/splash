@@ -30,7 +30,7 @@ uint32_t contextOf(const EngineMemoryPlanResult &result) {
 }
 
 // Logs `outcome` of a start of `model` as `setting` allows: a model without
-// dense FFN layers and one --no-ane leaves alone without its layers said, and
+// dense FFN layers and one --disable-ane leaves alone without its layers said, and
 // a refusal of a context the GPU alone does not hold either, which fails the
 // start on its own, log nothing. An automatic context below the GPU alone's
 // is named beside it.
@@ -38,7 +38,7 @@ void logOutcome(const AneFfnOutcome &outcome, const AneFfnModel &model, const An
                 uint32_t requestedContextTokens) {
   const std::string context = !requestedContextTokens && outcome.context != outcome.contextWithout
                                   ? "; context " + grouped(outcome.context) + " tokens (" +
-                                        grouped(outcome.contextWithout) + " with --no-ane)"
+                                        grouped(outcome.contextWithout) + " with --disable-ane)"
                                   : "";
   switch (outcome.kind) {
   case Kind::Off:
@@ -56,13 +56,13 @@ void logOutcome(const AneFfnOutcome &outcome, const AneFfnModel &model, const An
       logWarning("Neural Engine FFN split off: ", outcome.reason, ", and ",
                  setting.given ? "the given share" : "any split", " leaves at most ", grouped(outcome.context),
                  " tokens; pass --max-context ", outcome.context,
-                 " or less to run it, or --no-ane, which also silences this line.");
+                 " or less to run it, or --disable-ane, which also silences this line.");
     else
-      logWarning("Neural Engine FFN split off: ", outcome.reason, "; --no-ane silences this line.");
+      logWarning("Neural Engine FFN split off: ", outcome.reason, "; --disable-ane silences this line.");
     return;
   case Kind::Unavailable:
     logWarning("Neural Engine FFN split unavailable (", outcome.reason, "); the GPU runs the prefill FFN alone",
-               context, ". --no-ane silences this line.");
+               context, ". --disable-ane silences this line.");
     return;
   case Kind::Split:
     logLine("Neural Engine FFN split ", outcome.reason, context, ".");
@@ -131,7 +131,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
     return gpuAlone(kind, std::move(reason), automaticWith(assumed));
   };
 
-  logLine("Setting up the Neural Engine FFN split (splash serve --no-ane keeps the FFN on the GPU).");
+  logLine("Setting up the Neural Engine FFN split (splash serve --disable-ane keeps the FFN on the GPU).");
   const auto started = AwakeClock::now();
   const auto seconds = [&] {
     std::ostringstream text;

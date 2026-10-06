@@ -14,7 +14,7 @@
 namespace splash::engine {
 
 // Whether the prefill FFN's Neural Engine split may run (splash serve
-// --no-ane turns it off), and the split a dev tool runs instead of
+// --disable-ane turns it off), and the split a dev tool runs instead of
 // calibrating one.
 struct AneFfnSetting final {
   // The ANE takes the whole channel units nearest `share` of them

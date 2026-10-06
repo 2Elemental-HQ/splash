@@ -529,7 +529,7 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
-        "--no-ane",
+        "--disable-ane",
         "requests",
         dict(
             action="store_true",

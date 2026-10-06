@@ -1594,7 +1594,7 @@ def _native_command(args):
         command.extend(
             ("--idle-release", serve_options.idle_release_text(args.idle_release))
         )
-    if args.no_ane:
+    if args.disable_ane:
         command.extend(("--ane", "off"))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))

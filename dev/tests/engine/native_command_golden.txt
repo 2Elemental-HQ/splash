@@ -19,4 +19,4 @@ image_patches | --max-image-pixels 1048576 | auto auto --max-image-patches 4096
 image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patches 3904
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
-no_ane | --no-ane | auto auto --ane off
+disable_ane | --disable-ane | auto auto --ane off

@@ -107,9 +107,9 @@ struct RuntimeResourcesConfig {
   // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       queryHostAvailableMemory;
-  // The prefill FFN's Neural Engine split (startAneFfn): off with --no-ane,
-  // and a benchmark round runs the split of the first so that rounds repeat
-  // one another.
+  // The prefill FFN's Neural Engine split (startAneFfn): off with
+  // --disable-ane, and a benchmark round runs the split of the first so that
+  // rounds repeat one another.
   AneFfnSetting aneFfn;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation

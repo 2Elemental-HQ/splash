@@ -32,7 +32,7 @@ using splash::test::rejects;
 using splash::test::require;
 
 constexpr std::string_view kSettingUp =
-    "Setting up the Neural Engine FFN split (splash serve --no-ane keeps the FFN on the GPU).";
+    "Setting up the Neural Engine FFN split (splash serve --disable-ane keeps the FFN on the GPU).";
 
 DeviceCapabilities device() {
   DeviceCapabilities result;
@@ -169,7 +169,7 @@ bool nothingStarted(const Fake &fake, const Started &started) {
          !has(started.log, kSettingUp);
 }
 
-// --no-ane leaves the GPU alone, at the context the plan holds without the split, without asking whether this Mac
+// --disable-ane leaves the GPU alone, at the context the plan holds without the split, without asking whether this Mac
 // could run it, and says so where the split could run.
 void testOff() {
   Fake fake;
@@ -178,11 +178,11 @@ void testOff() {
               started.start.outcome.context == contextWith(0) &&
               started.start.outcome.contextWithout == contextWith(0) &&
               line(started.log, "The GPU runs the prefill FFN alone, as given."),
-          "--no-ane was not taken as given");
+          "--disable-ane was not taken as given");
   fake.unsupported = "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
   started = start(fake, {.enabled = false});
   require(started.start.outcome.kind == Kind::Off && started.log.empty(),
-          "--no-ane was logged for a model the split does not take");
+          "--disable-ane was logged for a model the split does not take");
 }
 
 // A model of no dense FFN layers logs nothing; one whose layers the split does not take, or on a Mac without the
@@ -223,7 +223,7 @@ void testRefusedContext() {
   require(line(started.log, "Warning · Neural Engine FFN split off: --max-context " + std::to_string(most + 1) +
                                 " cannot be held with it, and any split leaves at most ") &&
               has(started.log, "; pass --max-context " + std::to_string(most) +
-                                   " or less to run it, or --no-ane, which also silences this line."),
+                                   " or less to run it, or --disable-ane, which also silences this line."),
           "the refusal did not warn with the way out: " + started.log);
   started = start(fake, {}, without + 1);
   require(started.start.outcome.kind == Kind::Refused && nothingStarted(fake, started) && started.log.empty(),
@@ -244,8 +244,8 @@ void testRefusedAutomatic() {
   const Started started = start(fake);
   require(started.start.outcome.kind == Kind::Refused && started.start.outcome.context == contextWith(0) &&
               nothingStarted(fake, started) &&
-              line(started.log, "Warning · Neural Engine FFN split off: it leaves no memory for context; --no-ane "
-                                "silences this line."),
+              line(started.log, "Warning · Neural Engine FFN split off: it leaves no memory for context; "
+                                "--disable-ane silences this line."),
           "a split that leaves no context was not refused: " + started.log);
 }
 
@@ -270,7 +270,7 @@ void testAutomaticContext() {
                                         "on the Neural Engine's part (calibrated in ");
   require(started.log.find(kSettingUp) < split && split != std::string::npos &&
               has(started.log, "; context " + grouped(contextWith(fake.bytes(8))) + " tokens (" +
-                                   grouped(contextWith(0)) + " with --no-ane)."),
+                                   grouped(contextWith(0)) + " with --disable-ane)."),
           "the split was not set up and logged with both contexts: " + started.log);
 }
 
@@ -324,7 +324,7 @@ void testDeterministicContext() {
     const Started started = start(test.fake, test.setting);
     const AneFfnOutcome &outcome = started.start.outcome;
     const bool named = has(started.log, "; context " + grouped(context) + " tokens (" + grouped(contextWith(0)) +
-                                            " with --no-ane)");
+                                            " with --disable-ane)");
     require(outcome.kind == kind && outcome.context == context && outcome.contextWithout == contextWith(0) &&
                 (!started.start.plan || started.start.plan->maximumContextTokens() >= context) &&
                 (kind == Kind::Split) == started.start.plan.has_value() && named == (context != contextWith(0)),
@@ -340,7 +340,7 @@ void testDeterministicContext() {
   fake = {};
   const Started started = start(fake, {}, 4096);
   require(started.start.outcome.kind == Kind::Split && started.start.plan->maximumContextTokens() >= 4096 &&
-              !has(started.log, "with --no-ane"),
+              !has(started.log, "with --disable-ane"),
           "a start given --max-context named the automatic context");
 }
 
@@ -352,7 +352,7 @@ void testExplicitContext() {
   require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(5u, true) &&
               fake.remembered && fake.remembered->aneUnits == 5 && fake.recalled == 5u && fake.rememberedMost == 5u &&
               started.start.plan &&
-              started.start.plan->maximumContextTokens() >= context && !has(started.log, "with --no-ane"),
+              started.start.plan->maximumContextTokens() >= context && !has(started.log, "with --disable-ane"),
           "the split took more units than the plan holds with the context asked for");
 }
 
@@ -367,7 +367,7 @@ void testFailures() {
           "a timing that failed did not leave the GPU alone");
   require(has(started.log, "Warning · Neural Engine FFN split unavailable (calibration timings are not usable); the "
                            "GPU runs the prefill FFN alone; context ") &&
-              has(started.log, " with --no-ane). --no-ane silences this line."),
+              has(started.log, " with --disable-ane). --disable-ane silences this line."),
           "a timing that failed did not warn: " + started.log);
   fake = {};
   fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
