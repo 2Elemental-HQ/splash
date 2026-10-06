@@ -138,12 +138,6 @@ uint64_t Handoff::next() {
   return state_->value;
 }
 
-uint64_t Handoff::met() {
-  std::lock_guard lock(state_->mutex);
-  state_->event.signal(++state_->value);
-  return state_->value;
-}
-
 void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
   uint64_t id = 0;
   {

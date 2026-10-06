@@ -1349,9 +1349,10 @@ int main(int argc, char **argv) {
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }
-    // The context the engine served and the one its memory plan holds
-    // without the Neural Engine split, and its elastic state/KV budget and
-    // the split's.
+    // The context the engine served, the automatic one whatever split the
+    // round ran (engine::AneFfnOutcome::context) unless --max-context gave
+    // it, and the one its memory plan holds without the Neural Engine split,
+    // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
               << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout

@@ -372,6 +372,15 @@ std::filesystem::path cacheDirectory() {
   return std::filesystem::path(path) / "splash-ane";
 }
 
+std::optional<std::string> unavailable() {
+  try {
+    static_cast<void>(api());
+  } catch (const std::exception &error) {
+    return error.what();
+  }
+  return std::nullopt;
+}
+
 uint32_t Surface::rowBytes(uint32_t width, Element element) noexcept {
   return (width * elementBytes(element) + 63) / 64 * 64;
 }
@@ -815,23 +824,32 @@ namespace {
 std::filesystem::path choiceFile(std::string_view key) { return cacheDirectory() / ("choice-" + hex(fnv1a(bytesOf(key)))); }
 } // namespace
 
-std::optional<uint32_t> recall(std::string_view key) noexcept {
+std::optional<std::string> recall(std::string_view key) noexcept {
   try {
     std::ifstream file(choiceFile(key));
-    uint32_t value = 0;
-    if (file >> value) return value;
+    std::string line;
+    if (std::getline(file, line)) return line;
   } catch (const std::exception &) {
     // Nothing remembered can be read.
   }
   return std::nullopt;
 }
 
-void remember(std::string_view key, uint32_t value) noexcept {
+void remember(std::string_view key, std::string_view line) noexcept {
   try {
     std::filesystem::create_directories(cacheDirectory());
-    writeWhole(choiceFile(key), bytesOf(std::to_string(value)));
+    writeWhole(choiceFile(key), bytesOf(line));
   } catch (const std::exception &) {
-    // The next start chooses afresh.
+    // The next start calibrates again.
+  }
+}
+
+void forget(std::string_view key) noexcept {
+  std::error_code error;
+  try {
+    std::filesystem::remove(choiceFile(key), error);
+  } catch (const std::exception &) {
+    // The next start takes what is remembered.
   }
 }
 

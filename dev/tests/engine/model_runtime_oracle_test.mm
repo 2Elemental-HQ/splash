@@ -1484,7 +1484,8 @@ int main(int argc, char **argv) {
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     // A dense target's prefill FFN splits with the Neural Engine as a start
-    // splits it (engine::startAneFfn), calibrated unless a share is given,
+    // splits it (engine::startAneFfn), unless a share is given calibrated by
+    // the build's first run and remembered for the runs after it,
     // within a plan that holds the oracle's pages. The split is allocated
     // beside the weights, outside the governor's admissions, and its own
     // category of the plan bounds it, as the memory audit requires. A split
@@ -1496,13 +1497,28 @@ int main(int argc, char **argv) {
       require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
       ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
     }
+    const engine::AneFfnModel aneFfnModel = engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
     engine::AneFfnStart aneFfnStart =
-        engine::startAneFfn(engine::aneFfnModel(backend, model, operators, format, {}), aneFfnSetting,
-                            pageCount * kv::kPageTokens, planMemory, {});
+        engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
     std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
               << aneFfnStart.outcome.reason << '\n';
     require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
             "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
+    // The automatic context is what the plan holds with the split the start
+    // runs, as this Mac's calibration of the model remembers it, and without
+    // the split otherwise.
+    const auto contextOf = [&](uint64_t aneFfnBytes) {
+      const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
+      return result.plan ? result.plan->maximumContextTokens() : 0u;
+    };
+    const uint32_t automaticContext =
+        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(static_cast<uint32_t>(
+                                std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
+                          : contextOf(0);
+    std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
+              << " no_ane_context=" << aneFfnStart.outcome.contextWithout << '\n';
+    require(aneFfnStart.outcome.context == automaticContext && aneFfnStart.outcome.contextWithout == contextOf(0),
+            "the automatic context is not the plan's with the split the start runs");
     std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
     EngineMemoryPlanResult planned = aneFfnStart.plan ? EngineMemoryPlanResult{std::move(aneFfnStart.plan), {}}
                                                       : planMemory(0);

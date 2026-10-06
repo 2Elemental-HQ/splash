@@ -263,24 +263,26 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   }
 
   RuntimeBootstrapReport base = reportForPlan(resources->memoryPlan());
-  const uint32_t automaticContext =
+  const uint32_t planContext =
       resources->memoryPlan().maximumContextTokens();
-  if (!automaticContext) {
+  if (!planContext) {
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "memory plan cannot hold one model token");
   }
   if (!config.nativeLoop.engine.maxContext) {
-    config.nativeLoop.engine.maxContext = automaticContext;
-  } else if (config.nativeLoop.engine.maxContext > automaticContext) {
+    // The automatic context, which the plan holds and every start of the
+    // model on this Mac serves alike (AneFfnOutcome::context).
+    config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
+  } else if (config.nativeLoop.engine.maxContext > planContext) {
     // --max-memory sets the budget only below this Mac's own.
     const auto &budget = resources->memoryPlan().breakdown();
     const bool memoryCapped = budget.configuredMemoryLimitBytes &&
                               budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
-             " exceeds the " + std::to_string(automaticContext) + " tokens the model and " +
+             " exceeds the " + std::to_string(planContext) + " tokens the model and " +
              (memoryCapped ? "--max-memory" : "this Mac's memory") +
-             " allow; omit it or pass at most " + std::to_string(automaticContext));
+             " allow; omit it or pass at most " + std::to_string(planContext));
   }
   // Without the disk tier a request that runs out of memory cannot publish
   // its progress checkpoints and replays its prompt.

@@ -48,9 +48,15 @@ inline constexpr uint64_t kConstantOffset = 64;
 [[nodiscard]] std::vector<uint8_t> constantBlob(std::span<const _Float16> values);
 
 // splash-ane in the per-user cache directory, where programs keep their
-// sources and recall() and remember() their values. Throws if macOS names no
+// sources and recall() keeps what remember() wrote. Throws if macOS names no
 // per-user cache directory.
 [[nodiscard]] std::filesystem::path cacheDirectory();
+
+// Why no Program can run in this process, as constructing one would throw
+// it: the private interface it uses does not load, or lacks or changed a
+// class or method; none when one can. Resolves the interface once, compiling
+// nothing.
+[[nodiscard]] std::optional<std::string> unavailable();
 
 // What a Program throws when its caller's Limits::interrupted() ended the
 // wait for the service: the caller stopped, the service did not fail.
@@ -145,11 +151,11 @@ private:
   Limits limits_;
 };
 
-// A small value kept beside the compiled programs under `key`, such as the
-// share a calibration on this Mac chose last, whose programs it compiled; none
-// until remembered, once macOS clears the cache directory, or when it cannot
-// be read.
-[[nodiscard]] std::optional<uint32_t> recall(std::string_view key) noexcept;
-void remember(std::string_view key, uint32_t value) noexcept;
+// A line kept beside the compiled programs under `key`, such as a model's
+// calibration on this Mac; none until remembered, once forgotten or macOS
+// clears the cache directory, or when it cannot be read.
+[[nodiscard]] std::optional<std::string> recall(std::string_view key) noexcept;
+void remember(std::string_view key, std::string_view line) noexcept;
+void forget(std::string_view key) noexcept;
 
 } // namespace splash::ane

@@ -49,6 +49,9 @@ struct AneFfnModel final {
   bool dense = false;
   // Why the split does not take them; empty when it does.
   std::string unsupported;
+  // Why this Mac cannot run the split (ane::unavailable), asked only of a
+  // split that may run; none when it can.
+  std::function<std::optional<std::string>()> unavailable;
   // The channel units of the split (ops::AneFfn::units).
   uint32_t units = 0;
   // The split's Metal memory with the ANE taking `aneUnits` of them.
@@ -59,24 +62,31 @@ struct AneFfnModel final {
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
-  // The units the last start chose, if it remembered them, and remembering
-  // this start's.
-  std::function<std::optional<uint32_t>()> recall;
-  std::function<void(uint32_t aneUnits)> remember;
+  // This Mac's calibration of the split within `maxAneUnits` units, if one
+  // is remembered; remembering one; and forgetting it.
+  std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
+  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
+  std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
 };
 
-// How a start's split came out: off as given, not taken by the model,
-// refused by the memory plan, gaining too little, failed, or running, and
-// why or how. Startup logs it (startAneFfn).
+// How a start's split came out: off as given, not taken by the model or this
+// Mac, refused by the memory plan, gaining too little, failed, or running,
+// and why or how. Startup logs it (startAneFfn).
 struct AneFfnOutcome final {
   enum class Kind : uint8_t { Off, Unsupported, Refused, NoGain, Unavailable, Split };
   Kind kind = Kind::Off;
   std::string reason;
-  // The context the memory plan holds with the split that runs, or for a
-  // refused one with the fewest units it could take, and without the split.
-  uint32_t contextWith = 0, contextWithout = 0;
+  // The context the engine serves without --max-context, and the one the
+  // memory plan holds without the split. While the split may run, the first
+  // is what the plan holds with the split this Mac's calibration of the model
+  // takes, none if it found no gain, whatever the start makes of it, so that
+  // every start of the model on this Mac serves the same; with no calibration
+  // made, with the largest split the model could take. Otherwise both are the
+  // same. For a split refused a --max-context, the first is the most context
+  // a split leaves instead.
+  uint32_t context = 0, contextWithout = 0;
 };
 // The kind's name in lowercase, as "no_gain".
 [[nodiscard]] std::string_view aneFfnOutcomeName(AneFfnOutcome::Kind kind) noexcept;
@@ -91,18 +101,21 @@ struct AneFfnStart final {
 
 // The prefill FFN's Neural Engine split of `model` as `setting` allows,
 // within the memory plan `planMemory` makes with the split's bytes set aside:
-// one whose plan still holds `requestedContextTokens`, or with zero any
-// context, which becomes the context the plan holds with it. Every step is
-// arithmetic until the plan holds a split; then it logs that it sets the
-// split up, times it, chooses its share (ops::ane_ffn::choose), prepares the
-// split that serves, sets the least chunk it takes
-// (ops::ane_ffn::minimumRows) and, from the timings, what stops it once it
-// loses to the GPU alone (ops::ane_ffn::Breaker), and remembers the share; a
-// given split takes the given least chunk and no breaker. Logs the outcome. A
-// failure leaves the GPU alone, unless `cancelled` returns true, the wait for
-// the ANE was interrupted or the backend no longer serves, which the
-// failure's exception reports. Throws std::invalid_argument for a given split
-// of no units or of least rows no function holds.
+// one whose plan still holds `requestedContextTokens`, or with zero the
+// automatic context (AneFfnOutcome::context). Every step is arithmetic until
+// the plan holds a split; then it logs that it sets the split up. The split
+// takes this Mac's calibration of the model within the units the plan holds,
+// once remembered; else it is calibrated: timed, its share chosen
+// (ops::ane_ffn::choose), the split that serves prepared, its chunks timed
+// and the least it takes found (ops::ane_ffn::minimumRows), and the outcome
+// remembered, a split or none. The split then judges itself against the GPU
+// alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
+// when it trips, so that the next start calibrates again; a given split
+// takes the given least chunk, no breaker, and nothing remembered. Logs the
+// outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
+// the wait for the ANE was interrupted or the backend no longer serves, which
+// the failure's exception reports. Throws std::invalid_argument for a given
+// split of no units or of least rows no function holds.
 [[nodiscard]] AneFfnStart
 startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t requestedContextTokens,
             const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,

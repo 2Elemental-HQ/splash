@@ -14,7 +14,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace splash::ops {
@@ -72,8 +71,12 @@ public:
   [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
   void setMinimumRows(uint32_t rows);
   // Stops the split once it loses to the GPU alone: `breaker` judges each
-  // command finish() finds split. Until this is called, none does.
-  void setBreaker(ane_ffn::Breaker breaker) noexcept { breaker_ = std::move(breaker); }
+  // command finish() finds split, and `lost` runs once when it trips. Until
+  // this is called, none does.
+  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost) noexcept {
+    breaker_ = std::move(breaker);
+    lost_ = std::move(lost);
+  }
 
   // The commands finish() found split since the split was built, their
   // evaluations, and the Neural Engine's milliseconds over them
@@ -90,8 +93,10 @@ public:
   // rows over the first two layers, which stage the ANE's weights through
   // both sets, with the ANE's output filled with NaN before so that rows it
   // leaves unwritten show; each through begin(), the layers encoded as add()
-  // encodes them, commit() and its completion check. Returns the largest
-  // error of what the ANE adds to the GPU's part (AneFfn.cpp). Throws if an
+  // encodes them, commit() and its completion check; each against the
+  // leading rows of a full chunk on the GPU, which computes every row alike
+  // whatever the chunk's rows. Returns the largest error of what the ANE
+  // adds to the GPU's part (AneFfn.cpp). Throws if an
   // output is not finite, that error exceeds its bound or the ANE's work
   // fails, which stops the split.
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
@@ -137,7 +142,7 @@ public:
   void restore() noexcept;
 
 private:
-  // Times the split's parts apart and its layers against the GPU's alone.
+  // Times the split's layers and their GPU part against the GPU's alone.
   friend class ane_ffn::Measurement;
 
   // The split's channels: hidden and intermediate, the layers', the GPU's and
@@ -237,10 +242,6 @@ private:
   [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
   // Starts `job` on the ANE through the handoff.
   void queue(const Job &job);
-  // Starts evaluations outside a Metal command, back to back from now: each
-  // of `evaluations`, an evaluation and a weight set, once the one before it
-  // is done.
-  void queueNow(std::span<const std::pair<uint32_t, uint32_t>> evaluations);
   // finish() but for its log line and judgment: if every evaluation of the
   // command committed last succeeded and its joins read finite values, the
   // Neural Engine's time over them (ane::Handoff::finish); none otherwise,
@@ -265,6 +266,7 @@ private:
   // The evaluations of the command committed last, and its function's rows.
   uint32_t committedEvaluations_ = 0, committedRows_ = 0;
   ane_ffn::Breaker breaker_;
+  std::function<void()> lost_;
   Served served_;
   // Whether a command committed jobs that finish() has not yet judged.
   bool unfinished_ = false;

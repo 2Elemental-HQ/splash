@@ -175,9 +175,9 @@ private:
 class RuntimeResources final {
 public:
   // `requestedContextTokens` is the context the engine is asked to hold
-  // (--max-context), zero for all the memory plan holds, which the Neural
-  // Engine split must leave. A persistent tier takes back what the last
-  // process left before create() returns.
+  // (--max-context), zero for the automatic context (AneFfnOutcome::context),
+  // which the Neural Engine split must leave. A persistent tier takes back
+  // what the last process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
   create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);
 
@@ -217,7 +217,7 @@ public:
   // rows of a chunk it takes; 0 for none.
   [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
   [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
-  // How the start's split came out.
+  // How the start's split came out, and the automatic context.
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
@@ -276,12 +276,13 @@ private:
 // The model's side of the split of `loaded`'s target on `backend`, valid
 // while `backend`, `loaded` and `operators` are: its timing and prepared split
 // run on a prefill arena of their own, its programs wait for the ANE's
-// service until `cancelled` returns true, and the units it chose last are
+// service until `cancelled` returns true, and its calibrations are
 // remembered beside the programs (ane::recall) under its layers' shapes and
-// formats.
+// formats, the device, the macOS version, the engine's `buildId` and the
+// most units the plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::function<bool()> cancelled);
+                                      std::string_view buildId, std::function<bool()> cancelled);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

@@ -564,6 +564,23 @@ class BackendRegressionTests(unittest.TestCase):
                 args, "candidate", {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 512}
             )
 
+    def test_a_first_round_without_the_split_pins_no_share(self):
+        # A candidate whose first round ran no split runs every later round
+        # as it is, not as --ane-ffn-share 0, which would serve another
+        # context.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64, True)
+            self.fake_checkout(root, "candidate", "a" * 64, True, 0.0, minimum_rows=0)
+            self.assertEqual(self.run_main(root), 0)
+            shares = [
+                json.loads(line)
+                for line in (root / "shares.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                shares, [["candidate", None, None], ["candidate", None, None]]
+            )
+
     def test_a_round_that_runs_another_ane_ffn_share_fails(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()

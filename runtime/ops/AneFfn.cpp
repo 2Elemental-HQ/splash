@@ -604,6 +604,7 @@ bool AneFfn::finish() {
   if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
     handoff_.retire(std::move(losing));
     stopped();
+    if (lost_) std::exchange(lost_, {})();
   }
   return true;
 }
@@ -665,15 +666,6 @@ void AneFfn::queue(const Job &job) {
                  });
 }
 
-void AneFfn::queueNow(std::span<const std::pair<uint32_t, uint32_t>> evaluations) {
-  uint64_t ready = handoff_.met();
-  for (const auto &[evaluation, set] : evaluations) {
-    const uint64_t done = handoff_.next();
-    queue({evaluation, set, ready, done});
-    ready = done;
-  }
-}
-
 void AneFfn::fillNormalized(const metal::MetalBuffer &normalized) {
   auto *bits = static_cast<uint16_t *>(normalized.contents());
   if (!bits) throw std::invalid_argument("ANE FFN check writes rows the CPU cannot");
@@ -721,17 +713,21 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     return bf16Values(hidden[count & 1], uint64_t{rows} * shape_.hidden);
   };
   // What the ANE adds over the GPU's part, the GPU alone's output less the
-  // GPU part's, against the split's difference from the GPU alone.
+  // GPU part's, against the split's difference from the GPU alone, over the
+  // split's rows.
+  const uint32_t count = std::min<uint32_t>(2, shape_.layers);
+  const std::vector<float> gpu = forward(Way::Gpu, count, kMaximumRows),
+                           part = forward(Way::GpuPart, count, kMaximumRows);
   double worst = 0.0;
-  const auto check = [&](uint32_t count, uint32_t rows) {
-    const std::vector<float> gpu = forward(Way::Gpu, count, rows), part = forward(Way::GpuPart, count, rows),
-                             split = forward(Way::Split, count, rows);
+  for (const Evaluation &evaluation : evaluations_) {
+    const uint32_t rows = evaluation.rows;
+    const std::vector<float> split = forward(Way::Split, count, rows);
     const auto fail = [&](const std::string &why) {
       handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
       throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
     };
     double difference = 0.0, contribution = 0.0;
-    for (size_t i = 0; i < gpu.size(); ++i) {
+    for (size_t i = 0; i < split.size(); ++i) {
       if (!std::isfinite(split[i])) fail("is not finite");
       difference += (double(split[i]) - gpu[i]) * (double(split[i]) - gpu[i]);
       contribution += (double(gpu[i]) - part[i]) * (double(gpu[i]) - part[i]);
@@ -740,8 +736,7 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     if (!(error <= kMaximumAneError))
       fail("differs from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
     worst = std::max(worst, error);
-  };
-  for (const Evaluation &evaluation : evaluations_) check(std::min<uint32_t>(2, shape_.layers), evaluation.rows);
+  }
   return worst;
 }
 

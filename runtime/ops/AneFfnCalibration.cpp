@@ -7,53 +7,41 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace splash::ops::ane_ffn {
 namespace {
 
-// The model. Timing each part alone at two shares gives G and A, and both
-// together at those shares gives uG and uA where the bandwidth binds there. The
-// split runs where G meets A, near the fastest share of a prefill of seconds
-// measured on Qwen3.8-27B's FFN: the M5 Max's 0.24, the M5 Pro's 0.41 and the
-// M6's 0.76. A is timed over evaluations back to back, without the mixer's
-// time between them in a prefill. Short of it the ANE waits on
-// the GPU, whose part the third term slows where the two share bandwidth, as on
-// the M6; past it the GPU waits on the ANE, which T takes to run as fast as
-// alone. It does not: on the M6 the two slow each other's memory accesses
-// beyond the GPU's L2 (an ANE evaluation takes a third longer beside a GPU
-// kernel that streams memory), and a minute of prefill warms the ANE a tenth
-// slower. There these timings put the fastest share at 0.85-0.88, which a
-// 14K-token prompt runs 7% slower than 0.76. The split takes the least share
-// within kTolerance of it, for the ANE's memory and error, if T predicts a gain
-// of kMinimumGain there on the GPU alone, timed as well.
+// The model, from the split's layers as they run between stand-ins for the
+// mixer (Measurement). The GPU's part alone gives G at both shares. At the
+// high share, near 0.8, the ANE's part takes the longer on every Mac the
+// split was measured on, whose fastest full chunks of Qwen3.8-27B's split
+// layers take 9 of its 34 units on an M5 Max, 15 on an M5 Pro and 26-28 on an
+// M6: the split layer there is A, which scales with the ANE's channels. Where
+// the GPU's part takes the longer at the low share, the split layer there
+// exceeds it by the bandwidth the ANE's part takes beside it, which gives u:
+// on an M6 the GPU's part runs a tenth to a third longer beside the ANE's, on
+// an M5 Pro 3-7% near its fastest share. Where the ANE's part takes the
+// longer there, as on an M5 Max, the split layer's excess over A is the
+// ANE's own. Where the ANE's part does not take the longer at the high share,
+// A comes out longer than it is, and the choice smaller.
 //
-// The excess of both parts together over the longer alone that shows the
-// bandwidth binding; the most of the bandwidth either part is solved to
-// take, a little above all of it for the timings' noise; and the least
-// determinant of the two shares' timings, relative to its terms, that
-// solves for uG and uA.
-constexpr double kBindingMargin = 0.03, kMaximumUtilization = 1.05, kSingular = 1e-6;
-// The split's predicted gain below which the GPU runs the FFN alone, and the
-// slack of the fastest share.
-constexpr double kMinimumGain = 0.05, kTolerance = 0.01;
-// How much slower than the best a share's max(G, A) may be and the share
-// stay the choice of the last start: keeping a share a few percent slower
-// than the best costs that much of the prefill FFN; changing it costs a
-// compile, 29 s on an M6. Five back-to-back calibrations of Qwen3.8-27B on an
-// M5 Max put the best max(G, A) within 1.1% (MLX) and 1.7% (GGUF) of one
-// another; this is about twice that noise.
-constexpr double kHysteresis = 0.03;
+// The split's predicted gain below which the GPU runs the FFN alone.
+constexpr double kMinimumGain = 0.05;
 // How much longer than the GPU's alone a chunk's split layer may take and
 // the chunk still split: six timings of each function's split layer of
 // Qwen3.8-27B on an M5 Max spread over ±3%, and the FFN takes about half of
 // a prefill, so a chunk that splits within this prefills at most about 1%
 // slower.
 constexpr double kChunkNoise = 0.02;
+// The first word of a Calibration's text, which a change to its fields
+// renumbers.
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
-Line gpuAlone(const ChunkTimings &timings) {
-  const auto &[low, high] = timings.gpu;
+Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+  const auto &[low, high] = gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   return {low.milliseconds - slope * low.rows, slope};
 }
@@ -72,59 +60,46 @@ uint32_t nearestUnits(double share, uint32_t units) {
   return static_cast<uint32_t>(std::clamp<long>(std::lround(share * units), 1, units - 1));
 }
 
+// Not a number where either part is not.
 double Model::operator()(double share) const noexcept {
-  const double g = gpu(share), a = ane(share);
-  return std::max({g, a, uG * g + uA * a});
+  const double a = ane(share), g = gpu(share) + u * a;
+  return a > g ? a : g;
 }
 
-Model fit(const Timing &p, const Timing &q) {
-  if (!(p.share != q.share)) throw std::invalid_argument("ANE FFN calibration needs two shares");
-  const auto line = [&](double Timing::*part) {
-    const double slope = (q.*part - p.*part) / (q.share - p.share);
-    return Line{p.*part - slope * p.share, slope};
-  };
-  Model model{line(&Timing::gpu), line(&Timing::ane)};
-  const auto excess = [](const Timing &x) { return x.both / std::max(x.gpu, x.ane) - 1.0; };
-  bool solved = false;
-  if (excess(p) > kBindingMargin && excess(q) > kBindingMargin) {
-    const double det = p.gpu * q.ane - p.ane * q.gpu;
-    if (std::abs(det) > kSingular * (std::abs(p.gpu * q.ane) + std::abs(p.ane * q.gpu))) {
-      model.uG = (p.both * q.ane - p.ane * q.both) / det;
-      model.uA = (p.gpu * q.both - p.both * q.gpu) / det;
-      solved = model.uG >= 0.0 && model.uG <= kMaximumUtilization && model.uA >= 0.0 &&
-               model.uA <= kMaximumUtilization;
-    }
-  }
-  if (!solved) {
-    // Binding at one share: the GPU's part alone nearly saturates memory, so
-    // that share's excess over it is the ANE's fraction.
-    const Timing &x = excess(p) >= excess(q) ? p : q;
-    model.uG = excess(x) > kBindingMargin ? 1.0 : 0.0;
-    model.uA = model.uG > 0.0 ? (x.both - x.gpu) / x.ane : 0.0;
-  }
-  model.uG = std::clamp(model.uG, 0.0, 1.0);
-  model.uA = std::clamp(model.uA, 0.0, 1.0);
+Model fit(const Timing &low, const Timing &high) {
+  if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
+  const double slope = (high.gpu - low.gpu) / (high.share - low.share);
+  Model model{{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}};
+  const double gpu = model.gpu(low.share), ane = model.ane(low.share);
+  if (gpu > ane) model.u = std::clamp((low.split - gpu) / ane, 0.0, 1.0);
   return model;
 }
 
-// The ANE units where the GPU's part and the ANE's alone take most nearly as
-// long: `previous` while it is within kHysteresis of the least max(G, A) and
-// gains, else the least within kTolerance of it, if that gains.
-std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units, uint32_t maxAneUnits,
-                               std::optional<uint32_t> previous) {
+// The units whose T, or T a unit either way, is least at its longest: the
+// timings can put T's least a unit off, and a unit past where the ANE's part
+// takes the longer costs the ANE's time per unit, a unit short of it the
+// GPU's. On an M5 Max and an M5 Pro the ANE's is the longer, 1.7 ms a unit of
+// Qwen3.8-27B's full-chunk layer against the GPU's 0.6 and 1.1 ms, and the
+// choice keeps below T's least; on an M6 the GPU's is, 1.9 ms against 1.2,
+// and it need not. Chunks of fewer rows, which the ANE pads up to its
+// functions' rows, move T's least lower still; minimumRows keeps the split
+// from the chunks it loses. The choice runs only if T there gains
+// kMinimumGain on the GPU alone.
+std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units, uint32_t maxAneUnits) {
   if (!maxAneUnits || maxAneUnits >= units) throw std::invalid_argument("ANE FFN choice of no feasible units");
-  const auto share = [&](uint32_t aneUnits) { return static_cast<double>(aneUnits) / units; };
-  const auto longer = [&](uint32_t aneUnits) { return std::max(model.gpu(share(aneUnits)), model.ane(share(aneUnits))); };
-  const auto gains = [&](uint32_t aneUnits) { return model(share(aneUnits)) <= (1.0 - kMinimumGain) * gpuAlone; };
-  double best = std::numeric_limits<double>::infinity();
-  for (uint32_t aneUnits = 1; aneUnits <= maxAneUnits; ++aneUnits) best = std::min(best, longer(aneUnits));
-  if (!(best > 0.0 && std::isfinite(best))) return std::nullopt;
-  if (previous && *previous >= 1 && *previous <= maxAneUnits && longer(*previous) <= (1.0 + kHysteresis) * best &&
-      gains(*previous))
-    return previous;
-  for (uint32_t aneUnits = 1; aneUnits <= maxAneUnits; ++aneUnits)
-    if (longer(aneUnits) <= (1.0 + kTolerance) * best) return gains(aneUnits) ? std::optional(aneUnits) : std::nullopt;
-  return std::nullopt;
+  std::vector<double> at(units);
+  for (uint32_t aneUnits = 1; aneUnits < units; ++aneUnits) {
+    at[aneUnits] = model(static_cast<double>(aneUnits) / units);
+    if (!(at[aneUnits] > 0.0 && std::isfinite(at[aneUnits]))) return std::nullopt;
+  }
+  const auto longest = [&](uint32_t aneUnits) {
+    return std::max({at[aneUnits], at[std::max(aneUnits - 1, 1u)], at[std::min(aneUnits + 1, units - 1)]});
+  };
+  uint32_t chosen = 1;
+  for (uint32_t aneUnits = 2; aneUnits <= maxAneUnits; ++aneUnits)
+    if (longest(aneUnits) < longest(chosen)) chosen = aneUnits;
+  if (!(at[chosen] <= (1.0 - kMinimumGain) * gpuAlone)) return std::nullopt;
+  return chosen;
 }
 
 // A chunk splits while its function's split layer takes at most kChunkNoise
@@ -142,7 +117,7 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
     ordered = functions[index].least && functions[index].least <= functions[index].rows &&
               (!index || functions[index].rows + 1 == functions[index - 1].least);
   if (!ordered) throw std::invalid_argument("ANE FFN chunks are not those of its functions");
-  const Line gpu = gpuAlone(timings);
+  const Line gpu = gpuAlone(timings.gpu);
   std::optional<uint32_t> minimum;
   for (const ChunkTimings::Function &function : functions)
     for (uint32_t rows = function.rows; rows >= function.least; --rows) {
@@ -152,6 +127,32 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
   return minimum;
 }
 
+std::string Calibration::text() const {
+  std::ostringstream text;
+  text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
+  for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
+  return text.str();
+}
+
+// A record of units holds least rows and the GPU alone at ascending rows of
+// usable milliseconds; one of none holds neither.
+std::optional<Calibration> Calibration::parse(std::string_view text) {
+  std::istringstream in{std::string(text)};
+  std::string tag;
+  Calibration calibration;
+  in >> tag >> calibration.aneUnits >> calibration.minimumRows;
+  for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
+  std::string rest;
+  if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
+  const auto &[low, high] = calibration.gpu;
+  const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
+  if (!calibration.aneUnits) return calibration.minimumRows ? std::nullopt : std::optional(Calibration{});
+  if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
+      !usableMilliseconds(high.milliseconds))
+    return std::nullopt;
+  return calibration;
+}
+
 // Each layer the GPU waits for the Neural Engine's evaluation before it joins
 // the ANE's part to its own, so evaluations that take as long as the GPU's
 // whole layers alone make the split slower than the GPU alone, whatever the
@@ -159,21 +160,22 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
 // evaluation counts against the GPU alone's layer of its function's rows,
 // which the chunk pads up to, so the GPU alone would take no longer over the
 // chunk; the reason scales the window's ratio to a layer of the most rows.
-// At the share calibration chooses, an evaluation takes about as long as the
-// GPU's part (choose), about 1 - share of the GPU alone: on an M5 Max,
-// calibration's timings of Qwen3.8-27B put it at 14.0 ms against 19.0 at 9
-// of 34 units, and the M5 Pro's 0.41 and the M6's 0.76 leave more room.
+// At the units calibration chooses, at or just below where the parts meet
+// (choose), an evaluation takes at most about as long as the GPU's part: on
+// an M5 Max, calibration's fit of Qwen3.8-27B puts it at 13.2 ms against the
+// GPU alone's 19.0 at 8 of 34 units, and the M5 Pro's 0.41 and the M6's 0.74
+// leave more room.
 // Measured, another process keeping the ANE busy beside the split costs it
 // 2-8% on an M5 Max, an M5 Pro and an M6, and a minute of prefill slows the
 // M6's ANE by a third: far short of the trip point. Judging kWindow commands
 // at once, it weighs one slow evaluation, as a function's first after its
 // program loads again, among all of theirs.
-Breaker::Breaker(const ChunkTimings &timings) {
-  const auto &[low, high] = timings.gpu;
+Breaker::Breaker(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+  const auto &[low, high] = gpu;
   if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
   static_cast<void>(usable(low.milliseconds));
   static_cast<void>(usable(high.milliseconds));
-  gpu_ = gpuAlone(timings);
+  gpu_ = gpuAlone(gpu);
   mostRows_ = high.rows;
 }
 

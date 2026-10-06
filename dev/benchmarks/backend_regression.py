@@ -22,9 +22,11 @@ baseline) on this machine, which must be otherwise idle:
   partial hit (partial_4k_hit) and the GPU time of each short cold prefill
   (short_<rows>_rows_prefill_gpu_ms, by the rows of its first chunk).
 - memory plan: the candidate's plan holds no less context without the Neural
-  Engine split than the baseline serves, whose memory the split may take from
-  the KV cache; the context each serves and the change of the plan's elastic
-  state/KV budget are reported.
+  Engine split than the baseline serves, whose memory the split takes from
+  the KV cache; the context each serves, the candidate's with the split what
+  its plan holds with the largest split the model could take whichever split
+  a round runs, and the change of the plan's elastic state/KV budget are
+  reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
   (weights.compare_builds). A baseline of an earlier release prepares into a
@@ -162,7 +164,11 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             "--progress",
             str(stem.with_suffix(".progress.jsonl")),
         ]
-        if args.ane_ffn_share is not None and args.takes_ane_ffn_share[version]:
+        # A first round that ran no split pins none: later rounds take the
+        # outcome the build remembered, and the check holds them to it.
+        if (
+            args.ane_ffn_share_given or args.ane_ffn_share
+        ) and args.takes_ane_ffn_share[version]:
             command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
             if args.ane_ffn_minimum_rows and args.takes_ane_ffn_minimum_rows[version]:
                 command += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]

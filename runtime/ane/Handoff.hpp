@@ -56,8 +56,6 @@ public:
   // A value of the event no step has taken, for a step of the command being
   // encoded; once retired, one the event has reached.
   [[nodiscard]] uint64_t next();
-  // A value the event has reached: a job that waits for it starts at once.
-  [[nodiscard]] uint64_t met();
 
   // Starts a job of the command being encoded, before the command is
   // committed, through `start`, which this call does not keep. A job that
