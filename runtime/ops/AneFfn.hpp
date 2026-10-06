@@ -117,9 +117,11 @@ private:
   // Everything the split allocates (allocate() in AneFfn.cpp). The chunk's
   // rotated input rows in int8 segments, their per-token scales and the ANE's
   // partial down projection, which every function reads or writes, hold
-  // kMaximumRows rows, whose row stride each function declares.
+  // kMaximumRows rows, whose row stride each function declares. A join that
+  // reads a partial value or token scale that is not finite sets the status
+  // word (ane_ffn_join).
   struct Memory final {
-    metal::MetalBuffer signs, rowScales, rotated;
+    metal::MetalBuffer signs, rowScales, rotated, status;
     std::vector<ane::Surface> inputs;
     ane::Surface tokenScale, partial;
     std::array<Weights, 2> sets;
@@ -201,7 +203,8 @@ private:
   // is done.
   void queueNow(std::span<const std::pair<uint32_t, uint32_t>> evaluations);
   // finish() but for its log line: whether every evaluation of the command
-  // committed last succeeded; the split stops otherwise.
+  // committed last succeeded and its joins read finite values; stops the
+  // split otherwise.
   [[nodiscard]] bool completed();
   // Logs, once, that the split stopped.
   void stopped();

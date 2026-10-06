@@ -33,6 +33,10 @@
 // carries back.
 #define ANE_FFN_INT8_PEAK 127.0f
 #define ANE_FFN_INT8_UNIT 128.0f
+// The least peak a token's or a weight row's int8 scale is taken over:
+// fp16's least normal value, so that every scale is a normal half, its
+// inverse finite, and an all-zero row takes codes of 0.
+#define ANE_FFN_PEAK_FLOOR 0x1p-14f
 
 struct AneFfnRotateParams {
   uint32_t hidden;
@@ -60,7 +64,9 @@ struct AneFfnWeightParams {
   uint32_t format;
 };
 
-// output[t][c] += partial[c][t] for rows t < rows; stride halves per channel.
+// output[t][c] += partial[c][t] * partial[hidden][t] * token_scale[t], in
+// fp32, for rows t < rows, setting a status word if one of those values is
+// not finite; stride halves per channel of the partial.
 struct AneFfnJoinParams {
   uint32_t hidden;
   uint32_t stride;

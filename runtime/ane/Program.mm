@@ -336,11 +336,15 @@ std::vector<Signature> changed(std::string_view method) {
 
 // Runs `evaluate`, the sequence-th evaluation, or the fault `faults` puts in
 // its place: a failure reported from another thread without running, neither
-// a run nor a report, or the run faults.delay later, reporting its failure.
+// a run nor a report, the run faults.delay later, reporting its failure, or
+// `poison`.
 void evaluateWithFaults(const ProgramInstrumentation::Faults &faults, uint64_t sequence,
-                        void (^report)(BOOL, NSError *), const std::function<void()> &evaluate) {
+                        void (^report)(BOOL, NSError *), const std::function<void()> &evaluate,
+                        const std::function<void()> &poison) {
   dispatch_queue_t elsewhere = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
-  if (sequence == faults.failingEvaluation) {
+  if (sequence == faults.poisonedEvaluation) {
+    poison();
+  } else if (sequence == faults.failingEvaluation) {
     dispatch_async(elsewhere, ^{
       report(NO, nil);
     });
@@ -737,7 +741,14 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
     try {
       impl_->guarded("completion handler", [&] { [request setCompletionHandler:report]; });
 #ifdef SPLASH_ANE_INSTRUMENTATION
-      evaluateWithFaults(impl_->faults, sequence, report, evaluate);
+      const auto poison = [event, wait, signal, output = bound.surfaces.back(), report] {
+        event.notify(wait, [event, signal, output, report] {
+          *static_cast<uint16_t *>(IOSurfaceGetBaseAddress(static_cast<IOSurfaceRef>(output.get()))) = 0x7c00;
+          event.signal(signal);
+          report(YES, nil);
+        });
+      };
+      evaluateWithFaults(impl_->faults, sequence, report, evaluate, poison);
 #else
       evaluate();
 #endif

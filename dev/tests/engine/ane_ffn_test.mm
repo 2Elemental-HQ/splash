@@ -3,12 +3,14 @@
 //   and the rows' scales, as a CPU rotation of the rows does;
 // - weights: ane_ffn_row_scale and ane_ffn_weights turn the rows of affine Q4 and of every GGUF format into int8 rows
 //   at their stride and their scales at theirs, rotated in either block, as a CPU rotation of their dequantized values
-//   does;
-// - join: ane_ffn_join adds the ANE's channel-major partial rows to the chunk's output rows and to no others;
+//   does; rows of zeros take a normal scale and codes of 0;
+// - join: ane_ffn_join adds the ANE's channel-major partial rows, scaled in fp32, to the chunk's output rows and to no
+//   others, and flags a value of the chunk's rows that is not finite;
 // - the split: which layers, shares and chunks it takes; for three layers of affine Q4 and of mixed GGUF formats,
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two programs and of the
-//   most rows compute what the GPU computes alone within int8's error; layers it is given out of order are refused,
-//   and it keeps what it needs of the layers it was built from;
+//   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
+//   fp16 barely holds, and rows of a hidden channel of about 1e5; layers it is given out of order are refused, and it
+//   keeps what it needs of the layers it was built from; an infinity in the ANE's output stops it;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
 //   sizes stops the split without failing the Metal command, and the GPU alone then computes what it computes on its
 //   own; an evaluation that signals the shared event below its value leaves the value as it is;
@@ -20,7 +22,8 @@
 // differ by one and a scale by its last bit. The split runs on the Neural Engine, which every Apple Silicon Mac has.
 // Metal's validation layer wraps the shared event that orders the split's GPU and ANE work in one the ANE cannot
 // share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split`, `faults` and
-// `program` the others. The binary links the instrumented Program, whose faults only `faults` arms.
+// `program` the others. The binary links the instrumented Program, whose faults only `faults` and one check of
+// `split` arm.
 #include "AffineQ4Fixture.hpp"
 #include "AneProgramFixture.hpp"
 #include "AwakeClock.hpp"
@@ -154,13 +157,14 @@ float peak(std::span<const float> values) {
 }
 
 // ---------------------------------------------------------------- inputs
-// Rows of normal values, one in 997 forty times larger, as the ANE's two int8 input segments, each channel's rows at
-// a stride past them.
+// Rows of normal values, one in 997 forty times larger, and a row of zeros, which takes the least scale and codes of
+// 0, as the ANE's two int8 input segments, each channel's rows at a stride past them.
 void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<float> &sign) {
-  constexpr uint32_t kRows = 64, kStride = 96;
+  constexpr uint32_t kRows = 64, kStride = 96, kZeroRow = 7;
   std::normal_distribution<float> normal;
   std::vector<uint16_t> x(uint64_t{kRows} * kHidden);
-  for (uint64_t i = 0; i < x.size(); ++i) x[i] = floatToBf16(normal(rng) * (i % 997 ? 1.0f : 40.0f));
+  for (uint64_t i = 0; i < x.size(); ++i)
+    x[i] = i / kHidden == kZeroRow ? 0 : floatToBf16(normal(rng) * (i % 997 ? 1.0f : 40.0f));
   const MetalBuffer rotated = test::sharedBuffer(backend, x.size() * sizeof(uint16_t));
   const MetalBuffer scales = filled(backend, kRows * sizeof(uint16_t), kUntouched);
   CommandGraph graph;
@@ -178,7 +182,7 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
     std::vector<float> v(kHidden);
     for (uint32_t channel = 0; channel < kHidden; ++channel) v[channel] = bf16ToFloat(x[uint64_t{row} * kHidden + channel]);
     rotate(v, ANE_FFN_INPUT_BLOCK, sign);
-    const float scale = std::max(peak(v) / ANE_FFN_INT8_PEAK, 1e-8f), inverse = 1.0f / scale;
+    const float scale = std::max(peak(v), ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
     if (!near(fromHalf(contents<uint16_t>(scales)[row]), toHalf(scale * ANE_FFN_INT8_UNIT)))
       fail("row " + std::to_string(row) + ": scale " + std::to_string(fromHalf(contents<uint16_t>(scales)[row])) +
            ", not " + std::to_string(toHalf(scale * ANE_FFN_INT8_UNIT)));
@@ -195,7 +199,9 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
       for (uint32_t byte = kRows; byte < kStride; ++byte)
         if (contents<uint8_t>(segment)[uint64_t{channel} * kStride + byte] != kUntouched)
           fail("channel " + std::to_string(channel) + ": packed past the rows");
-  section("inputs: 64 rows of 5120 bf16 values as two int8 segments and the rows' scales");
+  if (!(fromHalf(contents<uint16_t>(scales)[kZeroRow]) >= 0x1p-14f))
+    fail("a row of zeros took a scale that is not a normal half");
+  section("inputs: 64 rows of 5120 bf16 values, one of zeros, as two int8 segments and the rows' scales");
 }
 
 // ---------------------------------------------------------------- weights
@@ -210,12 +216,20 @@ struct Source {
   std::vector<float> values;
 };
 
+// A row of zero weights, which takes the least scale and codes of 0.
+constexpr uint32_t kZeroWeightRow = 300;
+
 Source affineSource(MetalBackend &backend) {
   const Projection projection = test::deterministicQ4Projection(backend, {kWeightRows, kWeightInputs}, 11);
   const AffineWeights &weights = projection.affine();
   Source source{"affine Q4", {weights.weights, weights.scales, weights.biases}, kWeightInputs / 64, 0, "", {}};
   const auto *nibbles = contents<uint8_t>(weights.weights);
-  const auto *scales = contents<uint16_t>(weights.scales), *biases = contents<uint16_t>(weights.biases);
+  auto *scales = static_cast<uint16_t *>(weights.scales.contents());
+  auto *biases = static_cast<uint16_t *>(weights.biases.contents());
+  for (uint32_t group = 0; group < kWeightInputs / 64; ++group) {
+    const uint64_t unit = quant_tile_index(kZeroWeightRow, group, kWeightInputs / 64);
+    scales[unit] = biases[unit] = 0;
+  }
   source.values.resize(uint64_t{kWeightRows} * kWeightInputs);
   for (uint32_t row = 0; row < kWeightRows; ++row)
     for (uint32_t input = 0; input < kWeightInputs; ++input) {
@@ -274,7 +288,12 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
     rotate(v, block, sign);
     const uint16_t bits = contents<uint16_t>(rowScales)[r];
     const float rowScale = fromHalf(bits);
-    const float expected = toHalf(std::max(peak(v), 1e-8f) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
+    const float expected = toHalf(std::max(peak(v), ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
+    if (peak(v) == 0.0f && (!(rowScale >= 0x1p-14f) ||
+                            std::ranges::any_of(std::span(contents<int8_t>(output) + uint64_t{r} * stride, width),
+                                                [](int8_t value) { return value != 0; })))
+      fail(label + " row " + std::to_string(r) + ": a row of zeros took a scale that is not a normal half or codes "
+                   "other than 0");
     if (!near(rowScale, expected))
       fail(label + " row " + std::to_string(r) + ": scale " + std::to_string(rowScale) + ", not " +
            std::to_string(expected));
@@ -303,32 +322,74 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
     weights(backend, signs, sign, source, ANE_FFN_INTERMEDIATE_BLOCK, 0, 512, 1024);
   }
   section("weights: affine Q4 and " + std::to_string(gguf_reference::FMT_COUNT) +
-          " GGUF formats as int8 rows and scales, rotated in blocks of 128 and 512");
+          " GGUF formats as int8 rows and scales, rotated in blocks of 128 and 512; a row of zeros as codes of 0");
 }
 
 // ---------------------------------------------------------------- join
+constexpr uint16_t kHalfInfinity = 0x7c00, kHalfNaN = 0x7e00;
+
+// ane_ffn_join of `partial` ([kHidden + 1][stride] fp16, its last row the tokens' intermediate scales) and the
+// tokens' input scales into `output`, over a chunk of `rows` rows: the status word it leaves.
+uint32_t joined(MetalBackend &backend, const MetalBuffer &output, const std::vector<uint16_t> &partial,
+                const std::vector<uint16_t> &tokenScale, uint32_t stride, uint32_t rows) {
+  const MetalBuffer status = filled(backend, sizeof(uint32_t), 0);
+  CommandGraph graph;
+  graph.add("ane_ffn_join", {output, upload(backend, partial), upload(backend, tokenScale), status},
+            AneFfnJoinParams{kHidden, stride, rows},
+            {(rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, kHidden / ANE_FFN_TILE, 1},
+            {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  run(backend, graph);
+  return *contents<uint32_t>(status);
+}
+
+// The partial rows of a chunk, times each token's intermediate and input scales in fp32, added to its output rows and
+// to no others; a value of the chunk's rows that is not finite sets the status word, and one past them does not.
 void join(MetalBackend &backend) {
   constexpr uint32_t kRows = 70, kTiles = (kRows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, kStride = 128;
   std::normal_distribution<float> normal;
-  std::vector<uint16_t> output(uint64_t{kTiles} * ANE_FFN_TILE * kHidden), partial(uint64_t{kHidden} * kStride);
+  std::uniform_real_distribution<float> scale(0.5f, 2.0f);
+  std::vector<uint16_t> output(uint64_t{kTiles} * ANE_FFN_TILE * kHidden), partial(uint64_t{kHidden + 1} * kStride);
+  std::vector<uint16_t> tokenScale(kStride);
   for (uint16_t &value : output) value = floatToBf16(normal(rng) * 64.0f);
   for (uint16_t &value : partial) value = std::bit_cast<uint16_t>(_Float16(normal(rng)));
-  const MetalBuffer joined = upload(backend, output);
-  CommandGraph graph;
-  graph.add("ane_ffn_join", {joined, upload(backend, partial)}, AneFfnJoinParams{kHidden, kStride, kRows},
-            {kTiles, kHidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
-  run(backend, graph);
+  for (uint32_t row = 0; row < kStride; ++row) {
+    partial[uint64_t{kHidden} * kStride + row] = std::bit_cast<uint16_t>(_Float16(scale(rng) * 1024.0f));
+    tokenScale[row] = std::bit_cast<uint16_t>(_Float16(scale(rng) * 64.0f));
+  }
+  const MetalBuffer result = upload(backend, output);
+  if (joined(backend, result, partial, tokenScale, kStride, kRows)) fail("finite values set the status word");
   for (uint32_t row = 0; row < kTiles * ANE_FFN_TILE; ++row)
     for (uint32_t channel = 0; channel < kHidden; ++channel) {
       const uint64_t index = uint64_t{row} * kHidden + channel;
-      const uint16_t expected =
-          row < kRows ? floatToBf16(bf16ToFloat(output[index]) + fromHalf(partial[uint64_t{channel} * kStride + row]))
-                      : output[index];
-      if (contents<uint16_t>(joined)[index] != expected)
+      const float before = bf16ToFloat(output[index]), value = fromHalf(partial[uint64_t{channel} * kStride + row]),
+                  scaled = fromHalf(partial[uint64_t{kHidden} * kStride + row]) * fromHalf(tokenScale[row]);
+      // The kernel may fuse the multiply and the add.
+      const uint16_t got = contents<uint16_t>(result)[index];
+      const bool sum =
+          got == floatToBf16(before + value * scaled) || got == floatToBf16(std::fma(value, scaled, before));
+      if (row >= kRows ? got != output[index] : !sum)
         fail("row " + std::to_string(row) + " channel " + std::to_string(channel) +
-             (row < kRows ? ": not the sum" : ": past the chunk, changed"));
+             (row < kRows ? ": not the scaled sum" : ": past the chunk, changed"));
     }
-  section("join: the partial rows of a 70-row chunk added to its output rows and to no others");
+
+  // A value that is not finite: of the chunk's rows, a partial value, an intermediate scale and an input scale each
+  // set the status word; past them, none does.
+  const auto poisoned = [&](uint64_t index, uint16_t bits, bool token) {
+    std::vector<uint16_t> values = token ? tokenScale : partial;
+    values[index] = bits;
+    return joined(backend, upload(backend, output), token ? partial : values, token ? values : tokenScale, kStride,
+                  kRows);
+  };
+  if (poisoned(uint64_t{100} * kStride + kRows - 1, kHalfInfinity, false) != 1)
+    fail("an infinite partial value did not set the status word");
+  if (poisoned(uint64_t{kHidden} * kStride + 3, kHalfNaN, false) != 1)
+    fail("a NaN intermediate scale did not set the status word");
+  if (poisoned(5, kHalfInfinity | 0x8000, true) != 1) fail("an infinite input scale did not set the status word");
+  if (poisoned(uint64_t{100} * kStride + kRows, kHalfInfinity, false) ||
+      poisoned(uint64_t{kHidden} * kStride + kRows, kHalfNaN, false) || poisoned(kRows, kHalfInfinity, true))
+    fail("a value past the chunk's rows set the status word");
+  section("join: the scaled partial rows of a 70-row chunk added to its output rows and to no others; a value that "
+          "is not finite sets the status word");
 }
 
 // ---------------------------------------------------------------- the split
@@ -499,9 +560,9 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
   if (split->splits(AneFfn::kMinimumRows - 1) || !split->splits(AneFfn::kMinimumRows) ||
       !split->splits(AneFfn::kMaximumRows) || split->splits(AneFfn::kMaximumRows + 1))
     fail(model.name + ": the split takes other chunks than those of 512 to 2048 rows");
-  // The plan takes whole pages of each of its three buffers, of which Metal may report less.
+  // The plan takes whole pages of each of its four buffers, of which Metal may report less.
   const uint64_t planned = AneFfn::plannedBytes(model.layers, kShare), allocated = split->allocatedBytes();
-  if (allocated > planned || planned - allocated >= 3 * kHostPageBytes)
+  if (allocated > planned || planned - allocated >= 4 * kHostPageBytes)
     fail(model.name + ": allocated " + std::to_string(allocated) + " bytes, planned " + std::to_string(planned));
   fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   // The most rows first: later commands run on what earlier ones left in the split's surfaces.
@@ -547,6 +608,108 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   section("refusals: layers out of order and buffers short of the chunk's rows");
 }
 
+// Rows whose FFN intermediate peaks at about 2^-12 of their input's peak, and louder ones: rows of normal values
+// scaled by 2^-j, j = row % 16. The ANE quantizes the intermediate rows against their peak or a floor
+// (kIntermediateFloor in AneFfn.cpp) whose inverse fp16 holds. Every output is finite; the rows of each scale whose
+// intermediate peaks at kQuietRatio of their input's or more are within the bound, which small gate pre-activations
+// broke while the ANE took sigmoid's value (6.5% at 2^-2.6). Quieter rows' intermediate values approach fp16's least
+// normal value, below which the ANE's share of them fades (to 70% of their output from the GPU alone at 2^-11), so
+// their difference from the GPU alone is bounded against their input, as the residual stream they join holds it:
+// within kQuietError.
+constexpr double kQuietRatio = 0x1p-5, kQuietError = 0x1p-8;
+void quietRows(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kScales = 16;
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model);
+  fillRows(chunk, kRows, [](uint64_t row) { return std::ldexp(1.0f, -int(row % kScales)); });
+  const Forward expected = forward(backend, linear, model, nullptr, chunk, kRows);
+  // The last layer's intermediate rows, which the GPU alone leaves.
+  const auto *intermediate = contents<uint16_t>(chunk.ffn.intermediate);
+  const auto *normalized = contents<uint16_t>(chunk.ffn.normalized);
+  std::array<std::vector<double>, kScales> ratios;
+  for (uint32_t row = 0; row < kRows; ++row) {
+    float h = 0.0f, x = 0.0f;
+    for (uint32_t c = 0; c < kIntermediate; ++c)
+      h = std::max(h, std::fabs(bf16ToFloat(intermediate[uint64_t{row} * kIntermediate + c])));
+    for (uint32_t c = 0; c < kHidden; ++c)
+      x = std::max(x, std::fabs(bf16ToFloat(normalized[uint64_t{row} * kHidden + c])));
+    ratios[row % kScales].push_back(h / x);
+  }
+  const Forward got = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!got.usable) fail("quiet rows: unusable: " + split->reason());
+  bool reached = false;
+  for (uint32_t scale = 0; scale < kScales; ++scale) {
+    std::ranges::nth_element(ratios[scale], ratios[scale].begin() + ratios[scale].size() / 2);
+    const double ratio = ratios[scale][ratios[scale].size() / 2];
+    const auto rows = [&](uint64_t row, uint64_t) { return row % kScales == scale; };
+    const auto [error, finite] = difference(expected, got, rows);
+    // The difference against the rows' inputs, which the residual stream they join holds at their scale.
+    double difference = 0.0, input = 0.0;
+    for (uint64_t i = 0; i < got.bits.size(); ++i) {
+      if (!rows(i / kHidden, 0)) continue;
+      difference += (double(got[i]) - expected[i]) * (double(got[i]) - expected[i]);
+      input += double(bf16ToFloat(normalized[i])) * bf16ToFloat(normalized[i]);
+    }
+    const double inputError = std::sqrt(difference / input);
+    reached |= ratio >= 0x1p-13 && ratio <= 0x1p-11;
+    std::cout << "  rows scaled by 2^-" << scale << ", intermediate peak 2^" << std::log2(ratio)
+              << " of the input's: " << 100.0 * error << "% RMS from the GPU alone, 2^" << std::log2(inputError)
+              << " of the input's RMS\n";
+    if (!finite) fail("quiet rows: the split's output of rows scaled by 2^-" + std::to_string(scale) + " not finite");
+    if (ratio >= kQuietRatio ? !(error <= kMaximumError) : !(inputError <= kQuietError))
+      fail("quiet rows scaled by 2^-" + std::to_string(scale) + ": " + std::to_string(100.0 * error) +
+           "% RMS from the GPU alone");
+  }
+  if (!reached) fail("quiet rows: no scale's intermediate peaks within 2^-13 to 2^-11 of its input's");
+  section("quiet rows: all finite; intermediate rows down to 2^-5 of their input's peak within the bound, quieter "
+          "ones within 2^-8 of their input");
+}
+
+// A hidden channel of about 1e5 on every row, from four of the ANE's intermediate channels of the last layer whose up
+// rows are 1000 times larger, and the group of down's row of that channel over them larger to match: the ANE leaves
+// its tokens' scales to the join's fp32, where its fp16 output at full scale overflowed.
+void massiveChannel(MetalBackend &backend, const Linear &linear, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kChannel = 1234, kFirst = 4096, kCount = 4;
+  static_assert(kFirst >= kIntermediate / 2 && kFirst % 64 + kCount <= 64,
+                "the channels are the ANE's at share 0.5 and lie in one group of down's inputs");
+  const Model model = affineModel(backend);
+  // Scales the bf16 scales and biases of `row`'s groups [first, last) of `projection` by `factor`.
+  const auto scale = [](const Projection &projection, uint32_t row, uint32_t first, uint32_t last, float factor) {
+    auto *scales = static_cast<uint16_t *>(projection.affine().scales.contents());
+    auto *biases = static_cast<uint16_t *>(projection.affine().biases.contents());
+    for (uint32_t group = first; group < last; ++group) {
+      const uint64_t unit = quant_tile_index(row, group, projection.inputSize / 64);
+      scales[unit] = floatToBf16(bf16ToFloat(scales[unit]) * factor);
+      biases[unit] = floatToBf16(bf16ToFloat(biases[unit]) * factor);
+    }
+  };
+  const Projection &up = *model.layers.back().up, &down = *model.layers.back().down;
+  for (uint32_t channel = kFirst; channel < kFirst + kCount; ++channel) scale(up, channel, 0, kHidden / 64, 1000.0f);
+  fillRows(chunk, kRows, [](uint64_t) { return 1.0f; });
+  const auto peak = [&](const Forward &forward) {
+    float result = 0.0f;
+    for (uint32_t row = 0; row < kRows; ++row)
+      result = std::max(result, std::fabs(forward[uint64_t{row} * kHidden + kChannel]));
+    return result;
+  };
+  // Twice, as the rest of the channel's sum takes a little of it.
+  for (int pass = 0; pass < 2; ++pass)
+    scale(down, kChannel, kFirst / 64, kFirst / 64 + 1,
+          1e5f / peak(forward(backend, linear, model, nullptr, chunk, kRows)));
+  const Forward expected = forward(backend, linear, model, nullptr, chunk, kRows);
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model);
+  const Forward got = forward(backend, linear, model, split.get(), chunk, kRows);
+  const auto [error, finite] = difference(expected, got);
+  const auto [channelError, channelFinite] =
+      difference(expected, got, [](uint64_t, uint64_t channel) { return channel == kChannel; });
+  std::cout << "  a channel of " << peak(expected) << " at most: " << 100.0 * channelError << "% RMS from the GPU "
+            << "alone, " << 100.0 * error << "% over every channel\n";
+  if (!(peak(expected) >= 5e4f && peak(expected) <= 2e5f)) fail("massive channel: the channel does not reach 1e5");
+  if (!got.usable || !finite || !channelFinite || !(error <= kMaximumError) || !(channelError <= kMaximumError))
+    fail("massive channel: " + std::to_string(100.0 * channelError) + "% RMS from the GPU alone" +
+         (got.usable ? "" : ", unusable: " + split->reason()));
+  section("massive channel: a hidden channel of about 1e5 from the ANE's channels finite and within the bound");
+}
+
 // The number of evaluations a split queues as it is built: one of each of its functions.
 constexpr uint64_t kBuildEvaluations = (AneFfn::kMaximumRows - AneFfn::kMinimumRows) / AneFfn::kProgramStep + 1;
 
@@ -572,7 +735,8 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
-// The split of the affine Q4 and the GGUF model over normalized rows of normal values.
+// The split of the affine Q4 and the GGUF model over normalized rows of normal values, and the numerics of rows the
+// ANE's fp16 barely holds.
 void split(MetalBackend &backend) {
   const Linear linear(backend.capabilities());
   const Model affine = affineModel(backend), gguf = ggufModel(backend);
@@ -581,6 +745,12 @@ void split(MetalBackend &backend) {
   split(backend, linear, affine, rows);
   split(backend, linear, gguf, rows);
   refusals(backend, affine, rows);
+  quietRows(backend, linear, affine, rows);
+  massiveChannel(backend, linear, rows);
+  fillRows(rows, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  stops(backend, linear, affine, rows, {.poisonedEvaluation = kBuildEvaluations + 2}, "an infinity in layer 1's output",
+        AneFfn::kMaximumRows, "not finite");
+  section("stops: an infinity in the ANE's output stops the split");
 }
 
 // ---------------------------------------------------------------- faults
@@ -604,6 +774,7 @@ void faults(MetalBackend &backend) {
       {"a late evaluation",
        [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(3000)}; },
        "did not complete"},
+      {"an infinite output", [](uint64_t at) { return Faults{.poisonedEvaluation = at}; }, "not finite"},
   };
   for (const Fault &kind : kinds) {
     for (uint32_t layer = 0; layer < kLayers; ++layer)

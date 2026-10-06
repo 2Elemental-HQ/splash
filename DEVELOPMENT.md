@@ -1568,14 +1568,16 @@ on one queue (`runtime/ane/Program.mm`), so work queued behind a service that
 stopped answering runs out of its time too. Each share compiles a
 program of its own, and the M6's ANE service keeps few, so a start keeps the
 share the last one chose (`choice-*` in that directory) while it stays within
-1% of the best. The ANE computes in fp16, whose range (±65504) bounds the FFN values a
-split layer can produce. While serving, any failure of the ANE's work stops
-the split for the life of the process (`runtime/ane/Handoff.mm`): an
-evaluation that fails, cannot start or has not completed 2 s after the GPU
-raised its event (Metal fails a command buffer whose wait stays unmet for
-5 s). The CPU then raises the event to the GPU's last wait, the chunk runs
-again on the GPU alone, which computes what it would have, as does every
-chunk after it, and the engine logs `Warning · Neural Engine FFN split
+1% of the best. The ANE computes in fp16, whose range (±65504) bounds a split
+layer's gate pre-activations and its intermediate values over each token's
+input peak; it leaves its output's token scales to the GPU's join, in fp32.
+While serving, any failure of the ANE's work stops the split for the life of
+the process (`runtime/ane/Handoff.mm`): an evaluation that fails, cannot
+start or has not completed 2 s after the GPU raised its event (Metal fails a
+command buffer whose wait stays unmet for 5 s), or a value the join reads that
+is not finite. The CPU then raises the event to the GPU's last wait, the
+chunk runs again on the GPU alone, which computes what it would have, as does
+every chunk after it, and the engine logs `Warning · Neural Engine FFN split
 stopped (...)`. The split's logits differ from the GPU's alone (KL
 about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share.

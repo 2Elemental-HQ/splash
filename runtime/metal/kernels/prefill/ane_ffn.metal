@@ -87,7 +87,7 @@ kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
   threadgroup_barrier(mem_flags::mem_threadgroup);
   peak = 0.0f;
   for (uint group = 0; group < simd_groups; ++group) peak = max(peak, peaks[group]);
-  const float scale = max(peak / ANE_FFN_INT8_PEAK, 1e-8f), inverse = 1.0f / scale;
+  const float scale = max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
   for (uint block = 0; block < blocks; ++block) {
     const uint origin = row * params.hidden + (simd_group * blocks + block) * ANE_FFN_INPUT_BLOCK + lane * 4;
     for (uint e = 0; e < 4; ++e) rotated[origin + e] = half(value[block][0][e] * inverse);
@@ -207,7 +207,7 @@ inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c
       for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[k][e]));
   }
   peak = simd_max(peak);
-  if (lane == 0) row_scale[row] = half(max(peak, 1e-8f) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
+  if (lane == 0) row_scale[row] = half(max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
 }
 
 template <uint K>
@@ -267,21 +267,45 @@ template [[host_name("ane_ffn_row_scale_gguf_inputs")]] kernel AneFfnRowScaleKer
 template [[host_name("ane_ffn_row_scale_gguf_intermediate")]] kernel AneFfnRowScaleKernel
     ane_ffn_row_scale_gguf<kIntermediateUnits>;
 
+// Whether `value` is an infinity or a NaN, by its exponent bits: fast math
+// may fold isfinite() to true.
+inline bool ane_ffn_not_finite(half value) { return (as_type<ushort>(value) & 0x7c00) == 0x7c00; }
+
 // ANE_FFN_TILE x ANE_FFN_TILE tiles of rows x channels, ANE_FFN_TILE x
-// ANE_FFN_TILE_ROWS threads.
+// ANE_FFN_TILE_ROWS threads. Each row's partial values take their token's
+// intermediate scale (row `hidden` of the partial) and input scale in fp32. A
+// partial value or token scale of a row of the chunk that is not finite sets
+// `status`, which the host reads once the command completes. Each output
+// rounds to bf16 once more than on the GPU alone, after the GPU part's
+// residual epilogue: half a bf16 unit, which the split accepts rather than
+// fusing the join into that epilogue.
 kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
                          device const half *partial [[buffer(1)]],
-                         constant AneFfnJoinParams &params [[buffer(2)]],
+                         device const half *token_scale [[buffer(2)]],
+                         device atomic_uint *status [[buffer(3)]],
+                         constant AneFfnJoinParams &params [[buffer(4)]],
                          uint2 tile [[threadgroup_position_in_grid]],
                          uint2 position [[thread_position_in_threadgroup]]) {
   threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
-  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
-  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
-    staged[j][position.x] = float(partial[(channel + j) * params.stride + row + position.x]);
+  threadgroup float scale[ANE_FFN_TILE];
+  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE, token = row + position.x;
+  const bool chunk = token < params.rows;
+  bool finite = true;
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
+    const half value = partial[(channel + j) * params.stride + token];
+    finite &= !(chunk && ane_ffn_not_finite(value));
+    staged[j][position.x] = float(value);
+  }
+  if (position.y == 0) {
+    const half intermediate = partial[params.hidden * params.stride + token], input = token_scale[token];
+    finite &= !(chunk && (ane_ffn_not_finite(intermediate) || ane_ffn_not_finite(input)));
+    scale[position.x] = float(intermediate) * float(input);
+  }
+  if (!finite) atomic_store_explicit(status, 1u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
     if (row + j >= params.rows) continue;
     const uint index = (row + j) * params.hidden + channel + position.x;
-    output[index] = bfloat(float(output[index]) + staged[position.x][j]);
+    output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
   }
 }

@@ -145,12 +145,19 @@ std::string dimensions(uint64_t rows, uint64_t width) {
 std::string tensor(const char *type, uint64_t rows, uint64_t width) {
   return std::string("tensor<") + type + ", " + dimensions(rows, width) + ">";
 }
-// An fp16 constant, exactly.
+// An fp16 constant of `value`, written exactly: MIL rounds it to the nearest
+// fp16.
 std::string fp16(double value) {
   char text[32];
   std::snprintf(text, sizeof text, "fp16(%a)", value);
   return text;
 }
+// The least peak the ANE quantizes a token's rotated intermediate row
+// against: a quieter row takes coarser codes, each within this over 254 of
+// the token's input scale.
+constexpr double kIntermediateFloor = 0x1p-9;
+static_assert(ANE_FFN_INT8_PEAK / kIntermediateFloor <= 65504.0,
+              "the floor's inverse fits fp16, which 127 / 2^-12 overflows");
 
 // Calibration. At share s, a layer of a full chunk takes
 //   T(s) = max(G(s), A(s), uG G(s) + uA A(s)):
@@ -313,9 +320,10 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
   memory.rowScales = buffer(uint64_t{shape.layers} * (2 * shape.ane + shape.hidden) * sizeof(_Float16),
                             "ane ffn row scales");
   memory.rotated = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "ane ffn rotated input");
+  memory.status = buffer(sizeof(uint32_t), "ane ffn status");
   for (uint32_t k = 0; k < inputSegments; ++k) memory.inputs.push_back(surface(kSegment, kMaximumRows, Element::Int8));
   memory.tokenScale = surface(1, kMaximumRows, Element::Float16);
-  memory.partial = surface(shape.hidden, kMaximumRows, Element::Float16);
+  memory.partial = surface(shape.hidden + 1, kMaximumRows, Element::Float16);
   for (Weights &set : memory.sets) {
     for (uint32_t k = 0; k < inputSegments; ++k) {
       set.gate.push_back(surface(shape.ane, kSegment, Element::Int8));
@@ -372,8 +380,11 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
 // The ANE's share of the FFN over `rows` rows. Every int8 value is
 // dequantized by 1 / ANE_FFN_INT8_UNIT against fp16 overflow, which the
 // scales carry back. The intermediate rows are rotated and quantized per
-// token here. The function reads and writes the leading `rows` of each row of
-// the chunk's surfaces.
+// token here. The output holds down's rows before their tokens' scales, and
+// in a last row each token's intermediate scale, which the join multiplies
+// with the input's in fp32 (ane_ffn_join): the output at full scale could
+// overflow fp16. The function reads and writes the leading `rows` of each row
+// of the chunk's surfaces.
 std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, const ane::Surface &output,
                              uint32_t rows) {
   const uint32_t inputSegments = shape.hidden / kSegment, channels = shape.ane;
@@ -418,9 +429,15 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   }
   const std::string c = std::to_string(channels), r = std::to_string(rows),
                     block = std::to_string(ANE_FFN_INTERMEDIATE_BLOCK);
+  // silu(g) = g/2 (1 + tanh(g/2)): through the ANE's sigmoid, the split of
+  // layers whose gate pre-activations are about 0.1 differed from the GPU
+  // alone by 6.5% RMS, against 1.6% at about 1 (ane-ffn split's affine Q4
+  // layers); through its tanh both differ by 1.6%.
   f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
-  f16("sig", channels, rows, "sigmoid(x = gt)");
-  f16("silu", channels, rows, "mul(x = gt, y = sig)");
+  f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
+  f16("th", channels, rows, "tanh(x = gh)");
+  f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
+  f16("silu", channels, rows, "mul(x = gh, y = tp)");
   f16("h", channels, rows, "mul(x = silu, y = us)");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
        r + "]))");
@@ -434,7 +451,7 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   f16("hr", channels, rows, "reshape(x = hr4, shape = tensor<int32, [4]>(" + dimensions(channels, rows) + "))");
   f16("habs", channels, rows, "abs(x = hr)");
   f16("peak", 1, rows, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))");
-  f16("floor", 1, rows, "maximum(x = peak, y = " + fp16(0x1p-12) + ")");
+  f16("floor", 1, rows, "maximum(x = peak, y = " + fp16(kIntermediateFloor) + ")");
   f16("inverse", 1, rows, "real_div(x = " + fp16(ANE_FFN_INT8_PEAK) + ", y = floor)");
   f16("hs", channels, rows, "mul(x = hr, y = inverse)");
   line(tensor("int8", channels, rows) + " hq = quantize(input = hs, scale = fp16(1), output_dtype = string(\"int8\"))");
@@ -451,11 +468,10 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
     begin += width;
   }
   f16("ds", shape.hidden, rows, "mul(x = " + sum("dm", shape.downSegments.size(), shape.hidden) + ", y = sd_t)");
-  f16("ys", 1, rows, "mul(x = hscale, y = tx_t)");
-  f16("yt", shape.hidden, rows, "mul(x = ds, y = ys)");
-  line(output.bufferType(shape.hidden, rows) +
+  f16("yt", shape.hidden + 1, rows, "concat(axis = int32(2), interleave = bool(false), values = (ds, hscale))");
+  line(output.bufferType(shape.hidden + 1, rows) +
        " y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), "
-       "strides = tensor<int64, [4]>(" + output.strides(shape.hidden) + "))");
+       "strides = tensor<int64, [4]>(" + output.strides(shape.hidden + 1) + "))");
   return "    func " + functionName(rows) + "<ios18>(" + parameters + ") {\n" + body + "    } -> (y);\n";
 }
 
@@ -488,6 +504,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
       });
   const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> signs = rotationSigns();
   std::memcpy(memory_.signs.contents(), signs.data(), sizeof signs);
+  *static_cast<uint32_t *>(memory_.status.contents()) = 0;
 
   for (const SwiGluProjections &source : layers)
     layers_.push_back({{Planes(*source.gate), Planes(*source.up), Planes(*source.down)},
@@ -628,7 +645,7 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
-  graph.add("ane_ffn_join", {output, memory_.partial.buffer},
+  graph.add("ane_ffn_join", {output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
             AneFfnJoinParams{shape_.hidden, memory_.partial.strideBytes / uint32_t{sizeof(_Float16)}, rows},
             {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   if (ane) jobs_.push_back({index, set, ready, done});
@@ -663,7 +680,12 @@ bool AneFfn::finish() {
 
 bool AneFfn::completed() {
   unfinished_ = false;
-  return handoff_.finish();
+  bool usable = handoff_.finish();
+  if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && usable) {
+    handoff_.retire("the Neural Engine's output or its scales were not finite");
+    usable = false;
+  }
+  return usable;
 }
 
 void AneFfn::stopped() {
