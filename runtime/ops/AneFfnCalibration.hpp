@@ -3,12 +3,13 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 // How the prefill FFN's Neural Engine split (ops/AneFfn.hpp) runs on this
 // device, from what ane_ffn::Measurement times: the ANE's share of a full
-// chunk's FFN, and the least chunk the split takes. Nothing here touches
-// Metal or the ANE.
+// chunk's FFN, the least chunk the split takes, and when a split that serves
+// stops for losing to the GPU alone. Nothing here touches Metal or the ANE.
 namespace splash::ops::ane_ffn {
 
 // The split's per-layer milliseconds of a full chunk with the ANE taking
@@ -81,5 +82,35 @@ struct ChunkTimings final {
 // chunk of the functions timed splits (AneFfnCalibration.cpp); none when not
 // even a chunk of the most rows does.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
+
+// When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
+// over each kWindow commands it finishes, the Neural Engine's milliseconds
+// against the GPU alone's of as many layers.
+class Breaker final {
+public:
+  static constexpr uint32_t kWindow = 8;
+
+  // One that never trips, for a split whose GPU alone was not timed.
+  Breaker() = default;
+  // One against the GPU alone's layer as `timings` timed it, at the least and
+  // the most rows of the split's functions. Throws unless those are
+  // ascending rows of usable milliseconds.
+  explicit Breaker(const ChunkTimings &timings);
+
+  // A command the split finished: `evaluations` of its function of `rows`
+  // rows, from the least to the most rows timed, took the Neural Engine
+  // `milliseconds` in all. Why the split loses to the GPU alone, once a
+  // window of commands shows it; empty otherwise.
+  [[nodiscard]] std::string add(uint32_t rows, uint32_t evaluations, double milliseconds);
+
+private:
+  // The GPU alone's milliseconds of a layer by its rows, and the most rows.
+  std::optional<Line> gpu_;
+  uint32_t mostRows_ = 0;
+  // The window's commands, the Neural Engine's milliseconds over them and the
+  // GPU alone's of their layers.
+  uint32_t commands_ = 0;
+  double ane_ = 0.0, alone_ = 0.0;
+};
 
 } // namespace splash::ops::ane_ffn

@@ -2,12 +2,12 @@
 
 #include <dispatch/dispatch.h>
 
-#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,6 +19,14 @@ namespace {
 // Where a job of the current command stands: queued until the event reaches
 // its `ready`, started from then until it reports, then succeeded or failed.
 enum class Phase : uint8_t { Queued, Started, Succeeded, Failed };
+// A job of the current command: its phase, when the handoff learned that the
+// event reached its `ready`, and once it succeeded, how long after that it
+// reported.
+struct Job final {
+  Phase phase = Phase::Queued;
+  AwakeClock::time_point started{};
+  AwakeClock::duration ran{};
+};
 
 std::string seconds(AwakeClock::duration duration) {
   char text[32];
@@ -52,8 +60,9 @@ struct Handoff::State final {
     {
       std::lock_guard lock(state->mutex);
       const auto job = state->jobs.find(id);
-      if (job == state->jobs.end() || job->second != Phase::Queued) return;
-      job->second = Phase::Started;
+      if (job == state->jobs.end() || job->second.phase != Phase::Queued) return;
+      job->second.phase = Phase::Started;
+      job->second.started = AwakeClock::now();
     }
     // dispatch_time(DISPATCH_TIME_NOW, ...) counts mach absolute time, which
     // stops while the Mac sleeps, as AwakeClock's CLOCK_UPTIME_RAW does.
@@ -68,8 +77,8 @@ struct Handoff::State final {
     try {
       std::lock_guard lock(state->mutex);
       const auto job = state->jobs.find(id);
-      if (job != state->jobs.end() && job->second == Phase::Started)
-        state->fail(job->second, "an evaluation did not complete within " + seconds(state->bound) + " s");
+      if (job != state->jobs.end() && job->second.phase == Phase::Started)
+        state->fail(job->second.phase, "an evaluation did not complete within " + seconds(state->bound) + " s");
     } catch (...) {
     }
   }
@@ -79,12 +88,16 @@ struct Handoff::State final {
       std::lock_guard lock(state->mutex);
       if (!state->outstanding.erase(id)) return;
       state->changed.notify_all();
-      const auto job = state->jobs.find(id);
-      if (job == state->jobs.end() || job->second == Phase::Succeeded || job->second == Phase::Failed) return;
-      if (success)
-        job->second = Phase::Succeeded;
-      else
-        state->fail(job->second, "an evaluation failed");
+      const auto found = state->jobs.find(id);
+      if (found == state->jobs.end()) return;
+      Job &job = found->second;
+      if (job.phase == Phase::Succeeded || job.phase == Phase::Failed) return;
+      if (!success) {
+        state->fail(job.phase, "an evaluation failed");
+        return;
+      }
+      if (job.phase == Phase::Started) job.ran = AwakeClock::now() - job.started;
+      job.phase = Phase::Succeeded;
     } catch (...) {
     }
   }
@@ -96,7 +109,7 @@ struct Handoff::State final {
   // The highest value of the event allocated.
   uint64_t value = 0;
   // The jobs of the command queued last, by id, until finish() or cancel().
-  std::unordered_map<uint64_t, Phase> jobs;
+  std::unordered_map<uint64_t, Job> jobs;
   // The jobs of any command the agent started and has not reported.
   std::unordered_set<uint64_t> outstanding;
   uint64_t lastJob = 0;
@@ -137,10 +150,10 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
     std::lock_guard lock(state_->mutex);
     id = ++state_->lastJob;
     if (state_->retired) {
-      state_->jobs.emplace(id, Phase::Failed);
+      state_->jobs.emplace(id, Job{Phase::Failed});
       return;
     }
-    state_->jobs.emplace(id, Phase::Queued);
+    state_->jobs.emplace(id, Job{});
     state_->outstanding.insert(id);
   }
   std::string failure;
@@ -156,28 +169,34 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
   }
   std::lock_guard lock(state_->mutex);
   state_->outstanding.erase(id);
-  state_->fail(state_->jobs.at(id), std::move(failure));
+  state_->fail(state_->jobs.at(id).phase, std::move(failure));
 }
 
-bool Handoff::finish() {
+std::optional<AwakeClock::duration> Handoff::finish() {
   State &state = *state_;
   std::unique_lock lock(state.mutex);
   const auto settled = [&] {
     bool succeeded = true;
-    for (const auto &[id, phase] : state.jobs) {
-      if (phase == Phase::Failed) return true;
-      succeeded &= phase == Phase::Succeeded;
+    for (const auto &[id, job] : state.jobs) {
+      if (job.phase == Phase::Failed) return true;
+      succeeded &= job.phase == Phase::Succeeded;
     }
     return succeeded;
   };
   if (!state.changed.wait_until(lock, AwakeClock::now() + state.bound, settled))
-    for (auto &[id, phase] : state.jobs)
-      if (phase != Phase::Succeeded)
-        state.fail(phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
-  const bool succeeded =
-      std::ranges::all_of(state.jobs, [](const auto &job) { return job.second == Phase::Succeeded; });
+    for (auto &[id, job] : state.jobs)
+      if (job.phase != Phase::Succeeded)
+        state.fail(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
+  std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
+  for (const auto &[id, job] : state.jobs) {
+    if (job.phase != Phase::Succeeded) {
+      ran.reset();
+      break;
+    }
+    *ran += job.ran;
+  }
   state.jobs.clear();
-  return succeeded;
+  return ran;
 }
 
 void Handoff::cancel(std::string reason) {

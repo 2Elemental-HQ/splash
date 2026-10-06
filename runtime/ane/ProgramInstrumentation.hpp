@@ -38,6 +38,9 @@ public:
     // raised), and the one that runs `delay` late.
     uint64_t failingEvaluation = 0, stalledEvaluation = 0, delayedEvaluation = 0;
     std::chrono::milliseconds delay{0};
+    // Every evaluation starts this long after its event reaches its wait, as
+    // on a Neural Engine slower by as much.
+    std::chrono::milliseconds lag{0};
     // The evaluation that does not run but, once its event reaches its wait,
     // writes an fp16 infinity as its output's first value, raises the event
     // and reports success, as one whose output overflowed would.

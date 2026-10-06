@@ -1,5 +1,6 @@
 // How the prefill FFN's Neural Engine split is calibrated (ops/AneFfnCalibration.cpp), from timings it is given: the
-// model's fit, the share it chooses, the timings it takes and the least chunk it splits.
+// model's fit, the share it chooses, the timings it takes, the least chunk it splits and when a split that serves
+// stops for losing to the GPU alone.
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -190,6 +191,52 @@ void testMinimumRows() {
             "chunks of no functions were ruled");
 }
 
+// The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window
+// of 8 commands whose evaluations take as long as the GPU alone's layers trips it on its 8th command, one a little
+// faster never does, nor one that never was given the GPU alone. An evaluation of fewer rows counts against the GPU
+// alone's layer of its rows, not against its rows' part of the most rows', and each window is judged on its own.
+void testBreaker() {
+  ChunkTimings timings;
+  timings.gpu = {{{512, 8.0}, {2048, 20.0}}};
+  // `count` commands of 64 evaluations of the function of `rows` rows, each `ratio` of the GPU alone's layer of
+  // those rows: the first reason the breaker gives, and after how many commands.
+  const auto run = [](Breaker &breaker, uint32_t count, uint32_t rows, double ratio) {
+    for (uint32_t command = 1; command <= count; ++command) {
+      std::string reason = breaker.add(rows, 64, 64 * ratio * (4.0 + rows / 128.0));
+      if (!reason.empty()) return std::pair{command, reason};
+    }
+    return std::pair{0u, std::string()};
+  };
+  Breaker breaker(timings);
+  require(run(breaker, 8, 2048, 1.0) ==
+              std::pair{8u, std::string("losing to the GPU alone (20.0 ms on the Neural Engine per 2048-row layer "
+                                        "against 20.0 ms on the GPU alone)")},
+          "evaluations as long as the GPU alone's layers did not trip the breaker on the 8th command");
+  Breaker faster(timings);
+  require(run(faster, 80, 2048, 0.99).first == 0, "evaluations faster than the GPU alone's layers tripped it");
+  Breaker off;
+  require(run(off, 80, 2048, 100.0).first == 0, "a breaker given no GPU alone tripped");
+  // 1024 rows: the GPU alone takes 12 ms, more than half its 20 ms at 2048 rows.
+  Breaker fewer(timings);
+  require(run(fewer, 80, 1024, 0.99).first == 0,
+          "evaluations of 1024 rows faster than the GPU alone's layer of 1024 rows tripped it");
+  require(run(fewer, 8, 1024, 1.25) ==
+              std::pair{8u, std::string("losing to the GPU alone (25.0 ms on the Neural Engine per 2048-row layer "
+                                        "against 20.0 ms on the GPU alone)")},
+          "evaluations of 1024 rows slower than the GPU alone's layer of 1024 rows did not trip it");
+  Breaker windows(timings);
+  require(run(windows, 8, 2048, 0.5).first == 0 && run(windows, 8, 2048, 1.5).first == 8,
+          "a window was not judged on its own commands");
+  ChunkTimings equal = timings, reversed = timings, unusable = timings;
+  equal.gpu[0].rows = 2048;
+  std::ranges::reverse(reversed.gpu);
+  unusable.gpu[1].milliseconds = 0.0;
+  rejects([&] { static_cast<void>(Breaker(equal)); }, "two row counts",
+          "a breaker took the GPU alone at one row count");
+  rejects([&] { static_cast<void>(Breaker(reversed)); }, "two row counts", "a breaker took descending rows");
+  rejects([&] { static_cast<void>(Breaker(unusable)); }, "not usable", "a breaker took a GPU alone of 0 ms");
+}
+
 } // namespace
 
 int main() {
@@ -205,6 +252,7 @@ int main() {
     testNearestUnits();
     testRealizedShares();
     testMinimumRows();
+    testBreaker();
     std::cout << "ane ffn calibration tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

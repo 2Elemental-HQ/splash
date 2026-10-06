@@ -16,8 +16,9 @@
 //   release;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
 //   sizes, and a program that does not load again after the idle release, stop the split without failing the Metal
-//   command or throwing, and the GPU alone then computes what it computes on its own; an evaluation that signals the
-//   shared event below its value leaves the value as it is;
+//   command or throwing, and the GPU alone then computes what it computes on its own; so does a Neural Engine slower
+//   than the GPU alone, through the breaker, after a window of commands whose results stay usable; an evaluation that
+//   signals the shared event below its value leaves the value as it is;
 // - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
 //   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
 //   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
@@ -797,6 +798,46 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
+// A Neural Engine slower than the GPU alone, every evaluation starting kLag after its event reaches its wait: each
+// command's results are usable, the breaker given the GPU alone's layer as timed here stops the split after
+// ane_ffn::Breaker::kWindow commands and not before, for losing to the GPU alone, with the Neural Engine's time over
+// them counted, and the GPU alone then computes, bit for bit, what it computes on its own.
+void loses(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr auto kLag = std::chrono::milliseconds(200);
+  constexpr uint32_t kRows = AneFfn::kMaximumRows, kWindow = ane_ffn::Breaker::kWindow;
+  ane_ffn::ChunkTimings timings;
+  for (const uint32_t index : {0u, 1u}) {
+    const uint32_t rows = index ? AneFfn::kMaximumRows : AneFfn::kMinimumRows;
+    timings.gpu[index] = {rows, forward(backend, linear, model, nullptr, chunk, rows).milliseconds / kLayers};
+  }
+  if (!(timings.gpu[1].milliseconds < kLag.count() / 2.0))
+    fail("a slow Neural Engine: the GPU alone's layer takes " + std::to_string(timings.gpu[1].milliseconds) +
+         " ms, too near the lag");
+  ane::ProgramInstrumentation::arm({.lag = kLag});
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
+  split->setBreaker(ane_ffn::Breaker(timings));
+  for (uint32_t command = 1; command <= kWindow; ++command) {
+    const Forward got = forward(backend, linear, model, split.get(), chunk, kRows);
+    const std::string label = "a slow Neural Engine, command " + std::to_string(command);
+    if (!got.usable) fail(label + ": unusable: " + split->reason());
+    if (split->retired() != (command == kWindow))
+      fail(label + (split->retired() ? ": the split stopped for " + split->reason() : ": the split did not stop"));
+  }
+  std::cout << "  stopped for " << split->reason() << '\n';
+  if (!split->reason().starts_with("losing to the GPU alone ("))
+    fail("a slow Neural Engine: stopped for " + split->reason());
+  const AneFfn::Served served = split->served();
+  if (served.commands != kWindow || served.evaluations != kWindow * kLayers ||
+      !(served.milliseconds >= 0.9 * kWindow * kLayers * kLag.count()))
+    fail("a slow Neural Engine: served " + std::to_string(served.commands) + " commands, " +
+         std::to_string(served.evaluations) + " evaluations in " + std::to_string(served.milliseconds) + " ms");
+  const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
+  const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!after.usable || after.bits != alone.bits)
+    fail("a slow Neural Engine: the GPU's forward after the split stopped differs from the GPU's alone");
+  if (split->served().commands != kWindow) fail("a slow Neural Engine: the stopped split counted a command");
+}
+
 // The split of the affine Q4 and the GGUF model over normalized rows of normal values, and the numerics of rows the
 // ANE's fp16 barely holds.
 void split(MetalBackend &backend) {
@@ -863,6 +904,10 @@ void faults(MetalBackend &backend) {
   if (split->release()) fail("a failed reload: the stopped split unloaded its program");
   section("faults: a program that does not load again stops the split, and the GPU alone then computes what it "
           "computes on its own");
+
+  loses(backend, linear, model, rows);
+  section("faults: a Neural Engine slower than the GPU alone stops the split after 8 usable commands, and the GPU "
+          "alone then computes what it computes on its own");
 
   // The CPU raises the event past an evaluation's signal before it runs.
   test::AneSum sum(backend);

@@ -752,7 +752,19 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
           report(YES, nil);
         });
       };
-      evaluateWithFaults(impl_->faults, sequence, report, evaluate, poison);
+      const std::function<void()> lagged = [event, wait, evaluate, report, lag = impl_->faults.lag] {
+        event.notify(wait, [evaluate, report, lag] {
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, std::chrono::nanoseconds(lag).count()),
+                         dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                           try {
+                             evaluate();
+                           } catch (const std::exception &) {
+                             report(NO, nil);
+                           }
+                         });
+        });
+      };
+      evaluateWithFaults(impl_->faults, sequence, report, impl_->faults.lag.count() ? lagged : evaluate, poison);
 #else
       evaluate();
 #endif

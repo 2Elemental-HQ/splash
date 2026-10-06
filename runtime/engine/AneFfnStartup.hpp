@@ -96,7 +96,9 @@ struct AneFfnStart final {
 // arithmetic until the plan holds a split; then it logs that it sets the
 // split up, times it, chooses its share (ops::ane_ffn::choose), prepares the
 // split that serves, sets the least chunk it takes
-// (ops::ane_ffn::minimumRows) and remembers the share. Logs the outcome. A
+// (ops::ane_ffn::minimumRows) and, from the timings, what stops it once it
+// loses to the GPU alone (ops::ane_ffn::Breaker), and remembers the share; a
+// given split takes the given least chunk and no breaker. Logs the outcome. A
 // failure leaves the GPU alone, unless `cancelled` returns true, the wait for
 // the ANE was interrupted or the backend no longer serves, which the
 // failure's exception reports. Throws std::invalid_argument for a given split

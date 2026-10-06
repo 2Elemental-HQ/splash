@@ -4,12 +4,14 @@
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/AneFfnCalibration.hpp"
 #include "ops/Linear.hpp"
 
 #include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -32,7 +34,8 @@ class Measurement;
 // (ane::Handoff). Any failure of the ANE's work stops the split for the life
 // of the process: finish() then reports the command's results unusable, and
 // the caller runs the chunk again on the GPU alone, which every later chunk
-// runs too.
+// runs too. A split that loses to the GPU alone stops the same way, after a
+// command whose results are usable (setBreaker).
 class AneFfn final {
 public:
   // A chunk runs on the smallest of the program's functions that holds it,
@@ -68,6 +71,18 @@ public:
   // kMinimumRows to kMaximumRows.
   [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
   void setMinimumRows(uint32_t rows);
+  // Stops the split once it loses to the GPU alone: `breaker` judges each
+  // command finish() finds split. Until this is called, none does.
+  void setBreaker(ane_ffn::Breaker breaker) noexcept { breaker_ = std::move(breaker); }
+
+  // The commands finish() found split since the split was built, their
+  // evaluations, and the Neural Engine's milliseconds over them
+  // (ane::Handoff::finish).
+  struct Served final {
+    uint64_t commands = 0, evaluations = 0;
+    double milliseconds = 0.0;
+  };
+  [[nodiscard]] const Served &served() const noexcept { return served_; }
 
   // Checks the split against the GPU alone on `layers`, those it was built
   // from, with chunks in `ffn` and the residual and output of alternate
@@ -102,7 +117,8 @@ public:
   [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph, metal::CommandCompletion completion);
   // After the command committed last has completed: whether its outputs hold
   // the split's FFN. False when its ANE work failed, which stops the split
-  // and logs why, once.
+  // and logs why, once; true otherwise, also when the breaker stops the
+  // split after it.
   [[nodiscard]] bool finish();
 
   // The engine's idle release (engine::ReleasableMemory). Between commands:
@@ -225,10 +241,11 @@ private:
   // of `evaluations`, an evaluation and a weight set, once the one before it
   // is done.
   void queueNow(std::span<const std::pair<uint32_t, uint32_t>> evaluations);
-  // finish() but for its log line: whether every evaluation of the command
-  // committed last succeeded and its joins read finite values; stops the
-  // split otherwise.
-  [[nodiscard]] bool completed();
+  // finish() but for its log line and judgment: if every evaluation of the
+  // command committed last succeeded and its joins read finite values, the
+  // Neural Engine's time over them (ane::Handoff::finish); none otherwise,
+  // which stops the split.
+  [[nodiscard]] std::optional<AwakeClock::duration> completed();
   // Logs, once, that the split stopped.
   void stopped();
 
@@ -245,6 +262,10 @@ private:
   // layer it adds next.
   std::vector<Job> jobs_;
   uint32_t nextLayer_ = 0;
+  // The evaluations of the command committed last, and its function's rows.
+  uint32_t committedEvaluations_ = 0, committedRows_ = 0;
+  ane_ffn::Breaker breaker_;
+  Served served_;
   // Whether a command committed jobs that finish() has not yet judged.
   bool unfinished_ = false;
   // From a release() that unloaded the program until restore().

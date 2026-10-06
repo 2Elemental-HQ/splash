@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace splash::ops::ane_ffn {
 namespace {
@@ -46,6 +49,14 @@ constexpr double kHysteresis = 0.03;
 // a prefill, so a chunk that splits within this prefills at most about 1%
 // slower.
 constexpr double kChunkNoise = 0.02;
+
+// The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
+// through its timings, which the GPU follows within 1% between them.
+Line gpuAlone(const ChunkTimings &timings) {
+  const auto &[low, high] = timings.gpu;
+  const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
+  return {low.milliseconds - slope * low.rows, slope};
+}
 
 } // namespace
 
@@ -117,8 +128,7 @@ std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t uni
 }
 
 // A chunk splits while its function's split layer takes at most kChunkNoise
-// longer than the GPU's layer alone of the chunk's rows, on the line through
-// the GPU's timings, which the GPU follows within 1% between them. Every
+// longer than the GPU's layer alone of the chunk's rows (gpuAlone). Every
 // chunk a function runs takes about as long as the function's own rows: the
 // ANE's part runs them and takes the longer. The functions do not cost the
 // ANE in proportion to their rows (on an M5 Max 640 rows took 93% of 768's,
@@ -132,8 +142,7 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
     ordered = functions[index].least && functions[index].least <= functions[index].rows &&
               (!index || functions[index].rows + 1 == functions[index - 1].least);
   if (!ordered) throw std::invalid_argument("ANE FFN chunks are not those of its functions");
-  const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
-  const Line gpu{low.milliseconds - slope * low.rows, slope};
+  const Line gpu = gpuAlone(timings);
   std::optional<uint32_t> minimum;
   for (const ChunkTimings::Function &function : functions)
     for (uint32_t rows = function.rows; rows >= function.least; --rows) {
@@ -141,6 +150,46 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
       minimum = rows;
     }
   return minimum;
+}
+
+// Each layer the GPU waits for the Neural Engine's evaluation before it joins
+// the ANE's part to its own, so evaluations that take as long as the GPU's
+// whole layers alone make the split slower than the GPU alone, whatever the
+// rest of the layer takes: the breaker trips there, and never short of it. An
+// evaluation counts against the GPU alone's layer of its function's rows,
+// which the chunk pads up to, so the GPU alone would take no longer over the
+// chunk; the reason scales the window's ratio to a layer of the most rows.
+// At the share calibration chooses, an evaluation takes about as long as the
+// GPU's part (choose), about 1 - share of the GPU alone: on an M5 Max,
+// calibration's timings of Qwen3.8-27B put it at 14.0 ms against 19.0 at 9
+// of 34 units, and the M5 Pro's 0.41 and the M6's 0.76 leave more room.
+// Measured, another process keeping the ANE busy beside the split costs it
+// 2-8% on an M5 Max, an M5 Pro and an M6, and a minute of prefill slows the
+// M6's ANE by a third: far short of the trip point. Judging kWindow commands
+// at once, it weighs one slow evaluation, as a function's first after its
+// program loads again, among all of theirs.
+Breaker::Breaker(const ChunkTimings &timings) {
+  const auto &[low, high] = timings.gpu;
+  if (!(low.rows < high.rows)) throw std::invalid_argument("ANE FFN breaker needs the GPU alone at two row counts");
+  static_cast<void>(usable(low.milliseconds));
+  static_cast<void>(usable(high.milliseconds));
+  gpu_ = gpuAlone(timings);
+  mostRows_ = high.rows;
+}
+
+std::string Breaker::add(uint32_t rows, uint32_t evaluations, double milliseconds) {
+  if (!gpu_) return {};
+  ane_ += milliseconds;
+  alone_ += evaluations * (*gpu_)(rows);
+  if (++commands_ < kWindow) return {};
+  const double ratio = ane_ / alone_, most = (*gpu_)(mostRows_);
+  commands_ = 0;
+  ane_ = alone_ = 0.0;
+  if (!(ratio >= 1.0)) return {};
+  std::ostringstream reason;
+  reason << std::fixed << std::setprecision(1) << "losing to the GPU alone (" << ratio * most
+         << " ms on the Neural Engine per " << mostRows_ << "-row layer against " << most << " ms on the GPU alone)";
+  return reason.str();
 }
 
 } // namespace splash::ops::ane_ffn

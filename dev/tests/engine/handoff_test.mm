@@ -1,11 +1,12 @@
 // ane::Handoff (runtime/ane/Handoff.mm) between Metal commands and an agent the CPU plays, under Metal's shader
 // validation. For each way the agent can behave, a command of eight layers, each its GPU work, a signal of the layer's
 // `ready`, more GPU work and a wait for its `done`, completes within the handoff's bound of the fault and far from
-// Metal's own limit, and leaves the backend healthy; finish() reports whether every job succeeded; a failure stops
-// the handoff for good, and the commands after it run on the GPU alone; while the agent behaves, the GPU never passes
-// a layer's wait before the agent has seen its ready. cancel() and the destructor return within the bound, and a
-// report after the handoff is gone does nothing. The premise the handoff stands on: a shared event never decreases,
-// whether the CPU or the GPU signals below its value, and a GPU wait on a value it has passed completes at once.
+// Metal's own limit, and leaves the backend healthy; finish() reports whether every job succeeded, and how long the
+// agent took over them; a failure stops the handoff for good, and the commands after it run on the GPU alone; while
+// the agent behaves, the GPU never passes a layer's wait before the agent has seen its ready. cancel() and the
+// destructor return within the bound, and a report after the handoff is gone does nothing. The premise the handoff
+// stands on: a shared event never decreases, whether the CPU or the GPU signals below its value, and a GPU wait on a
+// value it has passed completes at once.
 #include "AwakeClock.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -25,6 +26,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -84,15 +86,16 @@ const char *name(Behaviour behaviour) {
   return "";
 }
 
-// The agent: a thread that runs the jobs it was given in order, each once the event reaches its wait, as the Neural
-// Engine does. Its `faulty`-th job, counted from 0 over its life, takes `behaviour`. The GPU work it can see is the
-// first word of `markers`, which each layer's work before its ready adds one to, and word 1 + k, which the work
-// after layer k's wait sets.
+// The agent: a thread that runs the jobs it was given in order, each once the event reaches its wait and taking
+// `pace` from then, as the Neural Engine does. Its `faulty`-th job, counted from 0 over its life, takes `behaviour`.
+// The GPU work it can see is the first word of `markers`, which each layer's work before its ready adds one to, and
+// word 1 + k, which the work after layer k's wait sets.
 class Agent final {
 public:
-  Agent(Behaviour behaviour, uint32_t faulty, const MetalBuffer &markers)
-      : behaviour_(behaviour), faulty_(faulty), markers_(static_cast<volatile uint32_t *>(markers.contents())),
-        thread_([this] { run(); }) {}
+  Agent(Behaviour behaviour, uint32_t faulty, const MetalBuffer &markers,
+        std::chrono::milliseconds pace = std::chrono::milliseconds(0))
+      : behaviour_(behaviour), faulty_(faulty), pace_(pace),
+        markers_(static_cast<volatile uint32_t *>(markers.contents())), thread_([this] { run(); }) {}
   ~Agent() {
     {
       std::lock_guard lock(mutex_);
@@ -176,6 +179,7 @@ private:
         default: break;
         }
       }
+      std::this_thread::sleep_for(pace_);
       job.event.signal(job.signal);
       report(job, true);
     }
@@ -188,6 +192,7 @@ private:
 
   const Behaviour behaviour_;
   const uint32_t faulty_;
+  const std::chrono::milliseconds pace_;
   volatile uint32_t *const markers_;
   mutable std::mutex mutex_;
   std::condition_variable changed_;
@@ -256,7 +261,7 @@ void behaves(MetalBackend &backend, Behaviour behaviour, uint32_t faulty) {
   require(first < milliseconds(kBound + kSlack),
           label + ": the command took " + std::to_string(first) + " ms, past the bound");
   require(backend.healthy(), label + ": the backend is unhealthy: " + backend.unhealthyReason());
-  require(handoff.finish() == !fails, label + ": finish() reported " + (fails ? "success" : "failure"));
+  require(handoff.finish().has_value() == !fails, label + ": finish() reported " + (fails ? "success" : "failure"));
   require(handoff.retired() == fails && handoff.reason().empty() == !fails,
           label + ": retired " + std::to_string(handoff.retired()) + " for " + handoff.reason());
   // While the agent behaves, the GPU waits for each layer's done; a failure as the jobs start releases every wait
@@ -271,12 +276,30 @@ void behaves(MetalBackend &backend, Behaviour behaviour, uint32_t faulty) {
   const uint32_t started = agent.started();
   const double second = layers.run(backend, handoff, agent.start());
   require(second < milliseconds(kBound + kSlack), label + ": the next command took " + std::to_string(second) + " ms");
-  require(handoff.finish() == !fails, label + ": the next command's finish() changed");
+  require(handoff.finish().has_value() == !fails, label + ": the next command's finish() changed");
   require(handoff.retired() == fails && handoff.reason() == reason, label + ": the handoff's state changed");
   require(agent.started() == started + (fails ? 0 : kLayers),
           label + ": the agent started " + std::to_string(agent.started() - started) + " jobs of the next command");
   require(fails || agent.ordered(2 * kLayers), label + ": the next command passed a wait before its ready");
   require(backend.healthy(), label + ": the next command left the backend unhealthy");
+}
+
+// finish() reports the agent's time over a command's jobs, each from the notice of its ready to its report: at least
+// the time it took over each, less the notices' delays, and no longer than the command.
+void times(MetalBackend &backend) {
+  constexpr auto kPace = std::chrono::milliseconds(20), kNotice = std::chrono::milliseconds(5);
+  ane::Handoff handoff(backend, kBound);
+  const MetalBuffer markers = zeroed(backend);
+  Agent agent(Behaviour::Succeed, kLayers, markers, kPace);
+  Layers layers(backend, markers);
+  const double command = layers.run(backend, handoff, agent.start());
+  const std::optional<AwakeClock::duration> ran = handoff.finish();
+  require(ran && milliseconds(*ran) >= kLayers * milliseconds(kPace - kNotice) &&
+              milliseconds(*ran) <= command + milliseconds(kNotice),
+          "finish() reported " + (ran ? std::to_string(milliseconds(*ran)) + " ms" : std::string("a failure")) +
+              " for 8 jobs of " + std::to_string(kPace.count()) + " ms in a command of " + std::to_string(command) +
+              " ms");
+  std::cout << "PASS finish() reports the agent's time over a command's jobs\n";
 }
 
 // cancel() releases the jobs of a command never committed and waits for the agent's reports, at most a bound; the
@@ -375,6 +398,7 @@ int main(int argc, const char *argv[]) {
           behaves(backend, behaviour, faulty);
         std::cout << "PASS " << name(behaviour) << " at jobs 0, 3 and 7 of 8\n";
       }
+      times(backend);
       cancels(backend);
     } catch (const std::exception &error) {
       std::cout << "FAIL " << error.what() << '\n';

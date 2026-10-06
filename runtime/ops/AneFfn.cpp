@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -571,6 +572,8 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
   const std::vector<Job> jobs = std::exchange(jobs_, {});
   for (const Job &job : jobs) queue(job);
   unfinished_ = !jobs.empty();
+  committedEvaluations_ = static_cast<uint32_t>(jobs.size());
+  committedRows_ = jobs.empty() ? 0 : evaluations_[jobs.front().evaluation].rows;
   const auto cancel = [&](const std::string &reason) {
     if (!std::exchange(unfinished_, false)) return;
     handoff_.cancel(reason);
@@ -588,19 +591,31 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
 }
 
 bool AneFfn::finish() {
-  if (completed()) return true;
-  stopped();
-  return false;
+  const std::optional<AwakeClock::duration> ran = completed();
+  if (!ran) {
+    stopped();
+    return false;
+  }
+  if (!committedEvaluations_) return true;
+  const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
+  ++served_.commands;
+  served_.evaluations += committedEvaluations_;
+  served_.milliseconds += milliseconds;
+  if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
+    handoff_.retire(std::move(losing));
+    stopped();
+  }
+  return true;
 }
 
-bool AneFfn::completed() {
+std::optional<AwakeClock::duration> AneFfn::completed() {
   unfinished_ = false;
-  bool usable = handoff_.finish();
-  if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && usable) {
+  std::optional<AwakeClock::duration> ran = handoff_.finish();
+  if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && ran) {
     handoff_.retire("the Neural Engine's output or its scales were not finite");
-    usable = false;
+    ran.reset();
   }
-  return usable;
+  return ran;
 }
 
 bool AneFfn::release() {

@@ -1610,10 +1610,18 @@ command buffer whose wait stays unmet for 5 s), or a value the join reads that
 is not finite. The CPU then raises the event to the GPU's last wait, the
 chunk runs again on the GPU alone, which computes what it would have, as does
 every chunk after it, and the engine logs `Warning · Neural Engine FFN split
-stopped (...)`. The idle release (`--idle-release`) unloads the program, so
-that the ANE's service gives its buffers back while the engine is idle, and
-keeps the split's own, which the residency keep-alive unwires
-(`AneFfn::release`); the next request loads the program again after the
+stopped (...)`. A split that loses to the GPU alone stops the same way, after
+a chunk whose results it keeps (`ops::ane_ffn::Breaker`): over each 8 commands
+it ran, the ANE's evaluations, each from the GPU's signal to start it to its
+report, took as long as the GPU alone's FFN layers of their functions' rows,
+on the line through the timings startup took. The GPU then waits on the ANE
+at every layer, so the split is slower than the GPU alone; another process
+keeping the ANE busy costs the split 2-8% and a minute of prefill slows the
+M6's ANE by a third, far short of that. A given share (`--ane-ffn-share`)
+takes no timings and never stops for it. The idle release (`--idle-release`)
+unloads the program, so that the ANE's service gives its buffers back while
+the engine is idle, and keeps the split's own, which the residency keep-alive
+unwires (`AneFfn::release`); the next request loads the program again after the
 weights (`AneFfn::restore`), in about 0.1 s, and logs `Neural Engine FFN
 program reloaded in N s`. A program that does not load again within 10 s
 stops the split like a failure while serving, and the request runs on the GPU
@@ -1622,17 +1630,18 @@ about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share over chunks
 of `--ane-ffn-minimum-rows` rows or more (512 by default), which
 `backend_regression` pins to its first round's.
-`make test-engine-cpu` runs `ane-ffn-calibration`, the fit, the choice and the
-least chunk on timings it is given, also under the sanitizers, and
-`ane-ffn-startup`, each outcome of a start on a model it plays. `make
+`make test-engine-cpu` runs `ane-ffn-calibration`, the fit, the choice, the
+least chunk and the breaker on timings it is given, also under the sanitizers,
+and `ane-ffn-startup`, each outcome of a start on a model it plays. `make
 test-engine-metal` runs `ane-ffn`: its kernels against CPU references for
 affine Q4 and every GGUF format under shader validation, then, without it, the
 split's memory and its output against the GPU alone, the same output once its
 program is unloaded and loaded again, `verify()` of every function and of a
 function the client's instrumented build
 (`runtime/ane/ProgramInstrumentation.hpp`) binds to another's procedure, each
-fault of an evaluation it injects at each layer and a program that does not
-load again, and the private client's failures, limits, unload and load, and
+fault of an evaluation it injects at each layer, a program that does not load
+again and evaluations slower than the GPU alone, which the breaker stops after
+8 commands, and the private client's failures, limits, unload and load, and
 cache files on a small program. `handoff` runs the event handoff against an
 agent the CPU plays in each way it can fail, and `ane-program-faults` checks
 that an Objective-C exception and a changed method signature fail as

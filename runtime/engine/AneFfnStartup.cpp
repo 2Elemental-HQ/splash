@@ -146,7 +146,10 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
              << " against " << chunks.gpu[1].milliseconds << " (calibrated in " << seconds() << ")";
       return gpuAlone(Kind::NoGain, reason.str());
     }
-    if (prepared.split) prepared.split->setMinimumRows(*minimumRows);
+    if (prepared.split) {
+      prepared.split->setMinimumRows(*minimumRows);
+      if (!given) prepared.split->setBreaker(ops::ane_ffn::Breaker(chunks));
+    }
     EngineMemoryPlanResult plan = planWith(aneUnits);
     if (!plan.plan) throw std::logic_error("the memory plan does not hold the split it chose");
     if (!given) model.remember(aneUnits);
