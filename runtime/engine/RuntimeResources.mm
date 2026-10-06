@@ -6,6 +6,7 @@
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/WeightStore.hpp"
+#include "ops/AneFfnMeasurement.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <utility>
 
@@ -124,6 +126,27 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
   }
 }
 
+// The layers' part of what ane::recall() keeps a calibration under: their
+// shapes and formats.
+std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
+  std::string key = "ane-ffn calibration";
+  for (const ops::SwiGluProjections &layer : layers)
+    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down}) {
+      const bool affine = projection->layout() == ops::WeightLayout::Affine64;
+      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":" +
+             (affine ? "a" : "g" + std::to_string(projection->blocks().segments.front().formatId));
+    }
+  return key;
+}
+
+// The split's part of what the engine gives back while idle, if it runs one.
+std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
+  if (!split)
+    return std::nullopt;
+  return ReleasableMemory::Split{[split] { return split->release(); },
+                                 [split] { split->restore(); }};
+}
+
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
   if (value.size() != 64) {
     throw std::invalid_argument(
@@ -225,6 +248,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
+    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::optional<uint64_t> hostAvailableAtStart)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
@@ -234,10 +258,13 @@ RuntimeResources::RuntimeResources(
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), hostAvailableAtStart_(hostAvailableAtStart) {}
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
+      aneFfnOutcome_(std::move(aneFfnOutcome)), hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
-RuntimeResources::create(const RuntimeResourcesConfig &config) {
+RuntimeResources::create(const RuntimeResourcesConfig &config,
+                         uint32_t requestedContextTokens) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
       !kv::validFormat(config.kvFormat) ||
       !config.model.valid() || !config.hostAvailableMemory ||
@@ -387,20 +414,23 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         RuntimeResourceStage::MemoryPlanning,
         std::string("model allocated-size plan is invalid: ") + error.what());
   }
-
-  ModelMemoryFootprint footprint{
-      loaded.targetActualAllocatedBytes(),
-      loaded.draft.actualAllocatedBytes,
-      loaded.vision.actualAllocatedBytes,
-      modelMemoryPlan,
-      stateStagingBytes,
+  // The engine's memory plan, with `aneFfnBytes` set aside for the prefill
+  // FFN's Neural Engine split.
+  const auto planMemory = [&](uint64_t aneFfnBytes) {
+    ModelMemoryFootprint footprint{
+        loaded.targetActualAllocatedBytes(),
+        loaded.draft.actualAllocatedBytes,
+        loaded.vision.actualAllocatedBytes,
+        modelMemoryPlan,
+        stateStagingBytes,
+        aneFfnBytes,
+    };
+    ModelMemoryProfile modelProfile{
+        loaded.name(), loaded.maximumContextTokens(),
+        loaded.targetKvLayout(config.kvFormat), footprint};
+    return evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
   };
-
-  ModelMemoryProfile modelProfile{
-      loaded.name(), loaded.maximumContextTokens(),
-      loaded.targetKvLayout(config.kvFormat), footprint};
-  EngineMemoryPlanResult planResult =
-      evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+  EngineMemoryPlanResult planResult = planMemory(0);
   if (!planResult.plan) {
     throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
                                 planResult.status.message,
@@ -421,18 +451,26 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   }
 
   try {
-    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
     // allocator reserves, so memory outside the backend's buffers is charged
-    // only beyond them, and elastic state and KV never grow into them.
+    // only beyond them, and elastic state and KV never grow into them. The
+    // split only moves bytes from KV to fixed runtime memory, so the governor
+    // is the same with it or without.
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, budget.hardBudgetBytes, hostReserveBytes, config.hostAvailableMemory,
-        budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes);
+        *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes, config.hostAvailableMemory,
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    AneFfnStart aneFfn =
+        startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled),
+                    config.aneFfn,
+                    requestedContextTokens, planMemory, config.cancelled);
+    if (aneFfn.plan)
+      memoryPlan = std::move(*aneFfn.plan);
+    const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,
     // never the id range, limits the pool.
@@ -502,7 +540,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        hostAvailableAtStart));
+        std::move(aneFfn.split), std::move(aneFfn.outcome), hostAvailableAtStart));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -615,7 +653,22 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *kvPages_,
       *stateStorage_,
       operators_,
+      aneFfn_.get(),
   };
+}
+
+AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
+  if (!aneFfn_)
+    return {.reason = aneFfnOutcome_.reason};
+  const bool stopped = aneFfn_->retired();
+  const ops::AneFfn::Served &served = aneFfn_->served();
+  return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
+          stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
+          aneFfn_->share(),
+          aneFfn_->minimumRows(),
+          served.commands,
+          served.evaluations,
+          served.milliseconds};
 }
 
 ActualMemoryReport RuntimeResources::actualMemoryReport(
@@ -632,6 +685,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
+  report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();
@@ -642,6 +696,56 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   // returns a result; the backend's own high-water mark keeps it.
   report.backendPeakAllocatedBytes = memory.peakAllocatedBytes;
   return report;
+}
+
+AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+                        const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
+                        std::function<bool()> cancelled) {
+  auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
+  AneFfnModel model;
+  model.dense = !layers->empty();
+  if (!model.dense) return model;
+  if (const char *reason = ops::AneFfn::unsupported(*layers)) {
+    model.unsupported = reason;
+    return model;
+  }
+  model.unavailable = [] { return ane::unavailable(); };
+  model.units = ops::AneFfn::units(*layers);
+  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
+    model::withPrefillArena(backend, loaded, operators, format, use);
+  };
+  model.time = [&backend, layers, cancelled, onArena] {
+    ops::ane_ffn::Timings timings;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+    });
+    return timings;
+  };
+  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+    AneFfnPrepared prepared;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
+      prepared.error = prepared.split->verify(*layers, ffn, hidden);
+      if (timeChunks)
+        prepared.chunks =
+            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+    });
+    return prepared;
+  };
+  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+                          [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
+                          std::string(buildId) + " most ";
+  model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
+    const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
+    return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;
+  };
+  model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
+    ane::remember(key + std::to_string(maxAneUnits), calibration.text());
+  };
+  model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
+  model.healthy = [&backend] { return backend.healthy(); };
+  return model;
 }
 
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {

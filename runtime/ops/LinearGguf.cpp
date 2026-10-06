@@ -123,7 +123,7 @@ void requireSegments(const Projection &p, LinearMatrix matrix) {
   for (const QuantizedSegment &s : p.blocks().segments) {
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
-    if (!s.isFloat()) requireSegmentPlanes(s, "projection");
+    if (!s.isFloat()) requireSegmentPlanes(s, "projection", p.planeInputs());
   }
 }
 
@@ -385,10 +385,13 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   for (const QuantizedSegment &s : p.blocks().segments) {
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-    graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
-              GgufPrefillParams{k, w.rows, n, s.columnOffset},
-              {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
-              {GGUF_PREFILL_THREADS, 1, 1});
+    const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
+    const metal::DispatchSize groups{plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1};
+    if (p.planeInputs())
+      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
+                GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+    else
+      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
   }
 }
 
@@ -474,18 +477,22 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
 }
 
-void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what) {
-  // Each plane ends at its unit of the last row's last group, or meta unit:
-  // tile row (rows - 1) % T of the last group of its tile.
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {
+  // Each plane ends at its unit of the last row's last group the segment
+  // reads, or meta unit: tile row (rows - 1) % T of that group of its tile,
+  // whose rows hold the groups of planeInputs inputs.
   const QuantFormat &format = segment.format();
   const uint32_t groups = segment.inputSize / 32, units = groups / format.meta_groups;
-  const auto planeBytes = [&](uint32_t blocks, uint32_t unitBytes) {
-    return (quant_tile_index(segment.outputSize - 1, blocks - 1, blocks) + 1) * unitBytes;
+  const uint32_t rowGroups = (planeInputs ? planeInputs : segment.inputSize) / 32,
+                 rowUnits = rowGroups / format.meta_groups;
+  const auto planeBytes = [&](uint32_t blocks, uint32_t rowBlocks, uint32_t unitBytes) {
+    return (quant_tile_index(segment.outputSize - 1, blocks - 1, rowBlocks) + 1) * unitBytes;
   };
   const std::string name(what);
-  requireBytes(segment.plane0, planeBytes(groups, format.plane0_bytes), name + " plane0");
-  if (format.plane1_bytes) requireBytes(segment.plane1, planeBytes(groups, format.plane1_bytes), name + " plane1");
-  requireBytes(segment.meta, planeBytes(units, format.meta_bytes), name + " meta");
+  requireBytes(segment.plane0, planeBytes(groups, rowGroups, format.plane0_bytes), name + " plane0");
+  if (format.plane1_bytes)
+    requireBytes(segment.plane1, planeBytes(groups, rowGroups, format.plane1_bytes), name + " plane1");
+  requireBytes(segment.meta, planeBytes(units, rowUnits, format.meta_bytes), name + " meta");
 }
 
 bool apple9StagesFormat(uint32_t format) noexcept {

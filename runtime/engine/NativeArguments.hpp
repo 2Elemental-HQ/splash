@@ -37,6 +37,10 @@ struct NativeArguments final {
   // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
   // automatically while it holds a request.
   bool preventIdleSleep = true;
+  // --ane on|off: whether a dense target's prefill FFN may split with the
+  // Neural Engine when that is faster (splash serve --disable-ane turns it
+  // off).
+  bool neuralEngine = true;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

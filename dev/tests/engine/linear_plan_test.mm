@@ -1582,6 +1582,173 @@ void blockExtents(metal::MetalBackend &backend) {
   }
 }
 
+// A view of the leading 512 inputs of rows of 1024 (Projection::leadingInputs)
+// over 512 outputs, two tiles of 256 rows: each prefill residual tile
+// encodes its leading-input instance with the view's parameters, and each
+// plane is read up to the last group the view reads of the second tile, after
+// every group of the first. A plane at that extent encodes, one element
+// shorter or holding only a matrix of the view's own inputs is refused. Every
+// other plan, a rotated view and a gate/up plan's gate are refused before
+// anything is encoded. The views' factories refuse inputs beyond the
+// projection's or of part of a quant group or meta unit, rows of part of a
+// tile, and float or rotated weights or a view; a view of leading rows holds
+// its planes' first tiles.
+void leadingInputViews(metal::MetalBackend &backend) {
+  const Linear linear = gpu(10, 16);
+  constexpr uint32_t n = 512, k = 512, wide = 1024, rows = 168;
+  const auto buffersOf = [&](const LinearPlan &plan) {
+    const uint64_t storage = plan.storageRows();
+    const LinearScratchSize scratch = plan.scratchSize();
+    return LinearBuffers{.input = allocate(backend, storage * k * 2),
+                         .output = allocate(backend, storage * n * 2),
+                         .sums = allocate(backend, plan.sumsBytes()),
+                         .residual = allocate(backend, storage * n * 2),
+                         .gateScratch = allocate(backend, plan.gateScratchBytes()),
+                         .downSums = allocate(backend, plan.downSumsBytes()),
+                         .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                     allocate(backend, scratch.partials), allocate(backend, scratch.counters)}};
+  };
+  const auto residualPrefill = [&](WeightLayout layout, LinearConfig config, LinearEpilogue epilogue) {
+    return Linear::plan({{n, k}, rows, LinearPhase::Prefill, epilogue, layout}, config, FloatOutput::BFloat16);
+  };
+  const auto encodes = [&](const Projection &view, const LinearPlan &plan, const auto &params) {
+    metal::CommandGraph graph;
+    (void)linear.add(graph, buffersOf(plan), view, plan);
+    const std::string kernel =
+        leadingInputsInstance(view.layout() == WeightLayout::Affine64 ? std::string(plan.pipeline())
+                                                                       : "gguf_prefill_q5k_r");
+    require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
+    const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
+    require(dispatch.pipelineName == kernel && dispatch.bytes.size() == 1 &&
+                dispatch.bytes[0].sizeBytes == sizeof(params) &&
+                std::memcmp(dispatch.bytes[0].data, &params, sizeof(params)) == 0,
+            "a view of leading inputs did not encode " + kernel + " with its parameters");
+  };
+  // The extent of a plane the view reads, in units of `unitBytes`: the first
+  // tile, `rowGroups` groups (or meta units) of each of its 256 rows, then
+  // the first `readGroups` of the second tile.
+  const auto reach = [](uint64_t rowGroups, uint64_t readGroups, uint64_t unitBytes) {
+    return (rowGroups + readGroups) * 256 * unitBytes;
+  };
+
+  const AffineWeights wideAffine{allocate(backend, uint64_t{n} * wide / 2),
+                                 allocate(backend, uint64_t{n} * (wide / 64) * 2),
+                                 allocate(backend, uint64_t{n} * (wide / 64) * 2)};
+  const auto affineView = [&](const AffineWeights &planes) { return Projection(n, wide, planes).leadingInputs(k); };
+  const Projection affine = affineView(wideAffine);
+  for (const LinearConfig config : {LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
+                                    LinearConfig{LinearTile::N128}, LinearConfig{LinearTile::N256}})
+    encodes(affine, residualPrefill(WeightLayout::Affine64, config, LinearEpilogue::Residual),
+            Q4PrefillLeadingParams{{n, k}, wide});
+  const LinearPlan affinePlan = residualPrefill(WeightLayout::Affine64, {LinearTile::N128, 0, LinearSimdgroups::Four},
+                                                LinearEpilogue::Residual);
+  const LinearBuffers affineBuffers = buffersOf(affinePlan);
+  for (const auto &[member, unitBytes, element, name] :
+       std::initializer_list<std::tuple<metal::MetalBuffer AffineWeights::*, uint64_t, uint64_t, const char *>>{
+           {&AffineWeights::weights, 32, 1, "projection weight"},
+           {&AffineWeights::scales, 2, 2, "projection scale"},
+           {&AffineWeights::biases, 2, 2, "projection bias"}}) {
+    const auto add = [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+      AffineWeights planes = wideAffine;
+      planes.*member = view;
+      (void)linear.add(graph, affineBuffers, affineView(planes), affinePlan);
+    };
+    requireExtent(backend, wideAffine.*member, reach(wide / 64, k / 64, unitBytes), element, name, add);
+    metal::CommandGraph graph;
+    rejects([&] { add(graph, backend.view(wideAffine.*member, 0, uint64_t{n} * (k / 64) * unitBytes)); },
+            std::string(name) + " buffer holds", "a view of leading inputs over planes of its own inputs was accepted");
+    require(graph.empty(), "a view of leading inputs over planes of its own inputs encoded a dispatch");
+  }
+
+  const QuantFormat &q5k = kQuantFormats[GGUF_FMT_Q5K];
+  const QuantizedSegment wideSegment = segmentPlanes(backend, GGUF_FMT_Q5K, n, wide);
+  const auto ggufView = [&](const QuantizedSegment &planes) {
+    return Projection(n, wide, BlockWeights{{planes}}).leadingInputs(k);
+  };
+  const Projection gguf = ggufView(wideSegment);
+  const LinearPlan ggufPlan =
+      residualPrefill(WeightLayout::Block32, {.tile = LinearTile::GgufPrefill}, LinearEpilogue::Residual);
+  encodes(gguf, ggufPlan, GgufPrefillLeadingParams{{k, rows, n, 0}, wide});
+  const LinearBuffers ggufBuffers = buffersOf(ggufPlan);
+  const QuantizedSegment narrow = segmentPlanes(backend, GGUF_FMT_Q5K, n, k);
+  for (const auto &[member, rowGroups, readGroups, unitBytes, name] :
+       std::initializer_list<
+           std::tuple<metal::MetalBuffer QuantizedSegment::*, uint64_t, uint64_t, uint64_t, const char *>>{
+           {&QuantizedSegment::plane0, wide / 32, k / 32, q5k.plane0_bytes, "projection plane0"},
+           {&QuantizedSegment::plane1, wide / 32, k / 32, q5k.plane1_bytes, "projection plane1"},
+           {&QuantizedSegment::meta, wide / 32 / q5k.meta_groups, k / 32 / q5k.meta_groups, q5k.meta_bytes,
+            "projection meta"}}) {
+    const auto add = [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+      QuantizedSegment planes = wideSegment;
+      planes.*member = view;
+      (void)linear.add(graph, ggufBuffers, ggufView(planes), ggufPlan);
+    };
+    requireExtent(backend, wideSegment.*member, reach(rowGroups, readGroups, unitBytes), unitBytes, name, add);
+    metal::CommandGraph graph;
+    rejects([&] { add(graph, narrow.*member); }, std::string(name) + " buffer holds",
+            "a view of leading inputs over planes of its own inputs was accepted");
+    require(graph.empty(), "a view of leading inputs over planes of its own inputs encoded a dispatch");
+  }
+
+  Projection rotated = gguf;
+  rotated.rotation.signs = allocate(backend, k);
+  const Projection plain(n, k, wideAffine);
+  const LinearPlan gateUp = linear.decodePlan(plain, 1, LinearEpilogue::GateUp, &affine);
+  const auto refuses = [&](const Projection &view, const LinearPlan &plan, std::string_view refusal,
+                           const Projection *gate = nullptr) {
+    metal::CommandGraph graph;
+    rejects([&] { (void)linear.add(graph, buffersOf(plan), view, plan, gate); }, refusal,
+            "a view of leading inputs ran on a plan without its instance");
+    require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
+  };
+  constexpr std::string_view kOtherPlan = "a view of leading inputs runs only the quantized prefill residual tiles";
+  refuses(affine, linear.decodePlan(affine, 1, LinearEpilogue::Residual), kOtherPlan);
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate}) {
+    refuses(affine, residualPrefill(WeightLayout::Affine64, {LinearTile::N128, 0, LinearSimdgroups::Four}, epilogue),
+            kOtherPlan);
+    refuses(gguf, residualPrefill(WeightLayout::Block32, {.tile = LinearTile::GgufPrefill}, epilogue), kOtherPlan);
+  }
+  refuses(gguf,
+          Linear::plan({{n, k}, 32, LinearPhase::Prefill, LinearEpilogue::Residual, WeightLayout::Block32},
+                       {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16),
+          kOtherPlan);
+  refuses(rotated, ggufPlan, kOtherPlan);
+  refuses(plain, gateUp, kOtherPlan, &affine);
+
+  // The views' factories: inputs beyond the projection's or of part of a quant group or meta unit, and a projection
+  // of float or rotated weights or of a view, are refused.
+  const Projection wideProjection(n, wide, wideAffine), wideGguf(n, wide, BlockWeights{{wideSegment}});
+  constexpr std::string_view kInputs = "a view of leading inputs takes whole quant groups and meta units";
+  constexpr std::string_view kSource = "views of a projection's planes take affine Q4 weights or one unrotated";
+  rejects([&] { (void)wideProjection.leadingInputs(wide + 64); }, kInputs, "a view of more inputs than rows hold");
+  rejects([&] { (void)wideProjection.leadingInputs(k + 32); }, kInputs, "a view of part of a quant group");
+  rejects([&] { (void)wideGguf.leadingInputs(k + 64); }, kInputs, "a view of part of a Q5_K meta unit");
+  const Projection floats(n, wide, BlockWeights{{QuantizedSegment::floats(n, wide, allocate(backend, n * wide * 4))}});
+  Projection rotatedSource = wideGguf;
+  rotatedSource.rotation.signs = allocate(backend, wide);
+  rejects([&] { (void)floats.leadingInputs(k); }, kSource, "a view of float weights");
+  rejects([&] { (void)rotatedSource.leadingInputs(k); }, kSource, "a view of rotated weights");
+  rejects([&] { (void)affine.leadingInputs(k / 2); }, kSource, "a view of a view");
+  rejects([&] { (void)floats.leadingRows(backend, 256); }, kSource, "a view of the rows of float weights");
+
+  // A view of leading rows, whole 256-row tiles, takes each plane's first tiles.
+  const Projection affineRows = wideProjection.leadingRows(backend, 256), ggufRows = wideGguf.leadingRows(backend, 256);
+  require(affineRows.outputSize == 256 && affineRows.inputSize == wide && !affineRows.planeInputs() &&
+              affineRows.affine().weights.sizeBytes() == uint64_t{256} * wide / 2 &&
+              affineRows.affine().scales.sizeBytes() == uint64_t{256} * (wide / 64) * 2 &&
+              affineRows.affine().biases.sizeBytes() == uint64_t{256} * (wide / 64) * 2,
+          "a view of 256 affine rows does not hold their tile");
+  const QuantizedSegment &segment = ggufRows.blocks().segments.front();
+  require(ggufRows.outputSize == 256 && segment.outputSize == 256 && segment.inputSize == wide &&
+              segment.plane0.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane0_bytes &&
+              segment.plane1.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane1_bytes &&
+              segment.meta.sizeBytes() == uint64_t{256} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes,
+          "a view of 256 Q5_K rows does not hold their tile");
+  for (const uint32_t count : {0u, 128u, n + 256})
+    rejects([&] { (void)wideProjection.leadingRows(backend, count); }, "whole plane tiles",
+            "a view of " + std::to_string(count) + " leading rows");
+}
+
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   std::array<uint64_t, 3> result{};
   const std::array buffers{projection.affine().weights, projection.affine().scales, projection.affine().biases};
@@ -2160,6 +2327,7 @@ int main(int argc, char **argv) {
     producerTableContract(backend);
     rotatedRegisterInput(backend);
     blockExtents(backend);
+    leadingInputViews(backend);
     registerTileExtents(backend);
     Linear linear(backend.capabilities());
     for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},

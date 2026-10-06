@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "engine/AneFfnStartup.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/CacheDirectory.hpp"
@@ -10,6 +11,8 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "engine/ReleasableMemory.hpp"
+#include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <condition_variable>
@@ -104,6 +107,10 @@ struct RuntimeResourcesConfig {
   // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       queryHostAvailableMemory;
+  // The prefill FFN's Neural Engine split (startAneFfn): off with
+  // --disable-ane, and a benchmark round runs the split of the first so that
+  // rounds repeat one another.
+  AneFfnSetting aneFfn;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -156,19 +163,23 @@ private:
 };
 
 // Owns every process-wide native resource exactly once. Members go in
-// reverse declaration order: Cache -> KV pool -> KV disk tier -> state
-// storage -> KV page storage -> governor -> loaded model -> Metal backend
-// -> a persistent tier's directory, whose lock goes last. The KV disk tier
-// must go before the KV page storage: its IO worker reads and writes pages
-// in place in the extents, and its destructor waits for every transfer in
-// flight. A persistent tier's files are sealed first, however the process
-// ends, so that the copies the cache lets go of stay for the next process.
+// reverse declaration order: what the engine gives back while idle -> Neural
+// Engine split -> Cache -> KV pool -> KV disk tier -> state storage -> KV
+// page storage -> governor -> loaded model -> Metal backend -> a persistent
+// tier's directory, whose lock goes last.
+// The KV disk tier must go before the KV page storage: its IO worker reads
+// and writes pages in place in the extents, and its destructor waits for
+// every transfer in flight. A persistent tier's files are sealed first,
+// however the process ends, so that the copies the cache lets go of stay for
+// the next process.
 class RuntimeResources final {
 public:
-  // A persistent tier takes back what the last process left before create()
-  // returns.
+  // `requestedContextTokens` is the context the engine is asked to hold
+  // (--max-context), zero for the automatic context (AneFfnOutcome::context),
+  // which the Neural Engine split must leave. A persistent tier takes back
+  // what the last process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
-  create(const RuntimeResourcesConfig &config);
+  create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);
 
   RuntimeResources(const RuntimeResources &) = delete;
   RuntimeResources &operator=(const RuntimeResources &) = delete;
@@ -202,9 +213,19 @@ public:
   [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
     return hostAvailableAtStart_;
   }
+  // The share the prefill FFN's Neural Engine split runs at and the least
+  // rows of a chunk it takes; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
+  [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
+  // How the start's split came out, and the automatic context.
+  [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // The split as it stands now, for /status.
+  [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
-  [[nodiscard]] model::WeightImages &weightImages() noexcept { return *model_.images; }
+  // What the engine gives back while idle (NativeLoopConfig::weights): the
+  // weight images, and the Neural Engine split's program if it runs one.
+  [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }
   [[nodiscard]] ActualMemoryReport
   actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
 
@@ -221,6 +242,7 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
@@ -239,6 +261,10 @@ private:
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
+  std::unique_ptr<ops::AneFfn> aneFfn_;
+  // Over model_'s images and aneFfn_.
+  ReleasableMemory releasableMemory_;
+  AneFfnOutcome aneFfnOutcome_;
   std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
@@ -246,6 +272,17 @@ private:
   std::condition_variable probationWake_;
   bool probationStopped_ = false;
 };
+
+// The model's side of the split of `loaded`'s target on `backend`, valid
+// while `backend`, `loaded` and `operators` are: its timing and prepared split
+// run on a prefill arena of their own, its programs wait for the ANE's
+// service until `cancelled` returns true, and its calibrations are
+// remembered beside the programs (ane::recall) under its layers' shapes and
+// formats, the device, the macOS version, the engine's `buildId` and the
+// most units the plan holds.
+[[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+                                      const ops::ExecutionPlans &operators, kv::Format format,
+                                      std::string_view buildId, std::function<bool()> cancelled);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

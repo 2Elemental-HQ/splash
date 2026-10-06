@@ -9,10 +9,17 @@
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
+#include <array>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <variant>
+#include <vector>
+
+namespace splash::ops {
+class AneFfn;
+} // namespace splash::ops
 
 namespace splash::model {
 
@@ -70,6 +77,8 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
+  // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
+  ops::AneFfn *aneFfn = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -96,6 +105,14 @@ loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor);
 
+// The FFN layers of a dense target, which the prefill FFN's Neural Engine
+// split (ops::AneFfn) may take; none for another target.
+[[nodiscard]] std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model);
+// Runs `use` on a prefill arena allocated for the call: on the dense FFN's
+// buffers of a full chunk and the hidden rows layers alternate between.
+void withPrefillArena(
+    metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
+    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,

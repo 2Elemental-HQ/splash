@@ -24,6 +24,18 @@ struct Q4Params {
 static_assert(sizeof(Q4Params) == 8,
               "Q4 projection parameters are 8 bytes on both sides");
 
+// The prefill residual kernels over a view of the leading inputs of wider
+// weight rows (prefill_linear_q4_*_leading_inputs): each row of the weight,
+// scale and bias planes holds plane_input_size inputs, of which the
+// projection reads the first matrix.input_size.
+struct Q4PrefillLeadingParams {
+  Q4Params matrix;
+  uint32_t plane_input_size;
+};
+
+static_assert(sizeof(Q4PrefillLeadingParams) == 12,
+              "Q4 leading-input prefill parameters are 12 bytes on both sides");
+
 // The persistent decode tiles' matrix and their grid's `groups`
 // threadgroups, which stride over the column tiles. The stride is a
 // parameter rather than [[threadgroups_per_grid]]: compiled at -O3, a loop

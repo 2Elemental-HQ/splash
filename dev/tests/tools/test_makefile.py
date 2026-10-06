@@ -269,6 +269,7 @@ class MakefileTests(unittest.TestCase):
                         "LANGUAGE_ONLY=1",
                         f"MODEL_ROOT={model_root}",
                         f"BASELINE={baseline}",
+                        "ANE_FFN_SHARE=0",
                         f"VENV={directory / 'venv'}",
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -281,6 +282,8 @@ class MakefileTests(unittest.TestCase):
                     for command in commands:
                         arguments = parse_args(command[command.index(script) + 1 :])
                         self.assertEqual(arguments.model_root, model_root)
+                        if script == "dev.benchmarks.backend_regression":
+                            self.assertEqual(arguments.ane_ffn_share, 0.0)
 
 
 if __name__ == "__main__":
