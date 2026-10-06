@@ -656,6 +656,20 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
   };
 }
 
+AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
+  if (!aneFfn_)
+    return {.reason = aneFfnOutcome_.reason};
+  const bool stopped = aneFfn_->retired();
+  const ops::AneFfn::Served &served = aneFfn_->served();
+  return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
+          stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
+          aneFfn_->share(),
+          aneFfn_->minimumRows(),
+          served.commands,
+          served.evaluations,
+          served.milliseconds};
+}
+
 ActualMemoryReport RuntimeResources::actualMemoryReport(
     const model::ModelMemoryActual &modelMemory) const {
   ActualMemoryReport report;

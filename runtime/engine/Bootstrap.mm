@@ -143,7 +143,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
-      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot());
+      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
+      resources_->aneFfnSnapshot());
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(

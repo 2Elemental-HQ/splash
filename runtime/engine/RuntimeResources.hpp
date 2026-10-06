@@ -12,6 +12,7 @@
 #include "model/QwenState.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ReleasableMemory.hpp"
+#include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <condition_variable>
@@ -218,6 +219,8 @@ public:
   [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
   // How the start's split came out.
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // The split as it stands now, for /status.
+  [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the
