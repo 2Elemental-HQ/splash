@@ -145,10 +145,6 @@ struct EngineMemoryBreakdown {
   uint64_t minimumRequiredBytes = 0;
   uint64_t deficitBytes = 0;
 
-  // What the engine allocates as it starts and serves one request of
-  // `contextTokens`: the shared arenas, one lane's state and the request's KV
-  // pages, at least the runway warmup takes.
-  [[nodiscard]] uint64_t servingBytes(uint32_t contextTokens) const noexcept;
   [[nodiscard]] std::string toStatusJson() const;
   [[nodiscard]] std::string describe() const;
 };

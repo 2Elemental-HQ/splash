@@ -1504,26 +1504,15 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             queryHostAvailableMemory, 0);
-    // As at startup, the split runs only while the host holds it beside what
-    // the runtime allocates to serve the oracle's pages, before it exists and
-    // once it does. It is allocated beside the weights, outside the
-    // governor's admissions, and its own category of the plan bounds it, as
-    // the memory audit requires.
+    // The split is allocated beside the weights, outside the governor's
+    // admissions, and its own category of the plan bounds it, as the memory
+    // audit requires.
     std::unique_ptr<ops::AneFfn> aneFfn;
     if (aneFfnShare > 0.0) {
-      const uint64_t serving = budget.servingBytes(pageCount * kv::kPageTokens);
-      if (governor.hostHolds(aneFfnBytes + serving)) {
-        if (aneFfnFault) ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
-        aneFfn = model::createAneFfn(backend, model, aneFfnShare);
-        require(aneFfn->allocatedBytes() <= aneFfnBytes,
-                "the Neural Engine split allocated more than its plan");
-        if (!governor.hostHolds(serving))
-          aneFfn.reset();
-      }
-      if (!aneFfn) {
-        std::cout << "ane_ffn_split unavailable: it leaves the host too little free memory\n";
-        aneFfnShare = 0.0;
-      }
+      if (aneFfnFault) ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
+      aneFfn = model::createAneFfn(backend, model, aneFfnShare);
+      require(aneFfn->allocatedBytes() <= aneFfnBytes,
+              "the Neural Engine split allocated more than its plan");
     }
     std::cout << "ane_ffn_share=" << aneFfnShare << '\n';
     const metal::AllocationAdmission governed =

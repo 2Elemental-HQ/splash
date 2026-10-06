@@ -221,21 +221,6 @@ void testNeuralEngineSplitIsBudgeted() {
           "the split is missing from the memory plan status");
 }
 
-// Serving one request takes the arenas, one lane's state and its KV pages,
-// never less than the runway warmup takes.
-void testServingBytes() {
-  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
-  const auto &budget = plan.breakdown();
-  const uint64_t base = budget.sharedPrefillBytes + budget.sharedDecodeBytes + budget.laneStateBytes;
-  const uint64_t runway = budget.minimumDynamicBytes - budget.laneStateBytes;
-  require(budget.servingBytes(0) == base + runway && budget.servingBytes(1) == base + runway,
-          "a short request was planned below the warmup runway");
-  const uint32_t tokens = 4096 * budget.kvPageTokens + 1;
-  require(4097 * budget.kvPageBytes > runway &&
-              budget.servingBytes(tokens) == base + 4097 * budget.kvPageBytes,
-          "a request's KV pages were not counted whole");
-}
-
 // The pipeline and runtime reserves are the model constants rather than part
 // of a model's plan, and a model's plan without one of its arenas is refused.
 void testReservesAreTheModelConstants() {
@@ -401,7 +386,6 @@ int main() {
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
     testNeuralEngineSplitIsBudgeted();
-    testServingBytes();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
     testContextTokensWithin();

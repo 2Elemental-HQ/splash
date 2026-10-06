@@ -183,12 +183,6 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
   return out.str();
 }
 
-uint64_t EngineMemoryBreakdown::servingBytes(uint32_t contextTokens) const noexcept {
-  const uint64_t runway = minimumDynamicBytes - laneStateBytes;
-  const uint64_t pages = (uint64_t{contextTokens} + kvPageTokens - 1) / kvPageTokens;
-  return sharedPrefillBytes + sharedDecodeBytes + laneStateBytes + std::max(runway, pages * kvPageBytes);
-}
-
 std::string EngineMemoryBreakdown::describe() const {
   std::ostringstream out;
   out << "physical memory: " << bytesAndMiB(physicalMemoryBytes) << '\n'

@@ -1552,12 +1552,10 @@ plan with it still holds `--max-context`, or without one all the context the
 GPU alone would. Its program also holds buffers in the ANE's service, outside
 Metal, which only the host's free memory shows: on Qwen3.8-27B about 0.7 GB at
 the M6's share and 0.2 GB at the M5 Pro's, against 0.5 and 0.26 GB of the
-split's own. So the split also runs only while the host still holds, above the
-governor's 1 GiB margin, what the engine allocates to serve that context (the
-arenas, one lane's state and the context's KV pages): a start asks the host
-before it creates the split, for its planned bytes, and again once it has
-created it. The GPU runs the FFN alone if no share gains 5%, the check fails,
-either rule refuses, or the ANE or one of its functions is unavailable, as
+split's own; the governor meets them while serving as it meets other
+applications' memory. The GPU runs the FFN alone if no share gains 5%, the
+check fails, the plan refuses, or the ANE or one of its functions is
+unavailable, as
 under Metal's validation layer, whose wrapped shared events the ANE cannot
 share; only cancellation ends the start. Startup logs which (`Neural Engine
 FFN split at share ...`). The first start compiles the ANE program, about 9 s

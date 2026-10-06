@@ -133,18 +133,13 @@ std::string fixed(double value, int digits) {
 // The prefill FFN's Neural Engine split the engine runs, if any, which
 // replaces `memoryPlan` with the plan that sets its memory aside. It runs at
 // the share the config gives, or else at the one calibration finds fastest,
-// while its program loads and runs and the engine still holds the context the
-// config asks for, or all the context `memoryPlan` holds when it asks none:
-// in that plan, and in the host's free memory beside what the engine
-// allocates to serve it, above the governor's margin. Otherwise the GPU runs
-// the FFN alone on `memoryPlan` as it is. A failure of the split's, host
-// memory pressure its own memory caused included, leaves the GPU alone; only
-// cancellation ends the start, which meets the host's limits again without
-// the split.
+// while its program loads and runs and that plan still holds the context the
+// config asks for, or all the context `memoryPlan` holds when it asks none.
+// Otherwise the GPU runs the FFN alone on `memoryPlan` as it is. A failure of
+// the split's leaves the GPU alone; only cancellation ends the start.
 std::unique_ptr<ops::AneFfn>
 startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
             const ops::ExecutionPlans &operators, const RuntimeResourcesConfig &config,
-            const MemoryGovernor &governor,
             const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,
             EngineMemoryPlan &memoryPlan) {
   if (config.aneFfnShare && *config.aneFfnShare == 0.0) {
@@ -182,22 +177,7 @@ startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                   " tokens of context, not " + std::to_string(context));
       return {};
     }
-    // Its program's buffers live in the Neural Engine's service, beyond its
-    // own, which only the host's free memory shows: the host is asked before
-    // the split exists, for its planned bytes, and again once it does.
-    const uint64_t serving = plan->breakdown().servingBytes(context);
-    const auto leftToServe = [&] {
-      return "it leaves the host too little free memory to serve " + std::to_string(context) + " tokens";
-    };
-    if (!governor.hostHolds(bytes + serving)) {
-      unavailable(leftToServe());
-      return {};
-    }
     auto split = model::createAneFfn(backend, loaded, calibration.share);
-    if (!governor.hostHolds(serving)) {
-      unavailable(leftToServe());
-      return {};
-    }
     memoryPlan = std::move(*plan);
     if (config.aneFfnShare)
       logLine("Neural Engine FFN split at the given share ", fixed(calibration.share, 3), ".");
@@ -540,7 +520,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
     std::unique_ptr<ops::AneFfn> aneFfn =
-        startAneFfn(*backend, loaded, operators, config, *memoryGovernor, planMemory, memoryPlan);
+        startAneFfn(*backend, loaded, operators, config, planMemory, memoryPlan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,

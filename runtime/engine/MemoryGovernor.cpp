@@ -24,12 +24,6 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
          static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
 }
 
-// Whether `room` of the host's headroom holds `bytes` with the warning margin
-// left free.
-bool roomHolds(uint64_t room, uint64_t bytes) noexcept {
-  return bytes <= room && room - bytes >= kHostWarningMarginBytes;
-}
-
 } // namespace
 
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
@@ -169,10 +163,6 @@ uint64_t MemoryGovernor::hostHeadroomBytes(
       : 0;
 }
 
-bool MemoryGovernor::hostHolds(uint64_t bytes) const noexcept {
-  return roomHolds(hostHeadroomBytes(sampleHostAvailable(), reservedBytes_), bytes);
-}
-
 std::optional<MemoryGovernor::Reservation>
 MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!bytes) {
@@ -191,7 +181,9 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // Growth leaves the warning margin free above the host's reserve and waits
   // for the recovery margin once the host has run short, unless a request
   // in service needs it (setServing).
-  const bool hostRoomFits = roomHolds(hostHeadroomBytes(hostAvailable, 0), requested);
+  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  const bool hostRoomFits =
+      requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
