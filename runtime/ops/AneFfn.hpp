@@ -138,11 +138,11 @@ private:
   // of the ANE's channels), or with the ANE's evaluation, which the shared
   // event orders between the packing and the join.
   enum class Parts : uint8_t { Gpu, Both };
-  // The program's function of `rows` rows, its procedure, and the surfaces it
-  // reads, bound for each weight set.
+  // The program's function of `rows` rows over the surfaces of each weight
+  // set, by set.
   struct Evaluation final {
-    uint32_t rows = 0, procedure = 0;
-    std::array<std::vector<ane::Surface>, 2> bindings;
+    uint32_t rows = 0;
+    std::vector<ane::Program::Binding> bindings;
   };
   // An evaluation of weight set `set`: it starts once the GPU raises the
   // event to `ready`, and raises it to `done`.

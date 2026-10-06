@@ -1557,10 +1557,15 @@ created it. The GPU runs the FFN alone if no share gains 5%, the check fails,
 either rule refuses, or the ANE or one of its functions is unavailable, as
 under Metal's validation layer, whose wrapped shared events the ANE cannot
 share; only cancellation ends the start. Startup logs which (`Neural Engine
-FFN split at share ...`). The first start compiles the ANE program, about
-10-15 s on an M5 and half a minute on an M6; the ANE service keeps it under a
-hash of its source, which stays in `$TMPDIR/splash-ane-programs`, so later
-starts load it until macOS clears that directory. Each share compiles a
+FFN split at share ...`). The first start compiles the ANE program, about 9 s
+on an M5 Max (27 s for calibration's share 0.8) and half a minute on an M6;
+the ANE service keeps it under a hash of its source, which stays in
+`splash-ane` of the per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`),
+so later starts load it, in about 0.1 s, until macOS clears that directory.
+Startup gives the service 120 s to compile and load a program, after which
+the GPU runs alone: the private client's work for every program runs in turn
+on one queue (`runtime/ane/Program.mm`), so work queued behind a service that
+stopped answering runs out of its time too. Each share compiles a
 program of its own, and the M6's ANE service keeps few, so a start keeps the
 share the last one chose (`choice-*` in that directory) while it stays within
 1% of the best. The ANE computes in fp16, whose range (±65504) bounds the FFN values a
@@ -1569,7 +1574,12 @@ about 1e-4 to 7e-4 on Qwen3.8-27B); `splash serve --no-ane` keeps the FFN on
 the GPU, and `backend-benchmark --ane-ffn-share` runs a given share.
 `make test-engine-metal` runs `ane-ffn`: its kernels against CPU references
 for affine Q4 and every GGUF format under shader validation, then, without it,
-the split's memory and its output against the GPU alone.
+the split's memory and its output against the GPU alone, and the private
+client's failures, limits, unload and load, and cache files on a small
+program. `ane-program-faults` links the client's instrumented build
+(`runtime/ane/ProgramInstrumentation.hpp`), whose injected faults later tests
+of the split can use, and checks that an Objective-C exception and a changed
+method signature fail as `std::runtime_error`.
 
 ### Residency and KV extents
 

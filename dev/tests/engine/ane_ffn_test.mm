@@ -8,14 +8,21 @@
 // - the split: which layers, shares and chunks it takes; for three layers of affine Q4 and of mixed GGUF formats,
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two programs and of the
 //   most rows compute what the GPU computes alone within int8's error.
+// - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
+//   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
+//   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
+//   leaves no partial file when it cannot write one.
 // The kernels round where the CPU may not (fast-math rsqrt and division, fused multiply-adds), so an int8 value may
 // differ by one and a scale by its last bit. The split runs on the Neural Engine, which every Apple Silicon Mac has.
 // Metal's validation layer wraps the shared event that orders the split's GPU and ANE work in one the ANE cannot
-// share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split` the others.
+// share, so `kernels` runs the first three checks, which test-engine-metal validates, and `split` and `program` the
+// others.
 #include "AffineQ4Fixture.hpp"
+#include "AneProgramFixture.hpp"
 #include "Checked.hpp"
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
+#include "TestFiles.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/AneFfn.h"
@@ -27,17 +34,30 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+// What the program checks send the private AppleNeuralEngine client beside
+// ane::Program.
+@protocol AneTestModel
++ (id)modelAtURL:(NSURL *)url key:(NSString *)key;
+@end
+@protocol AneTestClient
++ (id)sharedConnection;
+- (void)purgeCompiledModel:(id)model;
+@end
 
 using namespace splash;
 using namespace splash::ops;
@@ -449,12 +469,138 @@ void split(MetalBackend &backend) {
   split(backend, linear, gguf, ffn, hidden);
 }
 
+// ---------------------------------------------------------------- the program
+using ane::Program;
+using test::AneSum;
+using test::thrown;
+
+const Program::Limits kLimits{std::chrono::seconds(120), {}};
+constexpr auto kEvaluationTimeout = std::chrono::seconds(10);
+
+// Purges the service's compilation of the program whose files are in
+// `directory`, as the service may on its own: its name is the service's key.
+void purge(const std::filesystem::path &directory) {
+  @autoreleasepool {
+    id model = [(Class<AneTestModel>)NSClassFromString(@"_ANEModel")
+        modelAtURL:[NSURL fileURLWithPath:@(directory.c_str()) isDirectory:YES]
+               key:@(directory.filename().c_str())];
+    [[(Class<AneTestClient>)NSClassFromString(@"_ANEClient") sharedConnection] purgeCompiledModel:model];
+  }
+}
+
+// One evaluation of `binding` that reports success and sums the inputs.
+void evaluates(AneSum &sum, Program &program, const Program::Binding &binding, const std::string &what) {
+  sum.fill(rng);
+  const std::optional<bool> result = sum.evaluate(program, binding, kEvaluationTimeout);
+  if (result != true)
+    fail(what + (result ? ": the evaluation failed" : ": the evaluation did not complete"));
+  else if (!sum.summed())
+    fail(what + ": the output is not the inputs' sum");
+}
+
+// What fails as a std::exception, an evaluation, and unload() and load().
+void programs(AneSum &sum, const std::filesystem::path &cache) {
+  std::string message = thrown<std::runtime_error>([&] { Program broken("not a MIL program", {}, kLimits, cache); });
+  if (message.find("ANE compilation failed") == std::string::npos) fail("an invalid MIL: " + message);
+  Program program(sum.mil("sum"), {}, kLimits, cache);
+  message = thrown<std::invalid_argument>([&] { static_cast<void>(program.procedure("none")); });
+  if (message.find("no function none") == std::string::npos) fail("a function the program lacks: " + message);
+  message = thrown<std::invalid_argument>(
+      [&] { static_cast<void>(program.bind(program.procedure("sum"), sum.oneInput(), sum.output())); });
+  if (message.find("input count") == std::string::npos) fail("a binding of one input short: " + message);
+  const Program::Binding binding = sum.bind(program, "sum");
+  evaluates(sum, program, binding, "an evaluation");
+  section("program: an invalid MIL, a function it lacks and a binding of one input short throw; it evaluates");
+
+  const std::vector<_Float16> loaded = sum.values();
+  program.unload();
+  program.unload();
+  message = thrown<std::runtime_error>([&] { sum.enqueue(program, binding, [](bool) {}); });
+  if (message.find("not loaded") == std::string::npos) fail("an evaluation of an unloaded program: " + message);
+  program.load(kLimits);
+  program.load(kLimits);
+  const std::optional<bool> result = sum.evaluate(program, binding, kEvaluationTimeout);
+  if (result != true)
+    fail("an evaluation once loaded again did not succeed");
+  else if (sum.values() != loaded)
+    fail("an evaluation once loaded again computed other values");
+
+  // A program whose compilation the service no longer holds.
+  const test::TemporaryDirectory own("splash-ane-program");
+  Program lost(sum.mil("sum_lost"), {}, kLimits, own.path());
+  lost.unload();
+  purge(test::programDirectory(own.path()));
+  message = thrown<std::runtime_error>([&] { lost.load(kLimits); });
+  if (message.find("not compiled") == std::string::npos) fail("load() of a program not compiled: " + message);
+  section("unload() and load(): twice each, the same values once loaded again; load() does not compile");
+}
+
+// Limits that end the wait for the service.
+void limits(AneSum &sum, const std::filesystem::path &cache) {
+  std::string message = thrown<std::runtime_error>(
+      [&] { Program late(sum.mil("sum_late"), {}, {std::chrono::nanoseconds(1), {}}, cache); });
+  if (message.find("the Neural Engine did not answer within 1e-09 s") == std::string::npos)
+    fail("a limit of 1 ns: " + message);
+  // Queued behind the work the first stopped waiting for.
+  Program next(sum.mil("sum_next"), {}, kLimits, cache);
+  evaluates(sum, next, sum.bind(next, "sum_next"), "the program after a limit ran out");
+  message = thrown<ane::Interrupted>([&] {
+    Program interrupted(sum.mil("sum_interrupted"), {}, {std::chrono::seconds(120), [] { return true; }}, cache);
+  });
+  if (message.find("interrupted") == std::string::npos) fail("an interrupted wait: " + message);
+  section("limits: 1 ns runs out, and a program comes up after it; an interrupted wait throws Interrupted");
+}
+
+// The cache's files: one of other bytes is written again, and one that cannot
+// be written leaves no partial file.
+void cacheFiles(AneSum &sum) {
+  const test::TemporaryDirectory cache("splash-ane-program");
+  const std::string mil = sum.mil("sum_cached");
+  { Program first(mil, {}, kLimits, cache.path()); }
+  const std::filesystem::path directory = test::programDirectory(cache.path()), source = directory / "model.mil";
+  std::string other = mil;
+  other[other.find("sum_cached")] = 'S';
+  test::writeFile(source, other);
+  {
+    Program again(mil, {}, kLimits, cache.path());
+    evaluates(sum, again, sum.bind(again, "sum_cached"), "a program whose cached source was written again");
+  }
+  const std::vector<uint8_t> written = test::readFile(source);
+  if (std::string(written.begin(), written.end()) != mil) fail("a cached source of the same size kept other bytes");
+
+  const auto partials = [&] {
+    return std::ranges::count_if(std::filesystem::directory_iterator(directory),
+                                 [](const auto &entry) { return entry.path().extension() == ".partial"; });
+  };
+  test::writeFile(source, other);
+  std::filesystem::permissions(directory, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+  std::string message = thrown<std::runtime_error>([&] { Program unwritable(mil, {}, kLimits, cache.path()); });
+  std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+  if (message.find("unable to write") == std::string::npos) fail("an unwritable cache directory: " + message);
+  if (partials()) fail("an unwritable cache directory kept a partial file");
+  // A source that cannot be replaced: a directory in its place.
+  std::filesystem::remove(source);
+  std::filesystem::create_directories(source / "entry");
+  message = thrown<std::filesystem::filesystem_error>([&] { Program unreplaced(mil, {}, kLimits, cache.path()); });
+  if (message.find("rename") == std::string::npos) fail("a source that cannot be replaced: " + message);
+  if (partials()) fail("a source that cannot be replaced left a partial file");
+  section("cache: a source of the same size and other bytes is written again; a failed write leaves no partial file");
+}
+
+void program(MetalBackend &backend) {
+  AneSum sum(backend);
+  const test::TemporaryDirectory cache("splash-ane-program");
+  programs(sum, cache.path());
+  limits(sum, cache.path());
+  cacheFiles(sum);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   const std::string_view mode = argc == 3 ? argv[2] : "";
-  if (mode != "kernels" && mode != "split") {
-    std::cerr << "usage: ane-ffn METALLIB kernels|split\n";
+  if (mode != "kernels" && mode != "split" && mode != "program") {
+    std::cerr << "usage: ane-ffn METALLIB kernels|split|program\n";
     return 2;
   }
   try {
@@ -466,8 +612,10 @@ int main(int argc, char **argv) {
       inputs(backend, signs, sign);
       weights(backend, signs, sign);
       join(backend);
-    } else {
+    } else if (mode == "split") {
       split(backend);
+    } else {
+      program(backend);
     }
   } catch (const std::exception &error) {
     std::cout << "FAIL " << error.what() << '\n';

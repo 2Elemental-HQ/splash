@@ -225,6 +225,9 @@ ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 # Only tests and benchmarks link it, ahead of the engine library, whose own
 # MetalBackend object the linker then never pulls.
 ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrumented.o
+# Program with the fault seam ane/ProgramInstrumentation.hpp declares, linked
+# the same way.
+ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/DraftAttention.cpp \
@@ -296,10 +299,10 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
-	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(PRODUCTION_AIRS) \
-	$(LIB) $(TARGET)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
+	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
-	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -332,6 +335,11 @@ $(ENGINE_INSTRUMENTED_METAL_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
 		-DSPLASH_BACKEND_INSTRUMENTATION=1 -c $< -o $@
+
+$(ENGINE_INSTRUMENTED_ANE_OBJECT): runtime/ane/Program.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_ANE_INSTRUMENTATION=1 -c $< -o $@
 
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)

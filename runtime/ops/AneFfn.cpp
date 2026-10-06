@@ -37,6 +37,11 @@ constexpr uint32_t kRotateGroup = ANE_FFN_INPUT_BLOCK * (ANE_FFN_ROTATE_THREADS 
 // for the ANE, whole 256-row tiles of the weight planes for the GPU.
 constexpr uint32_t kChannelUnit = std::max(QUANT_TILE_ROWS, ANE_FFN_INTERMEDIATE_BLOCK);
 constexpr auto kCompletionTimeout = std::chrono::seconds(10);
+// How long the service may take to compile and load the program: four times
+// the cold compile of the largest the split compiles, calibration's at share
+// 0.8 (27 s on an M5 Max, about 30 s on an M6), so that a busy Mac still
+// finishes and only a service that stopped answering runs out of it.
+constexpr auto kProgramLimit = std::chrono::seconds(120);
 
 uint32_t gpuChannels(uint32_t intermediate, double share) {
   if (!(share > 0.0 && share < 1.0)) throw std::invalid_argument("ANE FFN share must lie in (0, 1)");
@@ -517,17 +522,21 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
-                                            rotationBlob(shape_.ane, signs));
+                                            rotationBlob(shape_.ane, signs),
+                                            ane::Program::Limits{kProgramLimit, {}});
   for (const uint32_t rows : functionRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
     evaluation.rows = rows;
-    evaluation.procedure = program_->procedure(functionName(rows));
-    for (uint32_t set = 0; set < 2; ++set)
-      for (const std::string &name : program_->inputs(evaluation.procedure)) {
+    const uint32_t procedure = program_->procedure(functionName(rows));
+    for (uint32_t set = 0; set < 2; ++set) {
+      std::vector<ane::Surface> surfaces;
+      for (const std::string &name : program_->inputs(procedure)) {
         const auto input = std::ranges::find(inputs, name, &Input::name);
         if (input == inputs.end()) throw std::logic_error("ANE FFN program has an unknown input " + name);
-        evaluation.bindings[set].push_back(*input->surfaces[set]);
+        surfaces.push_back(*input->surfaces[set]);
       }
+      evaluation.bindings.push_back(program_->bind(procedure, surfaces, memory_.partial));
+    }
   }
   event_ = backend_.newSharedEvent();
 
@@ -635,8 +644,8 @@ void AneFfn::submit() {
   for (const Job &job : jobs) {
     try {
       const Evaluation &evaluation = evaluations_[job.evaluation];
-      program_->enqueue(evaluation.procedure, evaluation.bindings[job.set], memory_.partial, event_, job.ready,
-                        job.done, [completions = completions_](bool success) {
+      program_->enqueue(evaluation.bindings[job.set], event_, job.ready, job.done,
+                        [completions = completions_](bool success) {
                           std::lock_guard lock(completions->mutex);
                           ++completions->completed;
                           completions->failed |= !success;
