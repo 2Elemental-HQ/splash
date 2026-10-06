@@ -143,6 +143,21 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
                 raise models.ModelError(
                     f"invalid installed snapshot reference: {ref}"
                 ) from None
+        except OSError as error:
+            # exFAT have no hard links, so os.link can't publish reference there.
+            # Fallback to an exclusive create instead.
+            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
+            try:
+                # x = open for exclusive creation, failing if the file already exists
+                # b = binary mode
+                with open(ref, "xb") as reference:
+                    reference.write(commit.encode())
+            except FileExistsError:
+                if ref.read_text() != commit:
+                    raise models.ModelError(
+                        f"invalid installed snapshot reference: {ref}"
+                    ) from None
     return ref
 
 

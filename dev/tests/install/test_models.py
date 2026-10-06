@@ -905,6 +905,20 @@ class ModelArtifactTest(unittest.TestCase):
                     legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
         self.assertFalse((models / self.MODEL_ID).exists())
 
+    def test_new_install_pins_where_hard_links_are_unsupported(self):
+        snapshot, _ = self.package_fixture()
+        models = self.root / "models"
+        self.configure_hub(snapshot)
+        with mock.patch.object(
+            hub.os,
+            "link",
+            side_effect=OSError(errno.ENOTSUP, "Operation not supported"),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
+        refs = list((snapshot.parent.parent / "refs/splash").glob("*/*"))
+        self.assertEqual([ref.read_text() for ref in refs], [self.REVISION])
+
     def test_invalid_existing_ref_is_not_ignored(self):
         snapshot, _ = self.package_fixture()
         models = self.root / "models"
