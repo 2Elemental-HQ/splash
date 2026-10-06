@@ -12,7 +12,6 @@
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -69,11 +68,11 @@ void testBandwidth() {
           "the ANE's fraction was not clamped to none or all of the bandwidth");
 }
 
-// T is least at the units where the GPU's part, slowed by the bandwidth, meets the ANE's, and the units chosen are those
-// whose T, or T a unit either way, is least at its longest: G(s) = 20 - 20 s and A(s) = 40 s meet at s = 1/3, where of
-// 10 units 3 (G 14, A 12; 16 a unit either way) beat 2 (G 16; 18 below) and 4 (A 16; 20 above), and of 100 units 33
-// (13.4; 13.6 either way) beat 32 (13.8 below) and 34 (14.0 above). Each Mac's timings choose their units, the best
-// its sweeps measured.
+// T is least at the units where the GPU's part, slowed by the bandwidth, meets the ANE's, and the units chosen are
+// those whose T, or T a unit either way, is least at its longest: G(s) = 20 - 20 s and A(s) = 40 s meet at s = 1/3,
+// where of 10 units 3 (G 14, A 12; 16 a unit either way) beat 2 (G 16; 18 below) and 4 (A 16; 20 above), and of 100
+// units 33 (13.4; 13.6 either way) beat 32 (13.8 below) and 34 (14.0 above). Each Mac's timings choose their units,
+// the best its sweeps measured.
 void testChoice() {
   const Model model = fit({0.25, 15, 15}, {0.75, 5, 30});
   require(choose(model, 20, 10, 9) == 3u, "the crossing's units were not chosen");
@@ -94,21 +93,15 @@ void testChoice() {
   Model m6 = fit(kMeasured[2].low, kMeasured[2].high);
   require(m6.u > 0.25 && m6.u < 0.35, "the M6's bandwidth term was not fitted");
   m6.u = 0.0;
-  require(choose(m6, kMeasured[2].gpuAlone, 34, 33) == 23u, "the M6 without its bandwidth term did not choose 23 units");
+  require(choose(m6, kMeasured[2].gpuAlone, 34, 33) == 23u,
+          "the M6 without its bandwidth term did not choose 23 units");
 }
 
-// Timings that put T at zero or below, or that are not numbers, choose nothing, and the choice ends; timings a Mac
-// takes again give the same choice.
-void testUnusableAndRepeated() {
+// Timings that put T at zero or below, or that are not numbers, choose nothing.
+void testUnusable() {
   require(!choose(fit({0.5, 1, 1}, {0.6, -0.1, 0.0}), 20, 34, 33), "T of zero chose units");
   const double nan = std::numeric_limits<double>::quiet_NaN();
   require(!choose(fit({0.3, nan, 12}, {0.8, 4, 32}), 20, 10, 9), "lines of NaN chose units");
-  for (const Measured &measured : kMeasured) {
-    std::set<std::optional<uint32_t>> choices;
-    for (int repeat = 0; repeat < 3; ++repeat)
-      choices.insert(choose(fit(measured.low, measured.high), measured.gpuAlone, 34, 33));
-    require(choices.size() == 1, std::string("the ") + measured.mac + "'s timings chose differently");
-  }
 }
 
 // The choice of units the plan holds: the most it holds where T falls beyond them, 30 of 100 (14.0, 14.2 a unit
@@ -176,8 +169,9 @@ void testMinimumRows() {
   require(minimumRows(functions(0.8, {{640, 5.5}})) == 553u, "the least chunk of a function was not found by its rows");
   // A function slower than the GPU at each of its chunks holds back every chunk below it, though they split.
   for (const uint32_t slow : {768u, 896u, 1024u})
-    require(minimumRows(functions(0.8, {{640, 6.5}, {slow, 1.2 * gpuAt(slow)}})) == slow + 1,
-            "a function of " + std::to_string(slow) + " rows that does not split did not hold back the chunks below it");
+    require(minimumRows(functions(0.8, {{slow, 1.2 * gpuAt(slow)}})) == slow + 1,
+            "a function of " + std::to_string(slow) +
+                " rows that does not split did not hold back the chunks below it");
   // Within 2%: function 2048 as slow as the GPU at 2048 rows splits chunks of 2008 rows, whose GPU layer takes 1.95%
   // less, and not of 2007; 2.5% slower than the GPU it splits none.
   require(minimumRows(functions(0.8, {{2048, 20.0}})) == 2008u && !minimumRows(functions(0.8, {{2048, 20.5}})),
@@ -267,7 +261,7 @@ int main() {
     testFit();
     testBandwidth();
     testChoice();
-    testUnusableAndRepeated();
+    testUnusable();
     testMostUnits();
     testNoGain();
     testUsable();

@@ -165,6 +165,9 @@ public:
   // they are (planeInputs()).
   [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
+  // Whether those views take it: its own planes, not a view, of affine Q4
+  // weights or of one unrotated quantized GGUF tensor.
+  [[nodiscard]] bool takesPlaneViews() const noexcept;
   // The inputs each row of the weight planes holds when the projection reads
   // only their first inputSize, a view of leadingInputs(); zero for
   // inputSize. Only the prefill residual tiles of quantized weights take such

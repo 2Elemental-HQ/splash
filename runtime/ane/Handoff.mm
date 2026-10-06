@@ -129,7 +129,6 @@ Handoff::~Handoff() {
 
 const metal::SharedEvent &Handoff::event() const noexcept { return state_->event; }
 
-
 uint64_t Handoff::next() {
   std::lock_guard lock(state_->mutex);
   ++state_->value;

@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
-#include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -76,13 +75,6 @@ std::vector<uint32_t> segments(uint32_t channels) {
   return result;
 }
 
-// A projection the split takes: affine Q4, or one quantized GGUF image tensor.
-bool splittable(const Projection &projection) {
-  if (projection.layout() == WeightLayout::Affine64) return true;
-  const std::vector<QuantizedSegment> &segments = projection.blocks().segments;
-  return segments.size() == 1 && !segments.front().isFloat() && !projection.rotation;
-}
-
 } // namespace
 
 const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
@@ -95,7 +87,8 @@ const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
     return "ANE FFN split needs two or more whole rotation blocks of intermediate channels";
   for (const SwiGluProjections &layer : layers) {
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
-      if (!splittable(*projection)) return "ANE FFN split needs affine Q4 projections or quantized GGUF tensors";
+      if (!projection->takesPlaneViews())
+        return "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
     if (layer.gate->outputSize != intermediate || layer.gate->inputSize != hidden ||
         layer.up->outputSize != intermediate || layer.up->inputSize != hidden || layer.down->outputSize != hidden ||
         layer.down->inputSize != intermediate)
@@ -168,7 +161,7 @@ std::string fp16(double value) {
 // the token's input scale.
 constexpr double kIntermediateFloor = 0x1p-9;
 static_assert(ANE_FFN_INT8_PEAK / kIntermediateFloor <= 65504.0,
-              "the floor's inverse fits fp16, which 127 / 2^-12 overflows");
+              "the int8 peak over the floor fits fp16");
 
 // The rows of the program's functions, ascending.
 std::vector<uint32_t> functionRows() {
@@ -282,7 +275,8 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
     inputs.push_back({"x" + std::to_string(k), {&memory.inputs[k], &memory.inputs[k]}, kSegment, 0});
   inputs.push_back({"tx", {&memory.tokenScale, &memory.tokenScale}, 1, 0});
   for (uint32_t k = 0; k < memory.inputs.size(); ++k) {
-    inputs.push_back({"wg" + std::to_string(k), {&memory.sets[0].gate[k], &memory.sets[1].gate[k]}, shape.ane, kSegment});
+    inputs.push_back(
+        {"wg" + std::to_string(k), {&memory.sets[0].gate[k], &memory.sets[1].gate[k]}, shape.ane, kSegment});
     inputs.push_back({"wu" + std::to_string(k), {&memory.sets[0].up[k], &memory.sets[1].up[k]}, shape.ane, kSegment});
   }
   inputs.push_back({"sg", both(&Weights::gateScale), shape.ane, 1});
@@ -313,7 +307,8 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   };
   for (const Input &input : inputs) {
     const uint32_t width = input.width ? input.width : rows;
-    parameters += (parameters.empty() ? "" : ", ") + input.surfaces[0]->bufferType(input.rows, width) + " " + input.name;
+    parameters +=
+        (parameters.empty() ? "" : ", ") + input.surfaces[0]->bufferType(input.rows, width) + " " + input.name;
     line(tensor(ane::Surface::milType(input.surfaces[0]->element), input.rows, width) + " " + input.name +
          "_t = tensor_buffer_to_tensor<ios17>(input = " + input.name + ")");
   }
@@ -358,8 +353,9 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   f16("h", channels, rows, "mul(x = silu, y = us)");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
        r + "]))");
-  line("tensor<fp16, [" + c + ", " + block + ", 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" +
-       c + ", " + block + ", 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(" +
+  line("tensor<fp16, [" + c + ", " + block +
+       ", 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" + c + ", " + block +
+       ", 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(" +
        std::to_string(ane::kConstantOffset) + ")))]");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32(" +
        std::to_string(channels / ANE_FFN_INTERMEDIATE_BLOCK) +
@@ -519,7 +515,7 @@ bool AneFfn::begin() {
   // evaluations it queued with it.
   if (std::exchange(unfinished_, false)) {
     handoff_.cancel("a command it split did not finish");
-    stopped();
+    warnStopped();
   }
   jobs_.clear();
   nextLayer_ = 0;
@@ -578,7 +574,7 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
   const auto cancel = [&](const std::string &reason) {
     if (!std::exchange(unfinished_, false)) return;
     handoff_.cancel(reason);
-    stopped();
+    warnStopped();
   };
   try {
     return backend_.submitCommandAsync(graph.command(), std::move(completion));
@@ -594,7 +590,7 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
 bool AneFfn::finish() {
   const std::optional<AwakeClock::duration> ran = completed();
   if (!ran) {
-    stopped();
+    warnStopped();
     return false;
   }
   if (!committedEvaluations_) return true;
@@ -604,7 +600,7 @@ bool AneFfn::finish() {
   served_.milliseconds += milliseconds;
   if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
     handoff_.retire(std::move(losing));
-    stopped();
+    warnStopped();
     if (lost_) std::exchange(lost_, {})();
   }
   return true;
@@ -628,7 +624,7 @@ bool AneFfn::release() {
     program_->unload({kReloadLimit, {}});
   } catch (const std::exception &error) {
     handoff_.retire(std::string("its program did not unload: ") + error.what());
-    stopped();
+    warnStopped();
     return false;
   }
   released_ = true;
@@ -652,10 +648,10 @@ void AneFfn::restore() noexcept {
   } catch (...) {
   }
   handoff_.retire("its program did not load again: " + failure);
-  stopped();
+  warnStopped();
 }
 
-void AneFfn::stopped() {
+void AneFfn::warnStopped() {
   if (std::exchange(warned_, true)) return;
   logWarning("Neural Engine FFN split stopped (", handoff_.reason(),
              "); the GPU runs the prefill FFN alone until the engine restarts.");

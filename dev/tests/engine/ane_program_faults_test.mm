@@ -1,6 +1,7 @@
 // The faults runtime/ane/ProgramInstrumentation.hpp injects into ane::Program, on the Neural Engine: an Objective-C
 // exception the framework raises becomes a std::runtime_error, at construction and at an evaluation; a method whose
-// type encoding changed fails construction; and each fault a test of the split can inject does what it says.
+// type encoding changed fails construction; and a throwing enqueue and a failed, a stalled and a delayed evaluation
+// each do what they say.
 #include "AneProgramFixture.hpp"
 #include "AwakeClock.hpp"
 #include "TestFiles.hpp"

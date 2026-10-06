@@ -1,7 +1,5 @@
 #pragma once
 
-#include "ane/Program.hpp"
-
 #include <chrono>
 #include <cstdint>
 #include <string>

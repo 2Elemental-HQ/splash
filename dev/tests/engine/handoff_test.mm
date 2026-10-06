@@ -15,7 +15,6 @@
 
 #import <Metal/Metal.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -60,7 +59,7 @@ uint64_t reached(const SharedEvent &event) {
   return [(__bridge id<MTLSharedEvent>)event.nativeHandle() signaledValue];
 }
 
-// Calls `callback` once `event` reaches `value`, or returns false after `limit`.
+// Whether `event` reaches `value` within `limit`.
 bool awaitValue(const SharedEvent &event, uint64_t value, std::chrono::milliseconds limit) {
   auto reachedValue = std::make_shared<std::promise<void>>();
   std::future<void> future = reachedValue->get_future();

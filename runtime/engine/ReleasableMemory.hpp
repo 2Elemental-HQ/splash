@@ -13,7 +13,8 @@ namespace splash::engine {
 // the split's program in the ANE service (ops::AneFfn::release). release()
 // releases the images, then the program; restore() writes back an image per
 // call, as the images do, then loads the program in one call more. Without a
-// split, or once the split has stopped, it is the images.
+// split it is the images; a split that stopped gives its program back once
+// more, and then nothing (ops::AneFfn::release).
 class ReleasableMemory final : public model::WeightMemory {
 public:
   // The split's part: `release` unloads its program between commands, true

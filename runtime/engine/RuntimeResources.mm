@@ -128,7 +128,7 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
 
 // The layers' part of what ane::recall() keeps a calibration under: their
 // shapes and formats.
-std::string choiceKey(std::span<const ops::SwiGluProjections> layers) {
+std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
   std::string key = "ane-ffn calibration";
   for (const ops::SwiGluProjections &layer : layers)
     for (const ops::Projection *projection : {layer.gate, layer.up, layer.down}) {
@@ -733,7 +733,7 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return prepared;
   };
-  const std::string key = choiceKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
                           std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {

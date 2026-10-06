@@ -107,12 +107,9 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
-// Throws unless views of `p`'s planes can stand for it: its own planes of
-// affine Q4 weights or of one unrotated quantized GGUF tensor.
+// Throws unless views of `p`'s planes can stand for it (takesPlaneViews).
 void requirePlaneViews(const Projection &p) {
-  if (!p.planeInputs() && (p.layout() == WeightLayout::Affine64 ||
-                           (p.blocks().segments.size() == 1 && !p.blocks().segments.front().isFloat() && !p.rotation)))
-    return;
+  if (p.takesPlaneViews()) return;
   throw std::invalid_argument(
       "views of a projection's planes take affine Q4 weights or one unrotated quantized GGUF tensor, not a view");
 }
@@ -122,6 +119,13 @@ void requirePlaneViews(const Projection &p) {
 // Every plane of either layout holds its rows in tiles of QUANT_TILE_ROWS
 // rows, each tile's units in order, so the leading rows' tiles lead it.
 static_assert(SPLASH_AFFINE_TILE_ROWS == QUANT_TILE_ROWS, "affine Q4 and GGUF planes share their tiles");
+
+bool Projection::takesPlaneViews() const noexcept {
+  if (planeInputs_) return false;
+  if (layout() == WeightLayout::Affine64) return true;
+  const std::vector<QuantizedSegment> &segments = blocks().segments;
+  return segments.size() == 1 && !segments.front().isFloat() && !rotation;
+}
 
 Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t rows) const {
   requirePlaneViews(*this);

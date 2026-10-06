@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -16,6 +15,7 @@
 namespace splash::engine {
 namespace {
 
+namespace ane_ffn = ops::ane_ffn;
 using Kind = AneFfnOutcome::Kind;
 
 // `tokens` with its thousands grouped, as the server prints a context.
@@ -83,9 +83,9 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
   if (const std::optional<std::string> reason = model.unavailable())
     return gpuAlone(Kind::Unsupported, *reason, without);
   const std::optional<uint32_t> given =
-      setting.given ? std::optional(ops::ane_ffn::nearestUnits(setting.given->share, model.units)) : std::nullopt;
-  if (setting.given &&
-      (setting.given->minimumRows < ops::AneFfn::kMinimumRows || setting.given->minimumRows > ops::AneFfn::kMaximumRows))
+      setting.given ? std::optional(ane_ffn::nearestUnits(setting.given->share, model.units)) : std::nullopt;
+  if (setting.given && (setting.given->minimumRows < ops::AneFfn::kMinimumRows ||
+                        setting.given->minimumRows > ops::AneFfn::kMaximumRows))
     throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(setting.given->minimumRows) +
                                 " rows");
 
@@ -169,14 +169,21 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
     // The split takes the calibration's least chunk, and judges itself
     // against the GPU alone as calibrated, forgetting the calibration once it
     // loses.
-    const auto take = [&](AneFfnPrepared &prepared, const ops::ane_ffn::Calibration &calibration) {
+    const auto take = [&](AneFfnPrepared &prepared, const ane_ffn::Calibration &calibration) {
       if (!prepared.split) return;
       prepared.split->setMinimumRows(calibration.minimumRows);
-      prepared.split->setBreaker(ops::ane_ffn::Breaker(calibration.gpu),
+      prepared.split->setBreaker(ane_ffn::Breaker(calibration.gpu),
                                  [forget = model.forget, maxAneUnits] { forget(maxAneUnits); });
     };
+    // No split gains enough: the start remembers so, and the GPU alone serves
+    // its own context.
+    const auto noGain = [&](std::string reason) {
+      model.remember(maxAneUnits, {});
+      assumed = 0;
+      return gpuAloneServing(Kind::NoGain, std::move(reason));
+    };
 
-    std::optional<ops::ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
+    std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
         (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
          calibration->minimumRows > ops::AneFfn::kMaximumRows))
@@ -191,28 +198,22 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
                    "set up as calibrated before");
     }
 
-    const ops::ane_ffn::Timings timings = model.time();
-    const std::optional<uint32_t> chosen = ops::ane_ffn::choose(ops::ane_ffn::fit(timings.low, timings.high),
-                                                                timings.gpuAlone, model.units, maxAneUnits);
-    if (!chosen) {
-      model.remember(maxAneUnits, {});
-      assumed = 0;
-      return gpuAloneServing(Kind::NoGain, "no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
-                                               " by enough (calibrated in " + seconds() + ")");
-    }
+    const ane_ffn::Timings timings = model.time();
+    const std::optional<uint32_t> chosen =
+        ane_ffn::choose(ane_ffn::fit(timings.low, timings.high), timings.gpuAlone, model.units, maxAneUnits);
+    if (!chosen)
+      return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
+                    " by enough (calibrated in " + seconds() + ")");
     AneFfnPrepared prepared = model.prepare(*chosen, true);
-    const ops::ane_ffn::ChunkTimings &chunks = prepared.chunks;
+    const ane_ffn::ChunkTimings &chunks = prepared.chunks;
     if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
         fixed(chunks.functions.front().split) + layer + " against " + fixed(chunks.gpu[1].milliseconds);
-    const std::optional<uint32_t> minimumRows = ops::ane_ffn::minimumRows(chunks);
-    if (!minimumRows) {
-      model.remember(maxAneUnits, {});
-      assumed = 0;
-      return gpuAloneServing(Kind::NoGain, "no chunk of the Neural Engine split beats it by enough, " + timed +
-                                               " (calibrated in " + seconds() + ")");
-    }
-    const ops::ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
+    const std::optional<uint32_t> minimumRows = ane_ffn::minimumRows(chunks);
+    if (!minimumRows)
+      return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
+                    seconds() + ")");
+    const ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
     take(prepared, made);
     AneFfnStart start = serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone",
                               "calibrated");

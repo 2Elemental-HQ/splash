@@ -1484,8 +1484,8 @@ int main(int argc, char **argv) {
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     // A dense target's prefill FFN splits with the Neural Engine as a start
-    // splits it (engine::startAneFfn), unless a share is given calibrated by
-    // the build's first run and remembered for the runs after it,
+    // splits it (engine::startAneFfn), calibrated by the build's first run and
+    // remembered for the runs after it unless a share is given,
     // within a plan that holds the oracle's pages. The split is allocated
     // beside the weights, outside the governor's admissions, and its own
     // category of the plan bounds it, as the memory audit requires. A split
@@ -1497,7 +1497,8 @@ int main(int argc, char **argv) {
       require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
       ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
     }
-    const engine::AneFfnModel aneFfnModel = engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
+    const engine::AneFfnModel aneFfnModel =
+        engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " SPLASH_BUILD_ID, {});
     engine::AneFfnStart aneFfnStart =
         engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
     std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '

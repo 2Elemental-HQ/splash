@@ -22,10 +22,10 @@ baseline) on this machine, which must be otherwise idle:
   partial hit (partial_4k_hit) and the GPU time of each short cold prefill
   (short_<rows>_rows_prefill_gpu_ms, by the rows of its first chunk).
 - memory plan: the candidate's plan holds no less context without the Neural
-  Engine split than the baseline serves, whose memory the split takes from
-  the KV cache; the context each serves, the candidate's with the split what
-  its plan holds with the largest split the model could take whichever split
-  a round runs, and the change of the plan's elastic state/KV budget are
+  Engine split than the baseline's holds without it, what a baseline before
+  the split serves; the split takes its memory from the KV cache. The context
+  each serves, the candidate's what its plan holds with the split it
+  calibrated, and the change of the plan's elastic state/KV budget are
   reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
@@ -78,8 +78,8 @@ class RegressionError(RuntimeError):
 def usage(benchmark: Path) -> str:
     """A backend-benchmark's usage, which it prints without arguments. It
     names the options a build takes: older builds take one --scenario and no
-    short scenario, builds before the Neural Engine split no --ane-ffn-share
-    and builds before its least chunk no --ane-ffn-minimum-rows."""
+    short scenario, and builds before the Neural Engine split no
+    --ane-ffn-share."""
     return subprocess.run(
         [str(benchmark)], capture_output=True, text=True, timeout=60
     ).stderr
@@ -170,7 +170,7 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             args.ane_ffn_share_given or args.ane_ffn_share
         ) and args.takes_ane_ffn_share[version]:
             command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
-            if args.ane_ffn_minimum_rows and args.takes_ane_ffn_minimum_rows[version]:
+            if args.ane_ffn_minimum_rows:
                 command += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]
         print(f"round {round_index + 1} {version}: {scenario}", file=sys.stderr)
         with stem.with_suffix(".log").open("w") as log:
@@ -487,9 +487,6 @@ def main(argv=None) -> int:
     args.scenarios = [name for name in SCENARIOS if short or name != "short"]
     args.takes_ane_ffn_share = {
         name: "--ane-ffn-share" in text for name, text in usages.items()
-    }
-    args.takes_ane_ffn_minimum_rows = {
-        name: "--ane-ffn-minimum-rows" in text for name, text in usages.items()
     }
     args.ane_ffn_share_given = args.ane_ffn_share is not None
     args.ane_ffn_minimum_rows = None

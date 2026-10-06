@@ -1402,30 +1402,35 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
 // the split's program. A request waits while the images are written back, an
 // image per tick, and the program is loaded in one tick more, before the
 // request begins. A program that does not load again stops the split, never
-// the engine (ops::AneFfn::restore): the request runs, and a stopped split
-// unloads nothing, so that the images alone come back for the next.
+// the engine (ops::AneFfn::restore): the request runs. The stopped split gives
+// back what a load that ran late may have left once, at the next idle
+// release, and loads nothing, so that the images alone come back after that.
 void testIdleReleaseRestoresTheSplitLast() {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
   Weights weights;
-  // The split's program: whether it is loaded, the times it was loaded
-  // again, and whether the split stopped, as one whose program does not
-  // load again (`failLoad`) does.
-  bool loaded = true, stopped = false, failLoad = false;
+  // The split's program: whether it is loaded, whether the split released
+  // it, the times it was loaded again, and whether the split stopped, as one
+  // whose program does not load again (`failLoad`) does.
+  bool loaded = true, released = false, stopped = false, failLoad = false;
   uint32_t loads = 0;
   ReleasableMemory memory(
       weights, ReleasableMemory::Split{
                    [&] {
                      require(weights.released(),
                              "the split's program was unloaded before the images were released");
-                     if (stopped)
+                     if (released)
                        return false;
+                     released = true;
                      loaded = false;
                      return true;
                    },
                    [&] {
                      require(!weights.released() && !loaded,
                              "the split's program was loaded before every image was written back");
+                     if (!released || stopped)
+                       return;
+                     released = false;
                      ++loads;
                      if (failLoad)
                        stopped = true;
@@ -1478,12 +1483,17 @@ void testIdleReleaseRestoresTheSplitLast() {
   runUntilIdle(loop);
   require(loop.snapshot().completed == 2, "the request did not run after the split stopped");
 
-  require(idlePass(), "the idle release kept the images once the split stopped");
-  require(!imagesBack(3) && loads == 2 && loop.weightsSnapshot().restores == 3,
+  require(idlePass() && released, "the stopped split kept what its program may hold");
+  require(imagesBack(3) && loop.tick() && loads == 2 && loop.weightsSnapshot().restores == 3,
           "a stopped split's program was loaded again");
   runUntilIdle(loop);
   require(loop.snapshot().completed == 3 && loop.engineHealthy(),
           "a request after the split stopped did not run");
+  require(idlePass(), "the idle release kept the images once the split stopped");
+  require(!imagesBack(4) && loads == 2 && loop.weightsSnapshot().restores == 4,
+          "the images did not come back alone once the stopped split had given its program back");
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 4, "a later request did not run");
 }
 
 // With --idle-release off the control pass never releases the weights,

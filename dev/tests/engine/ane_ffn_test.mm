@@ -7,7 +7,7 @@
 // - join: ane_ffn_join adds the ANE's channel-major partial rows, scaled in fp32, to the chunk's output rows and to no
 //   others, and flags a value of the chunk's rows that is not finite;
 // - the split: which layers, units and chunks it takes; for three layers of affine Q4 and of mixed GGUF formats,
-//   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two programs and of the
+//   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two functions and of the
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
 //   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes every function of either model and
 //   fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps what it
@@ -186,7 +186,8 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
 
   for (uint32_t row = 0; row < kRows; ++row) {
     std::vector<float> v(kHidden);
-    for (uint32_t channel = 0; channel < kHidden; ++channel) v[channel] = bf16ToFloat(x[uint64_t{row} * kHidden + channel]);
+    for (uint32_t channel = 0; channel < kHidden; ++channel)
+      v[channel] = bf16ToFloat(x[uint64_t{row} * kHidden + channel]);
     rotate(v, ANE_FFN_INPUT_BLOCK, sign);
     const float scale = std::max(peak(v), ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
     if (!near(fromHalf(contents<uint16_t>(scales)[row]), toHalf(scale * ANE_FFN_INT8_UNIT)))
@@ -253,8 +254,9 @@ Source ggufSource(MetalBackend &backend, gguf_reference::Fmt format) {
   const Packed packed = repack(format, native, kWeightRows, kWeightInputs, nullptr);
   const MetalBuffer meta = upload(backend, packed.meta);
   // A format without plane1 binds meta in its place (QuantizedSegment::plane1Slot).
+  const MetalBuffer plane1 = kQuantFormats[format].plane1_bytes ? upload(backend, packed.w1) : meta;
   Source source{fmtName(format),
-                {upload(backend, packed.w0), kQuantFormats[format].plane1_bytes ? upload(backend, packed.w1) : meta, meta},
+                {upload(backend, packed.w0), plane1, meta},
                 kWeightInputs / 32,
                 uint32_t(format),
                 "_gguf",
@@ -453,7 +455,8 @@ Model ggufModel(MetalBackend &backend) {
 
 // Which layers and shares the split takes.
 void takes(MetalBackend &backend, const Model &affine, const Model &gguf) {
-  if (AneFfn::unsupported(affine.layers) || AneFfn::unsupported(gguf.layers)) fail("the split does not take the models");
+  if (AneFfn::unsupported(affine.layers) || AneFfn::unsupported(gguf.layers))
+    fail("the split does not take the models");
   if (!AneFfn::unsupported({})) fail("the split takes no layers");
   // A hidden size the programs' segments do not take, and layers of two shapes.
   const Projection gate = test::deterministicQ4Projection(backend, {kIntermediate, 4096}, 1);
@@ -641,7 +644,7 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   test::rejects([&] { split.add(graph, 1, narrow, hidden[1], hidden[0], kRows); }, "ANE FFN input buffer holds",
                 "an input one element short was accepted");
   if (graph.dispatches().size() != encoded) fail("a refused layer encoded a dispatch");
-  if (!split.begin()) fail("a split begins a command again");
+  if (!split.begin()) fail("a split does not begin a command again");
   split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
   section("refusals: layers out of order and buffers short of the chunk's rows");
 }
@@ -784,7 +787,7 @@ void idle(MetalBackend &backend, const Linear &linear, const Model &model, const
   section("idle: the program unloaded and loaded again computes the same values; a command encoded, in flight or "
           "not finished refuses a release");
 }
-// A fault armed for the next split's program at the evaluation of `layer` in its first forward of `rows` rows: the
+// A fault armed for the next split's program at the evaluation `faults` names in its first forward of `rows` rows: the
 // forward's results are unusable and the split stops, without failing its command, within the handoff's bound of
 // the evaluation's start, and the GPU alone then computes, bit for bit, what it computes on its own.
 void stops(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk,
@@ -860,16 +863,16 @@ void split(MetalBackend &backend) {
   const Linear linear(backend.capabilities());
   const Model affine = affineModel(backend), gguf = ggufModel(backend);
   takes(backend, affine, gguf);
-  const Chunk rows = chunk(backend, AneFfn::kMaximumRows);
-  split(backend, linear, affine, rows);
-  split(backend, linear, gguf, rows);
-  misbound(backend, affine, rows);
-  refusals(backend, affine, rows);
-  quietRows(backend, linear, affine, rows);
-  massiveChannel(backend, linear, rows);
-  idle(backend, linear, affine, rows);
-  fillRows(rows, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
-  stops(backend, linear, affine, rows, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
+  const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
+  split(backend, linear, affine, buffers);
+  split(backend, linear, gguf, buffers);
+  misbound(backend, affine, buffers);
+  refusals(backend, affine, buffers);
+  quietRows(backend, linear, affine, buffers);
+  massiveChannel(backend, linear, buffers);
+  idle(backend, linear, affine, buffers);
+  fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  stops(backend, linear, affine, buffers, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
         AneFfn::kMaximumRows, "not finite");
   section("stops: an infinity in the ANE's output stops the split");
 }
@@ -881,8 +884,8 @@ void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
   const Linear linear(backend.capabilities());
   const Model model = affineModel(backend);
-  const Chunk rows = chunk(backend, AneFfn::kMaximumRows);
-  fillRows(rows, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
+  fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   struct Fault {
     const char *name;
     Faults (*arm)(uint64_t evaluation);
@@ -900,7 +903,7 @@ void faults(MetalBackend &backend) {
   for (const Fault &kind : kinds) {
     for (uint32_t layer = 0; layer < kLayers; ++layer)
       for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows})
-        stops(backend, linear, model, rows, kind.arm(layer + 1),
+        stops(backend, linear, model, buffers, kind.arm(layer + 1),
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
     section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
   }
@@ -913,8 +916,8 @@ void faults(MetalBackend &backend) {
   if (!split->retired() || split->splits(AneFfn::kMaximumRows)) fail("a failed reload: the split did not stop");
   if (split->reason().find("did not load again: ANE load failed") == std::string::npos)
     fail("a failed reload: stopped for " + split->reason());
-  const Forward alone = forward(backend, linear, model, nullptr, rows, AneFfn::kMaximumRows);
-  const Forward after = forward(backend, linear, model, split.get(), rows, AneFfn::kMaximumRows);
+  const Forward alone = forward(backend, linear, model, nullptr, buffers, AneFfn::kMaximumRows);
+  const Forward after = forward(backend, linear, model, split.get(), buffers, AneFfn::kMaximumRows);
   if (!after.usable || after.bits != alone.bits)
     fail("a failed reload: the GPU's forward after the split stopped differs from the GPU's alone");
   // Idle, the stopped split unloads what a load that ran late may have left loaded, once, and keeps it unloaded.
@@ -924,7 +927,7 @@ void faults(MetalBackend &backend) {
   section("faults: a program that does not load again stops the split, and the GPU alone then computes what it "
           "computes on its own");
 
-  loses(backend, linear, model, rows);
+  loses(backend, linear, model, buffers);
   section("faults: a Neural Engine slower than the GPU alone stops the split after 8 usable commands, and the GPU "
           "alone then computes what it computes on its own");
 

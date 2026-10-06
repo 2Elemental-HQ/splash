@@ -179,7 +179,8 @@ inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *
   const uint row = tile.x * ANE_FFN_WEIGHT_ROWS + simd_group, block = tile.y * K * ANE_FFN_ROTATION_UNIT;
   float value[K][4];
   for (uint k = 0; k < K; ++k)
-    Source::values(value[k], a, b, c, params.groups, params.row + row, params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
+    Source::values(value[k], a, b, c, params.groups, params.row + row,
+                   params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
   ane_ffn_rotate_block<K>(value, lane, sign);
   const float inverse = ANE_FFN_INT8_UNIT / float(row_scale[row]);
   for (uint k = 0; k < K; ++k)
@@ -201,7 +202,8 @@ inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c
   for (uint block = 0; block < params.width; block += K * ANE_FFN_ROTATION_UNIT) {
     float value[K][4];
     for (uint k = 0; k < K; ++k)
-      Source::values(value[k], a, b, c, params.groups, params.row + row, params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
+      Source::values(value[k], a, b, c, params.groups, params.row + row,
+                     params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
     ane_ffn_rotate_block<K>(value, lane, sign);
     for (uint k = 0; k < K; ++k)
       for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[k][e]));
@@ -220,9 +222,10 @@ kernel void ane_ffn_weights(device uchar *a [[buffer(0)]], device uchar *b [[buf
 }
 // The GGUF variants run the body of the dispatch's format.
 template <uint K>
-kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
-    device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]], device half *scale [[buffer(5)]],
-    device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
+kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
+    device uchar *c [[buffer(2)]], device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]],
+    device half *scale [[buffer(5)]], device const float *sign [[buffer(6)]],
+    constant AneFfnWeightParams &params [[buffer(7)]],
     uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   quant_format_switch(params.format, [&](auto format) {
@@ -231,15 +234,15 @@ kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b 
   });
 }
 template <uint K>
-kernel void ane_ffn_row_scale(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
-    device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
+kernel void ane_ffn_row_scale(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
+    device uchar *c [[buffer(2)]], device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
     constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   ane_ffn_row_scales<K, AneFfnAffine>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
 }
 template <uint K>
-kernel void ane_ffn_row_scale_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
-    device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
+kernel void ane_ffn_row_scale_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
+    device uchar *c [[buffer(2)]], device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
     constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   quant_format_switch(params.format, [&](auto format) {

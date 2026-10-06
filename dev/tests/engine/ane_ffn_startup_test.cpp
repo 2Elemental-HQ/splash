@@ -8,7 +8,6 @@
 #include "ane/Program.hpp"
 #include "engine/AneFfnStartup.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -18,7 +17,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -29,7 +27,6 @@ using namespace splash::engine;
 using Kind = AneFfnOutcome::Kind;
 using splash::ops::ane_ffn::Calibration;
 using splash::ops::ane_ffn::ChunkTimings;
-using splash::ops::ane_ffn::Timing;
 using splash::ops::ane_ffn::Timings;
 using splash::test::rejects;
 using splash::test::require;
@@ -110,8 +107,9 @@ struct Fake {
   std::optional<std::pair<uint32_t, bool>> prepared;
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
-  // The automatic context: what the plan holds with the most units whose plan holds any.
-  [[nodiscard]] uint32_t automatic() const {
+  // What the plan holds with the largest split the model could take, the most units whose plan holds any: the
+  // context a start that fails assumes until a calibration is remembered.
+  [[nodiscard]] uint32_t largestSplitContext() const {
     for (uint32_t aneUnits = 33; aneUnits > 0; --aneUnits)
       if (const uint32_t context = contextWith(bytes(aneUnits))) return context;
     return 0;
@@ -181,7 +179,7 @@ void testOff() {
               started.start.outcome.contextWithout == contextWith(0) &&
               line(started.log, "The GPU runs the prefill FFN alone, as given."),
           "--no-ane was not taken as given");
-  fake.unsupported = "ANE FFN split needs affine Q4 projections or quantized GGUF tensors";
+  fake.unsupported = "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
   started = start(fake, {.enabled = false});
   require(started.start.outcome.kind == Kind::Off && started.log.empty(),
           "--no-ane was logged for a model the split does not take");
@@ -197,7 +195,7 @@ void testUnsupported() {
               started.start.outcome.context == contextWith(0),
           "a MoE model was logged");
   fake = {};
-  fake.unsupported = "ANE FFN split needs affine Q4 projections or quantized GGUF tensors";
+  fake.unsupported = "ANE FFN split needs affine Q4 projections or unrotated quantized GGUF tensors";
   started = start(fake);
   require(started.start.outcome.kind == Kind::Unsupported && nothingStarted(fake, started) && !fake.asked &&
               started.start.outcome.context == contextWith(0) &&
@@ -252,8 +250,8 @@ void testRefusedAutomatic() {
 }
 
 // Without --max-context the split takes its memory from the KV cache: the start adopts the plan with it and
-// remembers its calibration, and the engine serves the context the plan holds with the split, which the log names beside
-// the GPU's alone.
+// remembers its calibration, and the engine serves the context the plan holds with the split, which the log names
+// beside the GPU's alone.
 void testAutomaticContext() {
   Fake fake;
   const Started started = start(fake);
@@ -292,7 +290,7 @@ void testDeterministicContext() {
   };
   const auto fails = [](uint32_t, bool) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
   const Calibration nine{9, 700, {{{512, 5.0}, {2048, 20.0}}}};
-  const uint32_t most = Fake{}.automatic();
+  const uint32_t most = Fake{}.largestSplitContext();
   require(most && most < contextWith(Fake{}.bytes(1)), "the largest split holds no less context");
   struct Case {
     Fake fake;
@@ -425,7 +423,8 @@ void testNoGain() {
   };
   started = start(fake);
   require(started.start.outcome.kind == Kind::NoGain && fake.remembered && !fake.remembered->aneUnits &&
-              !started.start.plan && has(started.log, "no chunk of the Neural Engine split beats it by enough, 21.0 ms per 2048-row FFN "
+              !started.start.plan &&
+              has(started.log, "no chunk of the Neural Engine split beats it by enough, 21.0 ms per 2048-row FFN "
                                "layer against 20.0 (calibrated in "),
           "a split of no chunk that gains split: " + started.log);
 }

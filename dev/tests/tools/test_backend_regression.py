@@ -314,8 +314,7 @@ class BackendRegressionTests(unittest.TestCase):
         share it has the Neural Engine split: it reports that share and
         minimum_rows as calibrated, or runs the share --ane-ffn-share gives
         and the rows --ane-ffn-minimum-rows gives, else 512, unless
-        honours_share is false, and logs what it was given. Without
-        minimum_rows it takes no --ane-ffn-minimum-rows and reports none."""
+        honours_share is false, and logs what it was given."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/splash.metallib").write_text("")
@@ -329,7 +328,7 @@ class BackendRegressionTests(unittest.TestCase):
             if list_support
             else "[--scenario decode|partial]"
         ) + (" [--ane-ffn-share SHARE]" if share is not None else "")
-        if share is not None and minimum_rows is not None:
+        if share is not None:
             usage += " [--ane-ffn-minimum-rows ROWS]"
         if list_support:
             names = "decode, partial, short" if short else "decode, partial"
@@ -345,13 +344,9 @@ class BackendRegressionTests(unittest.TestCase):
             "document['ane_ffn_share'] = "
             + ("float(given) if given else " if honours_share else "")
             + f"{share!r}\n"
-            + (
-                "document['ane_ffn_minimum_rows'] = 0 if not document['ane_ffn_share'] "
-                + ("else int(rows) if rows else 512 if given " if honours_share else "")
-                + f"else {minimum_rows!r}\n"
-                if minimum_rows is not None
-                else ""
-            )
+            + "document['ane_ffn_minimum_rows'] = 0 if not document['ane_ffn_share'] "
+            + ("else int(rows) if rows else 512 if given " if honours_share else "")
+            + f"else {minimum_rows!r}\n"
             if share is not None
             else ""
         )
@@ -504,8 +499,7 @@ class BackendRegressionTests(unittest.TestCase):
         calibrated = 1 - 24 / 34
         # A baseline without the split leaves the candidate's first round to
         # calibrate; one with it calibrates first and the candidate runs its
-        # share and least chunk rows, which a baseline that takes no
-        # --ane-ffn-minimum-rows runs without.
+        # share and least chunk rows.
         for baseline_share, baseline_rows, expected in (
             (None, 832, [["candidate", None, None], ["candidate", repr(0.32), "896"]]),
             (

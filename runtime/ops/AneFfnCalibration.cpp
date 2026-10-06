@@ -12,20 +12,6 @@
 namespace splash::ops::ane_ffn {
 namespace {
 
-// The model, from the split's layers as they run between stand-ins for the
-// mixer (Measurement). The GPU's part alone gives G at both shares. At the
-// high share, near 0.8, the ANE's part takes the longer on every Mac the
-// split was measured on, whose fastest full chunks of Qwen3.8-27B's split
-// layers take 9 of its 34 units on an M5 Max, 15 on an M5 Pro and 26-28 on an
-// M6: the split layer there is A, which scales with the ANE's channels. Where
-// the GPU's part takes the longer at the low share, the split layer there
-// exceeds it by the bandwidth the ANE's part takes beside it, which gives u:
-// on an M6 the GPU's part runs a tenth to a third longer beside the ANE's, on
-// an M5 Pro 3-7% near its fastest share. Where the ANE's part takes the
-// longer there, as on an M5 Max, the split layer's excess over A is the
-// ANE's own. Where the ANE's part does not take the longer at the high share,
-// A comes out longer than it is, and the choice smaller.
-//
 // The split's predicted gain below which the GPU runs the FFN alone.
 constexpr double kMinimumGain = 0.05;
 // How much longer than the GPU's alone a chunk's split layer may take and
@@ -66,6 +52,19 @@ double Model::operator()(double share) const noexcept {
   return a > g ? a : g;
 }
 
+// The model, from the split's layers as they run between stand-ins for the
+// mixer (Measurement). The GPU's part alone gives G at both shares. At the
+// high share, near 0.8, the ANE's part takes the longer on every Mac the
+// split was measured on, whose fastest full chunks of Qwen3.8-27B's split
+// layers take 8-9 of its 34 units on an M5 Max, 14-15 on an M5 Pro and 26-27
+// on an M6: the split layer there is A, which scales with the ANE's channels.
+// Where the GPU's part takes the longer at the low share, the split layer
+// there exceeds it by the bandwidth the ANE's part takes beside it, which
+// gives u: on an M6 the GPU's part runs a tenth to a third longer beside the
+// ANE's, on an M5 Pro 3-7% near its fastest share. Where the ANE's part takes
+// the longer there, as on an M5 Max, the split layer's excess over A is the
+// ANE's own. Where the ANE's part does not take the longer at the high share,
+// A comes out longer than it is, and the choice smaller.
 Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
@@ -163,7 +162,7 @@ std::optional<Calibration> Calibration::parse(std::string_view text) {
 // At the units calibration chooses, at or just below where the parts meet
 // (choose), an evaluation takes at most about as long as the GPU's part: on
 // an M5 Max, calibration's fit of Qwen3.8-27B puts it at 13.2 ms against the
-// GPU alone's 19.0 at 8 of 34 units, and the M5 Pro's 0.41 and the M6's 0.74
+// GPU alone's 19.0 at 8 of 34 units, and the M5 Pro's 0.44 and the M6's 0.76
 // leave more room.
 // Measured, another process keeping the ANE busy beside the split costs it
 // 2-8% on an M5 Max, an M5 Pro and an M6, and a minute of prefill slows the

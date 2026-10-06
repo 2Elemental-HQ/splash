@@ -21,6 +21,15 @@ constexpr uint32_t kSampledLayers = 5;
 // command.
 constexpr uint32_t kCommandRows = 2 * AneFfn::kMaximumRows, kRuns = 3;
 
+// The median of kRuns of `run`'s milliseconds, which passes over a first run
+// that wires a function.
+double median(const std::function<double()> &run) {
+  std::array<double, kRuns> runs{};
+  for (double &milliseconds : runs) milliseconds = run();
+  std::ranges::nth_element(runs, runs.begin() + kRuns / 2);
+  return runs[kRuns / 2];
+}
+
 } // namespace
 
 Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
@@ -46,9 +55,9 @@ Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluPro
 // rows timed alike, takes away the stand-in and with it the command's
 // submission. Each command takes `count` layers from the first, over which
 // the jitter of the handoffs and the staging of the first layer's weights,
-// which a prefill's command does once, average out, and the median of kRuns,
-// which passes over a first run that wires a function, gives a layer's
-// milliseconds. Each layer timed stages the next one's weights.
+// which a prefill's command does once, average out, and the median of kRuns
+// gives a layer's milliseconds. Each layer timed stages the next one's
+// weights.
 double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows, AneFfn *split,
                           double standIn) {
   if (!count || count >= layers.size()) throw std::invalid_argument("ANE FFN layers timed without one to stage");
@@ -74,10 +83,7 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
     }
     return millisecondsSince(start) / count;
   };
-  std::array<double, kRuns> runs{};
-  for (double &run : runs) run = command();
-  std::ranges::nth_element(runs, runs.begin() + kRuns / 2);
-  return usable(runs[kRuns / 2] - standIn);
+  return usable(median(command) - standIn);
 }
 
 // Commands of all but the last of `layers` and of the first alone, of the
@@ -87,9 +93,8 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
 // for all its layers: about 1 ms a command on an M5 Max, against a GPU part
 // of 5-12 ms a layer.
 double Measurement::gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split) {
-  const auto median = [&](uint32_t count) {
-    std::array<double, kRuns> runs{};
-    for (double &run : runs) {
+  const auto command = [&](uint32_t count) {
+    return median([&] {
       metal::CommandGraph graph;
       if (!split.begin()) throw std::runtime_error("ANE FFN split stopped (" + split.reason() + ")");
       for (uint32_t index = 0; index < count; ++index)
@@ -97,13 +102,11 @@ double Measurement::gpuPart(std::span<const SwiGluProjections> layers, AneFfn &s
                      AneFfn::Parts::Gpu);
       const auto start = AwakeClock::now();
       static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
-      run = millisecondsSince(start);
-    }
-    std::ranges::nth_element(runs, runs.begin() + kRuns / 2);
-    return runs[kRuns / 2];
+      return millisecondsSince(start);
+    });
   };
   const auto count = static_cast<uint32_t>(layers.size() - 1);
-  return usable((median(count) - median(1)) / (count - 1));
+  return usable((command(count) - command(1)) / (count - 1));
 }
 
 Timings Measurement::time() {

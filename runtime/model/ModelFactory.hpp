@@ -6,7 +6,6 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
-#include "ops/AneFfn.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -17,6 +16,10 @@
 #include <string>
 #include <variant>
 #include <vector>
+
+namespace splash::ops {
+class AneFfn;
+} // namespace splash::ops
 
 namespace splash::model {
 

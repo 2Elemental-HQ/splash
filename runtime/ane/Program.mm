@@ -7,7 +7,6 @@
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
-#import <Metal/Metal.h>
 
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -86,7 +85,10 @@ constexpr Signature kSignatures[] = {
     {"_ANEClient", '-', "unloadModel:options:qos:error:", "B@:@@I^@"},
     {"_ANEClient", '-', "evaluateWithModel:options:request:qos:error:", "B@:@@@I^@"},
     {"_ANEIOSurfaceObject", '+', "objectWithIOSurface:", "@@:^{__IOSurface=}"},
-    {"_ANERequest", '+', "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:", "@@:@@@@@@@@@"},
+    {"_ANERequest", '+',
+     "requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:"
+     "transactionHandle:",
+     "@@:@@@@@@@@@"},
     {"_ANERequest", '-', "setCompletionHandler:", "v@:@?"},
     {"_ANESharedWaitEvent", '+', "waitEventWithValue:sharedEvent:eventType:", "@@:Q@Q"},
     {"_ANESharedSignalEvent", '+', "signalEventWithValue:symbolIndex:eventType:sharedEvent:", "@@:QIq@"},
@@ -362,6 +364,11 @@ void evaluateWithFaults(const ProgramInstrumentation::Faults &faults, uint64_t s
   }
 }
 #endif
+
+// The file recall() reads under `key`, which remember() writes.
+std::filesystem::path rememberedFile(std::string_view key) {
+  return cacheDirectory() / ("remembered-" + hex(fnv1a(bytesOf(key))));
+}
 
 } // namespace
 
@@ -821,13 +828,9 @@ void ProgramInstrumentation::arm(Faults faults) {
 }
 #endif
 
-namespace {
-std::filesystem::path choiceFile(std::string_view key) { return cacheDirectory() / ("choice-" + hex(fnv1a(bytesOf(key)))); }
-} // namespace
-
 std::optional<std::string> recall(std::string_view key) noexcept {
   try {
-    std::ifstream file(choiceFile(key));
+    std::ifstream file(rememberedFile(key));
     std::string line;
     if (std::getline(file, line)) return line;
   } catch (const std::exception &) {
@@ -839,7 +842,7 @@ std::optional<std::string> recall(std::string_view key) noexcept {
 void remember(std::string_view key, std::string_view line) noexcept {
   try {
     std::filesystem::create_directories(cacheDirectory());
-    writeWhole(choiceFile(key), bytesOf(line));
+    writeWhole(rememberedFile(key), bytesOf(line));
   } catch (const std::exception &) {
     // The next start calibrates again.
   }
@@ -848,7 +851,7 @@ void remember(std::string_view key, std::string_view line) noexcept {
 void forget(std::string_view key) noexcept {
   std::error_code error;
   try {
-    std::filesystem::remove(choiceFile(key), error);
+    std::filesystem::remove(rememberedFile(key), error);
   } catch (const std::exception &) {
     // The next start takes what is remembered.
   }
