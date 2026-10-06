@@ -20,7 +20,7 @@ baseline) on this machine, which must be otherwise idle:
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold), the TTFT of its
   partial hit (partial_4k_hit) and the GPU time of each short cold prefill
-  (short_<tokens>_prefill_gpu_ms).
+  (short_<rows>_rows_prefill_gpu_ms, by the rows of its first chunk).
 - memory plan: the candidate's plan holds no less context without the Neural
   Engine split than the baseline serves, whose memory the split may take from
   the KV cache; the context each serves and the change of the plan's elastic
@@ -57,8 +57,9 @@ ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
 METALLIB = Path("build/splash.metallib")
 PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
-# The prompt lengths of the short scenario's cold prefills.
-SHORT = (511, 512, 513, 640, 641, 1025, 1536, 2048)
+# The rows of the first chunk of the short scenario's cold prefills, whose
+# prompts hold a token more.
+SHORT = (480, 512, 544, 640, 672, 1024, 1536, 2016)
 # The memory plan a load served, as the benchmark reports it.
 MEMORY_PLAN = (
     "max_context_tokens",
@@ -184,11 +185,11 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
 
 def round_record(version: str, documents: list[dict], scenarios) -> dict:
     """What one round of these scenarios measured: decode samples per width,
-    partial requests per scenario and short requests per prompt length, with
+    partial requests per scenario and short requests per first chunk, with
     the identity and memory plan each load reported."""
     decode = {width: [] for width in WIDTHS}
     partial = {scenario: [] for scenario in PARTIAL}
-    short = {length: [] for length in SHORT} if "short" in scenarios else {}
+    short = {rows: [] for rows in SHORT} if "short" in scenarios else {}
     for document in documents:
         for sample in document.get("decode_throughput", {}).get("samples", []):
             decode[sample["width"]].append(
@@ -214,9 +215,9 @@ def round_record(version: str, documents: list[dict], scenarios) -> dict:
                 partial[measurement["scenario"]].append(request)
             elif (
                 measurement["scenario"] == "short"
-                and measurement["prompt_tokens"] in short
+                and measurement["prompt_tokens"] - 1 in short
             ):
-                short[measurement["prompt_tokens"]].append(request)
+                short[measurement["prompt_tokens"] - 1].append(request)
     measured = {"decode": decode, "partial": partial, "short": short}
     if lacking := [name for name, found in measured.items() if not all(found.values())]:
         raise RegressionError(
@@ -256,9 +257,9 @@ def metrics(rounds: list[dict]) -> dict:
         [request["ttft_ms"] for request in record["partial"]["partial_4k_hit"]]
         for record in rounds
     ]
-    for length in rounds[0]["short"]:
-        result[f"short_{length}_prefill_gpu_ms"] = [
-            [request["prefill_gpu_ms"] for request in record["short"][length]]
+    for rows in rounds[0]["short"]:
+        result[f"short_{rows}_rows_prefill_gpu_ms"] = [
+            [request["prefill_gpu_ms"] for request in record["short"][rows]]
             for record in rounds
         ]
     return result
@@ -280,9 +281,9 @@ def outputs(record: dict) -> dict:
             result[f"{scenario} sample {request['sample']}"] = tuple(
                 request["output_tokens"]
             )
-    for length, requests in record["short"].items():
+    for rows, requests in record["short"].items():
         for request in requests:
-            result[f"short {length} sample {request['sample']}"] = tuple(
+            result[f"short {rows} rows sample {request['sample']}"] = tuple(
                 request["output_tokens"]
             )
     return result

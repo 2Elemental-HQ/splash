@@ -1190,22 +1190,23 @@ int main(int argc, char **argv) {
       }
     }
 
-    // Cold prefills of up to one prefill chunk around where the prefill FFN's
-    // Neural Engine split starts (512 rows) and its program steps (128 rows).
-    // A cold prompt prefills up to its replay point, the last 32-token page
-    // boundary before its last token, then the rest: 512 tokens as 480 and 32
-    // rows, 513 as 512 and 1. Each prompt is unique and runs on an empty cache.
+    // Cold prefills whose first chunk holds these rows, around where the
+    // prefill FFN's Neural Engine split starts and where its program's
+    // functions step (ops::AneFfn): a cold prompt prefills up to its replay
+    // point, the last 32-token page boundary before its last token, then the
+    // rest, so a prompt of rows + 1 tokens runs a chunk of those rows and one
+    // of a row. Each prompt is unique and runs on an empty cache.
     if (selected.shortPrompts) {
-      constexpr std::array<uint32_t, 8> shortLengths{511, 512, 513, 640, 641, 1025, 1536, 2048};
+      constexpr std::array<uint32_t, 8> shortRows{480, 512, 544, 640, 672, 1024, 1536, 2016};
       for (uint32_t sample = 0; sample < samples; ++sample) {
-        for (uint32_t length : shortLengths) {
+        for (uint32_t rows : shortRows) {
           evictAllCache(resources->cache());
           Measurement result = runRequest(
               engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
-              prompt(length, (uint64_t{length} << 32 | sample) ^ 0x53484f5254ULL));
+              prompt(rows + 1, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
           if (result.cacheStatus != "miss")
-            throw std::runtime_error("short " + std::to_string(length) +
-                                     "-token prompt was not a cold miss: " + result.cacheStatus);
+            throw std::runtime_error("short prompt of a " + std::to_string(rows) +
+                                     "-row chunk was not a cold miss: " + result.cacheStatus);
           measurements.push_back(std::move(result));
         }
       }

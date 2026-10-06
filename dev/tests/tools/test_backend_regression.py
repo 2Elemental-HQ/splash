@@ -35,7 +35,7 @@ def benchmark_document(
     ]
     requests = [
         (scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios
-    ] + [("short", tokens) for tokens in regression.SHORT if "short" in scenarios]
+    ] + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
     measurements = [
         {
             "scenario": scenario,
@@ -98,7 +98,7 @@ class BackendRegressionTests(unittest.TestCase):
             sorted(summary["speed"]),
             sorted(
                 decode_and_partial
-                + [f"short_{tokens}_prefill_gpu_ms" for tokens in regression.SHORT]
+                + [f"short_{rows}_rows_prefill_gpu_ms" for rows in regression.SHORT]
             ),
         )
         # GPU time per decode step, not per request.
@@ -130,9 +130,9 @@ class BackendRegressionTests(unittest.TestCase):
                 "prefill_gpu_ms", 1.05, "partial_4k_cold"
             ),
             "partial_4k_hit_ttft_ms": slower("ttft_ms", 1.05, "partial_4k_hit"),
-            # A 512-token prompt 2.5% slower: beyond the 2% floor.
-            "short_512_prefill_gpu_ms": slower(
-                "prefill_gpu_ms", 1.025, "short", tokens=512
+            # A prompt of a 512-row chunk 2.5% slower: beyond the 2% floor.
+            "short_512_rows_prefill_gpu_ms": slower(
+                "prefill_gpu_ms", 1.025, "short", tokens=513
             ),
         }.items():
             with self.subTest(metric=name):
@@ -272,7 +272,7 @@ class BackendRegressionTests(unittest.TestCase):
         )
         self.assertEqual(len(record["decode"][4]), 2)
         self.assertEqual(len(record["partial"]["partial_4k_hit"]), 2)
-        self.assertEqual(len(record["short"][2048]), 2)
+        self.assertEqual(len(record["short"][2016]), 2)
         self.assertEqual(len(record["identities"]), 3)
         self.assertEqual(
             record["memory_plans"][0],
