@@ -706,6 +706,16 @@ uint32_t parseMaxContext(std::string_view value) {
   return tokens;
 }
 
+// --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
+// Engine split takes, a positive count.
+uint32_t parseAneFfnMinimumRows(std::string_view value) {
+  uint32_t rows = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), rows);
+  if (error != std::errc{} || end != value.data() + value.size() || !rows)
+    throw std::invalid_argument("--ane-ffn-minimum-rows takes a positive row count");
+  return rows;
+}
+
 // --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
 double parseAneFfnShare(std::string_view value) {
   double share = 0.0;
@@ -783,12 +793,14 @@ int main(int argc, char **argv) {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
-                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE] "
-                   "[--max-context TOKENS]\n"
+                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS]\n"
                    "  NAME: decode, partial, short, context or exact "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
+                   "  ROWS: the least rows of a chunk that share takes "
+                   "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context (default: what memory holds)\n";
       return 2;
@@ -797,6 +809,7 @@ int main(int argc, char **argv) {
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
     std::optional<double> aneFfnShare;
+    std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
@@ -810,6 +823,8 @@ int main(int argc, char **argv) {
         selected = parseScenarios(argv[index + 1]);
       } else if (option == "--ane-ffn-share") {
         aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-ffn-minimum-rows") {
+        aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
       } else {
@@ -827,7 +842,7 @@ int main(int argc, char **argv) {
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::inspectModelRoot(config.modelRoot);
     config.buildId = SPLASH_BUILD_ID;
-    config.aneFfnShare = aneFfnShare;
+    config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -865,8 +880,9 @@ int main(int argc, char **argv) {
     // its Engine stays empty. The later benchmark Engine is the sole request
     // driver and is destroyed before the bootstrap owner/model/shared cache.
     auto *resources = &bootstrap->resources();
-    // The Neural Engine share startup calibrated, or the one given.
+    // The Neural Engine split startup calibrated, or the one given.
     const double ranAneFfnShare = resources->aneFfnShare();
+    const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
     const auto &cacheIdentity = resources->cacheIdentity();
     const std::string identity =
@@ -904,7 +920,7 @@ int main(int argc, char **argv) {
 
     Events events;
     engine::EngineConfig engineConfig;
-    engineConfig.maxContext = maxContext ? maxContext : resources->memoryPlan().maximumContextTokens();
+    engineConfig.maxContext = bootstrap->nativeLoop().snapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
@@ -1271,6 +1287,7 @@ int main(int argc, char **argv) {
     std::cout << "{\"schema_version\":2,\"build_id\":\"" << SPLASH_BUILD_ID
               << "\",\"identity\":" << identity
               << ",\"ane_ffn_share\":" << std::string_view(share.data(), written.ptr - share.data())
+              << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
               << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
@@ -1331,10 +1348,12 @@ int main(int argc, char **argv) {
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }
-    // The context the engine served, and its memory plan's elastic state/KV
-    // budget and Neural Engine split.
+    // The context the engine served and the one its memory plan holds
+    // without the Neural Engine split, and its elastic state/KV budget and
+    // the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
               << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
               << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
               << ",\"skipped_context_lengths\":[";

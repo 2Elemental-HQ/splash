@@ -12,17 +12,19 @@ baseline) on this machine, which must be otherwise idle:
   rounds. With --expect-output-change (or EXPECT_OUTPUT_CHANGE=1) each build
   must still repeat itself, and the candidate's acceptance rate per width may
   be at most 0.02 below the baseline's.
-- the prefill FFN's Neural Engine share: with --ane-ffn-share every round of
+- the prefill FFN's Neural Engine split: with --ane-ffn-share every round of
   a build that takes the option runs that share and must report it, and a
   build that does not must report none. Without it startup calibrates the
-  share from timings, so the first share a round reports is the one every
-  later round runs when its build takes the option.
+  split from timings, so the first share and least chunk rows a round reports
+  are those every later round runs when its build takes the options.
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold), the TTFT of its
   partial hit (partial_4k_hit) and the GPU time of each short cold prefill
   (short_<tokens>_prefill_gpu_ms).
-- memory plan: the candidate serves no less context than the baseline; the
-  change of the plan's elastic state/KV budget is reported.
+- memory plan: the candidate's plan holds no less context without the Neural
+  Engine split than the baseline serves, whose memory the split may take from
+  the KV cache; the context each serves and the change of the plan's elastic
+  state/KV budget are reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
   (weights.compare_builds). A baseline of an earlier release prepares into a
@@ -58,7 +60,12 @@ PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
 # The prompt lengths of the short scenario's cold prefills.
 SHORT = (511, 512, 513, 640, 641, 1025, 1536, 2048)
 # The memory plan a load served, as the benchmark reports it.
-MEMORY_PLAN = ("max_context_tokens", "dynamic_budget_bytes", "ane_ffn_bytes")
+MEMORY_PLAN = (
+    "max_context_tokens",
+    "no_ane_context_tokens",
+    "dynamic_budget_bytes",
+    "ane_ffn_bytes",
+)
 
 
 class RegressionError(RuntimeError):
@@ -68,8 +75,8 @@ class RegressionError(RuntimeError):
 def usage(benchmark: Path) -> str:
     """A backend-benchmark's usage, which it prints without arguments. It
     names the options a build takes: older builds take one --scenario and no
-    short scenario, and builds before the Neural Engine split no
-    --ane-ffn-share."""
+    short scenario, builds before the Neural Engine split no --ane-ffn-share
+    and builds before its least chunk no --ane-ffn-minimum-rows."""
     return subprocess.run(
         [str(benchmark)], capture_output=True, text=True, timeout=60
     ).stderr
@@ -83,11 +90,11 @@ def ane_ffn_share(value: str) -> float:
     return share
 
 
-def pin_ane_ffn_share(args, version: str, document: dict) -> None:
-    """Holds every round to one Neural Engine share, the given one or else
-    the first one a round reports, and fails a round that reported another.
-    With a share given, a build that does not take --ane-ffn-share runs
-    without it and must report none."""
+def pin_ane_ffn(args, version: str, document: dict) -> None:
+    """Holds every round to one Neural Engine split, the given share or else
+    the first share and least chunk rows a round reports, and fails a round
+    that reported another. With a share given, a build that does not take
+    --ane-ffn-share runs without it and must report none."""
     share = document.get("ane_ffn_share")
     if args.ane_ffn_share_given:
         if not args.takes_ane_ffn_share[version]:
@@ -103,12 +110,14 @@ def pin_ane_ffn_share(args, version: str, document: dict) -> None:
         return
     if share is None:
         return
+    rows = document.get("ane_ffn_minimum_rows")
     if args.ane_ffn_share is None:
-        args.ane_ffn_share = share
-    elif share != args.ane_ffn_share:
+        args.ane_ffn_share, args.ane_ffn_minimum_rows = share, rows
+    elif (share, rows) != (args.ane_ffn_share, args.ane_ffn_minimum_rows):
         raise RegressionError(
-            f"ran the Neural Engine split at share {share}, "
-            f"not the first round's {args.ane_ffn_share}"
+            f"ran the Neural Engine split at share {share} from {rows} rows, "
+            f"not the first round's {args.ane_ffn_share} from "
+            f"{args.ane_ffn_minimum_rows}"
         )
 
 
@@ -154,6 +163,8 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
         ]
         if args.ane_ffn_share is not None and args.takes_ane_ffn_share[version]:
             command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
+            if args.ane_ffn_minimum_rows and args.takes_ane_ffn_minimum_rows[version]:
+                command += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]
         print(f"round {round_index + 1} {version}: {scenario}", file=sys.stderr)
         with stem.with_suffix(".log").open("w") as log:
             finished = subprocess.run(
@@ -162,7 +173,7 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
         stem.with_suffix(".json").write_text(finished.stdout)
         try:
             document = parse_document(finished.stdout, finished.returncode)
-            pin_ane_ffn_share(args, version, document)
+            pin_ane_ffn(args, version, document)
             documents.append(document)
         except RegressionError as error:
             log = stem.with_suffix(".log")
@@ -340,12 +351,18 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     if len(places) != 1:
         failures.append(f"rounds ran different models or devices: {sorted(places)}")
     # What an older build's benchmark does not report is None, and not
-    # compared.
-    context = {name: plan["max_context_tokens"] for name, plan in plans.items()}
+    # compared; one before the Neural Engine split serves its plan's context.
+    context = {
+        name: plan["max_context_tokens"]
+        if plan.get("no_ane_context_tokens") is None
+        else plan["no_ane_context_tokens"]
+        for name, plan in plans.items()
+    }
     if None not in context.values() and context["candidate"] < context["baseline"]:
         failures.append(
-            f"the candidate serves {context['candidate']} tokens of context, "
-            f"less than the baseline's {context['baseline']}"
+            f"the candidate holds {context['candidate']} tokens of context "
+            f"without the Neural Engine split, less than the baseline's "
+            f"{context['baseline']}"
         )
     budget = {name: plan["dynamic_budget_bytes"] for name, plan in plans.items()}
     rates = {
@@ -464,7 +481,11 @@ def main(argv=None) -> int:
     args.takes_ane_ffn_share = {
         name: "--ane-ffn-share" in text for name, text in usages.items()
     }
+    args.takes_ane_ffn_minimum_rows = {
+        name: "--ane-ffn-minimum-rows" in text for name, text in usages.items()
+    }
     args.ane_ffn_share_given = args.ane_ffn_share is not None
+    args.ane_ffn_minimum_rows = None
     document = {
         "schema_version": 1,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
@@ -492,6 +513,7 @@ def main(argv=None) -> int:
         ]
         document["rounds"] = rounds
         document["ane_ffn_share"] = args.ane_ffn_share
+        document["ane_ffn_minimum_rows"] = args.ane_ffn_minimum_rows
         document["comparison"] = summarize(rounds, args.expect_output_change)
         document["weights"] = weights.compare_builds(
             trees["baseline"] / "build",
@@ -530,7 +552,9 @@ def report(document: dict) -> None:
     plans = comparison["memory_plan"]
     print(
         f"context: baseline {plans['baseline']['max_context_tokens']}, "
-        f"candidate {plans['candidate']['max_context_tokens']} tokens; "
+        f"candidate {plans['candidate']['max_context_tokens']} tokens "
+        f"({plans['candidate']['no_ane_context_tokens']} without the Neural "
+        f"Engine split); "
         f"elastic budget change: {plans['dynamic_budget_change_bytes']} bytes"
     )
     images = document["weights"]

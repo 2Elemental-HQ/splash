@@ -1,6 +1,5 @@
 #include "ops/AneFfn.hpp"
 
-#include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "StderrLine.hpp"
 #include "metal/abi/AneFfn.h"
@@ -62,12 +61,11 @@ constexpr auto kProgramLimit = std::chrono::seconds(120);
 // instead of holding the request longer.
 constexpr auto kReloadLimit = std::chrono::seconds(10);
 
-uint32_t gpuChannels(uint32_t intermediate, double share) {
-  if (!(share > 0.0 && share < 1.0)) throw std::invalid_argument("ANE FFN share must lie in (0, 1)");
-  const auto units = static_cast<uint32_t>(std::lround((1.0 - share) * intermediate / kChannelUnit));
-  if (!units || units >= intermediate / kChannelUnit)
-    throw std::invalid_argument("ANE FFN share leaves the GPU or the ANE no channels");
-  return units * kChannelUnit;
+// The GPU's channels of `intermediate` with the ANE taking `aneUnits`.
+uint32_t gpuChannels(uint32_t intermediate, uint32_t aneUnits) {
+  if (!aneUnits || aneUnits >= intermediate / kChannelUnit)
+    throw std::invalid_argument("ANE FFN split leaves the GPU or the ANE no channels");
+  return intermediate - aneUnits * kChannelUnit;
 }
 
 std::vector<uint32_t> segments(uint32_t channels) {
@@ -83,14 +81,16 @@ bool splittable(const Projection &projection) {
   return segments.size() == 1 && !segments.front().isFloat() && !projection.rotation;
 }
 
-// Why the split does not take `layers`, or null when it does.
-const char *unsupported(std::span<const SwiGluProjections> layers) {
+} // namespace
+
+const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
   if (layers.empty()) return "ANE FFN split has no layers";
   const uint32_t hidden = layers.front().gate->inputSize, intermediate = layers.front().gate->outputSize;
   if (hidden % kSegment) return "ANE FFN split needs a hidden size of whole 2560-channel segments";
   if (hidden % kRotateGroup || hidden / kRotateGroup > ANE_FFN_ROTATE_BLOCKS)
     return "ANE FFN split needs a hidden size ane_ffn_rotate takes";
-  if (intermediate % kChannelUnit) return "ANE FFN split needs whole rotation blocks of intermediate channels";
+  if (intermediate % kChannelUnit || intermediate < 2 * kChannelUnit)
+    return "ANE FFN split needs two or more whole rotation blocks of intermediate channels";
   for (const SwiGluProjections &layer : layers) {
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
       if (!splittable(*projection)) return "ANE FFN split needs affine Q4 projections or quantized GGUF tensors";
@@ -102,10 +102,12 @@ const char *unsupported(std::span<const SwiGluProjections> layers) {
   return nullptr;
 }
 
-// The format of a projection's planes: its GGUF tensor's, or 0 for affine Q4.
-uint32_t formatOf(const Projection &projection) {
-  return projection.layout() == WeightLayout::Affine64 ? 0 : projection.blocks().segments.front().formatId;
+uint32_t AneFfn::units(std::span<const SwiGluProjections> layers) {
+  if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
+  return layers.front().gate->outputSize / kChannelUnit;
 }
+
+namespace {
 
 // The rotation a weight kernel applies: over gate's and up's hidden inputs,
 // or over down's intermediate inputs.
@@ -166,127 +168,33 @@ constexpr double kIntermediateFloor = 0x1p-9;
 static_assert(ANE_FFN_INT8_PEAK / kIntermediateFloor <= 65504.0,
               "the floor's inverse fits fp16, which 127 / 2^-12 overflows");
 
-// Calibration. At share s, a layer of a full chunk takes
-//   T(s) = max(G(s), A(s), uG G(s) + uA A(s)):
-// G(s) is the GPU's part alone (its channels, the staging of the ANE's int8
-// weights, and the packing and join of the ANE's channels) and A(s) the
-// ANE's evaluation, each close to linear in s. The third term is the memory
-// bandwidth both parts share when they run together, uG and uA each one's
-// fraction of it alone. Timing each part alone at two shares gives G and A,
-// and both together at those shares gives uG and uA where the bandwidth
-// binds there. Neither part waits on the other while timed: a command buffer
-// that hands off to the ANE after little GPU work can start the next one
-// late, by tens of milliseconds at random on the M5 Max with Qwen3.8-27B
-// resident, which would time Metal's scheduling instead.
-// The split runs where G meets A: on Qwen3.8-27B's FFN the fastest share of a
-// prefill of seconds, measured on the M5 Max (0.24), the M5 Pro (0.41) and the
-// M6 (0.76). Short of it the ANE waits on the GPU, whose part the third term
-// slows where the two share bandwidth, as on the M6; past it the GPU waits on
-// the ANE, which T takes to run as fast as alone. It does not: on the M6 the
-// two slow each other's memory accesses beyond the GPU's L2 (an ANE
-// evaluation takes a third longer beside a GPU kernel that streams memory),
-// and a minute of prefill warms the ANE a tenth slower. There these timings put the
-// fastest share at 0.85-0.88, which a 14K-token prompt runs 7% slower than
-// 0.76. The split takes the least share within kTolerance of it, for the ANE's
-// memory and error, if T(s) predicts a gain of kMinimumGain there on the GPU
-// alone, timed as well.
-constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
-// Per-layer milliseconds come from commands of one and of kTimedLayers
-// layers, which cancels each command's fixed costs, of layers spread over the
-// model, whose formats can differ with depth; one more layer gives the last
-// one's next weights to stage.
-constexpr uint32_t kTimedLayers = 4;
-// The split's gain below which the GPU runs the FFN alone, the excess over
-// max(G, A) that shows the bandwidth binding, the slack of the optimum, and
-// the most the split's output may differ from the GPU's (Calibration).
-constexpr double kMinimumGain = 0.05, kBindingMargin = 0.03, kTolerance = 0.01, kMaximumError = 0.05;
-
-// A share's per-layer milliseconds: the GPU's part alone, the ANE's
-// evaluations alone, and both together.
-struct Timing final {
-  double share, gpu, ane, both;
-};
-struct Line final {
-  double at0, slope;
-  [[nodiscard]] double operator()(double share) const noexcept { return at0 + slope * share; }
-};
-struct Model final {
-  Line gpu, ane;
-  double uG = 0.0, uA = 0.0;
-  [[nodiscard]] double operator()(double share) const noexcept {
-    const double g = gpu(share), a = ane(share);
-    return std::max({g, a, uG * g + uA * a});
-  }
-};
-
-Model fit(const Timing &p, const Timing &q) {
-  const auto line = [&](double Timing::*part) {
-    const double slope = (q.*part - p.*part) / (q.share - p.share);
-    return Line{p.*part - slope * p.share, slope};
-  };
-  Model model{line(&Timing::gpu), line(&Timing::ane)};
-  const auto excess = [](const Timing &x) { return x.both / std::max(x.gpu, x.ane) - 1.0; };
-  bool solved = false;
-  if (excess(p) > kBindingMargin && excess(q) > kBindingMargin) {
-    const double det = p.gpu * q.ane - p.ane * q.gpu;
-    if (std::abs(det) > 1e-9) {
-      model.uG = (p.both * q.ane - p.ane * q.both) / det;
-      model.uA = (p.gpu * q.both - p.both * q.gpu) / det;
-      solved = model.uG >= 0.0 && model.uG <= 1.05 && model.uA >= 0.0 && model.uA <= 1.05;
-    }
-  }
-  if (!solved) {
-    // Binding at one share: the GPU's part alone nearly saturates memory, so
-    // that share's excess over it is the ANE's fraction.
-    const Timing &x = excess(p) >= excess(q) ? p : q;
-    model.uG = excess(x) > kBindingMargin ? 1.0 : 0.0;
-    model.uA = model.uG > 0.0 ? (x.both - x.gpu) / x.ane : 0.0;
-  }
-  model.uG = std::clamp(model.uG, 0.0, 1.0);
-  model.uA = std::clamp(model.uA, 0.0, 1.0);
-  return model;
-}
-
-// The GPU's channel units, of `units`, at which full chunks split: where the
-// GPU's part and the ANE's alone take most nearly as long, the most units
-// within kTolerance of the least max(G, A), or the `previous` choice while it
-// still is, as each share compiles a program of its own, which takes half a
-// minute on an M6, whose ANE service keeps few; none if `model` predicts no
-// gain of kMinimumGain there on `gpuAlone` milliseconds.
-std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units,
-                               std::optional<uint32_t> previous) {
-  const auto share = [&](uint32_t gpuUnits) { return 1.0 - static_cast<double>(gpuUnits) / units; };
-  const auto longer = [&](uint32_t gpuUnits) {
-    return std::max(model.gpu(share(gpuUnits)), model.ane(share(gpuUnits)));
-  };
-  double best = std::numeric_limits<double>::infinity();
-  for (uint32_t gpuUnits = 1; gpuUnits < units; ++gpuUnits) best = std::min(best, longer(gpuUnits));
-  uint32_t gpuUnits = units - 1;
-  if (previous && *previous && *previous < units && longer(*previous) <= (1.0 + kTolerance) * best)
-    gpuUnits = *previous;
-  else
-    while (longer(gpuUnits) > (1.0 + kTolerance) * best) --gpuUnits;
-  if (model(share(gpuUnits)) > (1.0 - kMinimumGain) * gpuAlone) return std::nullopt;
-  return gpuUnits;
-}
-
-// What calibration's remembered choice is kept under: the layers' shapes and
-// formats.
-std::string choiceKey(std::span<const SwiGluProjections> layers) {
-  std::string key = "ane-ffn";
-  for (const SwiGluProjections &layer : layers)
-    for (const Projection *projection : {layer.gate, layer.up, layer.down})
-      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":" +
-             std::to_string(formatOf(*projection)) + (projection->layout() == WeightLayout::Affine64 ? "a" : "g");
-  return key;
-}
-
 // The rows of the program's functions, ascending.
 std::vector<uint32_t> functionRows() {
   std::vector<uint32_t> rows;
   for (uint32_t row = AneFfn::kMinimumRows; row <= AneFfn::kMaximumRows; row += AneFfn::kProgramStep)
     rows.push_back(row);
   return rows;
+}
+
+// What AneFfn::verify fills the ANE's output with before a check: an fp16
+// NaN, which the join flags where the ANE leaves it.
+constexpr uint16_t kHalfNaN = 0x7e00;
+// The most the split's output may differ from the GPU's alone, as the RMS of
+// their difference relative to the RMS of what the ANE adds over the GPU's
+// part (AneFfn::verify): int8 leaves 2.5-2.8% on Qwen3.8-27B's MLX and GGUF
+// layers on an M5 Max, and over three times that leaves room for other
+// models and devices, where a function that computes other values differs by
+// about all of the ANE's part.
+constexpr double kMaximumAneError = 0.10;
+
+// The leading `count` values of the CPU-visible bf16 `buffer`.
+std::vector<float> bf16Values(const metal::MetalBuffer &buffer, uint64_t count) {
+  const auto *bits = static_cast<const uint16_t *>(buffer.contents());
+  if (!bits || buffer.sizeBytes() < count * sizeof(uint16_t))
+    throw std::invalid_argument("ANE FFN check reads rows the CPU cannot");
+  std::vector<float> values(count);
+  for (uint64_t i = 0; i < count; ++i) values[i] = std::bit_cast<float>(uint32_t{bits[i]} << 16);
+  return values;
 }
 
 } // namespace
@@ -307,13 +215,13 @@ AneFfn::Planes::Planes(const Projection &projection) {
   buffers = {segment.plane0, segment.plane1Slot(), segment.meta};
 }
 
-AneFfn::Shape AneFfn::shapeOf(std::span<const SwiGluProjections> layers, double share) {
+AneFfn::Shape AneFfn::shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits) {
   if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
   Shape shape;
   shape.hidden = layers.front().gate->inputSize;
   shape.intermediate = layers.front().gate->outputSize;
   shape.layers = static_cast<uint32_t>(layers.size());
-  shape.gpu = gpuChannels(shape.intermediate, share);
+  shape.gpu = gpuChannels(shape.intermediate, aneUnits);
   shape.ane = shape.intermediate - shape.gpu;
   shape.downSegments = segments(shape.ane);
   return shape;
@@ -344,10 +252,10 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
   return memory;
 }
 
-uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, double share) {
+uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits) {
   uint64_t bytes = 0;
   static_cast<void>(allocate(
-      shapeOf(layers, share),
+      shapeOf(layers, aneUnits),
       [&](uint64_t size, const char *) {
         bytes += alignUp(size);
         return metal::MetalBuffer{};
@@ -489,12 +397,13 @@ std::string AneFfn::program(const Shape &shape, std::span<const Input> inputs, c
   return text + "}\n";
 }
 
-AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, double share)
-    : AneFfn(backend, layers, share, functionRows()) {}
+AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+               std::function<bool()> interrupted)
+    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows()) {}
 
-AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, double share,
-               std::span<const uint32_t> functionRows)
-    : backend_(backend), linear_(backend.capabilities()), share_(share), shape_(shapeOf(layers, share)),
+AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+               std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
+    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
       handoff_(backend, kHandoffBound) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
@@ -522,7 +431,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
                                             rotationBlob(shape_.ane, signs),
-                                            ane::Program::Limits{kProgramLimit, {}});
+                                            ane::Program::Limits{kProgramLimit, std::move(interrupted)});
   for (const uint32_t rows : functionRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
     evaluation.rows = rows;
@@ -554,19 +463,18 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
     add(Matrix::Down, 0, shape_.gpu, shape_.ane, shape_.hidden, Rotation::Intermediate);
   }
   static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
-
-  // Each function evaluates once now, so that one the ANE loads but cannot run
-  // fails where startup falls back to the GPU, not in a request.
-  std::vector<std::pair<uint32_t, uint32_t>> functions;
-  for (uint32_t index = 0; index < evaluations_.size(); ++index) functions.emplace_back(index, 0);
-  queueNow(functions);
-  if (!handoff_.finish()) throw std::runtime_error("ANE FFN program does not run (" + handoff_.reason() + ")");
 }
 
-bool AneFfn::supports(std::span<const SwiGluProjections> layers) { return !unsupported(layers); }
+double AneFfn::share() const noexcept { return static_cast<double>(shape_.ane) / shape_.intermediate; }
+
+void AneFfn::setMinimumRows(uint32_t rows) {
+  if (rows < kMinimumRows || rows > kMaximumRows)
+    throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(rows) + " rows");
+  minimumRows_ = rows;
+}
 
 bool AneFfn::splits(uint32_t rows) const {
-  return rows >= kMinimumRows && rows <= kMaximumRows && !handoff_.retired();
+  return rows >= minimumRows_ && rows <= kMaximumRows && !handoff_.retired();
 }
 
 metal::MetalBuffer AneFfn::rowScales(uint32_t layer, Matrix matrix) const {
@@ -751,124 +659,75 @@ void AneFfn::queueNow(std::span<const std::pair<uint32_t, uint32_t>> evaluations
   }
 }
 
-AneFfn::Calibration AneFfn::calibrate(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
-                                      const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-  if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
-  const Linear linear(backend.capabilities());
-  // A model of fewer layers times some twice.
-  std::vector<SwiGluProjections> sampled;
-  for (uint32_t index = 0; index <= kTimedLayers; ++index)
-    sampled.push_back(layers[index * (layers.size() - 1) / kTimedLayers]);
-
-  // Inputs of the magnitude of normalized rows; timing does not depend on
-  // their values.
-  if (auto *data = static_cast<uint16_t *>(ffn.normalized.contents())) {
-    std::mt19937 random(20261001);
-    std::uniform_real_distribution<float> uniform(-2.0f, 2.0f);
-    for (uint64_t i = 0; i < ffn.normalized.sizeBytes() / 2; ++i)
-      data[i] = static_cast<uint16_t>(std::bit_cast<uint32_t>(uniform(random)) >> 16);
-  }
-  for (const metal::MetalBuffer &buffer : {ffn.sums, hidden[0], hidden[1]})
-    if (auto *data = static_cast<uint8_t *>(buffer.contents())) std::memset(data, 0, buffer.sizeBytes());
-
-  // The per-layer milliseconds of `run`, which runs a number of layers and
-  // returns its milliseconds: the least of two runs of one and of
-  // kTimedLayers layers.
-  const auto perLayer = [](const auto &run) {
-    const auto least = [&](uint32_t count) { return std::min(run(count), run(count)); };
-    return (least(kTimedLayers) - least(1)) / (kTimedLayers - 1);
-  };
-  // The split at `share` timed: the GPU's part of a number of layers in one
-  // command buffer, and the ANE's evaluations back to back, the first
-  // starting at once.
-  const auto measure = [&](double share) {
-    AneFfn split(backend, sampled, share, std::array{kMaximumRows});
-    const auto parts = [&](bool gpu, bool ane) {
-      return [&, gpu, ane](uint32_t count) {
-        metal::CommandGraph graph;
-        split.begin();
-        if (gpu)
-          for (uint32_t layer = 0; layer < count; ++layer)
-            split.encode(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kMaximumRows, Parts::Gpu);
-        std::vector<std::pair<uint32_t, uint32_t>> evaluations;
-        for (uint32_t layer = 0; layer < count; ++layer) evaluations.emplace_back(0, layer & 1);
-        const auto start = AwakeClock::now();
-        if (ane) split.queueNow(evaluations);
-        if (gpu) static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-        if (!split.handoff_.finish())
-          throw std::runtime_error("ANE FFN evaluations failed (" + split.reason() + ")");
-        return millisecondsSince(start);
-      };
-    };
-    // The first command compiles and wires what the others run.
-    static_cast<void>(parts(true, true)(kTimedLayers));
-    return Timing{share, perLayer(parts(true, false)), perLayer(parts(false, true)), perLayer(parts(true, true))};
-  };
-  const Model model = fit(measure(kTimedShares[0]), measure(kTimedShares[1]));
-  const double gpuMilliseconds = perLayer([&](uint32_t count) {
-    metal::CommandGraph graph;
-    for (uint32_t layer = 0; layer < count; ++layer)
-      linear.addPrefillSwiGlu(graph, sampled[layer], ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kMaximumRows);
-    const auto start = AwakeClock::now();
-    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    return millisecondsSince(start);
-  });
-
-  const uint32_t units = layers.front().gate->outputSize / kChannelUnit;
-  const std::string key = choiceKey(layers);
-  const std::optional<uint32_t> gpuUnits = choose(model, gpuMilliseconds, units, ane::recall(key));
-  if (!gpuUnits) return {0.0, gpuMilliseconds, gpuMilliseconds};
-  const double share = 1.0 - static_cast<double>(*gpuUnits) / units;
-  // The split must compute what the GPU computes alone: an ANE that runs but
-  // returns other values, as a change to its private client could make it,
-  // would otherwise serve wrong logits.
-  const double error = splitError(backend, linear, sampled, share, ffn, hidden);
-  if (!(error <= kMaximumError))
-    throw std::runtime_error("the split's FFN differs from the GPU's by " + std::to_string(error));
-  ane::remember(key, *gpuUnits);
-  return {share, gpuMilliseconds, model(share), error};
+void AneFfn::fillNormalized(const metal::MetalBuffer &normalized) {
+  auto *bits = static_cast<uint16_t *>(normalized.contents());
+  if (!bits) throw std::invalid_argument("ANE FFN check writes rows the CPU cannot");
+  std::mt19937 random(20261001);
+  std::uniform_real_distribution<float> uniform(-2.0f, 2.0f);
+  for (uint64_t i = 0; i < normalized.sizeBytes() / sizeof(uint16_t); ++i)
+    bits[i] = static_cast<uint16_t>(std::bit_cast<uint32_t>(uniform(random)) >> 16);
 }
 
-double AneFfn::splitError(metal::MetalBackend &backend, const Linear &linear,
-                          std::span<const SwiGluProjections> layers, double share, const PrefillFfnBuffers &ffn,
-                          const std::array<metal::MetalBuffer, 2> &hidden) {
+double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
+                      const std::array<metal::MetalBuffer, 2> &hidden) {
+  if (layers.size() != layers_.size() || layers.front().gate->outputSize != shape_.intermediate)
+    throw std::invalid_argument("ANE FFN split verified on other layers than its own");
+  if (handoff_.retired()) throw std::runtime_error("ANE FFN split stopped (" + handoff_.reason() + ")");
+  fillNormalized(ffn.normalized);
   // Layer l adds its FFN of the normalized rows to hidden[l & 1] into
-  // hidden[(l & 1) ^ 1], from zeros, each way. The affine Q4 kernels read the
-  // rows' sums, which the GPU's way computes first.
-  const metal::MetalBuffer &result = hidden[layers.size() & 1];
-  const auto output = [&] {
-    const auto *bits = static_cast<const uint16_t *>(result.contents());
-    std::vector<float> values(uint64_t{kMaximumRows} * layers.front().gate->inputSize);
-    for (size_t i = 0; i < values.size(); ++i) values[i] = std::bit_cast<float>(uint32_t{bits[i]} << 16);
-    return values;
+  // hidden[(l & 1) ^ 1], from zeros, on the GPU alone, as the split's GPU part
+  // alone over a partial output of zeros, or split. The affine Q4 kernels
+  // read the rows' sums, which each command computes first.
+  enum class Way : uint8_t { Gpu, GpuPart, Split };
+  const auto forward = [&](Way way, uint32_t count, uint32_t rows) {
+    std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
+    if (way != Way::Gpu) {
+      std::fill_n(static_cast<uint16_t *>(memory_.partial.buffer.contents()),
+                  memory_.partial.buffer.sizeBytes() / sizeof(uint16_t), way == Way::Split ? kHalfNaN : 0);
+      static_cast<void>(begin());
+    }
+    metal::CommandGraph graph;
+    if (layers.front().gate->layout() == WeightLayout::Affine64)
+      linear_.addPrefillSums(graph, ffn.normalized, ffn.sums, *layers.front().gate, rows);
+    for (uint32_t layer = 0; layer < count; ++layer) {
+      const metal::MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
+      if (way == Way::Gpu)
+        linear_.addPrefillSwiGlu(graph, layers[layer], ffn, residual, output, rows);
+      else
+        encode(graph, layer, ffn, residual, output, rows, way == Way::Split ? Parts::Both : Parts::Gpu);
+    }
+    if (way == Way::Split) {
+      static_cast<void>(commit(graph, {}).wait());
+      if (!completed())
+        throw std::runtime_error("ANE FFN split of " + std::to_string(rows) + " rows failed (" + reason() + ")");
+    } else {
+      static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+    }
+    return bf16Values(hidden[count & 1], uint64_t{rows} * shape_.hidden);
   };
-  const auto zero = [&] { std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes()); };
-  zero();
-  metal::CommandGraph gpu;
-  if (layers.front().gate->layout() == WeightLayout::Affine64)
-    linear.addPrefillSums(gpu, ffn.normalized, ffn.sums, *layers.front().gate, kMaximumRows);
-  for (uint32_t layer = 0; layer < layers.size(); ++layer)
-    linear.addPrefillSwiGlu(gpu, layers[layer], ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kMaximumRows);
-  static_cast<void>(backend.submitCommandAsync(gpu.dispatches()).wait());
-  const std::vector<float> expected = output();
-
-  zero();
-  AneFfn split(backend, layers, share, std::array{kMaximumRows});
-  metal::CommandGraph graph;
-  split.begin();
-  for (uint32_t layer = 0; layer < layers.size(); ++layer)
-    split.add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kMaximumRows);
-  static_cast<void>(split.commit(graph, {}).wait());
-  if (!split.completed()) throw std::runtime_error("ANE FFN evaluations failed (" + split.reason() + ")");
-  const std::vector<float> got = output();
-
-  double difference = 0.0, magnitude = 0.0;
-  for (size_t i = 0; i < expected.size(); ++i) {
-    const double value = expected[i], delta = got[i] - value;
-    difference += delta * delta;
-    magnitude += value * value;
-  }
-  return std::sqrt(difference / magnitude);
+  // What the ANE adds over the GPU's part, the GPU alone's output less the
+  // GPU part's, against the split's difference from the GPU alone.
+  double worst = 0.0;
+  const auto check = [&](uint32_t count, uint32_t rows) {
+    const std::vector<float> gpu = forward(Way::Gpu, count, rows), part = forward(Way::GpuPart, count, rows),
+                             split = forward(Way::Split, count, rows);
+    const auto fail = [&](const std::string &why) {
+      handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
+      throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
+    };
+    double difference = 0.0, contribution = 0.0;
+    for (size_t i = 0; i < gpu.size(); ++i) {
+      if (!std::isfinite(split[i])) fail("is not finite");
+      difference += (double(split[i]) - gpu[i]) * (double(split[i]) - gpu[i]);
+      contribution += (double(gpu[i]) - part[i]) * (double(gpu[i]) - part[i]);
+    }
+    const double error = std::sqrt(difference / contribution);
+    if (!(error <= kMaximumAneError))
+      fail("differs from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
+    worst = std::max(worst, error);
+  };
+  for (const Evaluation &evaluation : evaluations_) check(std::min<uint32_t>(2, shape_.layers), evaluation.rows);
+  return worst;
 }
 
 } // namespace splash::ops

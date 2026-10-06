@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace splash::ane {
 
@@ -41,6 +42,9 @@ public:
     // writes an fp16 infinity as its output's first value, raises the event
     // and reports success, as one whose output overflowed would.
     uint64_t poisonedEvaluation = 0;
+    // bind() of the function named first binds the procedure of the function
+    // named second in its place, as a client that confused the two would.
+    std::pair<std::string, std::string> swappedBinding;
   };
   // The faults of the next Program this process constructs, for its life.
   // Programs constructed after it take none until faults are armed again.

@@ -6,6 +6,7 @@
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "model/WeightStore.hpp"
+#include "ops/AneFfnMeasurement.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <utility>
 
@@ -124,76 +126,17 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
   }
 }
 
-std::string fixed(double value, int digits) {
-  std::ostringstream text;
-  text << std::fixed << std::setprecision(digits) << value;
-  return text.str();
-}
-
-// The prefill FFN's Neural Engine split the engine runs, if any, which
-// replaces `memoryPlan` with the plan that sets its memory aside. It runs at
-// the share the config gives, or else at the one calibration finds fastest,
-// while its program loads and runs and that plan still holds the context the
-// config asks for, or all the context `memoryPlan` holds when it asks none.
-// Otherwise the GPU runs the FFN alone on `memoryPlan` as it is. A failure of
-// the split's leaves the GPU alone; only cancellation ends the start.
-std::unique_ptr<ops::AneFfn>
-startAneFfn(metal::MetalBackend &backend, const model::LoadedModel &loaded,
-            const ops::ExecutionPlans &operators, const RuntimeResourcesConfig &config,
-            const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,
-            EngineMemoryPlan &memoryPlan) {
-  if (config.aneFfnShare && *config.aneFfnShare == 0.0) {
-    logLine("The GPU runs the prefill FFN alone, as given.");
-    return {};
-  }
-  if (!model::supportsAneFfn(loaded))
-    return {};
-  const auto started = AwakeClock::now();
-  const auto seconds = [&] {
-    return fixed(std::chrono::duration<double>(AwakeClock::now() - started).count(), 1);
-  };
-  const std::string layer =
-      " ms per " + std::to_string(ops::AneFfn::kMaximumRows) + "-row FFN layer";
-  const auto unavailable = [](std::string_view reason) {
-    logLine("Neural Engine FFN split unavailable (", reason, "); the GPU runs the FFN alone.");
-  };
-  try {
-    ops::AneFfn::Calibration calibration;
-    if (config.aneFfnShare)
-      calibration.share = *config.aneFfnShare;
-    else
-      calibration = model::calibrateAneFfn(backend, loaded, operators, config.kvFormat);
-    if (calibration.share == 0.0) {
-      logLine("The GPU runs the prefill FFN alone, ", fixed(calibration.gpuMilliseconds, 1), layer,
-                 ": no Neural Engine split beats it by enough (calibrated in ", seconds(), " s).");
-      return {};
+// What ane::recall() keeps the units chosen last under: the layers' shapes
+// and formats.
+std::string choiceKey(std::span<const ops::SwiGluProjections> layers) {
+  std::string key = "ane-ffn ane-units";
+  for (const ops::SwiGluProjections &layer : layers)
+    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down}) {
+      const bool affine = projection->layout() == ops::WeightLayout::Affine64;
+      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":" +
+             (affine ? "a" : "g" + std::to_string(projection->blocks().segments.front().formatId));
     }
-    const uint64_t bytes = model::aneFfnBytes(loaded, calibration.share);
-    std::optional<EngineMemoryPlan> plan = planMemory(bytes).plan;
-    const uint32_t context = config.maximumContextTokens ? config.maximumContextTokens
-                                                         : memoryPlan.maximumContextTokens();
-    if (!plan || plan->maximumContextTokens() < context) {
-      unavailable("its memory leaves " + std::to_string(plan ? plan->maximumContextTokens() : 0) +
-                  " tokens of context, not " + std::to_string(context));
-      return {};
-    }
-    auto split = model::createAneFfn(backend, loaded, calibration.share);
-    memoryPlan = std::move(*plan);
-    if (config.aneFfnShare)
-      logLine("Neural Engine FFN split at the given share ", fixed(calibration.share, 3), ".");
-    else
-      logLine("Neural Engine FFN split at share ", fixed(calibration.share, 2), ": a predicted ",
-                 fixed(calibration.splitMilliseconds, 1), layer, " against ",
-                 fixed(calibration.gpuMilliseconds, 1), " on the GPU alone, output ",
-                 fixed(100.0 * calibration.error, 1), "% RMS from the GPU's (set up in ", seconds(),
-                 " s).");
-    return split;
-  } catch (const std::exception &error) {
-    if (config.cancelled && config.cancelled())
-      throw;
-    unavailable(error.what());
-    return {};
-  }
+  return key;
 }
 
 // The split's part of what the engine gives back while idle, if it runs one.
@@ -305,7 +248,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, std::optional<uint64_t> hostAvailableAtStart)
+    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::optional<uint64_t> hostAvailableAtStart)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -316,10 +260,11 @@ RuntimeResources::RuntimeResources(
       kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
-      hostAvailableAtStart_(hostAvailableAtStart) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), hostAvailableAtStart_(hostAvailableAtStart) {}
 
 std::unique_ptr<RuntimeResources>
-RuntimeResources::create(const RuntimeResourcesConfig &config) {
+RuntimeResources::create(const RuntimeResourcesConfig &config,
+                         uint32_t requestedContextTokens) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
       !kv::validFormat(config.kvFormat) ||
       !config.model.valid() || !config.hostAvailableMemory ||
@@ -519,8 +464,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       memoryGovernor->setPressure(config.memoryPressure());
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
-    std::unique_ptr<ops::AneFfn> aneFfn =
-        startAneFfn(*backend, loaded, operators, config, planMemory, memoryPlan);
+    AneFfnStart aneFfn =
+        startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.cancelled), config.aneFfn,
+                    requestedContextTokens, planMemory, config.cancelled);
+    if (aneFfn.plan)
+      memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
 
     // Page ids for every extent the hard budget could hold: the governor,
@@ -591,7 +539,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(kvPool), std::move(cache),
-        std::move(aneFfn), hostAvailableAtStart));
+        std::move(aneFfn.split), std::move(aneFfn.outcome), hostAvailableAtStart));
     result->adoptPersistentCache();
     return result;
   } catch (const metal::MetalAllocationError &error) {
@@ -733,6 +681,46 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   // returns a result; the backend's own high-water mark keeps it.
   report.backendPeakAllocatedBytes = memory.peakAllocatedBytes;
   return report;
+}
+
+AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+                        const ops::ExecutionPlans &operators, kv::Format format, std::function<bool()> cancelled) {
+  auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
+  AneFfnModel model;
+  model.dense = !layers->empty();
+  if (!model.dense) return model;
+  if (const char *reason = ops::AneFfn::unsupported(*layers)) {
+    model.unsupported = reason;
+    return model;
+  }
+  model.units = ops::AneFfn::units(*layers);
+  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
+    model::withPrefillArena(backend, loaded, operators, format, use);
+  };
+  model.time = [&backend, layers, cancelled, onArena] {
+    ops::ane_ffn::Timings timings;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+    });
+    return timings;
+  };
+  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+    AneFfnPrepared prepared;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
+      prepared.error = prepared.split->verify(*layers, ffn, hidden);
+      if (timeChunks)
+        prepared.chunks =
+            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+    });
+    return prepared;
+  };
+  const std::string key = choiceKey(*layers);
+  model.recall = [key] { return ane::recall(key); };
+  model.remember = [key](uint32_t aneUnits) { ane::remember(key, aneUnits); };
+  model.healthy = [&backend] { return backend.healthy(); };
+  return model;
 }
 
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {

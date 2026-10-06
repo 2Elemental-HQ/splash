@@ -230,6 +230,8 @@ ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrument
 ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
+	runtime/ops/AneFfnCalibration.cpp \
+	runtime/ops/AneFfnMeasurement.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
@@ -247,6 +249,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
+	runtime/engine/AneFfnStartup.cpp \
 	runtime/engine/Scheduler.cpp \
 	runtime/engine/Cache.cpp \
 	runtime/engine/WriteBehind.cpp \

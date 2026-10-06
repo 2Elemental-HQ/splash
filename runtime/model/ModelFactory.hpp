@@ -10,10 +10,13 @@
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
+#include <array>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -71,7 +74,7 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  // The prefill FFN's Neural Engine split (createAneFfn), if any.
+  // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
 };
 
@@ -99,16 +102,14 @@ loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor);
 
-// The Neural Engine split of the model's prefill FFN (ops::AneFfn), which
-// takes a dense target's FFN in the formats it supports. The others need
-// one: its calibration on this device on a prefill arena of its own, the
-// split at `share` ready to run, and the Metal memory of that split.
-[[nodiscard]] bool supportsAneFfn(const LoadedModel &model);
-[[nodiscard]] ops::AneFfn::Calibration calibrateAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
-                                                       const ops::ExecutionPlans &operators, kv::Format format);
-[[nodiscard]] std::unique_ptr<ops::AneFfn> createAneFfn(metal::MetalBackend &backend, const LoadedModel &model,
-                                                        double share);
-[[nodiscard]] uint64_t aneFfnBytes(const LoadedModel &model, double share);
+// The FFN layers of a dense target, which the prefill FFN's Neural Engine
+// split (ops::AneFfn) may take; none for another target.
+[[nodiscard]] std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model);
+// Runs `use` on a prefill arena allocated for the call: on the dense FFN's
+// buffers of a full chunk and the hidden rows layers alternate between.
+void withPrefillArena(
+    metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
+    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,

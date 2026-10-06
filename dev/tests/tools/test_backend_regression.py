@@ -58,6 +58,7 @@ def benchmark_document(
         },
         "decode_throughput": {"samples": samples if "decode" in scenarios else []},
         "max_context_tokens": CONTEXT,
+        "no_ane_context_tokens": CONTEXT,
         "dynamic_budget_bytes": 35 << 30,
         "ane_ffn_bytes": 0,
         "measurements": measurements,
@@ -277,6 +278,7 @@ class BackendRegressionTests(unittest.TestCase):
             record["memory_plans"][0],
             {
                 "max_context_tokens": CONTEXT,
+                "no_ane_context_tokens": CONTEXT,
                 "dynamic_budget_bytes": 35 << 30,
                 "ane_ffn_bytes": 0,
             },
@@ -302,15 +304,18 @@ class BackendRegressionTests(unittest.TestCase):
         honours_share=True,
         short=True,
         context=CONTEXT,
+        minimum_rows=832,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
         its invocations. With digest its weight-digests prints one image of
         that digest; without, it has none, as a build of an earlier release.
         Its benchmark takes a list of scenarios with list_support, the short
         scenario among them with short too, and serves context tokens. With a
-        share it has the Neural Engine split: it reports that share as
-        calibrated, or runs the one --ane-ffn-share gives unless honours_share
-        is false, and logs what it was given."""
+        share it has the Neural Engine split: it reports that share and
+        minimum_rows as calibrated, or runs the share --ane-ffn-share gives
+        and the rows --ane-ffn-minimum-rows gives, else 512, unless
+        honours_share is false, and logs what it was given. Without
+        minimum_rows it takes no --ane-ffn-minimum-rows and reports none."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
         (checkout / "build/splash.metallib").write_text("")
@@ -324,19 +329,29 @@ class BackendRegressionTests(unittest.TestCase):
             if list_support
             else "[--scenario decode|partial]"
         ) + (" [--ane-ffn-share SHARE]" if share is not None else "")
+        if share is not None and minimum_rows is not None:
+            usage += " [--ane-ffn-minimum-rows ROWS]"
         if list_support:
             names = "decode, partial, short" if short else "decode, partial"
             usage += f"\n  NAME: {names}, context or exact"
         document = benchmark_document(build=name)
-        document["max_context_tokens"] = context
+        document["max_context_tokens"] = document["no_ane_context_tokens"] = context
         given = (
-            "given = sys.argv[sys.argv.index('--ane-ffn-share') + 1] "
-            "if '--ane-ffn-share' in sys.argv else None\n"
+            "option = lambda name: sys.argv[sys.argv.index(name) + 1] "
+            "if name in sys.argv else None\n"
+            "given, rows = option('--ane-ffn-share'), option('--ane-ffn-minimum-rows')\n"
             f"with open({str(root / 'shares.jsonl')!r}, 'a') as log:\n"
-            f"    log.write(json.dumps([{name!r}, given]) + '\\n')\n"
+            f"    log.write(json.dumps([{name!r}, given, rows]) + '\\n')\n"
             "document['ane_ffn_share'] = "
             + ("float(given) if given else " if honours_share else "")
             + f"{share!r}\n"
+            + (
+                "document['ane_ffn_minimum_rows'] = 0 if not document['ane_ffn_share'] "
+                + ("else int(rows) if rows else 512 if given " if honours_share else "")
+                + f"else {minimum_rows!r}\n"
+                if minimum_rows is not None
+                else ""
+            )
             if share is not None
             else ""
         )
@@ -485,20 +500,22 @@ class BackendRegressionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.run_main(root)
 
-    def test_later_rounds_run_the_first_reported_ane_ffn_share(self):
+    def test_later_rounds_run_the_first_reported_ane_ffn_split(self):
         calibrated = 1 - 24 / 34
         # A baseline without the split leaves the candidate's first round to
         # calibrate; one with it calibrates first and the candidate runs its
-        # share.
-        for baseline_share, expected in (
-            (None, [["candidate", None], ["candidate", repr(0.32)]]),
+        # share and least chunk rows, which a baseline that takes no
+        # --ane-ffn-minimum-rows runs without.
+        for baseline_share, baseline_rows, expected in (
+            (None, 832, [["candidate", None, None], ["candidate", repr(0.32), "896"]]),
             (
                 calibrated,
+                832,
                 [
-                    ["baseline", None],
-                    ["candidate", repr(calibrated)],
-                    ["candidate", repr(calibrated)],
-                    ["baseline", repr(calibrated)],
+                    ["baseline", None, None],
+                    ["candidate", repr(calibrated), "832"],
+                    ["candidate", repr(calibrated), "832"],
+                    ["baseline", repr(calibrated), "832"],
                 ],
             ),
         ):
@@ -507,8 +524,17 @@ class BackendRegressionTests(unittest.TestCase):
                 TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
-                self.fake_checkout(root, "baseline", "a" * 64, True, baseline_share)
-                self.fake_checkout(root, "candidate", "a" * 64, True, 0.32)
+                self.fake_checkout(
+                    root,
+                    "baseline",
+                    "a" * 64,
+                    True,
+                    baseline_share,
+                    minimum_rows=baseline_rows,
+                )
+                self.fake_checkout(
+                    root, "candidate", "a" * 64, True, 0.32, minimum_rows=896
+                )
                 self.assertEqual(self.run_main(root), 0)
                 shares = [
                     json.loads(line)
@@ -519,9 +545,24 @@ class BackendRegressionTests(unittest.TestCase):
                     (root / "release/backend-regression.json").read_text()
                 )
                 self.assertEqual(
-                    document["ane_ffn_share"],
-                    0.32 if baseline_share is None else calibrated,
+                    (document["ane_ffn_share"], document["ane_ffn_minimum_rows"]),
+                    (0.32, 896) if baseline_share is None else (calibrated, 832),
                 )
+        args = SimpleNamespace(
+            ane_ffn_share=0.3,
+            ane_ffn_minimum_rows=832,
+            ane_ffn_share_given=False,
+        )
+        regression.pin_ane_ffn(
+            args, "candidate", {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 832}
+        )
+        with self.assertRaisesRegex(
+            regression.RegressionError,
+            "at share 0.3 from 512 rows, not the first round's 0.3 from 832",
+        ):
+            regression.pin_ane_ffn(
+                args, "candidate", {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 512}
+            )
 
     def test_a_round_that_runs_another_ane_ffn_share_fails(self):
         with TemporaryDirectory() as directory:
@@ -533,7 +574,7 @@ class BackendRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 regression.RegressionError,
                 r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
-                r"at share 0.0, not the first round's 0.3",
+                r"at share 0.0 from 0 rows, not the first round's 0.3 from 832",
             ):
                 self.run_main(root)
 
@@ -541,8 +582,8 @@ class BackendRegressionTests(unittest.TestCase):
         # Share 0, the GPU alone, against a baseline without the split, which
         # runs as it is and reports no share, and against one with it.
         for baseline_share, expected in (
-            (None, [["candidate", "0.0"], ["candidate", "0.0"]]),
-            (1 - 24 / 34, [[version, "0.0"] for version in regression.ROUNDS]),
+            (None, [["candidate", "0.0", None], ["candidate", "0.0", None]]),
+            (1 - 24 / 34, [[version, "0.0", None] for version in regression.ROUNDS]),
         ):
             with (
                 self.subTest(baseline_share=baseline_share),
@@ -582,12 +623,12 @@ class BackendRegressionTests(unittest.TestCase):
             ane_ffn_share_given=True,
             takes_ane_ffn_share={"baseline": False},
         )
-        regression.pin_ane_ffn_share(args, "baseline", {})
+        regression.pin_ane_ffn(args, "baseline", {})
         with self.assertRaisesRegex(
             regression.RegressionError,
             "takes no --ane-ffn-share but reported the share 0.24",
         ):
-            regression.pin_ane_ffn_share(args, "baseline", {"ane_ffn_share": 0.24})
+            regression.pin_ane_ffn(args, "baseline", {"ane_ffn_share": 0.24})
 
     def test_an_ane_ffn_share_outside_zero_to_one_is_refused(self):
         for value in ("1", "1.5", "-0.1", "nan", "inf", "half"):
@@ -603,24 +644,23 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual(regression.ane_ffn_share("0"), 0.0)
         self.assertEqual(regression.ane_ffn_share("0.999"), 0.999)
 
-    def test_the_candidate_must_serve_the_baselines_context(self):
-        def serves(tokens, budget):
+    def test_the_candidate_must_hold_the_baselines_context(self):
+        def serves(tokens, budget, without=CONTEXT):
             def change(document):
                 document["max_context_tokens"] = tokens
+                document["no_ane_context_tokens"] = without
                 document["dynamic_budget_bytes"] = budget
                 document["ane_ffn_bytes"] = (35 << 30) - budget
 
             return change
 
-        # A split of 173 MiB that costs 4K tokens of context.
-        smaller = serves(CONTEXT - 4096, (35 << 30) - (173 << 20))
-        summary = regression.summarize(rounds({1: smaller, 2: smaller}), False)
+        # A split of 173 MiB that takes 4K tokens of context from the KV
+        # cache passes, and is reported.
+        split = serves(CONTEXT - 4096, (35 << 30) - (173 << 20))
+        summary = regression.summarize(rounds({1: split, 2: split}), False)
+        self.assertTrue(summary["pass"], summary["failures"])
         self.assertEqual(
-            summary["failures"],
-            [
-                f"the candidate serves {CONTEXT - 4096} tokens of context, "
-                f"less than the baseline's {CONTEXT}"
-            ],
+            summary["memory_plan"]["candidate"]["max_context_tokens"], CONTEXT - 4096
         )
         self.assertEqual(
             summary["memory_plan"]["dynamic_budget_change_bytes"], -(173 << 20)
@@ -628,22 +668,37 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual(
             summary["memory_plan"]["candidate"]["ane_ffn_bytes"], 173 << 20
         )
-        # The same context passes with a smaller elastic budget.
-        same = serves(CONTEXT, (35 << 30) - (173 << 20))
-        self.assertTrue(regression.summarize(rounds({1: same, 2: same}), False)["pass"])
+        # A plan that holds less context without the split fails.
+        smaller = serves(CONTEXT - 4096, 35 << 30, CONTEXT - 4096)
+        summary = regression.summarize(rounds({1: smaller, 2: smaller}), False)
+        self.assertEqual(
+            summary["failures"],
+            [
+                f"the candidate holds {CONTEXT - 4096} tokens of context without "
+                f"the Neural Engine split, less than the baseline's {CONTEXT}"
+            ],
+        )
 
-        # A baseline that reports no memory plan is not compared.
+        # A baseline that reports no memory plan is not compared, and one
+        # before the split is compared by the context it serves.
         def unreported(document):
             for key in regression.MEMORY_PLAN:
                 del document[key]
+
+        def before_split(document):
+            del document["no_ane_context_tokens"]
 
         summary = regression.summarize(
             rounds({0: unreported, 3: unreported, 1: smaller, 2: smaller}), False
         )
         self.assertTrue(summary["pass"])
         self.assertIsNone(summary["memory_plan"]["dynamic_budget_change_bytes"])
+        summary = regression.summarize(
+            rounds({0: before_split, 3: before_split, 1: smaller, 2: smaller}), False
+        )
+        self.assertEqual(len(summary["failures"]), 1)
         # A build's plan must not change between its rounds.
-        summary = regression.summarize(rounds({2: smaller}), False)
+        summary = regression.summarize(rounds({2: split}), False)
         self.assertEqual(
             summary["failures"],
             ["the candidate build's memory plan changed between rounds"],
@@ -660,8 +715,8 @@ class BackendRegressionTests(unittest.TestCase):
             self.assertEqual(
                 document["comparison"]["failures"],
                 [
-                    f"the candidate serves {CONTEXT - 1} tokens of context, "
-                    f"less than the baseline's {CONTEXT}"
+                    f"the candidate holds {CONTEXT - 1} tokens of context without "
+                    f"the Neural Engine split, less than the baseline's {CONTEXT}"
                 ],
             )
 

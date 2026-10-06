@@ -147,8 +147,9 @@ private:
 
 // A small value kept beside the compiled programs under `key`, such as the
 // share a calibration on this Mac chose last, whose programs it compiled; none
-// until remembered, or once macOS clears the cache directory.
-[[nodiscard]] std::optional<uint32_t> recall(std::string_view key);
+// until remembered, once macOS clears the cache directory, or when it cannot
+// be read.
+[[nodiscard]] std::optional<uint32_t> recall(std::string_view key) noexcept;
 void remember(std::string_view key, uint32_t value) noexcept;
 
 } // namespace splash::ane

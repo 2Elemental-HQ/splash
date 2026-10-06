@@ -8,14 +8,18 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
+
+namespace ane_ffn {
+class Measurement;
+} // namespace ane_ffn
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
 // GPU and the Neural Engine. The GPU runs the leading channels with its
@@ -31,53 +35,54 @@ namespace splash::ops {
 // runs too.
 class AneFfn final {
 public:
-  // Chunks of kMinimumRows rows or more split, up to the prefill budget; the
-  // GPU alone runs smaller ones faster. A chunk runs on the smallest of the
-  // program's functions that holds it, one every kProgramStep rows, since an
-  // evaluation costs the ANE its function's rows.
+  // A chunk runs on the smallest of the program's functions that holds it,
+  // one every kProgramStep rows from kMinimumRows to the prefill budget,
+  // since an evaluation costs the ANE its function's rows.
   static constexpr uint32_t kMinimumRows = 512, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
 
-  // `share` is the fraction of intermediate channels the ANE takes. The
-  // program is compiled and loaded, and each of its functions evaluated once,
-  // here, so that a split the ANE cannot run fails before it serves.
-  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, double share);
+  // The ANE takes `aneUnits` of the units() of intermediate channels. The
+  // program is compiled and loaded here, and the wait for the ANE's service
+  // ends with ane::Interrupted once `interrupted` returns true. The split
+  // takes every chunk its functions hold until setMinimumRows().
+  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+         std::function<bool()> interrupted);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
-  [[nodiscard]] double share() const noexcept { return share_; }
+  // Why the split does not take `layers`, or null when it does: affine Q4 or
+  // quantized GGUF projections of one shape (AneFfn.cpp).
+  [[nodiscard]] static const char *unsupported(std::span<const SwiGluProjections> layers);
+  // The units the split moves intermediate channels in, of `layers`, which
+  // it takes: the ANE takes from one to all but one of them.
+  [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
+  // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
+  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+
+  // The fraction of intermediate channels the ANE takes.
+  [[nodiscard]] double share() const noexcept;
   // What Metal allocated for the split, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
+  // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
+  // kMinimumRows to kMaximumRows.
+  [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
+  void setMinimumRows(uint32_t rows);
 
-  // Whether the split takes `layers`: affine Q4 or quantized GGUF projections
-  // of one shape (AneFfn.cpp).
-  [[nodiscard]] static bool supports(std::span<const SwiGluProjections> layers);
-  // The Metal memory of the split of `layers` at `share`.
-  [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, double share);
+  // Checks the split against the GPU alone on `layers`, those it was built
+  // from, with chunks in `ffn` and the residual and output of alternate
+  // layers in `hidden`, all of which it overwrites: each function at its own
+  // rows over the first two layers, which stage the ANE's weights through
+  // both sets, with the ANE's output filled with NaN before so that rows it
+  // leaves unwritten show; each through begin(), the layers encoded as add()
+  // encodes them, commit() and its completion check. Returns the largest
+  // error of what the ANE adds to the GPU's part (AneFfn.cpp). Throws if an
+  // output is not finite, that error exceeds its bound or the ANE's work
+  // fails, which stops the split.
+  [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
+                              const std::array<metal::MetalBuffer, 2> &hidden);
 
-  struct Calibration final {
-    // The fraction of intermediate channels the ANE takes; 0 when no share
-    // beats the GPU alone by enough.
-    double share = 0.0;
-    // A full chunk's FFN layer on the GPU alone, as timed, and split at
-    // `share`, as the timed model (AneFfn.cpp) predicts it.
-    double gpuMilliseconds = 0.0, splitMilliseconds = 0.0;
-    // The split's output against the GPU's alone over the timed layers: the
-    // RMS of their difference relative to the GPU's.
-    double error = 0.0;
-  };
-  // The share at which full chunks of `layers` (supports()) split on this
-  // device, where the GPU's part and the ANE's take equally long (AneFfn.cpp),
-  // timed on layers spread over the model with full chunks in
-  // `ffn` and the residual and output of alternate layers in `hidden`, all of
-  // which it overwrites. Throws if the split at that share computes other
-  // values than the GPU alone, beyond int8's error.
-  [[nodiscard]] static Calibration calibrate(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
-                                             const PrefillFfnBuffers &ffn,
-                                             const std::array<metal::MetalBuffer, 2> &hidden);
-
-  // Whether the split takes a chunk of `rows` rows: from kMinimumRows to
+  // Whether the split takes a chunk of `rows` rows: from minimumRows() to
   // kMaximumRows, until it stops.
   [[nodiscard]] bool splits(uint32_t rows) const;
   // Whether the split stopped, and why.
@@ -86,9 +91,9 @@ public:
 
   // Starts encoding a command; false once the split stopped.
   bool begin();
-  // Layer `layer`'s FFN of a chunk of `rows` rows (splits(rows)), encoded in
-  // layer order from layer 0 after begin(): output = residual + FFN of
-  // ffn.normalized, whose Q4 sums the norm wrote.
+  // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
+  // kMaximumRows, encoded in layer order from layer 0 after begin(): output =
+  // residual + FFN of ffn.normalized, whose Q4 sums the norm wrote.
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
            metal::MetalBuffer output, uint32_t rows);
   // Starts the ANE's evaluations of the command encoded since begin(), then
@@ -116,6 +121,9 @@ public:
   void restore() noexcept;
 
 private:
+  // Times the split's parts apart and its layers against the GPU's alone.
+  friend class ane_ffn::Measurement;
+
   // The split's channels: hidden and intermediate, the layers', the GPU's and
   // the ANE's, and the segments of down's inputs the ANE takes.
   struct Shape final {
@@ -189,9 +197,10 @@ private:
     uint64_t ready, done;
   };
 
-  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, double share,
-         std::span<const uint32_t> functionRows);
-  [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, double share);
+  // The split with a function of each of `functionRows` rows, ascending.
+  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+         std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+  [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them.
   template <class MakeBuffer, class MakeSurface>
@@ -203,10 +212,9 @@ private:
                                            const ane::Surface &output, std::span<const uint32_t> rows);
   [[nodiscard]] static std::string function(const Shape &shape, std::span<const Input> inputs,
                                             const ane::Surface &output, uint32_t rows);
-  // Calibration.error of `layers` split at `share` (AneFfn.cpp).
-  [[nodiscard]] static double splitError(metal::MetalBackend &backend, const Linear &linear,
-                                         std::span<const SwiGluProjections> layers, double share,
-                                         const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden);
+  // Fills the CPU-visible bf16 rows `normalized` with the same values of a
+  // normalized row's magnitude each time.
+  static void fillNormalized(const metal::MetalBuffer &normalized);
   void encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
               metal::MetalBuffer output, uint32_t rows, Parts parts);
   void addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const;
@@ -226,8 +234,8 @@ private:
 
   metal::MetalBackend &backend_;
   const Linear linear_;
-  double share_ = 0.0;
   Shape shape_;
+  uint32_t minimumRows_ = kMinimumRows;
   std::vector<Layer> layers_;
   Memory memory_;
   std::unique_ptr<ane::Program> program_;

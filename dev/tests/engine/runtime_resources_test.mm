@@ -75,7 +75,7 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
                                const std::filesystem::path &root,
                                const char *message) {
   try {
-    auto resources = RuntimeResources::create(config);
+    auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
     const std::string_view text = error.what();
@@ -136,7 +136,7 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   {
     config.memoryPressure = [] { return MemoryPressure::Critical; };
     try {
-      auto resources = RuntimeResources::create(config);
+      auto resources = RuntimeResources::create(config, 0);
       throw std::runtime_error("model load ignored system pressure");
     } catch (const RuntimeResourcesError &error) {
       require(error.failure() == RuntimeResourceFailure::HostCapacity,
@@ -156,7 +156,7 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   for (uint64_t ceiling : {minimum - 1, minimum, uint64_t{0}}) {
     config.maximumMemoryBytes = ceiling;
     try {
-      auto resources = RuntimeResources::create(config);
+      auto resources = RuntimeResources::create(config, 0);
       throw std::runtime_error("placeholder model unexpectedly loaded");
     } catch (const RuntimeResourcesError &error) {
       if (ceiling == minimum - 1) {
@@ -201,7 +201,7 @@ void testStateStagingNeedsAStartedTier(const char *metallibPath) {
 
   config.maximumCacheDiskBytes = stateBytes;
   try {
-    auto resources = RuntimeResources::create(config);
+    auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
@@ -227,7 +227,7 @@ void testImagePatchCapIsBounded(const char *metallibPath) {
   for (const uint32_t patches : {ops::kMaximumImagePatches + 4, 6U}) {
     config.maximumImagePatches = patches;
     try {
-      auto resources = RuntimeResources::create(config);
+      auto resources = RuntimeResources::create(config, 0);
       throw std::runtime_error("an image patch cap outside the protocol's was accepted");
     } catch (const RuntimeResourcesError &error) {
       require(error.stage() == RuntimeResourceStage::Configuration,
@@ -246,7 +246,7 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   config.hostAvailableMemory = {};
   try {
-    auto resources = RuntimeResources::create(config);
+    auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("resources were assembled without a host memory probe");
   } catch (const RuntimeResourcesError &error) {
     require(error.stage() == RuntimeResourceStage::Configuration,
@@ -262,7 +262,7 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   config.maximumMemoryBytes = 35 * kGiB;
   try {
-    auto resources = RuntimeResources::create(config);
+    auto resources = RuntimeResources::create(config, 0);
     throw std::runtime_error("placeholder model unexpectedly loaded");
   } catch (const RuntimeResourcesError &error) {
     require(error.failure() == RuntimeResourceFailure::EngineCapacity &&
@@ -291,7 +291,7 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
        {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
     config.hostAvailableMemory = [available] { return available; };
     try {
-      auto resources = RuntimeResources::create(config);
+      auto resources = RuntimeResources::create(config, 0);
       throw std::runtime_error("model load ignored the macOS reserve");
     } catch (const RuntimeResourcesError &error) {
       require(error.failure() == RuntimeResourceFailure::HostCapacity,
@@ -392,14 +392,14 @@ void testFailedStepIsNamed(const char *metallibPath) {
   // also reports the SSD cache a disk quota gives it, by that name.
   host(64 * kGiB);
   config.maximumCacheDiskBytes = kGiB;
-  require(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config)); })
+  require(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); })
                   .find("SSD cache: 1024 MiB for KV pages of ") != std::string::npos,
           "a start did not report its SSD cache by that name");
   config.maximumCacheDiskBytes = 0;
   const auto failure = [&](uint64_t available) {
     host(available);
     try {
-      static_cast<void>(RuntimeResources::create(config));
+      static_cast<void>(RuntimeResources::create(config, 0));
     } catch (const RuntimeResourcesError &error) {
       return RuntimeBootstrapError(error).report();
     }

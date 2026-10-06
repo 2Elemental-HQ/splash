@@ -172,6 +172,16 @@ void testServerCommandLines(const char *path) {
   }
 }
 
+// The Neural Engine split is on unless --ane off turns it off; --ane on, which
+// the server never writes, keeps it on.
+void testNeuralEngine() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).neuralEngine &&
+              parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
+              !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
+          "--ane did not reach the arguments as given");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -242,6 +252,7 @@ int main(int argc, char **argv) {
   }
   try {
     testServerCommandLines(argv[1]);
+    testNeuralEngine();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

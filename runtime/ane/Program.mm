@@ -655,6 +655,10 @@ const std::vector<std::string> &Program::inputs(uint32_t procedure) const {
 }
 
 Program::Binding Program::bind(uint32_t procedure, std::span<const Surface> inputs, const Surface &output) const {
+#ifdef SPLASH_ANE_INSTRUMENTATION
+  const auto &[bound, instead] = impl_->faults.swappedBinding;
+  if (!bound.empty() && impl_->procedures.at(procedure).function == bound) procedure = Program::procedure(instead);
+#endif
   const Procedure &called = impl_->procedures.at(procedure);
   if (inputs.size() != called.inputs.size()) throw std::invalid_argument("ANE program input count mismatch");
   auto state = std::make_shared<Binding::State>();
@@ -799,10 +803,14 @@ namespace {
 std::filesystem::path choiceFile(std::string_view key) { return cacheDirectory() / ("choice-" + hex(fnv1a(bytesOf(key)))); }
 } // namespace
 
-std::optional<uint32_t> recall(std::string_view key) {
-  std::ifstream file(choiceFile(key));
-  uint32_t value = 0;
-  if (file >> value) return value;
+std::optional<uint32_t> recall(std::string_view key) noexcept {
+  try {
+    std::ifstream file(choiceFile(key));
+    uint32_t value = 0;
+    if (file >> value) return value;
+  } catch (const std::exception &) {
+    // Nothing remembered can be read.
+  }
   return std::nullopt;
 }
 

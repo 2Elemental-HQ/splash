@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "engine/AneFfnStartup.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/CacheDirectory.hpp"
@@ -105,16 +106,10 @@ struct RuntimeResourcesConfig {
   // and by the governor afterwards.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       queryHostAvailableMemory;
-  // The share of the prefill FFN's Neural Engine split to run instead of
-  // calibrating one: 0 runs the GPU alone (--no-ane), and a benchmark round
-  // runs the share of the first so that rounds repeat one another; the
-  // memory plan must still fit it.
-  std::optional<double> aneFfnShare;
-  // The context the engine is asked to hold (--max-context), zero for all the
-  // memory plan holds. The split's memory comes out of the KV cache, so it
-  // runs only while the plan still holds this context, or with zero all the
-  // context it holds without the split.
-  uint32_t maximumContextTokens = 0;
+  // The prefill FFN's Neural Engine split (startAneFfn): off with --no-ane,
+  // and a benchmark round runs the split of the first so that rounds repeat
+  // one another.
+  AneFfnSetting aneFfn;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -178,10 +173,12 @@ private:
 // the next process.
 class RuntimeResources final {
 public:
-  // A persistent tier takes back what the last process left before create()
-  // returns.
+  // `requestedContextTokens` is the context the engine is asked to hold
+  // (--max-context), zero for all the memory plan holds, which the Neural
+  // Engine split must leave. A persistent tier takes back what the last
+  // process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
-  create(const RuntimeResourcesConfig &config);
+  create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);
 
   RuntimeResources(const RuntimeResources &) = delete;
   RuntimeResources &operator=(const RuntimeResources &) = delete;
@@ -215,8 +212,12 @@ public:
   [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
     return hostAvailableAtStart_;
   }
-  // The share the prefill FFN's Neural Engine split runs at; 0 for none.
+  // The share the prefill FFN's Neural Engine split runs at and the least
+  // rows of a chunk it takes; 0 for none.
   [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
+  [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
+  // How the start's split came out.
+  [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the
@@ -238,7 +239,7 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn,
+                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
@@ -260,6 +261,7 @@ private:
   std::unique_ptr<ops::AneFfn> aneFfn_;
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
+  AneFfnOutcome aneFfnOutcome_;
   std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
@@ -267,6 +269,16 @@ private:
   std::condition_variable probationWake_;
   bool probationStopped_ = false;
 };
+
+// The model's side of the split of `loaded`'s target on `backend`, valid
+// while `backend`, `loaded` and `operators` are: its timing and prepared split
+// run on a prefill arena of their own, its programs wait for the ANE's
+// service until `cancelled` returns true, and the units it chose last are
+// remembered beside the programs (ane::recall) under its layers' shapes and
+// formats.
+[[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+                                      const ops::ExecutionPlans &operators, kv::Format format,
+                                      std::function<bool()> cancelled);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

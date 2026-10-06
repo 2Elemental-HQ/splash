@@ -175,17 +175,6 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
   return buffers;
 }
 
-// The FFN layers of a dense target, which the Neural Engine split can take;
-// none for another target.
-std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
-  std::vector<ops::SwiGluProjections> layers;
-  if (const auto *dense = std::get_if<Qwen3_8Weights>(&model.target))
-    for (const Qwen3_8LayerWeights &layer : dense->layers)
-      layers.push_back({&layer.gateProjection, &layer.upProjection,
-                        &layer.downProjection});
-  return layers;
-}
-
 } // namespace
 
 struct Runtime::Impl {
@@ -2695,23 +2684,20 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   return result;
 }
 
-bool supportsAneFfn(const LoadedModel &model) {
-  return ops::AneFfn::supports(aneFfnLayers(model));
+std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
+  std::vector<ops::SwiGluProjections> layers;
+  if (const auto *dense = std::get_if<Qwen3_8Weights>(&model.target))
+    for (const Qwen3_8LayerWeights &layer : dense->layers)
+      layers.push_back({&layer.gateProjection, &layer.upProjection, &layer.downProjection});
+  return layers;
 }
 
-ops::AneFfn::Calibration calibrateAneFfn(MetalBackend &backend, const LoadedModel &model,
-                                         const ops::ExecutionPlans &operators, kv::Format format) {
+void withPrefillArena(
+    MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
+    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
   const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
   const QwenTargetPrefillBuffers buffers = prefillBuffers(arena);
-  return ops::AneFfn::calibrate(backend, aneFfnLayers(model), buffers.ffn(), buffers.hidden);
-}
-
-uint64_t aneFfnBytes(const LoadedModel &model, double share) {
-  return ops::AneFfn::plannedBytes(aneFfnLayers(model), share);
-}
-
-std::unique_ptr<ops::AneFfn> createAneFfn(MetalBackend &backend, const LoadedModel &model, double share) {
-  return std::make_unique<ops::AneFfn>(backend, aneFfnLayers(model), share);
+  use(buffers.ffn(), buffers.hidden);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,

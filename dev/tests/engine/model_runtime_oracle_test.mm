@@ -1,6 +1,6 @@
 #include "TestChecks.hpp"
-#include "TestModel.hpp"
 #include "ane/ProgramInstrumentation.hpp"
+#include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
@@ -1461,33 +1461,21 @@ int main(int argc, char **argv) {
     model::LoadedModel model =
         model::loadModel(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
-    // A dense target's prefill FFN splits with the Neural Engine at the share
-    // startup calibrates, as the server runs it, unless one is given; where
-    // the Neural Engine is unavailable the GPU runs it alone, as there.
-    double aneFfnShare = givenAneFfnShare.value_or(0.0);
-    if (!givenAneFfnShare && model::supportsAneFfn(model)) {
-      try {
-        const ops::AneFfn::Calibration calibration =
-            model::calibrateAneFfn(backend, model, operators, format);
-        aneFfnShare = calibration.share;
-        std::cout << "ane_ffn_split_error=" << calibration.error << '\n';
-      } catch (const std::exception &error) {
-        std::cout << "ane_ffn_split unavailable: " << error.what() << '\n';
-      }
-    }
-    const uint64_t aneFfnBytes = aneFfnShare > 0.0 ? model::aneFfnBytes(model, aneFfnShare) : 0;
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format);
-    ModelMemoryFootprint footprint{
-        model.targetActualAllocatedBytes(),
-        model.draft.actualAllocatedBytes,
-        model.vision.actualAllocatedBytes,
-        executorPlan, 0, aneFfnBytes};
-    ModelMemoryProfile profile{
-        model.name(), model.maximumContextTokens(),
-        model.targetKvLayout(format), footprint};
-    EngineMemoryPlan memoryPlan =
-        test::requireMemoryPlan(backend.capabilities(), profile);
+    // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
+    // Neural Engine split.
+    const auto planMemory = [&](uint64_t aneFfnBytes) {
+      ModelMemoryFootprint footprint{
+          model.targetActualAllocatedBytes(),
+          model.draft.actualAllocatedBytes,
+          model.vision.actualAllocatedBytes,
+          executorPlan, 0, aneFfnBytes};
+      ModelMemoryProfile profile{
+          model.name(), model.maximumContextTokens(),
+          model.targetKvLayout(format), footprint};
+      return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
+    };
 
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.
@@ -1495,7 +1483,34 @@ int main(int argc, char **argv) {
     const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
+    // A dense target's prefill FFN splits with the Neural Engine as a start
+    // splits it (engine::startAneFfn), calibrated unless a share is given,
+    // within a plan that holds the oracle's pages. The split is allocated
+    // beside the weights, outside the governor's admissions, and its own
+    // category of the plan bounds it, as the memory audit requires. A split
+    // that fails fails the oracle; given share 0 runs the GPU alone. A fault
+    // is armed for the first program constructed, the split's with a share
+    // given, whose evaluations count from verify's.
+    const engine::AneFfnSetting aneFfnSetting = engine::AneFfnSetting::fromGiven(givenAneFfnShare, std::nullopt);
+    if (aneFfnFault) {
+      require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
+      ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
+    }
+    engine::AneFfnStart aneFfnStart =
+        engine::startAneFfn(engine::aneFfnModel(backend, model, operators, format, {}), aneFfnSetting,
+                            pageCount * kv::kPageTokens, planMemory, {});
+    std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
+              << aneFfnStart.outcome.reason << '\n';
+    require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
+            "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
+    std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
+    EngineMemoryPlanResult planned = aneFfnStart.plan ? EngineMemoryPlanResult{std::move(aneFfnStart.plan), {}}
+                                                      : planMemory(0);
+    require(planned.plan.has_value(), "the oracle model has no memory plan: " + planned.status.describe());
+    EngineMemoryPlan memoryPlan = std::move(*planned.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
+    require(!aneFfn || aneFfn->allocatedBytes() <= budget.aneFfnBytes,
+            "the Neural Engine split allocated more than its plan");
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
                     budget.hardBudgetBytes - budget.pipelineReserveBytes,
@@ -1504,17 +1519,8 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             queryHostAvailableMemory, 0);
-    // The split is allocated beside the weights, outside the governor's
-    // admissions, and its own category of the plan bounds it, as the memory
-    // audit requires.
-    std::unique_ptr<ops::AneFfn> aneFfn;
-    if (aneFfnShare > 0.0) {
-      if (aneFfnFault) ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
-      aneFfn = model::createAneFfn(backend, model, aneFfnShare);
-      require(aneFfn->allocatedBytes() <= aneFfnBytes,
-              "the Neural Engine split allocated more than its plan");
-    }
-    std::cout << "ane_ffn_share=" << aneFfnShare << '\n';
+    std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
+              << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {

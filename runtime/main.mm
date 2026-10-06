@@ -191,8 +191,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
-  if (!arguments.neuralEngine)
-    config.resources.aneFfnShare = 0.0;
+  config.resources.aneFfn.enabled = arguments.neuralEngine;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;
