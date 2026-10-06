@@ -3,20 +3,26 @@
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
 --model-root MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
 engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
-too. The native benchmark's decode and partial scenarios run in ABBA order
-(baseline, candidate, candidate, baseline) on this machine, which must be
-otherwise idle:
+too. The native benchmark's decode, partial and short scenarios (short when
+both builds take it) run in ABBA order (baseline, candidate, candidate,
+baseline) on this machine, which must be otherwise idle:
 
 - outputs: every width's output_token_hash and accepted/drafted counts and
-  every partial request's output tokens are identical in all four rounds. With
-  --expect-output-change (or EXPECT_OUTPUT_CHANGE=1) each build must still
-  repeat itself, and the candidate's acceptance rate per width may be at most
-  0.02 below the baseline's. Startup calibrates the share of the prefill FFN's
-  Neural Engine split from timings, so the first share a round reports is the
-  one every later round runs (--ane-ffn-share) when its build takes it.
+  every partial and short request's output tokens are identical in all four
+  rounds. With --expect-output-change (or EXPECT_OUTPUT_CHANGE=1) each build
+  must still repeat itself, and the candidate's acceptance rate per width may
+  be at most 0.02 below the baseline's.
+- the prefill FFN's Neural Engine share: with --ane-ffn-share every round of
+  a build that takes the option runs that share and must report it, and a
+  build that does not must report none. Without it startup calibrates the
+  share from timings, so the first share a round reports is the one every
+  later round runs when its build takes the option.
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
-  time of the 14,096-token cold prefill (partial_4k_cold) and the TTFT of its
-  partial hit (partial_4k_hit).
+  time of the 14,096-token cold prefill (partial_4k_cold), the TTFT of its
+  partial hit (partial_4k_hit) and the GPU time of each short cold prefill
+  (short_<tokens>_prefill_gpu_ms).
+- memory plan: the candidate serves no less context than the baseline; the
+  change of the plan's elastic state/KV budget is reported.
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
   (weights.compare_builds). A baseline of an earlier release prepares into a
@@ -33,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,12 +49,16 @@ from dev.tests import smoke_real as smoke
 
 ROOT = Path(__file__).resolve().parents[2]
 ROUNDS = ("baseline", "candidate", "candidate", "baseline")
-SCENARIOS = ("decode", "partial")
+SCENARIOS = ("decode", "partial", "short")
 WIDTHS = (1, 2, 3, 4)
 ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
 METALLIB = Path("build/splash.metallib")
 PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
+# The prompt lengths of the short scenario's cold prefills.
+SHORT = (511, 512, 513, 640, 641, 1025, 1536, 2048)
+# The memory plan a load served, as the benchmark reports it.
+MEMORY_PLAN = ("max_context_tokens", "dynamic_budget_bytes", "ane_ffn_bytes")
 
 
 class RegressionError(RuntimeError):
@@ -56,17 +67,40 @@ class RegressionError(RuntimeError):
 
 def usage(benchmark: Path) -> str:
     """A backend-benchmark's usage, which it prints without arguments. It
-    names the options a build takes: older builds take one --scenario, and
-    builds before the Neural Engine split no --ane-ffn-share."""
+    names the options a build takes: older builds take one --scenario and no
+    short scenario, and builds before the Neural Engine split no
+    --ane-ffn-share."""
     return subprocess.run(
         [str(benchmark)], capture_output=True, text=True, timeout=60
     ).stderr
 
 
-def pin_ane_ffn_share(args, document: dict) -> None:
-    """Keeps the first Neural Engine share a round reports for every later
-    round, and fails a round that ran another."""
+def ane_ffn_share(value: str) -> float:
+    """An --ane-ffn-share argument: a share in [0, 1)."""
+    share = float(value)
+    if not 0 <= share < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a share in [0, 1)")
+    return share
+
+
+def pin_ane_ffn_share(args, version: str, document: dict) -> None:
+    """Holds every round to one Neural Engine share, the given one or else
+    the first one a round reports, and fails a round that reported another.
+    With a share given, a build that does not take --ane-ffn-share runs
+    without it and must report none."""
     share = document.get("ane_ffn_share")
+    if args.ane_ffn_share_given:
+        if not args.takes_ane_ffn_share[version]:
+            if share is not None:
+                raise RegressionError(
+                    f"takes no --ane-ffn-share but reported the share {share}"
+                )
+        elif share != args.ane_ffn_share:
+            raise RegressionError(
+                f"ran the Neural Engine split at share {share}, "
+                f"not the given {args.ane_ffn_share}"
+            )
+        return
     if share is None:
         return
     if args.ane_ffn_share is None:
@@ -78,11 +112,11 @@ def pin_ane_ffn_share(args, document: dict) -> None:
         )
 
 
-def invocations(combined: bool) -> list[str]:
-    """The --scenario values of one round: both scenarios in one model load
+def invocations(combined: bool, scenarios) -> list[str]:
+    """The --scenario values of one round: its scenarios in one model load
     when both builds take a list, else one load each, so both builds always
     run the same work."""
-    return [",".join(SCENARIOS)] if combined else list(SCENARIOS)
+    return [",".join(scenarios)] if combined else list(scenarios)
 
 
 def parse_document(stdout: str, returncode: int) -> dict:
@@ -103,7 +137,7 @@ def parse_document(stdout: str, returncode: int) -> dict:
 
 def run_round(tree: Path, model_root: Path, round_index: int, version: str, args, env):
     documents = []
-    for scenario in invocations(args.combined):
+    for scenario in invocations(args.combined, args.scenarios):
         stem = args.output_dir / (
             f"round-{round_index + 1}-{version}-{scenario.replace(',', '-')}"
         )
@@ -128,7 +162,7 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
         stem.with_suffix(".json").write_text(finished.stdout)
         try:
             document = parse_document(finished.stdout, finished.returncode)
-            pin_ane_ffn_share(args, document)
+            pin_ane_ffn_share(args, version, document)
             documents.append(document)
         except RegressionError as error:
             log = stem.with_suffix(".log")
@@ -137,11 +171,13 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
     return documents
 
 
-def round_record(version: str, documents: list[dict]) -> dict:
-    """What one round measured: decode samples per width and partial
-    requests per scenario, with the identity each load reported."""
+def round_record(version: str, documents: list[dict], scenarios) -> dict:
+    """What one round of these scenarios measured: decode samples per width,
+    partial requests per scenario and short requests per prompt length, with
+    the identity and memory plan each load reported."""
     decode = {width: [] for width in WIDTHS}
     partial = {scenario: [] for scenario in PARTIAL}
+    short = {length: [] for length in SHORT} if "short" in scenarios else {}
     for document in documents:
         for sample in document.get("decode_throughput", {}).get("samples", []):
             decode[sample["width"]].append(
@@ -157,30 +193,39 @@ def round_record(version: str, documents: list[dict]) -> dict:
                 }
             )
         for measurement in document.get("measurements", []):
+            request = {
+                "sample": measurement["sample"],
+                "output_tokens": measurement["output_tokens"],
+                "prefill_gpu_ms": measurement["prefill_gpu_ms"],
+                "ttft_ms": measurement["ttft_ms"],
+            }
             if measurement["scenario"] in partial:
-                partial[measurement["scenario"]].append(
-                    {
-                        "sample": measurement["sample"],
-                        "output_tokens": measurement["output_tokens"],
-                        "prefill_gpu_ms": measurement["prefill_gpu_ms"],
-                        "ttft_ms": measurement["ttft_ms"],
-                    }
-                )
-    if not all(decode.values()) or not all(partial.values()):
-        raise RegressionError(f"a {version} round lacks decode or partial samples")
+                partial[measurement["scenario"]].append(request)
+            elif (
+                measurement["scenario"] == "short"
+                and measurement["prompt_tokens"] in short
+            ):
+                short[measurement["prompt_tokens"]].append(request)
+    measured = {"decode": decode, "partial": partial, "short": short}
+    if lacking := [name for name, found in measured.items() if not all(found.values())]:
+        raise RegressionError(
+            f"a {version} round lacks {' and '.join(lacking)} samples"
+        )
     return {
         "version": version,
         "identities": [
             {**document["identity"], "build_id": document["build_id"]}
             for document in documents
         ],
+        "memory_plans": [
+            {key: document.get(key) for key in MEMORY_PLAN} for document in documents
+        ],
         "performance_failures": [
             failure
             for document in documents
             for failure in document.get("performance_failures", [])
         ],
-        "decode": decode,
-        "partial": partial,
+        **measured,
     }
 
 
@@ -200,12 +245,17 @@ def metrics(rounds: list[dict]) -> dict:
         [request["ttft_ms"] for request in record["partial"]["partial_4k_hit"]]
         for record in rounds
     ]
+    for length in rounds[0]["short"]:
+        result[f"short_{length}_prefill_gpu_ms"] = [
+            [request["prefill_gpu_ms"] for request in record["short"][length]]
+            for record in rounds
+        ]
     return result
 
 
 def outputs(record: dict) -> dict:
     """What must repeat: per width and sample the output hash and draft
-    counts, per partial request its output tokens."""
+    counts, per partial and short request its output tokens."""
     result = {}
     for width, samples in record["decode"].items():
         for sample in samples:
@@ -217,6 +267,11 @@ def outputs(record: dict) -> dict:
     for scenario, requests in record["partial"].items():
         for request in requests:
             result[f"{scenario} sample {request['sample']}"] = tuple(
+                request["output_tokens"]
+            )
+    for length, requests in record["short"].items():
+        for request in requests:
+            result[f"short {length} sample {request['sample']}"] = tuple(
                 request["output_tokens"]
             )
     return result
@@ -246,12 +301,13 @@ def differences(first: dict, second: dict) -> list[str]:
 
 def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     """The comparison of four rounds in ABBA order: failures of outputs,
-    identity and invariants, and the speed verdict per metric."""
+    identity, memory plan and invariants, and the speed verdict per
+    metric."""
     if [record["version"] for record in rounds] != list(ROUNDS):
         raise RegressionError("rounds are not in ABBA order")
     failures = []
     baseline, candidate = [rounds[0], rounds[3]], [rounds[1], rounds[2]]
-    builds = {}
+    builds, plans = {}, {}
     for name, records in (("baseline", baseline), ("candidate", candidate)):
         identities = [
             {
@@ -266,6 +322,10 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
                 f"the {name} build or its loaded model changed between rounds"
             )
         builds[name] = identities[0]["build_id"]
+        loads = [plan for record in records for plan in record["memory_plans"]]
+        if any(plan != loads[0] for plan in loads):
+            failures.append(f"the {name} build's memory plan changed between rounds")
+        plans[name] = loads[0]
         if changed := differences(outputs(records[0]), outputs(records[1])):
             failures.append(f"the {name} build did not repeat its outputs: {changed}")
     if builds["baseline"] == builds["candidate"]:
@@ -279,6 +339,15 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     }
     if len(places) != 1:
         failures.append(f"rounds ran different models or devices: {sorted(places)}")
+    # What an older build's benchmark does not report is None, and not
+    # compared.
+    context = {name: plan["max_context_tokens"] for name, plan in plans.items()}
+    if None not in context.values() and context["candidate"] < context["baseline"]:
+        failures.append(
+            f"the candidate serves {context['candidate']} tokens of context, "
+            f"less than the baseline's {context['baseline']}"
+        )
+    budget = {name: plan["dynamic_budget_bytes"] for name, plan in plans.items()}
     rates = {
         f"B{width}": {
             "baseline": acceptance(baseline, width),
@@ -308,6 +377,12 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     return {
         "expect_output_change": expect_output_change,
         "acceptance": rates,
+        "memory_plan": {
+            **plans,
+            "dynamic_budget_change_bytes": None
+            if None in budget.values()
+            else budget["candidate"] - budget["baseline"],
+        },
         "baseline_performance_failures": sorted(
             {f for record in baseline for f in record["performance_failures"]}
         ),
@@ -349,6 +424,13 @@ def parse_args(argv=None):
         default=os.environ.get("EXPECT_OUTPUT_CHANGE", "") not in ("", "0"),
         help="allow changed outputs with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)",
     )
+    parser.add_argument(
+        "--ane-ffn-share",
+        type=ane_ffn_share,
+        metavar="SHARE",
+        help="the prefill FFN's Neural Engine share in [0, 1) every round runs "
+        "(0: the GPU alone; default: the first share a round reports)",
+    )
     args = parser.parse_args(argv)
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -376,17 +458,20 @@ def main(argv=None) -> int:
         environments["baseline"].update(weights.baseline_environment(args.output_dir))
     usages = {name: usage(tree / BENCHMARK) for name, tree in trees.items()}
     args.combined = all("NAME[,NAME...]" in text for text in usages.values())
+    # Both builds run short only when both take it.
+    short = all(re.search(r"\bshort\b", text) for text in usages.values())
+    args.scenarios = [name for name in SCENARIOS if short or name != "short"]
     args.takes_ane_ffn_share = {
         name: "--ane-ffn-share" in text for name, text in usages.items()
     }
-    args.ane_ffn_share = None
+    args.ane_ffn_share_given = args.ane_ffn_share is not None
     document = {
         "schema_version": 1,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
         "model_root": str(args.model_root),
         "trees": {name: str(tree) for name, tree in trees.items()},
         "samples": args.samples,
-        "scenario_invocations": invocations(args.combined),
+        "scenario_invocations": invocations(args.combined, args.scenarios),
         "pass": False,
     }
     try:
@@ -401,6 +486,7 @@ def main(argv=None) -> int:
                     args,
                     environments[version],
                 ),
+                args.scenarios,
             )
             for index, version in enumerate(ROUNDS)
         ]
@@ -434,11 +520,19 @@ def report(document: dict) -> None:
     for name, result in comparison["speed"].items():
         rounds = " ".join(f"{value:.2f}" for value in result["rounds"])
         print(f"{name}: {abba.describe(result)} (ABBA {rounds})")
+    if not any("short" in scenario for scenario in document["scenario_invocations"]):
+        print("short prompts: not compared, a build's backend-benchmark lacks them")
     for width, rate in comparison["acceptance"].items():
         print(
             f"{width} acceptance: baseline {rate['baseline']:.4f}, "
             f"candidate {rate['candidate']:.4f}"
         )
+    plans = comparison["memory_plan"]
+    print(
+        f"context: baseline {plans['baseline']['max_context_tokens']}, "
+        f"candidate {plans['candidate']['max_context_tokens']} tokens; "
+        f"elastic budget change: {plans['dynamic_budget_change_bytes']} bytes"
+    )
     images = document["weights"]
     print(
         f"weight bytes: {len(images['images'])} images "

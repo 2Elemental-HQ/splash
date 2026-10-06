@@ -10,7 +10,6 @@
 #include <array>
 #include <charconv>
 #include <chrono>
-#include <cstdlib>
 #include <thread>
 #include <condition_variable>
 #include <cstdint>
@@ -19,7 +18,6 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -699,25 +697,20 @@ uint32_t parseSamples(std::string_view value) {
   return static_cast<uint32_t>(parsed);
 }
 
-// --ane-ffn-share: the Neural Engine share a previous round reported, in
-// [0, 1).
 // A context limit, as serve's --max-context: a positive token count.
 uint32_t parseMaxContext(std::string_view value) {
-  uint64_t parsed = 0;
-  for (char character : value) {
-    if (character < '0' || character > '9' || parsed > std::numeric_limits<uint32_t>::max() / 10)
-      throw std::invalid_argument("--max-context takes a positive token count");
-    parsed = parsed * 10 + static_cast<uint64_t>(character - '0');
-  }
-  if (!parsed || parsed > std::numeric_limits<uint32_t>::max())
+  uint32_t tokens = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), tokens);
+  if (error != std::errc{} || end != value.data() + value.size() || !tokens)
     throw std::invalid_argument("--max-context takes a positive token count");
-  return static_cast<uint32_t>(parsed);
+  return tokens;
 }
 
-double parseAneFfnShare(const char *value) {
-  char *end = nullptr;
-  const double share = std::strtod(value, &end);
-  if (end == value || *end || !(share >= 0.0 && share < 1.0))
+// --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
+double parseAneFfnShare(std::string_view value) {
+  double share = 0.0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), share);
+  if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share < 1.0))
     throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
   return share;
 }
@@ -751,17 +744,20 @@ std::vector<double> decodeWallThroughputs(
 struct BenchmarkScenarios final {
   bool decode = true;
   bool partial = true;
+  // The short scenario; short is a keyword.
+  bool shortPrompts = false;
   bool context = true;
   bool exact = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
     bool *scenario = name == "decode"    ? &selected.decode
                      : name == "partial" ? &selected.partial
+                     : name == "short"   ? &selected.shortPrompts
                      : name == "context" ? &selected.context
                      : name == "exact"   ? &selected.exact
                                          : nullptr;
@@ -789,10 +785,10 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE] "
                    "[--max-context TOKENS]\n"
-                   "  NAME: decode, partial, context or exact "
+                   "  NAME: decode, partial, short, context or exact "
                    "(default: decode,partial,context)\n"
-                   "  SHARE: the prefill FFN's Neural Engine share to run "
-                   "instead of calibrating one (0: GPU alone)\n"
+                   "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
+                   "to run instead of calibrating one (0: GPU alone)\n"
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context (default: what memory holds)\n";
       return 2;
@@ -1178,6 +1174,27 @@ int main(int argc, char **argv) {
       }
     }
 
+    // Cold prefills of up to one prefill chunk around where the prefill FFN's
+    // Neural Engine split starts (512 rows) and its program steps (128 rows).
+    // A cold prompt prefills up to its replay point, the last 32-token page
+    // boundary before its last token, then the rest: 512 tokens as 480 and 32
+    // rows, 513 as 512 and 1. Each prompt is unique and runs on an empty cache.
+    if (selected.shortPrompts) {
+      constexpr std::array<uint32_t, 8> shortLengths{511, 512, 513, 640, 641, 1025, 1536, 2048};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t length : shortLengths) {
+          evictAllCache(resources->cache());
+          Measurement result = runRequest(
+              engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
+              prompt(length, (uint64_t{length} << 32 | sample) ^ 0x53484f5254ULL));
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("short " + std::to_string(length) +
+                                     "-token prompt was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
     // A request lazily materializes a KV junction where its match ends past
     // its state at a branch point: another branch goes on below and holds a
     // state there, and the junction lies a draft window or more past the
@@ -1314,7 +1331,12 @@ int main(int argc, char **argv) {
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }
+    // The context the engine served, and its memory plan's elastic state/KV
+    // budget and Neural Engine split.
+    const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
+              << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
               << ",\"skipped_context_lengths\":[";
     for (size_t index = 0; index < skippedLengths.size(); ++index)
       std::cout << (index ? "," : "") << skippedLengths[index];

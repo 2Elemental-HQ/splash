@@ -1895,7 +1895,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
-| `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
+| `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
@@ -2003,9 +2003,13 @@ the other. Per model, `release-check`:
   share when its build takes one: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
   within 0.02), and so must the bytes of the weight images both load
-  (`dev/benchmarks/weights.py`); decode and prefill GPU time may regress by at
-  most the larger of 2% and twice the run's own ABBA spread, and a spread
-  above 5% fails as inconclusive.
+  (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
+  prefills of short prompts (511 to 2048 tokens) when both builds' benchmarks
+  run them, may regress by at most the larger of 2% and twice the run's own
+  ABBA spread, a spread above 5% fails as inconclusive, and this build must
+  serve at least the baseline's maximum context. `ANE_FFN_SHARE=SHARE` runs
+  every round at that share instead, in each build whose benchmark takes one
+  (0: the GPU alone); a baseline whose benchmark takes none must report none.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json` must be identical on
@@ -2019,6 +2023,10 @@ Expect about 1.5 hours on an M5 Pro and 2.5 hours on an M3 Max, most of it in
 the three 27B comparisons. A laptop can cap its GPU power during a long
 comparison and so make it inconclusive; rerun `make test-performance-real` for
 that model alone once the Mac has cooled.
+
+`.venv/bin/python dev/tools/kernel_identity.py BASELINE/build build` compares
+the AIR of each kernel the decode path may run in the two builds'
+`splash.metallib` (`--match` for others) and fails if any differs.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout
@@ -2039,8 +2047,9 @@ make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit
 make test-performance-real MODEL=mlx-community/Qwen3.8-27B-4bit BASELINE=/path/to/baseline
 ```
 
-The first characterizes this build: the decode widths B1-B4 and a 14,096-token
-partial-prefix request, three samples each, in
+The first characterizes this build: the decode widths B1-B4, a 14,096-token
+partial-prefix request and the cold prefills of short prompts, three samples
+each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
 `make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
 plan holds. The second compares this build with a retained checkout's in ABBA

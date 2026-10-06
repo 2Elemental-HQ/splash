@@ -6,17 +6,18 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.benchmarks import backend_regression as regression
 from dev.benchmarks import weights
 from dev.tests import smoke_real as smoke
 
-SCENARIO_NAMES = ("decode", "partial")
+CONTEXT = 262144
 
 
 def benchmark_document(
-    scenarios=SCENARIO_NAMES, build="build", layout="layout", step=10.0
+    scenarios=regression.SCENARIOS, build="build", layout="layout", step=10.0
 ):
     """backend-benchmark output of two samples for these scenarios."""
     samples = [
@@ -32,16 +33,20 @@ def benchmark_document(
         for sample in range(2)
         for width in regression.WIDTHS
     ]
+    requests = [
+        (scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios
+    ] + [("short", tokens) for tokens in regression.SHORT if "short" in scenarios]
     measurements = [
         {
             "scenario": scenario,
             "sample": sample,
+            "prompt_tokens": tokens,
             "output_tokens": [7],
             "prefill_gpu_ms": 1000.0,
             "ttft_ms": 300.0,
         }
         for sample in range(2)
-        for scenario in regression.PARTIAL
+        for scenario, tokens in requests
     ]
     return {
         "schema_version": 2,
@@ -52,22 +57,27 @@ def benchmark_document(
             "device": "Apple M5 Pro",
         },
         "decode_throughput": {"samples": samples if "decode" in scenarios else []},
-        "measurements": measurements if "partial" in scenarios else [],
+        "max_context_tokens": CONTEXT,
+        "dynamic_budget_bytes": 35 << 30,
+        "ane_ffn_bytes": 0,
+        "measurements": measurements,
         "performance_pass": True,
         "performance_failures": [],
     }
 
 
-def rounds(changes=None):
-    """Four ABBA round records; changes maps a round index to a function
-    that edits that round's benchmark document."""
+def rounds(changes=None, scenarios=regression.SCENARIOS):
+    """Four ABBA round records of these scenarios; changes maps a round
+    index to a function that edits that round's benchmark document."""
     changes = changes or {}
     result = []
     for index, version in enumerate(regression.ROUNDS):
-        document = benchmark_document(build=version, layout=f"layout-{version}")
+        document = benchmark_document(
+            scenarios, build=version, layout=f"layout-{version}"
+        )
         if index in changes:
             changes[index](document)
-        result.append(regression.round_record(version, [document]))
+        result.append(regression.round_record(version, [document], scenarios))
     return result
 
 
@@ -80,25 +90,35 @@ class BackendRegressionTests(unittest.TestCase):
         summary = regression.summarize(rounds(), False)
         self.assertEqual(summary["failures"], [])
         self.assertTrue(summary["pass"])
+        decode_and_partial = [
+            f"decode_B{width}_gpu_ms_per_step" for width in regression.WIDTHS
+        ] + ["partial_4k_cold_prefill_gpu_ms", "partial_4k_hit_ttft_ms"]
         self.assertEqual(
             sorted(summary["speed"]),
             sorted(
-                [f"decode_B{width}_gpu_ms_per_step" for width in regression.WIDTHS]
-                + ["partial_4k_cold_prefill_gpu_ms", "partial_4k_hit_ttft_ms"]
+                decode_and_partial
+                + [f"short_{tokens}_prefill_gpu_ms" for tokens in regression.SHORT]
             ),
         )
         # GPU time per decode step, not per request.
         self.assertEqual(summary["speed"]["decode_B2_gpu_ms_per_step"]["baseline"], 20)
         self.assertEqual(summary["acceptance"]["B1"]["candidate"], 40 / 64)
+        # Rounds against a build without the short scenario compare the rest.
+        summary = regression.summarize(rounds(scenarios=("decode", "partial")), False)
+        self.assertTrue(summary["pass"])
+        self.assertEqual(sorted(summary["speed"]), sorted(decode_and_partial))
 
     def test_speed_regressions_fail_per_metric(self):
-        def slower(field, factor, scenario=None, width=None):
+        def slower(field, factor, scenario=None, width=None, tokens=None):
             def change(document):
                 if width:
                     for sample in decode_samples(document, width):
                         sample[field] *= factor
                 for measurement in document["measurements"]:
-                    if measurement["scenario"] == scenario:
+                    if measurement["scenario"] == scenario and tokens in (
+                        None,
+                        measurement["prompt_tokens"],
+                    ):
                         measurement[field] *= factor
 
             return change
@@ -109,6 +129,10 @@ class BackendRegressionTests(unittest.TestCase):
                 "prefill_gpu_ms", 1.05, "partial_4k_cold"
             ),
             "partial_4k_hit_ttft_ms": slower("ttft_ms", 1.05, "partial_4k_hit"),
+            # A 512-token prompt 2.5% slower: beyond the 2% floor.
+            "short_512_prefill_gpu_ms": slower(
+                "prefill_gpu_ms", 1.025, "short", tokens=512
+            ),
         }.items():
             with self.subTest(metric=name):
                 summary = regression.summarize(rounds({1: change, 2: change}), False)
@@ -239,16 +263,34 @@ class BackendRegressionTests(unittest.TestCase):
             with self.subTest(stdout=stdout[:20], code=code):
                 with self.assertRaises(regression.RegressionError):
                     regression.parse_document(stdout, code)
-        # Separate decode and partial loads of an older build form one round.
+        # Separate loads, one per scenario, form one round.
         record = regression.round_record(
             "baseline",
-            [benchmark_document(("decode",)), benchmark_document(("partial",))],
+            [benchmark_document((name,)) for name in regression.SCENARIOS],
+            regression.SCENARIOS,
         )
         self.assertEqual(len(record["decode"][4]), 2)
         self.assertEqual(len(record["partial"]["partial_4k_hit"]), 2)
-        self.assertEqual(len(record["identities"]), 2)
-        with self.assertRaisesRegex(regression.RegressionError, "lacks"):
-            regression.round_record("baseline", [benchmark_document(("decode",))])
+        self.assertEqual(len(record["short"][2048]), 2)
+        self.assertEqual(len(record["identities"]), 3)
+        self.assertEqual(
+            record["memory_plans"][0],
+            {
+                "max_context_tokens": CONTEXT,
+                "dynamic_budget_bytes": 35 << 30,
+                "ane_ffn_bytes": 0,
+            },
+        )
+        for documents, scenarios, lacking in (
+            ([("decode",)], ("decode", "partial"), "lacks partial samples"),
+            ([("decode", "partial")], regression.SCENARIOS, "lacks short samples"),
+        ):
+            with self.assertRaisesRegex(regression.RegressionError, lacking):
+                regression.round_record(
+                    "baseline",
+                    [benchmark_document(names) for names in documents],
+                    scenarios,
+                )
 
     def fake_checkout(
         self,
@@ -258,11 +300,15 @@ class BackendRegressionTests(unittest.TestCase):
         list_support: bool,
         share=None,
         honours_share=True,
+        short=True,
+        context=CONTEXT,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
         its invocations. With digest its weight-digests prints one image of
         that digest; without, it has none, as a build of an earlier release.
-        With a share it has the Neural Engine split: it reports that share as
+        Its benchmark takes a list of scenarios with list_support, the short
+        scenario among them with short too, and serves context tokens. With a
+        share it has the Neural Engine split: it reports that share as
         calibrated, or runs the one --ane-ffn-share gives unless honours_share
         is false, and logs what it was given."""
         checkout = root / name
@@ -278,6 +324,11 @@ class BackendRegressionTests(unittest.TestCase):
             if list_support
             else "[--scenario decode|partial]"
         ) + (" [--ane-ffn-share SHARE]" if share is not None else "")
+        if list_support:
+            names = "decode, partial, short" if short else "decode, partial"
+            usage += f"\n  NAME: {names}, context or exact"
+        document = benchmark_document(build=name)
+        document["max_context_tokens"] = context
         given = (
             "given = sys.argv[sys.argv.index('--ane-ffn-share') + 1] "
             "if '--ane-ffn-share' in sys.argv else None\n"
@@ -294,14 +345,15 @@ class BackendRegressionTests(unittest.TestCase):
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
             "if len(sys.argv) < 3:\n"
-            f"    print('usage: backend-benchmark {usage}', file=sys.stderr)\n"
+            f"    print('usage: backend-benchmark ' + {usage!r}, file=sys.stderr)\n"
             "    raise SystemExit(2)\n"
             "scenarios = sys.argv[sys.argv.index('--scenario') + 1].split(',')\n"
             f"with open({str(root / 'calls.jsonl')!r}, 'a') as log:\n"
             f"    log.write(json.dumps([{name!r}, scenarios, os.environ.get('SPLASH_WEIGHT_CACHE')]) + '\\n')\n"
-            f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name)))})\n"
+            f"document = json.loads({json.dumps(json.dumps(document))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
-            "if 'partial' not in scenarios: document['measurements'] = []\n"
+            "document['measurements'] = [m for m in document['measurements'] if "
+            "('short' if m['scenario'] == 'short' else 'partial') in scenarios]\n"
             + given
             + "print(json.dumps(document))\n"
         )
@@ -309,8 +361,9 @@ class BackendRegressionTests(unittest.TestCase):
         return checkout
 
     @staticmethod
-    def run_main(root: Path) -> int:
-        """main on the fake checkouts under root and a legacy package."""
+    def run_main(root: Path, *options: str) -> int:
+        """main with these options on the fake checkouts under root and a
+        legacy package."""
         models = root / "models"
         package = models / "incoai/Qwen3.8-27B-Splash"
         package.mkdir(parents=True)
@@ -324,6 +377,7 @@ class BackendRegressionTests(unittest.TestCase):
             str(package),
             "--output-dir",
             str(root / "release"),
+            *options,
         ]
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
@@ -348,7 +402,7 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial: .*without JSON(.|\n)*boom",
+                r"round-2-candidate-decode-partial-short: .*without JSON(.|\n)*boom",
             ):
                 self.run_main(root)
             document = json.loads(
@@ -364,13 +418,22 @@ class BackendRegressionTests(unittest.TestCase):
 
     def test_main_runs_abba_rounds_and_compares_the_weights(self):
         a, b = "a" * 64, "b" * 64
-        for baseline, list_support in ((a, True), (None, True), (None, False)):
+        # A baseline without the short scenario runs the others alone, and so
+        # does the candidate.
+        for baseline, list_support, short, scenarios in (
+            (a, True, True, [["decode", "partial", "short"]]),
+            (a, True, False, [["decode", "partial"]]),
+            (None, True, True, [["decode", "partial", "short"]]),
+            (None, False, False, [["decode"], ["partial"]]),
+        ):
             with (
-                self.subTest(baseline=baseline, list_support=list_support),
+                self.subTest(baseline=baseline, list_support=list_support, short=short),
                 TemporaryDirectory() as directory,
             ):
                 root = Path(directory).resolve()
-                self.fake_checkout(root, "baseline", baseline, list_support)
+                self.fake_checkout(
+                    root, "baseline", baseline, list_support, short=short
+                )
                 self.fake_checkout(root, "candidate", a, True)
                 output = root / "release"
                 self.assertEqual(self.run_main(root), 0)
@@ -378,11 +441,6 @@ class BackendRegressionTests(unittest.TestCase):
                     json.loads(line)
                     for line in (root / "calls.jsonl").read_text().splitlines()
                 ]
-                scenarios = (
-                    [["decode", "partial"]]
-                    if list_support
-                    else [["decode"], ["partial"]]
-                )
                 self.assertEqual(
                     calls,
                     [
@@ -474,10 +532,138 @@ class BackendRegressionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 regression.RegressionError,
-                r"round-2-candidate-decode-partial: ran the Neural Engine split "
+                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
                 r"at share 0.0, not the first round's 0.3",
             ):
                 self.run_main(root)
+
+    def test_a_given_ane_ffn_share_runs_in_every_round_that_takes_it(self):
+        # Share 0, the GPU alone, against a baseline without the split, which
+        # runs as it is and reports no share, and against one with it.
+        for baseline_share, expected in (
+            (None, [["candidate", "0.0"], ["candidate", "0.0"]]),
+            (1 - 24 / 34, [[version, "0.0"] for version in regression.ROUNDS]),
+        ):
+            with (
+                self.subTest(baseline_share=baseline_share),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", "a" * 64, True, baseline_share)
+                self.fake_checkout(root, "candidate", "a" * 64, True, 0.32)
+                self.assertEqual(self.run_main(root, "--ane-ffn-share", "0"), 0)
+                shares = [
+                    json.loads(line)
+                    for line in (root / "shares.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(shares, expected)
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(document["ane_ffn_share"], 0.0)
+
+    def test_a_reported_ane_ffn_share_must_be_the_given_one(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64, True)
+            self.fake_checkout(
+                root, "candidate", "a" * 64, True, 0.32, honours_share=False
+            )
+            with self.assertRaisesRegex(
+                regression.RegressionError,
+                r"round-2-candidate-decode-partial-short: ran the Neural Engine split "
+                r"at share 0.32, not the given 0.0",
+            ):
+                self.run_main(root, "--ane-ffn-share", "0")
+        # A build that takes no --ane-ffn-share runs without the given share
+        # and must report none.
+        args = SimpleNamespace(
+            ane_ffn_share=0.0,
+            ane_ffn_share_given=True,
+            takes_ane_ffn_share={"baseline": False},
+        )
+        regression.pin_ane_ffn_share(args, "baseline", {})
+        with self.assertRaisesRegex(
+            regression.RegressionError,
+            "takes no --ane-ffn-share but reported the share 0.24",
+        ):
+            regression.pin_ane_ffn_share(args, "baseline", {"ane_ffn_share": 0.24})
+
+    def test_an_ane_ffn_share_outside_zero_to_one_is_refused(self):
+        for value in ("1", "1.5", "-0.1", "nan", "inf", "half"):
+            with (
+                self.subTest(value=value),
+                contextlib.redirect_stderr(io.StringIO()) as errors,
+                self.assertRaises(SystemExit),
+            ):
+                regression.parse_args(
+                    ["--baseline", "b", "--model-root", "m", "--ane-ffn-share", value]
+                )
+            self.assertIn("argument --ane-ffn-share", errors.getvalue())
+        self.assertEqual(regression.ane_ffn_share("0"), 0.0)
+        self.assertEqual(regression.ane_ffn_share("0.999"), 0.999)
+
+    def test_the_candidate_must_serve_the_baselines_context(self):
+        def serves(tokens, budget):
+            def change(document):
+                document["max_context_tokens"] = tokens
+                document["dynamic_budget_bytes"] = budget
+                document["ane_ffn_bytes"] = (35 << 30) - budget
+
+            return change
+
+        # A split of 173 MiB that costs 4K tokens of context.
+        smaller = serves(CONTEXT - 4096, (35 << 30) - (173 << 20))
+        summary = regression.summarize(rounds({1: smaller, 2: smaller}), False)
+        self.assertEqual(
+            summary["failures"],
+            [
+                f"the candidate serves {CONTEXT - 4096} tokens of context, "
+                f"less than the baseline's {CONTEXT}"
+            ],
+        )
+        self.assertEqual(
+            summary["memory_plan"]["dynamic_budget_change_bytes"], -(173 << 20)
+        )
+        self.assertEqual(
+            summary["memory_plan"]["candidate"]["ane_ffn_bytes"], 173 << 20
+        )
+        # The same context passes with a smaller elastic budget.
+        same = serves(CONTEXT, (35 << 30) - (173 << 20))
+        self.assertTrue(regression.summarize(rounds({1: same, 2: same}), False)["pass"])
+
+        # A baseline that reports no memory plan is not compared.
+        def unreported(document):
+            for key in regression.MEMORY_PLAN:
+                del document[key]
+
+        summary = regression.summarize(
+            rounds({0: unreported, 3: unreported, 1: smaller, 2: smaller}), False
+        )
+        self.assertTrue(summary["pass"])
+        self.assertIsNone(summary["memory_plan"]["dynamic_budget_change_bytes"])
+        # A build's plan must not change between its rounds.
+        summary = regression.summarize(rounds({2: smaller}), False)
+        self.assertEqual(
+            summary["failures"],
+            ["the candidate build's memory plan changed between rounds"],
+        )
+        # main fails on the loss too.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", "a" * 64, True)
+            self.fake_checkout(root, "candidate", "a" * 64, True, context=CONTEXT - 1)
+            self.assertEqual(self.run_main(root), 1)
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertEqual(
+                document["comparison"]["failures"],
+                [
+                    f"the candidate serves {CONTEXT - 1} tokens of context, "
+                    f"less than the baseline's {CONTEXT}"
+                ],
+            )
 
     def test_results_are_named_by_selection(self):
         models = Path("/install/models")
