@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      full_verification:
+        description: Run every check, ignoring the record of checks that already passed for the same content
+        required: false
+        type: boolean
+        default: false
       expect_output_change:
         description: Allow outputs that differ from the baseline's, with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)
         required: false
@@ -25,8 +30,54 @@ permissions:
   contents: read
 
 jobs:
+  # Fork change (app/UPSTREAM_PATCHES.md): the two long jobs run only when what they cover changed since a run
+  # of them passed. A pull request that carries app/ changes on top of server changes does not rerun them for
+  # the app alone. A skipped job counts as passed for a required check; the workflow itself always runs, so no
+  # check waits forever. Pushes to main, and a manual run with full_verification, run everything.
+  scope:
+    name: Select checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      engine: ${{ steps.pick.outputs.engine }}
+      python: ${{ steps.pick.outputs.python }}
+      engine_key: ${{ steps.keys.outputs.engine }}
+      python_key: ${{ steps.keys.outputs.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: keys
+        name: Name the content each long job covers
+        run: |
+          # Native engine, its build and the tools that drive it.
+          engine="$(.github/scripts/scope.sh ci-engine runtime Makefile dev/Makefile dev/native.mk dev/tools dev/tuning dev/tests/engine dev/tests/tools .github/workflows/ci.yml .github/scripts/scope.sh)"
+          # The Python tests also build the engine, so they cover its sources too.
+          python="$(.github/scripts/scope.sh ci-python runtime Makefile dev/Makefile dev/native.mk dev/tools dev/tuning server install dev/tests dev/requirements.txt dev/ruff.toml dev/benchmarks .github/workflows/ci.yml .github/scripts/scope.sh)"
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+      - id: engine_seen
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ci-passed
+          key: ${{ steps.keys.outputs.engine }}
+          lookup-only: true
+      - id: python_seen
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ci-passed
+          key: ${{ steps.keys.outputs.python }}
+          lookup-only: true
+      - id: pick
+        run: |
+          everything=false
+          if [ "${{ github.event_name }}" != pull_request ] || [ "${{ inputs.full_verification }}" = true ]; then everything=true; fi
+          if [ "$everything" = true ] || [ "${{ steps.engine_seen.outputs.cache-hit }}" != true ]; then echo "engine=true" >> "$GITHUB_OUTPUT"; else echo "engine=false" >> "$GITHUB_OUTPUT"; fi
+          if [ "$everything" = true ] || [ "${{ steps.python_seen.outputs.cache-hit }}" != true ]; then echo "python=true" >> "$GITHUB_OUTPUT"; else echo "python=false" >> "$GITHUB_OUTPUT"; fi
+          cat "$GITHUB_OUTPUT"
+
   engine-check:
     name: Production, CPU runtime, native builds, and sanitizers
+    needs: scope
+    if: ${{ needs.scope.outputs.engine == 'true' }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -43,6 +94,8 @@ jobs:
 
   python-compatibility:
     name: Python compatibility ${{ matrix.python-version }}
+    needs: scope
+    if: ${{ needs.scope.outputs.python == 'true' }}
     runs-on: macos-26
     timeout-minutes: 20
     strategy:
@@ -65,6 +118,27 @@ jobs:
           make check-python PYTHON_CANDIDATES=python3
           actual=$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
           test "$actual" = "${{ matrix.python-version }}"
+
+  # Leaves a marker for content whose long job passed, so a later run with the same content skips it.
+  record:
+    name: Record passed checks
+    needs: [scope, engine-check, python-compatibility]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Marker file
+        run: echo "${{ github.sha }}" > .ci-passed
+      - if: ${{ needs.engine-check.result == 'success' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ci-passed
+          key: ${{ needs.scope.outputs.engine_key }}
+      - if: ${{ needs.python-compatibility.result == 'success' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ci-passed
+          key: ${{ needs.scope.outputs.python_key }}
 
   release-hardware:
     name: Release gate (${{ matrix.runner_label }})

@@ -44,12 +44,20 @@ class HttpAdmission:
             raise ValueError("HTTP admission capacity must be a positive integer")
         self.capacity = capacity
         self.active = 0
+        # Set by close(): no slot is granted again. Granting and closing share
+        # the lock, so a slot is either granted before close() or never.
+        self.closed = False
         # Input finalizers can run during a stats snapshot on this thread.
         self.lock = threading.RLock()
 
+    def close(self):
+        """Refuse every later acquire; slots already held run to release()."""
+        with self.lock:
+            self.closed = True
+
     def acquire(self, amount=1):
         with self.lock:
-            if self.active + amount > self.capacity:
+            if self.closed or self.active + amount > self.capacity:
                 return False
             self.active += amount
             return True

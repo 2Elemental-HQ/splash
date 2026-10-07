@@ -27,6 +27,10 @@ class ServerMainTests(unittest.TestCase):
         closing_handlers = []
 
         def install(signum, handler):
+            if signum == signal.SIGUSR1:
+                # The drain request (fork-only, app/UPSTREAM_PATCHES.md) is not a stop signal.
+                self.assertIs(handler, api._request_drain)
+                return signal.SIG_DFL
             if handler is api._interrupt:
                 handlers[signum] = handler
                 return signal.SIG_DFL

@@ -1,0 +1,175 @@
+name: Splash Manager
+
+# The macOS app in app/, the runtime it bundles, and the drain patch in the Splash server.
+# Needs no model, no Keychain secret, no signing identity; permissions are read-only.
+#
+# Each job runs only when the content it covers changed since a run of it passed (see .github/scripts/scope.sh).
+# The workflow itself always runs on a pull request, so no check is left waiting; a job that is skipped counts as
+# passed. A push to main and a manual run with full_verification run every job. Pushes to other branches do not
+# start this workflow: the pull request does, once.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full_verification:
+        description: Run every job, ignoring the record of jobs that already passed
+        type: boolean
+        default: false
+
+concurrency:
+  group: splash-manager-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    name: Select checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.pick.outputs.app }}
+      runtime: ${{ steps.pick.outputs.runtime }}
+      python: ${{ steps.pick.outputs.python }}
+      app_key: ${{ steps.keys.outputs.app }}
+      runtime_key: ${{ steps.keys.outputs.runtime }}
+      python_key: ${{ steps.keys.outputs.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: keys
+        name: Name the content each job covers
+        run: |
+          self=".github/workflows/splash-manager.yml .github/scripts/scope.sh"
+          # Swift code and tests, the package, and the app build. Not the release scripts or the runtime.
+          app="$(.github/scripts/scope.sh sm-app app/Sources app/Tests app/Package.swift app/VERSION app/build-dev.sh $self)"
+          # Runtime assembly and packaging: the pinned upstream archive, the overlay, the files laid over it,
+          # the integrity code, the release scripts and what they bundle.
+          runtime="$(.github/scripts/scope.sh sm-runtime app/release app/build-dev.sh app/Sources/SplashManagerCore/RuntimeBundle.swift app/VERSION server install $self)"
+          # The Python server's drain patch and the tests around it.
+          python="$(.github/scripts/scope.sh sm-python server install dev/tests/server dev/tests/server_fixtures.py dev/requirements.txt dev/ruff.toml $self)"
+          { echo "app=$app"; echo "runtime=$runtime"; echo "python=$python"; } >> "$GITHUB_OUTPUT"
+      - id: app_seen
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ steps.keys.outputs.app }}", lookup-only: true }
+      - id: runtime_seen
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ steps.keys.outputs.runtime }}", lookup-only: true }
+      - id: python_seen
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ steps.keys.outputs.python }}", lookup-only: true }
+      - id: pick
+        run: |
+          everything=false
+          if [ "${{ github.event_name }}" != pull_request ] || [ "${{ inputs.full_verification }}" = true ]; then everything=true; fi
+          for job in app runtime python; do
+            case $job in
+              app) seen="${{ steps.app_seen.outputs.cache-hit }}" ;;
+              runtime) seen="${{ steps.runtime_seen.outputs.cache-hit }}" ;;
+              python) seen="${{ steps.python_seen.outputs.cache-hit }}" ;;
+            esac
+            if [ "$everything" = true ] || [ "$seen" != true ]; then echo "$job=true" >> "$GITHUB_OUTPUT"; else echo "$job=false" >> "$GITHUB_OUTPUT"; fi
+          done
+          cat "$GITHUB_OUTPUT"
+
+  drain-patch:
+    name: Splash server drain patch (Python)
+    needs: scope
+    if: ${{ needs.scope.outputs.python == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            install/requirements.txt
+            dev/requirements.txt
+      - name: Install the server's dependencies
+        run: python -m pip install -r install/requirements.txt -r dev/requirements.txt
+      - name: Drain, signal handling, HTTP admission and transport tests
+        run: >-
+          python -m unittest -v
+          dev.tests.server.test_drain
+          dev.tests.server.test_server_main
+          dev.tests.server.test_http_transport
+          dev.tests.server.test_http_body_budget
+          dev.tests.server.test_server_recovery
+      - name: Style of the touched Python
+        run: |
+          python -m ruff check --config dev/ruff.toml server dev/tests/server/test_drain.py dev/tests/server/test_server_main.py
+          python -m ruff format --check --config dev/ruff.toml server dev/tests/server/test_drain.py dev/tests/server/test_server_main.py
+
+  app:
+    name: App tests and build
+    needs: scope
+    if: ${{ needs.scope.outputs.app == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+      - name: Unit and process tests
+        working-directory: app
+        run: swift test
+      - name: Release build of the app
+        working-directory: app
+        run: swift build -c release --product SplashManager --arch arm64
+
+  runtime-package:
+    name: Bundled runtime, packaging and release gate
+    needs: scope
+    if: ${{ needs.scope.outputs.runtime == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: app/release/cache
+          key: splash-upstream-runtime-${{ hashFiles('app/release/runtime/UPSTREAM.json') }}
+      - name: Development build with the bundled runtime (unsigned layout) and the disk image layout
+        working-directory: app
+        env:
+          SIGN_IDENTITY: "-"   # ad hoc: CI never signs for distribution
+          WITH_RUNTIME: "1"
+        run: ./build-dev.sh --dmg
+      - name: The bundled runtime verifies and launches
+        working-directory: app
+        run: |
+          app="build/Splash Manager.app"
+          "$app/Contents/MacOS/SplashManager" --verify-runtime
+          "$app/Contents/Resources/Splash/bin/splash" --version | grep -q "1.3.0-drain.1"
+          grep -q SIGUSR1 "$app/Contents/Resources/Splash/server/server.py"
+      - name: Release script refuses without a Developer ID identity
+        working-directory: app
+        run: |
+          if release/build-release.sh --check; then echo "release preflight must fail on CI"; exit 1; fi
+
+  # Leaves a marker for content whose job passed, so a later run with the same content skips that job.
+  record:
+    name: Record passed checks
+    needs: [scope, drain-patch, app, runtime-package]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Marker file
+        run: echo "${{ github.sha }}" > .ci-passed
+      - if: ${{ needs.app.result == 'success' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ needs.scope.outputs.app_key }}" }
+      - if: ${{ needs.runtime-package.result == 'success' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ needs.scope.outputs.runtime_key }}" }
+      - if: ${{ needs.drain-patch.result == 'success' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with: { path: .ci-passed, key: "${{ needs.scope.outputs.python_key }}" }

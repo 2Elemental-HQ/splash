@@ -1,0 +1,5 @@
+# Files of this fork that replace the same path in the upstream runtime archive.
+# Every other file under server/ and install/ must equal upstream's; build-runtime.sh fails when it does not,
+# which means the fork moved past the pinned upstream release and UPSTREAM.json must be bumped.
+server/connections.py
+server/server.py

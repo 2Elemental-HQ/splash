@@ -1,0 +1,10 @@
+{
+  "comment": "The upstream Splash release that the bundled runtime is built from. The engine binary and the Python tree come from it unchanged (apart from re-signing); the files in OVERLAY.txt come from this fork.",
+  "upstream_version": "1.3.0",
+  "runtime_version": "1.3.0-drain.1",
+  "url": "https://github.com/incoai/splash/releases/download/1.3.0/splash-1.3.0-arm64-macos26.tar.gz",
+  "sha256": "9cbf463598367c912ee17eaba27cba4be3d324d688541f7ed5106ed9b2bd691d",
+  "archive_root": "splash-1.3.0-arm64-macos26",
+  "upstream_engine_sha256": "87f615bc3f75fc6fb85cfd815cdc01c6112da2261c74cc1399caa4cc0a02d17b",
+  "upstream_metallib_sha256": "30dd9a792a07699ab95f8bda62d295568807bbb94429b9518f60f3b4746d8099"
+}

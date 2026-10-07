@@ -12,6 +12,7 @@ import select
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -611,11 +612,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.server.token_counts if route.prompt_only else self.server.requests
         )
         if not admission.acquire():
+            # A draining server (SIGUSR1) takes no new request; those it
+            # holds run to their end.
+            draining = admission.closed
             self._safe_error(
                 APIError(
                     503,
-                    "frontend request capacity is exhausted",
-                    "frontend_overloaded",
+                    "the server is draining and accepts no new requests"
+                    if draining
+                    else "frontend request capacity is exhausted",
+                    "server_draining" if draining else "frontend_overloaded",
                 )
             )
             return
@@ -1485,6 +1491,8 @@ class FrontendServer(HTTPServer):
             "max_request_bytes": self.max_request_bytes,
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
+            # True once SIGUSR1 closed the admission of generation requests.
+            "draining": self.requests.closed,
         }
         return status
 
@@ -1622,6 +1630,27 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+# SIGUSR1 asks for a drain: refuse new generation requests, let those held
+# finish, then stop as SIGTERM does. A supervisor that must not cut a running
+# call (Splash Manager, app/) sends it instead of SIGTERM. Fork-only; see
+# app/UPSTREAM_PATCHES.md.
+DRAIN_REQUESTED = threading.Event()
+
+
+def _request_drain(_signum, _frame):
+    DRAIN_REQUESTED.set()
+
+
+def drain_then_stop(server, stop_signal=signal.SIGTERM, poll=0.1):
+    """Wait for a drain request, close the admission, wait until no request is
+    held, then signal this process to stop."""
+    DRAIN_REQUESTED.wait()
+    server.requests.close()
+    while server.requests.active:
+        time.sleep(poll)
+    os.kill(os.getpid(), stop_signal)
+
+
 def main():
     args = parse_args()
     server = None
@@ -1632,6 +1661,7 @@ def main():
     # signals explicitly so scripts and supervisors can interrupt it.
     signal.signal(signal.SIGTERM, _interrupt)
     signal.signal(signal.SIGINT, _interrupt)
+    signal.signal(signal.SIGUSR1, _request_drain)
     try:
         # The launcher blocks both across its exec: one sent while this module
         # imported arrives here and ends the startup cleanly.
@@ -1652,6 +1682,9 @@ def main():
             allowed_origins=args.allowed_origin,
         )
         server.server_bind()
+        threading.Thread(
+            target=drain_then_stop, args=(server,), daemon=True, name="drain"
+        ).start()
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
             print_status(
                 "Warning · --allowed-origin '*' without --api-key lets every web "
