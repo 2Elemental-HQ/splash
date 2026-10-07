@@ -86,10 +86,16 @@ final class Harness {
         return text.split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
     }
 
+    /// What the harness saw four seconds into a wait that had not succeeded yet, while the process still lived.
+    var midWaitDiagnosis: String?
+
     func waitUntil(_ timeout: TimeInterval = 15, _ condition: () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
+        let start = Date()
+        let deadline = start.addingTimeInterval(timeout)
+        midWaitDiagnosis = nil
         while Date() < deadline {
             if condition() { return true }
+            if midWaitDiagnosis == nil, Date().timeIntervalSince(start) > 4 { midWaitDiagnosis = diagnosis() }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return condition()
@@ -98,7 +104,7 @@ final class Harness {
     func expect(_ timeout: TimeInterval = 15, file: StaticString = #filePath, line: UInt = #line,
                 _ condition: () -> Bool) async {
         let ok = await waitUntil(timeout, condition)
-        XCTAssertTrue(ok, "condition not reached in \(timeout) s. \(diagnosis())", file: file, line: line)
+        XCTAssertTrue(ok, "condition not reached in \(timeout) s. AT 4 s: \(midWaitDiagnosis ?? "-") AT END: \(diagnosis())", file: file, line: line)
     }
 
     /// What a failed wait needs to be understood from a CI log alone.

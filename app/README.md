@@ -22,17 +22,25 @@ The Setup card in the window shows these checks for the Mac in front of you.
 
 ## Install
 
-Distribution is a notarized disk image (`SplashManager-<version>-arm64.dmg`): open it, drag the app to
-Applications, open it. No Xcode, no manual build, no Gatekeeper workaround. See
-[release/README.md](release/README.md) for how it is made and how it is verified.
-**Release status:** `SplashManager-0.2.0-arm64.dmg` was built, signed (Developer ID Application, team QE3S4M7AA5),
-notarized, stapled and passed `release/verify-artifact.sh` (all 14 checks, Gatekeeper included) on the build Mac. It has not
-been installed on a clean second Mac, and no release is published.
+Distribution is a notarized disk image: `SplashManager-<version>-arm64.dmg`. Open it, drag the app to Applications,
+open it. **The app carries its own Splash runtime**: no Homebrew, no Xcode, no manual build, no path setting, no
+Gatekeeper workaround. See [release/README.md](release/README.md) for how it is made and verified.
 
-On a Mac without Splash the Setup card guides the install: it checks the hardware, offers
-`brew install incoai/tap/splash` (about 235 MB, after a confirmation, never installing Homebrew itself),
-and suggests models from the installed Splash. **No model is downloaded without a confirmation that shows its size.**
-Splash is not bundled; see release/README.md for why.
+* **What is inside:** the app, and the Splash 1.3.0 release (engine, bundled Python, server) with this fork's drain patch,
+  about 240 MB unpacked. Every Mach-O file is re-signed with the same Developer ID as the app, so the whole image
+  is notarized; `release.json` and `runtime-manifest.json` are written after signing and describe the files as shipped.
+* **Integrity:** before the runtime is started the app recomputes the SHA-256 of the engine, the Metal library, the server,
+  the launcher and every Mach-O file against that manifest (and of `release.json`). A mismatch means the runtime is not
+  used. The app's own code signature covers the rest of the bundle. Provenance: the upstream archive is pinned by
+  SHA-256 and its engine digest is checked before anything is re-signed.
+* **Existing Homebrew installs are never touched.** The bundled runtime is preferred (it can drain); Settings can prefer the
+  installed one, which cannot.
+* **Models are separate.** Nothing downloads a model without a confirmation that shows its size. The first start of a model that is
+  not in the Hugging Face cache asks first; models Splash already installed are imported.
+* **Without the bundled runtime** (a development build) the Setup card offers `brew install incoai/tap/splash` after a confirmation.
+
+**Release status:** see the PR for the current image, its SHA-256 and what was tested. No release is published and no
+installation on a clean second Mac has been tested yet.
 
 ## Develop
 
@@ -43,6 +51,8 @@ cd app
 ./build-dev.sh                 # build/Splash Manager.app, development-signed, not for distribution
 ./build-dev.sh --dmg           # also a DEV disk image, to check its layout
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test    # no model needed; uses a fake Splash
+WITH_RUNTIME=1 ./build-dev.sh  # also stages the bundled runtime (unsigned layout)
+release/test-package.sh <dmg>  # end-to-end test of a built image, with the cached model
 ```
 
 `SPLASH_MANAGER_HOME=<dir>` moves all app state and `SPLASH_MANAGER_KEYCHAIN_SERVICE=<name>` the Keychain
@@ -67,7 +77,8 @@ tests on macOS without any secret.
 | `ManagementAPI.swift`, `HTTP.swift` | The API and its listeners (Network.framework, explicit addresses only) |
 | `HFCache.swift` | Reads the Hugging Face cache: file completeness; size estimate |
 | `SplashLocator.swift` | Finds Splash; reads its version, `serve` flags, family table and suggested models |
-| `Requirements.swift` | Hardware and macOS checks; Homebrew-guided install |
+| `Requirements.swift` | Hardware and macOS checks; Homebrew-guided install (only without a bundled runtime) |
+| `RuntimeBundle.swift` | Finds the bundled runtime and checks it against its manifest |
 | `Spawn.swift`, `Secrets.swift`, `Logs.swift` | `posix_spawn` and pid identity, Keychain, redaction |
 
 ### Applied against saved

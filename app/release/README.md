@@ -57,13 +57,39 @@ this app:
 3. Run `release/verify-artifact.sh` on the downloaded file.
 4. Check the Setup card in the window shows the correct requirement results for that Mac.
 
-## What is not in the image
+## What is in the image
 
-Splash and models. The app installs Splash through Homebrew after a confirmation, and downloads
-a model only after showing its size and asking.
+* **The app.** Developer ID signed, hardened runtime, arm64 only, macOS 14 or later.
+* **The Splash runtime** in `Contents/Resources/Splash`: the upstream release `splash-1.3.0-arm64-macos26.tar.gz`
+  (pinned by SHA-256 in `release/runtime/UPSTREAM.json`) with two files of this fork laid over it
+  (`release/runtime/OVERLAY.txt`: the drain patch). `release/runtime/build-runtime.sh` downloads and verifies the archive,
+  checks that every other `server/` and `install/` file of the fork still equals upstream's (it fails when the fork moved
+  past the pinned release: bump `UPSTREAM.json`), signs all 67 Mach-O files (engine, Python, extension modules) with the
+  hardened runtime and a secure timestamp, and writes the manifests.
+* **No model.** The app downloads a model only after showing its size and asking.
 
-Why Splash is not bundled: it is about 235 MB (216 MB of that is its own Python); its engine
-binary is pinned by hash in its own `release.json` and is not Developer ID signed, so re-signing
-it would break that check or ship an unsigned nested binary that fails notarization; every Splash
-update would need a new notarized release of this app; and the Homebrew package is the
-supported channel of the Splash authors.
+### Why re-signing is safe here (the engine hash)
+
+Upstream's `release.json` pins the engine by SHA-256 and the engine is ad hoc signed, which notarization does not accept.
+Re-signing changes the engine's bytes, so a copy of upstream's hash would be wrong. The build therefore (1) checks the
+engine and Metal library against upstream's published digests *before* touching them, (2) signs, (3) writes new digests of
+the files as they ship, in `release.json` and `runtime-manifest.json`, and (4) the app checks those at every start and
+`verify-artifact.sh` checks them again. Nothing is trusted that was not hashed after the last change.
+
+### Bundled, not downloaded
+
+A separate runtime package would add a download, a second signing and notarization, and a version check between two
+artifacts. Bundling is one artifact, one notarization, one seal. The cost is size (about 90 MB compressed) and that a Splash
+update means a new app release; the pinned `UPSTREAM.json` makes that a one-file change.
+
+## Test a built image end to end
+
+```sh
+release/test-package.sh release/out/SplashManager-<version>-arm64.dmg
+```
+
+Needs the Splash-pinned model in the Hugging Face cache; downloads nothing. It copies the app out of the image into a
+temporary folder, unmounts the image, runs the app with a minimal environment and its own state (nothing from the source
+checkout), and checks: runtime found, verified and able to drain; start and readiness; a real short call; a switch during a
+running stream (the stream finishes, a new call is refused with `server_draining`, a second operation is refused); the
+other configuration runs; stop. It does not replace the clean-second-Mac test above.

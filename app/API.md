@@ -65,12 +65,13 @@ after a 300 ms delay. The API never returns the token or the inference API key.
 ```json
 {
   "api_version": 1,
-  "manager": {"version": "0.2.0", "started_at": "…"},
+  "manager": {"version": "0.3.0", "started_at": "…"},
   "state": "stopped | starting | ready | stopping | failed",
   "ownership": "none | managed | external",
   "operation": "start | stop | switch | retry | adopt | null",
   "detail": "human text or null",
-  "splash": {"installed": true, "version": "1.3.0"},
+  "splash": {"installed": true, "version": "1.3.0-drain.1", "source": "bundled | installed | custom",
+             "integrity": "verified | failed | null", "drain_declared": true, "problem": null},
   "config": {"id": "…", "display_name": "…", "model_id": "…", "revision": "…|null"},
   "applied": {"config_id": "…", "model_id": "…", "revision": "…|null", "options": {…},
               "port": 8000, "exposure": "loopback | all_interfaces", "allowed_hosts": [], "offline": true},
@@ -88,6 +89,11 @@ after a 300 ms delay. The API never returns the token or the inference API key.
 }
 ```
 
+* `splash.source`: `bundled` is the runtime inside the app (upstream Splash 1.3.0 with the drain patch, checked against its
+  manifest before it is used); `installed` is a Splash on this Mac (Homebrew), which the app never changes; `custom` is a path
+  from Settings. The bundled one is preferred unless Settings says otherwise. `integrity` is the bundled runtime's check;
+  `failed` means it is not used and `problem` says why. `drain_declared` is what its release.json promises; `drain.supported`
+  is what the running process proved.
 * `config` is the running configuration (from `applied`), or the selected one when nothing runs.
 * `state: "ready"`: the process runs, `/ready` answered 200 **and** `/v1/models` lists the intended model.
 * `ownership: "managed"`: the app started this process, or re-adopted it after an app restart after checking
@@ -180,7 +186,7 @@ holds the slot and still acts on the same process (pid and kernel start time). S
 | --- | --- |
 | Splash with drain support (this fork) | The app sends `SIGUSR1`. From that moment Splash refuses new generation requests with `503 server_draining`. Requests already accepted, including streams and waiting ones, run to their end. Splash exits when none is left. **No timeout forces a running call.** A drain can take as long as the longest call. |
 | Idle Splash does not exit after a drain | Only then, after 60 s with nothing running, the app uses SIGTERM, SIGINT, SIGKILL. |
-| Splash without drain support (Homebrew 1.3.0) | `stop` and `switch` over the API return 409 `drain_unsupported`; `switch_safe` is false. The window offers a confirmed *Stop now* that can cut calls. |
+| Splash without drain support (a Homebrew install; never the bundled runtime) | `stop` and `switch` over the API return 409 `drain_unsupported`; `switch_safe` is false. The window offers a confirmed *Stop now* that can cut calls. |
 | Process that never became ready | Stopped at once; no call could have been accepted. |
 | Person chooses *Stop now* | `SIGTERM`, then `SIGINT` after 40 s, then `SIGKILL` after 10 s. Running calls end with `server_shutdown`. |
 
@@ -204,6 +210,12 @@ Evidence for the first and last row is in the PR description. The Splash change 
 | 409 | `not_managed` | Stop or switch of a process the app does not own. |
 | 422 | `option_unsupported`, `exposure_unsupported` | The installed Splash lacks a flag. |
 | 424 | `splash_not_installed` | No Splash executable found. |
+
+## Which Splash runs
+
+A DMG install needs no Homebrew and no build: the app carries the Splash runtime (engine, Python, server) and starts it
+itself. Check `splash.source` and `splash.integrity` in the status if a deployment must be sure. A Splash that was installed
+with Homebrew is left alone; if Settings prefers it, `drain.supported` is false and stop/switch return `drain_unsupported`.
 
 ## What AgentOS must do
 

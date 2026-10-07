@@ -50,6 +50,8 @@ public final class SplashSupervisor: ObservableObject {
     @Published public private(set) var drainSupported: Bool?
     @Published public private(set) var draining = false
     @Published public private(set) var operationKind: String?
+    /// False until the first look at the installed Splash and the adoption of a running one are done.
+    @Published public private(set) var initialized = false
 
     public let store: ConfigStore
     public let logs: LogBuffer
@@ -60,7 +62,7 @@ public final class SplashSupervisor: ObservableObject {
     public var familiesOverride: [SplashFamily]?
     /// Test hook: runs after a stop is accepted and before its signal is sent.
     public var beforeStopSignal: (@MainActor () async -> Void)?
-    public static let managerVersion = "0.2.0"
+    public static let managerVersion = "0.3.0"
 
     private enum OpKind: String { case start, stop, switchTo = "switch", retry, adopt }
     private struct Operation {
@@ -108,6 +110,7 @@ public final class SplashSupervisor: ObservableObject {
             await self.refreshInstall()
             await self.adoptIfPossible()
             if let adoptToken { self.release(adoptToken) }
+            self.initialized = true
             if self.store.settings.startSplashWhenAppLaunches, self.state == .stopped, self.ownership == .none,
                let id = self.store.settings.selectedConfigId {
                 do { _ = try await self.start(configId: id, allowDownload: false) }
@@ -155,6 +158,13 @@ public final class SplashSupervisor: ObservableObject {
     }
 
     // MARK: Public operations
+
+    /// The management API answers only after startup finished, so a first request never sees "no Splash found" by mistake.
+    public func waitInitialized(timeout: TimeInterval = 20) async {
+        guard pollTask != nil else { return }   // not begun (tests, tools): nothing to wait for
+        let deadline = Date().addingTimeInterval(timeout)
+        while !initialized, Date() < deadline { try? await Task.sleep(nanoseconds: 20_000_000) }
+    }
 
     /// Adoption at launch is brief and competes with nothing; a request that arrives meanwhile waits for it.
     private func settleAdoption() async {

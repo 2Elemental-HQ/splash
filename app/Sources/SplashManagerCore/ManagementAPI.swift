@@ -34,6 +34,7 @@ public final class ManagementAPI {
             response.headers["WWW-Authenticate"] = "Bearer"
             return response
         }
+        await supervisor.waitInitialized()
         do {
             return try await route(request)
         } catch let error as AppError {
