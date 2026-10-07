@@ -24,6 +24,8 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
         public var localUrl: String
         public var tailnetUrl: String?
         public var openaiBasePath: String
+        /// Host names the last start told Splash to accept, besides loopback.
+        public var allowedHosts: [String]
     }
     public struct Readiness: Codable, Equatable, Sendable {
         public var processAlive: Bool

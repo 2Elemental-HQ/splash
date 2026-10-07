@@ -62,6 +62,7 @@ public final class SplashSupervisor: ObservableObject {
     private var retryTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var installInspectedFor: URL?
+    private var effectiveAllowedHosts: [String] = []
     private var assessCache: [String: (Date, HFCache.Assessment)] = [:]
     public var cache = HFCache()
     public static let managerVersion = "0.1.0"
@@ -259,8 +260,9 @@ public final class SplashSupervisor: ObservableObject {
             loadedModelId: loadedModelId,
             endpoint: .init(bindHost: host, port: settings.inferencePort, exposure: settings.inferenceExposure,
                             requiresApiKey: key, localUrl: "http://127.0.0.1:\(settings.inferencePort)",
-                            tailnetUrl: tailnet.map { "http://\($0):\(settings.inferencePort)" },
-                            openaiBasePath: "/v1"),
+                            tailnetUrl: settings.inferenceExposure == .allInterfaces ? tailnet.map { "http://\($0):\(settings.inferencePort)" } : nil,
+                            openaiBasePath: "/v1",
+                            allowedHosts: effectiveAllowedHosts),
             readiness: .init(processAlive: alive || ownership == .external, httpReady: httpReady, modelLoaded: modelLoaded),
             activity: .init(activeRequests: activity?.activeRequests, idle: activity?.idle, switchSafe: safe, reason: reason),
             process: identity.flatMap { id in startedAt.map {
@@ -330,16 +332,23 @@ public final class SplashSupervisor: ObservableObject {
         switch settings.inferenceExposure {
         case .loopback: break
         case .tailnet:
-            guard let address = NetInfo.tailnetAddress() else {
-                throw AppError("tailnet_unavailable", "This Mac has no Tailscale address. Start Tailscale or choose another exposure.", status: 424)
-            }
-            host = address
-            key = try Secrets.ensure(SecretAccount.inferenceKey, in: secrets)
+            // A Mac cannot connect to its own Tailscale address, so readiness could not be proven.
+            throw AppError("exposure_unsupported", "Inference cannot be bound to the Tailscale address alone. Use all interfaces with an API key.", status: 422)
         case .allInterfaces:
             host = "0.0.0.0"
             key = try Secrets.ensure(SecretAccount.inferenceKey, in: secrets)
         }
-        let arguments = try ServeArguments.build(config: config, settings: settings, install: install, host: host,
+        // Splash refuses a Host name it was not told about. Over the network, accept this Mac's Tailscale names.
+        var hostSettings = settings
+        if settings.inferenceExposure == .allInterfaces {
+            var hosts = settings.allowedHosts
+            if let address = NetInfo.tailnetAddress() { hosts.append(address) }
+            if let name = await NetInfo.tailnetHostName() { hosts.append(name) }
+            var seen = Set<String>()
+            hostSettings.allowedHosts = hosts.filter { seen.insert($0).inserted }
+        }
+        effectiveAllowedHosts = hostSettings.allowedHosts
+        let arguments = try ServeArguments.build(config: config, settings: hostSettings, install: install, host: host,
                                                  offline: assessment.availability == .local)
 
         // The port must be free. Look before spawning; never touch what is there.
@@ -501,11 +510,7 @@ public final class SplashSupervisor: ObservableObject {
 
     private func tickUnmanaged() async {
         let settings = store.settings
-        let probeHost: String
-        switch settings.inferenceExposure {
-        case .tailnet: probeHost = NetInfo.tailnetAddress() ?? "127.0.0.1"
-        default: probeHost = "127.0.0.1"
-        }
+        let probeHost = "127.0.0.1"
         let listening = await NetInfo.isListening(host: probeHost, port: settings.inferencePort, timeout: 0.5)
         guard identity == nil, !busy else { return }
         if !listening {
@@ -617,8 +622,7 @@ public final class SplashSupervisor: ObservableObject {
         var key: String?
         switch record.exposure {
         case .loopback: host = "127.0.0.1"
-        case .tailnet: host = NetInfo.tailnetAddress() ?? "127.0.0.1"; key = secrets.read(SecretAccount.inferenceKey)
-        case .allInterfaces: host = "127.0.0.1"; key = secrets.read(SecretAccount.inferenceKey)
+        case .tailnet, .allInterfaces: host = "127.0.0.1"; key = secrets.read(SecretAccount.inferenceKey)
         }
         let probe = await SplashClient(host: host, port: record.port, apiKey: key).probe()
         // The pid must still be the process whose own status names that pid.
@@ -645,7 +649,7 @@ public final class SplashSupervisor: ObservableObject {
             return SplashClient(host: runHost, port: store.settings.inferencePort, apiKey: runKey)
         case .external:
             let settings = store.settings
-            let host = settings.inferenceExposure == .tailnet ? (NetInfo.tailnetAddress() ?? "127.0.0.1") : "127.0.0.1"
+            let host = "127.0.0.1"
             let key = settings.inferenceExposure == .loopback ? nil : secrets.read(SecretAccount.inferenceKey)
             return SplashClient(host: host, port: settings.inferencePort, apiKey: key)
         case .none: return nil
@@ -655,8 +659,7 @@ public final class SplashSupervisor: ObservableObject {
     private func bindHost(for settings: ManagerSettings) -> String {
         switch settings.inferenceExposure {
         case .loopback: return "127.0.0.1"
-        case .tailnet: return NetInfo.tailnetAddress() ?? "unavailable"
-        case .allInterfaces: return "0.0.0.0"
+        case .tailnet, .allInterfaces: return "0.0.0.0"
         }
     }
 

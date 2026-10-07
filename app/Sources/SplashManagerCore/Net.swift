@@ -26,6 +26,18 @@ public enum NetInfo {
         return nil
     }
 
+    /// The MagicDNS name of this Mac (without the trailing dot), from the Tailscale CLI, if it can be read.
+    public static func tailnetHostName() async -> String? {
+        let candidates = ["/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
+                          "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
+        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+              let text = await SplashLocator.run(URL(fileURLWithPath: path), ["status", "--json", "--peers=false"], timeout: 4),
+              let json = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
+              let me = json["Self"] as? [String: Any], var name = me["DNSName"] as? String else { return nil }
+        if name.hasSuffix(".") { name.removeLast() }
+        return (try? Validation.hostName(name)) ?? nil
+    }
+
     /// True when something accepts TCP connections at host:port.
     public static func isListening(host: String, port: Int, timeout: TimeInterval = 1) async -> Bool {
         await withCheckedContinuation { continuation in

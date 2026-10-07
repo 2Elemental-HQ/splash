@@ -33,6 +33,26 @@ public struct HFCache: Sendable {
         return fm.fileExists(atPath: snapshotDirectory(repo, commit: commit).path) ? commit : nil
     }
 
+    /// Any installed snapshot: the one a ref names, else one Splash pinned, else the newest.
+    /// Used where no revision is requested; the start then runs `--offline` on what is installed.
+    func installedCommit(for repo: String, revision: String?) -> String? {
+        if let exact = commit(for: repo, revision: revision) { return exact }
+        let fm = FileManager.default
+        let pins = repoDirectory(repo).appendingPathComponent("refs/splash")
+        for install in (try? fm.contentsOfDirectory(atPath: pins.path)) ?? [] {
+            for name in (try? fm.contentsOfDirectory(atPath: pins.appendingPathComponent(install).path)) ?? []
+            where name.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil
+                && fm.fileExists(atPath: snapshotDirectory(repo, commit: name).path) { return name }
+        }
+        let snapshots = repoDirectory(repo).appendingPathComponent("snapshots")
+        let names = ((try? fm.contentsOfDirectory(atPath: snapshots.path)) ?? []).sorted {
+            let a = (try? fm.attributesOfItem(atPath: snapshots.appendingPathComponent($0).path)[.modificationDate] as? Date) ?? .distantPast
+            let b = (try? fm.attributesOfItem(atPath: snapshots.appendingPathComponent($1).path)[.modificationDate] as? Date) ?? .distantPast
+            return a > b
+        }
+        return names.first
+    }
+
     func files(_ repo: String, commit: String) -> [String] {
         let base = snapshotDirectory(repo, commit: commit)
         return (try? FileManager.default.subpathsOfDirectory(atPath: base.path)) ?? []
@@ -62,7 +82,7 @@ public struct HFCache: Sendable {
         var missing: [String] = []
         var note: String?
 
-        if let commit = commit(for: repo, revision: revision) {
+        if let commit = revision == nil ? installedCommit(for: repo, revision: nil) : commit(for: repo, revision: revision) {
             let names = files(repo, commit: commit)
             if let variant {
                 if !names.contains(where: { $0.lowercased().hasSuffix(".gguf") && $0.lowercased().contains(variant.lowercased()) }) {
@@ -76,7 +96,7 @@ public struct HFCache: Sendable {
         }
 
         if let draft = Self.draftRepository(for: modelId) {
-            if let commit = commit(for: draft, revision: nil),
+            if let commit = installedCommit(for: draft, revision: nil),
                files(draft, commit: commit).contains("config.json") {
                 // present
             } else {

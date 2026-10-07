@@ -13,7 +13,7 @@ let package = Package(
     targets: [
         .target(name: "SplashManagerCore"),
         .executableTarget(name: "SplashManager", dependencies: ["SplashManagerCore"]),
-        .testTarget(name: "SplashManagerCoreTests", dependencies: ["SplashManagerCore"]),
+        .testTarget(name: "SplashManagerCoreTests", dependencies: ["SplashManagerCore"], exclude: ["Fixtures"]),
     ],
     swiftLanguageModes: [.v5]
 )

@@ -102,3 +102,26 @@ final class HFCacheTests: XCTestCase {
         XCTAssertEqual(cache.assess(modelId: "a/b", revision: commitA).availability, .notLocal, "the draft is unknown, so a download cannot be ruled out")
     }
 }
+
+final class HFCachePinnedTests: XCTestCase {
+    /// The layout Splash itself leaves: pins under refs/splash, no refs/main.
+    func testSplashPinnedInstallIsLocal() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hf-\(UUID().uuidString.prefix(6))")
+        func make(_ repo: String, files: [String]) throws {
+            let base = dir.appendingPathComponent("models--" + repo.replacingOccurrences(of: "/", with: "--"))
+            let snap = base.appendingPathComponent("snapshots/\(commitA)")
+            let pin = base.appendingPathComponent("refs/splash/install1")
+            try FileManager.default.createDirectory(at: snap, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: pin, withIntermediateDirectories: true)
+            try Data().write(to: pin.appendingPathComponent(commitA))
+            for f in files { try Data().write(to: snap.appendingPathComponent(f)) }
+        }
+        try make("mlx-community/Qwen3.8-27B-4bit", files: ["config.json", "m.safetensors"])
+        try make("incoai/Qwen3.8-27B-DFlash2", files: ["config.json", "model.safetensors"])
+        let cache = HFCache(root: dir)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitA).availability, .local)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: nil).availability, .local)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitB).availability, .notLocal)
+        XCTAssertEqual(cache.splashPinnedModels(), [HFCache.Candidate(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitA)])
+    }
+}

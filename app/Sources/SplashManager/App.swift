@@ -1,0 +1,122 @@
+import SwiftUI
+import AppKit
+import ServiceManagement
+import SplashManagerCore
+
+@MainActor
+final class AppEnvironment: ObservableObject {
+    static let shared = AppEnvironment()
+
+    let store: ConfigStore
+    let secrets = KeychainStore()
+    let logs = LogBuffer()
+    let supervisor: SplashSupervisor
+    let api: ManagementAPI
+    let service: ManagementService
+
+    private init() {
+        store = ConfigStore(paths: .default)
+        supervisor = SplashSupervisor(store: store, secrets: secrets, logs: logs)
+        api = ManagementAPI(supervisor: supervisor, secrets: secrets)
+        service = ManagementService(api: api, store: store)
+        _ = try? Secrets.ensure(SecretAccount.managementToken, in: secrets)
+        if store.configs.isEmpty { importDetectedModels() }
+        supervisor.begin()
+        service.begin()
+    }
+
+    /// First run: offer the models Splash itself installed, with their pinned revision.
+    func importDetectedModels() {
+        let existing = Set(store.configs.map(\.id))
+        var ids = existing
+        for candidate in HFCache().splashPinnedModels() {
+            if store.configs.contains(where: { $0.modelId == candidate.modelId && $0.revision == candidate.revision }) { continue }
+            let id = ModelConfig.makeId(modelId: candidate.modelId, revision: candidate.revision, existing: ids)
+            ids.insert(id)
+            let name = candidate.modelId.split(separator: "/").last.map(String.init) ?? candidate.modelId
+            _ = try? store.save(ModelConfig(id: id, displayName: name, modelId: candidate.modelId, revision: candidate.revision))
+        }
+        if store.settings.selectedConfigId == nil, let first = store.configs.first {
+            try? store.updateSettings { $0.selectedConfigId = first.id }
+        }
+    }
+
+    func managementToken() -> String { secrets.read(SecretAccount.managementToken) ?? "" }
+
+    func regenerate(_ account: String) {
+        try? secrets.write(Secrets.generate(), account: account)
+        objectWillChange.send()
+    }
+
+    static func setLaunchAtLogin(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = AppEnvironment.shared
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let env = AppEnvironment.shared
+        guard env.supervisor.ownership == .managed, env.store.settings.stopSplashWhenAppQuits else {
+            env.service.stop()
+            return .terminateNow
+        }
+        Task { @MainActor in
+            let check = await env.supervisor.checkIdle()
+            if !check.safe {
+                let alert = NSAlert()
+                alert.messageText = "Splash is busy"
+                alert.informativeText = (check.reason ?? "Calls may be running.") + " Quitting stops Splash and ends them."
+                alert.addButton(withTitle: "Cancel")
+                alert.addButton(withTitle: "Stop Splash and Quit")
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn { sender.reply(toApplicationShouldTerminate: false); return }
+            }
+            _ = try? await env.supervisor.stop(force: true)
+            env.service.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
+@main
+struct SplashManagerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var env = AppEnvironment.shared
+
+    init() {
+        // `SplashManager --print-token` prints the management token for scripts and exits.
+        if CommandLine.arguments.contains("--print-token") {
+            let store = KeychainStore()
+            print((try? Secrets.ensure(SecretAccount.managementToken, in: store)) ?? "")
+            exit(0)
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count {
+            Snapshot.run(into: CommandLine.arguments[index + 1])
+        }
+    }
+
+    var body: some Scene {
+        MenuBarExtra {
+            MenuContent().environmentObject(env).environmentObject(env.supervisor)
+        } label: {
+            MenuIcon().environmentObject(env.supervisor)
+        }
+        Window("Splash Manager", id: "main") {
+            MainWindow()
+                .environmentObject(env)
+                .environmentObject(env.supervisor)
+                .environmentObject(env.store)
+                .environmentObject(env.logs)
+                .environmentObject(env.service)
+                .frame(minWidth: 780, minHeight: 520)
+        }
+        .defaultSize(width: 920, height: 640)
+    }
+}

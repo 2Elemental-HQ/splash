@@ -30,6 +30,9 @@ public final class ConfigStore: ObservableObject {
         guard next.settings.inferencePort != next.settings.managementPort else {
             throw Validation.Failure(field: "management port", message: "must differ from the inference port")
         }
+        guard next.settings.inferenceExposure != .tailnet else {
+            throw Validation.Failure(field: "inference exposure", message: "use loopback or all interfaces")
+        }
         guard next.settings.managementExposure != .allInterfaces else {
             throw Validation.Failure(field: "management exposure", message: "all interfaces is not available")
         }

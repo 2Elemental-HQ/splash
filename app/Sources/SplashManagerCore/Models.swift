@@ -77,9 +77,10 @@ public enum Exposure: String, Codable, CaseIterable, Sendable {
     /// 127.0.0.1 only.
     case loopback
     /// The Tailscale address of this Mac (100.64.0.0/10) in addition to
-    /// loopback where the component allows it.
+    /// loopback. Management API only: a Mac cannot connect to its own
+    /// Tailscale address, so inference readiness could not be proven there.
     case tailnet
-    /// 0.0.0.0. Inference only; the management API has no such mode.
+    /// 0.0.0.0, with an API key. Inference only; the management API has no such mode.
     case allInterfaces = "all_interfaces"
 }
 
