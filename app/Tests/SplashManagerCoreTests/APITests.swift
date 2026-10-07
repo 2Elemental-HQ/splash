@@ -77,7 +77,8 @@ final class APITests: XCTestCase {
         XCTAssertEqual(body["state"] as? String, "ready")
         XCTAssertEqual((body["readiness"] as? [String: Any])?["model_loaded"] as? Bool, true)
         // Without waiting the answer is 202 while the model loads.
-        _ = await api.handle(request("POST", "/api/v1/stop"))
+        let stopped = await api.handle(request("POST", "/api/v1/stop", body: "{\"wait_stopped_seconds\":20}"))
+        XCTAssertEqual(stopped.status, 200)
         try await h.setControl(["ready_delay": 1.0])
         let accepted = await api.handle(request("POST", "/api/v1/start", body: "{\"config_id\":\"a\"}"))
         XCTAssertEqual(accepted.status, 202)
@@ -85,22 +86,45 @@ final class APITests: XCTestCase {
         await h.cleanup()
     }
 
-    func testBusyStopAndSwitchReturnConflict() async throws {
-        let h = try Harness(control: ["hold": 2]); let api = try makeAPI(h)
+    func testStopOverTheApiDrainsAndAnswersAccepted() async throws {
+        let h = try Harness(control: ["hold": 1.5]); let api = try makeAPI(h)
         h.supervisor.begin()
         _ = await api.handle(request("POST", "/api/v1/start", body: "{\"config_id\":\"a\",\"wait_ready_seconds\":30}"))
-        async let call = h.chat()
+        await h.expect { h.supervisor.drainSupported == true }
+        let call = Task { await h.chat() }
         await h.expect { h.supervisor.activity?.activeRequests == 1 }
-        for (path, body) in [("/api/v1/stop", ""), ("/api/v1/switch", "{\"config_id\":\"b\",\"allow_download\":true}")] {
-            let r = await api.handle(request("POST", path, body: body.isEmpty ? nil : body))
-            XCTAssertEqual(r.status, 409, path)
-            let error = json(r)["error"] as? [String: Any]
-            XCTAssertEqual(error?["code"] as? String, "active_requests")
-        }
+        let r = await api.handle(request("POST", "/api/v1/stop"))
+        XCTAssertEqual(r.status, 202)
+        XCTAssertEqual(json(r)["state"] as? String, "stopping")
+        let second = await api.handle(request("POST", "/api/v1/switch", body: "{\"config_id\":\"b\",\"allow_download\":true}"))
+        XCTAssertEqual(second.status, 409)
+        XCTAssertEqual((json(second)["error"] as? [String: Any])?["code"] as? String, "busy")
+        let finished = await call.value
+        XCTAssertEqual(finished, 200)
+        let done = await api.handle(request("GET", "/api/v1/status", query: ["wait_for": "stopped", "timeout": "20"]))
+        XCTAssertEqual(json(done)["state"] as? String, "stopped", "\(json(done)) \(h.logs.exportText)")
+        await h.cleanup()
+    }
+
+    func testStatusSeparatesSavedFromAppliedAndDoesNotCallASnapshotSafe() async throws {
+        let h = try Harness(control: ["no_drain": true]); let api = try makeAPI(h)
+        h.supervisor.begin()
+        _ = await api.handle(request("POST", "/api/v1/start", body: "{\"config_id\":\"a\",\"wait_ready_seconds\":30}"))
+        await h.expect { h.supervisor.drainSupported == false }
+        var config = h.store.config(id: "a")!; config.options.maxContext = "64K"; try h.store.save(config)
         let status = json(await api.handle(request("GET", "/api/v1/status")))
-        XCTAssertEqual((status["activity"] as? [String: Any])?["switch_safe"] as? Bool, false)
-        let code = await call
-        XCTAssertEqual(code, 200)
+        XCTAssertEqual((status["pending_changes"] as? [String: Any])?["restart_required"] as? Bool, true)
+        XCTAssertEqual((status["applied"] as? [String: Any])?["revision"] as? String, commitA)
+        let activity = status["activity"] as? [String: Any]
+        XCTAssertEqual(activity?["idle"] as? Bool, true)
+        XCTAssertEqual(activity?["switch_safe"] as? Bool, false, "idle now, but this Splash cannot refuse new calls")
+        for path in ["/api/v1/stop", "/api/v1/switch"] {
+            let r = await api.handle(request("POST", path, body: path.hasSuffix("switch") ? "{\"config_id\":\"a\"}" : nil))
+            XCTAssertEqual(r.status, 409, path)
+            XCTAssertEqual((json(r)["error"] as? [String: Any])?["code"] as? String, "drain_unsupported")
+        }
+        let start = await api.handle(request("POST", "/api/v1/start", body: "{\"config_id\":\"a\"}"))
+        XCTAssertEqual((json(start)["error"] as? [String: Any])?["code"] as? String, "configuration_changed")
         await h.cleanup()
     }
 

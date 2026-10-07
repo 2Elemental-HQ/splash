@@ -115,6 +115,8 @@ public struct SplashClient: Sendable {
         public var instancePid: Int?
         public var instanceModel: String?
         public var statusReadable = false
+        /// nil when the status has no `http.draining` field: this Splash cannot drain.
+        public var draining: Bool?
         public var authRequired = false
         public var activity: Activity?
     }
@@ -145,6 +147,7 @@ public struct SplashClient: Sendable {
                 probe.instanceModel = instance["model"] as? String
             }
             probe.activity = Self.activity(from: json)
+            probe.draining = (json["http"] as? [String: Any])?["draining"] as? Bool
         }
         return probe
     }

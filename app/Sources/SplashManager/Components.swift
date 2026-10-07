@@ -81,7 +81,7 @@ extension Availability {
     var title: String {
         switch self {
         case .loaded: "Loaded"
-        case .local: "Downloaded"
+        case .local: "Files in cache"
         case .notLocal: "Needs download"
         }
     }

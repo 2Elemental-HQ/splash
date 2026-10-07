@@ -4,6 +4,9 @@ import XCTest
 
 let commitA = String(repeating: "a", count: 40)
 let commitB = String(repeating: "b", count: 40)
+let commitC = String(repeating: "c", count: 40)
+let testFamilies = [SplashFamily(name: "Qwen3.8-27B", draftRepo: "incoai/Qwen3.8-27B-DFlash2"),
+                    SplashFamily(name: "Qwen3.6-35B-A3B", draftRepo: "incoai/Qwen3.6-35B-A3B-DFlash2")]
 
 @MainActor
 final class Harness {
@@ -47,7 +50,7 @@ final class Harness {
         var t = timing ?? SupervisorTiming()
         if timing == nil {
             t.tick = 0.1; t.termGrace = 2; t.intGrace = 2; t.retryDelays = [0.3, 0.3, 0.3]; t.idleRecheck = 0.05
-            t.notReadyTicksBeforeStarting = 3; t.startTimeoutLocal = 10
+            t.notReadyTicksBeforeStarting = 3; t.startTimeoutLocal = 10; t.drainPoll = 0.05
         }
         supervisor = SplashSupervisor(store: store, secrets: secrets, logs: logs, timing: t)
         try makeCache()
@@ -63,9 +66,14 @@ final class Harness {
             try commit.write(to: base.appendingPathComponent("refs/\(ref)"), atomically: true, encoding: .utf8)
             for f in files { try Data().write(to: snap.appendingPathComponent(f)) }
         }
-        try repo("mlx-community/Qwen3.8-27B-4bit", commit: commitA, files: ["config.json", "model-1.safetensors"])
+        try repo("mlx-community/Qwen3.8-27B-4bit", commit: commitA, files: ["config.json", "tokenizer.json", "model-1.safetensors"])
+        // A second pinned revision of the same repository.
+        let second = root.appendingPathComponent("models--mlx-community--Qwen3.8-27B-4bit/snapshots/\(commitC)")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        for f in ["config.json", "tokenizer.json", "model-1.safetensors"] { try Data().write(to: second.appendingPathComponent(f)) }
         try repo("incoai/Qwen3.8-27B-DFlash2", commit: commitB, files: ["config.json", "model.safetensors"])
         supervisor.cache = HFCache(root: root)
+        supervisor.familiesOverride = testFamilies
         // Model B has no files: starting it needs a download.
     }
 
@@ -101,8 +109,14 @@ final class Harness {
         return ((try? await URLSession.shared.data(for: request).1) as? HTTPURLResponse)?.statusCode ?? 0
     }
 
+    /// A drained stop, then the wait for it to finish.
+    func stopAndWait(timeout: TimeInterval = 20) async throws {
+        _ = try await supervisor.stop()
+        await expect(timeout) { self.supervisor.state == .stopped && self.supervisor.ownership == .none }
+    }
+
     func cleanup() async {
-        if supervisor.ownership == .managed { _ = try? await supervisor.stop(force: true) }
+        _ = try? await supervisor.stop(force: true)
         supervisor.shutdownSupervisor()
         try? FileManager.default.removeItem(at: dir)
     }

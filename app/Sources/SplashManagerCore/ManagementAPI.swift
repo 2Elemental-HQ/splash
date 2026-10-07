@@ -88,8 +88,12 @@ public final class ManagementAPI {
             status = await waitIfAsked(body, status)
             return try encode(status.state == .ready ? 200 : 202, status)
         case ("POST", ["stop"]):
-            _ = try Self.body(request, allowed: [])
-            return try encode(200, try await supervisor.stop(force: false))
+            let body = try Self.body(request, allowed: ["wait_stopped_seconds"])
+            var status = try await supervisor.stop(force: false)
+            if let seconds = (body["wait_stopped_seconds"] as? NSNumber)?.doubleValue, seconds > 0, status.state == .stopping {
+                status = await supervisor.wait(for: .stopped, timeout: seconds)
+            }
+            return try encode(status.state == .stopping ? 202 : 200, status)
         case (_, ["status"]), (_, ["configs"]), (_, ["logs"]), (_, ["start"]), (_, ["switch"]), (_, ["stop"]):
             throw AppError("method_not_allowed", "Method not allowed for this route.", status: 405)
         default:
@@ -116,9 +120,11 @@ public final class ManagementAPI {
         guard extra.isEmpty else {
             throw AppError("invalid_request", "Unknown field(s): \(extra.sorted().joined(separator: ", ")). This API accepts configuration ids only.", status: 400)
         }
-        if let wait = object["wait_ready_seconds"] {
-            guard let number = wait as? NSNumber, number.doubleValue >= 0, number.doubleValue <= 600 else {
-                throw AppError("invalid_request", "wait_ready_seconds must be a number from 0 to 600.", status: 400)
+        for key in ["wait_ready_seconds", "wait_stopped_seconds"] {
+            if let wait = object[key] {
+                guard let number = wait as? NSNumber, number.doubleValue >= 0, number.doubleValue <= 600 else {
+                    throw AppError("invalid_request", "\(key) must be a number from 0 to 600.", status: 400)
+                }
             }
         }
         return object

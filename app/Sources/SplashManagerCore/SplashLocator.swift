@@ -6,6 +6,9 @@ public struct SplashInstall: Equatable, Sendable {
     public var version: String
     /// Long options in `splash serve --help`.
     public var serveFlags: Set<String>
+    /// The model families and draft repositories the installed Splash declares
+    /// (`install/families.py`), or nil when they could not be read.
+    public var families: [SplashFamily]?
 
     public func supports(_ flag: String) -> Bool { serveFlags.contains(flag) }
 }
@@ -31,7 +34,8 @@ public enum SplashLocator {
         guard let versionText = await versionOut, let help = await helpOut else { return nil }
         let version = versionText.split(whereSeparator: \.isNewline).first.map(String.init)?
             .replacingOccurrences(of: "Splash ", with: "") ?? "unknown"
-        return SplashInstall(executable: executable, version: version, serveFlags: parseFlags(help))
+        let families = await SplashFamilies.load(executable: executable)
+        return SplashInstall(executable: executable, version: version, serveFlags: parseFlags(help), families: families)
     }
 
     static func parseFlags(_ help: String) -> Set<String> {
@@ -64,5 +68,71 @@ public enum SplashLocator {
                 continuation.resume(returning: process.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil)
             }
         }
+    }
+}
+
+public struct SplashFamily: Equatable, Sendable {
+    public var name: String
+    public var draftRepo: String
+    public init(name: String, draftRepo: String) { self.name = name; self.draftRepo = draftRepo }
+}
+
+/// Reads the family table of the installed Splash instead of copying it: the
+/// app follows `install/families.py` of whatever release is installed.
+public enum SplashFamilies {
+    /// The directory that holds `install/families.py`: the Homebrew `libexec`, or a source checkout.
+    static func root(of executable: URL) -> URL? {
+        let fm = FileManager.default
+        let real = executable.resolvingSymlinksInPath()
+        let bin = real.deletingLastPathComponent()
+        let candidates = [bin.deletingLastPathComponent().appendingPathComponent("libexec"), bin, bin.deletingLastPathComponent()]
+        return candidates.first { fm.fileExists(atPath: $0.appendingPathComponent("install/families.py").path) }
+    }
+
+    public static func load(executable: URL) async -> [SplashFamily]? {
+        guard let root = root(of: executable) else { return nil }
+        let fm = FileManager.default
+        let pythons = [root.appendingPathComponent("python/bin/python3"), root.appendingPathComponent(".venv/bin/python"),
+                       URL(fileURLWithPath: "/usr/bin/python3")]
+        guard let python = pythons.first(where: { fm.isExecutableFile(atPath: $0.path) }) else { return nil }
+        let code = "import json; from install import families as f; print(json.dumps([[x.name, x.draft_repo] for x in f.FAMILIES]))"
+        guard let text = await run(python, root: root, ["-c", code]), let data = text.data(using: .utf8),
+              let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String]] else { return nil }
+        let families = rows.compactMap { $0.count == 2 ? SplashFamily(name: $0[0], draftRepo: $0[1]) : nil }
+        return families.isEmpty ? nil : families
+    }
+
+    private static func run(_ python: URL, root: URL, _ arguments: [String]) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                let process = Process()
+                process.executableURL = python
+                process.arguments = arguments
+                process.currentDirectoryURL = root
+                process.environment = ["PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": root.path]
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                process.standardInput = FileHandle.nullDevice
+                do { try process.run() } catch { continuation.resume(returning: nil); return }
+                let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: killer)
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                killer.cancel()
+                continuation.resume(returning: process.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil)
+            }
+        }
+    }
+}
+
+extension SplashFamilies {
+    /// Models the installed Splash suggests (`install/completions/suggested-models.txt`).
+    /// Nothing is downloaded by reading them.
+    public static func suggestedModels(executable: URL) -> [String] {
+        guard let root = root(of: executable),
+              let text = try? String(contentsOf: root.appendingPathComponent("install/completions/suggested-models.txt"), encoding: .utf8)
+        else { return [] }
+        return text.split(whereSeparator: \.isNewline).compactMap { try? Validation.modelId(String($0)) }
     }
 }

@@ -8,7 +8,7 @@ final class AppEnvironment: ObservableObject {
     static let shared = AppEnvironment()
 
     let store: ConfigStore
-    let secrets = KeychainStore()
+    let secrets = KeychainStore(service: ProcessInfo.processInfo.environment["SPLASH_MANAGER_KEYCHAIN_SERVICE"] ?? "net.2elemental.splash-manager")
     let logs = LogBuffer()
     let supervisor: SplashSupervisor
     let api: ManagementAPI
@@ -68,16 +68,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Task { @MainActor in
             let check = await env.supervisor.checkIdle()
-            if !check.safe {
+            let drains = env.supervisor.drainSupported == true
+            var mode = drains ? "drain" : "force"
+            if !check.safe || !drains {
                 let alert = NSAlert()
-                alert.messageText = "Splash is busy"
-                alert.informativeText = (check.reason ?? "Calls may be running.") + " Quitting stops Splash and ends them."
+                alert.messageText = check.safe ? "Splash cannot drain" : "Splash is busy"
+                alert.informativeText = (check.safe ? "This Splash build cannot finish running calls before it stops. " : (check.reason ?? "Calls may be running.") + " ")
+                    + "Quitting can end calls."
                 alert.addButton(withTitle: "Cancel")
-                alert.addButton(withTitle: "Stop Splash and Quit")
+                if drains { alert.addButton(withTitle: "Let calls finish, then quit") }
+                alert.addButton(withTitle: "Stop now and quit")
                 NSApp.activate(ignoringOtherApps: true)
-                if alert.runModal() == .alertFirstButtonReturn { sender.reply(toApplicationShouldTerminate: false); return }
+                let answer = alert.runModal()
+                if answer == .alertFirstButtonReturn { sender.reply(toApplicationShouldTerminate: false); return }
+                mode = (drains && answer == .alertSecondButtonReturn) ? "drain" : "force"
             }
-            _ = try? await env.supervisor.stop(force: true)
+            if mode == "drain" {
+                _ = try? await env.supervisor.stop(force: false)
+                _ = await env.supervisor.wait(for: .stopped, timeout: 3600)
+            } else {
+                _ = try? await env.supervisor.stop(force: true)
+            }
             env.service.stop()
             sender.reply(toApplicationShouldTerminate: true)
         }
@@ -93,7 +104,7 @@ struct SplashManagerApp: App {
     init() {
         // `SplashManager --print-token` prints the management token for scripts and exits.
         if CommandLine.arguments.contains("--print-token") {
-            let store = KeychainStore()
+            let store = KeychainStore(service: ProcessInfo.processInfo.environment["SPLASH_MANAGER_KEYCHAIN_SERVICE"] ?? "net.2elemental.splash-manager")
             print((try? Secrets.ensure(SecretAccount.managementToken, in: store)) ?? "")
             exit(0)
         }

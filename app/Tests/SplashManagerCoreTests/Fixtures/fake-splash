@@ -9,6 +9,7 @@ It answers `--version`, `serve --help` and a small part of the HTTP surface of
   fail_start   exit 2 at once, printing an error
   ignore_term  ignore SIGTERM (SIGINT still stops it)
   hold         seconds that a chat call keeps the request counted as active
+  no_drain     behave like a Splash without drain support (no http.draining; SIGUSR1 kills it)
 """
 import json, os, signal, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,7 +61,7 @@ def main():
     print(f"10:00:00 Loading · {model}", flush=True)
     if c.get("fail_start"):
         print("Error · cannot load the model", flush=True); sys.exit(2)
-    state = {"active": 0, "ready_at": time.time() + c.get("ready_delay", 0.3)}
+    state = {"active": 0, "draining": False, "ready_at": time.time() + c.get("ready_delay", 0.3)}
     lock = threading.Lock()
 
     class H(BaseHTTPRequestHandler):
@@ -83,15 +84,20 @@ def main():
                 return self.send(200, {"object": "list", "data": data})
             if self.path == "/status":
                 with lock: active = state["active"]
+                http = {"requests": {"active": active, "capacity": 32}}
+                if not c.get("no_drain"): http["draining"] = state["draining"]
                 return self.send(200, {"ready": ready, "instance": {"pid": os.getpid(), "model": model, "port": port},
-                    "http": {"requests": {"active": active, "capacity": 32}},
+                    "http": http,
                     "scheduler": {"queued": 0, "waiting_resources": 0, "waiting_prefix": 0, "prefilling": 0, "decoding": active, "waiting_mask": 0},
                     "admission": {"waiting": 0, "restoring": 0, "suspended": 0}})
             self.send(404, {})
         def do_POST(self):
             if not self.authed(): return self.send(401, {})
             n = int(self.headers.get("Content-Length") or 0); self.rfile.read(n)
-            with lock: state["active"] += 1
+            with lock:
+                if state["draining"]:
+                    return self.send(503, {"error": {"code": "server_draining"}})
+                state["active"] += 1
             try:
                 time.sleep(control().get("hold", 0))
                 self.send(200, {"model": model, "choices": [{"message": {"role": "assistant", "content": "pong"}}]})
@@ -101,15 +107,23 @@ def main():
     server = ThreadingHTTPServer((host, port), H)
     server.daemon_threads = True
     stop = threading.Event()
+    drain_requested = threading.Event()
     def term(*_):
         if control().get("ignore_term"): return
         print("Stopping · releasing engine resources", flush=True); stop.set()
     signal.signal(signal.SIGTERM, term)
     signal.signal(signal.SIGINT, lambda *_: stop.set())
+    if not c.get("no_drain"):
+        # Like the real server: the handler only sets an event. Taking `lock` here could deadlock the main thread.
+        signal.signal(signal.SIGUSR1, lambda *_: drain_requested.set())
     threading.Thread(target=server.serve_forever, daemon=True).start()
     crash_at = None
     while not stop.is_set():
         time.sleep(0.05)
+        with lock:
+            if drain_requested.is_set(): state["draining"] = True
+            if state["draining"] and state["active"] == 0:
+                print("Stopping · releasing engine resources", flush=True); stop.set()
         if crash_at is None and time.time() >= state["ready_at"] and "crash_after" in c:
             limit = c.get("crash_limit")
             starts = sum(1 for _ in open(os.path.join(HERE, "starts.log")))

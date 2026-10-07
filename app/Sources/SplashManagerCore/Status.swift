@@ -51,6 +51,27 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
         public var maxAttempts: Int
         public var nextAt: Date
     }
+    /// The configuration the running process was started with. Not the saved one.
+    public struct Applied: Codable, Equatable, Sendable {
+        public var configId: String
+        public var modelId: String
+        public var revision: String?
+        public var options: ConfigView.Options
+        public var port: Int
+        public var exposure: Exposure
+        public var allowedHosts: [String]
+        public var offline: Bool
+    }
+    /// Saved changes that the running process does not have yet.
+    public struct Pending: Codable, Equatable, Sendable {
+        public var restartRequired: Bool
+        public var changes: [String]
+    }
+    public struct Drain: Codable, Equatable, Sendable {
+        /// Whether the running Splash drains on request. nil until its status was read.
+        public var supported: Bool?
+        public var draining: Bool
+    }
     public struct Conflict: Codable, Equatable, Sendable {
         /// `external_splash`, `foreign_service` or `unreadable_service`.
         public var kind: String
@@ -66,6 +87,11 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
     public var detail: String?
     public var splash: SplashInfo
     public var config: ConfigRef?
+    public var applied: Applied?
+    public var pendingChanges: Pending
+    public var drain: Drain
+    /// The lifecycle operation in progress: start, stop, switch, retry or adopt.
+    public var operation: String?
     public var loadedModelId: String?
     public var endpoint: Endpoint
     public var readiness: Readiness
@@ -94,6 +120,12 @@ public struct ConfigView: Codable, Equatable, Sendable {
     public var active: Bool
     public var missing: [String]
     public var downloadRequired: Bool
+    /// Files that are absent or unreadable in the cache, by repository.
+    public var incomplete: [String: [String]]
+    /// `installed_splash`: the draft comes from the installed Splash's family table; `unknown` otherwise.
+    public var draftSource: String
+    /// When a start of this model and revision last reached ready. nil: never proven here.
+    public var verifiedStartAt: Date?
     public var note: String?
     public var options: Options
 }

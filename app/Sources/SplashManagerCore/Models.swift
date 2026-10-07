@@ -102,10 +102,78 @@ public struct ManagerSettings: Codable, Equatable, Sendable {
     public init() {}
 }
 
+/// Everything that decides how a process is started. Two specs that are equal
+/// start the same process; display names and unrelated settings are not part of it.
+public struct EffectiveSpec: Codable, Equatable, Sendable {
+    public var modelId: String
+    public var revision: String?
+    public var options: ServeOptions
+    public var port: Int
+    public var exposure: Exposure
+    /// The names a person listed. Tailscale names are added at start (see AppliedConfig).
+    public var allowedHosts: [String]
+
+    public init(config: ModelConfig, settings: ManagerSettings) {
+        modelId = config.modelId
+        revision = config.revision
+        options = config.options
+        port = settings.inferencePort
+        exposure = settings.inferenceExposure
+        allowedHosts = settings.allowedHosts
+    }
+
+    /// Human-readable differences from `other`, empty when equal.
+    public func differences(from other: EffectiveSpec) -> [String] {
+        var changes: [String] = []
+        func add(_ name: String, _ old: String, _ new: String) { if old != new { changes.append("\(name): \(old) -> \(new)") } }
+        add("model", modelId, other.modelId)
+        add("revision", revision ?? "default branch", other.revision ?? "default branch")
+        add("inference port", String(port), String(other.port))
+        add("exposure", exposure.rawValue, other.exposure.rawValue)
+        add("allowed hosts", allowedHosts.joined(separator: ","), other.allowedHosts.joined(separator: ","))
+        add("language only", String(options.languageOnly), String(other.options.languageOnly))
+        add("max context", options.maxContext ?? "auto", other.options.maxContext ?? "auto")
+        add("max memory", options.maxMemory ?? "auto", other.options.maxMemory ?? "auto")
+        add("idle release", options.idleRelease ?? "default", other.options.idleRelease ?? "default")
+        add("default thinking", options.reasoning.rawValue, other.options.reasoning.rawValue)
+        add("disable ANE", String(options.disableANE), String(other.options.disableANE))
+        return changes
+    }
+}
+
+/// What was really applied when the running process was started. Monitoring,
+/// process control and the status of the running process read this, never the
+/// saved settings, which may have changed since.
+public struct AppliedConfig: Codable, Equatable, Sendable {
+    public var configId: String
+    public var displayName: String
+    public var spec: EffectiveSpec
+    public var bindHost: String
+    /// User-listed names plus the Tailscale names added at start.
+    public var effectiveAllowedHosts: [String]
+    public var offline: Bool
+    public var keyRequired: Bool
+
+    public var modelConfig: ModelConfig {
+        ModelConfig(id: configId, displayName: displayName, modelId: spec.modelId, revision: spec.revision, options: spec.options)
+    }
+}
+
 public struct PersistedState: Codable, Equatable, Sendable {
     public var configs: [ModelConfig] = []
     public var settings = ManagerSettings()
+    /// Time of the last start that reached ready, by `model@revision`. A cache inspection says
+    /// files exist; only this says a start worked.
+    public var verifiedStarts: [String: Date] = [:]
     public init() {}
+
+    enum CodingKeys: String, CodingKey { case configs, settings, verifiedStarts }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        configs = try c.decodeIfPresent([ModelConfig].self, forKey: .configs) ?? []
+        settings = try c.decodeIfPresent(ManagerSettings.self, forKey: .settings) ?? ManagerSettings()
+        verifiedStarts = try c.decodeIfPresent([String: Date].self, forKey: .verifiedStarts) ?? [:]
+    }
 }
 
 // MARK: - Runtime state

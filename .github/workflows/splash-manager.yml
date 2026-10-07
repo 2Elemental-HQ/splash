@@ -1,0 +1,33 @@
+name: Splash Manager
+
+# Builds the macOS app in app/ and runs its tests. It needs no model, no Keychain
+# secret, no signing identity and no download. Upstream workflows are untouched.
+on:
+  push:
+    paths: ["app/**", ".github/workflows/splash-manager.yml"]
+  pull_request:
+    paths: ["app/**", ".github/workflows/splash-manager.yml"]
+
+jobs:
+  app:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+      - name: Unit and process tests
+        working-directory: app
+        run: swift test
+      - name: Development build and disk image layout
+        working-directory: app
+        env:
+          SIGN_IDENTITY: "-"   # ad hoc: CI never signs for distribution
+        run: ./build-dev.sh --dmg
+      - name: Release script refuses without a Developer ID identity
+        working-directory: app
+        run: |
+          if release/build-release.sh --check; then echo "release preflight must fail on CI"; exit 1; fi

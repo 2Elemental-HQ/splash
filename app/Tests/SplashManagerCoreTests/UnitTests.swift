@@ -98,8 +98,8 @@ final class HFCacheTests: XCTestCase {
         XCTAssertEqual(cache.commit(for: "a/b", revision: commitA), commitA)
         XCTAssertNil(cache.commit(for: "a/b", revision: commitB))
         XCTAssertNil(cache.commit(for: "a/b", revision: nil), "no refs/main file")
-        XCTAssertEqual(cache.assess(modelId: "a/b", revision: commitB).availability, .notLocal)
-        XCTAssertEqual(cache.assess(modelId: "a/b", revision: commitA).availability, .notLocal, "the draft is unknown, so a download cannot be ruled out")
+        XCTAssertEqual(cache.assess(modelId: "a/b", revision: commitB, families: testFamilies).availability, .notLocal)
+        XCTAssertEqual(cache.assess(modelId: "a/b", revision: commitA, families: testFamilies).availability, .notLocal, "the draft is unknown, so a download cannot be ruled out")
     }
 }
 
@@ -116,12 +116,81 @@ final class HFCachePinnedTests: XCTestCase {
             try Data().write(to: pin.appendingPathComponent(commitA))
             for f in files { try Data().write(to: snap.appendingPathComponent(f)) }
         }
-        try make("mlx-community/Qwen3.8-27B-4bit", files: ["config.json", "m.safetensors"])
+        try make("mlx-community/Qwen3.8-27B-4bit", files: ["config.json", "tokenizer.json", "m.safetensors"])
         try make("incoai/Qwen3.8-27B-DFlash2", files: ["config.json", "model.safetensors"])
         let cache = HFCache(root: dir)
-        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitA).availability, .local)
-        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: nil).availability, .local)
-        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitB).availability, .notLocal)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitA, families: testFamilies).availability, .local)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: nil, families: testFamilies).availability, .local)
+        XCTAssertEqual(cache.assess(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitB, families: testFamilies).availability, .notLocal)
         XCTAssertEqual(cache.splashPinnedModels(), [HFCache.Candidate(modelId: "mlx-community/Qwen3.8-27B-4bit", revision: commitA)])
+    }
+}
+
+final class FamilyDiscoveryTests: XCTestCase {
+    func testFamiliesAreReadFromTheInstalledSplash() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fam-\(UUID().uuidString.prefix(6))")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("install"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        try Data().write(to: root.appendingPathComponent("install/__init__.py"))
+        try """
+        from dataclasses import dataclass
+        @dataclass(frozen=True)
+        class ModelFamily:
+            name: str
+            draft_repo: str
+        FAMILIES = (ModelFamily("Foo-1B", "acme/Foo-1B-Draft"),)
+        """.write(to: root.appendingPathComponent("install/families.py"), atomically: true, encoding: .utf8)
+        let executable = root.appendingPathComponent("bin/splash")
+        try "#!/bin/sh\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let families = await SplashFamilies.load(executable: executable)
+        XCTAssertEqual(families, [SplashFamily(name: "Foo-1B", draftRepo: "acme/Foo-1B-Draft")])
+        XCTAssertEqual(HFCache.draftRepository(for: "x/Foo-1B-4bit", families: families), "acme/Foo-1B-Draft")
+        XCTAssertNil(HFCache.draftRepository(for: "x/Other-7B", families: families), "an unknown model stays unknown")
+        XCTAssertNil(HFCache.draftRepository(for: "x/Foo-1B", families: nil))
+    }
+
+    func testNoFamilyTableMeansUnknown() async {
+        let families = await SplashFamilies.load(executable: URL(fileURLWithPath: "/usr/bin/true"))
+        XCTAssertNil(families)
+    }
+
+    func testHomebrewSplashFamiliesWhenInstalled() async throws {
+        guard let url = SplashLocator.find(preferred: nil) else { throw XCTSkip("Splash is not installed") }
+        let families = await SplashFamilies.load(executable: url)
+        XCTAssertNotNil(families)
+        XCTAssertTrue(families?.contains { $0.name == "Qwen3.8-27B" } ?? false)
+    }
+}
+
+final class RequirementsTests: XCTestCase {
+    func v(_ major: Int, _ minor: Int) -> OperatingSystemVersion { .init(majorVersion: major, minorVersion: minor, patchVersion: 0) }
+
+    func testChipGeneration() {
+        XCTAssertEqual(SystemRequirements.chipGeneration("Apple M4 Max"), 4)
+        XCTAssertEqual(SystemRequirements.chipGeneration("Apple M1"), 1)
+        XCTAssertEqual(SystemRequirements.chipGeneration("Apple M12 Ultra"), 12)
+        XCTAssertNil(SystemRequirements.chipGeneration("Intel(R) Core(TM) i9"))
+        XCTAssertNil(SystemRequirements.chipGeneration(nil))
+    }
+
+    func testSupportedMac() {
+        let checks = SystemRequirements.evaluate(appleSilicon: true, chipBrand: "Apple M3 Pro", os: v(26, 4))
+        XCTAssertTrue(checks.allSatisfy { $0.ok == true })
+    }
+
+    func testOldChipAndOldMacOSAreReportedSeparately() {
+        let m1 = SystemRequirements.evaluate(appleSilicon: true, chipBrand: "Apple M1", os: v(26, 4))
+        XCTAssertEqual(m1.first { $0.id == "chip" }?.ok, false)
+        XCTAssertEqual(m1.first { $0.id == "os" }?.ok, true)
+        let old = SystemRequirements.evaluate(appleSilicon: true, chipBrand: "Apple M4", os: v(26, 3))
+        XCTAssertEqual(old.first { $0.id == "os" }?.ok, false)
+        XCTAssertEqual(SystemRequirements.evaluate(appleSilicon: true, chipBrand: "Apple M4", os: v(27, 0)).first { $0.id == "os" }?.ok, true)
+    }
+
+    func testIntelIsNeverSupported() {
+        let checks = SystemRequirements.evaluate(appleSilicon: false, chipBrand: "Intel(R) Core(TM) i7", os: v(26, 4))
+        XCTAssertEqual(checks.first { $0.id == "arch" }?.ok, false)
+        XCTAssertEqual(checks.first { $0.id == "chip" }?.ok, false)
     }
 }

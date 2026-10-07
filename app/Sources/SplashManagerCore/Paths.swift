@@ -5,7 +5,12 @@ public struct AppPaths: Sendable {
     public let runDirectory: URL
     public let logsDirectory: URL
 
+    /// `SPLASH_MANAGER_HOME` moves all state to another directory, so a test run never touches the real settings.
     public static let `default`: AppPaths = {
+        if let override = ProcessInfo.processInfo.environment["SPLASH_MANAGER_HOME"], !override.isEmpty {
+            let base = URL(fileURLWithPath: override, isDirectory: true)
+            return AppPaths(support: base.appendingPathComponent("support"), logs: base.appendingPathComponent("logs"))
+        }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return AppPaths(
             support: home.appendingPathComponent("Library/Application Support/Splash Manager", isDirectory: true),

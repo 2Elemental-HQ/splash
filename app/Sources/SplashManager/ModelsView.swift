@@ -29,6 +29,7 @@ struct ModelsView: View {
                             Text(view.displayName).font(.headline)
                             Pill(text: view.availability.title, color: view.availability.color)
                             if view.active { Pill(text: "active", color: .green) }
+                            if view.verifiedStartAt != nil { Pill(text: "start verified", color: .green) }
                             if view.selected { Pill(text: "selected", color: .accentColor) }
                             Spacer()
                             Button("Edit") { editing = store.config(id: view.id); isNew = false }

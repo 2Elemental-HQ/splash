@@ -54,6 +54,18 @@ public final class ConfigStore: ObservableObject {
         return valid
     }
 
+    public static func verificationKey(modelId: String, revision: String?) -> String { "\(modelId)@\(revision ?? "")" }
+
+    public func verifiedStart(modelId: String, revision: String?) -> Date? {
+        state.verifiedStarts[Self.verificationKey(modelId: modelId, revision: revision)]
+    }
+
+    public func markVerified(modelId: String, revision: String?) {
+        var next = state
+        next.verifiedStarts[Self.verificationKey(modelId: modelId, revision: revision)] = Date()
+        try? commit(next)
+    }
+
     public func remove(id: String) throws {
         var next = state
         next.configs.removeAll { $0.id == id }

@@ -1,7 +1,8 @@
 import Foundation
 
-/// A read-only view of the Hugging Face cache. Splash installs models from it,
-/// so a file here is the closest local signal that a start needs no download.
+/// A read-only view of the Hugging Face cache. It answers "are the files that
+/// Splash needs in the cache?". It does not prove that a start works: only a
+/// start that reaches ready does, and the app records that separately.
 public struct HFCache: Sendable {
     public let root: URL
 
@@ -58,55 +59,96 @@ public struct HFCache: Sendable {
         return (try? FileManager.default.subpathsOfDirectory(atPath: base.path)) ?? []
     }
 
-    /// The DFlash2 draft repository Splash pairs with a model family.
-    /// Mirrors `install/families.py` of the Splash release this was written for;
-    /// an unknown family reports nil and is never treated as downloaded.
-    public static func draftRepository(for modelId: String) -> String? {
+    /// The draft repository of the family whose name the model id contains.
+    /// The family table comes from the installed Splash. The match by name is an
+    /// inference: the engine itself decides the family from the model's config at start.
+    public static func draftRepository(for modelId: String, families: [SplashFamily]?) -> String? {
         let lower = modelId.lowercased()
-        if lower.contains("qwen3.8-27b") { return "incoai/Qwen3.8-27B-DFlash2" }
-        if lower.contains("qwen3.6-35b-a3b") { return "incoai/Qwen3.6-35B-A3B-DFlash2" }
-        return nil
+        return families?.first { lower.contains($0.name.lowercased()) }?.draftRepo
     }
+
+    public enum Kind { case target, draft }
+
+    /// Files missing or unreadable in one snapshot, empty when the set looks complete.
+    /// A dangling link counts as missing: `fileExists` follows links to their blob.
+    func problems(repo: String, commit: String, kind: Kind, gguf variant: String?) -> [String] {
+        let fm = FileManager.default
+        let base = snapshotDirectory(repo, commit: commit)
+        func present(_ name: String) -> Bool { fm.fileExists(atPath: base.appendingPathComponent(name).path) }
+        let names = files(repo, commit: commit)
+        var problems: [String] = []
+        if let variant {
+            let ggufs = names.filter { $0.lowercased().hasSuffix(".gguf") && $0.lowercased().contains(variant.lowercased()) }
+            if ggufs.isEmpty { return ["no .gguf file for \(variant)"] }
+            for file in ggufs where !present(file) { problems.append("\(file) is unreadable") }
+            // Split files are named name-00001-of-0000N.gguf; every part must be there.
+            if let regex = try? NSRegularExpression(pattern: "-(\\d{5})-of-(\\d{5})\\.gguf$", options: .caseInsensitive) {
+                for file in ggufs {
+                    let range = NSRange(file.startIndex..., in: file)
+                    if let match = regex.firstMatch(in: file, range: range), let total = Range(match.range(at: 2), in: file).flatMap({ Int(file[$0]) }) {
+                        let prefix = String(file[..<Range(match.range, in: file)!.lowerBound])
+                        for index in 1...max(1, total) {
+                            let part = "\(prefix)-\(String(format: "%05d", index))-of-\(String(format: "%05d", total)).gguf"
+                            if !ggufs.contains(where: { $0.caseInsensitiveCompare(part) == .orderedSame }) { problems.append("missing part \(part)") }
+                        }
+                    }
+                }
+            }
+            return Array(Set(problems)).sorted()
+        }
+        if !present("config.json") { problems.append("config.json") }
+        if kind == .target, !present("tokenizer.json") { problems.append("tokenizer.json") }
+        if let indexData = try? Data(contentsOf: base.appendingPathComponent("model.safetensors.index.json")),
+           let index = (try? JSONSerialization.jsonObject(with: indexData)) as? [String: Any],
+           let map = index["weight_map"] as? [String: String] {
+            for shard in Set(map.values).sorted() where !present(shard) { problems.append(shard) }
+        } else if !names.contains(where: { $0.hasSuffix(".safetensors") && present($0) }) {
+            problems.append("weights (*.safetensors)")
+        }
+        return problems
+    }
+
+    public enum DraftSource: String, Sendable { case installedSplash = "installed_splash", unknown }
 
     public struct Assessment: Equatable, Sendable {
         public var availability: Availability
-        /// Repositories a start would download.
+        /// Repositories a start would download (absent, or incomplete).
         public var missing: [String]
+        /// Per repository, the files that are absent or unreadable.
+        public var incomplete: [String: [String]]
+        public var draftSource: DraftSource
         public var note: String?
     }
 
-    public func assess(modelId: String, revision: String?) -> Assessment {
+    public func assess(modelId: String, revision: String?, families: [SplashFamily]?) -> Assessment {
         let parts = modelId.split(separator: ":", maxSplits: 1).map(String.init)
         let repo = parts[0]
         let variant = parts.count > 1 ? parts[1] : nil
         var missing: [String] = []
-        var note: String?
+        var incomplete: [String: [String]] = [:]
+        var notes: [String] = []
 
-        if let commit = revision == nil ? installedCommit(for: repo, revision: nil) : commit(for: repo, revision: revision) {
-            let names = files(repo, commit: commit)
-            if let variant {
-                if !names.contains(where: { $0.lowercased().hasSuffix(".gguf") && $0.lowercased().contains(variant.lowercased()) }) {
-                    missing.append(repo)
-                }
-            } else if !names.contains("config.json") || !names.contains(where: { $0.hasSuffix(".safetensors") }) {
-                missing.append(repo)
-            }
-        } else {
-            missing.append(repo)
+        func check(_ repo: String, revision: String?, kind: Kind, variant: String?, anyInstalled: Bool) {
+            let commit = anyInstalled ? installedCommit(for: repo, revision: revision) : commit(for: repo, revision: revision)
+            guard let commit else { missing.append(repo); return }
+            let found = problems(repo: repo, commit: commit, kind: kind, gguf: variant)
+            if !found.isEmpty { missing.append(repo); incomplete[repo] = found }
         }
+        check(repo, revision: revision, kind: .target, variant: variant, anyInstalled: revision == nil)
 
-        if let draft = Self.draftRepository(for: modelId) {
-            if let commit = installedCommit(for: draft, revision: nil),
-               files(draft, commit: commit).contains("config.json") {
-                // present
-            } else {
-                missing.append(draft)
-            }
+        var source = DraftSource.unknown
+        if let draft = Self.draftRepository(for: modelId, families: families) {
+            source = .installedSplash
+            check(draft, revision: nil, kind: .draft, variant: nil, anyInstalled: true)
         } else {
             missing.append("(draft unknown)")
-            note = "The matching draft model is unknown to this app, so a download cannot be ruled out."
+            notes.append(families == nil
+                ? "The installed Splash's family table could not be read, so the draft model is unknown and a download cannot be ruled out."
+                : "No model family of the installed Splash matches this model id, so the draft model is unknown and a download cannot be ruled out.")
         }
-        return Assessment(availability: missing.isEmpty ? .local : .notLocal, missing: missing, note: note)
+        if !incomplete.isEmpty { notes.append("Incomplete in the cache: " + incomplete.map { "\($0.key) (\($0.value.joined(separator: ", ")))" }.sorted().joined(separator: "; ")) }
+        return Assessment(availability: missing.isEmpty ? .local : .notLocal, missing: missing, incomplete: incomplete,
+                          draftSource: source, note: notes.isEmpty ? nil : notes.joined(separator: " "))
     }
 
     public struct Candidate: Equatable, Sendable {

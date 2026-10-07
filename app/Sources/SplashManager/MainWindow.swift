@@ -43,6 +43,7 @@ struct OverviewView: View {
         let status = supervisor.snapshot()
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                SetupView()
                 HStack {
                     StatusBadge(state: status.state, external: status.ownership == .external)
                     if let detail = status.detail { Text(detail).foregroundStyle(.secondary).lineLimit(2) }
@@ -52,6 +53,19 @@ struct OverviewView: View {
                     Label(conflict.message, systemImage: "exclamationmark.circle")
                         .padding(10).frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if status.pendingChanges.restartRequired {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Saved changes are not active yet", systemImage: "arrow.triangle.2.circlepath").font(.headline)
+                        Text("The running Splash keeps the settings it started with (port \(status.applied?.port ?? 0), \(status.applied?.exposure.rawValue ?? "")).")
+                            .font(.callout).foregroundStyle(.secondary)
+                        ForEach(status.pendingChanges.changes, id: \.self) { Text("• \($0)").font(.callout) }
+                        if let id = status.applied?.configId, status.state == .ready {
+                            Button("Restart with saved settings") { Task { await SwitchFlow.run(supervisor, configId: id) } }
+                        }
+                    }
+                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
                 if let error = status.lastError, status.state == .failed || status.state == .stopped {
                     VStack(alignment: .leading, spacing: 4) {
@@ -84,11 +98,15 @@ struct OverviewView: View {
                                 Text(selected.modelId).font(.system(.body, design: .monospaced))
                                 if let rev = selected.revision { Pill(text: "rev \(rev.prefix(8))", color: .secondary) }
                                 Pill(text: assessment.availability.title, color: assessment.availability.color)
+                                if env.store.verifiedStart(modelId: selected.modelId, revision: selected.revision) != nil {
+                                    Pill(text: "start verified", color: .green)
+                                }
                             }
                             if assessment.availability == .notLocal {
                                 Text("Starting needs a download: \(assessment.missing.joined(separator: ", ")). You confirm it first.")
                                     .font(.callout).foregroundStyle(.orange)
                             }
+                            if let note = assessment.note { Text(note).font(.caption).foregroundStyle(.secondary) }
                         } else {
                             Text("Add a model in the Models tab.").foregroundStyle(.secondary)
                         }
@@ -107,6 +125,14 @@ struct OverviewView: View {
                             GridRow {
                                 Text("Activity").foregroundStyle(.secondary)
                                 Text(status.activity.activeRequests.map { "\($0) active request(s)" } ?? "unknown")
+                            }
+                            if status.ownership == .managed {
+                                GridRow {
+                                    Text("Safe stop").foregroundStyle(.secondary)
+                                    Text(status.drain.supported == true ? "Drains: running calls finish before Splash stops"
+                                         : status.drain.supported == false ? "This Splash cannot drain; stop and switch need confirmation"
+                                         : "not known yet")
+                                }
                             }
                             if let process = status.process {
                                 GridRow {
@@ -146,6 +172,7 @@ struct OverviewView: View {
             Text("Not managed here").foregroundStyle(.secondary)
         case (_, .stopping):
             ProgressView().controlSize(.small)
+            Button("Stop now…") { Task { await StopFlow.now(supervisor) } }
         case (.managed, .ready), (.managed, .starting):
             Button("Stop") { Task { await StopFlow.run(supervisor) } }
             if let id = store.settings.selectedConfigId, id != status.config?.id {
