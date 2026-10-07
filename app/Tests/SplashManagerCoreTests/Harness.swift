@@ -98,7 +98,22 @@ final class Harness {
     func expect(_ timeout: TimeInterval = 15, file: StaticString = #filePath, line: UInt = #line,
                 _ condition: () -> Bool) async {
         let ok = await waitUntil(timeout, condition)
-        XCTAssertTrue(ok, "condition not reached in \(timeout) s", file: file, line: line)
+        XCTAssertTrue(ok, "condition not reached in \(timeout) s. \(diagnosis())", file: file, line: line)
+    }
+
+    /// What a failed wait needs to be understood from a CI log alone.
+    func diagnosis() -> String {
+        let status = supervisor.snapshot()
+        let lines = logs.lines.suffix(12).map { "[\($0.source.rawValue)] \($0.text)" }.joined(separator: " | ")
+        return "state=\(status.state) ownership=\(status.ownership) op=\(status.operation ?? "-") error=\(status.lastError.map { "\($0.code): \($0.message)" } ?? "-") starts=\(startLog.count) python=\(pythonVersion) log=\(lines)"
+    }
+
+    var pythonVersion: String {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/env"); p.arguments = ["python3", "--version"]
+        p.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        try? p.run(); p.waitUntilExit()
+        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func chat(hold: TimeInterval? = nil) async -> Int {
