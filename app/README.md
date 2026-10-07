@@ -25,8 +25,9 @@ The Setup card in the window shows these checks for the Mac in front of you.
 Distribution is a notarized disk image (`SplashManager-<version>-arm64.dmg`): open it, drag the app to
 Applications, open it. No Xcode, no manual build, no Gatekeeper workaround. See
 [release/README.md](release/README.md) for how it is made and how it is verified.
-**Release status:** the signing and notarization pipeline is in place and tested up to the point where it needs a
-*Developer ID Application* certificate and a notarytool profile, which this Mac does not have yet. No release image exists.
+**Release status:** `SplashManager-0.2.0-arm64.dmg` was built, signed (Developer ID Application, team QE3S4M7AA5),
+notarized, stapled and passed `release/verify-artifact.sh` (all 14 checks, Gatekeeper included) on the build Mac. It has not
+been installed on a clean second Mac, and no release is published.
 
 On a Mac without Splash the Setup card guides the install: it checks the hardware, offers
 `brew install incoai/tap/splash` (about 235 MB, after a confirmation, never installing Homebrew itself),
@@ -129,7 +130,7 @@ itself pinned. Options appear only if `splash serve --help` lists the flag, and 
 ### Not done / known limits
 
 * The tailnet path of the management API is bound but not tested from another device.
-* No release image yet (needs the Developer ID certificate and notary profile); no clean-second-Mac test yet.
+* The disk image is not installed-tested on a clean second Mac, and nothing is published.
 * GGUF completeness is judged by file names (variant substring and `-0000N-of-0000M` parts).
 * A shell's `HF_TOKEN` or `HF_HUB_CACHE` is not inherited by a GUI app.
 * `brew upgrade splash` while Splash runs: stop first, as Splash advises.
