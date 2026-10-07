@@ -54,6 +54,36 @@ public final class ConfigStore: ObservableObject {
         return valid
     }
 
+    /// Adds the models that Splash itself installed. It reads the Hugging Face cache (the pins in `refs/splash`),
+    /// saves what is new and reports what happened. It never downloads anything, and a second run adds nothing.
+    /// It does not see models of other runtimes (LM Studio and the like); those are added by id.
+    @discardableResult
+    public func importSplashInstalledModels(cache: HFCache = HFCache()) -> ImportResult {
+        var result = ImportResult()
+        let found = cache.splashPinnedModels()
+        result.found = found.count
+        var ids = Set(state.configs.map(\.id))
+        for candidate in found {
+            if state.configs.contains(where: { $0.modelId == candidate.modelId && $0.revision == candidate.revision }) {
+                result.alreadyConfigured += 1
+                continue
+            }
+            let id = ModelConfig.makeId(modelId: candidate.modelId, revision: candidate.revision, existing: ids)
+            let name = candidate.modelId.split(separator: "/").last.map(String.init) ?? candidate.modelId
+            do {
+                try save(ModelConfig(id: id, displayName: name, modelId: candidate.modelId, revision: candidate.revision))
+                ids.insert(id)
+                result.added.append(name)
+            } catch {
+                result.errors.append("\(candidate.modelId): \(error)")
+            }
+        }
+        if state.settings.selectedConfigId == nil, let first = state.configs.first {
+            do { try updateSettings { $0.selectedConfigId = first.id } } catch { result.errors.append("selection: \(error)") }
+        }
+        return result
+    }
+
     public static func verificationKey(modelId: String, revision: String?) -> String { "\(modelId)@\(revision ?? "")" }
 
     public func verifiedStart(modelId: String, revision: String?) -> Date? {
@@ -79,5 +109,27 @@ public final class ConfigStore: ObservableObject {
         try paths.prepare()
         try Files.writeAtomically(try encoder.encode(next), to: paths.configFile)
         state = next
+    }
+}
+
+public struct ImportResult: Equatable, Sendable {
+    public var found = 0
+    public var added: [String] = []
+    public var alreadyConfigured = 0
+    public var errors: [String] = []
+
+    public init() {}
+
+    /// What to tell a person.
+    public var summary: String {
+        var lines: [String] = []
+        if found == 0 && errors.isEmpty {
+            lines.append("No models that Splash installed were found in the Hugging Face cache. Models of other runtimes (such as LM Studio) are not detected; add them with Add model.")
+        } else {
+            lines.append("\(added.count) added, \(alreadyConfigured) already configured (\(found) found).")
+            if !added.isEmpty { lines.append("Added: " + added.joined(separator: ", ") + ".") }
+        }
+        if !errors.isEmpty { lines.append("Problems: " + errors.joined(separator: "; ")) }
+        return lines.joined(separator: " ")
     }
 }

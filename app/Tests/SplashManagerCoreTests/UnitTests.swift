@@ -268,3 +268,158 @@ final class RuntimeBundleTests: XCTestCase {
         XCTAssertNil(SplashLocator.resolve(preferred: nil, bundledRoot: nil).flatMap { $0.source == .bundled ? $0 : nil })
     }
 }
+
+@MainActor
+final class StoredConfigurationTests: XCTestCase {
+    func makeStore(_ json: String) throws -> ConfigStore {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cfg-\(UUID().uuidString.prefix(6))")
+        let paths = AppPaths(support: dir.appendingPathComponent("support"), logs: dir.appendingPathComponent("logs"))
+        try paths.prepare()
+        try json.write(to: paths.configFile, atomically: true, encoding: .utf8)
+        return ConfigStore(paths: paths)
+    }
+
+    /// A configuration file as version 0.2.0 wrote it: no preferInstalledSplash, no serveWebChat, no verifiedStarts.
+    let version02 = """
+    {"configs":[{"id":"qwen","displayName":"Qwen","modelId":"mlx-community/Qwen3.8-27B-4bit","revision":"10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+                 "options":{"disableANE":false,"languageOnly":true,"reasoning":"off","maxContext":"64K"}}],
+     "settings":{"allowedHosts":["mac.ts.net"],"autoRestart":false,"inferenceExposure":"all_interfaces","inferencePort":8123,
+                 "managementEnabled":true,"managementExposure":"tailnet","managementPort":8800,"persistLogsToFile":true,
+                 "selectedConfigId":"qwen","startSplashWhenAppLaunches":true,"stopSplashWhenAppQuits":false,"splashPath":"/opt/homebrew/bin/splash"}}
+    """
+
+    func testAnOlderFileKeepsEverythingItHad() throws {
+        let store = try makeStore(version02)
+        XCTAssertEqual(store.configs.count, 1, "the configuration must not be reset")
+        XCTAssertEqual(store.configs[0].options.maxContext, "64K")
+        XCTAssertTrue(store.configs[0].options.languageOnly)
+        XCTAssertEqual(store.settings.inferencePort, 8123)
+        XCTAssertEqual(store.settings.inferenceExposure, .allInterfaces)
+        XCTAssertEqual(store.settings.allowedHosts, ["mac.ts.net"])
+        XCTAssertEqual(store.settings.splashPath, "/opt/homebrew/bin/splash")
+        XCTAssertFalse(store.settings.autoRestart)
+        XCTAssertTrue(store.settings.startSplashWhenAppLaunches)
+        // New keys take their defaults.
+        XCTAssertFalse(store.settings.preferInstalledSplash)
+        XCTAssertTrue(store.settings.serveWebChat)
+    }
+
+    func testAMinimalFileStillLoads() throws {
+        let store = try makeStore(#"{"configs":[{"id":"a","modelId":"x/y"}],"settings":{}}"#)
+        XCTAssertEqual(store.configs.first?.displayName, "a")
+        XCTAssertEqual(store.settings.managementPort, 8765)
+    }
+
+    func testAnOldAppliedRecordStillDecodes() throws {
+        let json = #"{"modelId":"x/y","options":{},"port":8000,"exposure":"loopback"}"#
+        let spec = try JSONDecoder().decode(EffectiveSpec.self, from: Data(json.utf8))
+        XCTAssertTrue(spec.serveWebChat)
+        XCTAssertEqual(spec.allowedHosts, [])
+    }
+
+    // MARK: Import
+
+    func makeCache(models: [(String, String)]) throws -> HFCache {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hf-\(UUID().uuidString.prefix(6))")
+        for (repo, commit) in models {
+            let base = root.appendingPathComponent("models--" + repo.replacingOccurrences(of: "/", with: "--"))
+            try FileManager.default.createDirectory(at: base.appendingPathComponent("snapshots/\(commit)"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: base.appendingPathComponent("refs/splash/install1"), withIntermediateDirectories: true)
+            try Data().write(to: base.appendingPathComponent("refs/splash/install1/\(commit)"))
+        }
+        return HFCache(root: root)
+    }
+
+    func testImportReportsAndNeverDuplicates() throws {
+        let store = try makeStore(#"{"configs":[],"settings":{}}"#)
+        let cache = try makeCache(models: [("a/one", commitA), ("b/two", commitB)])
+        let first = store.importSplashInstalledModels(cache: cache)
+        XCTAssertEqual(first.found, 2); XCTAssertEqual(first.added.count, 2); XCTAssertEqual(first.alreadyConfigured, 0)
+        XCTAssertEqual(store.configs.count, 2)
+        XCTAssertEqual(store.settings.selectedConfigId, store.configs.first?.id)
+        let again = store.importSplashInstalledModels(cache: cache)
+        XCTAssertEqual(again.added.count, 0); XCTAssertEqual(again.alreadyConfigured, 2)
+        XCTAssertEqual(store.configs.count, 2, "a second click adds nothing")
+        XCTAssertTrue(again.summary.contains("0 added, 2 already configured"))
+    }
+
+    func testImportSaysWhenNothingIsFound() throws {
+        let store = try makeStore(#"{"configs":[],"settings":{}}"#)
+        let result = store.importSplashInstalledModels(cache: try makeCache(models: []))
+        XCTAssertEqual(result.found, 0)
+        XCTAssertTrue(result.summary.contains("No models that Splash installed were found"))
+        XCTAssertTrue(result.summary.contains("LM Studio"), "it names what it does not see")
+    }
+
+    func testImportKeepsAConfigWithOtherOptionsAndAddsNoSecondCopy() throws {
+        let store = try makeStore(#"{"configs":[],"settings":{}}"#)
+        let cache = try makeCache(models: [("a/one", commitA)])
+        store.importSplashInstalledModels(cache: cache)
+        var config = store.configs[0]; config.options.maxContext = "32K"; try store.save(config)
+        let result = store.importSplashInstalledModels(cache: cache)
+        XCTAssertEqual(result.alreadyConfigured, 1)
+        XCTAssertEqual(store.configs.count, 1)
+        XCTAssertEqual(store.configs[0].options.maxContext, "32K")
+    }
+
+    func testImportReportsASaveError() throws {
+        let store = try makeStore(#"{"configs":[],"settings":{}}"#)
+        let cache = try makeCache(models: [("a/one", commitA)])
+        // An immutable configuration file cannot be replaced: the save fails.
+        var locked = URLResourceValues(); locked.isUserImmutable = true
+        var file = store.paths.configFile
+        try store.save(ModelConfig(id: "seed", displayName: "Seed", modelId: "x/seed"))
+        try file.setResourceValues(locked)
+        defer { var open = URLResourceValues(); open.isUserImmutable = false; try? file.setResourceValues(open) }
+        let result = store.importSplashInstalledModels(cache: cache)
+        XCTAssertEqual(result.added.count, 0)
+        XCTAssertFalse(result.errors.isEmpty)
+        XCTAssertTrue(result.summary.contains("Problems"))
+    }
+}
+
+final class WebChatActionTests: XCTestCase {
+    func status(state: RunState, ownership: Ownership = .managed, available: Bool? = nil, url: String? = nil) -> ManagerStatus {
+        ManagerStatus(
+            manager: .init(version: "t", startedAt: Date()), state: state, ownership: ownership, detail: nil,
+            splash: .init(installed: true, version: "1", source: .bundled, integrity: "verified", drainDeclared: true, problem: nil),
+            config: nil, applied: nil, pendingChanges: .init(restartRequired: false, changes: []),
+            webChat: .init(available: available, url: url), drain: .init(supported: true, draining: false), operation: nil,
+            loadedModelId: nil,
+            endpoint: .init(bindHost: "127.0.0.1", port: 8000, exposure: .loopback, requiresApiKey: false, localUrl: "http://127.0.0.1:8000", tailnetUrl: nil, openaiBasePath: "/v1", allowedHosts: []),
+            readiness: .init(processAlive: true, httpReady: true, modelLoaded: true),
+            activity: .init(activeRequests: 0, idle: true, switchSafe: true, reason: nil),
+            process: nil, lastError: nil, retry: nil, conflict: nil)
+    }
+
+    func testReadyWithTheChatPageOpensTheLocalAddress() {
+        let action = WebChatAction.decide(status(state: .ready, available: true, url: "http://127.0.0.1:8123/"), hasSelectedModel: true)
+        XCTAssertEqual(action, .open(URL(string: "http://127.0.0.1:8123/")!))
+        XCTAssertFalse(URL(string: "http://127.0.0.1:8123/")!.absoluteString.contains("key"), "no key in the address")
+    }
+
+    func testStoppedOffersToStartFirst() {
+        XCTAssertEqual(WebChatAction.decide(status(state: .stopped, ownership: .none), hasSelectedModel: true), .startThenOpen)
+        XCTAssertEqual(WebChatAction.decide(status(state: .stopped, ownership: .none), hasSelectedModel: false), .unavailable("Add a model first."))
+    }
+
+    func testStartingAndStoppingWait() {
+        XCTAssertFalse(WebChatAction.decide(status(state: .starting), hasSelectedModel: true).isEnabled)
+        XCTAssertFalse(WebChatAction.decide(status(state: .stopping), hasSelectedModel: true).isEnabled)
+    }
+
+    func testAServerWithoutTheChatPageSaysSo() {
+        let action = WebChatAction.decide(status(state: .ready, available: false, url: "http://127.0.0.1:8000/"), hasSelectedModel: true)
+        guard case .unavailable(let why) = action else { return XCTFail("\(action)") }
+        XCTAssertTrue(why.contains("chat page"))
+        XCTAssertFalse(action.isEnabled)
+    }
+
+    func testReadyButNotYetChecked() {
+        XCTAssertEqual(WebChatAction.decide(status(state: .ready, available: nil, url: "http://127.0.0.1:8000/"), hasSelectedModel: true).isEnabled, false)
+    }
+
+    func testFailedIsNotOpenable() {
+        XCTAssertFalse(WebChatAction.decide(status(state: .failed, ownership: .none), hasSelectedModel: true).isEnabled)
+    }
+}

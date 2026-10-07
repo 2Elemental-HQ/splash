@@ -19,6 +19,18 @@ public struct ServeOptions: Codable, Equatable, Sendable {
 
     public init() {}
 
+    enum CodingKeys: String, CodingKey { case languageOnly, maxContext, maxMemory, idleRelease, reasoning, disableANE }
+    /// A key that is missing (a file from an older version) keeps its default; nothing saved is dropped.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        languageOnly = try c.decodeIfPresent(Bool.self, forKey: .languageOnly) ?? false
+        maxContext = try c.decodeIfPresent(String.self, forKey: .maxContext)
+        maxMemory = try c.decodeIfPresent(String.self, forKey: .maxMemory)
+        idleRelease = try c.decodeIfPresent(String.self, forKey: .idleRelease)
+        reasoning = try c.decodeIfPresent(ReasoningDefault.self, forKey: .reasoning) ?? .modelDefault
+        disableANE = try c.decodeIfPresent(Bool.self, forKey: .disableANE) ?? false
+    }
+
     public func validated() throws -> ServeOptions {
         var copy = self
         copy.maxContext = try Validation.size(maxContext, field: "max context")
@@ -45,6 +57,16 @@ public struct ModelConfig: Codable, Identifiable, Equatable, Sendable {
         self.modelId = modelId
         self.revision = revision
         self.options = options
+    }
+
+    enum CodingKeys: String, CodingKey { case id, displayName, modelId, revision, options }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? id
+        modelId = try c.decode(String.self, forKey: .modelId)
+        revision = try c.decodeIfPresent(String.self, forKey: .revision)
+        options = try c.decodeIfPresent(ServeOptions.self, forKey: .options) ?? ServeOptions()
     }
 
     public func validated() throws -> ModelConfig {
@@ -100,8 +122,33 @@ public struct ManagerSettings: Codable, Equatable, Sendable {
     public var stopSplashWhenAppQuits = true
     public var autoRestart = true
     public var persistLogsToFile = false
+    /// Serve Splash's own chat page (`/`). Off passes `--no-webui`.
+    public var serveWebChat = true
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case splashPath, preferInstalledSplash, inferencePort, inferenceExposure, allowedHosts, managementEnabled, managementPort,
+             managementExposure, selectedConfigId, startSplashWhenAppLaunches, stopSplashWhenAppQuits, autoRestart, persistLogsToFile, serveWebChat
+    }
+    /// A key that is missing (a file from an older version) keeps its default; nothing saved is dropped.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        splashPath = try c.decodeIfPresent(String.self, forKey: .splashPath)
+        preferInstalledSplash = try c.decodeIfPresent(Bool.self, forKey: .preferInstalledSplash) ?? false
+        inferencePort = try c.decodeIfPresent(Int.self, forKey: .inferencePort) ?? 8000
+        inferenceExposure = try c.decodeIfPresent(Exposure.self, forKey: .inferenceExposure) ?? .loopback
+        allowedHosts = try c.decodeIfPresent([String].self, forKey: .allowedHosts) ?? []
+        managementEnabled = try c.decodeIfPresent(Bool.self, forKey: .managementEnabled) ?? true
+        managementPort = try c.decodeIfPresent(Int.self, forKey: .managementPort) ?? 8765
+        managementExposure = try c.decodeIfPresent(Exposure.self, forKey: .managementExposure) ?? .loopback
+        selectedConfigId = try c.decodeIfPresent(String.self, forKey: .selectedConfigId)
+        startSplashWhenAppLaunches = try c.decodeIfPresent(Bool.self, forKey: .startSplashWhenAppLaunches) ?? false
+        stopSplashWhenAppQuits = try c.decodeIfPresent(Bool.self, forKey: .stopSplashWhenAppQuits) ?? true
+        autoRestart = try c.decodeIfPresent(Bool.self, forKey: .autoRestart) ?? true
+        persistLogsToFile = try c.decodeIfPresent(Bool.self, forKey: .persistLogsToFile) ?? false
+        serveWebChat = try c.decodeIfPresent(Bool.self, forKey: .serveWebChat) ?? true
+    }
 }
 
 /// Everything that decides how a process is started. Two specs that are equal
@@ -114,6 +161,7 @@ public struct EffectiveSpec: Codable, Equatable, Sendable {
     public var exposure: Exposure
     /// The names a person listed. Tailscale names are added at start (see AppliedConfig).
     public var allowedHosts: [String]
+    public var serveWebChat: Bool
 
     public init(config: ModelConfig, settings: ManagerSettings) {
         modelId = config.modelId
@@ -122,6 +170,20 @@ public struct EffectiveSpec: Codable, Equatable, Sendable {
         port = settings.inferencePort
         exposure = settings.inferenceExposure
         allowedHosts = settings.allowedHosts
+        serveWebChat = settings.serveWebChat
+    }
+
+    enum CodingKeys: String, CodingKey { case modelId, revision, options, port, exposure, allowedHosts, serveWebChat }
+    /// A record written by an older version has no `serveWebChat`; the chat page was on then.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modelId = try c.decode(String.self, forKey: .modelId)
+        revision = try c.decodeIfPresent(String.self, forKey: .revision)
+        options = try c.decode(ServeOptions.self, forKey: .options)
+        port = try c.decode(Int.self, forKey: .port)
+        exposure = try c.decode(Exposure.self, forKey: .exposure)
+        allowedHosts = try c.decodeIfPresent([String].self, forKey: .allowedHosts) ?? []
+        serveWebChat = try c.decodeIfPresent(Bool.self, forKey: .serveWebChat) ?? true
     }
 
     /// Human-readable differences from `other`, empty when equal.
@@ -133,6 +195,7 @@ public struct EffectiveSpec: Codable, Equatable, Sendable {
         add("inference port", String(port), String(other.port))
         add("exposure", exposure.rawValue, other.exposure.rawValue)
         add("allowed hosts", allowedHosts.joined(separator: ","), other.allowedHosts.joined(separator: ","))
+        add("chat page", serveWebChat ? "on" : "off", other.serveWebChat ? "on" : "off")
         add("language only", String(options.languageOnly), String(other.options.languageOnly))
         add("max context", options.maxContext ?? "auto", other.options.maxContext ?? "auto")
         add("max memory", options.maxMemory ?? "auto", other.options.maxMemory ?? "auto")

@@ -50,6 +50,8 @@ public final class SplashSupervisor: ObservableObject {
     @Published public private(set) var drainSupported: Bool?
     @Published public private(set) var draining = false
     @Published public private(set) var operationKind: String?
+    /// Whether the running Splash serves its chat page: asked once it is ready.
+    @Published public private(set) var webChatAvailable: Bool?
     /// False until the first look at the installed Splash and the adoption of a running one are done.
     @Published public private(set) var initialized = false
 
@@ -62,7 +64,7 @@ public final class SplashSupervisor: ObservableObject {
     public var familiesOverride: [SplashFamily]?
     /// Test hook: runs after a stop is accepted and before its signal is sent.
     public var beforeStopSignal: (@MainActor () async -> Void)?
-    public static let managerVersion = "0.3.0"
+    public static let managerVersion = "0.4.0"
 
     private enum OpKind: String { case start, stop, switchTo = "switch", retry, adopt }
     private struct Operation {
@@ -436,9 +438,10 @@ public final class SplashSupervisor: ObservableObject {
             applied: applied.map {
                 .init(configId: $0.configId, modelId: $0.spec.modelId, revision: $0.spec.revision,
                       options: Self.optionsView($0.spec.options), port: $0.spec.port, exposure: $0.spec.exposure,
-                      allowedHosts: $0.effectiveAllowedHosts, offline: $0.offline)
+                      allowedHosts: $0.effectiveAllowedHosts, offline: $0.offline, serveWebChat: $0.spec.serveWebChat)
             },
             pendingChanges: .init(restartRequired: !pending.isEmpty, changes: pending),
+            webChat: .init(available: webChatAvailable, url: webChatURL),
             drain: .init(supported: ownership == .managed ? drainSupported : nil, draining: draining),
             operation: operationKind,
             loadedModelId: loadedModelId,
@@ -452,6 +455,12 @@ public final class SplashSupervisor: ObservableObject {
             process: identity.flatMap { id in startedAt.map {
                 .init(pid: id.pid, startedAt: $0, uptimeSeconds: max(0, Int(Date().timeIntervalSince($0))), adopted: adopted) } },
             lastError: lastError, retry: retry, conflict: conflict)
+    }
+
+    /// The local address of the running Splash's chat page: loopback, the applied port, no key in it.
+    public var webChatURL: String? {
+        guard state == .ready || ownership == .external else { return nil }
+        return "http://127.0.0.1:\(applied?.spec.port ?? store.settings.inferencePort)/"
     }
 
     static func optionsView(_ o: ServeOptions) -> ConfigView.Options {
@@ -549,6 +558,7 @@ public final class SplashSupervisor: ObservableObject {
         var runSettings = store.settings
         runSettings.inferencePort = spec.port
         runSettings.allowedHosts = hosts
+        runSettings.serveWebChat = spec.serveWebChat
         var runConfig = config
         runConfig.options = spec.options
         runConfig.revision = spec.revision
@@ -703,7 +713,7 @@ public final class SplashSupervisor: ObservableObject {
     private func clearRun() {
         identity = nil; pid = nil; startedAt = nil; adopted = false
         httpReady = false; modelLoaded = false; loadedModelId = nil; activity = nil
-        applied = nil; runKey = nil; draining = false; drainSupported = nil
+        applied = nil; runKey = nil; draining = false; drainSupported = nil; webChatAvailable = nil
         try? FileManager.default.removeItem(at: paths.managedFile)
     }
 
@@ -718,7 +728,7 @@ public final class SplashSupervisor: ObservableObject {
         guard !ticking else { return }
         ticking = true
         defer { ticking = false }
-        tailnetAddress = NetInfo.tailnetAddress()
+        update(\.tailnetAddress, NetInfo.tailnetAddress())
         drainConsole()
         if identity != nil { await tickManaged() } else if op == nil { await tickUnmanaged() }
     }
@@ -731,16 +741,17 @@ public final class SplashSupervisor: ObservableObject {
         let probe = await SplashClient(host: "127.0.0.1", port: run.spec.port, apiKey: runKey).probe()
         // The answer belongs to the process asked, and only while it is still the one we run.
         guard identity == id, applied == run, state != .stopping else { return }
-        activity = probe.activity
-        httpReady = probe.httpReady
-        loadedModelId = probe.loadedModelIds.first
-        modelLoaded = probe.loadedModelIds.contains(run.spec.modelId)
-        if probe.statusReadable { drainSupported = probe.draining != nil; if let flag = probe.draining { draining = flag } }
+        update(\.activity, probe.activity)
+        update(\.httpReady, probe.httpReady)
+        update(\.loadedModelId, probe.loadedModelIds.first)
+        update(\.modelLoaded, probe.loadedModelIds.contains(run.spec.modelId))
+        if probe.statusReadable { update(\.drainSupported, probe.draining != nil); if let flag = probe.draining { update(\.draining, flag) } }
         let isReady = probe.httpReady && modelLoaded
         if isReady {
             failedProbes = 0
             if state != .ready {
                 state = .ready; detail = nil
+                webChatAvailable = nil
                 if !readyOnce {
                     readyOnce = true
                     log("Ready: \(run.spec.modelId)")
@@ -748,6 +759,7 @@ public final class SplashSupervisor: ObservableObject {
                 }
                 readyAt = Date()
             }
+            if webChatAvailable == nil { await refreshWebChat(host: "127.0.0.1", port: run.spec.port, expect: id) }
             if let readyAt, failureCount > 0, Date().timeIntervalSince(readyAt) > timing.stableAfter { failureCount = 0 }
         } else if state == .ready {
             failedProbes += 1
@@ -770,16 +782,22 @@ public final class SplashSupervisor: ObservableObject {
         }
     }
 
+    private func refreshWebChat(host: String, port: Int, expect id: ProcessIdentity?) async {
+        let page = await SplashClient(host: host, port: port, apiKey: nil).page("/")
+        guard identity == id else { return }
+        webChatAvailable = page.status == 200 && (page.contentType ?? "").hasPrefix("text/html")
+    }
+
     private func tickUnmanaged() async {
         let settings = store.settings
         let probeHost = "127.0.0.1"
         let listening = await NetInfo.isListening(host: probeHost, port: settings.inferencePort, timeout: 0.5)
         guard identity == nil, op == nil else { return }
         if !listening {
-            conflict = nil
+            update(\.conflict, nil)
             if ownership == .external {
                 ownership = .none; state = .stopped; detail = nil
-                httpReady = false; modelLoaded = false; loadedModelId = nil; activity = nil; applied = nil
+                httpReady = false; modelLoaded = false; loadedModelId = nil; activity = nil; applied = nil; webChatAvailable = nil
             }
             return
         }
@@ -787,22 +805,23 @@ public final class SplashSupervisor: ObservableObject {
         let probe = await SplashClient(host: probeHost, port: settings.inferencePort, apiKey: key).probe()
         guard identity == nil, op == nil else { return }
         if probe.statusReadable || probe.httpReady {
-            ownership = .external
-            httpReady = probe.httpReady
-            loadedModelId = probe.loadedModelIds.first ?? probe.instanceModel
-            modelLoaded = loadedModelId != nil
-            activity = probe.activity
-            state = probe.httpReady ? .ready : .starting
-            conflict = .init(kind: "external_splash", pid: probe.instancePid, modelId: loadedModelId,
-                             message: "A Splash that this app did not start runs on port \(settings.inferencePort). This app only watches it.")
-            detail = conflict?.message
+            update(\.ownership, .external)
+            update(\.httpReady, probe.httpReady)
+            update(\.loadedModelId, probe.loadedModelIds.first ?? probe.instanceModel)
+            update(\.modelLoaded, loadedModelId != nil)
+            update(\.activity, probe.activity)
+            update(\.state, probe.httpReady ? .ready : .starting)
+            if probe.httpReady, webChatAvailable == nil { await refreshWebChat(host: probeHost, port: settings.inferencePort, expect: nil) }
+            update(\.conflict, .init(kind: "external_splash", pid: probe.instancePid, modelId: loadedModelId,
+                                     message: "A Splash that this app did not start runs on port \(settings.inferencePort). This app only watches it."))
+            update(\.detail, conflict?.message)
         } else {
-            ownership = .none
-            state = .stopped
-            conflict = .init(kind: probe.authRequired ? "unreadable_service" : "foreign_service", pid: nil, modelId: nil,
-                             message: probe.authRequired
-                             ? "A server answers on port \(settings.inferencePort) and wants a key this app does not hold."
-                             : "Another program listens on port \(settings.inferencePort).")
+            update(\.ownership, .none)
+            update(\.state, .stopped)
+            update(\.conflict, .init(kind: probe.authRequired ? "unreadable_service" : "foreign_service", pid: nil, modelId: nil,
+                                     message: probe.authRequired
+                                     ? "A server answers on port \(settings.inferencePort) and wants a key this app does not hold."
+                                     : "Another program listens on port \(settings.inferencePort)."))
         }
     }
 
@@ -931,6 +950,12 @@ public final class SplashSupervisor: ObservableObject {
         return candidates.last ?? "No output."
     }
 
+    /// Assigns only a changed value. A `@Published` property announces a change on every assignment, even of an equal
+    /// value, and a poll every second must not make every observer rebuild (and close an open menu) for nothing.
+    private func update<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<SplashSupervisor, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
     private func log(_ text: String) { logs.append(text, source: .app) }
 }
 
@@ -958,6 +983,7 @@ public enum ServeArguments {
         if let value = config.options.idleRelease { try need("--idle-release"); arguments += ["--idle-release", value] }
         if config.options.reasoning == .off { try need("--default-reasoning-effort"); arguments += ["--default-reasoning-effort", "none"] }
         if config.options.disableANE { try need("--disable-ane"); arguments.append("--disable-ane") }
+        if !settings.serveWebChat { try need("--no-webui"); arguments.append("--no-webui") }
         return arguments
     }
 }

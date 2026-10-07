@@ -109,6 +109,16 @@ public struct SplashClient: Sendable {
         }
     }
 
+    /// A page fetch that does not parse JSON: status and content type. Used to find out whether the chat page is served.
+    public func page(_ path: String) async -> (status: Int, contentType: String?) {
+        guard let url = URL(string: "http://\(host):\(port)\(path)") else { return (0, nil) }
+        do {
+            let (_, response) = try await session.data(for: URLRequest(url: url))
+            let http = response as? HTTPURLResponse
+            return (http?.statusCode ?? 0, http?.value(forHTTPHeaderField: "Content-Type"))
+        } catch { return (0, nil) }
+    }
+
     public struct Probe: Sendable {
         public var httpReady = false
         public var loadedModelIds: [String] = []

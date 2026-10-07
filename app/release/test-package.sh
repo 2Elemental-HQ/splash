@@ -85,6 +85,16 @@ R=$(curl -s -m 60 localhost:$INFER/v1/chat/completions -H 'Content-Type: applica
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: pong\"}],\"max_tokens\":50,\"reasoning_effort\":\"none\"}")
 check "a real short inference call answers" '[ "$(echo "$R" | jq_ "d[\"choices\"][0][\"message\"][\"content\"].strip()")" = pong ]'
 
+# Splash's own chat page, from the packaged runtime: the page, its asset and the call the page makes.
+S=$(api /status)
+check "status names the chat page address (loopback, applied port, no key)" '[ "$(echo "$S" | jq_ "d[\"web_chat\"][\"url\"]")" = "http://127.0.0.1:$INFER/" ]'
+check "the chat page is reported available"        '[ "$(echo "$S" | jq_ "d[\"web_chat\"][\"available\"]")" = True ]'
+PAGE=$(curl -s -i -m 10 localhost:$INFER/)
+check "GET / answers 200 text/html"                'echo "$PAGE" | head -1 | grep -q " 200" && echo "$PAGE" | grep -qi "^content-type: text/html"'
+check "the page is Splash's chat page"             'echo "$PAGE" | grep -q "<title>Splash</title>"'
+check "its only asset, /favicon.ico, is served"    '[ "$(curl -s -o /dev/null -w "%{http_code}" localhost:$INFER/favicon.ico)" = 200 ]'
+check "the page's own call (streamed chat) answers" 'curl -s -N -m 60 localhost:$INFER/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":20,\"stream\":true,\"reasoning_effort\":\"none\"}" | grep -q "\[DONE\]"'
+
 # A long stream, then a switch to the other configuration while it runs.
 curl -s -N -m 120 localhost:$INFER/v1/chat/completions -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Write 600 words about Antwerp harbour.\"}],\"max_tokens\":700,\"stream\":true,\"reasoning_effort\":\"none\"}" > "$WORK/stream.out" &
@@ -107,4 +117,20 @@ check "inference works again after the switch" '[ "$(echo "$R" | jq_ "d[\"choice
 S=$(api /stop '{"wait_stopped_seconds":60}' 90 POST)
 check "stop drains and ends in state stopped" '[ "$(echo "$S" | jq_ "d[\"state\"]")" = stopped ]'
 check "no Splash process is left" '! pgrep -f "Splash Manager.app/Contents/Resources/Splash" >/dev/null'
+
+# The same runtime reachable from other devices: the chat page stays open, everything else needs the key.
+KEY=packagetest-key-0123456789abcdef
+RT="$APP/Contents/Resources/Splash/bin/splash"
+REV=$(python3 -c "import json; print(json.load(open('$ISO/support/config.json'))['configs'][0]['revision'])")
+( cd / && exec env -i HOME="$HOME" PATH=/usr/bin:/bin SPLASH_API_KEY=$KEY "$RT" serve --model "$MODEL" --revision "$REV" --offline --port 8204 --host 0.0.0.0 > "$WORK/key-mode.out" 2>&1 ) & KEYMODE=$!
+for _ in $(seq 1 90); do curl -s -m 1 localhost:8204/ready | grep -q ready && break; sleep 1; done
+code() { curl -s -o /dev/null -w "%{http_code}" -m 20 "$@"; }
+check "with an API key set the chat page is still served (200)"      '[ "$(code localhost:8204/)" = 200 ]'
+check "without the key the API refuses (401)"                          '[ "$(code localhost:8204/v1/models)" = 401 ]'
+chat_code() { curl -s -o /dev/null -w "%{http_code}" -m 30 localhost:8204/v1/chat/completions -H "Content-Type: application/json" "$@" \
+    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":5,\"reasoning_effort\":\"none\"}"; }
+check "a chat call without the key is refused (401)"                   '[ "$(chat_code)" = 401 ]'
+check "a chat call with the key answers (200)"                         '[ "$(chat_code -H "Authorization: Bearer $KEY")" = 200 ]'
+check "a foreign Host name is refused (403)"                           '[ "$(code -H "Host: evil.example:8204" localhost:8204/)" = 403 ]'
+kill -TERM "$KEYMODE" 2>/dev/null; wait "$KEYMODE" 2>/dev/null
 echo; echo "$pass passed, $failed failed"; [ "$failed" = 0 ]

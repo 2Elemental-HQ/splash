@@ -8,6 +8,7 @@ struct ModelsView: View {
     @State private var editing: ModelConfig?
     @State private var isNew = false
     @State private var estimates: [String: String] = [:]
+    @State private var importMessage: String?
 
     var body: some View {
         let views = supervisor.configViews()
@@ -16,12 +17,20 @@ struct ModelsView: View {
                 Text("One model is loaded per Splash instance. Switching stops the running model and starts the other, and is refused while calls run.")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
-                Button("Import installed") { env.importDetectedModels() }
-                    .help("Add models that Splash installed, with their pinned revision")
+                Button("Find installed models") { importMessage = env.importInstalledModels().summary }
+                    .help("Adds the models that Splash itself installed (pinned in the Hugging Face cache), with their revision. It downloads nothing and never adds a model twice. Models of other runtimes, such as LM Studio, are not detected; use Add model.")
                 Button("Add model…") {
                     editing = ModelConfig(id: "", displayName: "", modelId: ""); isNew = true
                 }.buttonStyle(.borderedProminent)
             }.padding([.horizontal, .top], 16)
+            if let importMessage {
+                HStack {
+                    Text(importMessage).font(.callout)
+                    Spacer()
+                    Button("Dismiss") { self.importMessage = nil }.buttonStyle(.link)
+                }
+                .padding(10).background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 16)
+            }
             List {
                 ForEach(views, id: \.id) { view in
                     VStack(alignment: .leading, spacing: 6) {

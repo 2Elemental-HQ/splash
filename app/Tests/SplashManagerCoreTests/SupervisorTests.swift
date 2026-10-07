@@ -535,3 +535,55 @@ final class ForeignListener {
     func stillOpen() -> Bool { fcntl(descriptor, F_GETFD) != -1 }
     func close() { Darwin.close(descriptor) }
 }
+
+@MainActor
+final class MenuStabilityTests: XCTestCase {
+    /// The menu is built from the supervisor, which polls every tick. A property that announces a change on every
+    /// poll, equal or not, makes every observer rebuild; with a menu open that closes its submenu.
+    func testSteadyPollingAnnouncesNothing() async throws {
+        let h = try Harness()
+        h.supervisor.begin()
+        _ = try await h.supervisor.start(configId: "a", allowDownload: false)
+        await h.expect { h.supervisor.state == .ready }
+        await h.expect { h.supervisor.drainSupported != nil && h.supervisor.webChatAvailable != nil }
+        var announcements = 0
+        let observer = h.supervisor.objectWillChange.sink { _ in announcements += 1 }
+        try await Task.sleep(nanoseconds: 2_500_000_000)   // ~25 polls at 0.1 s
+        observer.cancel()
+        XCTAssertEqual(announcements, 0, "polling an unchanged Splash must announce no change")
+        await h.cleanup()
+    }
+
+    func testARealChangeIsStillAnnounced() async throws {
+        let h = try Harness()
+        h.supervisor.begin()
+        var announcements = 0
+        let observer = h.supervisor.objectWillChange.sink { _ in announcements += 1 }
+        _ = try await h.supervisor.start(configId: "a", allowDownload: false)
+        await h.expect { h.supervisor.state == .ready }
+        observer.cancel()
+        XCTAssertGreaterThan(announcements, 0)
+        await h.cleanup()
+    }
+
+    func testTheChatPageIsFoundAndTheSwitchTurnsItOff() async throws {
+        let h = try Harness()
+        h.supervisor.begin()
+        try await h.supervisor.start(configId: "a", allowDownload: false)
+        await h.expect { h.supervisor.state == .ready }
+        await h.expect { h.supervisor.webChatAvailable == true }
+        let status = h.supervisor.snapshot()
+        XCTAssertEqual(status.webChat.url, "http://127.0.0.1:\(h.port)/")
+        XCTAssertEqual(WebChatAction.decide(status, hasSelectedModel: true), .open(URL(string: "http://127.0.0.1:\(h.port)/")!))
+        // Turning the page off is a saved change that waits for a restart, then passes --no-webui.
+        try h.store.updateSettings { $0.serveWebChat = false }
+        XCTAssertTrue(h.supervisor.snapshot().pendingChanges.changes.joined().contains("chat page"))
+        _ = try await h.supervisor.switchTo(configId: "a", allowDownload: false)
+        await h.expect { h.supervisor.state == .ready && h.startLog.count == 2 }
+        XCTAssertTrue((h.startLog.last?["argv"] as? [String] ?? []).contains("--no-webui"))
+        await h.expect { h.supervisor.webChatAvailable == false }
+        let action = WebChatAction.decide(h.supervisor.snapshot(), hasSelectedModel: true)
+        XCTAssertFalse(action.isEnabled, "\(action)")
+        await h.cleanup()
+    }
+}

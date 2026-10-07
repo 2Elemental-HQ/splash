@@ -1,6 +1,7 @@
 # Management API, version 1
 
-Handover contract for AgentOS (PR #106 and later). This API manages the Splash
+Contract for programs and devices that manage Splash from outside the app (the integration notes for AgentOS, PR #106 and later,
+are at the end). This API manages the Splash
 process. It does not carry inference: AgentOS keeps calling Splash's own
 OpenAI-compatible endpoint (`<endpoint>/v1`).
 
@@ -65,7 +66,7 @@ after a 300 ms delay. The API never returns the token or the inference API key.
 ```json
 {
   "api_version": 1,
-  "manager": {"version": "0.3.0", "started_at": "…"},
+  "manager": {"version": "0.4.0", "started_at": "…"},
   "state": "stopped | starting | ready | stopping | failed",
   "ownership": "none | managed | external",
   "operation": "start | stop | switch | retry | adopt | null",
@@ -74,8 +75,9 @@ after a 300 ms delay. The API never returns the token or the inference API key.
              "integrity": "verified | failed | null", "drain_declared": true, "problem": null},
   "config": {"id": "…", "display_name": "…", "model_id": "…", "revision": "…|null"},
   "applied": {"config_id": "…", "model_id": "…", "revision": "…|null", "options": {…},
-              "port": 8000, "exposure": "loopback | all_interfaces", "allowed_hosts": [], "offline": true},
+              "port": 8000, "exposure": "loopback | all_interfaces", "allowed_hosts": [], "offline": true, "serve_web_chat": true},
   "pending_changes": {"restart_required": false, "changes": ["max context: auto -> 64K"]},
+  "web_chat": {"available": true, "url": "http://127.0.0.1:8000/"},
   "drain": {"supported": true, "draining": false},
   "loaded_model_id": "model id that /v1/models lists, or null",
   "endpoint": {"bind_host": "127.0.0.1", "port": 8000, "exposure": "loopback", "requires_api_key": false,
@@ -94,6 +96,9 @@ after a 300 ms delay. The API never returns the token or the inference API key.
   from Settings. The bundled one is preferred unless Settings says otherwise. `integrity` is the bundled runtime's check;
   `failed` means it is not used and `problem` says why. `drain_declared` is what its release.json promises; `drain.supported`
   is what the running process proved.
+* `web_chat.url` is the local address of Splash's own chat page (loopback, the applied port, never a key). `available` is true when the
+  page answered 200 as HTML, false when the running Splash serves none (started with `--no-webui`, or a build without it), null until asked.
+  The page asks for the API key itself when exposure needs one.
 * `config` is the running configuration (from `applied`), or the selected one when nothing runs.
 * `state: "ready"`: the process runs, `/ready` answered 200 **and** `/v1/models` lists the intended model.
 * `ownership: "managed"`: the app started this process, or re-adopted it after an app restart after checking
@@ -217,7 +222,7 @@ A DMG install needs no Homebrew and no build: the app carries the Splash runtime
 itself. Check `splash.source` and `splash.integrity` in the status if a deployment must be sure. A Splash that was installed
 with Homebrew is left alone; if Settings prefers it, `drain.supported` is false and stop/switch return `drain_unsupported`.
 
-## What AgentOS must do
+## Integration notes: AgentOS
 
 1. `GET /configs` once and keep, per configuration, the `id` **and** the `revision` and `options` it expects.
    Do not identify a model by `loaded_model_id` alone.

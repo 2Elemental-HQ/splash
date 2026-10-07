@@ -146,6 +146,14 @@ struct OverviewView: View {
 
                 GroupBox("Endpoint") {
                     VStack(alignment: .leading, spacing: 8) {
+                        let chat = WebChatAction.decide(status, hasSelectedModel: store.settings.selectedConfigId != nil)
+                        HStack {
+                            Button(chat.menuTitle) { WebChatLauncher.open(env) }.disabled(!chat.isEnabled)
+                            if case .unavailable(let why) = chat { Text(why).font(.caption).foregroundStyle(.secondary) }
+                            if case .open = chat, status.endpoint.requiresApiKey {
+                                Text("The page asks for the API key below.").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                         CopyField(label: "Local", value: status.endpoint.localUrl + "/v1")
                         if status.endpoint.exposure != .loopback, let url = status.endpoint.tailnetUrl {
                             CopyField(label: "Tailnet", value: url + "/v1")

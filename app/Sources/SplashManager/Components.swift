@@ -30,11 +30,6 @@ extension RunState {
     }
 }
 
-struct MenuIcon: View {
-    @EnvironmentObject var supervisor: SplashSupervisor
-    var body: some View { Image(systemName: supervisor.state.symbol) }
-}
-
 struct StatusBadge: View {
     let state: RunState
     var external = false

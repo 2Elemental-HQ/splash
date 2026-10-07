@@ -93,3 +93,33 @@ temporary folder, unmounts the image, runs the app with a minimal environment an
 checkout), and checks: runtime found, verified and able to drain; start and readiness; a real short call; a switch during a
 running stream (the stream finishes, a new call is refused with `server_draining`, a second operation is refused); the
 other configuration runs; stop. It does not replace the clean-second-Mac test above.
+
+## Test the menu
+
+```sh
+release/test-menu.sh release/out/SplashManager-<version>-arm64.dmg
+```
+
+Starts the app from a copy with `--selftest-menu`: its real `NSMenu` is presented in tracking mode and kept open for 35 s while this script
+starts Splash through the API, so the supervisor's state really changes (stopped, starting, ready) under the open menu. The test fails if the menu
+closed or was rebuilt by itself, if the Model submenu object was replaced, or if choosing the other model in the submenu (the action a click
+triggers) was not saved. It takes focus for a moment. It is **not a physical mouse click**: synthesising one needs the Accessibility permission, and
+an unattended run cannot be granted it. A physical check (hover Model while Splash starts) remains a human step.
+
+## Continuous integration
+
+Two workflows, both always start on a pull request (so no required check can wait for a job that never was created) and decide per job:
+
+| Job | Runs when this changed since it last passed | Where |
+| --- | --- | --- |
+| Engine build and sanitizers (`engine-check`) | `runtime/`, build files, `dev/tools`, `dev/tuning`, engine tests | upstream `ci.yml` |
+| Python suite 3.12/3.13/3.14 | the above, plus `server/`, `install/`, `dev/tests`, requirements | upstream `ci.yml` |
+| Drain patch tests | `server/`, `install/`, server tests | `splash-manager.yml` |
+| App tests and release build | `app/Sources`, `app/Tests`, `Package.swift`, `VERSION`, `build-dev.sh` | `splash-manager.yml` |
+| Bundled runtime, packaging, release gate | `app/release`, the integrity code, `server/`, `install/` | `splash-manager.yml` |
+
+"Since it last passed" is a cache marker keyed by a hash of the git blobs of the covered paths (`.github/scripts/scope.sh`), written by the
+`record` job after a pull request run in which the job succeeded. It follows content, not commits, so an app-only commit on top of server changes
+does not rerun the 40-minute engine and Python jobs, while any change to what they cover, or to their workflow, does. A skipped job counts as
+passed. Caches can be evicted; then the job simply runs. Pushes to `main` and manual runs with *full_verification* run everything. Pushes to
+other branches start nothing: the pull request does, once. Permissions stay `contents: read`; no secret is used.

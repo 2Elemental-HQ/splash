@@ -20,26 +20,14 @@ final class AppEnvironment: ObservableObject {
         api = ManagementAPI(supervisor: supervisor, secrets: secrets)
         service = ManagementService(api: api, store: store)
         _ = try? Secrets.ensure(SecretAccount.managementToken, in: secrets)
-        if store.configs.isEmpty { importDetectedModels() }
+        if store.configs.isEmpty { importInstalledModels() }
         supervisor.begin()
         service.begin()
     }
 
-    /// First run: offer the models Splash itself installed, with their pinned revision.
-    func importDetectedModels() {
-        let existing = Set(store.configs.map(\.id))
-        var ids = existing
-        for candidate in HFCache().splashPinnedModels() {
-            if store.configs.contains(where: { $0.modelId == candidate.modelId && $0.revision == candidate.revision }) { continue }
-            let id = ModelConfig.makeId(modelId: candidate.modelId, revision: candidate.revision, existing: ids)
-            ids.insert(id)
-            let name = candidate.modelId.split(separator: "/").last.map(String.init) ?? candidate.modelId
-            _ = try? store.save(ModelConfig(id: id, displayName: name, modelId: candidate.modelId, revision: candidate.revision))
-        }
-        if store.settings.selectedConfigId == nil, let first = store.configs.first {
-            try? store.updateSettings { $0.selectedConfigId = first.id }
-        }
-    }
+    /// Finds the models Splash itself installed and adds the new ones. See `ConfigStore.importSplashInstalledModels`.
+    @discardableResult
+    func importInstalledModels() -> ImportResult { store.importSplashInstalledModels() }
 
     func managementToken() -> String { secrets.read(SecretAccount.managementToken) ?? "" }
 
@@ -54,8 +42,23 @@ final class AppEnvironment: ObservableObject {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusMenu: StatusMenuController?
+    var windowController: MainWindowController?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = AppEnvironment.shared
+        let env = AppEnvironment.shared
+        let windows = MainWindowController(env: env)
+        let menu = StatusMenuController(env: env)
+        menu.openWindow = { windows.show() }
+        windowController = windows
+        statusMenu = menu
+        if CommandLine.arguments.contains("--selftest-menu") { MenuSelfTest.run(menu: menu, env: env) }
+    }
+
+    /// A second launch (or a click on the app in Finder) opens the window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        windowController?.show()
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -96,11 +99,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+@MainActor
+final class MainWindowController {
+    private var window: NSWindow?
+    private let env: AppEnvironment
+
+    init(env: AppEnvironment) { self.env = env }
+
+    func show() {
+        if window == nil {
+            let root = MainWindow()
+                .environmentObject(env).environmentObject(env.supervisor).environmentObject(env.store)
+                .environmentObject(env.logs).environmentObject(env.service)
+                .frame(minWidth: 780, minHeight: 520)
+            let created = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
+                                   styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            created.title = "Splash Manager"
+            created.isReleasedWhenClosed = false
+            created.contentView = NSHostingView(rootView: root)
+            created.center()
+            created.setFrameAutosaveName("SplashManagerMain")
+            window = created
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 @main
 struct SplashManagerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var env = AppEnvironment.shared
-
     init() {
         // `SplashManager --print-token` prints the management token for scripts and exits.
         if CommandLine.arguments.contains("--print-token") {
@@ -120,21 +148,8 @@ struct SplashManagerApp: App {
         }
     }
 
+    // The menu bar item and the window are AppKit (see StatusMenu.swift, MainWindowController); the app needs one scene.
     var body: some Scene {
-        MenuBarExtra {
-            MenuContent().environmentObject(env).environmentObject(env.supervisor)
-        } label: {
-            MenuIcon().environmentObject(env.supervisor)
-        }
-        Window("Splash Manager", id: "main") {
-            MainWindow()
-                .environmentObject(env)
-                .environmentObject(env.supervisor)
-                .environmentObject(env.store)
-                .environmentObject(env.logs)
-                .environmentObject(env.service)
-                .frame(minWidth: 780, minHeight: 520)
-        }
-        .defaultSize(width: 920, height: 640)
+        Settings { EmptyView() }
     }
 }

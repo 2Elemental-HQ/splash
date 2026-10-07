@@ -1,8 +1,8 @@
 # Splash Manager
 
-A native macOS menu bar app that supervises the installed `splash serve`
-process, and a small authenticated API so another machine (AgentOS) can start,
-watch, drain-stop and switch it. It is an unofficial companion to
+A native macOS menu bar app that runs and supervises Splash on your Mac: choose a model,
+start, stop and switch it, open Splash's chat page, and see what it is doing. A small authenticated API lets other programs and
+devices start, watch, drain-stop and switch it as well. It is an unofficial companion to
 [incoai/splash](https://github.com/incoai/splash); it does not replace the Splash
 engine and ships no Splash code. Apache-2.0, like the rest of this repository.
 
@@ -55,18 +55,26 @@ WITH_RUNTIME=1 ./build-dev.sh  # also stages the bundled runtime (unsigned layou
 release/test-package.sh <dmg>  # end-to-end test of a built image, with the cached model
 ```
 
-`SPLASH_MANAGER_HOME=<dir>` moves all app state and `SPLASH_MANAGER_KEYCHAIN_SERVICE=<name>` the Keychain
+A configuration file of an older version loads with its values: every key that is missing keeps its default (a test decodes a
+0.2.0-format file). `SPLASH_MANAGER_HOME=<dir>` moves all app state and `SPLASH_MANAGER_KEYCHAIN_SERVICE=<name>` the Keychain
 items, so a test run never touches the real settings. CI (`.github/workflows/splash-manager.yml`) builds and
-tests on macOS without any secret.
+tests on macOS without any secret. Which jobs run depends on what changed: see "Continuous integration" in release/README.md.
 
 ## What it does
 
-* **Menu bar:** state, start/stop, model choice, open window, quit.
+* **Menu bar:** state, start/stop, model choice, **Open Web Chat**, open window, quit. The menu is built by AppKit when it opens and
+  is never touched while it is open, so the Model submenu stays put while Splash starts or stops (see Design).
+* **Web chat:** Splash's own chat page (nothing is reimplemented), opened at the local address of the running Splash. The page asks
+  for the API key itself when Splash is reachable from other devices; no key is ever put in the address.
 * **Overview:** state, loaded model, readiness (process, HTTP, model), active requests, whether Splash can drain,
   endpoint, errors, retry status, and **saved changes that are not active yet**.
 * **Models:** saved configurations (model id, optional revision, a few options), file availability, verified starts,
-  download size check, import of models Splash installed.
-* **Settings:** Splash path and version, ports, exposure, API keys, login item, restart policy, log persistence.
+  download size check. *Find installed models* adds the models that Splash itself installed (its pins in the Hugging Face cache),
+  says how many it added and how many were already there, and never adds one twice or downloads anything. Models of other runtimes,
+  such as LM Studio, are not detected; add them by id.
+* **Settings:** General (open at login, start and stop behaviour, restart after a crash), Access (who can reach Splash and the
+  remote-control API, keys), the Splash runtime in use, and an **Advanced** section (executable override, prefer an installed Splash,
+  ports, allowed host names, chat page on or off, logs, diagnostics).
 * **Logs:** last 2000 redacted lines.
 
 ## Design
@@ -80,6 +88,13 @@ tests on macOS without any secret.
 | `Requirements.swift` | Hardware and macOS checks; Homebrew-guided install (only without a bundled runtime) |
 | `RuntimeBundle.swift` | Finds the bundled runtime and checks it against its manifest |
 | `Spawn.swift`, `Secrets.swift`, `Logs.swift` | `posix_spawn` and pid identity, Keychain, redaction |
+
+### The menu does not move while it is open
+
+A `MenuBarExtra` rebuilds its menu whenever an observed object announces a change, and the supervisor announced a change on every
+poll: `@Published` announces each assignment, equal or not (measured with a 0.1 s poll: 119 announcements in 2 s of steady polling in 0.3.0, 0 now). The menu is now
+an `NSStatusItem` with an `NSMenu` built in `menuNeedsUpdate`, only while closed; the supervisor assigns only changed values; the icon
+is updated when the menu closes. `release/test-menu.sh` drives the real menu (see release/README.md).
 
 ### Applied against saved
 

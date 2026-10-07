@@ -10,6 +10,7 @@ struct SetupView: View {
     @EnvironmentObject var store: ConfigStore
     @State private var installing = false
     @State private var installError: String?
+    @State private var importMessage: String?
     private let checks = SystemRequirements.current()
 
     var needed: Bool {
@@ -85,7 +86,8 @@ struct SetupView: View {
                     if let saved = try? store.save(config), store.settings.selectedConfigId == nil { try? store.updateSettings { $0.selectedConfigId = saved.id } }
                 }
             }
-            Button("Import models Splash already installed") { env.importDetectedModels() }
+            Button("Find models Splash already installed") { importMessage = env.importInstalledModels().summary }
+            if let importMessage { Text(importMessage).font(.callout).foregroundStyle(.secondary) }
         } else {
             Label("\(store.configs.count) model configuration(s)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         }

@@ -36,6 +36,7 @@ options:
   --max-context TOKENS  context limit
   --idle-release DURATION
   --default-reasoning-effort EFFORT
+  --no-webui            disable the chat page
 """
 
 def main():
@@ -49,7 +50,7 @@ def main():
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in ("--offline", "--language-only", "--disable-ane"):
+        if a in ("--offline", "--language-only", "--disable-ane", "--no-webui"):
             opts[a] = True; i += 1
         else:
             opts[a] = argv[i + 1]; i += 2
@@ -76,6 +77,11 @@ def main():
             return self.headers.get("Authorization") == f"Bearer {key}"
         def do_GET(self):
             ready = time.time() >= state["ready_at"]
+            if self.path in ("/", "/index.html"):
+                if opts.get("--no-webui"): return self.send(404, {"error": {"code": "not_found"}})
+                body = b"<!doctype html><title>Splash</title>"
+                self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             if self.path == "/health": return self.send(200, {"status": "ok"})
             if self.path == "/ready": return self.send(200 if ready else 503, {"status": "ready" if ready else "loading"})
             if not self.authed(): return self.send(401, {"error": {"code": "authentication_error"}})

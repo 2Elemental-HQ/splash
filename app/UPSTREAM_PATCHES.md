@@ -24,6 +24,14 @@ accepted between the check and the signal. Admission has to close first.
 About 40 lines of source. Nothing else changes: control routes (`/health`, `/ready`, `/status`,
 `/v1/models`) keep answering while draining; a drain that is never requested has no effect.
 
+## CI scoping (`.github/workflows/ci.yml`, `.github/scripts/scope.sh`)
+
+The upstream workflow ran its 40-minute jobs on every pull request push. A `scope` job (ubuntu, seconds) now decides per long job whether
+the content it covers changed since a run of it passed (cache marker keyed by the git blob hash of the covered paths); `engine-check` and
+`python-compatibility` got `needs: scope` and an `if`, a `record` job writes the markers, and `workflow_dispatch` got a `full_verification`
+input. Pushes to `main` still run everything. The jobs, their names and steps are unchanged. When merging upstream, keep upstream's job bodies
+and re-apply these four additions (the `scope` and `record` jobs, the two `needs`/`if` lines, the input).
+
 ## How the app uses it
 
 The app reads `http.draining` from `/status`. Its presence means "this Splash can drain".

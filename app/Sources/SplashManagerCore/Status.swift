@@ -68,11 +68,18 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
         public var exposure: Exposure
         public var allowedHosts: [String]
         public var offline: Bool
+        public var serveWebChat: Bool
     }
     /// Saved changes that the running process does not have yet.
     public struct Pending: Codable, Equatable, Sendable {
         public var restartRequired: Bool
         public var changes: [String]
+    }
+    /// Splash's own chat page. `url` is the local address of the running instance, never with a key in it.
+    public struct WebChat: Codable, Equatable, Sendable {
+        /// True when the page answered 200 as HTML; false when the server answered otherwise (for example started with --no-webui); nil until asked.
+        public var available: Bool?
+        public var url: String?
     }
     public struct Drain: Codable, Equatable, Sendable {
         /// Whether the running Splash drains on request. nil until its status was read.
@@ -96,6 +103,7 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
     public var config: ConfigRef?
     public var applied: Applied?
     public var pendingChanges: Pending
+    public var webChat: WebChat
     public var drain: Drain
     /// The lifecycle operation in progress: start, stop, switch, retry or adopt.
     public var operation: String?
