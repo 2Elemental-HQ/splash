@@ -11,7 +11,7 @@ It answers `--version`, `serve --help` and a small part of the HTTP surface of
   hold         seconds that a chat call keeps the request counted as active
   no_drain     behave like a Splash without drain support (no http.draining; SIGUSR1 kills it)
 """
-import json, os, signal, sys, threading, time
+import json, os, signal, socketserver, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,7 +104,14 @@ def main():
             finally:
                 with lock: state["active"] -= 1
 
-    server = ThreadingHTTPServer((host, port), H)
+    class Server(ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup that can block for
+            # many seconds on a CI runner. The fake needs no host name.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = host, self.server_address[1]
+
+    server = Server((host, port), H)
     server.daemon_threads = True
     stop = threading.Event()
     drain_requested = threading.Event()
