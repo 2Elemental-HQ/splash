@@ -19,7 +19,7 @@ from Homebrew (`/opt/homebrew/bin/splash`) or any path set in Settings.
 cd app
 ./build-app.sh                # builds and signs build/Splash Manager.app
 open "build/Splash Manager.app"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test   # 37 tests, no model needed
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test   # 38 tests, no model needed
 ```
 
 `build-app.sh` signs with the first valid codesigning identity (override with
