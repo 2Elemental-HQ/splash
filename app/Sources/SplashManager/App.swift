@@ -108,6 +108,13 @@ struct SplashManagerApp: App {
             print((try? Secrets.ensure(SecretAccount.managementToken, in: store)) ?? "")
             exit(0)
         }
+        // `SplashManager --verify-runtime` checks the bundled Splash runtime against its manifest and exits 0 or 1.
+        if CommandLine.arguments.contains("--verify-runtime") {
+            guard let root = RuntimeBundle.root() else { print("no bundled runtime"); exit(1) }
+            let check = RuntimeBundle.verify(root: root)
+            print("runtime \(check.version ?? "?"): \(check.state.rawValue)\(check.problems.isEmpty ? "" : " - " + check.problems.joined(separator: "; "))")
+            exit(check.state == .verified ? 0 : 1)
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count {
             Snapshot.run(into: CommandLine.arguments[index + 1])
         }

@@ -40,6 +40,8 @@ public final class SplashSupervisor: ObservableObject {
     @Published public private(set) var retry: ManagerStatus.Retry?
     @Published public private(set) var conflict: ManagerStatus.Conflict?
     @Published public private(set) var install: SplashInstall?
+    /// Why a Splash that exists is not used, for example a bundled runtime that fails its check.
+    @Published public private(set) var runtimeProblem: String?
     @Published public private(set) var startedAt: Date?
     @Published public private(set) var pid: Int32?
     @Published public private(set) var adopted = false
@@ -347,12 +349,31 @@ public final class SplashSupervisor: ObservableObject {
     }
 
     public func refreshInstall() async {
-        let url = SplashLocator.find(preferred: store.settings.splashPath)
-        guard let url else { install = nil; installInspectedFor = nil; return }
-        if installInspectedFor == url, install != nil { return }
-        install = await SplashLocator.inspect(url)
-        installInspectedFor = install == nil ? nil : url
+        let settings = store.settings
+        guard let found = SplashLocator.resolve(preferred: settings.splashPath, preferInstalled: settings.preferInstalledSplash,
+                                                bundledRoot: bundledRootOverride ?? RuntimeBundle.root()) else {
+            install = nil; installInspectedFor = nil; return
+        }
+        if installInspectedFor == found.url, install != nil { return }
+        runtimeProblem = nil
+        var check: RuntimeCheck?
+        if found.source == .bundled, let root = found.url.deletingLastPathComponent().deletingLastPathComponent() as URL? {
+            // Hash off the main actor: a few tens of megabytes.
+            check = await Task.detached { RuntimeBundle.verify(root: root) }.value
+            if check?.state != .verified {
+                runtimeProblem = "The runtime bundled with this app failed its integrity check (\(check?.problems.joined(separator: "; ") ?? "unknown")). Reinstall the app."
+                install = nil; installInspectedFor = nil
+                return
+            }
+        }
+        var inspected = await SplashLocator.inspect(found.url, source: found.source)
+        inspected?.runtime = check
+        install = inspected
+        installInspectedFor = install == nil ? nil : found.url
     }
+
+    /// Tests point this at a staged runtime; the app uses `RuntimeBundle.root()`.
+    public var bundledRootOverride: URL?
 
     public func settingsChanged() {
         logs.persistTo = store.settings.persistLogsToFile ? paths.persistentLog : nil
@@ -398,7 +419,9 @@ public final class SplashSupervisor: ObservableObject {
         return ManagerStatus(
             manager: .init(version: Self.managerVersion, startedAt: startedAtApp),
             state: state, ownership: ownership, detail: detail,
-            splash: .init(installed: install != nil, version: install?.version),
+            splash: .init(installed: install != nil, version: install?.version, source: install?.source,
+                          integrity: install?.runtime.map { $0.state.rawValue }, drainDeclared: install?.runtime?.drainDeclared,
+                          problem: runtimeProblem),
             config: ref.map { .init(id: $0.0, displayName: $0.1, modelId: $0.2, revision: $0.3) },
             applied: applied.map {
                 .init(configId: $0.configId, modelId: $0.spec.modelId, revision: $0.spec.revision,

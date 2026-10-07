@@ -46,7 +46,11 @@ struct SetupView: View {
 
     @ViewBuilder private var splashStep: some View {
         if let install = supervisor.install {
-            Label("Splash \(install.version) found at \(install.executable.path)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            let where_ = install.source == .bundled ? "bundled with this app, integrity verified"
+                : install.source == .installed ? "installed on this Mac: \(install.executable.path)" : "custom path: \(install.executable.path)"
+            Label("Splash \(install.version) (\(where_))", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+        } else if let problem = supervisor.runtimeProblem {
+            Label(problem, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
         } else {
             Label("Splash is not installed", systemImage: "xmark.circle.fill").foregroundStyle(.red)
             if let brew = Homebrew.find() {

@@ -105,7 +105,15 @@ final class Harness {
     func diagnosis() -> String {
         let status = supervisor.snapshot()
         let lines = logs.lines.suffix(12).map { "[\($0.source.rawValue)] \($0.text)" }.joined(separator: " | ")
-        return "state=\(status.state) ownership=\(status.ownership) op=\(status.operation ?? "-") error=\(status.lastError.map { "\($0.code): \($0.message)" } ?? "-") starts=\(startLog.count) python=\(pythonVersion) log=\(lines)"
+        // Ask the fake directly, two ways, so a CI log says whether the server or the app's probe is at fault.
+        let curl = Process(); curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        curl.arguments = ["-s", "-m", "3", "-w", " [http %{http_code}]", "http://127.0.0.1:\(port)/ready"]
+        let pipe = Pipe(); curl.standardOutput = pipe; curl.standardError = pipe
+        try? curl.run(); curl.waitUntilExit()
+        let viaCurl = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let listening = NetInfo.connect(host: "127.0.0.1", port: port, timeout: 1)
+        let alive = (status.process?.pid).map { Spawner.identity(of: $0) != nil } ?? false
+        return "curl=\(viaCurl) listening=\(listening) pidAlive=\(alive) readiness=\(status.readiness) console=\((try? String(contentsOf: paths.consoleFile, encoding: .utf8))?.suffix(300) ?? "-") state=\(status.state) ownership=\(status.ownership) op=\(status.operation ?? "-") error=\(status.lastError.map { "\($0.code): \($0.message)" } ?? "-") starts=\(startLog.count) python=\(pythonVersion) log=\(lines)"
     }
 
     var pythonVersion: String {

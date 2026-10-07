@@ -79,10 +79,13 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 APP="$OUT/$APP_DIR_NAME"
 assemble_app "$BIN/SplashManager" "$APP" "$BUNDLE_ID" "$APP_NAME"
 
-# --- 4. sign the app (hardened runtime, secure timestamp) -------------------------
-# The bundle holds one executable and no frameworks or helpers; if any are added, sign them first, inside out.
-find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) ! -path "$APP/Contents/MacOS/SplashManager" | grep -q . \
-    && fail "the bundle contains additional code; extend the signing step to sign it before the app."
+# --- 4. the Splash runtime, then the app (hardened runtime, secure timestamp) ---------
+# The runtime is upstream's release with this fork's drain patch, every Mach-O file re-signed with the same identity.
+release/runtime/build-runtime.sh --sign "$IDENTITY" "$APP/Contents/Resources/Splash"
+# Nothing else in the bundle may be code: sign it first, inside out, if something is ever added.
+stray=$(find "$APP" -type f ! -path "$APP/Contents/MacOS/SplashManager" ! -path "$APP/Contents/Resources/Splash/*" \
+    | while IFS= read -r f; do if is_macho "$f"; then echo "$f"; fi; done)
+[ -z "$stray" ] || fail "the bundle contains additional code outside the runtime: $stray"
 codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -120,4 +123,4 @@ xcrun stapler staple "$DMG"
 release/verify-artifact.sh "$DMG"
 ( cd "$OUT" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256" )
 echo "Done: $DMG"
-echo "Not tested here: installation on a clean second Mac (see release/README.md)."
+echo "Not tested here: installation on a clean second Mac, and the network route from another device (see release/README.md)."

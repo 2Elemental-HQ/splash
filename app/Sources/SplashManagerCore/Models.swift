@@ -86,6 +86,8 @@ public enum Exposure: String, Codable, CaseIterable, Sendable {
 
 public struct ManagerSettings: Codable, Equatable, Sendable {
     public var splashPath: String?
+    /// Use a Splash installed on this Mac (Homebrew) before the runtime bundled with the app.
+    public var preferInstalledSplash = false
     public var inferencePort = 8000
     public var inferenceExposure: Exposure = .loopback
     public var allowedHosts: [String] = []

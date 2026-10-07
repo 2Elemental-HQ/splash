@@ -1,0 +1,14 @@
+#!/bin/sh
+# The launcher of the bundled Splash runtime. It finds its own directory, so the app can sit anywhere.
+set -eu
+script=$0
+while [ -L "$script" ]; do
+    target=$(readlink -- "$script")
+    case $target in
+        /*) script=$target ;;
+        *) script=$(dirname -- "$script")/$target ;;
+    esac
+done
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$script")/.." && pwd -P)
+export PYTHONDONTWRITEBYTECODE=1
+exec "$ROOT/python/bin/python3" -u "$ROOT/install/launcher.py" "$@"

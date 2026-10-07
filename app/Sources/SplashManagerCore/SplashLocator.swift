@@ -4,6 +4,9 @@ import Foundation
 public struct SplashInstall: Equatable, Sendable {
     public var executable: URL
     public var version: String
+    public var source: SplashSource = .installed
+    /// Set for the bundled runtime: the result of checking it against its manifest.
+    public var runtime: RuntimeCheck?
     /// Long options in `splash serve --help`.
     public var serveFlags: Set<String>
     /// The model families and draft repositories the installed Splash declares
@@ -16,26 +19,32 @@ public struct SplashInstall: Equatable, Sendable {
 public enum SplashLocator {
     public static let candidates = ["/opt/homebrew/bin/splash", "/usr/local/bin/splash"]
 
-    public static func find(preferred: String?) -> URL? {
+    /// Chooses the Splash to run: a path set in Settings first; then the runtime bundled with the app
+    /// (it can drain, so it is the default); then a Splash installed on this Mac. `preferInstalled`
+    /// puts the installed one before the bundled one. Nothing here changes any installation.
+    public static func resolve(preferred: String?, preferInstalled: Bool = false, bundledRoot: URL? = RuntimeBundle.root())
+        -> (url: URL, source: SplashSource)? {
         let fm = FileManager.default
-        var paths = [String]()
-        if let preferred, !preferred.isEmpty { paths.append(preferred) }
-        paths.append(contentsOf: candidates)
-        for path in paths where fm.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
+        if let preferred, !preferred.isEmpty, fm.isExecutableFile(atPath: preferred) {
+            return (URL(fileURLWithPath: preferred), .custom)
         }
-        return nil
+        let bundled = bundledRoot.map { ($0.appendingPathComponent("bin/splash"), SplashSource.bundled) }
+        let installed = candidates.first(where: { fm.isExecutableFile(atPath: $0) }).map { (URL(fileURLWithPath: $0), SplashSource.installed) }
+        let order = preferInstalled ? [installed, bundled] : [bundled, installed]
+        return order.compactMap { $0 }.first.map { (url: $0.0, source: $0.1) }
     }
 
+    public static func find(preferred: String?) -> URL? { resolve(preferred: preferred, bundledRoot: nil)?.url }
+
     /// Runs `splash --version` and `splash serve --help` with a small timeout.
-    public static func inspect(_ executable: URL) async -> SplashInstall? {
+    public static func inspect(_ executable: URL, source: SplashSource = .installed) async -> SplashInstall? {
         async let versionOut = run(executable, ["--version"])
         async let helpOut = run(executable, ["serve", "--help"])
         guard let versionText = await versionOut, let help = await helpOut else { return nil }
         let version = versionText.split(whereSeparator: \.isNewline).first.map(String.init)?
             .replacingOccurrences(of: "Splash ", with: "") ?? "unknown"
         let families = await SplashFamilies.load(executable: executable)
-        return SplashInstall(executable: executable, version: version, serveFlags: parseFlags(help), families: families)
+        return SplashInstall(executable: executable, version: version, source: source, serveFlags: parseFlags(help), families: families)
     }
 
     static func parseFlags(_ help: String) -> Set<String> {

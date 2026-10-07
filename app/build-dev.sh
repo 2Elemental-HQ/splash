@@ -15,6 +15,9 @@ APP="build/$APP_DIR_NAME"
 mkdir -p build
 assemble_app "$BIN/SplashManager" "$APP" "net.2elemental.splash-manager" "$APP_NAME"
 
+# WITH_RUNTIME=1 also stages the bundled Splash runtime (unsigned layout, upstream signatures) to try it in a dev build.
+if [ "${WITH_RUNTIME:-}" = 1 ]; then release/runtime/build-runtime.sh --unsigned "$APP/Contents/Resources/Splash"; fi
+
 IDENTITY=${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p' | head -1)}
 codesign --force --sign "${IDENTITY:--}" --options runtime "$APP"
 echo "Built $APP (development signature: ${IDENTITY:-ad hoc}; not for distribution)"

@@ -9,6 +9,13 @@ public struct ManagerStatus: Codable, Equatable, Sendable {
     public struct SplashInfo: Codable, Equatable, Sendable {
         public var installed: Bool
         public var version: String?
+        /// `bundled`, `installed` or `custom`. nil when no Splash was found.
+        public var source: SplashSource?
+        /// The bundled runtime's own check against its manifest: `verified`, `failed`, or nil when not bundled.
+        public var integrity: String?
+        /// release.json declares drain support. The live status in `drain` is what counts.
+        public var drainDeclared: Bool?
+        public var problem: String?
     }
     public struct ConfigRef: Codable, Equatable, Sendable {
         public var id: String

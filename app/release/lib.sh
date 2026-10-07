@@ -69,3 +69,11 @@ What it does not include
   - Any model. A model is downloaded only after the app shows its size and you confirm.
 TXT
 }
+
+# True for a Mach-O file (thin or universal).
+is_macho() {
+    case "$(head -c 4 "$1" | xxd -p)" in
+        cffaedfe|cafebabe|cefaedfe) return 0 ;;
+    esac
+    return 1
+}

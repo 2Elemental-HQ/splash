@@ -194,3 +194,77 @@ final class RequirementsTests: XCTestCase {
         XCTAssertEqual(checks.first { $0.id == "chip" }?.ok, false)
     }
 }
+
+final class RuntimeBundleTests: XCTestCase {
+    func stage(release: [String: Any]? = nil, extra: [String: String] = [:]) throws -> URL {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rt-\(UUID().uuidString.prefix(6))")
+        let fm = FileManager.default
+        for dir in ["bin", "engine", "server"] { try fm.createDirectory(at: root.appendingPathComponent(dir), withIntermediateDirectories: true) }
+        try "#!/bin/sh\necho Splash".write(to: root.appendingPathComponent("bin/splash"), atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.appendingPathComponent("bin/splash").path)
+        try Data("engine".utf8).write(to: root.appendingPathComponent("engine/splash"))
+        try Data("lib".utf8).write(to: root.appendingPathComponent("engine/splash.metallib"))
+        try Data("server".utf8).write(to: root.appendingPathComponent("server/server.py"))
+        let engine = RuntimeBundle.sha256(of: root.appendingPathComponent("engine/splash"))!
+        let metallib = RuntimeBundle.sha256(of: root.appendingPathComponent("engine/splash.metallib"))!
+        let rel = release ?? ["version": "9.9.9-test", "binary_sha256": engine, "metallib_sha256": metallib, "features": ["drain"]]
+        try JSONSerialization.data(withJSONObject: rel).write(to: root.appendingPathComponent("release.json"))
+        var files = ["engine/splash": engine, "engine/splash.metallib": metallib,
+                     "server/server.py": RuntimeBundle.sha256(of: root.appendingPathComponent("server/server.py"))!,
+                     "bin/splash": RuntimeBundle.sha256(of: root.appendingPathComponent("bin/splash"))!,
+                     "release.json": RuntimeBundle.sha256(of: root.appendingPathComponent("release.json"))!]
+        files.merge(extra) { $1 }
+        try JSONSerialization.data(withJSONObject: ["runtime_version": rel["version"] ?? "", "files": files]).write(to: root.appendingPathComponent("runtime-manifest.json"))
+        return root
+    }
+
+    func testIntactRuntimeVerifies() throws {
+        let check = RuntimeBundle.verify(root: try stage())
+        XCTAssertEqual(check.state, .verified, "\(check.problems)")
+        XCTAssertEqual(check.version, "9.9.9-test")
+        XCTAssertTrue(check.drainDeclared)
+    }
+
+    func testAChangedFileFailsTheCheck() throws {
+        let root = try stage()
+        try Data("tampered".utf8).write(to: root.appendingPathComponent("server/server.py"))
+        let check = RuntimeBundle.verify(root: root)
+        XCTAssertEqual(check.state, .failed)
+        XCTAssertTrue(check.problems.contains("changed: server/server.py"))
+    }
+
+    func testAMissingFileAndAReplacedEngineFail() throws {
+        let root = try stage()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("engine/splash.metallib"))
+        XCTAssertTrue(RuntimeBundle.verify(root: root).problems.contains("missing or unreadable: engine/splash.metallib"))
+    }
+
+    func testReleaseJsonMustDescribeTheEngineThatShips() throws {
+        let root = try stage(release: ["version": "9.9.9-test", "binary_sha256": String(repeating: "0", count: 64), "features": []])
+        let check = RuntimeBundle.verify(root: root)
+        XCTAssertEqual(check.state, .failed)
+        XCTAssertTrue(check.problems.contains { $0.contains("binary_sha256") })
+        XCTAssertFalse(check.drainDeclared)
+    }
+
+    func testManifestPathsCannotEscapeTheRuntime() throws {
+        let check = RuntimeBundle.verify(root: try stage(extra: ["../../etc/hosts": "00"]))
+        XCTAssertEqual(check.state, .failed)
+        XCTAssertTrue(check.problems.contains { $0.hasPrefix("unexpected path") })
+    }
+
+    func testMissingManifestFails() throws {
+        let root = try stage()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("runtime-manifest.json"))
+        XCTAssertEqual(RuntimeBundle.verify(root: root).state, .failed)
+    }
+
+    func testBundledRuntimeIsPreferredAndInstalledOneIsLeftAlone() throws {
+        let root = try stage()
+        XCTAssertEqual(SplashLocator.resolve(preferred: nil, bundledRoot: root)?.source, .bundled)
+        XCTAssertEqual(SplashLocator.resolve(preferred: nil, preferInstalled: true, bundledRoot: root)?.source,
+                       FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/splash") || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/splash") ? .installed : .bundled)
+        XCTAssertEqual(SplashLocator.resolve(preferred: "/bin/ls", bundledRoot: root)?.source, .custom)
+        XCTAssertNil(SplashLocator.resolve(preferred: nil, bundledRoot: nil).flatMap { $0.source == .bundled ? $0 : nil })
+    }
+}

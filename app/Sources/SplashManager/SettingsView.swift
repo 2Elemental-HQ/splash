@@ -22,6 +22,17 @@ struct SettingsView: View {
                     Text(supervisor.install?.executable.path ?? "not found").textSelection(.enabled)
                 }
                 LabeledContent("Version", value: supervisor.install?.version ?? "unknown")
+                LabeledContent("Source", value: {
+                    switch supervisor.install?.source {
+                    case .bundled?: return "Bundled with this app" + (supervisor.install?.runtime?.drainDeclared == true ? " (can drain)" : "")
+                    case .installed?: return "Installed on this Mac (not changed by this app)"
+                    case .custom?: return "Custom path"
+                    case nil: return "none"
+                    }
+                }())
+                if let problem = supervisor.runtimeProblem { Text(problem).foregroundStyle(.red).font(.caption) }
+                Toggle("Prefer the Splash installed on this Mac over the bundled one", isOn: Binding(get: { s.preferInstalledSplash }, set: { v in apply { $0.preferInstalledSplash = v } }))
+                Text("The installed Splash (Homebrew) cannot drain, so stop and switch need confirmation with it.").font(.caption).foregroundStyle(.secondary)
                 HStack {
                     TextField("Path override", text: Binding(get: { s.splashPath ?? "" }, set: { v in apply { $0.splashPath = v.isEmpty ? nil : v } }), prompt: Text("default: Homebrew"))
                     Button("Choose…") { choose() }

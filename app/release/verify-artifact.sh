@@ -28,6 +28,21 @@ check "app has a secure timestamp" bash -c "codesign -dvv '$APP' 2>&1 | grep -q 
 check "app has a team identifier" bash -c "codesign -dvv '$APP' 2>&1 | grep -q '^TeamIdentifier=[A-Z0-9]\{10\}'"
 check "app carries a notarization ticket" xcrun stapler validate "$APP"
 check "Gatekeeper accepts the app" spctl --assess --type execute --verbose=2 "$APP"
+RT="$APP/Contents/Resources/Splash"
+check "the Splash runtime is bundled" test -x "$RT/bin/splash"
+check "the runtime passes the app's own integrity check (manifest, release.json)" "$APP/Contents/MacOS/SplashManager" --verify-runtime
+check "release.json declares drain support" bash -c "grep -q '\"drain\"' '$RT/release.json'"
+check "the runtime's server has the drain patch" bash -c "grep -q SIGUSR1 '$RT/server/server.py'"
+check "every Mach-O file in the runtime is Developer ID signed, hardened, timestamped" bash -c '
+    n=0; bad=0
+    while IFS= read -r -d "" f; do
+        case "$(head -c 4 "$f" | xxd -p)" in cffaedfe|cafebabe|cefaedfe) ;; *) continue ;; esac
+        n=$((n+1)); i=$(codesign -dvv "$f" 2>&1)
+        echo "$i" | grep -q "Authority=Developer ID Application:" && echo "$i" | grep -q "flags=.*runtime" && echo "$i" | grep -q "^Timestamp=" && codesign --verify --strict "$f" 2>/dev/null || { echo "not properly signed: $f"; bad=$((bad+1)); }
+    done < <(find "'"$RT"'" -type f -print0)
+    echo "$n Mach-O files checked"; [ "$n" -gt 60 ] && [ "$bad" = 0 ]'
+check "the app has no other code than its executable and the runtime" bash -c '
+    find "'"$APP"'" -type f ! -path "'"$APP"'/Contents/MacOS/SplashManager" ! -path "'"$RT"'/*" -print0 | while IFS= read -r -d "" f; do case "$(head -c 4 "$f" | xxd -p)" in cffaedfe|cafebabe|cefaedfe) echo "$f";; esac; done | grep -q . && exit 1 || exit 0'
 check "app is arm64 only (no Intel code is claimed)" bash -c "[ \"\$(lipo -archs '$APP/Contents/MacOS/SplashManager')\" = arm64 ]"
 check "app declares macOS 14.0 as its minimum" bash -c "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' '$APP/Contents/Info.plist')\" = 14.0 ]"
 check "binary targets macOS 14.0" bash -c "vtool -show-build '$APP/Contents/MacOS/SplashManager' | grep -q 'minos 14.0'"
