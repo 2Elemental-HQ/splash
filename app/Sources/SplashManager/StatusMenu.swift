@@ -42,21 +42,18 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                      NSApplication.didUpdateNotification, NSMenu.didEndTrackingNotification, NSMenu.didBeginTrackingNotification,
                      NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] where name != NSApplication.didUpdateNotification {
             notes.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] n in
-                MainActor.assumeIsolated { self?.note("notification \(n.name.rawValue)") }
+                MainActor.assumeIsolated {
+                    let who = (n.object as? NSWindow).map { "\(type(of: $0)) title=\($0.title) visible=\($0.isVisible) level=\($0.level.rawValue)" } ?? "\(String(describing: n.object))"
+                    self?.note("notification \(n.name.rawValue) \(who)")
+                }
             })
         }
         env.supervisor.$state.dropFirst().sink { [weak self] value in self?.note("supervisor.state = \(value.rawValue)") }.store(in: &bag)
     }
 
-    /// Opens the real menu as a click on the item does; returns when it closes. For the self test.
-    func openForTest() {
-        // Presented directly under the item, the way a click presents it; no synthetic mouse events involved.
-        guard let window = item.button?.window else { return }
-        // A menu of an inactive app is dismissed as soon as another app takes focus.
-        NSApp.activate(ignoringOtherApps: true)
-        let frame = window.frame
-        menu.popUp(positioning: nil, at: NSPoint(x: frame.minX, y: frame.minY), in: nil)
-    }
+    /// What AppKit does around a displayed menu, called by hand for the self test: `menuNeedsUpdate`, then `menuWillOpen`.
+    func simulateOpen() { menuNeedsUpdate(menu); menuWillOpen(menu) }
+    func simulateClose() { menuDidClose(menu) }
 
     private func updateIcon() {
         // Changing the item's image while its menu is open can dismiss the menu; do it when it closes.

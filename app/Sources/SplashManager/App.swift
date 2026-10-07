@@ -53,6 +53,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowController = windows
         statusMenu = menu
         if CommandLine.arguments.contains("--selftest-menu") { MenuSelfTest.run(menu: menu, env: env) }
+        if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count {
+            Snapshot.run(into: CommandLine.arguments[index + 1])
+        }
     }
 
     /// A second launch (or a click on the app in Finder) opens the window.
@@ -123,33 +126,5 @@ final class MainWindowController {
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
-    }
-}
-
-@main
-struct SplashManagerApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    init() {
-        // `SplashManager --print-token` prints the management token for scripts and exits.
-        if CommandLine.arguments.contains("--print-token") {
-            let store = KeychainStore(service: ProcessInfo.processInfo.environment["SPLASH_MANAGER_KEYCHAIN_SERVICE"] ?? "net.2elemental.splash-manager")
-            print((try? Secrets.ensure(SecretAccount.managementToken, in: store)) ?? "")
-            exit(0)
-        }
-        // `SplashManager --verify-runtime` checks the bundled Splash runtime against its manifest and exits 0 or 1.
-        if CommandLine.arguments.contains("--verify-runtime") {
-            guard let root = RuntimeBundle.root() else { print("no bundled runtime"); exit(1) }
-            let check = RuntimeBundle.verify(root: root)
-            print("runtime \(check.version ?? "?"): \(check.state.rawValue)\(check.problems.isEmpty ? "" : " - " + check.problems.joined(separator: "; "))")
-            exit(check.state == .verified ? 0 : 1)
-        }
-        if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count {
-            Snapshot.run(into: CommandLine.arguments[index + 1])
-        }
-    }
-
-    // The menu bar item and the window are AppKit (see StatusMenu.swift, MainWindowController); the app needs one scene.
-    var body: some Scene {
-        Settings { EmptyView() }
     }
 }

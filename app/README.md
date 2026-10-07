@@ -89,12 +89,18 @@ tests on macOS without any secret. Which jobs run depends on what changed: see "
 | `RuntimeBundle.swift` | Finds the bundled runtime and checks it against its manifest |
 | `Spawn.swift`, `Secrets.swift`, `Logs.swift` | `posix_spawn` and pid identity, Keychain, redaction |
 
-### The menu does not move while it is open
+### The menu stays put while it is open
 
-A `MenuBarExtra` rebuilds its menu whenever an observed object announces a change, and the supervisor announced a change on every
-poll: `@Published` announces each assignment, equal or not (measured with a 0.1 s poll: 119 announcements in 2 s of steady polling in 0.3.0, 0 now). The menu is now
-an `NSStatusItem` with an `NSMenu` built in `menuNeedsUpdate`, only while closed; the supervisor assigns only changed values; the icon
-is updated when the menu closes. `release/test-menu.sh` drives the real menu (see release/README.md).
+Two causes were found for the Model submenu closing:
+
+1. The supervisor announced a change on every poll: `@Published` announces each assignment, equal or not (measured with a 0.1 s poll:
+   119 announcements in 2 s of steady polling in 0.3.0, 0 now), and a SwiftUI `MenuBarExtra` rebuilds its menu on each announcement.
+2. The app had a SwiftUI scene whose window took key focus when the app activated. The timeline of a test run shows that
+   window (`Splash Manager Settings`) becoming key at the moment the menu opened, and the menu's own popup window resigning key.
+
+Now the app is plain AppKit (`main.swift`, no SwiftUI scene, so no stray window): an `NSStatusItem` whose `NSMenu` is built in
+`menuNeedsUpdate`, only while the menu is closed. The supervisor assigns only changed values, and the icon changes when the menu closes.
+`release/test-menu.sh` checks the controller against the real supervisor (see release/README.md for what it does and does not prove).
 
 ### Applied against saved
 

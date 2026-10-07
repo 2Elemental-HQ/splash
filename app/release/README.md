@@ -100,11 +100,16 @@ other configuration runs; stop. It does not replace the clean-second-Mac test ab
 release/test-menu.sh release/out/SplashManager-<version>-arm64.dmg
 ```
 
-Starts the app from a copy with `--selftest-menu`: its real `NSMenu` is presented in tracking mode and kept open for 35 s while this script
-starts Splash through the API, so the supervisor's state really changes (stopped, starting, ready) under the open menu. The test fails if the menu
-closed or was rebuilt by itself, if the Model submenu object was replaced, or if choosing the other model in the submenu (the action a click
-triggers) was not saved. It takes focus for a moment. It is **not a physical mouse click**: synthesising one needs the Accessibility permission, and
-an unattended run cannot be granted it. A physical check (hover Model while Splash starts) remains a human step.
+Runs the app from a copy with `--selftest-menu`. Its real menu controller and `NSMenu` are "opened" the way AppKit opens them
+(`menuNeedsUpdate`, then `menuWillOpen`) and held open for 35 s while this script starts Splash through the API, so the real supervisor
+goes stopped, starting, ready and announces dozens of changes under the open menu. Then the other model is chosen through the Model
+submenu item's own action, the menu is closed and opened again. It fails if the menu was rebuilt or its items, titles or submenu were replaced
+while open, if the supervisor's change did not occur, if the choice was not saved, or if the next opening does not show the new state and the check mark.
+It shows nothing on screen and takes no focus.
+
+What it does **not** prove: that the menu looks right, or that a physical hover over *Model* while Splash starts keeps it open. A menu
+presented by a program with no mouse button down is dismissed by macOS after a second or two (its popup window resigns key by itself),
+and a synthetic click needs the Accessibility permission that an unattended run cannot get. That check stays with a person.
 
 ## Continuous integration
 
