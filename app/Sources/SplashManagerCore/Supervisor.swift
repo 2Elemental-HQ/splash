@@ -280,6 +280,7 @@ public final class SplashSupervisor: ObservableObject {
         }
         if ownership == .none { return try await start(configId: configId, allowDownload: allowDownload) }
         if let current = applied, current.configId == target.id, current.spec == spec { return snapshot() }
+        try validatePackage(target)
         let assessment = assess(target)
         if assessment.availability == .notLocal, !allowDownload { throw downloadRequired(target, assessment) }
         let id = identity
@@ -483,7 +484,7 @@ public final class SplashSupervisor: ObservableObject {
                 id: config.id, displayName: config.displayName, modelId: config.modelId, revision: config.revision,
                 availability: loaded ? .loaded : assessment.availability,
                 selected: selected == config.id, active: isActive,
-                missing: assessment.missing, downloadRequired: assessment.availability == .notLocal,
+                missing: assessment.missing, downloadRequired: assessment.availability == .notLocal && !assessment.missing.isEmpty,
                 incomplete: assessment.incomplete, draftSource: assessment.draftSource.rawValue,
                 verifiedStartAt: store.verifiedStart(modelId: config.modelId, revision: config.revision),
                 note: isActive && !runs ? "Saved changes are not applied yet; switch to restart with them." : assessment.note,
@@ -526,12 +527,20 @@ public final class SplashSupervisor: ObservableObject {
         }
     }
 
+    private func validatePackage(_ config: ModelConfig) throws {
+        if let install, install.version.compare("1.3.1", options: .numeric) != .orderedAscending,
+           let note = cache.unsupportedPackageNote(modelId: config.modelId, revision: config.revision) {
+            throw AppError("unsupported_model_package", note, status: 422)
+        }
+    }
+
     private func launch(_ config: ModelConfig, spec: EffectiveSpec, allowDownload: Bool, token: UUID) async throws {
         await refreshInstall()
         guard isCurrent(token) else { throw AppError("cancelled", "The operation was replaced.") }
         guard let install else {
             throw AppError("splash_not_installed", "No Splash executable was found. Install it with Homebrew or set its path in Settings.", status: 424)
         }
+        try validatePackage(config)
         let assessment = assess(config)
         if assessment.availability == .notLocal, !allowDownload { throw downloadRequired(config, assessment) }
 

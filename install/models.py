@@ -8,8 +8,7 @@ Terms the installer modules share:
   serves it.
 - assembly: the directory an upstream model is served from, of links to
   source snapshot files and its record, model.json (assembly.py), built and
-  published by upstream.py. A legacy Splash package is served from its own
-  Hub snapshot instead (legacy.py).
+  published by upstream.py.
 - source snapshot: a repository at one commit in the Hub cache, or a local
   draft directory (hub.py).
 
@@ -49,8 +48,15 @@ MODELS = paths.MODELS
 # kilobytes, so a larger one is refused unread. The engine bounds the files it
 # reads by its own rule.
 MAX_JSON_BYTES = 4 * 1024 * 1024
-# What installation_kind finds at a selection link.
+# What installation_kind finds at a selection link: an assembly, or a Splash
+# package an earlier release installed.
 ASSEMBLY, PACKAGE = "assembly", "package"
+# Splash packages, the prebuilt format that predated upstream loading, are no
+# longer loaded: each package format names the MLX model of its family.
+PACKAGE_REPLACEMENTS = {
+    "splash-packed-q4": "mlx-community/Qwen3.8-27B-4bit",
+    "splash-packed-q4-moe": "mlx-community/Qwen3.6-35B-A3B-4bit",
+}
 # Staging an interrupted installation leaves, which garbage collection
 # removes: a selection link being replaced (beside the link), and an assembly
 # or derived metadata entry being written (beside the published entries).
@@ -246,13 +252,36 @@ class Selection:
 
 
 def installation_kind(link: Path):
-    """What serves a selection link: an assembly (its model.json), a legacy
-    Splash package (its manifest.json), or nothing (None)."""
+    """What serves a selection link: an assembly (its model.json), a Splash
+    package an earlier release installed (its manifest.json), or nothing
+    (None)."""
     if (link / "model.json").exists():
         return ASSEMBLY
     if (link / "manifest.json").exists():
         return PACKAGE
     return None
+
+
+def refuse_package(model, manifest, link=None):
+    """Raise for a Splash package, whose manifest.json names a package format,
+    with the MLX model to serve instead; another tool's manifest.json passes.
+    For a package an earlier release installed at link, a link to its Hub
+    snapshot, the message names the Hub cache folder holding its files, which
+    nothing reads any more."""
+    format_ = manifest.get("format") if isinstance(manifest, dict) else None
+    name = format_.get("name") if isinstance(format_, dict) else None
+    if name in PACKAGE_REPLACEMENTS:
+        snapshot = link.resolve() if link is not None and link.is_symlink() else None
+        files = ""
+        if snapshot and snapshot.parent.name == "snapshots":
+            folder = snapshot.parent.parent
+            if folder.name.startswith("models--"):
+                files = f" (its files in {folder} can be deleted)"
+        raise ModelError(
+            f"{model} is a Splash package, which Splash no longer loads{files}; "
+            f"serve the MLX model of its family instead: splash serve --model "
+            f"{PACKAGE_REPLACEMENTS[name]}"
+        )
 
 
 @contextmanager
@@ -332,7 +361,7 @@ def main(argv=None):
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
-    from . import assembly, legacy, upstream
+    from . import assembly, upstream
 
     try:
         # The launcher starts this with the stop signals blocked, so that one
@@ -342,12 +371,15 @@ def main(argv=None):
             upstream.prepare(selection)
         else:
             kind = installation_kind(selection.link)
-            if kind == ASSEMBLY:
-                assembly.verify(selection.link, full=args.full)
-            elif kind == PACKAGE:
-                legacy.verify(selection.link, selection.repo_id, full=args.full)
-            else:
+            if kind == PACKAGE:
+                refuse_package(
+                    args.model,
+                    read_json(selection.link / "manifest.json"),
+                    selection.link,
+                )
+            if kind != ASSEMBLY:
                 raise ModelError(f"{args.model} is not installed in {args.models}")
+            assembly.verify(selection.link, full=args.full)
             print(
                 f"Splash model {args.model} preflight passed "
                 f"({'full' if args.full else 'quick'})."

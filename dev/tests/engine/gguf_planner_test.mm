@@ -115,6 +115,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
       return tensors;
     };
     for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
+      if (quant_affine_format(format)) continue;   // no GGUF tensor type
       const uint32_t type = kQuantFormats[format].ggml_type;
       writeGguf(path, tensorsWith(type, type), g);
       const Plan result = plan(path, g);

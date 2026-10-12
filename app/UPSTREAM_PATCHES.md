@@ -47,7 +47,16 @@ The Homebrew package does not have it. Build this fork (`make`, see DEVELOPMENT.
 
 ## When merging upstream
 
-* `git merge upstream/main`. Conflicts can only occur in the two server files above.
+* Merge the selected upstream release commit. Review both server files, tests and CI even when Git reports no conflicts.
 * After resolving, run `python -m unittest dev.tests.server.test_drain` and the HTTP transport tests.
 * If upstream adds its own graceful drain, drop this patch, keep `http.draining` (or map the
   app's `Probe.draining` to the new status field) and delete this file.
+
+## Release 1.3.1 audit
+
+Integrated `f91c91e21dda483f8c59a248a444d0989a560d31` (84 commits after the fork base).
+No textual merge conflicts occurred. Comparing against that exact commit confirms the server diff
+is still only the original drain overlay; the HTTP admission lock, SIGUSR1 handler, held-request wait,
+503 `server_draining` response and `http.draining` capability field remain intact.
+Upstream's connection upload draining is unrelated to graceful generation shutdown. There is no
+native replacement in 1.3.1. The CI scope/record jobs remain around upstream's updated job bodies.

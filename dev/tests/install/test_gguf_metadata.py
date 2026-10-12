@@ -615,7 +615,9 @@ class GgufMetadataTests(unittest.TestCase):
         f32 = (vision_fixture(), [(name, GGML["F32"]) for name, _ in tensors])
         f16 = (vision_fixture(), [(tensors[0][0], GGML["F16"]), tensors[1]])
         text = (fixture(), tensors)
-        # Other publishers' names; F16 and non-vision files never count.
+        quantized = (vision_fixture(), [(tensors[0][0], GGML["Q8_0"]), tensors[1]])
+        # Other publishers' names; BF16 is preferred to F32 and F32 to F16, and
+        # non-vision files never count.
         repo = projectors(
             **{"mmproj-Model-bf16": bf16, "mmproj-Model-f16": f16, "mmproj-x": text}
         )
@@ -628,12 +630,16 @@ class GgufMetadataTests(unittest.TestCase):
             )[0],
             "mmproj-f32.gguf",
         )
+        only_f16 = projectors(**{"mmproj-f16": f16, "mmproj-x": text})
+        self.assertEqual(upstream.select_vision(only_f16)[0], "mmproj-f16.gguf")
         with self.assertRaisesRegex(
             models.ModelError,
-            r"no BF16 or F32 vision projector \(mmproj-f16.gguf \(clip: F16, F32\); "
+            r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\); use --language-only",
         ):
-            upstream.select_vision(projectors(**{"mmproj-f16": f16, "mmproj-x": text}))
+            upstream.select_vision(
+                projectors(**{"mmproj-q8": quantized, "mmproj-x": text})
+            )
         with self.assertRaisesRegex(
             models.ModelError, "several BF16 vision projectors"
         ):

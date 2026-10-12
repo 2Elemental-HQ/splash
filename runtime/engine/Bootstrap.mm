@@ -124,7 +124,9 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
       nativeLoop_(std::move(nativeLoop)),
       memoryControl_(resources_->memoryGovernor(), resources_->backend(),
                      *nativeLoop_),
-      report_(std::move(report)) {}
+      report_(std::move(report)) {
+  sampleThermalState();
+}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
   // Refuse new commands before the loop, the model and the resources they
@@ -144,7 +146,13 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot());
+      resources_->aneFfnSnapshot(), thermalState_.state());
+}
+
+void RuntimeBootstrap::sampleThermalState() {
+  const std::string transition = thermalState_.update(queryThermalState());
+  if (!transition.empty())
+    logLine(transition);
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
@@ -345,6 +353,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     config.nativeLoop.weights = &resources->releasableMemory();
+    config.nativeLoop.weightAdmission = resources->memoryGovernor().allocationAdmission();
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(

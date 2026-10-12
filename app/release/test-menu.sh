@@ -30,10 +30,23 @@ python3 - "$WORK/state/support/config.json" "$MGMT" "$INFER" <<'PY' || { echo "n
 import glob, json, os, sys
 out, mgmt, infer = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 cache = os.environ.get("HF_HUB_CACHE") or (os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else os.path.expanduser("~/.cache/huggingface/hub"))
-cands = [(os.path.basename(r)[8:].replace("--", "/"), os.path.basename(p)) for r in sorted(glob.glob(os.path.join(cache, "models--*")))
-         if not r.lower().endswith("dflash2") for p in glob.glob(os.path.join(r, "refs", "splash", "*", "*"))]
-if not cands: sys.exit(1)
-model, rev = cands[0]
+# Explicit selection allows the same gate to exercise a cached GGUF variant.
+model = os.environ.get("SPLASH_TEST_MODEL")
+rev = os.environ.get("SPLASH_TEST_REVISION")
+if not model:
+    cands = []
+    for repo in sorted(glob.glob(os.path.join(cache, "models--*"))):
+        name = os.path.basename(repo)[8:].replace("--", "/")
+        if name.lower().endswith("dflash2"): continue
+        for pin in glob.glob(os.path.join(repo, "refs", "splash", "*", "*")):
+            commit = os.path.basename(pin)
+            snapshot = os.path.join(repo, "snapshots", commit)
+            # Auto-select MLX only: a GGUF needs an explicit variant, and old
+            # Splash packages no longer load in 1.3.1.
+            if os.path.isfile(os.path.join(snapshot, "config.json")) and glob.glob(os.path.join(snapshot, "*.safetensors")):
+                cands.append((name, commit))
+    if not cands: sys.exit("Set SPLASH_TEST_MODEL and SPLASH_TEST_REVISION to a cached MLX or GGUF model")
+    model, rev = cands[0]
 cfg = lambda i, n, **o: {"id": i, "displayName": n, "modelId": model, "revision": rev, "options": {**o}}
 json.dump({"configs": [cfg("base", "Base"), cfg("ctx64k", "64K context", maxContext="64K")],
            "settings": {"inferencePort": infer, "managementPort": mgmt, "selectedConfigId": "base"}}, open(out, "w"))

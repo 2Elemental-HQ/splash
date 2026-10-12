@@ -59,7 +59,7 @@ public final class ManagementAPI {
             guard let config = supervisor.store.config(id: id) else { throw AppError("unknown_config", "No such configuration.", status: 404) }
             let assessment = supervisor.assess(config)
             let estimates = await DownloadEstimator.estimate(modelId: config.modelId, revision: config.revision, missing: assessment.missing)
-            return try encode(200, EstimateBody(configId: id, downloadRequired: assessment.availability == .notLocal,
+            return try encode(200, EstimateBody(configId: id, downloadRequired: assessment.availability == .notLocal && !assessment.missing.isEmpty,
                                                 missing: assessment.missing, estimates: estimates))
         }
         switch (request.method, tail) {

@@ -147,7 +147,7 @@ jobs:
         run: |
           app="build/Splash Manager.app"
           "$app/Contents/MacOS/SplashManager" --verify-runtime
-          "$app/Contents/Resources/Splash/bin/splash" --version | grep -q "1.3.0-drain.1"
+          "$app/Contents/Resources/Splash/bin/splash" --version | grep -q "1.3.1-drain.1"
           grep -q SIGUSR1 "$app/Contents/Resources/Splash/server/server.py"
       - name: Release script refuses without a Developer ID identity
         working-directory: app
