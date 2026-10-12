@@ -77,7 +77,12 @@ public struct HFCache: Sendable {
         if let replacement = official[modelId] {
             return "Splash 1.3.1 no longer loads Splash packages. Add \(replacement) as a new configuration; its revision differs from this package's. Your existing configuration and cached files are kept."
         }
-        guard let commit = installedCommit(for: modelId, revision: revision),
+        // An uncached explicit revision says nothing about its format; another
+        // installed revision may still be a legacy package of the same model.
+        let snapshotCommit = revision == nil
+            ? installedCommit(for: modelId, revision: nil)
+            : commit(for: modelId, revision: revision)
+        guard let commit = snapshotCommit,
               let data = try? Data(contentsOf: snapshotDirectory(modelId, commit: commit).appendingPathComponent("manifest.json")),
               let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let format = manifest["format"] as? [String: Any],
