@@ -67,6 +67,43 @@ public struct HFCache: Sendable {
         return families?.first { lower.contains($0.name.lowercased()) }?.draftRepo
     }
 
+    /// The two official packages have direct replacements. Community packages
+    /// are identified by their manifest, never by a repository-name suffix.
+    public func unsupportedPackageNote(modelId: String, revision: String?) -> String? {
+        let official = [
+            "incoai/Qwen3.8-27B-Splash": "mlx-community/Qwen3.8-27B-4bit",
+            "incoai/Qwen3.6-35B-A3B-Splash": "mlx-community/Qwen3.6-35B-A3B-4bit",
+        ]
+        if let replacement = official[modelId] {
+            return "Splash 1.3.1 no longer loads Splash packages. Add \(replacement) as a new configuration; its revision differs from this package's. Your existing configuration and cached files are kept."
+        }
+        // An uncached explicit revision says nothing about its format; another
+        // installed revision may still be a legacy package of the same model.
+        let snapshotCommit = revision == nil
+            ? installedCommit(for: modelId, revision: nil)
+            : commit(for: modelId, revision: revision)
+        guard let commit = snapshotCommit,
+              let data = try? Data(contentsOf: snapshotDirectory(modelId, commit: commit).appendingPathComponent("manifest.json")),
+              let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let format = manifest["format"] as? [String: Any],
+              let name = format["name"] as? String,
+              ["splash-packed-q4", "splash-packed-q4-moe"].contains(name) else { return nil }
+        return "Splash 1.3.1 no longer loads this Splash package. Add the same fine-tune's MLX or GGUF release as a new configuration. Your existing configuration and cached files are kept."
+    }
+
+    /// Match upstream's root-only GGUF selection; vision projectors are not targets.
+    static func ggufTargets(_ names: [String]) -> [String] {
+        names.filter { !$0.contains("/") && $0.hasSuffix(".gguf") && !$0.lowercased().contains("mmproj") }.sorted()
+    }
+
+    static func ggufVariants(_ targets: [String]) -> [String] {
+        let parts = targets.map { String($0.dropLast(5)).components(separatedBy: "-") }
+        guard let first = parts.first, parts.count > 1 else { return [] }
+        var shared = 0
+        while shared < first.count && parts.allSatisfy({ $0.count > shared && $0[shared] == first[shared] }) { shared += 1 }
+        return parts.map { $0.dropFirst(shared).joined(separator: "-") }
+    }
+
     public enum Kind { case target, draft }
 
     /// Files missing or unreadable in one snapshot, empty when the set looks complete.
@@ -77,24 +114,17 @@ public struct HFCache: Sendable {
         func present(_ name: String) -> Bool { fm.fileExists(atPath: base.appendingPathComponent(name).path) }
         let names = files(repo, commit: commit)
         var problems: [String] = []
+        let targets = Self.ggufTargets(names)
+        if variant == nil && !names.contains(where: { $0.hasSuffix(".safetensors") }) && !targets.isEmpty {
+            guard targets.count == 1 else { return ["select a GGUF variant: " + Self.ggufVariants(targets).joined(separator: ", ")] }
+            return present(targets[0]) ? [] : ["\(targets[0]) is unreadable"]
+        }
         if let variant {
-            let ggufs = names.filter { $0.lowercased().hasSuffix(".gguf") && $0.lowercased().contains(variant.lowercased()) }
-            if ggufs.isEmpty { return ["no .gguf file for \(variant)"] }
-            for file in ggufs where !present(file) { problems.append("\(file) is unreadable") }
-            // Split files are named name-00001-of-0000N.gguf; every part must be there.
-            if let regex = try? NSRegularExpression(pattern: "-(\\d{5})-of-(\\d{5})\\.gguf$", options: .caseInsensitive) {
-                for file in ggufs {
-                    let range = NSRange(file.startIndex..., in: file)
-                    if let match = regex.firstMatch(in: file, range: range), let total = Range(match.range(at: 2), in: file).flatMap({ Int(file[$0]) }) {
-                        let prefix = String(file[..<Range(match.range, in: file)!.lowerBound])
-                        for index in 1...max(1, total) {
-                            let part = "\(prefix)-\(String(format: "%05d", index))-of-\(String(format: "%05d", total)).gguf"
-                            if !ggufs.contains(where: { $0.caseInsensitiveCompare(part) == .orderedSame }) { problems.append("missing part \(part)") }
-                        }
-                    }
-                }
-            }
-            return Array(Set(problems)).sorted()
+            let variants = Self.ggufVariants(targets)
+            let exact = zip(targets, variants).filter { $0.1.caseInsensitiveCompare(variant) == .orderedSame }.map { $0.0 }
+            let selected = exact.isEmpty ? targets.filter { String($0.dropLast(5)).lowercased().hasSuffix("-" + variant.lowercased()) } : exact
+            guard selected.count == 1 else { return ["no single root .gguf file for \(variant)"] }
+            return present(selected[0]) ? [] : ["\(selected[0]) is unreadable"]
         }
         if !present("config.json") { problems.append("config.json") }
         if kind == .target, !present("tokenizer.json") { problems.append("tokenizer.json") }
@@ -134,6 +164,9 @@ public struct HFCache: Sendable {
             let found = problems(repo: repo, commit: commit, kind: kind, gguf: variant)
             if !found.isEmpty { missing.append(repo); incomplete[repo] = found }
         }
+        if let note = unsupportedPackageNote(modelId: modelId, revision: revision) {
+            return Assessment(availability: .notLocal, missing: [], incomplete: [:], draftSource: .unknown, note: note)
+        }
         check(repo, revision: revision, kind: .target, variant: variant, anyInstalled: revision == nil)
 
         var source = DraftSource.unknown
@@ -171,7 +204,15 @@ public struct HFCache: Sendable {
                 let commits = (try? fm.contentsOfDirectory(atPath: pins.appendingPathComponent(install).path)) ?? []
                 for commit in commits where commit.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil
                     && fm.fileExists(atPath: snapshotDirectory(repo, commit: commit).path) && seen.insert(commit).inserted {
-                    result.append(Candidate(modelId: repo, revision: commit))
+                    let targets = Self.ggufTargets(files(repo, commit: commit))
+                    let variants = Self.ggufVariants(targets)
+                    if targets.count > 1 {
+                        for variant in variants where !variant.isEmpty {
+                            result.append(Candidate(modelId: repo + ":" + variant, revision: commit))
+                        }
+                    } else {
+                        result.append(Candidate(modelId: repo, revision: commit))
+                    }
                 }
             }
         }

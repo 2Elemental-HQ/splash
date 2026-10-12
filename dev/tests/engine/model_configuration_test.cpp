@@ -11,6 +11,7 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/WeightStore.hpp"
 
 #include <filesystem>
 #include <initializer_list>
@@ -89,6 +90,11 @@ void testFamilies(const std::filesystem::path &fixtures) {
               denseDescriptor.targetSource == model::TargetSource::Mlx && !denseDescriptor.hasVision() &&
               denseDescriptor.draft == model::kQwen3_8DraftLayout,
           "an MLX Qwen3.8-27B made another descriptor");
+  // The sources' identity is the digest of the record naming them.
+  require(denseDescriptor.sourceIdentity == model::weightDigest(dense.record) &&
+              inspect(dense.with(&SourceModel::record, "community/fine-tune", "community/other"))
+                      .sourceIdentity != denseDescriptor.sourceIdentity,
+          "the sources' identity is not the digest of the record naming them");
   require(inspect(dense.with(&SourceModel::record, R"("none")", R"("safetensors")")).visionSource ==
               model::VisionSource::Mlx,
           "an MLX Qwen3.8-27B with its vision tower made another descriptor");
@@ -120,8 +126,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
 }
 
 // A descriptor states where its weights come from: one that leaves either
-// source unset, which draftFromCheckpoint and hasVision would read as a
-// checkpoint draft and a vision tower, is not valid.
+// source unset, which hasVision would read as a vision tower, is not valid.
 void testSources() {
   const auto described = [](model::TargetSource target, model::VisionSource vision) {
     return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
@@ -190,13 +195,64 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
           "upstream model config exceeds 1048576 bytes", "an oversized config was read");
 }
 
-// An MLX target states each module's quantization as its images read it: 4
-// bits in groups of 64 in MLX's affine mode, a MoE's router and shared-expert
-// gate at 8 bits, each module by its own entry or else the object's. A GGUF
-// target has none (above).
+// An MLX target's quantization is MLX's own object: the object and each
+// module's own entry name affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64
+// or 128, or mxfp4; an entry is affine unless it names its mode, and takes its
+// mode's default bits and group size (affine 4 and 64, mxfp4 4 and 32) when it
+// omits them, as MLX loads it. The entry false, which MLX writes for a module
+// it leaves unquantized, is refused for a projection, the head and the token
+// table, and accepted for the router, the shared-expert gate and GDN alpha and
+// beta. A GGUF target has none (above).
 void testQuantization(const std::filesystem::path &fixtures) {
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
+  static_cast<void>(inspect(dense));
+  static_cast<void>(inspect(moe));
+  // The dense object and the MoE's leading fields, as mxfp4.
+  const std::string_view affine = R"("group_size": 64,
+    "bits": 4,
+    "mode": "affine")";
+  const std::string_view mxfp4 = R"("group_size": 32,
+    "bits": 4,
+    "mode": "mxfp4")";
+  // The MoE router's entry.
+  const std::string_view router = R"("group_size": 64,
+      "bits": 8)";
+  // The object's first key, before which a module's entry is added.
+  const std::string_view object = R"("quantization": {)";
+  // The MoE's first router and shared-expert gate entries.
+  const std::string_view routerEntry = R"("language_model.model.layers.0.mlp.gate": {
+      "group_size": 64,
+      "bits": 8
+    })";
+  const std::string_view sharedGateEntry = R"("language_model.model.layers.0.mlp.shared_expert_gate": {
+      "group_size": 64,
+      "bits": 8
+    })";
+  struct Accepted final {
+    const SourceModel &model;
+    std::string_view from, to;
+  };
+  for (const Accepted &accepted : std::initializer_list<Accepted>{
+           {dense, R"("bits": 4)", R"("bits": 8)"},
+           {dense, R"("bits": 4)", R"("bits": 3)"},
+           {dense, R"("group_size": 64)", R"("group_size": 128)"},
+           {dense, affine, mxfp4},
+           // The router 4-bit; under an mxfp4 object, its 8-bit entry stays affine.
+           {moe, R"("bits": 8)", R"("bits": 4)"},
+           {moe, affine, mxfp4},
+           // An entry of only its bits takes affine's group of 64.
+           {moe, router, R"("bits": 8)"},
+           // An entry of only its mode: mxfp4, 4-bit in groups of 32.
+           {moe, router, R"("mode": "mxfp4")"},
+           // Modules the images also read unquantized (as F32).
+           {moe, routerEntry, R"("language_model.model.layers.0.mlp.gate": false)"},
+           {moe, sharedGateEntry, R"("language_model.model.layers.0.mlp.shared_expert_gate": false)"},
+           {dense, object, R"("quantization": {
+    "language_model.model.layers.0.linear_attn.in_proj_a": false,
+    "language_model.model.layers.0.linear_attn.in_proj_b": false,)"},
+       })
+    static_cast<void>(inspect(accepted.model.with(&SourceModel::config, accepted.from, accepted.to)));
   struct Refused final {
     const SourceModel &model;
     std::string_view from, to, error;
@@ -205,20 +261,41 @@ void testQuantization(const std::filesystem::path &fixtures) {
            // MLX's own object, not the quantization_config a transformers
            // checkpoint (GPTQ, AWQ, ...) states.
            {dense, R"("quantization": {)", R"("unused": {)",
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"},
-           {dense, R"("bits": 4)", R"("bits": 8)",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv bits mismatch: MLX 8, runtime 4"},
-           {dense, R"("group_size": 64)", R"("group_size": 32)",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv group_size mismatch"},
-           {dense, R"("mode": "affine")", R"("mode": "mxfp4")",
-            "quantization language_model.model.layers.0.linear_attn.in_proj_qkv mode must be affine"},
-           {dense, R"("quantization": {)", R"("quantization": {"language_model.lm_head": false,)",
-            "quantization language_model.lm_head must be an object"},
-           {moe, R"("bits": 8)", R"("bits": 4)",
-            "quantization language_model.model.layers.0.mlp.gate bits mismatch: MLX 4, runtime 8"},
+            "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, or "
+            "mxfp4) or a supported GGUF"},
+           {dense, R"("bits": 4)", R"("bits": 7)",
+            "quantization is affine 7-bit in groups of 64; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in "
+            "groups of 32, 64 or 128, or as mxfp4"},
+           {dense, R"("group_size": 64)", R"("group_size": 16)", "quantization is affine 4-bit in groups of 16"},
+           // A group past a byte is no format (4 bits in groups of 320 are not af5g64).
+           {dense, R"("group_size": 64)", R"("group_size": 320)", "quantization is affine 4-bit in groups of 320"},
+           {dense, R"("mode": "affine")", R"("mode": "nvfp4")", "quantization is nvfp4 4-bit in groups of 64"},
+           {moe, R"("bits": 8
+    },)", R"("bits": 8, "mode": "mxfp8"
+    },)", "quantization language_model.model.layers.0.mlp.gate is mxfp8 8-bit in groups of 64"},
        })
     refuses(refused.model.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "an MLX quantization was accepted with " + std::string(refused.to));
+  // A module the images read only quantized, left unquantized: a projection
+  // of each kind, the head and the token table.
+  struct Unquantized final {
+    const SourceModel &model;
+    std::string module;
+  };
+  for (const Unquantized &unquantized : std::initializer_list<Unquantized>{
+           {dense, "language_model.model.layers.3.self_attn.q_proj"},
+           {dense, "language_model.model.layers.0.linear_attn.in_proj_qkv"},
+           {dense, "language_model.model.layers.0.mlp.up_proj"},
+           {dense, "language_model.lm_head"},
+           {dense, "language_model.model.embed_tokens"},
+           {moe, "language_model.model.layers.0.mlp.switch_mlp.down_proj"},
+           {moe, "language_model.model.layers.0.mlp.shared_expert.gate_proj"},
+       })
+    refuses(unquantized.model.with(&SourceModel::config, object,
+                                   std::string(object) + "\"" + unquantized.module + "\": false,"),
+            "quantization " + unquantized.module +
+                " is unquantized; Splash loads quantized MLX projections and token tables",
+            "an unquantized " + unquantized.module + " was accepted");
 }
 
 // The vision tower the record names is the family's, over RGB patches of two

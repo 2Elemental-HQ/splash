@@ -50,7 +50,7 @@ for dir in server install; do
         file="$dir/${rel#"$dir"/}"
         case " $(echo $OVERLAY) " in *" $rel "*) continue ;; esac
         if [ ! -f "$REPO/$rel" ]; then echo "missing in the fork: $rel" >&2; drift=1
-        elif ! cmp -s "$REPO/$rel" "$SRC/$rel"; then echo "differs from upstream 1.3.0: $rel" >&2; drift=1; fi
+        elif ! cmp -s "$REPO/$rel" "$SRC/$rel"; then echo "differs from upstream 1.3.1: $rel" >&2; drift=1; fi
     done < <(cd "$SRC" && find "$dir" -type f ! -name '*.pyc' | sort)
 done
 [ "$drift" = 0 ] || fail "the fork's server/install files moved past the pinned upstream release. Bump release/runtime/UPSTREAM.json (and re-check the overlay), or revert."

@@ -39,14 +39,23 @@ python3 - "$ISO/support/config.json" "$MGMT" "$INFER" <<'PY' || { echo "no Splas
 import glob, json, os, sys
 out, mgmt, infer = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 cache = os.environ.get("HF_HUB_CACHE") or (os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else os.path.expanduser("~/.cache/huggingface/hub"))
-cands = []
-for repo in sorted(glob.glob(os.path.join(cache, "models--*"))):
-    name = os.path.basename(repo)[len("models--"):].replace("--", "/")
-    if name.lower().endswith("dflash2"): continue
-    for pin in glob.glob(os.path.join(repo, "refs", "splash", "*", "*")):
-        cands.append((name, os.path.basename(pin)))
-if not cands: sys.exit(1)
-model, rev = cands[0]
+# Explicit selection allows the same gate to exercise a cached GGUF variant.
+model = os.environ.get("SPLASH_TEST_MODEL")
+rev = os.environ.get("SPLASH_TEST_REVISION")
+if not model:
+    cands = []
+    for repo in sorted(glob.glob(os.path.join(cache, "models--*"))):
+        name = os.path.basename(repo)[8:].replace("--", "/")
+        if name.lower().endswith("dflash2"): continue
+        for pin in glob.glob(os.path.join(repo, "refs", "splash", "*", "*")):
+            commit = os.path.basename(pin)
+            snapshot = os.path.join(repo, "snapshots", commit)
+            # Auto-select MLX only: a GGUF needs an explicit variant, and old
+            # Splash packages no longer load in 1.3.1.
+            if os.path.isfile(os.path.join(snapshot, "config.json")) and glob.glob(os.path.join(snapshot, "*.safetensors")):
+                cands.append((name, commit))
+    if not cands: sys.exit("Set SPLASH_TEST_MODEL and SPLASH_TEST_REVISION to a cached MLX or GGUF model")
+    model, rev = cands[0]
 def cfg(i, n, **o): return {"id": i, "displayName": n, "modelId": model, "revision": rev, "options": {"disableANE": False, "languageOnly": False, "reasoning": "model_default", **o}}
 json.dump({"configs": [cfg("base", "Base"), cfg("ctx64k", "64K context", maxContext="64K")],
            "settings": {"inferencePort": infer, "managementPort": mgmt, "selectedConfigId": "base", "allowedHosts": [],
@@ -71,7 +80,7 @@ S=$(api /status)
 echo "  start-up status: $(echo "$S" | jq_ 'd["splash"]')"
 check "bundled runtime is used"            '[ "$(echo "$S" | jq_ "d[\"splash\"][\"source\"]")" = bundled ]'
 check "runtime integrity is reported"      '[ "$(echo "$S" | jq_ "d[\"splash\"][\"integrity\"]")" = verified ]'
-check "runtime version is the drain build" '[ "$(echo "$S" | jq_ "d[\"splash\"][\"version\"]")" = 1.3.0-drain.1 ]'
+check "runtime version is the drain build" '[ "$(echo "$S" | jq_ "d[\"splash\"][\"version\"]")" = 1.3.1-drain.1 ]'
 check "configurations came from the cache" '[ "$(api /configs | jq_ "len(d[\"configs\"])")" = 2 ]'
 
 api /start '{"config_id":"base","wait_ready_seconds":150}' 170 POST > "$WORK/start.json"
@@ -85,14 +94,22 @@ R=$(curl -s -m 60 localhost:$INFER/v1/chat/completions -H 'Content-Type: applica
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: pong\"}],\"max_tokens\":50,\"reasoning_effort\":\"none\"}")
 check "a real short inference call answers" '[ "$(echo "$R" | jq_ "d[\"choices\"][0][\"message\"][\"content\"].strip()")" = pong ]'
 
-# Splash's own chat page, from the packaged runtime: the page, its asset and the call the page makes.
+# Splash's own chat page, from the packaged runtime: the page, its assets and the call the page makes.
 S=$(api /status)
 check "status names the chat page address (loopback, applied port, no key)" '[ "$(echo "$S" | jq_ "d[\"web_chat\"][\"url\"]")" = "http://127.0.0.1:$INFER/" ]'
 check "the chat page is reported available"        '[ "$(echo "$S" | jq_ "d[\"web_chat\"][\"available\"]")" = True ]'
 PAGE=$(curl -s -i -m 10 localhost:$INFER/)
 check "GET / answers 200 text/html"                'echo "$PAGE" | head -1 | grep -q " 200" && echo "$PAGE" | grep -qi "^content-type: text/html"'
 check "the page is Splash's chat page"             'echo "$PAGE" | grep -q "<title>Splash</title>"'
-check "its only asset, /favicon.ico, is served"    '[ "$(curl -s -o /dev/null -w "%{http_code}" localhost:$INFER/favicon.ico)" = 200 ]'
+check "the favicon is served"    '[ "$(curl -s -o /dev/null -w "%{http_code}" localhost:$INFER/favicon.ico)" = 200 ]'
+for asset in markdown-it-15.0.2.min.js highlight-11.12.0.min.js github-11.12.0.min.css github-dark-11.12.0.min.css; do
+    if curl -fsS -m 10 "localhost:$INFER/chat-assets/$asset" -o "$WORK/$asset" && [ -s "$WORK/$asset" ]; then
+        ok "chat asset $asset is packaged and served"
+    else bad "chat asset $asset is packaged and served"; fi
+done
+if curl -fsS -m 10 "localhost:$INFER/metrics" -o "$WORK/metrics" && grep -q splash_thermal_state "$WORK/metrics"; then
+    ok "metrics expose the upstream thermal state"
+else bad "metrics expose the upstream thermal state"; fi
 check "the page's own call (streamed chat) answers" 'curl -s -N -m 60 localhost:$INFER/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":20,\"stream\":true,\"reasoning_effort\":\"none\"}" | grep -q "\[DONE\]"'
 
 # A long stream, then a switch to the other configuration while it runs.

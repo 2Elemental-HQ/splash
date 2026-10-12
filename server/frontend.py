@@ -270,7 +270,7 @@ class Frontend:
         self.chat_templates = chat_templates
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
-        # The package id the engine loaded. /status reports it, so an alias
+        # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
         self.model = model
         served = tuple(parse_served_model_name(name) for name in served_model_names)

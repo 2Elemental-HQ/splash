@@ -23,7 +23,8 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
   else
     out << weights.idleReleaseSeconds;
   out << ",\"released\":" << boolean(weights.released)
-      << ",\"restores\":" << weights.restores << '}';
+      << ",\"restores\":" << weights.restores
+      << ",\"restore_failures\":" << weights.restoreFailures << '}';
 }
 
 // reruns: the chunks the GPU ran again alone once the split's work for them
@@ -60,7 +61,7 @@ std::string runtimeStatusJson(
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn) {
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -73,7 +74,8 @@ std::string runtimeStatusJson(
        metalMemory.devicePeakAllocatedBytes});
   // Warning pressure pauses growth but permits serving; only the governor's
   // critical verdict makes host pressure a readiness failure. A status exists
-  // only after warmup and the memory audit passed.
+  // only after warmup and the memory audit passed. The thermal state slows
+  // serving but never stops it, so it is reported and readiness ignores it.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
   const bool ready = metalHealthy && hostSafe &&
                      currentBytes <= plan.breakdown().hardBudgetBytes;
@@ -90,6 +92,7 @@ std::string runtimeStatusJson(
       << ",\"maximum_context_tokens\":" << core.maximumContextTokens
       << ",\"memory_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.pressure))
+      << ",\"thermal_state\":" << json::quote(thermalStateName(thermalState))
       << ",\"admission\":{\"waiting\":"
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
@@ -157,6 +160,7 @@ std::string runtimeStatusJson(
       << ",\"active_lanes\":" << resources.activeRequests
       << ",\"idle_gdn_cells\":" << executorTelemetry.idleGdnCells
       << ",\"idle_draft_rings\":" << executorTelemetry.idleDraftRings
+      << ",\"idle_context_windows\":" << executorTelemetry.idleContextWindows
       << ",\"publications\":" << state.publications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries

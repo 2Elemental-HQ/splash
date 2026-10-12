@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -28,6 +29,11 @@ static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTo
 // How long a request waits for memory before it fails, and a resident
 // drain lasts, by default.
 inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
+// A request refused memory retries at once when the engine frees some
+// (signalResourceProgress). Memory that comes back without that, as the
+// host's does, it finds by retrying this often: at most a tenth of a second
+// later, without spinning the loop on attempts.
+inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 
 // The engine's constructor refuses a config without its context window, its
 // vocabulary or the governor's two hooks, which the bootstrap sets from the
@@ -56,6 +62,30 @@ struct EngineConfig final {
   // (MemoryGovernor::setServing).
   std::function<void(bool)> serving;
 };
+
+// While an active one lives, allocations are memory a request in service
+// needs (EngineConfig::serving).
+class Serving final {
+public:
+  Serving(const std::function<void(bool)> &mark, bool active)
+      : mark_(active ? &mark : nullptr) {
+    if (mark_)
+      (*mark_)(true);
+  }
+  ~Serving() {
+    if (mark_)
+      (*mark_)(false);
+  }
+  Serving(const Serving &) = delete;
+  Serving &operator=(const Serving &) = delete;
+
+private:
+  const std::function<void(bool)> *mark_;
+};
+
+// What a request fails with once it has waited the resource wait limit for
+// memory, last refused for `failure`.
+[[nodiscard]] std::string resourceTimeoutMessage(metal::AllocationFailure failure);
 
 // The progress checkpoints a request plans between the point it resumes from
 // and its replay boundary: the multiples of `interval` at least one prefill

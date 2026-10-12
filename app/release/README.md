@@ -60,7 +60,7 @@ this app:
 ## What is in the image
 
 * **The app.** Developer ID signed, hardened runtime, arm64 only, macOS 14 or later.
-* **The Splash runtime** in `Contents/Resources/Splash`: the upstream release `splash-1.3.0-arm64-macos26.tar.gz`
+* **The Splash runtime** in `Contents/Resources/Splash`: the upstream release `splash-1.3.1-arm64-macos26.tar.gz`
   (pinned by SHA-256 in `release/runtime/UPSTREAM.json`) with two files of this fork laid over it
   (`release/runtime/OVERLAY.txt`: the drain patch). `release/runtime/build-runtime.sh` downloads and verifies the archive,
   checks that every other `server/` and `install/` file of the fork still equals upstream's (it fails when the fork moved
@@ -128,3 +128,16 @@ Two workflows, both always start on a pull request (so no required check can wai
 does not rerun the 40-minute engine and Python jobs, while any change to what they cover, or to their workflow, does. A skipped job counts as
 passed. Caches can be evicted; then the job simply runs. Pushes to `main` and manual runs with *full_verification* run everything. Pushes to
 other branches start nothing: the pull request does, once. Permissions stay `contents: read`; no secret is used.
+
+## 1.3.1 integration
+
+The runtime is pinned to upstream release commit `f91c91e21dda483f8c59a248a444d0989a560d31`,
+not upstream main. `UPSTREAM.json` records that commit and the published archive digest; the engine
+and Metal library digests were read from the verified archive. Splash Manager stays at 0.4.0.
+The two-file SIGUSR1 overlay is still required: 1.3.1 has no graceful generation drain API.
+Signing, hardened-runtime flags, secure timestamps, integrity manifests and notarization gates are unchanged.
+An unsigned development package does not prove distribution signing or notarization.
+
+Package/menu tests auto-select a cached MLX checkpoint, skipping old Splash packages. To test a
+specific cached MLX or GGUF selection, set `SPLASH_TEST_MODEL=OWNER/REPO[:VARIANT]` and optionally
+`SPLASH_TEST_REVISION=COMMIT` before invoking either script. The tests start offline and download no models.

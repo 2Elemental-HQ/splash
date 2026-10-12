@@ -15,7 +15,7 @@ The management API contract is [API.md](API.md).
 | | Needs |
 | --- | --- |
 | This app | A Mac with **Apple silicon**, macOS 14 or later. The binary is arm64 only; **Intel Macs are not supported.** |
-| Splash (the engine it manages) | Apple **M3 or newer** and macOS **26.4 or later** (README of Splash 1.3.0; Splash's own device check decides at every start). |
+| Splash (the engine it manages) | Apple **M3 or newer** and macOS **26.4 or later** (README of Splash 1.3.1; Splash's own device check decides at every start). |
 
 So the app opens on an M1 or M2 Mac, or on macOS 14–26.3, but Splash will most likely refuse to run there.
 The Setup card in the window shows these checks for the Mac in front of you.
@@ -26,7 +26,7 @@ Distribution is a notarized disk image: `SplashManager-<version>-arm64.dmg`. Ope
 open it. **The app carries its own Splash runtime**: no Homebrew, no Xcode, no manual build, no path setting, no
 Gatekeeper workaround. See [release/README.md](release/README.md) for how it is made and verified.
 
-* **What is inside:** the app, and the Splash 1.3.0 release (engine, bundled Python, server) with this fork's drain patch,
+* **What is inside:** the app, and the Splash 1.3.1 release (engine, bundled Python, server) with this fork's drain patch,
   about 240 MB unpacked. Every Mach-O file is re-signed with the same Developer ID as the app, so the whole image
   is notarized; `release.json` and `runtime-manifest.json` are written after signing and describe the files as shipped.
 * **Integrity:** before the runtime is started the app recomputes the SHA-256 of the engine, the Metal library, the server,
@@ -123,7 +123,7 @@ identical one; a late result cannot touch a newer process (tested with overlappi
 
 A stop that ends running calls is not a stop. With drain support, stop and switch send `SIGUSR1`: Splash refuses new
 generation requests (`503 server_draining`), lets every accepted call finish, then exits. No timeout forces a running
-call. Without drain support (Homebrew 1.3.0) the API refuses them (`drain_unsupported`) and `switch_safe` is false; the
+call. Without drain support (Homebrew 1.3.1) the API refuses them (`drain_unsupported`) and `switch_safe` is false; the
 window offers a confirmed *Stop now*. Details and evidence: API.md and UPSTREAM_PATCHES.md.
 
 ### Process ownership
@@ -141,12 +141,12 @@ A configuration is `model id + optional revision + options`. Nothing is hardcode
 itself pinned. Options appear only if `splash serve --help` lists the flag, and values are validated.
 
 * **Cache inspection is not proof of startability.** "Files in cache" means the files Splash needs are complete: config,
-  tokenizer, every shard the weight index names, all parts of a split GGUF, and the draft. Only a start that reached
+  tokenizer, every shard the weight index names, the selected root GGUF, and the draft. Only a start that reached
   `ready` is recorded as *start verified*. When the files are complete the app starts with `--offline`.
 * **Draft models are followed, not copied:** the app reads `install/families.py` of the installed Splash and matches a
   family name in the model id. That match is an inference; Splash decides the family from the model's config at start.
   A model that matches no family is *unknown* and never reported as fully local. If the table cannot be read, nothing
-  is claimed. Splash 1.3.0 offers no command that resolves a model's draft or lists required files without starting, so
+  is claimed. Splash 1.3.1 offers no command that resolves a model's draft or lists required files without starting, so
   a version-bound source (the family table) is read at runtime instead of being copied.
 * **Thinking:** only "model default" and "off" (`--default-reasoning-effort none`).
 
@@ -163,7 +163,24 @@ itself pinned. Options appear only if `splash serve --help` lists the flag, and 
 
 * The tailnet path of the management API is bound but not tested from another device.
 * The disk image is not installed-tested on a clean second Mac, and nothing is published.
-* GGUF completeness is judged by file names (variant substring and `-0000N-of-0000M` parts).
+* GGUF selection follows upstream 1.3.1 root-file and variant rules; binary compatibility and vision dependencies are still checked by Splash at startup.
 * A shell's `HF_TOKEN` or `HF_HUB_CACHE` is not inherited by a GUI app.
 * `brew upgrade splash` while Splash runs: stop first, as Splash advises.
 * No in-app updates.
+
+## Bundled runtime 1.3.1
+
+Splash Manager 0.4.0 now bundles Splash 1.3.1 with the same SIGUSR1 drain support.
+The management API, saved settings, configuration IDs and stop/switch behavior remain compatible.
+Upstream adds thermal status/metrics and a richer web chat; the manager tolerates additional status fields.
+
+Splash model packages no longer load in 1.3.1. Add `mlx-community/Qwen3.8-27B-4bit` or
+`mlx-community/Qwen3.6-35B-A3B-4bit` instead of the corresponding official `incoai/*-Splash`
+package. For a community fine-tune, use that fine-tune's MLX or GGUF release. Do not reuse an old
+package's revision for a different repository. The manager reports this change and preserves your old
+configuration and cached files; it never silently replaces the model or deletes weights.
+
+Import retains GGUF variants when a pinned repository contains multiple root GGUF targets, ignores
+vision projectors and subdirectories, and accepts a single root GGUF without requiring MLX metadata.
+Existing MLX and GGUF downloads remain reusable. Upstream 1.3.0's persistent conversation cache is
+not reused by 1.3.1 and refills as conversations run.

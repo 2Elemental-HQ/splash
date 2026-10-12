@@ -46,6 +46,7 @@ release = {
     "metallib_sha256": files["engine/splash.metallib"],
     "base": {
         "upstream_version": upstream["upstream_version"],
+        "upstream_commit": upstream["upstream_commit"],
         "archive_sha256": upstream["sha256"],
         "upstream_engine_sha256": upstream["upstream_engine_sha256"],
     },

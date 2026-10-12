@@ -49,6 +49,52 @@ inline constexpr uint32_t kQ8_0 = ggmlType("Q8_0"), kQ3_K = ggmlType("Q3_K"), kQ
 
 inline int failures = 0;
 
+// One tensor of the MLX quantization fixture (dev/tests/fixtures/mlx-quantization), which
+// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine or mxfp4), bits, group size and
+// shape, MLX's packed codes, scales and biases (bf16; none for mxfp4) and MLX's reading of it, an affine
+// tensor's codes and the fp32 values.
+struct MlxTensor {
+  bool affine = true;
+  uint32_t bits = 0, group = 0, rows = 0, columns = 0;
+  std::vector<uint8_t> weight, scales, biases, codes, values;
+  // Its format (metal/abi/QuantFormat.h).
+  [[nodiscard]] Fmt format() const {
+    return affine ? Fmt(quant_affine_format_of(bits, group)) : gguf_reference::MXFP4;
+  }
+  [[nodiscard]] std::vector<uint8_t> native() const {
+    return gguf_reference::mlxNative(affine, bits, group, rows, columns, weight, scales, biases);
+  }
+};
+inline std::vector<MlxTensor> mlxFixture(const char *path) {
+  NSData *data = [NSData dataWithContentsOfFile:@(path)];
+  NSDictionary *fixture = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+  if (![fixture isKindOfClass:NSDictionary.class]) throw std::runtime_error(std::string("unreadable ") + path);
+  const auto bytes = [](NSString *hex) {
+    std::vector<uint8_t> result(hex.length / 2);
+    const char *text = hex.UTF8String;
+    for (size_t i = 0; i < result.size(); ++i)
+      result[i] = uint8_t(std::stoul(std::string(text + 2 * i, 2), nullptr, 16));
+    return result;
+  };
+  std::vector<MlxTensor> tensors;
+  for (NSDictionary *entry in fixture[@"formats"]) {
+    MlxTensor &t = tensors.emplace_back();
+    t.affine = [entry[@"mode"] isEqual:@"affine"];
+    t.bits = [entry[@"bits"] unsignedIntValue];
+    t.group = [entry[@"group"] unsignedIntValue];
+    t.rows = [entry[@"rows"] unsignedIntValue];
+    t.columns = [entry[@"columns"] unsignedIntValue];
+    t.weight = bytes(entry[@"weight"]);
+    t.scales = bytes(entry[@"scales"]);
+    t.values = bytes(entry[@"values"]);
+    if (t.affine) {
+      t.biases = bytes(entry[@"biases"]);
+      t.codes = bytes(entry[@"codes"]);
+    }
+  }
+  return tensors;
+}
+
 inline void check(bool ok, const std::string &what) {
   std::printf("%-64s %s\n", what.c_str(), ok ? "ok" : "FAIL");
   failures += !ok;
@@ -93,9 +139,18 @@ inline void checkGolden(const Goldens &hashes, const std::string &name, std::spa
 }
 
 // Every byte random and every half scale a random finite half: either sign,
-// zero and subnormal included.
+// zero and subnormal included; an MLX affine format's bf16 scales and biases
+// random finite bf16s.
 inline std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t seed) {
   std::mt19937 rng(seed);
+  if (gguf_reference::affine(f)) {
+    std::vector<uint8_t> native((size_t)rows * gguf_reference::rowBytes(f, K));
+    for (auto &b : native) b = (uint8_t)rng();
+    for (size_t at = 0; at < native.size(); at += kQuantFormats[f].block_bytes)
+      for (size_t field = 0; field < 4; field += 2)
+        if ((native[at + field + 1] & 0x7F) == 0x7F && (native[at + field] & 0x80)) native[at + field + 1] ^= 1;
+    return native;
+  }
   return gguf_reference::makeNative(f, rows, K, rng, [&] {
     uint16_t h;
     do h = static_cast<uint16_t>(rng());

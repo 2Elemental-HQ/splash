@@ -132,8 +132,9 @@ reached, a start failed for good, or the timeout ends. Always 200 with the curre
 ```
 
 * `availability` is **cache inspection**, not proof. `local`: the files that Splash needs are in the Hugging Face cache
-  (config, tokenizer, every weight shard named by the index, every part of a split GGUF, and the draft). Splash
+  (config, tokenizer, every weight shard named by the index, the selected root GGUF, and the draft). Splash
   then starts with `--offline`. `not_local`: something is absent or unreadable; `missing` and `incomplete` say what.
+* Removed Splash packages are `not_local` with a migration `note` and `download_required: false`; downloading cannot make that format supported.
 * `loaded`: this exact saved configuration runs now (`applied` equals the saved effective spec). A configuration
   whose saved settings differ from the running ones is `active` but not `loaded`.
 * `verified_start_at`: when a start of this model and revision last reached `ready` on this Mac. null means the
@@ -213,6 +214,7 @@ Evidence for the first and last row is in the PR description. The Splash change 
 | 409 | `external_instance` | A Splash this app did not start owns the port. Not touched. |
 | 409 | `port_in_use` | Another program listens on the port. Not touched. |
 | 409 | `not_managed` | Stop or switch of a process the app does not own. |
+| 422 | `unsupported_model_package` | Splash 1.3.1 removed this package format; add its MLX/GGUF replacement. The original config and cache are retained. |
 | 422 | `option_unsupported`, `exposure_unsupported` | The installed Splash lacks a flag. |
 | 424 | `splash_not_installed` | No Splash executable found. |
 

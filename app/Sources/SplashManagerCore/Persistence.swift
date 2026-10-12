@@ -64,6 +64,10 @@ public final class ConfigStore: ObservableObject {
         result.found = found.count
         var ids = Set(state.configs.map(\.id))
         for candidate in found {
+            if let note = cache.unsupportedPackageNote(modelId: candidate.modelId, revision: candidate.revision) {
+                result.errors.append("\(candidate.modelId): \(note)")
+                continue
+            }
             if state.configs.contains(where: { $0.modelId == candidate.modelId && $0.revision == candidate.revision }) {
                 result.alreadyConfigured += 1
                 continue

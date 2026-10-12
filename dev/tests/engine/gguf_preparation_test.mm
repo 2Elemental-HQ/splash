@@ -1,14 +1,17 @@
 // GGUF weight preparation on the GPU: every format's planes through the
 // production executor against the CPU reference, the images the loader
 // writes from the small dense and MoE targets, their golden hashes, offsets
-// past 4 GiB, a restore of released images, and the target loader's reading
-// of a GGUF.
-//   gguf-preparation METALLIB GOLDENS
+// past 4 GiB, a restore of released images, the target loader's reading of a
+// GGUF, and MLX's quantized tensors read from a safetensors checkpoint.
+//   gguf-preparation METALLIB GOLDENS MLX_FIXTURE
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
-// how to update it.
+// how to update it. MLX_FIXTURE is
+// dev/tests/fixtures/mlx-quantization/fixture.json.
 #include "GgufFixtures.hpp"
+#include "TestAdmission.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/SafetensorsCheckpoint.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/WeightImages.hpp"
@@ -103,7 +106,7 @@ void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
   });
   check(uint64_t(goldens) == loaded.size(), "every golden " + name + " image is prepared");
   images.release();
-  while (!images.restore()) {
+  while (!images.restore(splash::test::admitAll)) {
   }
   check(bytesOf(images) == loaded, "restored " + name + " images are the bytes loaded");
 }
@@ -164,6 +167,7 @@ void checkDense(MetalBackend &backend, const std::filesystem::path &directory, c
 void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
   for (bool moe : {false, true})
     for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
+      if (quant_affine_format(format)) continue;   // no GGUF tensor type
       SmallTarget target = smallTarget(moe);
       const model::QwenTargetDimensions &g = target.geometry;
       const Fmt f = Fmt(format);
@@ -279,9 +283,7 @@ void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &d
 
 // The segments of a block projection of `n` x `k`, by output width.
 bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vector<uint32_t> widths) {
-  if (p.layout() != ops::WeightLayout::Block32 || p.outputSize != n || p.inputSize != k ||
-      p.blocks().segments.size() != widths.size())
-    return false;
+  if (p.outputSize != n || p.inputSize != k || p.blocks().segments.size() != widths.size()) return false;
   uint32_t offset = 0;
   for (size_t i = 0; i < widths.size(); ++i) {
     const ops::QuantizedSegment &s = p.blocks().segments[i];
@@ -341,8 +343,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             std::string_view(weights.logitsProjection.blocks().segments.front().name()) == "q6k" &&
             weights.logitsProjection.destination == ops::FloatOutput::Float32,
         "GGUF target: logits a Q6_K block projection of vocabulary x hidden into fp32");
-  check(weights.tokenEmbedding.layout() == ops::WeightLayout::Block32 &&
-            weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
+  check(weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
   check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");
@@ -412,6 +413,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     std::vector<uint8_t> input(kSourceOffset, 0);
     input.insert(input.end(), native.begin(), native.end());
     splash::test::writeFile(inputPath, input);
+    model::WeightSource source(inputPath);
+    source.setDataOffset(kSourceOffset);
     model::gguf::Repack step;
     step.format = f;
     step.rows = rows;
@@ -419,7 +422,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     step.plane0 = plane0;
     step.plane1 = layout.plane1_bytes ? plane1 : 0;
     step.meta = meta;
-    step.sources = {{"fixture", layout.ggml_type, 0, rows, stride, shape.order}};
+    step.sources = {{"fixture", layout.ggml_type, 0, rows, stride, shape.order, &source}};
     model::gguf::Image plan;
     plan.bytes = bytes;
     plan.repacks.push_back(step);
@@ -427,9 +430,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     // The writer writes every byte: none of these is left.
     std::memset(image.contents(), 0xFF, bytes);
     const auto before = backend.memoryStats();
-    model::WeightSource source(inputPath);
-    source.setDataOffset(kSourceOffset);
-    model::writeGgufImage(backend, source, image, plan);
+    model::writeGgufImage(backend, image, plan);
     const auto after = backend.memoryStats();
     check(after.allocatedBytes == before.allocatedBytes, "repack releases its staging buffer");
     check(after.peakAllocatedBytes <=
@@ -457,12 +458,95 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   }
 }
 
+// A safetensors shard of these tensors and bytes.
+struct ShardTensor {
+  std::string name, dtype;
+  std::vector<uint64_t> shape;
+  const std::vector<uint8_t> *bytes;
+};
+void writeShard(const std::filesystem::path &path, const std::vector<ShardTensor> &tensors) {
+  std::string header = "{";
+  uint64_t offset = 0;
+  for (const ShardTensor &tensor : tensors) {
+    std::string shape;
+    for (uint64_t dimension : tensor.shape) shape += (shape.empty() ? "" : ",") + std::to_string(dimension);
+    header += (header.size() > 1 ? ",\"" : "\"") + tensor.name + "\":{\"dtype\":\"" + tensor.dtype +
+              "\",\"shape\":[" + shape + "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + tensor.bytes->size()) + "]}";
+    offset += tensor.bytes->size();
+  }
+  header += "}";
+  header.resize((header.size() + 7) / 8 * 8, ' ');
+  std::vector<uint8_t> file(8);
+  const uint64_t length = header.size();
+  std::memcpy(file.data(), &length, 8);
+  file.insert(file.end(), header.begin(), header.end());
+  for (const ShardTensor &tensor : tensors) file.insert(file.end(), tensor.bytes->begin(), tensor.bytes->end());
+  std::filesystem::create_directories(path.parent_path());
+  splash::test::writeFile(path, file);
+}
+
+// Each MLX fixture tensor through the production writer, read from a
+// safetensors checkpoint as the MLX planner binds it (model/MlxImage.hpp): its
+// planes in one 256-row tile, the native rows the token gather reads and, for
+// an affine tensor, the F32 values the MoE router's dequantization writes,
+// against the CPU reference's planes of the loader's native rows (mlxNative)
+// and MLX's own values.
+void checkMlxSources(MetalBackend &backend, const std::filesystem::path &directory, const char *fixture) {
+  for (const MlxTensor &tensor : mlxFixture(fixture)) {
+    const Fmt f = tensor.format();
+    const QuantFormat &layout = kQuantFormats[f];
+    const uint32_t rows = tensor.rows, K = tensor.columns, groups = K / tensor.group;
+    const auto root = directory / (std::string("mlx-") + fmtName(f));
+    std::vector<ShardTensor> shard{{"m.weight", "U32", {rows, K * tensor.bits / 32}, &tensor.weight},
+                                   {"m.scales", tensor.affine ? "BF16" : "U8", {rows, groups}, &tensor.scales}};
+    if (tensor.affine) shard.push_back({"m.biases", "BF16", {rows, groups}, &tensor.biases});
+    writeShard(root / "model.safetensors", shard);
+    const model::SafetensorsCheckpoint checkpoint(root);
+    const model::SourceTensor &codes = checkpoint.require("m.weight");
+    const model::gguf::TensorRows source{
+        "m", layout.ggml_type, 0, rows, rowBytes(f, K), {}, codes.file,
+        {&codes, &checkpoint.require("m.scales"), tensor.affine ? &checkpoint.require("m.biases") : nullptr}};
+    const std::vector<uint8_t> native = tensor.native();
+    std::vector<uint8_t> tile = native;
+    tile.resize(size_t(QUANT_TILE_ROWS) * rowBytes(f, K), 0);
+    const Packed expected = repack(f, tile, QUANT_TILE_ROWS, K, nullptr);
+
+    model::gguf::ImageBuilder builder("mlx.bin", 0, 0);
+    model::gguf::Repack planes = builder.planes(f, QUANT_TILE_ROWS, K, "m");
+    planes.sources.push_back(source);
+    const model::gguf::Repack step = planes;
+    builder.repack(std::move(planes));
+    const uint64_t nativeAt = builder.section(native.size());
+    builder.copyAt(nativeAt, source, model::gguf::Conversion::None);
+    const uint64_t valuesAt = builder.section(tensor.values.size());
+    builder.copyAt(valuesAt, source, model::gguf::Conversion::DequantizeToFloat32);
+    const model::gguf::Image plan = builder.finish();
+    const auto image = backend.allocateBuffer(plan.bytes, splash::metal::BufferStorage::Shared, "mlx-image");
+    model::writeGgufImage(backend, image, plan);
+    const auto actual = model::contentsOf(image);
+    const auto holds = [&](uint64_t at, const std::vector<uint8_t> &bytes) {
+      return at + bytes.size() <= actual.size() && std::equal(bytes.begin(), bytes.end(), actual.begin() + at);
+    };
+    const std::string name = std::string("MLX ") + (tensor.affine ? "" : "mxfp4 as ") + fmtName(f);
+    check(holds(step.plane0, expected.w0) && (!layout.plane1_bytes || holds(step.plane1, expected.w1)) &&
+              holds(step.meta, expected.meta),
+          name + ": planes from its codes and scales");
+    check(holds(nativeAt, native), name + ": the token gather's native rows");
+    // By value: MLX writes an mxfp4 code of -0 as -0, the kernels as +0.
+    std::vector<float> expectedValues(tensor.values.size() / 4), values(expectedValues.size());
+    std::memcpy(expectedValues.data(), tensor.values.data(), tensor.values.size());
+    std::memcpy(values.data(), actual.data() + valuesAt, tensor.values.size());
+    check(values == expectedValues, name + ": dequantized to MLX's F32 values");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 3) {
-      std::fprintf(stderr, "usage: gguf-preparation METALLIB GOLDENS\n");
+    if (argc != 4) {
+      std::fprintf(stderr, "usage: gguf-preparation METALLIB GOLDENS MLX_FIXTURE\n");
       return 2;
     }
     const splash::test::TemporaryDirectory directory("splash-gguf-preparation");
@@ -475,6 +559,7 @@ int main(int argc, char **argv) {
     guarded("preparation of BF16 alpha/beta", [&] { checkWidenedAlphaBeta(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
+    guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
                 failures);
     return failures ? 1 : 0;
